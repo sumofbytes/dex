@@ -303,9 +303,9 @@ fn markdown_theme() -> ThemeConfig {
 
 /// Highlight a multi-line snippet in ONE tree-sitter pass and split the
 /// result back into per-line spans, so multi-line constructs (block
-/// comments, triple-quoted strings) keep their style across rows. Returns
-/// `None` when the language is unknown or yields nothing — callers keep the
-/// dim fallback, so highlighting never regresses to plain.
+/// comments, triple-quoted strings) keep their style across rows. Tree-sitter
+/// misses (sql, dockerfile, unknown) fall back to the generic lexer; `None`
+/// means nothing colorable — callers keep the dim fallback.
 /// ponytail: byte-safe slicing throughout; a bad split falls back to dim
 /// rather than panicking mid-frame.
 pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
@@ -313,50 +313,50 @@ pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Spa
         return None;
     }
     let mut segs = highlight::shared_highlighter().highlight(lang, code);
-    if segs.is_empty() {
-        return None;
-    }
-    segs.sort_by_key(|s| (s.start, s.end));
-    // Byte range of each `\n`-separated row in the joined text.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    for line in code.split('\n') {
-        ranges.push((start, start + line.len()));
-        start += line.len() + 1;
-    }
-    let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(ranges.len());
-    for (lo, hi) in ranges {
-        let mut spans = Vec::new();
-        let mut pos = lo;
-        for seg in segs.iter() {
-            if seg.end <= lo || seg.start >= hi || seg.end <= seg.start {
-                continue;
-            }
-            // Clip the segment to this row; anything unsliceable aborts
-            // the whole block to dim (never half-highlighted rows).
-            let s = seg.start.max(lo);
-            let e = seg.end.min(hi);
-            if s < pos {
-                continue;
-            }
-            let gap = code.get(pos..s)?;
-            if !gap.is_empty() {
-                spans.push(Span::raw(gap.to_string()));
-            }
-            let text = code.get(s..e)?;
-            if text.is_empty() {
-                continue;
-            }
-            spans.push(Span::styled(text.to_string(), seg.style));
-            pos = e;
+    if !segs.is_empty() {
+        segs.sort_by_key(|s| (s.start, s.end));
+        // Byte range of each `\n`-separated row in the joined text.
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        for line in code.split('\n') {
+            ranges.push((start, start + line.len()));
+            start += line.len() + 1;
         }
-        let tail = code.get(pos..hi)?;
-        if !tail.is_empty() {
-            spans.push(Span::raw(tail.to_string()));
+        let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(ranges.len());
+        for (lo, hi) in ranges {
+            let mut spans = Vec::new();
+            let mut pos = lo;
+            for seg in segs.iter() {
+                if seg.end <= lo || seg.start >= hi || seg.end <= seg.start {
+                    continue;
+                }
+                // Clip the segment to this row; anything unsliceable aborts
+                // the whole block to dim (never half-highlighted rows).
+                let s = seg.start.max(lo);
+                let e = seg.end.min(hi);
+                if s < pos {
+                    continue;
+                }
+                let gap = code.get(pos..s)?;
+                if !gap.is_empty() {
+                    spans.push(Span::raw(gap.to_string()));
+                }
+                let text = code.get(s..e)?;
+                if text.is_empty() {
+                    continue;
+                }
+                spans.push(Span::styled(text.to_string(), seg.style));
+                pos = e;
+            }
+            let tail = code.get(pos..hi)?;
+            if !tail.is_empty() {
+                spans.push(Span::raw(tail.to_string()));
+            }
+            out.push(spans);
         }
-        out.push(spans);
+        return Some(out);
     }
-    Some(out)
+    highlight::fallback_code_block(lang, code)
 }
 
 /// Transcript `▸ tool arg` row. Bash commands highlight via the compiled
@@ -1678,6 +1678,7 @@ mod tests {
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
             assistant_pending: String::new(),
+            assistant_gap: crate::core::markdown::GapState::new(),
             stream_last_flush: std::time::Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
@@ -2662,6 +2663,25 @@ mod tests {
     }
 
     #[test]
+    fn blank_runs_render_one_air_row() {
+        // Double/triple blank lines collapse to one air row (CommonMark and
+        // pi/codex/opencode all render a single separator for a blank run).
+        let src = crate::core::markdown::normalize_gaps(
+            "",
+            "para one\n\n\n\npara two\n\n\n- a\n- b\n\n\ntail",
+        );
+        let lines = markdown_lines(&src);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["para one", "", "para two", "", "•  a", "•  b", "", "tail"],
+        );
+    }
+
+    #[test]
     fn normalized_source_renders_gapped() {
         // The gap rule lives in `core::markdown` (unit-tested there); this
         // pins the render layer end to end: normalized dense source renders
@@ -2950,7 +2970,37 @@ mod tests {
         // comments, keywords) so ```bash blocks never fall back to yellow.
         let highlighted = highlight_code_block("bash", "echo \"hi\" # done\nif x; then y; fi\n");
         assert!(highlighted.is_some(), "bash grammar yielded nothing");
+        // Plain prose with no colorable tokens keeps the dim fallback.
         let unknown = highlight_code_block("definitely-not-a-lang", "plain");
         assert!(unknown.is_none());
+    }
+
+    #[test]
+    fn unknown_and_sql_fences_highlight_via_fallback() {
+        // Tree-sitter misses these; the generic lexer colors them instead of dim.
+        for (lang, code) in [
+            ("sql", "SELECT a FROM t WHERE x = 1\n"),
+            ("dockerfile", "FROM rust:1\nRUN cargo build\n"),
+            ("definitely-not-a-lang", "def x = 42\n"),
+        ] {
+            let rows = highlight_code_block(lang, code).expect("{lang} must fallback");
+            let text: String = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|s| s.content.as_ref().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(code.lines().next().unwrap_or("")), "{lang}");
+            assert!(
+                rows.iter()
+                    .flat_map(|r| r.iter())
+                    .any(|s| s.style.fg.is_some()),
+                "{lang} emitted no styles"
+            );
+        }
+        assert!(highlight_code_block("text", "SELECT 1\n").is_none());
     }
 }

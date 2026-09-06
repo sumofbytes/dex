@@ -93,7 +93,13 @@ impl StreamPrinter {
     }
 
     /// Headless prose path shared by sync/async inners (both print sync).
+    /// Blank runs collapse to one air row like the TUI: a blank line prints
+    /// exactly one row, so repeats are skipped once `headless_empty` says the
+    /// cursor is already on air (never doubled, never leading).
     fn headless_on_prose(&mut self, line: &str) {
+        if line.trim().is_empty() && self.headless_empty {
+            return;
+        }
         if self.headless_gap(line) {
             println!();
         }

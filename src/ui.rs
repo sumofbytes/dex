@@ -225,6 +225,10 @@ pub(crate) struct App {
     /// `STREAM_FLUSH_INTERVAL` instead of once per token; `flush_assistant`
     /// drains it into the tail `Assistant` block.
     pub(crate) assistant_pending: String,
+    /// Markdown gap state for the open assistant block. Survives throttled
+    /// `flush_assistant` clears of `assistant_pending` so a heading/list at a
+    /// window edge keeps its top air; reset on every fresh assistant block.
+    pub(crate) assistant_gap: crate::core::markdown::GapState,
     /// Last wall-clock markdown/thinking flush; gates `append_sink_line`
     /// throttling so the re-parse rate is frame-rate independent.
     pub(crate) stream_last_flush: Instant,
@@ -564,6 +568,13 @@ fn indent_transcript_line(mut line: Line<'static>) -> Line<'static> {
     line
 }
 
+/// True when a stored transcript line renders as air: every span is
+/// whitespace. Direct-pushed blanks (`Line::default()`) carry no spans;
+/// markdown-rendered blank rows carry the 1-space transcript indent.
+fn line_is_air(line: &Line) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
 pub(super) fn push_info_line(app: &mut App, line: Line<'static>) {
     flush_assistant(app);
     close_thinking(app);
@@ -671,14 +682,20 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 // Blank inside the current assistant message (e.g. streaming
                 // blank line between paragraphs). Keep it inside the tail
                 // Assistant block so the inter-block gutter remains canonical.
+                // Blank runs collapse to one air row (CommonMark/pi/codex):
+                // the model often emits several, and each used to push its
+                // own `Line::default()`.
                 if app.assistant_open {
                     flush_assistant(app);
                     if let Some(TranscriptBlock::Assistant { lines, stamp }) =
                         app.transcript.last_mut()
                     {
-                        lines.push(Line::default());
-                        *stamp = stamp.wrapping_add(1);
+                        if !lines.last().is_some_and(line_is_air) {
+                            lines.push(Line::default());
+                            *stamp = stamp.wrapping_add(1);
+                        }
                     }
+                    app.assistant_gap.note_blank();
                 }
                 return;
             }
@@ -688,8 +705,14 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // trailing newline), so rejoin buffered lines with '\n' to keep
             // paragraph structure across the throttle window. Normalize blank
             // lines around block-level markdown so dense model output still
-            // renders with air between sections.
-            let chunk = crate::core::markdown::normalize_gaps(&app.assistant_pending, &s);
+            // renders with air between sections. Gap state survives throttled
+            // flushes (which clear `assistant_pending`): without it a
+            // heading/list at a window edge lost its top air while the bottom
+            // air survived via the trailing blank.
+            if !app.assistant_open && app.assistant_pending.is_empty() {
+                app.assistant_gap.reset();
+            }
+            let chunk = app.assistant_gap.normalize(&s);
             if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
                 app.assistant_pending.push('\n');
             }
@@ -969,6 +992,7 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
 pub(crate) fn rebuild_transcript(app: &mut App) {
     app.transcript.clear();
     app.assistant_pending.clear();
+    app.assistant_gap.reset();
     app.assistant_open = false;
     app.thinking_open = false;
     let msgs = app.messages.clone();
@@ -1087,6 +1111,7 @@ mod tests {
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
             assistant_pending: String::new(),
+            assistant_gap: crate::core::markdown::GapState::new(),
             stream_last_flush: Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
@@ -1369,6 +1394,72 @@ mod tests {
             app.transcript.last(),
             Some(TranscriptBlock::Tool { .. })
         ));
+    }
+
+    #[test]
+    fn heading_keeps_top_air_across_flush_windows() {
+        // A heading at a throttle edge used to butt against the flushed prose
+        // (no top air) while the bottom air survived via the trailing blank.
+        let mut app = test_app();
+        let due = || Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
+        app.stream_last_flush = due();
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("intro text".into()),
+        );
+        assert!(app.assistant_open);
+        app.stream_last_flush = due();
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("## Heading".into()),
+        );
+        let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
+            panic!("expected assistant block");
+        };
+        let row = |l: &Line<'static>| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let rows: Vec<String> = lines.iter().map(row).collect();
+        assert_eq!(rows.len(), 3, "top air missing across flush: {rows:?}");
+        assert!(rows[0].contains("intro text"), "{rows:?}");
+        assert!(rows[1].trim().is_empty(), "{rows:?}");
+        assert!(rows[2].contains("Heading"), "{rows:?}");
+        assert!(!rows[2].contains('#'), "{rows:?}");
+    }
+
+    #[test]
+    fn assistant_blank_runs_collapse_to_one_air_row() {
+        // Streaming blank lines between paragraphs collapse to a single air
+        // row (CommonMark/pi/codex); each used to push its own blank `Line`.
+        let mut app = test_app();
+        let due = || Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
+        for line in ["para one", "", "", "", "para two"] {
+            app.stream_last_flush = due();
+            append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Assistant(line.into()),
+            );
+        }
+        flush_assistant(&mut app);
+        let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
+            panic!("expected assistant block");
+        };
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rows.len(), 3, "blank run not collapsed: {rows:?}");
+        assert!(rows[0].contains("para one"), "{rows:?}");
+        assert!(rows[1].trim().is_empty(), "{rows:?}");
+        assert!(rows[2].contains("para two"), "{rows:?}");
     }
 
     #[test]
