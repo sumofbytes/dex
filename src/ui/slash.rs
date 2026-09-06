@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[allow(unused_imports)]
 use crate::core::types::Plan;
@@ -31,6 +31,19 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 fn save_plan(app: &mut App) -> std::io::Result<()> {
     let json = app.plan.to_json();
     app.session.set_state("plan", &json)
+}
+
+/// Every session for this workspace, newest first, excluding the current one.
+/// No emptiness filtering: users pick by index/time, and resuming a session
+/// without messages just shows an empty transcript. Listing is header-only
+/// (`Session::list` reads one line per file), so no cache is needed.
+fn resume_candidates(app: &App) -> Vec<(PathBuf, crate::session::SessionHeader)> {
+    let current = app.session.id().to_string();
+    Session::list(&app.cwd)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, header)| header.id() != current)
+        .collect()
 }
 
 pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
@@ -92,21 +105,8 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        let Ok(sessions) = Session::list(&app.cwd) else {
-            return Vec::new();
-        };
-        // Hide the current session and empty sessions — they are the
-        // just-created placeholder and make `0` point at an empty transcript.
-        let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
-            .into_iter()
-            .filter(|(path, header)| {
-                if header.id() == app.session.id() {
-                    return false;
-                }
-                // Skip sessions with no persisted messages (only header).
-                crate::session::has_messages(path)
-            })
-            .collect();
+        // Hide the current session; everything else is listed by index/time.
+        let filtered = resume_candidates(app);
         return filtered
             .iter()
             .enumerate()
@@ -362,12 +362,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let sessions = Session::list(&app.cwd).unwrap_or_default();
             let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
                 .into_iter()
-                .filter(|(path, header)| {
-                    if header.id() == app.session.id() {
-                        return false;
-                    }
-                    crate::session::has_messages(path)
-                })
+                .filter(|(_, header)| header.id() != app.session.id())
                 .collect();
             if filtered.is_empty() {
                 push_info(app, "no sessions found.".to_string());
@@ -384,12 +379,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let sessions = Session::list(&app.cwd).unwrap_or_default();
             let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
                 .into_iter()
-                .filter(|(path, header)| {
-                    if header.id() == app.session.id() {
-                        return false;
-                    }
-                    crate::session::has_messages(path)
-                })
+                .filter(|(_, header)| header.id() != app.session.id())
                 .collect();
             let path_opt = if let Ok(idx) = selector.parse::<usize>() {
                 filtered.get(idx).map(|(p, _)| p.clone())

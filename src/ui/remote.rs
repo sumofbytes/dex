@@ -576,7 +576,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     handle_key(&mut remote, key);
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut remote, mouse),
-                Event::Paste(s) => remote.app.input.insert_paste(&s),
+                Event::Paste(s) => {
+                    remote.app.input.insert_paste(&s);
+                    // A paste can narrow the popup list like typing does.
+                    remote.app.slash_selected = 0;
+                }
                 Event::Resize(..) => {} // frame recomputed each draw
                 _ => {}
             }
@@ -1311,6 +1315,14 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 }
                 let is_followup = key.modifiers.contains(KeyModifiers::ALT);
                 submit_prompt(remote, is_followup);
+            }
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => {
+                // Typing narrows the popup list: feed the keystroke to the
+                // composer and jump back to the top match so the highlight
+                // never strands past the filtered results (e.g. `/` + `r`
+                // lands on `/resume` instead of a stale arrow position).
+                app.input.handle_key(key);
+                app.slash_selected = 0;
             }
             _ => app.input.handle_key(key),
         },
