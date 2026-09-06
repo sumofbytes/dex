@@ -72,6 +72,11 @@ pub(crate) enum TranscriptBlock {
         input: Line<'static>,
         output: Option<Line<'static>>,
         preview: Vec<Line<'static>>,
+        /// Short arg as emitted by `ToolInput` (e.g. `src/main.rs:1-20`).
+        /// Stored — not parsed back out of the rendered `input` line — so
+        /// `ToolOutput` can pick the preview language for syntax
+        /// highlighting without span scraping.
+        tool_arg: String,
     },
     System {
         stamp: u64,
@@ -684,7 +689,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // paragraph structure across the throttle window. Normalize blank
             // lines around block-level markdown so dense model output still
             // renders with air between sections.
-            let chunk = render::with_block_gaps(&app.assistant_pending, &s);
+            let chunk = crate::core::markdown::normalize_gaps(&app.assistant_pending, &s);
             if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
                 app.assistant_pending.push('\n');
             }
@@ -700,7 +705,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 .rsplit('\n')
                 .next()
                 .unwrap_or("");
-            let holding_table = render::is_table_line(last_line);
+            let holding_table = crate::core::markdown::is_table_line(last_line);
             if stream_flush_due(app) && !holding_table {
                 flush_assistant(app);
             }
@@ -747,6 +752,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 input,
                 output: None,
                 preview: Vec::new(),
+                tool_arg: arg,
             });
         }
         SinkLine::ToolOutput {
@@ -776,13 +782,15 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ));
             }
             let output = indent_transcript_line(Line::from(spans));
-            // write/edit previews are a git diff: color it like git does.
-            let is_diff = matches!(name.as_str(), "write" | "edit");
-            let preview_lines: Vec<Line<'static>> = preview
-                .iter()
-                .map(|line| {
-                    let style = if is_diff {
-                        if line.starts_with('+') && !line.starts_with("+++") {
+            // write/edit previews are a git diff: color like git does. read
+            // previews keep the numbered gutter dim and highlight the code
+            // by extension (opencode/Claude Code style, one tree-sitter
+            // pass per file section); anything unhighlightable stays dim.
+            let preview_lines: Vec<Line<'static>> = if matches!(name.as_str(), "write" | "edit") {
+                preview
+                    .iter()
+                    .map(|line| {
+                        let style = if line.starts_with('+') && !line.starts_with("+++") {
                             Style::default().fg(Color::LightGreen)
                         } else if line.starts_with('-') && !line.starts_with("---") {
                             Style::default().fg(Color::LightRed)
@@ -790,13 +798,41 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                             Style::default().fg(Color::Cyan)
                         } else {
                             Style::default().fg(theme::tool_preview_fg())
-                        }
-                    } else {
-                        Style::default().fg(theme::tool_preview_fg())
-                    };
-                    indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
-                })
-                .collect();
+                        };
+                        indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
+                    })
+                    .collect()
+            } else if matches!(name.as_str(), "read") && success {
+                // Language from the stored `ToolInput` arg (first token is
+                // the path: `src/main.rs:1-20`, a glob, or `N files`).
+                // `==> file <==` fan-out headers inside re-target per
+                // section in `render_read_preview`.
+                let arg_path = app
+                    .transcript
+                    .last()
+                    .and_then(|b| match b {
+                        TranscriptBlock::Tool {
+                            output: None,
+                            tool_arg,
+                            ..
+                        } => Some(tool_arg.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let path = arg_path.split_whitespace().next().unwrap_or("");
+                let path = path.split(':').next().unwrap_or(path);
+                render::render_read_preview(&preview, crate::core::markdown::lang_from_path(path))
+            } else {
+                preview
+                    .iter()
+                    .map(|line| {
+                        indent_transcript_line(Line::from(Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(theme::tool_preview_fg()),
+                        )))
+                    })
+                    .collect()
+            };
             app.assistant_open = false;
             // Complete the tool block started by ToolInput if it is still open.
             if let Some(TranscriptBlock::Tool {
@@ -814,6 +850,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 }
             }
             // Fallback: no open ToolInput (e.g. replay); synthesize a block.
+            // No arg is known here, so previews stay dim — the replay path
+            // (`rebuild_transcript`) always emits `ToolInput` first, which
+            // carries the arg for highlighting.
             app.transcript.push(TranscriptBlock::Tool {
                 stamp: 0,
                 input: indent_transcript_line(Line::from(Span::styled(
@@ -822,6 +861,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ))),
                 output: Some(output),
                 preview: preview_lines,
+                tool_arg: String::new(),
             });
         }
         SinkLine::System(s) => {
@@ -1392,6 +1432,59 @@ mod tests {
         }
         assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
         assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
+    }
+
+    #[test]
+    fn read_preview_highlights_code_and_keeps_gutter_dim() {
+        // Industry standard (opencode/Claude Code): read snippets highlight
+        // by extension; the `{:>4}  ` gutter stays dim for alignment.
+        let mut app = test_app();
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("read src/main.rs:1-2".into()),
+        );
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "read".into(),
+                summary: "v 2 lines".into(),
+                success: true,
+                preview: vec!["   1  fn main() {}".into(), "… +1 more lines".into()],
+                duration: 0.0,
+            },
+        );
+        let TranscriptBlock::Tool { preview, .. } = &app.transcript[0] else {
+            panic!("expected Tool block");
+        };
+        assert_eq!(preview.len(), 2);
+        // Code row: indent + dim gutter + at least one highlighted span.
+        // spans[0] is the transcript indent (unstyled), spans[1] the gutter.
+        let gutter: String = preview[0].spans[1]
+            .content
+            .as_ref()
+            .chars()
+            .chain(
+                preview[0]
+                    .spans
+                    .get(2)
+                    .map(|s| s.content.as_ref())
+                    .unwrap_or("")
+                    .chars(),
+            )
+            .collect();
+        assert!(gutter.contains('1'), "{gutter}");
+        assert_eq!(preview[0].spans[1].style.fg, Some(theme::tool_preview_fg()));
+        assert!(
+            preview[0].spans[2..]
+                .iter()
+                .any(|s| s.style.fg != Some(theme::tool_preview_fg())),
+            "code should highlight, got {:?}",
+            preview[0]
+        );
+        // Tail row stays dim (spans[0] is the unstyled indent gutter).
+        assert!(preview[1].spans[1..]
+            .iter()
+            .all(|s| s.style.fg == Some(theme::tool_preview_fg())));
     }
 
     /// Write a minimal persisted session JSONL (same entry shapes
