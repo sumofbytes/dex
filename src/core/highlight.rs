@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter};
+use ratatui_markdown::highlight::{CodeHighlighter, StyleSegment, TreeSitterHighlighter};
 use ratatui_markdown::CodeColors;
 
 use super::lang::canonical_lang;
@@ -65,14 +65,9 @@ pub(crate) fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
 /// Without this, fences for sql/dockerfile/kotlin/groovy rendered dim in
 /// the TUI while previews and headless output colored them.
 pub(crate) fn shared_markdown_highlighter() -> Arc<CombinedHighlighter> {
-    static COMBINED: OnceLock<Arc<CombinedHighlighter>> = OnceLock::new();
-    COMBINED
-        .get_or_init(|| {
-            Arc::new(CombinedHighlighter {
-                tree: shared_highlighter(),
-            })
-        })
-        .clone()
+    Arc::new(CombinedHighlighter {
+        tree: shared_highlighter(),
+    })
 }
 
 pub(crate) struct CombinedHighlighter {
@@ -80,30 +75,13 @@ pub(crate) struct CombinedHighlighter {
 }
 
 impl CodeHighlighter for CombinedHighlighter {
-    fn highlight(&self, lang: &str, code: &str) -> Vec<ratatui_markdown::highlight::StyleSegment> {
+    fn highlight(&self, lang: &str, code: &str) -> Vec<StyleSegment> {
         let segs = self.tree.highlight(lang, code);
         if !segs.is_empty() {
             return segs;
         }
-        fallback_style_segments(lang, code)
+        fallback_segments(lang, code)
     }
-}
-
-/// Fallback segments as tree-sitter [`StyleSegment`]s for the combined
-/// highlighter above. Empty when the language is unknown or nothing is
-/// colorable, so callers keep the dim fallback.
-fn fallback_style_segments(
-    lang: &str,
-    code: &str,
-) -> Vec<ratatui_markdown::highlight::StyleSegment> {
-    fallback_segments(lang, code)
-        .into_iter()
-        .map(|s| ratatui_markdown::highlight::StyleSegment {
-            start: s.start,
-            end: s.end,
-            style: s.style,
-        })
-        .collect()
 }
 
 /// Highlight a snippet to an ANSI-escaped string in ONE tree-sitter pass.
@@ -118,27 +96,7 @@ pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
         return None;
     }
     segs.sort_by_key(|s| (s.start, s.end));
-    let mut out = String::with_capacity(code.len() + code.len() / 4);
-    let mut pos = 0;
-    for seg in &segs {
-        // Byte-safe: a bad range falls back to plain rather than panicking.
-        // Clip to `pos` so overlapping segments never duplicate bytes.
-        let start = seg.start.min(code.len()).max(pos);
-        let end = seg.end.min(code.len());
-        if start > pos {
-            out.push_str(code.get(pos..start).unwrap_or(""));
-        }
-        if end > start {
-            if let Some(slice) = code.get(start..end) {
-                push_styled(&mut out, &seg.style, slice);
-            }
-            pos = pos.max(end);
-        }
-    }
-    if pos < code.len() {
-        out.push_str(code.get(pos..).unwrap_or(""));
-    }
-    Some(out)
+    Some(ansi_from_segments(code, &segs))
 }
 
 /// Generic fallback lexer for tree-sitter misses (`sql`, `dockerfile`,
@@ -158,24 +116,32 @@ pub(crate) fn fallback_highlight_ansi(lang: &str, code: &str) -> Option<String> 
     if segs.is_empty() {
         return None;
     }
+    Some(ansi_from_segments(code, &segs))
+}
+
+/// One ANSI pass for tree-sitter and fallback segments alike. Byte-safe: a
+/// bad range falls back to plain rather than panicking, and segments are
+/// clipped to `pos` so overlaps never duplicate bytes.
+fn ansi_from_segments(code: &str, segs: &[StyleSegment]) -> String {
     let mut out = String::with_capacity(code.len() + code.len() / 4);
     let mut pos = 0;
-    for seg in &segs {
-        // Segments are non-overlapping by construction; still clip so a
-        // future lexer change can never duplicate bytes.
-        let start = seg.start.max(pos);
+    for seg in segs {
+        let start = seg.start.min(code.len()).max(pos);
+        let end = seg.end.min(code.len());
         if start > pos {
             out.push_str(code.get(pos..start).unwrap_or(""));
         }
-        if let Some(slice) = code.get(seg.start..seg.end) {
-            push_styled(&mut out, &seg.style, slice);
+        if end > start {
+            if let Some(slice) = code.get(start..end) {
+                push_styled(&mut out, &seg.style, slice);
+            }
+            pos = pos.max(end);
         }
-        pos = pos.max(seg.end);
     }
     if pos < code.len() {
         out.push_str(code.get(pos..).unwrap_or(""));
     }
-    Some(out)
+    out
 }
 
 /// TUI twin of [`fallback_highlight_ansi`]: the same segments split into
@@ -192,6 +158,18 @@ pub(crate) fn fallback_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span
     if segs.is_empty() {
         return None;
     }
+    code_block_spans(code, &segs)
+}
+
+/// Split `segs` into per-line spans so multi-line constructs (block
+/// comments, triple-quoted strings) keep their style across rows. Shared by
+/// the tree-sitter path (`ui::render::highlight_code_block`) and the
+/// fallback above. Returns `None` on a bad split so callers keep dim rather
+/// than rendering half-highlighted rows.
+pub(crate) fn code_block_spans(
+    code: &str,
+    segs: &[StyleSegment],
+) -> Option<Vec<Vec<Span<'static>>>> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
     for line in code.split('\n') {
@@ -231,12 +209,6 @@ pub(crate) fn fallback_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span
     Some(out)
 }
 
-struct FallbackSeg {
-    start: usize,
-    end: usize,
-    style: Style,
-}
-
 /// Whether the generic lexer may color `lang`. Every canonical key (compiled
 /// or `dockerfile`) plus `groovy` (no upstream grammar, but common enough to
 /// deserve keywords) is allowed; `text`/`plain` and truly unknown fence tags
@@ -263,7 +235,7 @@ fn fallback_key(lang: &str) -> &str {
     }
 }
 
-fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
+fn fallback_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
     if !fallback_enabled(lang) {
         return Vec::new();
     }
@@ -277,14 +249,11 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
     let comment = Style::default()
         .fg(colors.comment)
         .add_modifier(Modifier::ITALIC);
-    let hash = fallback_hash_comment(lang);
-    let slash = fallback_slash_comment(lang);
-    let dash = fallback_dash_comment(lang);
-    let block = fallback_block_comment(lang);
+    let (hash, slash, dash, block) = comment_kinds(lang);
     let html = matches!(lang, "html" | "xml");
     let bytes = code.as_bytes();
     let len = bytes.len();
-    let mut segs: Vec<FallbackSeg> = Vec::new();
+    let mut segs: Vec<StyleSegment> = Vec::new();
     let mut pos = 0;
     let mut block_start: Option<usize> = None;
     let mut html_start: Option<usize> = None;
@@ -294,7 +263,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
         if let Some(s) = block_start {
             if pos + 1 < len && bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
                 pos += 2;
-                segs.push(FallbackSeg {
+                segs.push(StyleSegment {
                     start: s,
                     end: pos,
                     style: comment,
@@ -303,7 +272,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             } else {
                 pos += char_len_at(pos);
                 if pos >= len {
-                    segs.push(FallbackSeg {
+                    segs.push(StyleSegment {
                         start: s,
                         end: len,
                         style: comment,
@@ -319,7 +288,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
                 && bytes[pos + 2] == b'>'
             {
                 pos += 3;
-                segs.push(FallbackSeg {
+                segs.push(StyleSegment {
                     start: s,
                     end: pos,
                     style: comment,
@@ -328,7 +297,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             } else {
                 pos += char_len_at(pos);
                 if pos >= len {
-                    segs.push(FallbackSeg {
+                    segs.push(StyleSegment {
                         start: s,
                         end: len,
                         style: comment,
@@ -359,7 +328,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             while end < len && bytes[end] != b'\n' {
                 end += 1;
             }
-            segs.push(FallbackSeg {
+            segs.push(StyleSegment {
                 start: pos,
                 end,
                 style: comment,
@@ -372,7 +341,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             while end < len && bytes[end] != b'\n' {
                 end += 1;
             }
-            segs.push(FallbackSeg {
+            segs.push(StyleSegment {
                 start: pos,
                 end,
                 style: comment,
@@ -385,7 +354,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             while end < len && bytes[end] != b'\n' {
                 end += 1;
             }
-            segs.push(FallbackSeg {
+            segs.push(StyleSegment {
                 start: pos,
                 end,
                 style: comment,
@@ -427,7 +396,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             }
             // Unclosed strings still color to EOL/EOF rather than vanishing.
             if end > pos + 1 || closed {
-                segs.push(FallbackSeg {
+                segs.push(StyleSegment {
                     start: pos,
                     end: end.min(len),
                     style: string,
@@ -443,7 +412,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
             {
                 end += 1;
             }
-            segs.push(FallbackSeg {
+            segs.push(StyleSegment {
                 start: pos,
                 end,
                 style: number,
@@ -460,7 +429,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
                 .get(pos..end)
                 .is_some_and(|w| fallback_is_keyword(lang, w));
             if is_kw {
-                segs.push(FallbackSeg {
+                segs.push(StyleSegment {
                     start: pos,
                     end,
                     style: kw,
@@ -474,16 +443,16 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
     segs
 }
 
-fn fallback_hash_comment(lang: &str) -> bool {
-    matches!(
+/// Which comment markers the generic lexer honors, as
+/// `(hash, slash, dash, block)`. One table so `//`/`--`/`#` rules can't drift.
+/// CSS has no `//` comments — only `/* */` (covered by the block rule).
+/// `--` is a comment only in SQL/Lua; bash `grep -- -x` must not comment.
+fn comment_kinds(lang: &str) -> (bool, bool, bool, bool) {
+    let hash = matches!(
         lang,
         "python" | "ruby" | "bash" | "yaml" | "toml" | "nix" | "dockerfile" | "php"
-    )
-}
-
-fn fallback_slash_comment(lang: &str) -> bool {
-    // CSS has no `//` comments — only `/* */` (covered by the block rule).
-    matches!(
+    );
+    let slash = matches!(
         lang,
         "rust"
             | "javascript"
@@ -498,16 +467,9 @@ fn fallback_slash_comment(lang: &str) -> bool {
             | "scala"
             | "swift"
             | "php"
-    )
-}
-
-fn fallback_dash_comment(lang: &str) -> bool {
-    // `--` is a comment only in SQL/Lua. Bash `grep -- -x` must not comment.
-    matches!(lang, "sql" | "lua")
-}
-
-fn fallback_block_comment(lang: &str) -> bool {
-    matches!(
+    );
+    let dash = matches!(lang, "sql" | "lua");
+    let block = matches!(
         lang,
         "rust"
             | "javascript"
@@ -524,7 +486,8 @@ fn fallback_block_comment(lang: &str) -> bool {
             | "php"
             | "css"
             | "sql"
-    )
+    );
+    (hash, slash, dash, block)
 }
 
 fn fallback_is_keyword(lang: &str, word: &str) -> bool {
@@ -850,9 +813,6 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "while"
                 | "with"
                 | "yield"
-                | "select"
-                | "from"
-                | "where"
         ),
         _ => false,
     }

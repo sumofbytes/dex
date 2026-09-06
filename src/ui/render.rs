@@ -295,46 +295,7 @@ pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Spa
     let mut segs = highlight::shared_highlighter().highlight(lang, code);
     if !segs.is_empty() {
         segs.sort_by_key(|s| (s.start, s.end));
-        // Byte range of each `\n`-separated row in the joined text.
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        let mut start = 0usize;
-        for line in code.split('\n') {
-            ranges.push((start, start + line.len()));
-            start += line.len() + 1;
-        }
-        let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(ranges.len());
-        for (lo, hi) in ranges {
-            let mut spans = Vec::new();
-            let mut pos = lo;
-            for seg in segs.iter() {
-                if seg.end <= lo || seg.start >= hi || seg.end <= seg.start {
-                    continue;
-                }
-                // Clip the segment to this row; anything unsliceable aborts
-                // the whole block to dim (never half-highlighted rows).
-                let s = seg.start.max(lo);
-                let e = seg.end.min(hi);
-                if s < pos {
-                    continue;
-                }
-                let gap = code.get(pos..s)?;
-                if !gap.is_empty() {
-                    spans.push(Span::raw(gap.to_string()));
-                }
-                let text = code.get(s..e)?;
-                if text.is_empty() {
-                    continue;
-                }
-                spans.push(Span::styled(text.to_string(), seg.style));
-                pos = e;
-            }
-            let tail = code.get(pos..hi)?;
-            if !tail.is_empty() {
-                spans.push(Span::raw(tail.to_string()));
-            }
-            out.push(spans);
-        }
-        return Some(out);
+        return highlight::code_block_spans(code, &segs);
     }
     highlight::fallback_code_block(lang, code)
 }
