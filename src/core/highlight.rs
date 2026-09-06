@@ -135,22 +135,62 @@ pub(crate) fn print_ansi_highlighted_code(lang: &str, body: &str) {
 }
 
 /// Render one line of assistant markdown prose to the terminal. Replaces the
-/// `termimad` dependency: covers the constructs streamed prose actually uses
-/// (headings, bullets, bold, italic, inline code, links) in ~60 lines.
+/// `termimad` dependency: headings (stripped `#`, bold like glow/mdcat),
+/// bullets (`-`/`*`/`+` → `•`), ordered (`1. ` kept), tasks (`☐`/`☑` like the
+/// TUI), quotes (`│`), rules (`───`), plus inline code/bold/italic/links.
 pub(crate) fn print_markdown_text(line: &str) {
     println!("{}", render_markdown_line(line));
 }
 
 pub(crate) fn render_markdown_line(line: &str) -> String {
+    use super::markdown as md;
     let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return format!("\x1b[1m{}\x1b[0m", render_inline(trimmed));
+    if let Some(body) = md::heading_text(trimmed) {
+        // Strip the `#` markers (glow/mdcat style); H1 gets underline.
+        if md::heading_level(trimmed) == 1 {
+            return format!("\x1b[1;4m{}\x1b[0m", render_inline(body));
+        }
+        return format!("\x1b[1m{}\x1b[0m", render_inline(body));
     }
-    let (marker, body) = match trimmed.strip_prefix("- ").or(trimmed.strip_prefix("* ")) {
-        Some(rest) => ("\x1b[2m•\x1b[0m ", rest),
-        None => ("", trimmed),
-    };
-    format!("{marker}{}", render_inline(body))
+    if md::is_hr(trimmed) {
+        return "\x1b[2m───\x1b[0m".to_string();
+    }
+    if let Some(body) = md::blockquote_text(trimmed) {
+        return format!(
+            "\x1b[2m│\x1b[0m \x1b[3m{}\x1b[0m",
+            render_inline(body.trim_start())
+        );
+    }
+    if let Some((body, checked)) = md::task_text(trimmed) {
+        let box_glyph = if checked { "☑" } else { "☐" };
+        return format!("\x1b[2m{box_glyph}\x1b[0m {}", render_inline(body));
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or(trimmed.strip_prefix("* "))
+        .or(trimmed.strip_prefix("+ "))
+    {
+        return format!("\x1b[2m•\x1b[0m {}", render_inline(rest));
+    }
+    if md::is_ordered_item(trimmed) {
+        // Keep the number (industry standard); style the body only.
+        let digits = trimmed.len()
+            - trimmed
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .len();
+        let (num, sep_body) = trimmed.split_at(digits);
+        let body = sep_body
+            .strip_prefix(". ")
+            .or(sep_body.strip_prefix(") "))
+            .unwrap_or(sep_body);
+        let sep = if sep_body.starts_with(". ") {
+            ". "
+        } else {
+            ") "
+        };
+        return format!("\x1b[2m{num}{sep}\x1b[0m{}", render_inline(body));
+    }
+    render_inline(trimmed)
 }
 
 /// Inline styling: `` `code` ``, `**bold**`, `*italic*`, `[text](url)`.
@@ -259,12 +299,22 @@ mod tests {
 
     #[test]
     fn markdown_render_headings_bullets() {
-        assert_eq!(render_markdown_line("# Title"), "\x1b[1m# Title\x1b[0m");
+        // Industry standard (glow/mdcat): `#` markers are stripped, H1 gets
+        // underline, H2+ bold; bullets collapse to `•`.
+        assert_eq!(render_markdown_line("# Title"), "\x1b[1;4mTitle\x1b[0m");
+        assert_eq!(render_markdown_line("## Sub"), "\x1b[1mSub\x1b[0m");
+        assert_eq!(render_markdown_line("### Deep"), "\x1b[1mDeep\x1b[0m");
         assert_eq!(render_markdown_line("- item"), "\x1b[2m•\x1b[0m item");
+        assert_eq!(render_markdown_line("+ plus"), "\x1b[2m•\x1b[0m plus");
         assert_eq!(
             render_markdown_line("  - indented"),
             "\x1b[2m•\x1b[0m indented"
         );
+        assert_eq!(render_markdown_line("1. first"), "\x1b[2m1. \x1b[0mfirst");
+        assert_eq!(render_markdown_line("- [x] done"), "\x1b[2m☑\x1b[0m done");
+        assert_eq!(render_markdown_line("---"), "\x1b[2m───\x1b[0m");
+        assert_eq!(render_markdown_line("***"), "\x1b[2m───\x1b[0m");
+        assert!(render_markdown_line("> quote").contains('│'));
         assert_eq!(render_markdown_line("plain text"), "plain text");
     }
 
