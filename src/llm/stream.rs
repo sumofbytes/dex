@@ -484,6 +484,31 @@ impl SseDriver {
     }
 }
 
+/// Idle cap between SSE chunks. Providers stall (silent proxy drops, hung
+/// upstreams); without a floor the stream reader waits forever and the turn
+/// looks alive while nothing moves. Every chunk resets the timer, so a
+/// healthy long generation is never cut. `DEX_STREAM_IDLE_TIMEOUT_SECS`
+/// overrides (0 disables).
+/// Idle cap between SSE chunks. Providers stall (silent proxies, hung
+/// upstreams); without a floor the stream reader waits forever and the turn
+/// never terminates. Every chunk (including keep-alives) resets the timer.
+/// `DEX_STREAM_IDLE_TIMEOUT_SECS` overrides; `0` disables the watchdog, which
+/// maps to a deadline so large the branch never fires.
+fn stream_idle_timeout() -> Duration {
+    const DISABLED: Duration = Duration::from_secs(u64::MAX);
+    match env_secs("DEX_STREAM_IDLE_TIMEOUT_SECS") {
+        Some(0) => DISABLED,
+        Some(secs) => Duration::from_secs(secs),
+        None => Duration::from_secs(90),
+    }
+}
+
+fn env_secs(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 /// Shared async SSE driver over `response.chunk()`: buffer bytes,
 /// split on `\n`, feed the existing `StreamParser`s unchanged (pure
 /// functions over `&str`). Cancel via `select!(cancelled(),
@@ -503,6 +528,7 @@ async fn run_sse<P: StreamParser>(
         let _ = io::stdout().flush();
         return Err(stream_err("cancelled", false));
     }
+    let idle_timeout = stream_idle_timeout();
     let mut driver = SseDriver::new(sink.clone());
     let mut buf: Vec<u8> = Vec::new();
     // Pin the cancel future once; `cancelled()` loops until set, so a
@@ -516,13 +542,27 @@ async fn run_sse<P: StreamParser>(
                 let _ = io::stdout().flush();
                 return Err(stream_err("cancelled", driver.output_flowed));
             }
-            chunk_res = response.chunk() => {
+            // Idle watchdog: every chunk (including keep-alives) resets this
+            // timer, so it only fires when the provider truly stopped
+            // sending. Without it a stalled stream parks the turn forever.
+            // A disabled watchdog is an effectively infinite deadline, so the
+            // chunk branch always stays armed.
+            chunk_res = tokio::time::timeout(idle_timeout, response.chunk()) => {
                 match chunk_res {
-                    Err(e) => {
+                    Err(_elapsed) => {
+                        return Err(stream_err(
+                            &format!(
+                                "stream idle for over {}s; the provider stalled or the connection dropped (tune with DEX_STREAM_IDLE_TIMEOUT_SECS)",
+                                idle_timeout.as_secs()
+                            ),
+                            driver.output_flowed,
+                        ));
+                    }
+                    Ok(Err(e)) => {
                         return Err(stream_err(&e.to_string(), driver.output_flowed));
                     }
-                    Ok(None) => break,
-                      Ok(Some(bytes)) => {
+                    Ok(Ok(None)) => break,
+                      Ok(Ok(Some(bytes))) => {
                           buf.extend_from_slice(&bytes);
                           // Extract complete lines; keep partial tail buffered.
                           while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -886,10 +926,14 @@ impl StreamParser for ResponsesParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{delta_thought, stream_err, SinkLine, StreamDelta, StreamPrinter, Usage};
+    use super::{
+        delta_thought, read_stream, stream_err, stream_idle_timeout, SinkLine, StreamDelta,
+        StreamPrinter, Usage,
+    };
     use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
     use crate::llm::streaming::is_mid_stream;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     /// The compaction summarizer (and any in-process caller) must be able to
@@ -1282,5 +1326,60 @@ mod tests {
         assert!(!is_mid_stream(&*stream_err("boom", false)));
         assert!(is_mid_stream(&*stream_err("boom", true)));
         assert_eq!(stream_err("cancelled", true).to_string(), "cancelled");
+    }
+
+    #[test]
+    fn idle_timeout_env_parses() {
+        let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
+        std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "7");
+        assert_eq!(stream_idle_timeout(), Duration::from_secs(7));
+        // 0 disables the watchdog entirely (an effectively infinite deadline,
+        // not an immediate timeout).
+        std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "0");
+        assert_eq!(stream_idle_timeout(), Duration::from_secs(u64::MAX));
+        // Garbage falls back to the 90s default.
+        std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "junk");
+        assert_eq!(stream_idle_timeout(), Duration::from_secs(90));
+        match prev {
+            Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),
+        }
+    }
+
+    /// A provider that sends response headers and then never sends a byte
+    /// must not park the turn forever: the idle watchdog fails the stream
+    /// with a diagnosable error instead of an opaque hang.
+    #[tokio::test]
+    async fn stalled_stream_fails_after_idle_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = socket;
+            // Valid headers with a body that never arrives: chunk() pends.
+            use tokio::io::AsyncWriteExt as _;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/v1"))
+            .send()
+            .await
+            .unwrap();
+        let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
+        std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "1");
+        let result = read_stream(response, None, &CancellationToken::new()).await;
+        match prev {
+            Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),
+        }
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stream idle"),
+            "watchdog must name the stall: {err}"
+        );
     }
 }

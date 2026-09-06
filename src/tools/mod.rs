@@ -83,6 +83,19 @@ fn resolve_workspace_path(root: &Path, raw: &str) -> Result<PathBuf, ToolError> 
     }
 }
 
+/// Normalize a tool-call `path` argument for same-path conflict detection:
+/// `./foo.rs`, `src/../foo.rs` and `foo.rs` are the same file, but the raw
+/// strings differ — the turn loop would then fan out two edits to one file
+/// concurrently and the second edit would silently clobber the first.
+/// Best-effort: an unresolvable path (non-UTF-8, missing parent) falls back
+/// to the raw string, which is still better than skipping the check.
+pub(crate) fn normalize_conflict_path(raw: &str) -> String {
+    match workspace_path(raw) {
+        Ok(resolved) => resolved.display().to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ToolError {
     Missing(&'static str),
@@ -704,9 +717,7 @@ async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
             .map_err(ToolError::Io)?;
     }
     let replaced = tokio::fs::metadata(&path).await.ok().map(|meta| meta.len());
-    tokio::fs::write(&path, &content)
-        .await
-        .map_err(ToolError::Io)?;
+    atomic_write(&path, &content).await?;
     Ok(match replaced {
         Some(old_bytes) => format!(
             "wrote {} (replaced {old_bytes} bytes with {})",
@@ -715,6 +726,47 @@ async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
         ),
         None => format!("wrote {}", path.display()),
     })
+}
+
+/// Durability for `write`/`edit`: content lands in a sibling temp file (same
+/// directory, so the rename stays on one filesystem), is fsynced, then is
+/// atomically renamed over the target. A crash mid-write can never leave a
+/// truncated or half-edited file behind — readers see either the old or the
+/// new content, never a mixture. The plain `tokio::fs::write` this replaces
+/// truncates in place: a power loss during the write corrupts the file the
+/// agent is editing.
+async fn atomic_write(path: &Path, content: &str) -> Result<(), ToolError> {
+    use tokio::io::AsyncWriteExt as _;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(
+        ".dex-write-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = async {
+        let mut file = tokio::fs::File::create(&tmp).await.map_err(ToolError::Io)?;
+        file.write_all(content.as_bytes())
+            .await
+            .map_err(ToolError::Io)?;
+        file.sync_all().await.map_err(ToolError::Io)?;
+        drop(file);
+        // Windows rename() refuses to clobber an existing destination.
+        #[cfg(windows)]
+        let _ = tokio::fs::remove_file(path).await;
+        tokio::fs::rename(&tmp, path).await.map_err(ToolError::Io)?;
+        // Best-effort: flush the directory entry so the rename itself is
+        // durable; failure here (e.g. exotic filesystems) is not fatal — the
+        // file content is already in place.
+        if let Ok(handle) = tokio::fs::File::open(dir).await {
+            let _ = handle.sync_all().await;
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
 }
 
 /// When a write/edit carries `expected_hash`, reject if the file on disk no
@@ -779,9 +831,7 @@ async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
         .await
         .map_err(ToolError::Io)?;
     let (updated, note) = apply_edit(&content, &old, &new, replace_all)?;
-    tokio::fs::write(&path, updated)
-        .await
-        .map_err(ToolError::Io)?;
+    atomic_write(&path, &updated).await?;
     Ok(format!("edited {}{note}", path.display()))
 }
 
@@ -1325,6 +1375,61 @@ mod tests {
             execute("ffgrep", &args, &GlobalCancellation).await,
             Err(ToolError::InvalidArgument(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_leave_no_temp_files_and_round_trip() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-atomic-write-test.txt";
+        let full = cwd.join(rel);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("first\n".into()));
+        assert!(execute("write", &args, &GlobalCancellation).await.is_ok());
+        // Content round-trips and no `.dex-write-*` temp file survives.
+        assert_eq!(fs::read_to_string(&full).unwrap(), "first\n");
+        args.insert("oldText".into(), Value::String("first".into()));
+        args.insert("newText".into(), Value::String("second".into()));
+        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
+        assert_eq!(fs::read_to_string(&full).unwrap(), "second\n");
+        let strays: Vec<_> = fs::read_dir(cwd.join("target"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(".dex-write-"))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "temp files must be renamed away, not left"
+        );
+        let _ = fs::remove_file(&full);
+    }
+
+    #[test]
+    fn conflict_paths_normalize_spellings() {
+        // `./target` and `target` are the same directory; an absolute and a
+        // relative spelling of one file must collide too.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = "./target";
+        assert_eq!(
+            normalize_conflict_path(rel),
+            normalize_conflict_path("target")
+        );
+        let abs = cwd.join("target").display().to_string();
+        assert_eq!(
+            normalize_conflict_path(&abs),
+            normalize_conflict_path("target")
+        );
+        // Outside-workspace paths fall back to the raw string instead of
+        // crashing the check.
+        assert_eq!(
+            normalize_conflict_path("/definitely/not/here"),
+            "/definitely/not/here"
+        );
     }
 
     #[tokio::test]

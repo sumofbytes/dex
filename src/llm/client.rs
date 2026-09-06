@@ -77,6 +77,48 @@ pub(crate) fn retryable_status(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
 }
 
+/// `Retry-After` header value → duration. Seconds form plus the HTTP-date
+/// form; capped so a hostile header cannot park the turn for hours. `None`
+/// when absent or unparseable.
+fn retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(RETRY_AFTER_CAP_SECS)));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = date.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    Some(Duration::from_secs(
+        delta.num_seconds().clamp(0, RETRY_AFTER_CAP_SECS as i64) as u64,
+    ))
+}
+
+/// Backoff for attempt `attempt` (0-based): exponential base with ±25%
+/// jitter, or the provider's `Retry-After` when it asks for longer (honored
+/// exactly — the server asked for a specific delay). Jitter keeps a fleet of
+/// concurrent dex processes (or one daemon running several sessions) from
+/// retrying in lockstep and stampeding the endpoint again.
+fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    const BASE_MS: u64 = 500;
+    let base = Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempt.min(4)));
+    let Some(requested) = retry_after.filter(|d| *d > base / 2) else {
+        // Cheap jitter source: sub-second clock noise. Not cryptographic —
+        // it only needs to decorrelate concurrent retry loops.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| u64::from(t.subsec_nanos()))
+            .unwrap_or(0);
+        let spread = (base.as_millis() as u64 / 4).max(1);
+        let offset = (nanos % (2 * spread + 1)) as i64 - spread as i64;
+        let jittered = base.as_millis() as i64 + offset;
+        return Duration::from_millis(jittered.max(0) as u64);
+    };
+    requested
+}
+
+/// Ceiling for an honored `Retry-After`, so a pathological header cannot
+/// park a turn for minutes.
+const RETRY_AFTER_CAP_SECS: u64 = 120;
+
 pub(crate) fn provider_log(event: &str, detail: &str) {
     let Some(base) = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -117,7 +159,7 @@ async fn post_with_retry(
         {
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
-                let delay = Duration::from_millis(500 * 2u64.pow(attempt));
+                let delay = backoff_delay(attempt, None);
                 with_console(sink.is_some(), || {
                     eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay)
                 });
@@ -132,6 +174,11 @@ async fn post_with_retry(
 
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(retry_after);
             let body_text = resp.text().await.map_err(Box::new)?;
             if status == reqwest::StatusCode::UNAUTHORIZED
                 && active_config.provider.credentials_refreshable()
@@ -148,9 +195,17 @@ async fn post_with_retry(
             }
             let retryable = retryable_status(status);
             if retryable && attempt < MAX_RETRIES {
-                let delay = Duration::from_millis(500 * 2u64.pow(attempt));
+                let delay = backoff_delay(attempt, retry_after);
                 with_console(sink.is_some(), || {
-                    eprintln!("[llm] API error {}: retrying in {:?}", status, delay)
+                    eprintln!(
+                        "[llm] API error {}: retrying in {:?}{}",
+                        status,
+                        delay,
+                        match retry_after {
+                            Some(d) => format!(" (server asked for {d:?})"),
+                            None => String::new(),
+                        }
+                    )
                 });
                 tokio::time::sleep(delay).await;
                 continue;
@@ -279,6 +334,43 @@ mod tests {
                 stop_reason: None,
             })
         }
+    }
+
+    #[test]
+    fn retry_after_honors_seconds_dates_and_caps() {
+        assert_eq!(retry_after("2"), Some(Duration::from_secs(2)));
+        // A hostile header cannot park the turn for hours.
+        assert_eq!(retry_after("99999"), Some(Duration::from_secs(120)));
+        assert_eq!(retry_after("junk"), None);
+        // HTTP-date form.
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(10);
+        let formatted = soon.to_rfc2822();
+        let parsed = retry_after(&formatted).expect("rfc2822 retry-after parses");
+        assert!(parsed >= Duration::from_secs(1) && parsed <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn backoff_exponential_with_jitter_and_retry_after() {
+        // ±25% jitter around the exponential base.
+        for attempt in 0..3u32 {
+            let delay = backoff_delay(attempt, None);
+            let base = 500u64 * (1 << attempt);
+            let low = (base as f64 * 0.75) as u64;
+            let high = (base as f64 * 1.25) as u64;
+            let ms = delay.as_millis() as u64;
+            assert!(
+                (low..=high).contains(&ms),
+                "attempt {attempt}: {ms}ms outside [{low}, {high}]"
+            );
+        }
+        // A server asking for longer wins over the base backoff.
+        assert_eq!(
+            backoff_delay(0, Some(Duration::from_secs(30))),
+            Duration::from_secs(30)
+        );
+        // A tiny Retry-After (≤ base/2) is ignored in favor of the base.
+        let delay = backoff_delay(0, Some(Duration::from_millis(100)));
+        assert!(delay.as_millis() >= 375);
     }
 
     #[test]

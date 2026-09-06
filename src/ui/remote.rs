@@ -19,11 +19,13 @@ use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
 use crate::cli::Args;
-use crate::client::http::{ChatOptions, DaemonClient};
+use crate::client::http::{ChatOptions, ChatStream, DaemonClient};
 use crate::core::types::{
     ApiProtocol, ApprovalDecision as CoreApprovalDecision, PermissionMode, Provider, SinkLine,
 };
-use crate::protocol::{ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, StreamEvent};
+use crate::protocol::{
+    ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, EventsResponse, StreamEvent,
+};
 use crate::session::Session;
 
 use super::slash::{
@@ -1475,13 +1477,27 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     if !remote.app.plan.is_empty() && options.plan.is_none() {
         options.plan = Some(remote.app.plan.to_json());
     }
+    // P10 idempotency: a unique key per submission. If the connection drops
+    // mid-turn the worker re-POSTs with the SAME key — the daemon replays the
+    // recorded terminal event instead of re-running the effects (no duplicate
+    // prompt, no doubled edits).
+    options.idempotency_key = Some(uuid::Uuid::new_v4().to_string());
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
     let mut decision_rx = remote.take_decision_receiver();
     let cancel_flag = remote.cancel_flag.clone();
 
     crate::client::http::spawn_task(async move {
-        let mut stream = match client.chat_stream(&session_id, &prompt, options).await {
+        let mut saw_terminal = false;
+        // Journal cursor: highest seq delivered to the UI; a reconnect
+        // replays only what came after it.
+        let mut last_seq = 0u64;
+        // One reconnect attempt per turn — beyond that the failure is real.
+        let mut recovered = false;
+        let mut stream = match client
+            .chat_stream(&session_id, &prompt, options.clone())
+            .await
+        {
             Ok(stream) => stream,
             Err(e) => {
                 let _ = event_tx
@@ -1490,7 +1506,6 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                 return;
             }
         };
-        let mut saw_terminal = false;
         loop {
             match stream.next_event().await {
                 Some(Ok(event)) => {
@@ -1504,10 +1519,11 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                         }
                         _ => None,
                     };
+                    last_seq = stream.last_seq();
                     // Backpressured: awaits UI drain instead of dropping when
                     // the transcript bursts faster than the 8fps redraw.
                     if event_tx.send(WorkerMessage::Stream(event)).await.is_err() {
-                        break;
+                        return;
                     }
                     if let Some(request_id) = request_id {
                         // After a cancel request, deny automatically so the
@@ -1524,20 +1540,142 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    let _ = event_tx.send(WorkerMessage::Finished(Some(e))).await;
-                    return;
-                }
-                None => {
-                    // The daemon always closes with TurnComplete/TurnFailed;
-                    // a close without one is a transport failure, not success.
-                    let error = premature_close_error(saw_terminal);
-                    let _ = event_tx.send(WorkerMessage::Finished(error)).await;
+                // A transport failure (`Some(Err)`) or a close without a
+                // terminal event (`None`): one reattach attempt replays the
+                // journal from our cursor and re-POSTs with the same
+                // idempotency key.
+                outcome => {
+                    let transport_error = match outcome {
+                        Some(Err(e)) => Some(e),
+                        None => None,
+                        Some(Ok(_)) => unreachable!("handled above"),
+                    };
+                    if saw_terminal {
+                        // The daemon always closes right after the terminal
+                        // event; a clean close here is success.
+                        let _ = event_tx.send(WorkerMessage::Finished(None)).await;
+                        return;
+                    }
+                    if !recovered {
+                        recovered = true;
+                        match try_reconnect(
+                            &client,
+                            &session_id,
+                            &prompt,
+                            &options,
+                            last_seq,
+                            &event_tx,
+                        )
+                        .await
+                        {
+                            Reconnect::Resumed(new_stream) => {
+                                let _ = event_tx
+                                    .send(WorkerMessage::Stream(StreamEvent::System(
+                                        "connection lost mid-turn; reattached and replaying the missed events"
+                                            .into(),
+                                    )))
+                                    .await;
+                                stream = new_stream;
+                                continue;
+                            }
+                            Reconnect::Terminal => {
+                                let _ = event_tx.send(WorkerMessage::Finished(None)).await;
+                                return;
+                            }
+                            Reconnect::Failed(msg) => {
+                                let _ = event_tx.send(WorkerMessage::Finished(Some(msg))).await;
+                                return;
+                            }
+                        }
+                    }
+                    // Recovery exhausted: surface the real transport failure
+                    // (the daemon always closes with TurnComplete/TurnFailed,
+                    // so a close without one is a transport failure too).
+                    let _ = event_tx
+                        .send(WorkerMessage::Finished(
+                            transport_error.or_else(|| premature_close_error(false)),
+                        ))
+                        .await;
                     return;
                 }
             }
         }
     });
+}
+
+/// Outcome of a reconnect attempt after a transport failure mid-turn.
+enum Reconnect {
+    /// A live SSE stream for the same turn is open again.
+    Resumed(ChatStream),
+    /// The turn already finished while we were disconnected; its terminal
+    /// event was replayed to the UI.
+    Terminal,
+    /// Unrecoverable; carries the reason to surface.
+    Failed(String),
+}
+
+/// Recovery after a lost connection mid-turn: replay the daemon's journaled
+/// events past our cursor (the terminal event arrives there if the turn
+/// finished while we were gone), then re-POST the turn with the SAME
+/// idempotency key — a completed turn replays its recorded terminal event
+/// instead of running again. A still-running turn answers 409 CONFLICT, so
+/// no second stacked turn is ever created. Approvals in the replay are
+/// forwarded for visibility but not re-decided: parked approvals die with
+/// their turn on the daemon.
+async fn try_reconnect(
+    client: &DaemonClient,
+    session_id: &str,
+    prompt: &str,
+    options: &ChatOptions,
+    last_seq: u64,
+    event_tx: &mpsc::Sender<WorkerMessage>,
+) -> Reconnect {
+    // The journal call's error is non-Send (plain `Box<dyn Error>`); match it
+    // out immediately so the non-Send type never spans a later `.await`.
+    let replayed = match client.events_async(session_id, last_seq).await {
+        Ok(resp) => resp,
+        Err(_) => EventsResponse {
+            events: Vec::new(),
+            next_seq: 0,
+        },
+    };
+    {
+        let mut terminal = false;
+        for env in &replayed.events {
+            if matches!(
+                env.event,
+                StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. }
+            ) {
+                terminal = true;
+            }
+            if event_tx
+                .send(WorkerMessage::Stream(env.event.clone()))
+                .await
+                .is_err()
+            {
+                return Reconnect::Failed("ui closed while replaying events".into());
+            }
+        }
+        if terminal {
+            return Reconnect::Terminal;
+        }
+    }
+    match client
+        .chat_stream(session_id, prompt, options.clone())
+        .await
+    {
+        Ok(stream) => Reconnect::Resumed(stream),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("409") || msg.to_uppercase().contains("CONFLICT") {
+                Reconnect::Failed(
+                    "connection to the daemon was lost and the turn is still running; reopen it with `dex --reattach <session-id>` to follow".to_string(),
+                )
+            } else {
+                Reconnect::Failed(format!("connection lost and reattach failed: {msg}"))
+            }
+        }
+    }
 }
 
 impl RemoteApp {

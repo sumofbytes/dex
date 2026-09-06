@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse as _;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
@@ -26,7 +27,44 @@ use crate::protocol::{
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
 
-use super::{DaemonState, PendingApproval, SessionEntry};
+use super::{required_token, DaemonState, PendingApproval, SessionEntry};
+
+/// Bearer-token gate: every `/api/*` route requires `Authorization: Bearer
+/// <token>` when the daemon requires a token (non-loopback bind or an
+/// explicit `DEX_DAEMON_TOKEN`). `/health` stays open so liveness checks and
+/// `wait_until_ready` work before any credential is exchanged.
+async fn require_bearer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if request.uri().path().starts_with("/api/") {
+        if let Some(expected) = required_token() {
+            let provided = request
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::trim);
+            let ok = provided.is_some_and(|p| {
+                p.len() == expected.len() && {
+                    // Constant-time-ish compare: leaks at most the prefix length.
+                    p.bytes()
+                        .zip(expected.bytes())
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0
+                }
+            });
+            if !ok {
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "missing or invalid bearer token (set DEX_DAEMON_TOKEN on the client)",
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
+}
 
 pub(crate) fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
@@ -51,6 +89,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/waive", post(session_waive))
         .route("/api/sessions/{id}/name", post(session_name))
         .with_state(state)
+        .layer(axum::middleware::from_fn(require_bearer))
 }
 
 async fn health(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
