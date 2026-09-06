@@ -764,40 +764,6 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
     Ok(messages)
 }
 
-/// Cheap emptiness probe for `/resume` listings: does the file hold any
-/// message entries after the last `clear`? Streams line by line without
-/// parsing the whole history (`load_messages_from_session` semantics for the
-/// `!is_empty()` question); a trailing `clear` means no messages, so the
-/// full file is scanned.
-pub(crate) fn has_messages(path: &Path) -> bool {
-    let Ok(mut reader) = File::open(path).map(BufReader::new) else {
-        return false;
-    };
-    let mut line = String::new();
-    let mut found = false;
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return found,
-            Ok(_) => {}
-        }
-        // Entries serialize as {"type":"message",...}; `clear` restarts the
-        // transcript, so a later clear resets the answer to false. System
-        // messages are dropped by load, so they don't count as content.
-        if line.contains("\"type\":\"message\"") {
-            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
-                // role is top level: SessionMessageEntry flattens ChatMessage.
-                if v.get("role").and_then(Value::as_str) != Some("system") {
-                    found = true;
-                }
-            }
-        }
-        if line.contains("\"type\":\"clear\"") {
-            found = false;
-        }
-    }
-}
-
 /// Read only the first line of a file: session listings only ever need the
 /// header, and session files grow with the message history.
 fn read_first_line(path: &Path) -> Option<String> {
@@ -827,13 +793,6 @@ pub(crate) async fn load_messages_from_session_async(
     tokio::task::spawn_blocking(move || load_messages_from_session(&path))
         .await
         .map_err(io::Error::other)?
-}
-
-/// Header-only reads: async (no blocking pool).
-pub(crate) async fn has_messages_async(path: PathBuf) -> bool {
-    tokio::task::spawn_blocking(move || has_messages(&path))
-        .await
-        .unwrap_or(false)
 }
 
 impl Session {
@@ -1056,20 +1015,17 @@ mod tests {
         let clear = r#"{"type":"clear","id":"2","timestamp":"2020-01-01T00:00:00Z"}"#;
         fs::write(&path, format!("{}\n{}\n{}\n", header, message, clear)).unwrap();
         assert!(load_messages_from_session(&path).unwrap().is_empty());
-        // has_messages must agree with load: a trailing clear empties the
-        // transcript even though message entries appear earlier in the file.
-        assert!(!has_messages(&path));
-        // A clear followed by new messages counts again.
+        // A clear followed by new messages loads again.
         fs::write(
             &path,
             format!("{}\n{}\n{}\n{}\n", header, message, clear, message),
         )
         .unwrap();
-        assert!(has_messages(&path));
+        assert_eq!(load_messages_from_session(&path).unwrap().len(), 1);
         // System-only sessions hold no displayable content.
         let system = r#"{"type":"message","id":"3","timestamp":"2020-01-01T00:00:00Z","role":"system","content":"note"}"#;
         fs::write(&path, format!("{}\n{}\n", header, system)).unwrap();
-        assert!(!has_messages(&path));
+        assert!(load_messages_from_session(&path).unwrap().is_empty());
         let _ = fs::remove_file(path);
     }
 

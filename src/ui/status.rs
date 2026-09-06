@@ -101,10 +101,17 @@ fn context_style(app: &App, tokens: u64) -> Style {
 /// Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
 /// else `DEX_COST_PER_1K` fallback. `Some` once any prompt has been billed.
 /// Shared by the full and narrowed status lines so spend stays visible when
-/// the full line no longer fits beside the connection badge.
+/// the full line no longer fits beside the connection badge. Styled in the
+/// terminal's own foreground (`theme::surface_fg`, derived from the OSC 11
+/// query): one step brighter than the quiet facts for a little attention,
+/// but still on-theme for light/dark/tinted terminals instead of a fixed
+/// ANSI slot.
 fn cost_piece(app: &App) -> Option<Piece> {
     if app.tool_state.total_cost > 0.0005 {
-        Some(quiet(format!("${:.3}", app.tool_state.total_cost)))
+        Some((
+            format!("${:.3}", app.tool_state.total_cost),
+            Style::default().fg(theme::surface_fg()),
+        ))
     } else {
         None
     }
@@ -132,9 +139,10 @@ fn branch_pieces(app: &App) -> Vec<Piece> {
 }
 
 /// The full left-side status as styled runs. Quiet facts use the theme's
-/// muted foreground; accents reuse the app's semantic ANSI colors (Cyan
-/// identity, LightGreen clean branch, Yellow warnings, LightRed past the
-/// compaction trigger), which terminal themes remap to their own palette.
+/// muted foreground; spend uses the terminal's own foreground for a subtle
+/// step up in prominence. Other accents reuse the app's semantic ANSI colors
+/// (Cyan identity, LightGreen clean branch, Yellow warnings, LightRed past
+/// the compaction trigger), which terminal themes remap to their own palette.
 pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
     // Transient notice (copy confirmation) takes over the line until it
     // expires: unmissable feedback beats the quiet facts for two seconds.

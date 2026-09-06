@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[allow(unused_imports)]
 use crate::core::types::Plan;
@@ -31,6 +31,19 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 fn save_plan(app: &mut App) -> std::io::Result<()> {
     let json = app.plan.to_json();
     app.session.set_state("plan", &json)
+}
+
+/// Every session for this workspace, newest first, excluding the current one.
+/// No emptiness filtering: users pick by index/time, and resuming a session
+/// without messages just shows an empty transcript. Listing is header-only
+/// (`Session::list` reads one line per file), so no cache is needed.
+fn resume_candidates(app: &App) -> Vec<(PathBuf, crate::session::SessionHeader)> {
+    let current = app.session.id().to_string();
+    Session::list(&app.cwd)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, header)| header.id() != current)
+        .collect()
 }
 
 pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
@@ -92,21 +105,8 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        let Ok(sessions) = Session::list(&app.cwd) else {
-            return Vec::new();
-        };
-        // Hide the current session and empty sessions — they are the
-        // just-created placeholder and make `0` point at an empty transcript.
-        let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
-            .into_iter()
-            .filter(|(path, header)| {
-                if header.id() == app.session.id() {
-                    return false;
-                }
-                // Skip sessions with no persisted messages (only header).
-                crate::session::has_messages(path)
-            })
-            .collect();
+        // Hide the current session; everything else is listed by index/time.
+        let filtered = resume_candidates(app);
         return filtered
             .iter()
             .enumerate()
@@ -174,6 +174,72 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
     app.input = InputField::from_text(&completed);
     app.slash_selected = 0;
     true
+}
+
+/// Dismiss the slash popup without completing anything: clears the drafted
+/// command line and resets the highlight. Returns false when no popup is
+/// open (suggestions empty) so callers can fall through to other handling.
+/// The popup is derived from the input text, so clearing the draft is what
+/// actually closes it.
+pub(super) fn dismiss_slash(app: &mut App) -> bool {
+    if slash_suggestions(app).is_empty() {
+        return false;
+    }
+    app.input = InputField::from_text("");
+    app.slash_selected = 0;
+    true
+}
+
+/// Display label for a popup row. Inside an argument picker (`/model `,
+/// `/provider `, `/resume …`) the completion text repeats the command
+/// (`/model gpt-5`), so rows show just the item (`gpt-5`) — the popup
+/// header already names the picker. Outside a picker the command itself
+/// is the label.
+pub(super) fn suggestion_label<'a>(input: &str, command: &'a str) -> &'a str {
+    let prefix = if input.starts_with("/model ") {
+        Some("/model ")
+    } else if input.starts_with("/provider ") {
+        Some("/provider ")
+    } else if input == "/resume" || input.starts_with("/resume ") {
+        Some("/resume ")
+    } else {
+        None
+    };
+    match prefix {
+        Some(prefix) => command.strip_prefix(prefix).unwrap_or(command),
+        None => command,
+    }
+}
+
+/// Bare slash commands that open a picker (`/model` + `/provider` complete
+/// from the catalog, `/resume` from the session list). Enter on the bare
+/// form expands to `"<cmd> "` and keeps the popup open instead of
+/// submitting — the bare form would only print info into the transcript
+/// ("current model: …", "sessions: …"), which is never what Enter means
+/// when the popup is offering a choice.
+pub(super) const EXPAND_ON_ENTER: &[&str] = &["/model", "/provider", "/resume"];
+
+/// Rewrite a bare picker command (`/model`, `/provider`, `/resume`) to
+/// `"<cmd> "` so the popup shows the full choice list. Returns true when
+/// it expanded — the caller must not submit. Anything with an argument
+/// already (`/model foo`, `/resume 0`), a newline, or a non-picker command
+/// (`/clear`) is left untouched.
+///
+/// `/resume` needs the direct rewrite: its suggestions are session args, so
+/// `complete_slash` would jump straight to `/resume 0` and resume the first
+/// session instead of showing the list.
+pub(super) fn expand_bare_command(app: &mut App) -> bool {
+    let text = app.input.text();
+    if text.contains(' ') || text.contains('\n') {
+        return false;
+    }
+    let trimmed = text.trim();
+    if EXPAND_ON_ENTER.contains(&trimmed) {
+        app.input = InputField::from_text(&format!("{trimmed} "));
+        app.slash_selected = 0;
+        return true;
+    }
+    false
 }
 
 /// Clear per-session TUI state for `/clear` (same session) and `/new`
@@ -296,12 +362,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let sessions = Session::list(&app.cwd).unwrap_or_default();
             let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
                 .into_iter()
-                .filter(|(path, header)| {
-                    if header.id() == app.session.id() {
-                        return false;
-                    }
-                    crate::session::has_messages(path)
-                })
+                .filter(|(_, header)| header.id() != app.session.id())
                 .collect();
             if filtered.is_empty() {
                 push_info(app, "no sessions found.".to_string());
@@ -318,12 +379,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             let sessions = Session::list(&app.cwd).unwrap_or_default();
             let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
                 .into_iter()
-                .filter(|(path, header)| {
-                    if header.id() == app.session.id() {
-                        return false;
-                    }
-                    crate::session::has_messages(path)
-                })
+                .filter(|(_, header)| header.id() != app.session.id())
                 .collect();
             let path_opt = if let Ok(idx) = selector.parse::<usize>() {
                 filtered.get(idx).map(|(p, _)| p.clone())

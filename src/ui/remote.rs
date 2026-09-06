@@ -26,7 +26,10 @@ use crate::core::types::{
 use crate::protocol::{ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, StreamEvent};
 use crate::session::Session;
 
-use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
+use super::slash::{
+    complete_slash, dismiss_slash, expand_bare_command, handle_slash, reset_session_state,
+    slash_suggestions, EXPAND_ON_ENTER,
+};
 use super::{
     append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
     line_width, mouse_display_cell, push_banner, push_info, push_info_line, render_user_prompt,
@@ -573,7 +576,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     handle_key(&mut remote, key);
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut remote, mouse),
-                Event::Paste(s) => remote.app.input.insert_paste(&s),
+                Event::Paste(s) => {
+                    remote.app.input.insert_paste(&s);
+                    // A paste can narrow the popup list like typing does.
+                    remote.app.slash_selected = 0;
+                }
                 Event::Resize(..) => {} // frame recomputed each draw
                 _ => {}
             }
@@ -1262,6 +1269,11 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             bump_thinking_stamps(app);
         }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
+            KeyCode::Esc => {
+                // Discard the drafted slash command and close the popup
+                // without completing anything (busy+Esc still cancels).
+                dismiss_slash(app);
+            }
             KeyCode::Up => {
                 app.slash_selected = app.slash_selected.saturating_sub(1);
             }
@@ -1270,16 +1282,47 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 app.slash_selected = (app.slash_selected + 1).min(last);
             }
             KeyCode::Tab => {
-                complete_slash(app);
+                if !expand_bare_command(app) {
+                    complete_slash(app);
+                }
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Single Enter both completes the highlighted suggestion
-                // and submits. The old two-step (complete → second Enter)
-                // made `/resume` feel broken — selecting 0 left an empty
-                // transcript until the next Enter.
-                complete_slash(app);
+                // Bare picker command (`/model`, `/provider`, `/resume`):
+                // first Enter expands to `"<cmd> "` and shows the popup
+                // instead of submitting the bare form (which would only
+                // print info into the transcript).
+                if expand_bare_command(app) {
+                    return;
+                }
+                // Command-name completion without an argument yet (`/mod` →
+                // `/model `): complete but don't submit while the result is
+                // still a bare picker command. Argument-less commands
+                // (`/clear`) still submit immediately, and argument
+                // completions (`/model foo`, `/resume 0`) complete + submit
+                // the highlighted choice as before.
+                let before = app.input.text();
+                if !before.contains(' ') && !before.contains('\n') {
+                    let before_bare = before.trim().to_string();
+                    if complete_slash(app) {
+                        let bare = app.input.text().trim().to_string();
+                        if EXPAND_ON_ENTER.contains(&bare.as_str()) && before_bare != bare {
+                            app.slash_selected = 0;
+                            return;
+                        }
+                    }
+                } else {
+                    complete_slash(app);
+                }
                 let is_followup = key.modifiers.contains(KeyModifiers::ALT);
                 submit_prompt(remote, is_followup);
+            }
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => {
+                // Typing narrows the popup list: feed the keystroke to the
+                // composer and jump back to the top match so the highlight
+                // never strands past the filtered results (e.g. `/` + `r`
+                // lands on `/resume` instead of a stale arrow position).
+                app.input.handle_key(key);
+                app.slash_selected = 0;
             }
             _ => app.input.handle_key(key),
         },

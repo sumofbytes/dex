@@ -315,7 +315,7 @@ Any other arguments are treated as a one-shot prompt.
 ### Keyboard controls
 
 - **Enter** — submit the current input.
-- **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓** navigate suggestions.
+- **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓** navigate suggestions; **Esc** — discard the draft and close the popup.
 - **Shift+Enter** — insert a newline (multi-line input).
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.

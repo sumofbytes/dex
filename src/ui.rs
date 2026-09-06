@@ -1682,4 +1682,134 @@ mod tests {
                   .any(|b| matches!(b, TranscriptBlock::Info { line, .. } if line.spans.iter().any(|s| s.content.contains("turn is running"))))
         );
     }
+
+    #[test]
+    fn enter_expands_bare_picker_commands_instead_of_submitting() {
+        // `/model`, `/provider`, `/resume` open a popup picker: Enter on the
+        // bare form must expand to `"<cmd> "` (popup stays open) rather than
+        // submit and print info into the transcript.
+        for cmd in ["/model", "/provider", "/resume"] {
+            let mut app = test_app();
+            app.input = crate::ui::input::InputField::from_text(cmd);
+            app.slash_selected = 5;
+            assert!(
+                crate::ui::slash::expand_bare_command(&mut app),
+                "{cmd} must expand"
+            );
+            assert_eq!(app.input.text(), format!("{cmd} "));
+            assert_eq!(app.slash_selected, 0);
+        }
+    }
+
+    #[test]
+    fn enter_expansion_leaves_other_input_untouched() {
+        // Argument-less commands (`/clear`), partial prefixes (`/mod`), and
+        // inputs that already carry an argument keep the old path: the Enter
+        // handler's completion step (not the bare-command expansion) owns
+        // them.
+        for input in ["/clear", "/mod", "/model foo", "/resume 0", "hello"] {
+            let mut app = test_app();
+            app.input = crate::ui::input::InputField::from_text(input);
+            assert!(
+                !crate::ui::slash::expand_bare_command(&mut app),
+                "{input} must not expand"
+            );
+            assert_eq!(app.input.text(), input);
+        }
+    }
+
+    #[test]
+    fn command_prefix_completes_to_bare_picker_form() {
+        // `/mod` + completion → `/model `: the Enter handler sees a bare
+        // picker form in `EXPAND_ON_ENTER` and holds the submit so the popup
+        // stays open for the actual choice.
+        let mut app = test_app();
+        app.input = crate::ui::input::InputField::from_text("/mod");
+        assert!(crate::ui::slash::complete_slash(&mut app));
+        assert_eq!(app.input.text(), "/model ");
+        assert!(crate::ui::slash::EXPAND_ON_ENTER.contains(&"/model"));
+    }
+
+    #[test]
+    fn picker_rows_show_items_not_repeated_commands() {
+        // Inside a picker the popup rows show just the item (`gpt-5`), not
+        // the repeated command (`/model gpt-5`); outside a picker the
+        // command itself stays the label.
+        let label = crate::ui::slash::suggestion_label;
+        assert_eq!(label("/model ", "/model gpt-5"), "gpt-5");
+        assert_eq!(label("/model gp", "/model gpt-5"), "gpt-5");
+        assert_eq!(label("/provider ", "/provider opencode"), "opencode");
+        assert_eq!(label("/resume ", "/resume 0"), "0");
+        assert_eq!(label("/resume", "/resume 2"), "2");
+        assert_eq!(label("/resume old", "/resume 2"), "2");
+        assert_eq!(label("/", "/model"), "/model");
+        assert_eq!(label("/cl", "/clear"), "/clear");
+    }
+
+    #[test]
+    fn esc_dismiss_discards_draft_and_closes_popup() {
+        // Esc on an open popup discards the drafted slash command (which is
+        // what closes the popup — it is derived from the input) and resets
+        // the highlight, without submitting anything.
+        let mut app = test_app();
+        app.input = crate::ui::input::InputField::from_text("/mod");
+        app.slash_selected = 2;
+        assert!(crate::ui::slash::dismiss_slash(&mut app));
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.slash_selected, 0);
+        assert!(crate::ui::slash::slash_suggestions(&app).is_empty());
+        assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn slash_typing_narrows_to_matching_command() {
+        // `/` lists every command; typing `r` narrows to `/resume` — the
+        // popup filters on the input text, arrows only move the highlight.
+        let mut app = test_app();
+        app.input = crate::ui::input::InputField::from_text("/");
+        let all = crate::ui::slash::slash_suggestions(&app);
+        assert!(all.len() > 1);
+        app.input = crate::ui::input::InputField::from_text("/r");
+        let filtered = crate::ui::slash::slash_suggestions(&app);
+        assert_eq!(
+            filtered.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            vec!["/resume"]
+        );
+    }
+
+    #[test]
+    fn resume_lists_sessions_regardless_of_content() {
+        // `/resume` picks by index/time: a header-only session (no messages
+        // yet) is listed too — resuming it just shows an empty transcript.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-resume-empty-{}", std::process::id()));
+        let _env =
+            crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let session =
+            crate::session::Session::new("/tmp".into(), Some("empty-one".into())).unwrap();
+        let name = session.name().unwrap().to_string();
+        drop(session);
+        let mut app = test_app();
+        app.input = crate::ui::input::InputField::from_text("/resume ");
+        let suggestions = crate::ui::slash::slash_suggestions(&app);
+        assert!(
+            suggestions.iter().any(|(_, desc)| desc.contains(&name)),
+            "header-only session must be listed: {suggestions:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_dismiss_reports_when_no_popup_open() {
+        // Plain text (or empty input) shows no popup: nothing to discard.
+        for input in ["hello", ""] {
+            let mut app = test_app();
+            app.input = crate::ui::input::InputField::from_text(input);
+            assert!(!crate::ui::slash::dismiss_slash(&mut app));
+            assert_eq!(app.input.text(), input);
+        }
+    }
 }
