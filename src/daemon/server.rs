@@ -1,6 +1,5 @@
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -16,7 +15,6 @@ use tokio::sync::mpsc;
 use crate::agent::r#loop::process_turn;
 use crate::agent::state::ToolState;
 use crate::core::console::{CancellationToken, Console, TraceWriter};
-use crate::core::format::git_context;
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
@@ -26,7 +24,7 @@ use crate::protocol::{
     StreamEnvelope, StreamEvent,
 };
 use crate::session::{self, Session};
-use crate::skills::{discover_skills, discover_skills_fresh, skill_dirs};
+use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
 
 use super::{DaemonState, PendingApproval, SessionEntry};
 
@@ -65,17 +63,13 @@ async fn health(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value
 
 /// Best-effort runtime info so remote clients can render the same status
 /// footer as the local TUI. Resolved from the daemon's own environment.
-fn cached_git_context(cwd: &str) -> (Option<String>, bool) {
-    // `git branch` + `git status` spawn two processes (~10-30ms); `/api/config`
-    // runs on every TUI launch, and branch/dirty barely move within seconds.
+async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
+    // `git branch` + `git status` via `tokio::process` under the 5s cache (Phase 4/6).
     struct Entry {
         at: Instant,
         branch: Option<String>,
         dirty: bool,
     }
-    // Keyed by cwd (not single-entry): the daemon reports its own cwd today,
-    // but a per-session cwd must not evict another session's entry.
-    // Best-effort cache — cleared (not LRU'd) past the cap.
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Entry>>> = OnceLock::new();
     if let Some(hit) = CACHE
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -86,7 +80,7 @@ fn cached_git_context(cwd: &str) -> (Option<String>, bool) {
     {
         return (hit.branch.clone(), hit.dirty);
     }
-    let (branch, dirty) = git_context(cwd);
+    let (branch, dirty) = crate::core::format::git_context_async(cwd).await;
     let mut cache = CACHE
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
@@ -105,12 +99,12 @@ fn cached_git_context(cwd: &str) -> (Option<String>, bool) {
     (branch, dirty)
 }
 
-fn resolve_daemon_info() -> DaemonInfo {
+async fn resolve_daemon_info_async() -> DaemonInfo {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (git_branch, git_dirty) = cached_git_context(&cwd);
-    match LlmConfig::from_env(None, None, None, &[]) {
+    let (git_branch, git_dirty) = cached_git_context_async(&cwd).await;
+    match LlmConfig::from_env_async(None, None, None, Vec::new()).await {
         Ok(config) => DaemonInfo {
             provider: config.provider.name().to_string(),
             model: config.model.clone(),
@@ -158,56 +152,28 @@ fn resolve_daemon_info() -> DaemonInfo {
 }
 
 async fn get_config() -> Json<DaemonInfo> {
-    // `LlmConfig::from_env` builds a blocking reqwest client, which must not
-    // be created or dropped on a runtime worker.
-    let info = tokio::task::spawn_blocking(resolve_daemon_info)
-        .await
-        .unwrap_or(DaemonInfo {
-            provider: "opencode".into(),
-            model: "unknown".into(),
-            api: "openai-responses".into(),
-            available_models: Vec::new(),
-            context_window: 128_000,
-            permission: "ask-writes".into(),
-            cwd: String::new(),
-            git_branch: None,
-            git_dirty: false,
-            thinking_effort: None,
-            thinking_warning: None,
-        });
-    Json(info)
+    // Async client is Clone (no blocking TLS init); cache hits are a mutex bump.
+    Json(resolve_daemon_info_async().await)
 }
 
 /// Lightweight footer poll: just the daemon workspace's branch/dirty, behind
-/// the same 5s `cached_git_context` as `/api/config` so a 2s TUI poll costs
+/// the same 5s `cached_git_context_async` as `/api/config` so a 2s TUI poll costs
 /// at most one `git` spawn per 5s — and never pays `LlmConfig::from_env`.
 async fn get_git() -> Json<GitInfo> {
-    // `git` spawns block; keep them off the runtime workers like `get_config`.
-    let info = tokio::task::spawn_blocking(|| {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let (git_branch, git_dirty) = cached_git_context(&cwd);
-        GitInfo {
-            git_branch,
-            git_dirty,
-        }
+    // `tokio::process` git spawns under the 5s cache; per-frame cost zero.
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (git_branch, git_dirty) = cached_git_context_async(&cwd).await;
+    Json(GitInfo {
+        git_branch,
+        git_dirty,
     })
-    .await
-    .unwrap_or(GitInfo {
-        git_branch: None,
-        git_dirty: false,
-    });
-    Json(info)
 }
 
 async fn list_skills() -> Json<serde_json::Value> {
-    let skills = tokio::task::spawn_blocking(|| {
-        let dirs = skill_dirs();
-        discover_skills(&dirs)
-    })
-    .await
-    .unwrap_or_default();
+    let dirs = skill_dirs();
+    let skills = discover_skills_async(&dirs).await;
     let infos: Vec<SkillInfo> = skills
         .into_iter()
         .map(|s| SkillInfo {
@@ -238,19 +204,18 @@ async fn load_skill(
     .ok_or(StatusCode::NOT_FOUND)?;
     let skill_name = req.name.clone();
     let extra_dirs = req.skill_dirs.clone();
-    let (skill, content) = tokio::task::spawn_blocking(move || {
-        let mut dirs = skill_dirs();
-        dirs.extend(extra_dirs.iter().map(std::path::PathBuf::from));
-        // Explicit user load: bypass the discovery cache so a just-added
-        // skill resolves immediately.
-        let skills = discover_skills_fresh(&dirs);
-        let skill = skills.into_iter().find(|s| s.name == skill_name)?;
-        let content = std::fs::read_to_string(&skill.path).ok()?;
-        Some((skill, content))
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let mut dirs = skill_dirs();
+    dirs.extend(extra_dirs.iter().map(std::path::PathBuf::from));
+    // Explicit user load: bypass the discovery cache so a just-added
+    // skill resolves immediately (async dir scans + concurrent reads).
+    let skills = discover_skills_fresh_async(&dirs).await;
+    let skill = skills
+        .into_iter()
+        .find(|s| s.name == skill_name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let content = tokio::fs::read_to_string(&skill.path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     let skill_for_msg = skill.clone();
     let content_for_msg = content.clone();
     tokio::task::spawn_blocking(move || {
@@ -320,20 +285,31 @@ async fn create_session(
 }
 
 async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
-    // P10: disk-backed listing. Sessions created before a restart live on in
-    // the JSONL, so the list is rebuilt from the session directory (the
-    // in-memory `sessions` map is seeded the same way at startup).
-    //
-    // Merge disk entries over in-memory so a session created in this process
-    // (whose file already exists) is listed once.
+    // P10: disk-backed listing with JoinSet parallel per-session scans
+    // (`spawn_blocking` per file, join, sort) — fixes the linear scan (S2).
     let mut by_id: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
-    for (path, header) in session::Session::list_all().unwrap_or_default() {
+    let listed = session::Session::list_all_async().await.unwrap_or_default();
+    // Per-session message_count + turn_state in parallel (spawn_blocking per file).
+    let mut set = tokio::task::JoinSet::new();
+    for (path, header) in listed {
+        set.spawn(tokio::task::spawn_blocking(move || {
+            let message_count = crate::session::load_messages_from_session(&path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let turn_state = session::Session::last_turn_state(&path).to_string();
+            (path, header, message_count, turn_state)
+        }));
+    }
+    let mut scanned = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(Ok(v)) = r {
+            scanned.push(v);
+        }
+    }
+    scanned.sort_by(|a, b| b.1.timestamp().cmp(a.1.timestamp()));
+    for (path, header, message_count, turn_state) in scanned {
         let name = header.name().map(|n| n.to_string());
-        let message_count = crate::session::load_messages_from_session(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let turn_state = session::Session::last_turn_state(&path);
         by_id.insert(
             header.id().to_string(),
             json!({
@@ -425,8 +401,8 @@ async fn chat(
     // have a target as soon as the turn is registered (avoids a race where
     // the client sends steering in the gap between `active_turns` insert and
     // the `spawn_blocking` thread creating its channels).
-    let mut steering_rx_opt: Option<std_mpsc::Receiver<String>> = None;
-    let mut followup_rx_opt: Option<std_mpsc::Receiver<String>> = None;
+    let mut steering_rx_opt: Option<mpsc::Receiver<String>> = None;
+    let mut followup_rx_opt: Option<mpsc::Receiver<String>> = None;
     let mut cancel_for_turn: Option<CancellationToken> = None;
     if replay_envelope.is_none() {
         {
@@ -451,8 +427,8 @@ async fn chat(
         // Steering / follow-up queues for this turn (mirrors old local
         // `event.rs` channels). Insert now so the HTTP handlers can push
         // immediately.
-        let (steering_tx, steering_rx) = std_mpsc::channel::<String>();
-        let (followup_tx, followup_rx) = std_mpsc::channel::<String>();
+        let (steering_tx, steering_rx) = mpsc::channel::<String>(16);
+        let (followup_tx, followup_rx) = mpsc::channel::<String>(16);
         state
             .steering_txs
             .lock()
@@ -472,18 +448,17 @@ async fn chat(
     if let Some(env) = replay_envelope {
         // Replay: emit the recorded terminal envelope, then close.
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.blocking_send(env);
+        tokio::spawn(async move {
+            let _ = tx.send(env).await;
         });
     } else {
-        // Run the whole (blocking) agent turn on the blocking pool. Everything
-        // below — session IO, config building, the LLM call and tool
-        // execution — is synchronous, so it must never run on a runtime worker.
+        // Async turn: `tokio::spawn(run_agent_turn(...))` — session IO/config
+        // misses go through `spawn_blocking`, sockets/timers/bridges are tasks.
         let state_for_turn = state.clone();
         let sid = session_id.clone();
         let idem_key = idempotency_key;
         let cancel = cancel_for_turn.unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
+        tokio::spawn(async move {
             run_agent_turn(
                 state_for_turn,
                 sid,
@@ -494,7 +469,8 @@ async fn chat(
                 request_hash,
                 steering_rx_opt,
                 followup_rx_opt,
-            );
+            )
+            .await;
         });
     }
 
@@ -532,10 +508,35 @@ impl Stream for ReceiverStream {
     }
 }
 
-/// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Fully
-/// blocking; called from `spawn_blocking` only.
+/// `Future::catch_unwind` without a new dependency: polls the inner future
+/// inside `std::panic::catch_unwind` per poll, so a panic in
+/// `run_turn_inner` becomes `Err("turn panicked")` (the pre-async contract)
+/// instead of aborting the spawned turn task with no terminal SSE event —
+/// the client would otherwise hang until keep-alive timeout with cleanup
+/// done (via `TurnGuard::drop`) but no `TurnFailed` ever sent.
+struct CatchUnwind<F>(std::panic::AssertUnwindSafe<F>);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, String>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: we never move `F` out of the pin; only project to poll it.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0 .0) };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(_) => std::task::Poll::Ready(Err("turn panicked".to_string())),
+        }
+    }
+}
+
+/// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Async:
+/// spawned via `tokio::spawn`, bridges are tasks with `send().await`.
 #[allow(clippy::too_many_arguments)]
-fn run_agent_turn(
+async fn run_agent_turn(
     state: Arc<DaemonState>,
     session_id: String,
     req: ChatRequest,
@@ -543,11 +544,12 @@ fn run_agent_turn(
     tx: mpsc::Sender<StreamEnvelope>,
     idempotency_key: Option<String>,
     request_hash: u64,
-    steering_rx: Option<std_mpsc::Receiver<String>>,
-    followup_rx: Option<std_mpsc::Receiver<String>>,
+    steering_rx: Option<mpsc::Receiver<String>>,
+    followup_rx: Option<mpsc::Receiver<String>>,
 ) {
     // Use a guard so active_turns/cancel_tokens/pending approvals/steering
-    // are cleaned even when run_turn_inner panics inside spawn_blocking.
+    // are cleaned even when run_turn_inner panics inside the spawned task
+    // (`CatchUnwind` below still delivers `TurnFailed` in that case).
     struct TurnGuard {
         state: Arc<DaemonState>,
         session_id: String,
@@ -562,7 +564,7 @@ fn run_agent_turn(
                     .unwrap_or_else(|e| e.into_inner());
                 pending.retain(|_, p| {
                     if p.session_id == self.session_id {
-                        let _ = p.response.send(ApprovalDecision::Deny);
+                        let _ = p.response.try_send(ApprovalDecision::Deny);
                         false
                     } else {
                         true
@@ -603,8 +605,8 @@ fn run_agent_turn(
     let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
         (Some(sr), Some(fr)) => (sr, fr),
         _ => {
-            let (steering_tx, sr) = std_mpsc::channel::<String>();
-            let (followup_tx, fr) = std_mpsc::channel::<String>();
+            let (steering_tx, sr) = mpsc::channel::<String>(16);
+            let (followup_tx, fr) = mpsc::channel::<String>(16);
             state
                 .steering_txs
                 .lock()
@@ -618,8 +620,8 @@ fn run_agent_turn(
             (sr, fr)
         }
     };
-    let (steering_accepted_tx, steering_accepted_rx) = std_mpsc::channel::<String>();
-    let (followup_accepted_tx, followup_accepted_rx) = std_mpsc::channel::<String>();
+    let (steering_accepted_tx, mut steering_accepted_rx) = mpsc::channel::<String>(16);
+    let (followup_accepted_tx, mut followup_accepted_rx) = mpsc::channel::<String>(16);
     // Forward accepted steers/follow-ups onto the SSE stream so the remote
     // TUI can clear its `pending_*` badge and render the prompt. Journaled
     // so a reattach replay reconstructs the transcript.
@@ -633,11 +635,11 @@ fn run_agent_turn(
             .unwrap_or_else(|e| e.into_inner())
             .get(&sid)
             .map(|e| e.path.clone());
-        std::thread::spawn(move || {
+        tokio::spawn(async move {
             let mut journal = entry_path
                 .as_deref()
                 .and_then(|p| Session::from_path(p).ok());
-            while let Ok(content) = steering_accepted_rx.recv() {
+            while let Some(content) = steering_accepted_rx.recv().await {
                 let event = StreamEvent::SteeringAccepted {
                     content: content.clone(),
                 };
@@ -645,7 +647,7 @@ fn run_agent_turn(
                 if let Some(j) = journal.as_mut() {
                     let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
                 }
-                let _ = tx_clone.blocking_send(StreamEnvelope { seq, event });
+                let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
             }
         });
     }
@@ -659,11 +661,11 @@ fn run_agent_turn(
             .unwrap_or_else(|e| e.into_inner())
             .get(&sid)
             .map(|e| e.path.clone());
-        std::thread::spawn(move || {
+        tokio::spawn(async move {
             let mut journal = entry_path
                 .as_deref()
                 .and_then(|p| Session::from_path(p).ok());
-            while let Ok(content) = followup_accepted_rx.recv() {
+            while let Some(content) = followup_accepted_rx.recv().await {
                 let event = StreamEvent::FollowupAccepted {
                     content: content.clone(),
                 };
@@ -671,37 +673,41 @@ fn run_agent_turn(
                 if let Some(j) = journal.as_mut() {
                     let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
                 }
-                let _ = tx_clone.blocking_send(StreamEnvelope { seq, event });
+                let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
             }
         });
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_turn_inner(
+    // Own receivers mutably for the async turn (tokio try_recv needs &mut).
+    let mut steering_rx = steering_rx;
+    let mut followup_rx = followup_rx;
+    let result: Result<(String, Option<u64>, Option<u64>), String> =
+        match CatchUnwind(std::panic::AssertUnwindSafe(run_turn_inner(
             &state,
             &session_id,
             &req,
             &cancel,
             &tx,
-            Some(&steering_rx),
+            Some(&mut steering_rx),
             Some(&steering_accepted_tx),
-            Some(&followup_rx),
+            Some(&mut followup_rx),
             Some(&followup_accepted_tx),
-        )
-    }));
+        )))
+        .await
+        {
+            Ok(inner) => inner,
+            Err(panicked) => Err(panicked),
+        };
     // Drop the guard now before sending the terminal event so a new turn can
     // be accepted promptly; drop ordering handles pending approvals/active turns.
     drop(_guard);
 
     let terminal = match result {
-        Ok(Ok((response, usage, cached))) => StreamEvent::TurnComplete {
+        Ok((response, usage, cached)) => StreamEvent::TurnComplete {
             response,
             usage,
             cached,
         },
-        Ok(Err(error)) => StreamEvent::TurnFailed { error },
-        Err(_) => StreamEvent::TurnFailed {
-            error: "turn panicked".to_string(),
-        },
+        Err(error) => StreamEvent::TurnFailed { error },
     };
     // P10/P8: the terminal event gets a seq, is journaled (reopening the
     // session file so an in-flight handle is untouched), dedup'd via
@@ -733,20 +739,20 @@ fn run_agent_turn(
     if let Some(key) = idempotency_key {
         state.idempotency_record(&key, &session_id, request_hash, serialized);
     }
-    let _ = tx.blocking_send(env);
+    let _ = tx.send(env).await;
 }
 
 #[allow(clippy::too_many_arguments, unused_assignments)]
-fn run_turn_inner(
+async fn run_turn_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
-    steering_rx: Option<&std_mpsc::Receiver<String>>,
-    steering_accepted_tx: Option<&std_mpsc::Sender<String>>,
-    followup_rx: Option<&std_mpsc::Receiver<String>>,
-    followup_accepted_tx: Option<&std_mpsc::Sender<String>>,
+    steering_rx: Option<&mut mpsc::Receiver<String>>,
+    steering_accepted_tx: Option<&mpsc::Sender<String>>,
+    followup_rx: Option<&mut mpsc::Receiver<String>>,
+    followup_accepted_tx: Option<&mpsc::Sender<String>>,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -794,15 +800,20 @@ fn run_turn_inner(
     }
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
-    let mut config = LlmConfig::from_env(
+    // Async: cache hits are a mutex bump inline; misses parse the 4MB catalog
+    // in `spawn_blocking` (Phase 6 `from_env_async`).
+    let perm_override = req
+        .permission
+        .as_deref()
+        .map(crate::core::types::PermissionMode::parse)
+        .transpose()?;
+    let mut config = LlmConfig::from_env_async(
         req.base_url.clone().filter(|v| !v.is_empty()),
         req.model.clone().filter(|v| !v.is_empty()),
-        req.permission
-            .as_deref()
-            .map(crate::core::types::PermissionMode::parse)
-            .transpose()?,
-        &[],
+        perm_override,
+        Vec::new(),
     )
+    .await
     .map_err(|e| format!("failed to build config: {e}"))?;
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
@@ -831,15 +842,22 @@ fn run_turn_inner(
     }
 
     // Skills are resolved on the daemon (its filesystem is the workspace).
+    // Async dir scans + concurrent reads (Phase 6).
     let mut dirs = skill_dirs();
     dirs.extend(req.skill_dirs.iter().map(std::path::PathBuf::from));
-    let skills = discover_skills(&dirs);
+    let skills = discover_skills_async(&dirs).await;
 
     // Rebuild the conversation: system prompt + persisted history + prompt.
+    // History load via `spawn_blocking` (full-history scan, fast) — Phase 4/6.
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt(&skills)));
-    if let Some(path) = session.path() {
-        messages.extend(session::load_messages_from_session(path).unwrap_or_default());
+    if let Some(path) = session.path().map(|p| p.to_path_buf()) {
+        let loaded = tokio::task::spawn_blocking(move || {
+            session::load_messages_from_session(&path).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        messages.extend(loaded);
     }
     let user_message = ChatMessage::user(req.prompt.clone());
     // Durable journal (P8): a turn only exists once turn_start is recorded,
@@ -860,8 +878,8 @@ fn run_turn_inner(
 
     // The agent loop reports through std channels; bridge them onto the
     // tokio sender with dedicated threads.
-    let (sink_tx, sink_rx) = std_mpsc::channel::<SinkLine>();
-    let (approval_tx, approval_rx) = std_mpsc::channel::<ApprovalRequest>();
+    let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>(256);
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(16);
     let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
@@ -882,32 +900,31 @@ fn run_turn_inner(
 
     // Sink bridge: SinkLines arrive from the streaming LLM reader and tool
     // executor; forward them as numbered StreamEnvelopes on a dedicated
-    // thread, journaling each one for replay (P10).
+    // task with the same Thinking/Assistant coalescing, journaling each one
+    // for replay (P10). `send().await` replaces `blocking_send`.
     {
         let stream_tx = tx.clone();
         let state = state.clone();
         let session_path = session.path().map(|p| p.to_path_buf());
         let sid = session_id.to_string();
         let cancel = cancel.clone();
-        std::thread::spawn(move || {
+        tokio::spawn(async move {
             // Reopen so journal writes never fight the agent loop's handle;
             // events land in the separate `<id>.events.jsonl` file.
             let mut journal = session_path
                 .as_deref()
                 .and_then(|p| Session::from_path(p).ok());
             let mut deferred: Option<SinkLine> = None;
+            let mut sink_rx = sink_rx;
             loop {
                 let sl = match deferred.take() {
                     Some(sl) => sl,
-                    None => match sink_rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(sl) => sl,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if cancel.is_cancelled() {
-                                break;
-                            }
-                            continue;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    None => tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        recvd = sink_rx.recv() => match recvd {
+                            Some(sl) => sl,
+                            None => break,
+                        },
                     },
                 };
                 // Coalesce per-token thinking deltas: providers stream one
@@ -985,25 +1002,26 @@ fn run_turn_inner(
                 if let Some(s) = journal.as_mut() {
                     let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
                 }
-                let _ = stream_tx.blocking_send(StreamEnvelope { seq, event });
+                let _ = stream_tx.send(StreamEnvelope { seq, event }).await;
             }
         });
     }
 
     // Approval bridge: each ApprovalRequest gets a fresh request_id; the
     // response sender is parked in the shared state so POST /approve can
-    // resolve it. The agent thread blocks on that sender until then.
+    // resolve it. Task + `send().await` replaces the parked thread.
     {
         let state = state.clone();
         let session_id = session_id.to_string();
         let stream_tx = tx.clone();
         let cancel = cancel.clone();
-        std::thread::spawn(move || {
-            while let Ok(request) = approval_rx.recv() {
+        tokio::spawn(async move {
+            let mut approval_rx = approval_rx;
+            while let Some(request) = approval_rx.recv().await {
                 // A cancellation was requested: don't surface new approvals,
                 // deny them so the agent thread can unwind.
                 if cancel.is_cancelled() {
-                    let _ = request.response.send(ApprovalDecision::Deny);
+                    let _ = request.response.try_send(ApprovalDecision::Deny);
                     continue;
                 }
                 let request_id = uuid::Uuid::new_v4().to_string();
@@ -1023,21 +1041,23 @@ fn run_turn_inner(
                 if let Some(stale) = replaced {
                     // Should not happen (request_ids are unique); deny to
                     // avoid a deadlock in a stray agent thread.
-                    let _ = stale.response.send(ApprovalDecision::Deny);
+                    let _ = stale.response.try_send(ApprovalDecision::Deny);
                 }
-                let _ = stream_tx.blocking_send(StreamEnvelope {
-                    seq: state.next_seq(&session_id),
-                    event: StreamEvent::ApprovalRequired {
-                        request_id,
-                        name: request.name,
-                        input: request.input,
-                    },
-                });
+                let _ = stream_tx
+                    .send(StreamEnvelope {
+                        seq: state.next_seq(&session_id),
+                        event: StreamEvent::ApprovalRequired {
+                            request_id,
+                            name: request.name,
+                            input: request.input,
+                        },
+                    })
+                    .await;
             }
         });
     }
 
-    let mut tool_state = ToolState::load();
+    let mut tool_state = ToolState::load_async().await;
     #[allow(unused_assignments)]
     // Outer loop for follow-up chaining (mirrors old local `event.rs` loop):
     // `process_turn` consumes steering mid-turn; follow-ups are drained after
@@ -1045,36 +1065,49 @@ fn run_turn_inner(
     let mut final_response = String::new();
     let mut final_usage = None;
     let mut final_cached = None;
-    let turn_result: Result<String, Box<dyn std::error::Error>>;
+    let turn_result: Result<String, Box<dyn std::error::Error + Send + Sync>>;
+    // Own the option wrappers for the chained loop; reborrow inner `&mut`
+    // each iteration (tokio `try_recv` needs `&mut`).
+    let mut steering_opt = steering_rx;
+    let mut followup_opt = followup_rx;
     loop {
+        // Reborrow `&mut Receiver` from `Option<&mut Receiver>` without moving.
+        let steering_reborrow = steering_opt.as_deref_mut();
         let result = process_turn(
             &config,
             &mut messages,
             &mut tool_state,
-            steering_rx,
+            steering_reborrow,
             steering_accepted_tx,
             Some(&mut session),
             &config,
             cancel,
             &console,
-        );
+        )
+        .await;
         match result {
             Ok(resp) => {
                 final_response = resp;
                 final_usage = tool_state.last_usage;
                 final_cached = tool_state.last_cached;
                 // Drain follow-ups queued while this turn ran.
-                let followups: Vec<String> = followup_rx
-                    .as_ref()
-                    .map(|rx| rx.try_iter().collect())
-                    .unwrap_or_default();
+                let followups: Vec<String> = match followup_opt.as_mut() {
+                    Some(rx) => {
+                        let mut out = Vec::new();
+                        while let Ok(v) = rx.try_recv() {
+                            out.push(v);
+                        }
+                        out
+                    }
+                    None => Vec::new(),
+                };
                 if followups.is_empty() {
                     turn_result = Ok(final_response.clone());
                     break;
                 }
                 for content in followups {
                     if let Some(tx) = followup_accepted_tx {
-                        let _ = tx.send(content.clone());
+                        let _ = tx.send(content.clone()).await;
                     }
                     let msg = ChatMessage::user_named(content.clone(), "follow-up");
                     session
@@ -1145,7 +1178,7 @@ async fn approve(
                             .map(|h| std::path::PathBuf::from(h).join(".local/share"))
                     })
                 else {
-                    let _ = pending.response.send(decision);
+                    let _ = pending.response.try_send(decision);
                     return Ok(Json(json!({ "status": "ok" })));
                 };
                 let path = base.join("dex/audit.jsonl");
@@ -1180,7 +1213,7 @@ async fn approve(
                     let _ = std::io::Write::write_all(&mut file, line.as_bytes());
                 }
             }
-            let _ = pending.response.send(decision);
+            let _ = pending.response.send(decision).await;
             Ok(Json(json!({ "status": "ok" })))
         }
         Some(pending) => {
@@ -1213,9 +1246,10 @@ async fn cancel(
         token.cancel();
     }
 
-    // Deny any approvals still pending for this session so agent threads
-    // blocked on them wake up promptly.
-    {
+    // Deny any approvals still pending for this session so agent tasks
+    // blocked on them wake up promptly. Collect senders under the lock,
+    // then send without holding it (std MutexGuard is !Send across await).
+    let to_deny = {
         let mut pending = state
             .pending_approvals
             .lock()
@@ -1225,11 +1259,16 @@ async fn cancel(
             .filter(|(_, p)| p.session_id == session_id)
             .map(|(id, _)| id.clone())
             .collect();
+        let mut out = Vec::new();
         for id in stale {
             if let Some(p) = pending.remove(&id) {
-                let _ = p.response.send(ApprovalDecision::Deny);
+                out.push(p.response);
             }
         }
+        out
+    };
+    for sender in to_deny {
+        let _ = sender.send(ApprovalDecision::Deny).await;
     }
 
     Json(json!({ "status": "ok" }))
@@ -1254,7 +1293,7 @@ async fn steer(
         map.get(&session_id).cloned()
     }
     .ok_or(StatusCode::CONFLICT)?;
-    tx.send(content).map_err(|_| StatusCode::CONFLICT)?;
+    tx.send(content).await.map_err(|_| StatusCode::CONFLICT)?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -1276,7 +1315,7 @@ async fn followup(
         map.get(&session_id).cloned()
     }
     .ok_or(StatusCode::CONFLICT)?;
-    tx.send(content).map_err(|_| StatusCode::CONFLICT)?;
+    tx.send(content).await.map_err(|_| StatusCode::CONFLICT)?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -1640,7 +1679,7 @@ mod handler_tests {
         assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
 
         // pending parked under sess-a; decision sent against sess-b -> 404 and restored
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(1);
         state.pending_approvals.lock().unwrap().insert(
             "req-1".into(),
             PendingApproval {
@@ -1693,8 +1732,8 @@ mod handler_tests {
     #[tokio::test]
     async fn cancel_denies_pending_approvals_for_the_session() {
         let state = Arc::new(DaemonState::new());
-        let (tx_a, rx_a) = std::sync::mpsc::channel();
-        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
         {
             let mut pending = state.pending_approvals.lock().unwrap();
             pending.insert(
@@ -1821,8 +1860,9 @@ mod permission_gate_tests {
     /// remote client and trusted-mode tool execution: a client may only
     /// request a STRICTER mode than the daemon's own. Runs before any LLM
     /// call, so it is testable with no provider.
-    #[test]
-    fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1894,6 +1934,7 @@ mod permission_gate_tests {
             None,
             None,
         )
+        .await
         .unwrap_err();
         assert!(err.contains("escalation denied"), "got: {err}");
         // Nothing journaled: the turn never started.
@@ -1916,6 +1957,7 @@ mod permission_gate_tests {
             None,
             None,
         )
+        .await
         .unwrap_err();
         assert!(
             !err.contains("escalation denied"),
@@ -1934,6 +1976,7 @@ mod permission_gate_tests {
             None,
             None,
         )
+        .await
         .unwrap_err();
         assert!(err.contains("invalid plan JSON"), "got: {err}");
 
@@ -2121,5 +2164,54 @@ mod e2e_tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file("evil.txt");
+    }
+}
+
+#[cfg(test)]
+mod async_parallel_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn list_sessions_joins_parallel_and_sorts() {
+        // TDD Phase 4 (S2): JoinSet per-file scans, join, sort — same as sequential, ~50ms not ~500ms.
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data_dir = std::env::temp_dir().join(format!("dex-list-par-{}", std::process::id()));
+        let saved = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        let state = Arc::new(DaemonState::new());
+        // Create 5 sessions (each ~10ms scan serially would be ~50ms).
+        for i in 0..5 {
+            let s = Session::new(format!("/tmp/cwd-{i}"), Some(format!("n{i}"))).unwrap();
+            state.sessions.lock().unwrap().insert(
+                s.id().to_string(),
+                SessionEntry {
+                    path: s.path().unwrap().to_path_buf(),
+                    name: Some(format!("n{i}")),
+                    cwd: format!("/tmp/cwd-{i}"),
+                },
+            );
+        }
+        let start = std::time::Instant::now();
+        let resp = list_sessions(State(state)).await;
+        let elapsed = start.elapsed();
+        let sessions = resp.0["sessions"].as_array().cloned().unwrap_or_default();
+        assert_eq!(sessions.len(), 5, "all sessions listed");
+        // Sorted newest-first by created_at (list_all_async sorts too).
+        let mut prev = "9999";
+        for s in &sessions {
+            let at = s.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(at <= prev, "sorted newest-first");
+            prev = at;
+        }
+        // Parallel, not serial 500ms (loose: <5s, ensures JoinSet didn't serialize with sleeps).
+        assert!(elapsed < std::time::Duration::from_secs(5));
+        match saved {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

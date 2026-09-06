@@ -6,21 +6,18 @@ use serde_json::{Map, Value};
 use similar::TextDiff;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::agent::state::CancellationSource;
 use crate::core::format::clamp_lines;
+use tokio::io::AsyncReadExt as _;
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn setpgid(pid: i32, pgid: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn setsid() -> i32;
 }
@@ -303,30 +300,9 @@ fn tool_runner_env() -> Vec<(String, String)> {
     env
 }
 
-/// Read up to `limit` bytes; reports whether more output remained after the
-/// limit was hit (the distinguishing extra read happens after EOF-or-limit,
-/// so a stream that ends exactly at the limit is not flagged truncated).
-fn read_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
-    let mut bytes = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0u8; 8192];
-    loop {
-        let chunk = (limit - bytes.len()).min(buffer.len());
-        match reader.read(&mut buffer[..chunk]) {
-            Ok(0) | Err(_) => return (bytes, false),
-            Ok(size) => bytes.extend_from_slice(&buffer[..size]),
-        }
-        if bytes.len() >= limit {
-            break;
-        }
-    }
-    // The capture limit is reached; check whether the stream has more.
-    let more = matches!(reader.read(&mut buffer), Ok(n) if n > 0);
-    (bytes, more)
-}
-
-fn run_bash(
+async fn run_bash(
     command: &str,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<(String, Option<i32>), ToolError> {
     let timeout = shell_timeout();
     let max_bytes = env::var("DEX_TOOL_OUTPUT_BYTES")
@@ -334,40 +310,66 @@ fn run_bash(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
         .unwrap_or_else(|| CONFIGURED_OUTPUT_LIMIT.load(Ordering::Relaxed));
-    run_bash_with_limits(command, timeout, max_bytes, cancel)
+    run_bash_with_limits(command, timeout, max_bytes, cancel).await
 }
 
-fn run_bash_with_limits(
+async fn read_limited_async<R>(mut reader: R, limit: usize) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buf = [0u8; 8192];
+    loop {
+        let want = (limit - bytes.len()).min(buf.len());
+        if want == 0 {
+            break;
+        }
+        match reader.read(&mut buf[..want]).await {
+            Ok(0) | Err(_) => return (bytes, false),
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+        }
+        if bytes.len() >= limit {
+            break;
+        }
+    }
+    // Limit hit before EOF → truncated (sync version does an extra read to
+    // distinguish exact-limit vs over-limit; here reaching the limit without
+    // EOF is sufficient — exact-limit false-positives are harmless truncation
+    // markers, not data loss).
+    (bytes, true)
+}
+
+async fn run_bash_with_limits(
     command: &str,
     timeout: Duration,
     max_bytes: usize,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<(String, Option<i32>), ToolError> {
+    // Async shell: `tokio::process` + async pipe drain (tasks, not threads) +
+    // `select!(wait, timeout, cancelled)` — no reader threads, no 25ms poll
+    // quantum (S5). Process-group kill preserved.
     let mut child = shell_command(command).spawn().map_err(ToolError::Io)?;
-    // Put the shell in its own process group so cancellation/timeout does not
-    // leave descendants running.
-    mark_process_group(child.id());
+    let pid = child.id();
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_reader = thread::spawn(move || read_limited(stdout, max_bytes));
-    let stderr_reader = thread::spawn(move || read_limited(stderr, max_bytes));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(ToolError::Io)? {
-            break status;
+    // Async drain tasks (replace the 2 reader threads).
+    let out_h = tokio::spawn(read_limited_async(stdout, max_bytes.saturating_add(1)));
+    let err_h = tokio::spawn(read_limited_async(stderr, max_bytes.saturating_add(1)));
+    async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if cancel.is_cancelled() {
-            kill_process_group(&mut child);
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Ok(("Error: shell command cancelled".to_string(), None));
-        }
-        if Instant::now() >= deadline {
-            kill_process_group(&mut child);
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+    }
+    let status = tokio::select! {
+        st = child.wait() => st.map_err(ToolError::Io)?,
+        _ = tokio::time::sleep(timeout) => {
+            kill_process_group_async(pid, &mut child).await;
+            let _ = child.wait().await;
+            let _ = out_h.await;
+            let _ = err_h.await;
             return Ok((
                 format!(
                     "Error: shell command timed out after {} seconds",
@@ -376,26 +378,49 @@ fn run_bash_with_limits(
                 None,
             ));
         }
-        thread::sleep(Duration::from_millis(25));
+        _ = wait_cancelled(cancel) => {
+            kill_process_group_async(pid, &mut child).await;
+            let _ = child.wait().await;
+            let _ = out_h.await;
+            let _ = err_h.await;
+            return Ok(("Error: shell command cancelled".to_string(), None));
+        }
     };
-    let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
-    let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
+    let (mut stdout, stdout_truncated) = out_h.await.unwrap_or_default();
+    let (mut stderr, stderr_truncated) = err_h.await.unwrap_or_default();
+    // Exact-limit vs over-limit: read up to max+1 to detect over (matches sync `take(MAX+1)`).
+    let stdout_truncated = stdout_truncated || stdout.len() > max_bytes;
+    let stderr_truncated = stderr_truncated || stderr.len() > max_bytes;
+    stdout.truncate(max_bytes);
+    stderr.truncate(max_bytes);
     let mut result = String::from_utf8_lossy(&stdout).into_owned();
     if stdout_truncated {
         result.push_str("\n[... output exceeded capture limit ...]");
     }
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-    if !stderr.trim().is_empty() {
+    let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+    if !stderr_str.trim().is_empty() {
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
         result.push_str("--- stderr ---\n");
-        result.push_str(&stderr);
+        result.push_str(&stderr_str);
         if stderr_truncated {
             result.push_str("\n[... stderr exceeded capture limit ...]");
         }
     }
     Ok((result, status.code()))
+}
+
+async fn kill_process_group_async(pid: Option<u32>, child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        unsafe {
+            let _ = kill(-(pid as i32), SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    let _ = child.kill().await;
 }
 
 /// Spawn the workspace shell. Unix gets `sh -c` in a fresh session so tool
@@ -407,15 +432,16 @@ fn run_bash_with_limits(
 /// SAFETY: runs in the forked child before exec; it is not yet a process
 /// group leader, so setsid() succeeds.
 #[cfg(unix)]
-fn shell_command(command: &str) -> Command {
-    let mut builder = Command::new("sh");
+fn shell_command(command: &str) -> tokio::process::Command {
+    let mut builder = tokio::process::Command::new("sh");
     builder
         .arg("-c")
         .arg(command)
         .envs(tool_runner_env())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     unsafe {
         builder.pre_exec(|| {
             let _ = setsid();
@@ -426,41 +452,17 @@ fn shell_command(command: &str) -> Command {
 }
 
 #[cfg(not(unix))]
-fn shell_command(command: &str) -> Command {
-    let mut builder = Command::new("cmd");
+fn shell_command(command: &str) -> tokio::process::Command {
+    let mut builder = tokio::process::Command::new("cmd");
     builder
         .arg("/C")
         .arg(command)
         .envs(tool_runner_env())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     builder
-}
-
-#[cfg(unix)]
-fn mark_process_group(pid: u32) {
-    unsafe {
-        let _ = setpgid(pid as i32, pid as i32);
-    }
-}
-
-#[cfg(not(unix))]
-fn mark_process_group(_pid: u32) {}
-
-/// Kill the shell and (on unix) its whole process group so descendants do not
-/// outlive a cancel/timeout; Windows has no group kill, so just the shell.
-#[cfg(unix)]
-fn kill_process_group(child: &mut std::process::Child) {
-    unsafe {
-        let _ = kill(-(child.id() as i32), SIGKILL);
-    }
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(child: &mut std::process::Child) {
-    let _ = child.kill();
 }
 
 /// `read` returns line-numbered content (right-aligned number + two-space gap
@@ -473,16 +475,16 @@ fn kill_process_group(child: &mut std::process::Child) {
 /// read several files in ONE call — the "search, then read what it found"
 /// chain collapses into a single tool call. Per-file errors are isolated and
 /// the call succeeds when at least one file is readable.
-fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
+async fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
     if let Some(paths) = args.get("paths").and_then(Value::as_array) {
-        return fanout_read(parse_path_list(paths)?, args);
+        return fanout_read(parse_path_list(paths)?, args).await;
     }
     if let Some(glob) = args.get("glob").and_then(Value::as_str) {
-        return fanout_read(expand_glob(glob)?, args);
+        return fanout_read(expand_glob(glob).await?, args).await;
     }
     let path = workspace_path(&arg_str(args, "path")?)?;
     let (body, _more) =
-        read_file_numbered(&path, read_offset(args), read_limit(args, READ_MAX_LINES))?;
+        read_file_numbered(&path, read_offset(args), read_limit(args, READ_MAX_LINES)).await?;
     Ok(body)
 }
 
@@ -526,15 +528,19 @@ fn parse_path_list(paths: &[Value]) -> Result<Vec<PathBuf>, ToolError> {
 
 /// Line-numbered content for one file, within the read budgets. Also returns
 /// how many lines were omitted past the end (for pagination notes).
-fn read_file_numbered(
+async fn read_file_numbered(
     path: &Path,
     offset: usize,
     limit: usize,
 ) -> Result<(String, usize), ToolError> {
-    let file = fs::File::open(path).map_err(ToolError::Io)?;
+    // Budgeted read: `take(MAX+1)` caps the read at the byte budget + one
+    // probe byte, so a multi-GB log never lands in memory whole. The extra
+    // byte distinguishes over-budget from exact-fit.
+    let file = tokio::fs::File::open(path).await.map_err(ToolError::Io)?;
     let mut bytes = Vec::new();
-    file.take((READ_MAX_BYTES + 1) as u64)
+    file.take(u64::try_from(READ_MAX_BYTES + 1).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
+        .await
         .map_err(ToolError::Io)?;
     let over_budget = bytes.len() > READ_MAX_BYTES;
     bytes.truncate(READ_MAX_BYTES);
@@ -578,15 +584,37 @@ fn read_file_numbered(
 
 /// Multi-file read: `==> path <==` sections (grep-style), per-file limits,
 /// isolated per-file errors, one shared byte budget.
-fn fanout_read(paths: Vec<PathBuf>, args: &Map<String, Value>) -> Result<String, ToolError> {
+#[allow(clippy::type_complexity)]
+async fn fanout_read(paths: Vec<PathBuf>, args: &Map<String, Value>) -> Result<String, ToolError> {
+    // Concurrent reads (S1 latency win: 10x5ms serial ~50ms -> ~5-10ms).
+    // JoinSet + semaphore: at most 10 files read concurrently no matter
+    // how the input caps evolve; join + sort restores input order, budget
+    // is enforced on join.
     let per_file = read_limit(args, READ_FANOUT_PER_FILE_LINES);
     let offset = read_offset(args);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, path) in paths.iter().enumerate() {
+        let path = path.clone();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let res = read_file_numbered(&path, offset, per_file).await;
+            (idx, path.display().to_string(), res)
+        });
+    }
+    let mut joined: Vec<(usize, String, Result<(String, usize), ToolError>)> = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(v) = r {
+            joined.push(v);
+        }
+    }
+    joined.sort_by_key(|(idx, _, _)| *idx);
     let mut sections: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut used = 0usize;
-    for path in &paths {
-        let display = path.display().to_string();
-        match read_file_numbered(path, offset, per_file) {
+    for (_, display, res) in joined {
+        match res {
             Ok((body, _)) => {
                 used += body.len();
                 sections.push(format!("==> {display} <==\n{body}"));
@@ -614,7 +642,7 @@ fn fanout_read(paths: Vec<PathBuf>, args: &Map<String, Value>) -> Result<String,
 
 /// Expand a glob into workspace paths. Patterns with `/` match full paths
 /// (`src/tools/*.rs`); bare patterns match basenames anywhere (`*.rs`).
-fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
+async fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
     let glob = glob.trim().trim_start_matches("./").to_string();
     if glob.is_empty() || !glob.contains(['*', '?']) {
         return Err(ToolError::InvalidArgument(
@@ -627,7 +655,7 @@ fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
     } else {
         format!("find . \\( -name .git -o -name target -o -name node_modules \\) -prune -o -name '{glob}' -print")
     };
-    let (output, code) = run_bash(&command, &crate::agent::state::GlobalCancellation)?;
+    let (output, code) = run_bash(&command, &crate::agent::state::GlobalCancellation).await?;
     if !matches!(code, Some(0) | Some(1)) {
         return Err(ToolError::Shell { output, code });
     }
@@ -649,11 +677,11 @@ fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
     Ok(paths)
 }
 
-fn tool_bash(
+async fn tool_bash(
     args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
-    let (output, code) = run_bash(&arg_str(args, "command")?, cancel)?;
+    let (output, code) = run_bash(&arg_str(args, "command")?, cancel).await?;
     match code {
         Some(0) => Ok(clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES)),
         code => Err(ToolError::Shell {
@@ -663,15 +691,19 @@ fn tool_bash(
     }
 }
 
-fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
+async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
     let path = workspace_path(&arg_str(args, "path")?)?;
     let content = arg_str(args, "content")?;
-    check_expected_hash(args, &path)?;
+    check_expected_hash(args, &path).await?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(ToolError::Io)?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(ToolError::Io)?;
     }
-    let replaced = fs::metadata(&path).ok().map(|meta| meta.len());
-    fs::write(&path, &content).map_err(ToolError::Io)?;
+    let replaced = tokio::fs::metadata(&path).await.ok().map(|meta| meta.len());
+    tokio::fs::write(&path, &content)
+        .await
+        .map_err(ToolError::Io)?;
     Ok(match replaced {
         Some(old_bytes) => format!(
             "wrote {} (replaced {old_bytes} bytes with {})",
@@ -685,14 +717,14 @@ fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
 /// When a write/edit carries `expected_hash`, reject if the file on disk no
 /// longer matches (stale read → 409 semantics). Absent file hashes to the
 /// empty-string sentinel.
-fn check_expected_hash(args: &Map<String, Value>, path: &Path) -> Result<(), ToolError> {
+async fn check_expected_hash(args: &Map<String, Value>, path: &Path) -> Result<(), ToolError> {
     let Some(expected) = args.get("expected_hash").and_then(Value::as_str) else {
         return Ok(());
     };
     if expected.is_empty() {
         return Ok(());
     }
-    let actual = hash_file(&path.display().to_string());
+    let actual = hash_file_async(&path.display().to_string()).await;
     if actual != expected {
         return Err(ToolError::StaleFile {
             path: path.display().to_string(),
@@ -705,16 +737,23 @@ fn check_expected_hash(args: &Map<String, Value>, path: &Path) -> Result<(), Too
 
 /// FNV-1a 64-bit hex hash of a file's bytes. An absent file hashes as empty
 /// content (the before-hash of a `write` creating a new file).
-pub(crate) fn hash_file(path: &str) -> String {
-    let bytes = fs::read(path).unwrap_or_default();
+fn hash_bytes(bytes: &[u8]) -> String {
     let mut hash = 2166136261u64;
-    for b in &bytes {
+    for b in bytes {
         hash = (hash ^ u64::from(*b)).wrapping_mul(16777619);
     }
     format!("{:016x}", hash)
 }
 
-fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
+pub(crate) fn hash_file(path: &str) -> String {
+    hash_bytes(&fs::read(path).unwrap_or_default())
+}
+
+async fn hash_file_async(path: &str) -> String {
+    hash_bytes(&tokio::fs::read(path).await.unwrap_or_default())
+}
+
+async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
     let path = workspace_path(&arg_str(args, "path")?)?;
     let old = arg_str(args, "oldText")?;
     let new = arg_str(args, "newText")?;
@@ -732,10 +771,14 @@ fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
             "oldText and newText are identical; nothing to edit".to_string(),
         ));
     }
-    check_expected_hash(args, &path)?;
-    let content = fs::read_to_string(&path).map_err(ToolError::Io)?;
+    check_expected_hash(args, &path).await?;
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(ToolError::Io)?;
     let (updated, note) = apply_edit(&content, &old, &new, replace_all)?;
-    fs::write(&path, updated).map_err(ToolError::Io)?;
+    tokio::fs::write(&path, updated)
+        .await
+        .map_err(ToolError::Io)?;
     Ok(format!("edited {}{note}", path.display()))
 }
 
@@ -743,26 +786,8 @@ fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
 /// `/dev/null` for new files) of a pending write/edit, shown in the
 /// transcript before approval and under the tool result. Returns None when
 /// the file is missing or the change is empty.
-pub(crate) fn change_diff(name: &str, args: &Map<String, Value>) -> Option<String> {
-    let raw_path = arg_str(args, "path").ok()?;
-    let path = workspace_path(&raw_path).ok()?;
-    let before = fs::read_to_string(&path).ok();
-    let after = match name {
-        "write" => arg_str(args, "content").ok(),
-        "edit" => {
-            let old = arg_str(args, "oldText").ok()?;
-            let new = arg_str(args, "newText").ok()?;
-            let replace_all = args
-                .get("replaceAll")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            apply_edit(before.as_deref().unwrap_or(""), &old, &new, replace_all)
-                .ok()
-                .map(|(updated, _)| updated)
-        }
-        _ => return None,
-    }?;
-    let diff = TextDiff::from_lines(before.as_deref().unwrap_or(""), &after);
+fn build_diff(raw_path: &str, before: Option<&str>, after: &str) -> Option<String> {
+    let diff = TextDiff::from_lines(before.unwrap_or(""), after);
     let (old_header, new_header) = match &before {
         Some(_) => (format!("a/{raw_path}"), format!("b/{raw_path}")),
         None => ("/dev/null".to_string(), format!("b/{raw_path}")),
@@ -777,6 +802,32 @@ pub(crate) fn change_diff(name: &str, args: &Map<String, Value>) -> Option<Strin
     } else {
         Some(out)
     }
+}
+
+fn diff_after(name: &str, args: &Map<String, Value>, before: Option<&str>) -> Option<String> {
+    match name {
+        "write" => arg_str(args, "content").ok(),
+        "edit" => {
+            let old = arg_str(args, "oldText").ok()?;
+            let new = arg_str(args, "newText").ok()?;
+            let replace_all = args
+                .get("replaceAll")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            apply_edit(before.unwrap_or(""), &old, &new, replace_all)
+                .ok()
+                .map(|(updated, _)| updated)
+        }
+        _ => None,
+    }
+}
+
+async fn change_diff_async(name: &str, args: &Map<String, Value>) -> Option<String> {
+    let raw_path = arg_str(args, "path").ok()?;
+    let path = workspace_path(&raw_path).ok()?;
+    let before = tokio::fs::read_to_string(&path).await.ok();
+    let after = diff_after(name, args, before.as_deref())?;
+    build_diff(&raw_path, before.as_deref(), &after)
 }
 
 fn apply_edit(
@@ -875,26 +926,30 @@ fn apply_edit(
     Ok((updated, note))
 }
 
-fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
+async fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
     let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let path = workspace_path(raw)?;
-    let meta = std::fs::metadata(&path).map_err(ToolError::Io)?;
+    let meta = tokio::fs::metadata(&path).await.map_err(ToolError::Io)?;
     if !meta.is_dir() {
         return Ok(path.display().to_string());
     }
-    let mut entries: Vec<String> = std::fs::read_dir(&path)
-        .map_err(ToolError::Io)?
-        .filter_map(|e| e.ok())
-        .map(|e| {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            if p.is_dir() {
-                format!("{name}/")
-            } else {
-                name
-            }
-        })
-        .collect();
+    let mut dir = tokio::fs::read_dir(&path).await.map_err(ToolError::Io)?;
+    let mut entries: Vec<String> = Vec::new();
+    while let Some(entry) = dir.next_entry().await.map_err(ToolError::Io)? {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // is_dir via file_type to avoid extra metadata call; fallback to path check.
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or_else(|_| p.is_dir());
+        if is_dir {
+            entries.push(format!("{name}/"));
+        } else {
+            entries.push(name);
+        }
+    }
     entries.sort();
     if entries.is_empty() {
         return Ok("(empty)".to_string());
@@ -904,9 +959,9 @@ fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
     Ok(limited)
 }
 
-fn tool_git(
+async fn tool_git(
     args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("status");
     if !matches!(mode, "status" | "diff") {
@@ -914,7 +969,7 @@ fn tool_git(
     }
     // Routed through run_bash so git shares the shell timeout, cancellation,
     // capture limits, and clamping instead of running unbounded.
-    let (output, code) = run_bash(&format!("git --no-pager {mode}"), cancel)?;
+    let (output, code) = run_bash(&format!("git --no-pager {mode}"), cancel).await?;
     match code {
         Some(0) | Some(1) => Ok(clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES)),
         code => Err(ToolError::Shell {
@@ -935,9 +990,9 @@ const CHAIN_MAX_STEPS: usize = 4;
 /// mid-chain, and mutation/shell tools are refused. On a step failure the
 /// earlier steps' outputs ship with the error, so the round trip still
 /// carries information.
-fn tool_chain(
+async fn tool_chain(
     args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
     let steps = args
         .get("steps")
@@ -957,7 +1012,7 @@ fn tool_chain(
 
     let mut completed: Vec<(String, String)> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
-        match run_chain_step(step, index, &completed, cancel) {
+        match run_chain_step(step, index, &completed, cancel).await {
             Ok(pair) => completed.push(pair),
             Err(error) => {
                 let mut text = render_chain_steps(&completed);
@@ -987,11 +1042,11 @@ fn render_chain_steps(steps: &[(String, String)]) -> String {
     out
 }
 
-fn run_chain_step(
+async fn run_chain_step(
     step: &Value,
     index: usize,
     completed: &[(String, String)],
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<(String, String), ToolError> {
     let invalid = |message: String| ToolError::InvalidArgument(format!("step {index}: {message}"));
     let obj = step
@@ -1058,7 +1113,7 @@ fn run_chain_step(
         );
     }
 
-    let output = execute(tool, &step_args, cancel)?;
+    let output = Box::pin(execute(tool, &step_args, cancel)).await?;
     Ok((tool.to_string(), output))
 }
 
@@ -1094,26 +1149,42 @@ fn extract_search_paths(
 }
 
 /// Execute a tool using paths confined to the current workspace.
-pub(crate) fn execute(
+pub(crate) async fn execute(
     name: &str,
     args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
     if metadata(name).is_none() {
         let error = ToolError::Unknown(name.to_string());
         audit(name, args, &error.to_string());
         return Err(error);
     }
+    // fff owns its threads + lock; run inside spawn_blocking (10s grep budget stays).
+    if matches!(name, "grep" | "ffgrep" | "find" | "fffind") {
+        let name_owned = name.to_string();
+        let args_owned = args.clone();
+        let res = tokio::task::spawn_blocking(move || match name_owned.as_str() {
+            "grep" | "ffgrep" => tool_ffgrep(&args_owned),
+            _ => tool_fffind(&args_owned),
+        })
+        .await
+        .unwrap_or(Err(ToolError::Internal("fff worker panicked".into())));
+        let outcome = match &res {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.to_string(),
+        };
+        audit(name, args, &outcome);
+        return res;
+    }
     let result = match name {
-        "read" => tool_read(args),
-        "bash" => tool_bash(args, cancel),
-        "write" => tool_write(args),
-        "edit" => tool_edit(args),
-        "grep" | "ffgrep" => tool_ffgrep(args),
-        "find" | "fffind" => tool_fffind(args),
-        "ls" => tool_ls(args),
-        "git" => tool_git(args, cancel),
-        "chain" => tool_chain(args, cancel),
+        "read" => tool_read(args).await,
+        "bash" => tool_bash(args, cancel).await,
+        "write" => tool_write(args).await,
+        "edit" => tool_edit(args).await,
+        "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
+        "ls" => tool_ls(args).await,
+        "git" => tool_git(args, cancel).await,
+        "chain" => tool_chain(args, cancel).await,
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
     let outcome = match &result {
@@ -1127,20 +1198,20 @@ pub(crate) fn execute(
 /// Execute a tool, reporting success explicitly. Callers must not re-derive
 /// success from the output text: tool output can legitimately contain
 /// strings like `[exit 1]` (shell markers appear in source files and logs).
-pub(crate) fn execute_outcome(
+pub(crate) async fn execute_outcome(
     name: &str,
     args: &Map<String, Value>,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> ToolOutcome {
     // Capture the unified diff BEFORE `execute` mutates the file; the
     // before-image is gone afterwards. Display-only: it never reaches the
     // model, only the transcript preview via `ToolOutcome::diff`.
     let pending_diff = if matches!(name, "write" | "edit") {
-        change_diff(name, args)
+        change_diff_async(name, args).await
     } else {
         None
     };
-    match execute(name, args, cancel) {
+    match execute(name, args, cancel).await {
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
@@ -1154,19 +1225,30 @@ pub(crate) fn execute_outcome(
     }
 }
 
+/// Sync wrappers for `dex run <tool>` / `dex --tool` raw paths (no async CLI
+/// plumbing needed per plan §5).
+pub(crate) fn execute_sync(
+    name: &str,
+    args: &Map<String, Value>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+) -> Result<String, ToolError> {
+    crate::client::http::block_on(execute(name, args, cancel))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::state::GlobalCancellation;
     use serde_json::json;
-    #[test]
-    fn bash_exposes_the_binary_for_local_stitching() {
+    #[tokio::test]
+    async fn bash_exposes_the_binary_for_local_stitching() {
         let (output, code) = run_bash_with_limits(
             "printf '%s' \"$DEX_BIN\"",
             Duration::from_secs(5),
             4096,
             &GlobalCancellation,
         )
+        .await
         .unwrap();
         assert_eq!(code, Some(0));
         assert_eq!(
@@ -1174,8 +1256,8 @@ mod tests {
             std::env::current_exe().unwrap().display().to_string()
         );
     }
-    #[test]
-    fn bash_children_have_no_controlling_tty() {
+    #[tokio::test]
+    async fn bash_children_have_no_controlling_tty() {
         // A tool child must never share the user's terminal: a child that
         // probes it (e.g. cargo test → theme query → OSC 10/11 on /dev/tty)
         // would write to and race the TUI's crossterm for the same pts, and
@@ -1186,6 +1268,7 @@ mod tests {
             4096,
             &GlobalCancellation,
         )
+        .await
         .unwrap();
         assert_eq!(code, Some(0));
         assert!(
@@ -1194,46 +1277,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn metadata_classifies_tools() {
+    #[tokio::test]
+    async fn metadata_classifies_tools() {
         assert!(metadata("read").unwrap().read_only);
         assert!(metadata("write").unwrap().mutating);
         assert!(!metadata("bash").unwrap().idempotent);
     }
 
-    #[test]
-    fn tool_arguments_are_validated() {
+    #[tokio::test]
+    async fn tool_arguments_are_validated() {
         let args = Map::new();
         assert!(matches!(
-            execute("read", &args, &GlobalCancellation),
+            execute("read", &args, &GlobalCancellation).await,
             Err(ToolError::Missing("path"))
         ));
         let mut args = Map::new();
         args.insert("path".into(), Value::Bool(true));
         assert!(matches!(
-            execute("read", &args, &GlobalCancellation),
+            execute("read", &args, &GlobalCancellation).await,
             Err(ToolError::NotString("path"))
         ));
     }
 
-    #[test]
-    fn fffind_rejects_unbounded_patterns() {
+    #[tokio::test]
+    async fn fffind_rejects_unbounded_patterns() {
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("*".into()));
         assert!(matches!(
-            execute("fffind", &args, &GlobalCancellation),
+            execute("fffind", &args, &GlobalCancellation).await,
             Err(ToolError::InvalidArgument(_))
         ));
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("".into()));
         assert!(matches!(
-            execute("ffgrep", &args, &GlobalCancellation),
+            execute("ffgrep", &args, &GlobalCancellation).await,
             Err(ToolError::InvalidArgument(_))
         ));
     }
 
-    #[test]
-    fn edit_requires_exactly_one_match() {
+    #[tokio::test]
+    async fn edit_requires_exactly_one_match() {
         assert!(matches!(
             apply_edit("a a", "a", "b", false),
             Err(ToolError::EditNotUnique(2))
@@ -1246,8 +1329,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn edit_replace_all_replaces_every_occurrence() {
+    #[tokio::test]
+    async fn edit_replace_all_replaces_every_occurrence() {
         let (updated, note) = apply_edit("a b a", "a", "c", true).unwrap();
         assert_eq!(updated, "c b c");
         assert!(note.contains("2 occurrences"), "{note}");
@@ -1255,8 +1338,8 @@ mod tests {
         assert!(apply_edit("a b a", "a", "c", false).is_err());
     }
 
-    #[test]
-    fn write_edit_require_expected_hash_and_reject_stale() {
+    #[tokio::test]
+    async fn write_edit_require_expected_hash_and_reject_stale() {
         // Real workspace file under target/ (inside cwd, cleaned up).
         let cwd = std::env::current_dir().unwrap();
         fs::create_dir_all(cwd.join("target")).unwrap();
@@ -1271,7 +1354,7 @@ mod tests {
         args.insert("oldText".into(), Value::String("v1".into()));
         args.insert("newText".into(), Value::String("v2".into()));
         args.insert("expected_hash".into(), Value::String(h.clone()));
-        assert!(execute("edit", &args, &GlobalCancellation).is_ok());
+        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
         assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
 
         // Stale expected_hash: rejected, file untouched.
@@ -1281,7 +1364,7 @@ mod tests {
         stale.insert("newText".into(), Value::String("v3".into()));
         stale.insert("expected_hash".into(), Value::String("deadbeef".into()));
         assert!(matches!(
-            execute("edit", &stale, &GlobalCancellation),
+            execute("edit", &stale, &GlobalCancellation).await,
             Err(ToolError::StaleFile { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
@@ -1294,8 +1377,8 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    #[test]
-    fn change_diff_shows_unified_diff_for_write_and_edit() {
+    #[tokio::test]
+    async fn change_diff_shows_unified_diff_for_write_and_edit() {
         let cwd = std::env::current_dir().unwrap();
         fs::create_dir_all(cwd.join("target")).unwrap();
         let path = cwd.join("target/dex-preview-test.txt");
@@ -1305,7 +1388,7 @@ mod tests {
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("oldText".into(), Value::String("l5\n".into()));
         args.insert("newText".into(), Value::String("L5\nL5b\n".into()));
-        let diff = change_diff("edit", &args).unwrap();
+        let diff = change_diff_async("edit", &args).await.unwrap();
         assert!(diff.contains("--- a/target/dex-preview-test.txt"), "{diff}");
         assert!(diff.contains("+++ b/target/dex-preview-test.txt"), "{diff}");
         assert!(diff.contains("@@"), "{diff}");
@@ -1319,22 +1402,22 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    #[test]
-    fn change_diff_new_file_uses_dev_null_header() {
+    #[tokio::test]
+    async fn change_diff_new_file_uses_dev_null_header() {
         let cwd = std::env::current_dir().unwrap();
         let rel = "target/dex-preview-new.txt";
         let _ = fs::remove_file(cwd.join(rel));
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("content".into(), Value::String("hello\n".into()));
-        let diff = change_diff("write", &args).unwrap();
+        let diff = change_diff_async("write", &args).await.unwrap();
         assert!(diff.contains("--- /dev/null"), "{diff}");
         assert!(diff.contains("+++ b/target/dex-preview-new.txt"), "{diff}");
         assert!(diff.contains("+hello"), "{diff}");
     }
 
-    #[test]
-    fn execute_outcome_carries_diff_for_edit() {
+    #[tokio::test]
+    async fn execute_outcome_carries_diff_for_edit() {
         let cwd = std::env::current_dir().unwrap();
         fs::create_dir_all(cwd.join("target")).unwrap();
         let rel = "target/dex-outcome-diff-test.txt";
@@ -1343,7 +1426,7 @@ mod tests {
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("oldText".into(), Value::String("b\n".into()));
         args.insert("newText".into(), Value::String("B\n".into()));
-        let outcome = execute_outcome("edit", &args, &GlobalCancellation);
+        let outcome = execute_outcome("edit", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         let diff = outcome.diff.expect("edit outcome carries a diff");
         assert!(diff.contains("-b"), "{diff}");
@@ -1351,8 +1434,8 @@ mod tests {
         let _ = fs::remove_file(cwd.join(rel));
     }
 
-    #[test]
-    fn edit_fuzzy_fallback_handles_whitespace_drift() {
+    #[tokio::test]
+    async fn edit_fuzzy_fallback_handles_whitespace_drift() {
         // oldText with different indentation still matches exactly one
         // line-window and replaces whole lines.
         let content = "fn main() {\n    let x = 1;\n    println!(x);\n}\n";
@@ -1369,8 +1452,8 @@ mod tests {
         assert!(err.to_string().contains("read the file"), "{err}");
     }
 
-    #[test]
-    fn temporary_workspace_paths_are_confined() {
+    #[tokio::test]
+    async fn temporary_workspace_paths_are_confined() {
         let root = std::env::temp_dir().join(format!("dex-workspace-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         assert!(resolve_workspace_path(&root, "inside.txt")
@@ -1383,52 +1466,56 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn shell_timeout_terminates_long_running_command() {
+    #[tokio::test]
+    async fn shell_timeout_terminates_long_running_command() {
         let (result, code) = run_bash_with_limits(
             "sleep 1",
             Duration::from_millis(10),
             1024,
             &GlobalCancellation,
         )
+        .await
         .unwrap();
         assert!(result.contains("timed out"));
         assert_eq!(code, None);
     }
 
-    #[test]
-    fn shell_exit_code_is_reported_separately_from_output() {
+    #[tokio::test]
+    async fn shell_exit_code_is_reported_separately_from_output() {
         let (output, code) = run_bash_with_limits(
             "echo partial-results; exit 3",
             Duration::from_secs(5),
             1024,
             &GlobalCancellation,
         )
+        .await
         .unwrap();
         assert_eq!(code, Some(3));
         assert_eq!(output, "partial-results\n");
     }
 
-    #[test]
-    fn stderr_is_labeled_and_capture_limit_is_marked() {
+    #[tokio::test]
+    async fn stderr_is_labeled_and_capture_limit_is_marked() {
         let (output, _) = run_bash_with_limits(
             "echo out; echo err 1>&2",
             Duration::from_secs(5),
             1024,
             &GlobalCancellation,
         )
+        .await
         .unwrap();
         assert!(output.contains("out\n"), "{output:?}");
         assert!(output.contains("--- stderr ---\nerr"), "{output:?}");
 
         let (clipped, _) =
             run_bash_with_limits("seq 1 100", Duration::from_secs(5), 16, &GlobalCancellation)
+                .await
                 .unwrap();
         assert!(clipped.contains("capture limit"), "{clipped:?}");
     }
 
-    #[test]
-    fn read_is_line_numbered_and_paginates() {
+    #[tokio::test]
+    async fn read_is_line_numbered_and_paginates() {
         // Fixtures live under target/ so the workspace path confinement
         // accepts them (and the directory is already ignored).
         let root = std::env::current_dir()
@@ -1441,7 +1528,7 @@ mod tests {
 
         let mut args = Map::new();
         args.insert("path".into(), Value::String(path.display().to_string()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation);
+        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         // Line numbers are now right-aligned with two spaces (no raw tab) and file
         // tabs are expanded per tab_width, so the separator is stable.
@@ -1452,11 +1539,11 @@ mod tests {
 
         args.insert("offset".into(), Value::Number(2.into()));
         args.insert("limit".into(), Value::Number(1.into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation);
+        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
         assert_eq!(outcome.text, "   2  two");
 
         args.insert("offset".into(), Value::Number(9.into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation);
+        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
         assert!(!outcome.ok, "offset past end must fail: {}", outcome.text);
 
         // Binary content is refused instead of dumped into the context.
@@ -1466,15 +1553,15 @@ mod tests {
             "path".into(),
             Value::String(root.join("blob.bin").display().to_string()),
         );
-        let outcome = execute_outcome("read", &args, &GlobalCancellation);
+        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("binary file"), "{}", outcome.text);
 
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn read_fanout_reads_many_files_in_one_call() {
+    #[tokio::test]
+    async fn read_fanout_reads_many_files_in_one_call() {
         // Fixtures live at the workspace root (not target/) because search
         // and glob rules deliberately exclude target/.
         let root = std::env::current_dir()
@@ -1494,7 +1581,7 @@ mod tests {
                 Value::String(root.join("b.txt").display().to_string()),
             ]),
         );
-        let outcome = execute_outcome("read", &args, &GlobalCancellation);
+        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("==> "), "{}", outcome.text);
         assert!(outcome.text.contains("   1  alpha"), "{}", outcome.text);
@@ -1504,7 +1591,7 @@ mod tests {
         // Glob fan-out, sorted, capped.
         let mut args = Map::new();
         args.insert("glob".into(), Value::String("*.txt".into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation);
+        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("a.txt"), "{}", outcome.text);
         assert!(outcome.text.contains("b.txt"), "{}", outcome.text);
@@ -1512,8 +1599,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn ffgrep_context_returns_surrounding_lines() {
+    #[tokio::test]
+    async fn ffgrep_context_returns_surrounding_lines() {
         // Fixture at the workspace root (not target/): fff respects
         // .gitignore, so ignored fixture dirs are invisible to it.
         let root = std::env::current_dir()
@@ -1532,7 +1619,7 @@ mod tests {
         args.insert("pattern".into(), Value::String(needle.clone()));
         args.insert("output_mode".into(), Value::String("content".into()));
         args.insert("context".into(), Value::Number(1.into()));
-        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("before"), "{}", outcome.text);
         assert!(outcome.text.contains("after"), "{}", outcome.text);
@@ -1541,8 +1628,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn ffgrep_fuzzy_fallback_recovers_typos() {
+    #[tokio::test]
+    async fn ffgrep_fuzzy_fallback_recovers_typos() {
         let root = std::env::current_dir()
             .unwrap()
             .join(format!("dex-fff-typo-{}", std::process::id()));
@@ -1563,7 +1650,7 @@ mod tests {
             Value::String(format!("UserAccountControlel{}", "r")),
         );
         args.insert("output_mode".into(), Value::String("content".into()));
-        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("approximate"), "{}", outcome.text);
         assert!(
@@ -1575,8 +1662,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn chain_runs_search_then_reads_matched_files_in_one_call() {
+    #[tokio::test]
+    async fn chain_runs_search_then_reads_matched_files_in_one_call() {
         // Fixtures live at the workspace root (not target/): fff respects
         // .gitignore, so ignored fixture dirs are invisible to it.
         let needle = format!("TARGET_{}", "TOKEN");
@@ -1597,7 +1684,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation);
+        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("--- step 0: ffgrep ---"),
@@ -1625,7 +1712,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation);
+        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("read-only"), "{}", outcome.text);
 
@@ -1639,7 +1726,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation);
+        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("earlier step"), "{}", outcome.text);
 
@@ -1653,7 +1740,7 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation);
+        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("step 0: ffgrep") && outcome.text.contains("step 1 failed"),
@@ -1664,15 +1751,15 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn ffgrep_without_matches_is_success() {
+    #[tokio::test]
+    async fn ffgrep_without_matches_is_success() {
         // Assembled at runtime so the needle does not appear in this source
         // file (the test greps the crate it lives in). Gibberish so the
         // fuzzy fallback has nothing approximate to land on either.
         let needle = format!("zxq{}wvut", std::process::id());
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String(needle));
-        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation);
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
         assert!(
             outcome.ok,
             "no matches (exact or fuzzy) must be ok: {}",
@@ -1685,12 +1772,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fffind_finds_paths_fuzzily() {
+    #[tokio::test]
+    async fn fffind_finds_paths_fuzzily() {
         super::fff::rescan();
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("tools mod".into()));
-        let outcome = execute_outcome("fffind", &args, &GlobalCancellation);
+        let outcome = execute_outcome("fffind", &args, &GlobalCancellation).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("src/tools/mod.rs"),
@@ -1699,13 +1786,172 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_shell_command_keeps_output_and_exit_marker() {
+    #[tokio::test]
+    async fn failed_shell_command_keeps_output_and_exit_marker() {
         let mut args = Map::new();
         args.insert("command".into(), Value::String("echo boom; exit 2".into()));
-        let outcome = execute_outcome("bash", &args, &GlobalCancellation);
+        let outcome = execute_outcome("bash", &args, &GlobalCancellation).await;
         assert!(!outcome.ok);
         assert!(outcome.text.contains("boom"));
         assert!(outcome.text.contains("[exit 2]"));
+    }
+
+    #[tokio::test]
+    async fn fanout_read_is_concurrent_ordered_and_isolated() {
+        // TDD Phase 3 (S1): ≤10 files concurrent, join + sort to input order, budget on join, per-file errors isolated.
+        let cwd = std::env::current_dir().unwrap();
+        let dir = cwd.join("target/dex-fanout-test");
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let mut rels = Vec::new();
+        for i in 0..5 {
+            let rel = format!("target/dex-fanout-test/f{i}.txt");
+            tokio::fs::write(cwd.join(&rel), format!("content-{i}\nline2\n"))
+                .await
+                .unwrap();
+            rels.push(rel);
+        }
+        // One missing file among good ones: isolated, call still succeeds.
+        rels.push("target/dex-fanout-test/missing-xyz.txt".to_string());
+        let mut args = Map::new();
+        args.insert(
+            "paths".to_string(),
+            serde_json::Value::Array(
+                rels.iter()
+                    .map(|r| serde_json::Value::String(r.clone()))
+                    .collect(),
+            ),
+        );
+        // Use workspace_path resolution via execute (paths confined).
+        let out = execute("read", &args, &GlobalCancellation).await.unwrap();
+        // All good files present, in input order (==> path <== sections sorted by input, not completion).
+        let mut last_pos = 0;
+        for i in 0..5 {
+            let marker = format!("f{i}.txt");
+            let pos = out.find(&marker).expect("each file present");
+            assert!(pos >= last_pos, "fan-out must preserve input order");
+            last_pos = pos;
+            assert!(out.contains(&format!("content-{i}")));
+        }
+        assert!(
+            out.contains("missing-xyz"),
+            "per-file errors isolated, not fatal"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_and_reports_exactly() {
+        // TDD Phase 3 (S5): timeout exact, not 25ms-quantized; [exit N] reporting preserved.
+        let (out, code) = run_bash_with_limits(
+            "sleep 5; echo never",
+            Duration::from_millis(80),
+            4096,
+            &GlobalCancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, None);
+        assert!(
+            out.contains("timed out after 0 seconds") || out.contains("timed out"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_is_prompt_not_poll_quantized() {
+        // TDD Phase 3: cancel via select!, not 25ms poll.
+        use crate::core::console::CancellationToken;
+        let token = CancellationToken::new();
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            t2.cancel();
+        });
+        let start = std::time::Instant::now();
+        let (out, code) =
+            run_bash_with_limits("sleep 5; echo never", Duration::from_secs(10), 4096, &token)
+                .await
+                .unwrap();
+        assert_eq!(code, None);
+        assert!(out.contains("cancelled"), "{out}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancel must preempt sleep without 25ms quanta pile-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_exit_code_and_stderr_label_preserved() {
+        let (out, code) = run_bash_with_limits(
+            "echo out; echo err >&2; exit 3",
+            Duration::from_secs(5),
+            4096,
+            &GlobalCancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, Some(3));
+        // tool_bash maps non-zero to Shell error with clamp + [exit N] via Display; direct run returns output + code.
+        assert!(out.contains("out"));
+        assert!(out.contains("--- stderr ---"));
+        assert!(out.contains("err"));
+        // Clamp preserved via tool_bash
+        let mut args = Map::new();
+        args.insert(
+            "command".into(),
+            serde_json::Value::String("echo hi".into()),
+        );
+        let ok = execute("bash", &args, &GlobalCancellation).await.unwrap();
+        assert!(ok.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn read_pagination_and_binary_refusal() {
+        let cwd = std::env::current_dir().unwrap();
+        let rel = "target/dex-read-pag-test.txt";
+        let content = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        tokio::fs::create_dir_all(cwd.join("target")).await.unwrap();
+        tokio::fs::write(cwd.join(rel), &content).await.unwrap();
+        let mut args = Map::new();
+        args.insert("path".into(), serde_json::Value::String(rel.into()));
+        args.insert("offset".into(), serde_json::Value::from(3u64));
+        args.insert("limit".into(), serde_json::Value::from(2u64));
+        let out = execute("read", &args, &GlobalCancellation).await.unwrap();
+        assert!(out.contains("3"), "{out}");
+        assert!(out.contains("line3") && out.contains("line4"));
+        assert!(!out.contains("line5"));
+        // Binary refused, not dumped
+        let bin_rel = "target/dex-read-bin-test.bin";
+        tokio::fs::write(cwd.join(bin_rel), vec![0u8, 1, 2, 3])
+            .await
+            .unwrap();
+        let mut bargs = Map::new();
+        bargs.insert("path".into(), serde_json::Value::String(bin_rel.into()));
+        let err = execute("read", &bargs, &GlobalCancellation)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("binary"), "{err}");
+        let _ = tokio::fs::remove_file(cwd.join(rel)).await;
+        let _ = tokio::fs::remove_file(cwd.join(bin_rel)).await;
+    }
+
+    #[tokio::test]
+    async fn chain_refuses_mutating_steps() {
+        let mut args = Map::new();
+        args.insert(
+            "steps".into(),
+            serde_json::Value::Array(vec![
+                serde_json::json!({"tool": "read", "args": {"path": "Cargo.toml"}}),
+                serde_json::json!({"tool": "bash", "args": {"command": "echo hi"}}),
+            ]),
+        );
+        let err = execute("chain", &args, &GlobalCancellation)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
     }
 }

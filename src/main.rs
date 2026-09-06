@@ -12,7 +12,7 @@ mod ui;
 
 use crate::cli::{Args, Mode};
 use crate::session::{load_messages_from_session, Session};
-use crate::tools::execute;
+use crate::tools::execute_sync as execute;
 
 use crate::agent::r#loop::process_turn;
 use crate::agent::state::{GlobalCancellation, ToolState};
@@ -82,7 +82,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     messages.push(user);
     let mut state = ToolState::load();
     let console = crate::core::console::Console::none();
-    let result = process_turn(
+    let result = crate::client::http::block_on(process_turn(
         &config,
         &mut messages,
         &mut state,
@@ -92,7 +92,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         &config,
         &crate::agent::state::GlobalCancellation,
         &console,
-    );
+    ));
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {
             "turn_complete"
@@ -101,7 +101,9 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         });
     }
     println!();
-    result.map(|_| ())
+    result
+        .map(|_| ())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
 }
 
 fn run_interactive() {

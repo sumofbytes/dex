@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
 use crate::agent::tokens::{message_char_len, PER_MESSAGE_OVERHEAD};
@@ -297,11 +297,11 @@ const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversati
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
-pub(crate) fn summarize_old_messages(
+pub(crate) async fn summarize_old_messages(
     config: &LlmConfig,
     old: &[ChatMessage],
-    cancel: &dyn CancellationSource,
-) -> Result<(String, Option<Usage>), Box<dyn std::error::Error>> {
+    cancel: &(dyn CancellationSource + Send + Sync),
+) -> Result<(String, Option<Usage>), Box<dyn std::error::Error + Send + Sync>> {
     // Pi-like: serialize via `serialize_conversation` (via convertToLlm -> serialize),
     // handle previousSummary iterative, file ops via prompt, and custom instructions.
     // Preserve orientation anchors verbatim so compaction never erases the task.
@@ -345,9 +345,9 @@ pub(crate) fn summarize_old_messages(
     // raw to stdout, which inside the TUI process is the alternate screen —
     // the internal summary then ghosts over the UI until the next resize
     // repaint. A dropped receiver makes every send fail silently instead.
-    let (sink, rx) = mpsc::channel();
+    let (sink, rx) = mpsc::channel(16);
     drop(rx);
-    let turn = call_llm(config, &prompt, false, Some(sink), cancel)?;
+    let turn = call_llm(config, &prompt, false, Some(sink), cancel).await?;
     Ok((turn.message.content.unwrap_or_default(), turn.usage))
 }
 
@@ -540,10 +540,10 @@ pub(crate) fn find_cutoff_by_tokens(
     }
 }
 
-pub(crate) fn compact_history(
+pub(crate) async fn compact_history(
     _config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
-    _cancel: &dyn CancellationSource,
+    _cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -609,7 +609,7 @@ pub(crate) fn compact_history(
     let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
         // Use LLM path: if split, generate history + turn prefix separately then merge
         let history_summary = if !messages_to_summarize.is_empty() {
-            match summarize_old_messages(_config, &messages_to_summarize, _cancel) {
+            match summarize_old_messages(_config, &messages_to_summarize, _cancel).await {
                 Ok((s, u)) if !s.trim().is_empty() => {
                     merge_usage(&mut usage_total, u);
                     s
@@ -651,18 +651,18 @@ pub(crate) fn compact_history(
                     prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
                 )),
             ];
-            let (sink, rx) = mpsc::channel();
+            let (sink, rx) = mpsc::channel(16);
             drop(rx);
-            let prefix_summary = match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel)
-            {
-                Ok(turn) => {
-                    merge_usage(&mut usage_total, turn.usage);
-                    turn.message.content.unwrap_or_default()
-                }
-                Err(_) => {
-                    deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
-                }
-            };
+            let prefix_summary =
+                match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel).await {
+                    Ok(turn) => {
+                        merge_usage(&mut usage_total, turn.usage);
+                        turn.message.content.unwrap_or_default()
+                    }
+                    Err(_) => {
+                        deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
+                    }
+                };
             // Merge pi-like: history + "---" + turn context
             let (read_files, modified_files) = compute_file_lists(&file_ops);
             let file_section = format_file_operations(&read_files, &modified_files);

@@ -1498,7 +1498,7 @@ mod tests {
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
-                client: reqwest::blocking::Client::new(),
+                client: reqwest::Client::new(),
             },
             messages: Vec::new(),
             tool_state: super::super::ToolState::default(),
@@ -1982,7 +1982,7 @@ mod tests {
     fn approval_overlay_renders_action_and_choices() {
         // Input is raw JSON — overlay must render it as a readable `"$ cargo test"`
         // plus the human title, not the raw `bash cargo test` dump.
-        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
         let mut app = test_app();
         app.pending_approval = Some(super::super::PendingApproval {
             name: "bash".to_string(),
@@ -2026,7 +2026,7 @@ mod tests {
             "{symbols}"
         );
         // Second check: write tool formats path/lines, not raw JSON
-        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
         let mut app2 = test_app();
         app2.pending_approval = Some(super::super::PendingApproval {
             name: "write".to_string(),

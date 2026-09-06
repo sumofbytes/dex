@@ -107,10 +107,10 @@ pub(crate) enum AuthScheme {
 impl AuthScheme {
     pub(crate) fn apply(
         self,
-        request: reqwest::blocking::RequestBuilder,
+        request: reqwest::RequestBuilder,
         api_key: &str,
         account_id: Option<&str>,
-    ) -> reqwest::blocking::RequestBuilder {
+    ) -> reqwest::RequestBuilder {
         let request = request.bearer_auth(api_key);
         match self {
             Self::Bearer => request,
@@ -157,7 +157,7 @@ mod tests {
         let req = Provider::OpenAiCodex
             .auth_scheme()
             .apply(
-                reqwest::blocking::Client::new().get("http://localhost/v1"),
+                reqwest::Client::new().get("http://localhost/v1"),
                 "tok",
                 Some("acct"),
             )

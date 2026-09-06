@@ -809,6 +809,85 @@ fn read_first_line(path: &Path) -> Option<String> {
     }
 }
 
+async fn read_first_line_async(path: PathBuf) -> Option<String> {
+    use tokio::io::AsyncBufReadExt as _;
+    let file = tokio::fs::File::open(&path).await.ok()?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut first = String::new();
+    match reader.read_line(&mut first).await {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(first),
+    }
+}
+
+/// Async full-history load: streaming file, fast — short `spawn_blocking`.
+pub(crate) async fn load_messages_from_session_async(
+    path: PathBuf,
+) -> io::Result<Vec<ChatMessage>> {
+    tokio::task::spawn_blocking(move || load_messages_from_session(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Header-only reads: async (no blocking pool).
+pub(crate) async fn has_messages_async(path: PathBuf) -> bool {
+    tokio::task::spawn_blocking(move || has_messages(&path))
+        .await
+        .unwrap_or(false)
+}
+
+impl Session {
+    /// Async `list_all`: `JoinSet` (`spawn_blocking` per file, join, sort) —
+    /// fixes the linear scan (S2 cold-start 50x10ms ~500ms → ~50ms parallel).
+    pub(crate) async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+        let base = Self::session_dir();
+        let mut dirs = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(&base).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let dir = entry.path();
+                // Prefer async file_type; fallback to sync is_dir for races.
+                let is_dir = entry
+                    .file_type()
+                    .await
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or_else(|_| dir.is_dir());
+                if is_dir {
+                    dirs.push(dir);
+                }
+            }
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for dir in dirs {
+            set.spawn(tokio::task::spawn_blocking(move || {
+                let mut out = Vec::new();
+                if let Ok(files) = fs::read_dir(&dir) {
+                    for file in files.flatten() {
+                        let path = file.path();
+                        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                            if let Some(first) = read_first_line(&path) {
+                                if let Ok(header) =
+                                    serde_json::from_str::<SessionHeader>(first.trim_end())
+                                {
+                                    out.push((path, header));
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            }));
+        }
+        let mut sessions = Vec::new();
+        while let Some(r) = set.join_next().await {
+            if let Ok(Ok(mut v)) = r {
+                sessions.append(&mut v);
+            }
+        }
+        sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        Ok(sessions)
+    }
+}
+
 pub(crate) fn load_plan(path: &Path) -> crate::core::types::Plan {
     load_session_state(path)
         .ok()
@@ -1065,6 +1144,10 @@ mod tests {
 
     #[test]
     fn events_journal_replays_after_seq_cursor() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-events-test".into(), None).unwrap();
         s.append_event(0, r#"{"type":"assistant_text","data":"a"}"#)
             .unwrap();
@@ -1104,6 +1187,10 @@ mod tests {
 
     #[test]
     fn change_ledger_records_then_undo_restores() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-undo-test".into(), None).unwrap();
         let work = s.path().unwrap().parent().unwrap().join("work.txt");
         fs::write(&work, b"before\n").unwrap();
@@ -1138,6 +1225,10 @@ mod tests {
 
     #[test]
     fn undo_refuses_when_file_moved_on() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-undo-concurrent".into(), None).unwrap();
         let work = s.path().unwrap().parent().unwrap().join("c.txt");
         fs::write(&work, b"v1\n").unwrap();
@@ -1168,6 +1259,10 @@ mod tests {
 
     #[test]
     fn effect_journal_records_intent_and_outcome() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-effect-test".into(), None).unwrap();
         s.effect_start("call-1", "edit", "abc").unwrap();
         s.turn_event("turn_start").unwrap();
@@ -1186,6 +1281,10 @@ mod tests {
 
     #[test]
     fn record_skills_writes_session_state_entry() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let skills = vec![crate::core::types::Skill {
             name: "demo".into(),
             description: "does demo things".into(),
@@ -1226,6 +1325,10 @@ mod tests {
 
     #[test]
     fn new_session_defaults_name_but_keeps_explicit() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let s = Session::new("/tmp/dex-name-default".into(), None).unwrap();
         let name = s.name().unwrap().to_string();
         assert!(name.starts_with("dex-name-default-"), "got: {name}");
@@ -1241,5 +1344,33 @@ mod tests {
         assert_eq!(s.name(), Some("mine"));
         let path = s.path().unwrap().to_path_buf();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn session_async_readers_match_sync() {
+        // TDD Phase 6: async file streams / spawn_blocking, same wire format, same undo ledger.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-sess-async-{}", std::process::id()));
+        let _env = EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut s = Session::new("/tmp/async-cwd".into(), None).unwrap();
+        let msg = ChatMessage::user("hello async");
+        s.append_message(msg.clone()).unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+        let sync_msgs = load_messages_from_session(&path).unwrap();
+        let async_msgs = load_messages_from_session_async(path.clone())
+            .await
+            .unwrap();
+        assert_eq!(sync_msgs.len(), async_msgs.len());
+        assert_eq!(sync_msgs[0].content, async_msgs[0].content);
+        // list_all_async matches list_all (JoinSet, join, sort)
+        let sync_list = Session::list_all().unwrap();
+        let async_list = Session::list_all_async().await.unwrap();
+        assert_eq!(sync_list.len(), async_list.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

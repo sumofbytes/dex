@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc;
 
 use crate::core::console::CancellationToken;
 use crate::core::types::ApprovalDecision;
@@ -14,7 +15,7 @@ use crate::core::types::ApprovalDecision;
 /// A tool execution awaiting the client's approval decision.
 pub(crate) struct PendingApproval {
     pub(crate) session_id: String,
-    pub(crate) response: mpsc::Sender<ApprovalDecision>,
+    pub(crate) response: tokio::sync::mpsc::Sender<ApprovalDecision>,
     pub(crate) name: String,
     pub(crate) input: String,
 }
@@ -177,36 +178,54 @@ impl DaemonState {
     /// were interrupted by the crash (`turn_start` with no terminal entry) as
     /// `turn_failed` so a reattaching client sees the truth instead of a ghost.
     ///
-    /// Runs on a background thread at startup: all file IO happens lock-free
-    /// and the registry lock is held only for the final insert, so serving
-    /// (notably `POST /api/sessions`) never blocks behind the scan. Entries
-    /// use `or_insert` so sessions created while the rebuild was in flight
-    /// win over their (nonexistent) disk state.
-    pub fn rebuild(&self) {
+    /// Runs on a background task at startup: per-session scans run
+    /// concurrently in a `JoinSet` (`spawn_blocking` per file, join, sort),
+    /// fixing the linear scan; the registry lock is held only for the final
+    /// insert. Entries use `or_insert` so sessions created while the rebuild
+    /// was in flight win over their (nonexistent) disk state.
+    #[allow(clippy::type_complexity)]
+    /// Async parallel rebuild: per-session scans in a `JoinSet`
+    /// (`spawn_blocking` per file, join, sort). Used by the background task.
+    pub(crate) async fn rebuild_async(&self) {
+        let listed = tokio::task::spawn_blocking(crate::session::Session::list_all)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let mut set = tokio::task::JoinSet::new();
+        for (path, header) in listed {
+            let id = header.id().to_string();
+            let name = header.name().map(ToOwned::to_owned);
+            let cwd = header.cwd().to_string();
+            let path_c = path.clone();
+            set.spawn(tokio::task::spawn_blocking(move || {
+                let seq_next = crate::session::Session::max_event_seq(&path_c).map_or(0, |m| m + 1);
+                let interrupted =
+                    crate::session::Session::last_turn_state(&path_c) == "interrupted";
+                (id, path_c, name, cwd, seq_next, interrupted)
+            }));
+        }
+        let mut scanned: Vec<(String, PathBuf, Option<String>, String, u64, bool)> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Ok(v)) = joined {
+                scanned.push(v);
+            }
+        }
+        scanned.sort_by(|a, b| a.0.cmp(&b.0));
         let mut entries = Vec::new();
         let mut interrupted = Vec::new();
-        for (path, header) in crate::session::Session::list_all().unwrap_or_default() {
-            let id = header.id().to_string();
-            self.seed_seq(&id, &path);
-            if crate::session::Session::last_turn_state(&path) == "interrupted" {
+        for (id, path, name, cwd, seq_next, is_interrupted) in scanned {
+            self.event_seqs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(id.clone())
+                .and_modify(|s| *s = (*s).max(seq_next))
+                .or_insert(seq_next);
+            if is_interrupted {
                 interrupted.push((id.clone(), path.clone()));
             }
-            entries.push((
-                id,
-                SessionEntry {
-                    path: path.clone(),
-                    name: header.name().map(ToOwned::to_owned),
-                    cwd: header.cwd().to_string(),
-                },
-            ));
+            entries.push((id, SessionEntry { path, name, cwd }));
         }
-        // Mark interrupted turns failed BEFORE merging the registry, skipping
-        // sessions with a turn currently in flight: a client may have
-        // reattached and started chatting while the scan ran, and appending
-        // `turn_failed` under its live `turn_start` would corrupt that turn.
-        // Registration alone (no live turn) stays markable — the marker is
-        // still the truth and no one is appending. Each liveness check is a
-        // brief lock immediately before its write.
         for (id, path) in &interrupted {
             let live = self
                 .active_turns
@@ -216,8 +235,6 @@ impl DaemonState {
             if live {
                 continue;
             }
-            // Session::from_path refuses in-memory (pathless) sessions but
-            // these all came from disk.
             if let Ok(mut s) = crate::session::Session::from_path(path) {
                 let _ = s.turn_event("turn_failed").and_then(|_| {
                     s.set_state(
@@ -248,9 +265,7 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
     // in `/health` stays false.
     let warm = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = tokio::task::spawn_blocking(move || warm.rebuild()).await {
-            eprintln!("dex daemon: session registry rebuild failed: {e}");
-        }
+        warm.rebuild_async().await;
     });
 
     let app = server::router(state.clone());
@@ -321,8 +336,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
         // Depends on where the sessions dir resolves; serialize against tests
         // that redirect XDG_DATA_HOME.
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -340,7 +356,7 @@ mod tests {
         drop(s);
 
         let state = DaemonState::new();
-        state.rebuild();
+        state.rebuild_async().await;
         // The session is in the registry after restart.
         {
             let sessions = state.sessions.lock().unwrap();
@@ -373,8 +389,9 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("events.jsonl"));
     }
 
-    #[test]
-    fn rebuild_skips_failed_marking_for_live_turns() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rebuild_skips_failed_marking_for_live_turns() {
         // A reattach + chat racing the background rebuild owns the journal:
         // stamping `turn_failed` under its live `turn_start` would corrupt it.
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -389,7 +406,7 @@ mod tests {
 
         let state = DaemonState::new();
         state.active_turns.lock().unwrap().insert(id.clone());
-        state.rebuild();
+        state.rebuild_async().await;
         // Still registered, but the live turn is untouched.
         assert!(state.sessions.lock().unwrap().contains_key(&id));
         assert_eq!(
@@ -399,8 +416,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn rebuild_registry_merge_keeps_live_entries() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rebuild_registry_merge_keeps_live_entries() {
         // Sessions claimed (reattached/created) mid-rebuild win over disk via
         // `or_insert` — the rebuild must not clobber them.
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -418,7 +436,7 @@ mod tests {
             cwd: "/tmp".into(),
         };
         state.sessions.lock().unwrap().insert(id.clone(), live);
-        state.rebuild();
+        state.rebuild_async().await;
         assert_eq!(
             state.sessions.lock().unwrap().get(&id).unwrap().path,
             std::path::PathBuf::from("/tmp/dex-live-wins-marker")

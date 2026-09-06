@@ -1,7 +1,6 @@
 use serde_json::Value;
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, effective_tokens, KEEP_RECENT_MESSAGES};
 use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
@@ -52,7 +51,7 @@ pub(crate) fn persist_pending(
 /// cost, so the remote client never re-prices locally), and the
 /// session-cumulative USD cost. Also used for compaction summarizer calls,
 /// which are billed too.
-fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
+async fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
     state.last_usage = Some(u.prompt_tokens);
     state.last_cached = u.cached_tokens;
     let cost =
@@ -68,63 +67,33 @@ fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u:
                     (u.prompt_tokens + u.completion_tokens) as f64 * rate_per_1k / 1000.0
                 }
             });
-    if let Some(sink) = console.sink() {
-        let _ = sink.send(SinkLine::Usage {
+    console
+        .emit_async(SinkLine::Usage {
             tokens: u.prompt_tokens,
             cached: u.cached_tokens,
             cost,
             output: u.completion_tokens,
-        });
-    }
+        })
+        .await;
     state.total_cost += cost;
 }
 
-fn call_client_cancellable(
-    client: &(impl ModelClient + Sync + Send + Clone + 'static),
-    cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
-    messages: &[ChatMessage],
-    with_tools: bool,
-    console: &Console,
-) -> Result<Turn, Box<dyn std::error::Error>> {
-    let client = (*client).clone();
-    let messages = messages.to_vec();
-    let sink = console.sink().cloned();
-    let handle = cancel.clone();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client
-                .complete(&messages, with_tools, sink, &handle)
-                .map_err(|error| error.to_string())
-        }))
-        .unwrap_or_else(|payload| {
-            let detail = payload
-                .downcast_ref::<&str>()
-                .map(|message| (*message).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            Err(format!("provider worker panicked: {}", detail))
-        });
-        let _ = tx.send(result);
-    });
+/// Async wait for cancellation on the sync trait: polls with async sleep
+/// (10ms) so `select!` wakes within ~10ms without a 50ms `recv_timeout`
+/// quantum. One path covers `CancellationToken`, `GlobalCancellation` and
+/// test doubles while keeping `CancellationSource` sync per plan.
+async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
     loop {
         if cancel.is_cancelled() {
-            return Err("cancelled by user".into());
+            return;
         }
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Ok(result)) => return Ok(result),
-            Ok(Err(error)) => return Err(error.into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("provider worker disconnected".into())
-            }
-        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-fn execute_tool_call(
+async fn execute_tool_call(
     call: &LlmToolCall,
-    cancel: &dyn CancellationSource,
+    cancel: &(dyn CancellationSource + Send + Sync),
 ) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
@@ -154,22 +123,22 @@ fn execute_tool_call(
         );
     };
     let input = serde_json::to_string(&args).unwrap_or_default();
-    let outcome = execute_outcome(&name, &args, cancel);
+    let outcome = execute_outcome(&name, &args, cancel).await;
     (name, input, outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn process_turn(
+pub(crate) async fn process_turn(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
     state: &mut ToolState,
-    steering_rx: Option<&mpsc::Receiver<String>>,
+    mut steering_rx: Option<&mut mpsc::Receiver<String>>,
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
     mut session: Option<&mut Session>,
-    client: &(impl ModelClient + Sync + Send + Clone + 'static),
-    cancel: &(impl CancellationSource + Clone + Send + Sync + 'static),
+    client: &(impl ModelClient + 'static),
+    cancel: &(impl CancellationSource + Clone + 'static),
     console: &Console,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
@@ -182,10 +151,14 @@ pub(crate) fn process_turn(
             let _ = cancellation.take_cancelled();
             return Err("cancelled by user".into());
         }
-        if let Some(rx) = steering_rx {
+        if let Some(rx) = steering_rx.as_mut() {
+            let mut drained: Vec<String> = Vec::new();
             while let Ok(steering) = rx.try_recv() {
+                drained.push(steering);
+            }
+            for steering in drained {
                 if let Some(accepted) = &steering_accepted_tx {
-                    let _ = accepted.send(steering.clone());
+                    let _ = accepted.send(steering.clone()).await;
                 }
                 messages.push(ChatMessage::user_named(steering, "steering"));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
@@ -202,13 +175,13 @@ pub(crate) fn process_turn(
             if !need_by_tokens && !need_by_count {
                 break;
             }
-            match compact_history(config, messages, cancel) {
+            match compact_history(config, messages, cancel).await {
                 Ok((true, compacted)) => {
                     compaction_attempts += 1;
                     // Summarizer calls are billed like any other; account
                     // them so the status-bar spend includes compaction.
                     if let Some(u) = compacted {
-                        record_usage(config, state, console, u);
+                        record_usage(config, state, console, u).await;
                     }
                     if let Some(session) = session.as_deref_mut() {
                         session.clear_messages()?;
@@ -225,37 +198,63 @@ pub(crate) fn process_turn(
             }
         }
 
-        // Single clone for the provider worker thread happens inside
-        // `call_client_cancellable`; no snapshot clone here (messages is
-        // not mutated concurrently during the LLM call).
-        let turn = match call_client_cancellable(client, cancel, messages, true, console) {
-            Ok(result) => result,
-            Err(e) if e.to_string() == "interrupted" || e.to_string() == "cancelled" => {
+        // Async LLM call with prompt cancel: `select!(cancelled, complete)`
+        // wakes within ~10ms. No message `to_vec` clone beyond what the call
+        // needs and no parked thread (S6 resource win).
+        let cancel_ref: &(dyn CancellationSource + Send + Sync) = cancel;
+        let turn: Turn = tokio::select! {
+            _ = wait_cancelled(cancel_ref) => {
                 return Err("cancelled by user".into());
             }
-            Err(e) => return Err(e),
+            r = client.complete(messages, true, console.sink().cloned(), cancel_ref) => match r {
+                Ok(result) => result,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg == "interrupted" || msg == "cancelled" {
+                        return Err("cancelled by user".into());
+                    }
+                    return Err(msg.into());
+                }
+            },
         };
         if let Some(u) = turn.usage {
             last_usage = Some(u.prompt_tokens);
-            record_usage(config, state, console, u);
+            record_usage(config, state, console, u).await;
         }
         // The provider cut the reply off mid-generation (output-token limit
         // or a content filter): whatever landed is likely incomplete. Say so
         // instead of silently keeping a truncated reply as if it were complete.
-        let emit_note = |note: &str| match console.sink() {
-            Some(sink) => {
-                sink.send(SinkLine::System(note.to_string())).ok();
+        match console.sink() {
+            Some(_) => {
+                match turn.stop_reason {
+                    Some(StopReason::Length) => {
+                        console
+                            .emit_async(SinkLine::System(
+                                "model output hit the output-token limit and may be truncated"
+                                    .to_string(),
+                            ))
+                            .await;
+                    }
+                    Some(StopReason::ContentFilter) => {
+                        console.emit_async(SinkLine::System(
+                          "model output was cut off by a content filter and may be incomplete"
+                              .to_string(),
+                      )).await;
+                    }
+                    _ => {}
+                }
             }
-            None => with_console(false, || eprintln!("[dex] {note}")),
-        };
-        match turn.stop_reason {
-            Some(StopReason::Length) => {
-                emit_note("model output hit the output-token limit and may be truncated");
-            }
-            Some(StopReason::ContentFilter) => {
-                emit_note("model output was cut off by a content filter and may be incomplete");
-            }
-            _ => {}
+            None => with_console(false, || match turn.stop_reason {
+                Some(StopReason::Length) => {
+                    eprintln!("[dex] model output hit the output-token limit and may be truncated")
+                }
+                Some(StopReason::ContentFilter) => {
+                    eprintln!(
+                        "[dex] model output was cut off by a content filter and may be incomplete"
+                    )
+                }
+                _ => {}
+            }),
         }
         let message = turn.message;
 
@@ -272,44 +271,51 @@ pub(crate) fn process_turn(
 
             let serialize_batch = tool_calls_conflict(&calls);
             let results: Vec<_> = if serialize_batch {
-                let _guard = TOOL_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                calls
-                    .iter()
-                    .map(|call| {
-                        let started = Instant::now();
-                        let (name, input, outcome) = execute_tool_call(call, cancel);
-                        (name, input, outcome, started.elapsed())
-                    })
-                    .collect()
+                let _guard = TOOL_MUTATION_LOCK.lock().await;
+                let mut out = Vec::new();
+                for call in &calls {
+                    let started = Instant::now();
+                    let (name, input, outcome) =
+                        execute_tool_call(call, cancel as &(dyn CancellationSource + Send + Sync))
+                            .await;
+                    out.push((name, input, outcome, started.elapsed()));
+                }
+                out
             } else {
-                calls
-                    .iter()
-                    .map(|call| {
-                        let call = call.clone();
-                        let cancel = cancel.clone();
-                        thread::spawn(move || {
-                            let started = Instant::now();
-                            let (name, input, outcome) = execute_tool_call(&call, &cancel);
-                            (name, input, outcome, started.elapsed())
-                        })
-                    })
-                    .collect::<Vec<_>>()
+                // JoinSet tasks (async tools): N threads → N tasks, input-ordered
+                // via indexed results + sort (S3). Panics propagate as tool errors.
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, call) in calls.iter().enumerate() {
+                    let call = call.clone();
+                    let cancel = cancel.clone();
+                    set.spawn(async move {
+                        let started = Instant::now();
+                        let (name, input, outcome) = execute_tool_call(&call, &cancel).await;
+                        (idx, name, input, outcome, started.elapsed())
+                    });
+                }
+                let mut indexed: Vec<(usize, String, String, ToolOutcome, Duration)> = Vec::new();
+                while let Some(joined) = set.join_next().await {
+                    match joined {
+                        Ok(v) => indexed.push(v),
+                        Err(_) => indexed.push((
+                            usize::MAX,
+                            String::new(),
+                            String::new(),
+                            ToolOutcome {
+                                text: "Error: tool worker panicked".into(),
+                                ok: false,
+                                diff: None,
+                            },
+                            Duration::ZERO,
+                        )),
+                    }
+                }
+                indexed.sort_by_key(|(idx, _, _, _, _)| *idx);
+                indexed
                     .into_iter()
-                    .map(|handle| {
-                        handle.join().unwrap_or_else(|_| {
-                            (
-                                String::new(),
-                                String::new(),
-                                ToolOutcome {
-                                    text: "Error: tool worker panicked".into(),
-                                    ok: false,
-                                    diff: None,
-                                },
-                                Duration::ZERO,
-                            )
-                        })
-                    })
-                    .collect()
+                    .map(|(_, n, i, o, d)| (n, i, o, d))
+                    .collect::<Vec<(String, String, ToolOutcome, Duration)>>()
             };
 
             // Hoisted: one getcwd per iteration, not per tool result.
@@ -336,12 +342,14 @@ pub(crate) fn process_turn(
                     last_tools.push(cache_key.clone());
                 }
                 let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
-                if let Some(sink) = console.sink() {
-                    let _ = sink.send(SinkLine::ToolInput(format!(
-                        "{} {}",
-                        call.function.name,
-                        short_arg(&name, &input)
-                    )));
+                if console.sink().is_some() {
+                    console
+                        .emit_async(SinkLine::ToolInput(format!(
+                            "{} {}",
+                            call.function.name,
+                            short_arg(&name, &input)
+                        )))
+                        .await;
                 } else {
                     with_console(console.sink().is_some(), || {
                         eprintln!(
@@ -378,7 +386,7 @@ pub(crate) fn process_turn(
                     }
                     outcome.text
                 };
-                if let Some(sink) = console.sink() {
+                if console.sink().is_some() {
                     let mut summary = tool_result_summary(&name, &input, &result, ok);
                     if cache_hit {
                         summary = format!("cached · {summary}");
@@ -389,13 +397,15 @@ pub(crate) fn process_turn(
                     );
                     let skip_first = !counts_only || !ok;
                     let preview = tool_preview(&name, ok, diff.as_deref(), &result, skip_first);
-                    let _ = sink.send(SinkLine::ToolOutput {
-                        name: name.clone(),
-                        summary,
-                        success: ok,
-                        preview,
-                        duration: elapsed.as_secs_f64(),
-                    });
+                    console
+                        .emit_async(SinkLine::ToolOutput {
+                            name: name.clone(),
+                            summary,
+                            success: ok,
+                            preview,
+                            duration: elapsed.as_secs_f64(),
+                        })
+                        .await;
                 } else {
                     with_console(console.sink().is_some(), || {
                         let body = tool_preview_body(&name, ok, diff.as_deref(), &result);
@@ -411,7 +421,23 @@ pub(crate) fn process_turn(
                 ));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
-            state.save();
+            // Write-through persist (best-effort, tiny JSON): awaited so a
+            // process exit right after the turn can't lose it — a detached
+            // spawn would be dropped on shutdown before it ever ran.
+            if state.dirty {
+                let to_save = ToolState {
+                    cache: state.cache.clone(),
+                    dirty: true,
+                    last_usage: state.last_usage,
+                    last_cached: state.last_cached,
+                    total_usage: state.total_usage,
+                    total_output: state.total_output,
+                    total_cost: state.total_cost,
+                    verify_dirty: state.verify_dirty,
+                };
+                to_save.save_async().await;
+                state.dirty = false;
+            }
         } else {
             let text = message.content.unwrap_or_default();
             messages.push(ChatMessage {
@@ -423,12 +449,15 @@ pub(crate) fn process_turn(
                 reasoning_items: message.reasoning_items.clone(),
                 reasoning_content: message.reasoning_content.clone(),
             });
-            if let Some(rx) = steering_rx {
-                let steering: Vec<String> = rx.try_iter().collect();
+            if let Some(rx) = steering_rx.as_mut() {
+                let mut steering: Vec<String> = Vec::new();
+                while let Ok(s) = rx.try_recv() {
+                    steering.push(s);
+                }
                 if !steering.is_empty() {
                     for content in steering {
                         if let Some(accepted) = &steering_accepted_tx {
-                            let _ = accepted.send(content.clone());
+                            let _ = accepted.send(content.clone()).await;
                         }
                         messages.push(ChatMessage::user_named(content, "steering"));
                     }
@@ -455,13 +484,13 @@ mod tests {
     struct MockModel;
 
     impl ModelClient for MockModel {
-        fn complete(
+        async fn complete(
             &self,
             _messages: &[ChatMessage],
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
-            _cancel: &dyn CancellationSource,
-        ) -> Result<Turn, Box<dyn std::error::Error>> {
+            _cancel: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Turn {
                 message: ChatMessage::assistant("hello from mock"),
                 usage: Some(Usage {
@@ -503,15 +532,15 @@ mod tests {
             permission: PermissionMode::Trusted,
             verify_command: None,
             extra_headers: Default::default(),
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
             provider_entries: Default::default(),
             provider_headers: Default::default(),
             api_pinned: false,
         }
     }
 
-    #[test]
-    fn process_turn_completes_with_injected_client() {
+    #[tokio::test]
+    async fn process_turn_completes_with_injected_client() {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
@@ -525,7 +554,8 @@ mod tests {
             &MockModel,
             &NeverCancel,
             &crate::core::console::Console::none(),
-        );
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "hello from mock");
         assert!(messages
@@ -547,13 +577,13 @@ mod tests {
     }
 
     impl ModelClient for ToolThenAnswer {
-        fn complete(
+        async fn complete(
             &self,
             _messages: &[ChatMessage],
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
-            _cancel: &dyn CancellationSource,
-        ) -> Result<Turn, Box<dyn std::error::Error>> {
+            _cancel: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let message = if round == 0 {
                 ChatMessage::assistant_calls(
@@ -582,13 +612,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_result_streams_summary_preview_and_success() {
+    #[tokio::test]
+    async fn tool_result_streams_summary_preview_and_success() {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
-        let (sink_tx, sink_rx) = mpsc::channel();
-        let (approval_tx, _approval_rx) = mpsc::channel();
+        let (sink_tx, mut sink_rx) = mpsc::channel(32);
+        let (approval_tx, _approval_rx) = mpsc::channel(16);
         let _ = process_turn(
             &config,
             &mut messages,
@@ -599,11 +629,105 @@ mod tests {
             &ToolThenAnswer::new(),
             &NeverCancel,
             &crate::core::console::Console::daemon(sink_tx, approval_tx),
-        );
-        let events: Vec<_> = sink_rx.try_iter().collect();
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(e) = sink_rx.try_recv() {
+            events.push(e);
+        }
         assert!(events.iter().any(|e| matches!(e, SinkLine::ToolInput(_))));
         assert!(events
             .iter()
             .any(|e| matches!(e, SinkLine::ToolOutput { .. })));
+    }
+
+    #[tokio::test]
+    async fn conflict_serialize_still_serializes_same_path_edits() {
+        // TDD Phase 2: same-path edits must take the serialize path.
+        let calls = vec![
+            crate::core::types::LlmToolCall {
+                id: "a".into(),
+                call_type: "function".into(),
+                function: crate::core::types::FunctionCall {
+                    name: "edit".into(),
+                    arguments: r#"{"path":"same.rs"}"#.into(),
+                },
+            },
+            crate::core::types::LlmToolCall {
+                id: "b".into(),
+                call_type: "function".into(),
+                function: crate::core::types::FunctionCall {
+                    name: "edit".into(),
+                    arguments: r#"{"path":"same.rs"}"#.into(),
+                },
+            },
+        ];
+        assert!(tool_calls_conflict(&calls));
+        let different = vec![
+            crate::core::types::LlmToolCall {
+                id: "a".into(),
+                call_type: "function".into(),
+                function: crate::core::types::FunctionCall {
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                },
+            },
+            crate::core::types::LlmToolCall {
+                id: "b".into(),
+                call_type: "function".into(),
+                function: crate::core::types::FunctionCall {
+                    name: "read".into(),
+                    arguments: r#"{"path":"b.rs"}"#.into(),
+                },
+            },
+        ];
+        assert!(!tool_calls_conflict(&different));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_llm_call_unwinds_promptly() {
+        // TDD Phase 2: select!(cancelled, complete) — no 50ms poll quantum.
+        #[derive(Clone)]
+        struct Hanging;
+        impl ModelClient for Hanging {
+            async fn complete(
+                &self,
+                _m: &[ChatMessage],
+                _w: bool,
+                _s: Option<mpsc::Sender<SinkLine>>,
+                _c: &(dyn CancellationSource + Send + Sync),
+            ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                unreachable!()
+            }
+        }
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let cancel = crate::core::console::CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel2.cancel();
+        });
+        let start = std::time::Instant::now();
+        let err = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &Hanging,
+            &cancel,
+            &crate::core::console::Console::none(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "cancelled by user");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "cancel must preempt hanging LLM without 50ms quanta pile-up"
+        );
     }
 }

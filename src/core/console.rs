@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use tokio::sync::{mpsc, Notify};
 
 use crate::agent::state::CancellationSource;
 
@@ -78,18 +79,21 @@ pub(crate) fn is_interrupted() -> bool {
 #[derive(Clone)]
 pub(crate) struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl CancellationToken {
     pub(crate) fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
     /// Signal cancellation for the turn this token belongs to.
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// True until `reset` is called; safe to poll from worker threads.
@@ -101,6 +105,19 @@ impl CancellationToken {
     /// mirroring `take_interrupt`.
     pub(crate) fn take_cancelled(&self) -> bool {
         self.cancelled.swap(false, Ordering::SeqCst)
+    }
+
+    /// Async wait for cancellation: resolves immediately when already
+    /// cancelled, otherwise when `cancel()` fires. Powers
+    /// `tokio::select!` in async LLM/SSE/tool/daemon paths (instant cancel
+    /// instead of 25-50ms poll quanta).
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.notify.notified().await;
+        }
     }
 }
 
@@ -131,7 +148,7 @@ pub(crate) const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', 
 
 pub(crate) static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
 
-pub(crate) static TOOL_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static TOOL_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) static SPINNER_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -300,6 +317,21 @@ impl Console {
         self.approval.as_ref()
     }
 
+    /// Sync emit for legacy sync callers (printer, tool summaries): never
+    /// blocks, drops when full like the old `.send().ok()`.
+    pub(crate) fn emit(&self, line: SinkLine) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.try_send(line);
+        }
+    }
+
+    /// Async emit for async turn/SSE/tool paths: back-pressured `send().await`.
+    pub(crate) async fn emit_async(&self, line: SinkLine) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.send(line).await;
+        }
+    }
+
     pub(crate) fn approval_key(name: &str, input: &str) -> String {
         // Scope approvals: write/edit -> path, bash -> command, else full input hash.
         let relevant = if matches!(name, "write" | "edit") {
@@ -440,6 +472,29 @@ mod tests {
         assert!(!c.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn cancellation_token_cancelled_resolves_without_poll() {
+        // TDD: stalled stream + cancel() must resolve instantly, not on the
+        // next SSE line / 50ms poll quantum.
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+        token.cancel();
+        // Already-cancelled resolves without waiting.
+        tokio::time::timeout(Duration::from_millis(10), token.cancelled())
+            .await
+            .expect("cancelled() must resolve instantly when already cancelled");
+        // Notified waiter resolves when cancel() fires from another task.
+        let token2 = CancellationToken::new();
+        let waiter = token2.clone();
+        let handle = tokio::spawn(async move { waiter.cancelled().await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        token2.cancel();
+        tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("waiter must wake on cancel()")
+            .unwrap();
+    }
+
     #[test]
     fn approval_key_scopes_by_path_or_command() {
         let k1 = Console::approval_key("write", r#"{"path":"a.txt","content":"hi"}"#);
@@ -457,8 +512,8 @@ mod tests {
 
     #[test]
     fn session_approvals_are_scoped_and_recorded() {
-        let (tx, _rx) = mpsc::channel();
-        let (atx, _arx) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel(16);
+        let (atx, _arx) = mpsc::channel(16);
         let console = Console::new(tx, atx);
         let input = r#"{"path":"foo.rs","content":"x"}"#;
         assert!(!console.session_approved("write", input));
@@ -470,8 +525,8 @@ mod tests {
 
     #[test]
     fn console_daemon_sets_remote_flag() {
-        let (tx, _rx) = mpsc::channel();
-        let (atx, _arx) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel(16);
+        let (atx, _arx) = mpsc::channel(16);
         let c = Console::daemon(tx, atx);
         assert!(c.remote_approval);
         assert!(c.sink().is_some());
