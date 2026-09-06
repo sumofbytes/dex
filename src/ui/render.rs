@@ -625,11 +625,15 @@ struct TranscriptView;
 /// Wrapped rows for a transcript block at `width`. Thinking and activity
 /// blocks are cached in their settled form — collapsed indicator, duration
 /// summary or full dim text when expanded — so the live dots stay a
-/// per-frame overlay and never trigger a re-wrap themselves.
+/// per-frame overlay and never trigger a re-wrap themselves. An open
+/// turn-activity block wraps to zero rows while a thinking block streams:
+/// Working shows only when busy-but-not-thinking, so the transcript never
+/// stacks two live spinners.
 fn wrap_block(
     block: &super::TranscriptBlock,
     width: u16,
     show_thinking: bool,
+    thinking_open: bool,
 ) -> Vec<Line<'static>> {
     match block {
         super::TranscriptBlock::Thinking { text, elapsed, .. } => {
@@ -640,7 +644,11 @@ fn wrap_block(
             }
         }
         super::TranscriptBlock::Activity { settled, .. } => {
-            activity_display_lines(settled.as_deref(), 0, width)
+            if settled.is_none() && thinking_open {
+                Vec::new()
+            } else {
+                activity_display_lines(settled.as_deref(), 0, width)
+            }
         }
         _ => block
             .lines()
@@ -694,7 +702,7 @@ impl TranscriptView {
             if app.wrapped_cache[idx].stamp == block.stamp() {
                 continue;
             }
-            let rows = wrap_block(block, area.width, app.show_thinking);
+            let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
             app.wrapped_cache[idx] = WrappedBlock {
                 stamp: block.stamp(),
                 rows,
@@ -706,7 +714,7 @@ impl TranscriptView {
             // runs only on content or width changes, never for scroll.
             let mut display: Vec<Line<'static>> = Vec::new();
             for (idx, wb) in app.wrapped_cache.iter().enumerate() {
-                if idx > 0 {
+                if idx > 0 && !wb.rows.is_empty() {
                     display.push(Line::default());
                 }
                 display.extend(wb.rows.iter().cloned());
@@ -725,6 +733,11 @@ impl TranscriptView {
             let mut cum = 0usize;
             for (idx, block) in app.transcript.iter().enumerate() {
                 let rows = app.wrapped_cache[idx].rows.len();
+                // Gap accounting mirrors the display build above: a blank
+                // separator precedes every non-empty block except the first.
+                if idx > 0 && rows > 0 {
+                    cum += 1;
+                }
                 if rows > 0 {
                     if app.thinking_open
                         && !app.show_thinking
@@ -739,7 +752,7 @@ impl TranscriptView {
                         activity_row = Some(cum + rows - 1);
                     }
                 }
-                cum += rows + 1;
+                cum += rows;
             }
         }
         if let Some(row) = thinking_row {

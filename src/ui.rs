@@ -669,6 +669,18 @@ fn content_tail_mut(app: &mut App) -> Option<&mut TranscriptBlock> {
     app.transcript.get_mut(idx)
 }
 
+/// Re-wrap the open turn-activity block on thinking visibility flips. The
+/// spinner hides while a thinking block streams (Working shows only when
+/// busy-but-not-thinking), so its cached rows depend on `thinking_open` as
+/// well as its stamp — bump it whenever thinking opens or closes.
+fn bump_open_activity(app: &mut App) {
+    for block in &mut app.transcript {
+        if matches!(block, TranscriptBlock::Activity { settled: None, .. }) {
+            block.bump();
+        }
+    }
+}
+
 /// Drain the buffered assistant deltas into the tail `Assistant` block,
 /// rendering the markdown once for the whole buffered chunk. Call before
 /// anything reads the transcript or pushes a non-assistant block, so pending
@@ -796,6 +808,10 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             }
             if due {
                 note_stream_flush(app);
+            }
+            if !app.thinking_open {
+                // Spinner hides while thinking streams; re-wrap it away.
+                bump_open_activity(app);
             }
             app.thinking_open = true;
         }
@@ -964,6 +980,8 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
 pub(super) fn close_thinking(app: &mut App) {
     if app.thinking_open {
         app.thinking_open = false;
+        // Working reappears once thinking settles; re-wrap the spinner.
+        bump_open_activity(app);
         // Stamp bump forces a re-wrap so the settled row shows the elapsed
         // "Thought for …" (and an expanded Ctrl+T block shows any text that
         // arrived since the last throttled bump). Content tail: the open
