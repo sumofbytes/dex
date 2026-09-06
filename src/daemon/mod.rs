@@ -183,11 +183,6 @@ impl DaemonState {
     /// fixing the linear scan; the registry lock is held only for the final
     /// insert. Entries use `or_insert` so sessions created while the rebuild
     /// was in flight win over their (nonexistent) disk state.
-    #[allow(dead_code)]
-    pub fn rebuild(&self) {
-        crate::client::http::block_on(self.rebuild_async())
-    }
-
     #[allow(clippy::type_complexity)]
     /// Async parallel rebuild: per-session scans in a `JoinSet`
     /// (`spawn_blocking` per file, join, sort). Used by the background task.
@@ -341,8 +336,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
         // Depends on where the sessions dir resolves; serialize against tests
         // that redirect XDG_DATA_HOME.
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -360,7 +356,7 @@ mod tests {
         drop(s);
 
         let state = DaemonState::new();
-        state.rebuild();
+        state.rebuild_async().await;
         // The session is in the registry after restart.
         {
             let sessions = state.sessions.lock().unwrap();
@@ -393,8 +389,9 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("events.jsonl"));
     }
 
-    #[test]
-    fn rebuild_skips_failed_marking_for_live_turns() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rebuild_skips_failed_marking_for_live_turns() {
         // A reattach + chat racing the background rebuild owns the journal:
         // stamping `turn_failed` under its live `turn_start` would corrupt it.
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -409,7 +406,7 @@ mod tests {
 
         let state = DaemonState::new();
         state.active_turns.lock().unwrap().insert(id.clone());
-        state.rebuild();
+        state.rebuild_async().await;
         // Still registered, but the live turn is untouched.
         assert!(state.sessions.lock().unwrap().contains_key(&id));
         assert_eq!(
@@ -419,8 +416,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn rebuild_registry_merge_keeps_live_entries() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rebuild_registry_merge_keeps_live_entries() {
         // Sessions claimed (reattached/created) mid-rebuild win over disk via
         // `or_insert` — the rebuild must not clobber them.
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -438,7 +436,7 @@ mod tests {
             cwd: "/tmp".into(),
         };
         state.sessions.lock().unwrap().insert(id.clone(), live);
-        state.rebuild();
+        state.rebuild_async().await;
         assert_eq!(
             state.sessions.lock().unwrap().get(&id).unwrap().path,
             std::path::PathBuf::from("/tmp/dex-live-wins-marker")

@@ -776,7 +776,6 @@ async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
 /// `/dev/null` for new files) of a pending write/edit, shown in the
 /// transcript before approval and under the tool result. Returns None when
 /// the file is missing or the change is empty.
-#[allow(dead_code)]
 fn build_diff(raw_path: &str, before: Option<&str>, after: &str) -> Option<String> {
     let diff = TextDiff::from_lines(before.unwrap_or(""), after);
     let (old_header, new_header) = match &before {
@@ -811,16 +810,6 @@ fn diff_after(name: &str, args: &Map<String, Value>, before: Option<&str>) -> Op
         }
         _ => None,
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn change_diff(name: &str, args: &Map<String, Value>) -> Option<String> {
-    // Sync version for display paths (CLI previews): blocking fs, no runtime needed.
-    let raw_path = arg_str(args, "path").ok()?;
-    let path = workspace_path(&raw_path).ok()?;
-    let before = std::fs::read_to_string(&path).ok();
-    let after = diff_after(name, args, before.as_deref())?;
-    build_diff(&raw_path, before.as_deref(), &after)
 }
 
 async fn change_diff_async(name: &str, args: &Map<String, Value>) -> Option<String> {
@@ -1389,7 +1378,7 @@ mod tests {
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("oldText".into(), Value::String("l5\n".into()));
         args.insert("newText".into(), Value::String("L5\nL5b\n".into()));
-        let diff = change_diff("edit", &args).unwrap();
+        let diff = change_diff_async("edit", &args).await.unwrap();
         assert!(diff.contains("--- a/target/dex-preview-test.txt"), "{diff}");
         assert!(diff.contains("+++ b/target/dex-preview-test.txt"), "{diff}");
         assert!(diff.contains("@@"), "{diff}");
@@ -1411,7 +1400,7 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("content".into(), Value::String("hello\n".into()));
-        let diff = change_diff("write", &args).unwrap();
+        let diff = change_diff_async("write", &args).await.unwrap();
         assert!(diff.contains("--- /dev/null"), "{diff}");
         assert!(diff.contains("+++ b/target/dex-preview-new.txt"), "{diff}");
         assert!(diff.contains("+hello"), "{diff}");

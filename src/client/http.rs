@@ -84,9 +84,66 @@ pub(crate) fn shared_async_client() -> reqwest::Client {
         .clone()
 }
 
-/// Back-compat alias during migration: was `reqwest::blocking::Client`.
-pub(crate) fn shared_blocking_client() -> reqwest::Client {
-    shared_async_client()
+/// Byte framing for SSE `data:` lines. Pure buffer logic (no I/O, no runtime)
+/// shared by `ChatStream`; split lines across TCP chunks are reassembled,
+/// keep-alives and junk skipped, trailing partial line held for `finish()`.
+#[derive(Default)]
+struct SseFramer {
+    buf: Vec<u8>,
+    pending: std::collections::VecDeque<StreamEvent>,
+}
+
+impl SseFramer {
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            if let Some(event) = DaemonClient::parse_sse_line(&String::from_utf8_lossy(&line)) {
+                self.pending.push_back(event);
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        // Trailing buffered line without newline (terminal envelope).
+        if !self.buf.is_empty() {
+            let tail = String::from_utf8_lossy(&self.buf).into_owned();
+            self.buf.clear();
+            if let Some(event) = DaemonClient::parse_sse_line(&tail) {
+                self.pending.push_back(event);
+            }
+        }
+    }
+}
+
+/// One in-flight SSE response with its framing buffer. `next_event()` returns
+/// `None` on clean EOF and `Some(Err)` on transport failure, so callers can
+/// distinguish "turn completed" from "connection died".
+pub(crate) struct ChatStream {
+    response: reqwest::Response,
+    framer: SseFramer,
+    eof: bool,
+}
+
+impl ChatStream {
+    pub(crate) async fn next_event(&mut self) -> Option<Result<StreamEvent, String>> {
+        loop {
+            if let Some(event) = self.framer.pending.pop_front() {
+                return Some(Ok(event));
+            }
+            if self.eof {
+                return None;
+            }
+            match self.response.chunk().await {
+                Ok(Some(bytes)) => self.framer.push_bytes(&bytes),
+                Ok(None) => {
+                    self.eof = true;
+                    self.framer.finish();
+                }
+                Err(e) => return Some(Err(e.to_string())),
+            }
+        }
+    }
 }
 
 impl DaemonClient {
@@ -239,23 +296,41 @@ impl DaemonClient {
         block_on(self.list_sessions_async())
     }
 
-    /// Async SSE chat: drives `chat_async` stream, invoking `on_event`
-    /// synchronously per event. Approval decisions `await` the daemon
-    /// confirm POST instead of blocking a thread (S6).
-    pub async fn chat_async(
+    /// Parse one raw SSE line into a `StreamEvent`. Pure (no I/O, no runtime
+    /// interaction) so it is safe to call from any context and trivial to
+    /// unit-test. Returns `None` for keep-alives (`ping`), blanks, non-`data:`
+    /// lines, and unparsable payloads (skipped, matching prior behavior).
+    pub(crate) fn parse_sse_line(line: &str) -> Option<StreamEvent> {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let data = trimmed.strip_prefix("data:")?.trim();
+        if data.is_empty() || data == "ping" {
+            return None;
+        }
+        serde_json::from_str::<StreamEnvelope>(data)
+            .ok()
+            .map(|env| env.event)
+    }
+
+    /// Async-native SSE transport: POSTs the chat request and yields parsed
+    /// `StreamEvent`s via `next_event().await`. Carries no approval
+    /// side-effects — the caller forwards events and POSTs decisions itself
+    /// (the TUI worker maps UI decisions and calls `approve_async`). Single
+    /// `.chunk().await` read loop, no threads, backpressured by the caller.
+    pub async fn chat_stream(
         &self,
         session_id: &str,
         prompt: &str,
         options: ChatOptions,
-        on_event: &mut dyn FnMut(StreamEvent) -> Option<ApprovalDecision>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<ChatStream, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/api/sessions/{}/chat", self.base_url, session_id);
-
         let mut builder = self.http.post(&url).headers(self.api_headers());
         if let Some(key) = &options.idempotency_key {
             builder = builder.header("idempotency-key", key);
         }
-        let mut response = builder
+        let response = builder
             .json(&ChatRequest {
                 prompt: prompt.to_string(),
                 skill_dirs: options.skill_dirs,
@@ -266,70 +341,46 @@ impl DaemonClient {
                 plan: options.plan,
             })
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        Ok(ChatStream {
+            response,
+            framer: SseFramer::default(),
+            eof: false,
+        })
+    }
 
-        let mut buf: Vec<u8> = Vec::new();
-        #[allow(clippy::while_let_loop)]
-        while let Some(bytes) = response.chunk().await? {
-            buf.extend_from_slice(&bytes);
-            // Split on newlines; keep trailing partial line buffered.
-            loop {
-                let Some(pos) = buf.iter().position(|&b| b == b'\n') else {
-                    break;
-                };
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let trimmed = String::from_utf8_lossy(&line);
-                let trimmed = trimmed.trim_end();
-                if trimmed.is_empty() {
-                    continue;
+    /// Async SSE chat: drives `chat_async` stream, invoking `on_event`
+    /// synchronously per event. Approval decisions `await` the daemon
+    /// confirm POST instead of blocking a thread (S6).
+    pub async fn chat_async(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        options: ChatOptions,
+        on_event: &mut dyn FnMut(StreamEvent) -> Option<ApprovalDecision>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Sync-callback path (one-shot CLI, repl, e2e tests): the callback
+        // never touches the runtime, so driving the shared `ChatStream`
+        // framing here keeps one parser for both callers.
+        let mut stream = self
+            .chat_stream(session_id, prompt, options)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        while let Some(item) = stream.next_event().await {
+            let event = item.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
+                let request_id = request_id.clone();
+                let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
+                if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
+                    crate::llm::client::provider_log("approval_delivery_failed", &e.to_string());
                 }
-                let Some(data) = trimmed.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() || data == "ping" {
-                    continue;
-                }
-                let event = match serde_json::from_str::<StreamEnvelope>(data) {
-                    Ok(env) => env.event,
-                    Err(_) => continue,
-                };
-                if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
-                    let request_id = request_id.clone();
-                    let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
-                    if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
-                        crate::llm::client::provider_log(
-                            "approval_delivery_failed",
-                            &e.to_string(),
-                        );
-                    }
-                    continue;
-                }
-                on_event(event);
+                continue;
             }
+            on_event(event);
         }
-        // Trailing buffered line without newline (terminal envelope).
-        if !buf.is_empty() {
-            let trimmed = String::from_utf8_lossy(&buf);
-            let trimmed = trimmed.trim_end();
-            if let Some(data) = trimmed.strip_prefix("data:") {
-                let data = data.trim();
-                if !data.is_empty() && data != "ping" {
-                    if let Ok(env) = serde_json::from_str::<StreamEnvelope>(data) {
-                        let event = env.event;
-                        if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
-                            let request_id = request_id.clone();
-                            let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
-                            let _ = self.approve_async(session_id, &request_id, decision).await;
-                        } else {
-                            on_event(event);
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -689,5 +740,225 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("did not become ready"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parse_sse_line_skips_keepalives_and_junk() {
+        assert!(DaemonClient::parse_sse_line("").is_none());
+        assert!(DaemonClient::parse_sse_line("\n").is_none());
+        assert!(DaemonClient::parse_sse_line(": comment").is_none());
+        assert!(DaemonClient::parse_sse_line("event: message").is_none());
+        assert!(DaemonClient::parse_sse_line("data:").is_none());
+        assert!(DaemonClient::parse_sse_line("data: ping").is_none());
+        assert!(DaemonClient::parse_sse_line("data: not-json").is_none());
+        let env = StreamEnvelope {
+            seq: 1,
+            event: StreamEvent::AssistantText("hi".to_string()),
+        };
+        let line = format!("data: {}", serde_json::to_string(&env).unwrap());
+        assert!(matches!(
+            DaemonClient::parse_sse_line(&line),
+            Some(StreamEvent::AssistantText(t)) if t == "hi"
+        ));
+    }
+
+    #[test]
+    fn sse_framer_reassembles_split_lines_and_trailing_terminal() {
+        // One envelope split across TCP chunks reassembles; keep-alives and
+        // junk around it are skipped; the terminal envelope without a
+        // trailing newline surfaces via `finish()`.
+        let assistant = StreamEnvelope {
+            seq: 1,
+            event: StreamEvent::AssistantText("hello".to_string()),
+        };
+        let complete = StreamEnvelope {
+            seq: 2,
+            event: StreamEvent::TurnComplete {
+                response: "done".to_string(),
+                usage: None,
+                cached: None,
+            },
+        };
+        let first = format!("data: {}\n\n", serde_json::to_string(&assistant).unwrap());
+        let terminal = format!("data: {}", serde_json::to_string(&complete).unwrap());
+        let mut framer = SseFramer::default();
+        // Split mid-payload: nothing complete yet (chunks are contiguous on
+        // the wire, so the halves arrive back-to-back).
+        let (head, tail) = first.as_bytes().split_at(first.len() / 2);
+        framer.push_bytes(head);
+        assert!(framer.pending.is_empty());
+        framer.push_bytes(tail);
+        // Junk around real lines is skipped.
+        framer.push_bytes(b"data: ping\n\n\ndata: bogus{\n\n");
+        assert!(matches!(
+            framer.pending.pop_front(),
+            Some(StreamEvent::AssistantText(t)) if t == "hello"
+        ));
+        assert!(framer.pending.is_empty());
+        // Trailing terminal without newline is held until `finish()`.
+        framer.push_bytes(terminal.as_bytes());
+        assert!(framer.pending.is_empty());
+        framer.finish();
+        assert!(matches!(
+            framer.pending.pop_front(),
+            Some(StreamEvent::TurnComplete { response, .. }) if response == "done"
+        ));
+    }
+
+    fn sse_data(event: &StreamEvent, seq: u64) -> String {
+        let env = StreamEnvelope {
+            seq,
+            event: event.clone(),
+        };
+        format!("data: {}\n\n", serde_json::to_string(&env).unwrap())
+    }
+
+    /// Minimal mock daemon: streams `chat_body` for every chat POST and
+    /// records approval decisions. No new deps (axum is already one).
+    async fn mock_chat_server(
+        chat_body: String,
+        chat_status: u16,
+        approvals: std::sync::Arc<std::sync::Mutex<Vec<ApprovalDecision>>>,
+    ) -> String {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/chat",
+                post(move || {
+                    let body = chat_body.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::from_u16(chat_status).unwrap(),
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/{id}/approve",
+                post(move |Json(req): Json<ApprovalResponse>| {
+                    let approvals = approvals.clone();
+                    async move {
+                        approvals.lock().unwrap().push(req.decision);
+                        Json(serde_json::json!({"status": "ok"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn chat_stream_delivers_events_and_posts_approval() {
+        // Regression for the stuck-`Working ...` hang: the TUI worker drives
+        // this stream with `send().await` / `recv().await` only. The old
+        // worker called `blocking_send` / `blocking_recv` inside `block_on`,
+        // which panics ("Cannot block the current thread from within a
+        // runtime"), so no event ever reached the transcript.
+        let approvals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let complete = StreamEnvelope {
+            seq: 3,
+            event: StreamEvent::TurnComplete {
+                response: "done".to_string(),
+                usage: None,
+                cached: None,
+            },
+        };
+        let body = format!(
+            "\ndata: ping\n\ndata: not-json\n\n{}{}data: {}",
+            sse_data(&StreamEvent::AssistantText("hello".to_string()), 1),
+            sse_data(
+                &StreamEvent::ApprovalRequired {
+                    request_id: "r1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                },
+                2
+            ),
+            serde_json::to_string(&complete).unwrap(), // no trailing newline
+        );
+        let base = mock_chat_server(body, 200, approvals.clone()).await;
+        let client = DaemonClient::new(&base).unwrap();
+        let fut = async {
+            let mut stream = client
+                .chat_stream("s1", "hi", ChatOptions::default())
+                .await
+                .expect("POST must succeed");
+            let mut kinds = Vec::new();
+            while let Some(item) = stream.next_event().await {
+                let event = item.expect("transport must not fail");
+                if let StreamEvent::ApprovalRequired { request_id, .. } = &event {
+                    client
+                        .approve_async("s1", request_id, ApprovalDecision::AllowOnce)
+                        .await
+                        .expect("approve POST must succeed");
+                }
+                kinds.push(match &event {
+                    StreamEvent::AssistantText(_) => "text",
+                    StreamEvent::ApprovalRequired { .. } => "approval",
+                    StreamEvent::TurnComplete { .. } => "complete",
+                    _ => "other",
+                });
+            }
+            kinds
+        };
+        let kinds = tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .expect("stream must terminate, not hang");
+        assert_eq!(kinds, vec!["text", "approval", "complete"]);
+        assert_eq!(
+            *approvals.lock().unwrap(),
+            vec![ApprovalDecision::AllowOnce]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_surfaces_transport_error() {
+        let approvals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = mock_chat_server(String::new(), 500, approvals).await;
+        let client = DaemonClient::new(&base).unwrap();
+        let err = match client.chat_stream("s1", "hi", ChatOptions::default()).await {
+            Ok(_) => panic!("500 must fail"),
+            Err(e) => e,
+        };
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_async_callback_path_still_forwards_and_approves() {
+        // The sync-callback API (one-shot CLI, repl, e2e) shares the same
+        // `ChatStream` framing; approvals resolve via the callback return.
+        let approvals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = format!(
+            "{}{}",
+            sse_data(&StreamEvent::AssistantText("hi".to_string()), 1),
+            sse_data(
+                &StreamEvent::ApprovalRequired {
+                    request_id: "r9".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                },
+                2
+            )
+        );
+        let base = mock_chat_server(body, 200, approvals.clone()).await;
+        let client = DaemonClient::new(&base).unwrap();
+        let mut seen = Vec::new();
+        client
+            .chat_async("s1", "hi", ChatOptions::default(), &mut |event| {
+                let decision = matches!(event, StreamEvent::ApprovalRequired { .. })
+                    .then_some(ApprovalDecision::Deny);
+                seen.push(matches!(event, StreamEvent::ApprovalRequired { .. }));
+                decision
+            })
+            .await
+            .expect("chat must succeed");
+        assert_eq!(seen, vec![false, true]);
+        assert_eq!(*approvals.lock().unwrap(), vec![ApprovalDecision::Deny]);
     }
 }

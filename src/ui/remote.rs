@@ -75,9 +75,6 @@ struct RemoteApp {
     /// Last left press (time, transcript cell, consecutive-click count) for
     /// double-/triple-click detection; the count caps at 3.
     last_click: Option<(Instant, (usize, usize), u8)>,
-    /// Last footer git poll; gates `GET /api/git` so the branch/dirty badge
-    /// refreshes without spawning `git` (or an HTTP RTT) every frame.
-    last_git_check: Instant,
 }
 
 /// How often an idle TUI re-polls `GET /api/git` for the footer. The daemon
@@ -85,15 +82,6 @@ struct RemoteApp {
 /// per 5s — cheap enough to catch an external `git checkout` within seconds
 /// without the per-frame (~10-30ms) cost of `git branch + git status`.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Best-effort footer refresh from the daemon; returns true when the badge
-/// visibly changed. Failures are ignored — the next interval retries.
-fn poll_git_status(remote: &mut RemoteApp) -> bool {
-    let Ok(info) = remote.client.get_git() else {
-        return false;
-    };
-    apply_git_info(remote, &info)
-}
 
 fn apply_git_info(remote: &mut RemoteApp, info: &crate::protocol::GitInfo) -> bool {
     let changed =
@@ -122,14 +110,51 @@ fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Sender<WorkerMe
     });
 }
 
-/// Throttled poll for the main loop; resets the clock even on failure so a
-/// down daemon does not turn into a per-frame retry storm.
-fn poll_git_status_if_due(remote: &mut RemoteApp) -> bool {
-    if remote.last_git_check.elapsed() < GIT_REFRESH_INTERVAL {
-        return false;
+/// One-off footer refresh without blocking the UI thread: fetches
+/// `GET /api/git` on the shared runtime and forwards the result through the
+/// worker channel (daemon 5s cache keeps it cheap). Used at turn end so
+/// tool mutations show up immediately.
+fn refresh_git_async(client: DaemonClient, tx: mpsc::Sender<WorkerMessage>) {
+    crate::client::http::spawn_task(async move {
+        if let Ok(info) = client.get_git_async().await {
+            let _ = tx.send(WorkerMessage::Git(info)).await;
+        }
+    });
+}
+
+/// Maps a UI overlay decision to the wire protocol. Pure so approval routing
+/// is unit-testable without a daemon or TUI.
+fn map_approval_decision(decision: CoreApprovalDecision) -> ProtocolApprovalDecision {
+    match decision {
+        CoreApprovalDecision::Once => ProtocolApprovalDecision::AllowOnce,
+        CoreApprovalDecision::Session => ProtocolApprovalDecision::AllowSession,
+        CoreApprovalDecision::Deny => ProtocolApprovalDecision::Deny,
     }
-    remote.last_git_check = Instant::now();
-    poll_git_status(remote)
+}
+
+/// Next approval decision for the worker task. Auto-denies when a cancel was
+/// requested (so the turn unwinds without parking on the overlay); otherwise
+/// awaits the overlay. A closed channel means the turn went away — deny.
+async fn next_worker_decision(
+    cancel_flag: &AtomicBool,
+    decision_rx: &mut mpsc::Receiver<CoreApprovalDecision>,
+) -> ProtocolApprovalDecision {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return ProtocolApprovalDecision::Deny;
+    }
+    map_approval_decision(
+        decision_rx
+            .recv()
+            .await
+            .unwrap_or(CoreApprovalDecision::Deny),
+    )
+}
+
+/// Terminal-close classification for the worker task. The daemon always ends
+/// a turn with `TurnComplete` / `TurnFailed`; closing without one is a
+/// transport failure and must surface as an error, not silent success.
+fn premature_close_error(saw_terminal: bool) -> Option<String> {
+    (!saw_terminal).then(|| "connection closed before turn completed".to_string())
 }
 
 /// Build a display-only config from the daemon's reported runtime info. The
@@ -165,7 +190,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         api_pinned: false,
         // Display-only copy never talks to a provider; share the
         // process-wide client instead of initializing TLS + pool.
-        client: crate::client::http::shared_blocking_client(),
+        client: crate::client::http::shared_async_client(),
     }
 }
 
@@ -377,9 +402,6 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         decision_tx,
         cancel_flag,
         last_click: None,
-        // Just seeded from `GET /api/config` above; don't re-poll on the
-        // first idle tick.
-        last_git_check: Instant::now(),
     };
     // Background git poll off the UI thread (Phase 5): task polls every 2s,
     // pushes into the worker channel; UI loop only applies. Daemon 5s cache
@@ -515,10 +537,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             if remote.app.tick_notice() {
                 dirty = true;
             }
-            // Footer branch/dirty via background task (no per-frame `git` or HTTP
-            // on the UI thread, even when busy). `poll_git_status_if_due` kept
-            // as fallback for tests; production path is `WorkerMessage::Git`.
-            let _ = &poll_git_status_if_due;
+            // Footer branch/dirty arrives via the background git task (no per-frame
+            // `git` or HTTP on the UI thread, even when busy).
             // Animation heartbeat while a turn runs: at most ~8 fps, and
             // streaming/input draws reset the clock so they don't double up.
             let now = Instant::now();
@@ -932,11 +952,9 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     }
     // Tools (bash/git/write/edit) may have switched branches or dirtied the
     // tree mid-turn; refresh the footer now rather than waiting for the next
-    // idle interval. Best-effort and throttled by the daemon's 5s git cache,
-    // so a fast turn that lands inside the cache window still converges on
-    // the following idle poll.
-    remote.last_git_check = Instant::now();
-    poll_git_status(remote);
+    // background poll. Async so the UI thread never blocks on HTTP (the
+    // daemon's 5s git cache keeps it cheap).
+    refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
 }
 
 /// How long to hold a suspicious char run while waiting for the rest of an
@@ -1403,9 +1421,10 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     app.turn_started = Some(std::time::Instant::now());
     remote.cancel_flag.store(false, Ordering::SeqCst);
 
-    // Spawn the worker: it consumes the daemon's SSE stream and forwards
-    // events into the UI loop. Approval requests park the worker until the
-    // overlay resolves them via the decision channel.
+    // Spawn the worker as an async task: it drives the daemon's SSE stream
+    // with `send().await` / `recv().await` (never `blocking_send` /
+    // `blocking_recv`, which panic inside a runtime). Approval requests park
+    // the task until the overlay resolves them via the decision channel.
     let client = remote.client.clone();
     let session_id = remote.session_id.clone();
     let mut options = remote.options.clone();
@@ -1417,31 +1436,63 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let mut decision_rx = remote.take_decision_receiver();
     let cancel_flag = remote.cancel_flag.clone();
 
-    std::thread::spawn(move || {
-        let result = client.chat(&session_id, &prompt, options, &mut |event| {
-            let is_approval = matches!(event, StreamEvent::ApprovalRequired { .. });
-            let _ = event_tx.blocking_send(WorkerMessage::Stream(event));
-            if is_approval {
-                // After a cancel request, deny automatically so the turn can
-                // unwind without user interaction.
-                if cancel_flag.load(Ordering::SeqCst) {
-                    return Some(ProtocolApprovalDecision::Deny);
-                }
-                // Block until the user answers the overlay; the decision is
-                // POSTed back to the daemon.
-                match decision_rx.blocking_recv() {
-                    Some(CoreApprovalDecision::Once) => Some(ProtocolApprovalDecision::AllowOnce),
-                    Some(CoreApprovalDecision::Session) => {
-                        Some(ProtocolApprovalDecision::AllowSession)
-                    }
-                    Some(CoreApprovalDecision::Deny) | None => Some(ProtocolApprovalDecision::Deny),
-                }
-            } else {
-                None
+    crate::client::http::spawn_task(async move {
+        let mut stream = match client.chat_stream(&session_id, &prompt, options).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let _ = event_tx
+                    .send(WorkerMessage::Finished(Some(e.to_string())))
+                    .await;
+                return;
             }
-        });
-        let _ =
-            event_tx.blocking_send(WorkerMessage::Finished(result.err().map(|e| e.to_string())));
+        };
+        let mut saw_terminal = false;
+        loop {
+            match stream.next_event().await {
+                Some(Ok(event)) => {
+                    let request_id = match &event {
+                        StreamEvent::ApprovalRequired { request_id, .. } => {
+                            Some(request_id.clone())
+                        }
+                        StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. } => {
+                            saw_terminal = true;
+                            None
+                        }
+                        _ => None,
+                    };
+                    // Backpressured: awaits UI drain instead of dropping when
+                    // the transcript bursts faster than the 8fps redraw.
+                    if event_tx.send(WorkerMessage::Stream(event)).await.is_err() {
+                        break;
+                    }
+                    if let Some(request_id) = request_id {
+                        // After a cancel request, deny automatically so the
+                        // turn can unwind without user interaction.
+                        let decision = next_worker_decision(&cancel_flag, &mut decision_rx).await;
+                        if let Err(e) = client
+                            .approve_async(&session_id, &request_id, decision)
+                            .await
+                        {
+                            crate::llm::client::provider_log(
+                                "approval_delivery_failed",
+                                &e.to_string(),
+                            );
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = event_tx.send(WorkerMessage::Finished(Some(e))).await;
+                    return;
+                }
+                None => {
+                    // The daemon always closes with TurnComplete/TurnFailed;
+                    // a close without one is a transport failure, not success.
+                    let error = premature_close_error(saw_terminal);
+                    let _ = event_tx.send(WorkerMessage::Finished(error)).await;
+                    return;
+                }
+            }
+        }
     });
 }
 
@@ -2016,20 +2067,61 @@ mod tests {
     }
 
     #[test]
-    fn approval_after_cancel_auto_denies() {
-        // TDD Phase 5: approvals arriving after cancel are denied, not parked on overlay.
-        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Worker callback logic: when cancel_flag set, approval returns Deny without blocking.
-        // Simulate: `if cancel_flag { Deny }` path (see submit_prompt worker).
-        let decision = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            Some(crate::protocol::ApprovalDecision::Deny)
-        } else {
-            None
-        };
+    fn approval_decision_mapping_covers_all_variants() {
         assert!(matches!(
-            decision,
-            Some(crate::protocol::ApprovalDecision::Deny)
+            map_approval_decision(CoreApprovalDecision::Once),
+            ProtocolApprovalDecision::AllowOnce
         ));
+        assert!(matches!(
+            map_approval_decision(CoreApprovalDecision::Session),
+            ProtocolApprovalDecision::AllowSession
+        ));
+        assert!(matches!(
+            map_approval_decision(CoreApprovalDecision::Deny),
+            ProtocolApprovalDecision::Deny
+        ));
+    }
+
+    #[test]
+    fn premature_close_reports_transport_failure() {
+        assert_eq!(
+            premature_close_error(false),
+            Some("connection closed before turn completed".to_string())
+        );
+        assert_eq!(premature_close_error(true), None);
+    }
+
+    #[tokio::test]
+    async fn worker_decision_auto_denies_after_cancel_without_waiting() {
+        // Regression: approvals arriving after a cancel request must deny
+        // immediately instead of parking the turn on the overlay. The channel
+        // stays empty here — if the worker waited, the timeout fires.
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<CoreApprovalDecision>(16);
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_worker_decision(&cancel_flag, &mut rx),
+        )
+        .await
+        .expect("cancel path must not wait on the overlay");
+        assert!(matches!(decision, ProtocolApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn worker_decision_forwards_overlay_and_defaults_closed_to_deny() {
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CoreApprovalDecision>(16);
+        tx.send(CoreApprovalDecision::Session).await.unwrap();
+        let decision = next_worker_decision(&cancel_flag, &mut rx).await;
+        assert!(matches!(decision, ProtocolApprovalDecision::AllowSession));
+        // Turn went away (sender dropped): deny rather than hang.
+        drop(tx);
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next_worker_decision(&cancel_flag, &mut rx),
+        )
+        .await
+        .expect("closed channel must resolve, not hang");
+        assert!(matches!(decision, ProtocolApprovalDecision::Deny));
     }
 }
