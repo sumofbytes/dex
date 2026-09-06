@@ -254,6 +254,10 @@ impl DaemonState {
 
 /// Start the daemon HTTP server on an already-bound listener.
 pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+    // MCP bootstrap: connects servers in the background and merges their
+    // tools into the schema cache (plus the 60s liveness sweeper). Without
+    // this the manager stays uninitialized and `mcp__*` tools never exist.
+    crate::mcp::global_manager();
     let state = std::sync::Arc::new(DaemonState::new());
     // Rebuild in-memory state from the persisted JSONL on a background thread:
     // scanning every session (headers, event seqs, turn state) costs ~0.5s

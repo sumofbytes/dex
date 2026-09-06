@@ -1562,10 +1562,39 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                 ),
             }
         }
+        "/mcp" => {
+            // Explicit arm (not the `handle_slash` fallthrough below): the
+            // daemon owns the MCP connections, so status must come from
+            // `/api/mcp` — the client process's own manager was never
+            // bootstrapped and would render an empty list.
+            match remote.client.mcp_status() {
+                Ok(body) => {
+                    let statuses: Vec<crate::mcp::ServerStatus> = body["servers"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|v| crate::mcp::ServerStatus {
+                                    name: v["name"].as_str().unwrap_or("?").to_string(),
+                                    state: v["state"].as_str().unwrap_or("down").to_string(),
+                                    tools: v["tools"].as_u64().unwrap_or(0) as usize,
+                                    error: v["error"].as_str().map(|s| s.to_string()),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // No per-tool detail over the wire yet: headers + errors.
+                    let truncated = body["truncated"].as_u64().unwrap_or(0) as usize;
+                    for line in crate::core::format::render_mcp_panel(&statuses, &[], truncated) {
+                        push_info(&mut remote.app, line);
+                    }
+                }
+                Err(e) => push_info(&mut remote.app, format!("could not fetch MCP status: {e}")),
+            }
+        }
         "/help" => {
             push_info(
                 &mut remote.app,
-                "commands: /quit /clear /new /session /undo /waive <reason> /permissions /model [<m>] /skill:<name> /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear]"
+                "commands: /quit /clear /new /session /undo /mcp /waive <reason> /permissions /model [<m>] /skill:<name> /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear]"
                     .to_string(),
             );
             push_info(

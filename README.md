@@ -297,6 +297,7 @@ Any other arguments are treated as a one-shot prompt.
 | ------------------- | ---------------------------------------------------- |
 | `/quit`             | Exit the REPL.                                       |
 | `/permissions`      | Show permission mode and workspace.                  |
+| `/mcp`              | Show MCP servers, tools, and connection errors.      |
 | `/clear`            | Clear the conversation history (keeps the system prompt). |
 | `/new`              | Start a new session and clear history.               |
 | `/session`          | Show the current session id, path, and turn count.   |
@@ -388,6 +389,27 @@ schema):
 `*` behind `DEX_EXTRA_TOOLS=1` — pi parity is 6 tools. Tool results are truncated before being sent back to the model, and a result
 cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
 
+### MCP servers
+
+External tools via [Model Context Protocol](https://modelcontextprotocol.io) (stdio command or HTTP/SSE URL), declared under `mcp_servers:` in
+`config.yaml` (`DEX_MCP_SERVERS_JSON` wins when set — same shape as JSON):
+
+```yaml
+mcp_servers:
+  github: "npx -y github-mcp-server"          # shorthand: command + args
+  docs:
+    url: "https://docs.example.com/mcp"       # HTTP/SSE server
+    headers: { authorization: "Bearer ${DOCS_TOKEN}" }  # $VAR expands, fail-closed
+    timeout_secs: 30
+    allow: ["search"]                          # optional tool filter (deny wins)
+```
+
+Each server's tools appear in the schema as `mcp__<server>__<tool>` (description prefixed with `[<server>]`), plus one
+`mcp__<server>_read_resource` reader when the server hosts resources. The merged schema is capped at `DEX_MCP_MAX_TOOLS`
+(default 200, sorted by name, dropped count reported); servers connect in the background at startup and a 60s liveness
+sweeper marks dead ones `down` before the next turn uses them. `GET /api/mcp` shows per-server state/tool counts plus the
+truncated total; `POST /api/mcp/{server}/reconnect` redials a fixed server without restarting the daemon.
+
 ## Environment variables
 
 | Variable             | Description                                              |
@@ -410,6 +432,9 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
+| `DEX_MCP_SERVERS_JSON` | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests). |
+| `DEX_MCP` / `DEX_NO_MCP` | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers. |
+| `DEX_MCP_MAX_TOOLS` | Cap on merged MCP schema tools (default 200; head kept sorted by name). |
 | `DEX_COST_PER_1K` | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`). |
 | `DEX_CONTEXT_WINDOW` | Override model context window (pi: per-model from catalog, e.g. gpt-5.6 1050000, claude 200k, muse 1048576). |
 | `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384, pi: `compaction.reserveTokens`). |

@@ -10,6 +10,19 @@ pub(crate) trait CancellationSource: Send + Sync {
     fn take_cancelled(&self) -> bool;
 }
 
+/// Async wait for cancellation on the sync trait: polls with async sleep
+/// (10ms) so `select!` wakes within ~10ms. One path covers
+/// `CancellationToken`, `GlobalCancellation` and test doubles while keeping
+/// `CancellationSource` sync per plan.
+pub(crate) async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Process-global cancellation (Ctrl+C) used by the non-TUI paths
 /// (`dex "prompt"` and `dex --tool`). The TUI/daemon paths use a per-session
 /// `CancellationToken` instead, so a cancel never leaks across sessions.
