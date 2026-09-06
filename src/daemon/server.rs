@@ -177,11 +177,15 @@ async fn get_mcp() -> Json<serde_json::Value> {
     // Reads the process-wide cache; never spawns, never blocks the loop.
     // `error` carries the last connect/probe failure so operators see *why*
     // a server is down; `truncated` counts schema-cap drops (see loop.rs).
+    // `auth` carries the OAuth line for HTTP servers (`null` for stdio, which
+    // needs no login, and for servers the daemon never configured).
+    // Config loads once and maps over statuses (no N+1 reloads).
+    let configs = crate::mcp::load_server_configs();
     let servers: Vec<serde_json::Value> = crate::mcp::global_manager()
         .statuses()
         .await
         .into_iter()
-        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools, "error": s.error}))
+        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools, "error": s.error, "auth": crate::mcp::oauth::auth_line_with(&configs, &s.name)}))
         .collect();
     Json(json!({ "servers": servers, "truncated": crate::mcp::cached_truncated() }))
 }
@@ -1620,6 +1624,11 @@ mod handler_tests {
         let body = get_mcp().await.0;
         assert!(body.get("servers").and_then(|v| v.as_array()).is_some());
         assert!(body.get("truncated").and_then(|v| v.as_u64()).is_some());
+        // `auth` is always present (null for stdio/unconfigured): the remote
+        // TUI reads login state off this key, never the daemon's token files.
+        for server in body["servers"].as_array().into_iter().flatten() {
+            assert!(server.get("auth").is_some());
+        }
         // Smoke: unknown server surfaces down+error, never panics.
         let r = mcp_reconnect(Path("no-such-server".into())).await.0;
         assert_eq!(r.get("state").and_then(|v| v.as_str()), Some("down"));

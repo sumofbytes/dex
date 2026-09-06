@@ -192,6 +192,7 @@ fn print_help() {
         serve [bind]              daemon on 127.0.0.1:8420\n  \
         connect <url> [prompt]    TUI or one-shot against a daemon\n  \
         run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
+        mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
         update --models           refresh model catalog\n  \
         --tool                    raw JSON tool mode (stdin)\n\
         \n\
@@ -317,5 +318,48 @@ fn main() {
                 }
             }
         }
+        Mode::Mcp { action, server } => match action.as_str() {
+            "status" => {
+                let lines = crate::mcp::oauth::auth_lines();
+                if lines.is_empty() {
+                    println!("no HTTP MCP servers configured");
+                }
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            "login" => match server.as_deref() {
+                Some(server) => {
+                    match crate::client::http::block_on(crate::mcp::oauth::login(server)) {
+                        Ok(message) => println!("{message}"),
+                        Err(error) => {
+                            eprintln!("mcp login failed: {error}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("usage: dex mcp login <server>");
+                    std::process::exit(1);
+                }
+            },
+            "logout" => match server.as_deref() {
+                Some(server) => match crate::mcp::oauth::logout(server) {
+                    Ok(message) => println!("{message}"),
+                    Err(error) => {
+                        eprintln!("mcp logout failed: {error}");
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    eprintln!("usage: dex mcp logout <server>");
+                    std::process::exit(1);
+                }
+            },
+            _ => {
+                eprintln!("usage: dex mcp [status|login <server>|logout <server>]");
+                std::process::exit(1);
+            }
+        },
     }
 }

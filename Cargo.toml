@@ -39,6 +39,24 @@ ratatui-markdown = { version = "0.3.6", default-features = false, features = [
     "highlight-lang-typescript",
     "highlight-lang-toml",
     "highlight-lang-yaml",
+    "highlight-lang-c-sharp",
+    "highlight-lang-css",
+    "highlight-lang-dart",
+    # No highlight-lang-sql: tree-sitter-sequel 0.3.2 pins cc ~1.0.90,
+    # which conflicts with blake3's cc ^1.1.12 (single lockfile, no
+    # single cc satisfies both). sql stays on the generic lexer.
+    "highlight-lang-html",
+    # No highlight-lang-kotlin: ratatui-markdown 0.3.6's KOTLIN_HIGHLIGHTS
+    # query still references `(multiline_comment)`, renamed to
+    # `(block_comment)` in tree-sitter-kotlin-ng 1.1, so enabling the
+    # feature panics on any kotlin block. Re-add once upstream fixes it.
+    "highlight-lang-lua",
+    "highlight-lang-nix",
+    "highlight-lang-php",
+    "highlight-lang-ruby",
+    "highlight-lang-scala",
+    "highlight-lang-swift",
+    "highlight-lang-xml",
 ] }
 unicode-width = "0.1"
 similar = "2"
@@ -50,6 +68,9 @@ futures-core = "0.3"
 uuid = { version = "1", features = ["v4"] }
 terminal-colorsaurus = "1.0.3"
 fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
+# MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
+base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 http = "1"

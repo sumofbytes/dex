@@ -410,6 +410,13 @@ Each server's tools appear in the schema as `mcp__<server>__<tool>` (description
 sweeper marks dead ones `down` before the next turn uses them. `GET /api/mcp` shows per-server state/tool counts plus the
 truncated total; `POST /api/mcp/{server}/reconnect` redials a fixed server without restarting the daemon.
 
+HTTP servers with OAuth (RFC9728 protected-resource + RFC8414 discovery + RFC7591 registration + PKCE S256) log in
+via `dex mcp login <server>` (browser + loopback callback), `dex mcp logout <server>`, `dex mcp status`; `/mcp`
+shows the same auth lines. Tokens live in `$XDG_DATA_HOME/dex/mcp/<server>.json` (0600, never logged), refresh
+once per 401 with a 60s backoff on failure (`invalid_grant` drops the file). Discovery/token URLs must be https
+(loopback http allowed); optional `oauth_client_id`/`oauth_client_secret`/`oauth_scope` in config skip registration.
+When an AS rejects `resource` with `invalid_target`, login retries once without it.
+
 ## Environment variables
 
 | Variable             | Description                                              |

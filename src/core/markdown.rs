@@ -231,87 +231,125 @@ pub(crate) fn needs_gap_before(prev_empty: bool, curr: &str) -> bool {
         || is_table_gap_line(t)
 }
 
+/// Streaming gap state that survives throttled flushes. `normalize_gaps`
+/// derives `prev`/`air`/`fenced` from the unflushed `pending` buffer alone,
+/// so a heading/list at a flush boundary lost its top air (the buffer looked
+/// empty) while the bottom air survived via the trailing blank. Keeping this
+/// across `flush_assistant` calls restores symmetric MD022/MD031/MD032/MD058
+/// air; it resets on every fresh assistant block.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GapState {
+    prev: String,
+    prev_table: bool,
+    air: bool,
+    fenced: bool,
+}
+
+impl GapState {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// A blank transcript line (pushed directly, not via `pending`): clears
+    /// `prev`/`air` like processing an empty line, without touching `fenced`.
+    pub(crate) fn note_blank(&mut self) {
+        self.prev.clear();
+        self.prev_table = false;
+        self.air = false;
+    }
+
+    #[cfg(test)]
+    fn from_pending(pending: &str) -> Self {
+        let trimmed = pending.strip_suffix('\n').unwrap_or(pending);
+        let prev = trimmed
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .to_string();
+        let prev_table = is_table_line(&prev);
+        let air = block_leaves_air(&prev, prev_table);
+        let fenced = trimmed
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count()
+            % 2
+            == 1;
+        Self {
+            prev,
+            prev_table,
+            air,
+            fenced,
+        }
+    }
+
+    /// Insert blank lines where the model butts block-level markdown against
+    /// surrounding text, updating the state to the last line of `s`.
+    pub(crate) fn normalize(&mut self, s: &str) -> String {
+        let mut out = String::new();
+        for line in s.lines() {
+            let t = line.trim_start();
+            if is_fence(t) {
+                if !self.fenced && !self.prev.is_empty() {
+                    out.push('\n');
+                }
+                self.fenced = !self.fenced;
+                if !self.fenced {
+                    // Closing fence leaves air like any block (MD031).
+                    self.air = true;
+                    self.prev_table = false;
+                    // Point `prev` at something non-empty/block so the next
+                    // prose line sees the air.
+                    self.prev = "```".to_string();
+                }
+            } else if self.fenced {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            } else {
+                // Blank runs collapse to one air row (CommonMark/pi/codex
+                // render a single separator): `prev` is empty at stream start
+                // and right after a blank, and that earlier blank already
+                // separates, so skipping loses nothing. Fenced blanks take
+                // the branch above and pass through untouched.
+                if t.is_empty() && self.prev.is_empty() {
+                    continue;
+                }
+                let curr_table = is_table_line(t);
+                if !self.prev.is_empty()
+                    && !t.is_empty()
+                    && !is_continuation(&self.prev, self.prev_table, t, curr_table)
+                {
+                    let starts_block = is_block_start(t)
+                        || is_ordered_item(t)
+                        || (is_table_gap_line(t) && !self.prev_table);
+                    if self.air || starts_block {
+                        out.push('\n');
+                    }
+                }
+                self.prev = t.to_string();
+                self.prev_table = curr_table;
+                self.air = block_leaves_air(t, curr_table);
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
 /// Insert blank lines where the model butts block-level markdown against
 /// surrounding text, so dense output still renders with air between
 /// sections. `pending` is the assistant text already buffered for the
 /// streaming seam (or empty for whole-message replay). Never inserts inside
-/// code fences; existing blank lines are never doubled.
+/// code fences; blank runs collapse to a single blank line.
+#[cfg(test)]
 pub(crate) fn normalize_gaps(pending: &str, s: &str) -> String {
-    let trimmed = pending.strip_suffix('\n').unwrap_or(pending);
-    let mut prev: &str = trimmed.rsplit('\n').next().unwrap_or("").trim_start();
-    let mut prev_table = is_table_line(prev);
-    let mut air = block_leaves_air(prev, prev_table);
-    let mut fenced = trimmed
-        .lines()
-        .filter(|l| l.trim_start().starts_with("```"))
-        .count()
-        % 2
-        == 1;
-    let mut out = String::new();
-    for line in s.lines() {
-        let t = line.trim_start();
-        if is_fence(t) {
-            if !fenced && !prev.is_empty() {
-                out.push('\n');
-            }
-            fenced = !fenced;
-            if !fenced {
-                // Closing fence leaves air like any block (MD031).
-                air = true;
-                prev_table = false;
-                // Point `prev` at something non-empty/block so the next
-                // prose line sees the air. `t` borrows `line` (ends this
-                // iteration), so use a static fence marker instead.
-                prev = "```";
-            }
-        } else if fenced {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        } else {
-            let curr_table = is_table_line(t);
-            if !prev.is_empty()
-                && !t.is_empty()
-                && !is_continuation(prev, prev_table, t, curr_table)
-            {
-                let starts_block = is_block_start(t)
-                    || is_ordered_item(t)
-                    || (is_table_gap_line(t) && !prev_table);
-                if air || starts_block {
-                    out.push('\n');
-                }
-            }
-            prev = t;
-            prev_table = curr_table;
-            air = block_leaves_air(t, curr_table);
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-/// Tree-sitter language for a file path, covering the grammars compiled in
-/// via Cargo features plus common aliases. Unknown extensions return `""`
-/// and callers keep the dim fallback (never guess).
-pub(crate) fn lang_from_path(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let ext = ext.split(':').next().unwrap_or(&ext);
-    match ext {
-        "rs" => "rust",
-        "py" | "pyw" => "python",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        "ts" | "mts" | "cts" | "tsx" => "typescript",
-        "go" => "go",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cpp" | "hpp" | "cc" | "hh" | "cxx" => "cpp",
-        "json" | "jsonc" => "json",
-        "toml" => "toml",
-        "yaml" | "yml" => "yaml",
-        "sh" | "bash" | "zsh" => "bash",
-        _ => "",
-    }
+    GapState::from_pending(pending).normalize(s)
 }
 
 #[cfg(test)]
@@ -369,6 +407,14 @@ mod tests {
             normalize_gaps("", "## H\n\n- a\n\ntail"),
             "## H\n\n- a\n\ntail\n"
         );
+        // Blank runs collapse to one air row (CommonMark/pi/codex); leading
+        // blanks are dropped, fenced blanks pass through untouched.
+        assert_eq!(normalize_gaps("", "a\n\n\n\nb\n"), "a\n\nb\n");
+        assert_eq!(normalize_gaps("", "\n\n## H\n"), "## H\n");
+        assert_eq!(
+            normalize_gaps("", "```\n\n\ncode\n\n\n```\n"),
+            "```\n\n\ncode\n\n\n```\n"
+        );
         assert_eq!(
             normalize_gaps("", "```rust\n# not a heading\n```\ntext"),
             "```rust\n# not a heading\n```\n\ntext\n"
@@ -383,16 +429,6 @@ mod tests {
             normalize_gaps("```rust\nlet x = 1;\n", "# done"),
             "# done\n"
         );
-    }
-
-    #[test]
-    fn lang_map_covers_compiled_grammars() {
-        assert_eq!(lang_from_path("src/main.rs"), "rust");
-        assert_eq!(lang_from_path("a.py:12-20"), "python");
-        assert_eq!(lang_from_path("*.tsx"), "typescript");
-        assert_eq!(lang_from_path("run.SH"), "bash");
-        assert_eq!(lang_from_path("2 files"), "");
-        assert_eq!(lang_from_path("Makefile"), "");
     }
 
     #[test]

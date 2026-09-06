@@ -24,6 +24,8 @@ use tokio::sync::{Mutex, RwLock};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::types::ToolDefinition;
 
+pub(crate) mod oauth;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -44,6 +46,12 @@ pub(crate) struct McpServerConfig {
     pub(crate) allow: Vec<String>,
     /// Tool denylist: these server-side tool names are never exposed.
     pub(crate) deny: Vec<String>,
+    /// Pre-registered OAuth client (`dex mcp login` skips dynamic
+    /// registration when set). Refresh reuses the saved client otherwise.
+    pub(crate) oauth_client_id: Option<String>,
+    pub(crate) oauth_client_secret: Option<String>,
+    /// OAuth scope for the authorize request (metadata default otherwise).
+    pub(crate) oauth_scope: Option<String>,
 }
 
 impl McpServerConfig {
@@ -298,6 +306,9 @@ fn parse_server_config(value: &serde_yaml::Value) -> Result<McpServerConfig, Str
         disabled,
         allow: yaml_str_list(map, "allow")?,
         deny: yaml_str_list(map, "deny")?,
+        oauth_client_id: yaml_str(map, "oauth_client_id")?,
+        oauth_client_secret: yaml_str(map, "oauth_client_secret")?,
+        oauth_scope: yaml_str(map, "oauth_scope")?,
     })
 }
 
@@ -725,14 +736,20 @@ impl McpTransport for StdioTransport {
 }
 
 /// Transport-level failure: `session_gone` means the server forgot our
-/// Streamable HTTP session (restart) and the call is worth one re-handshake.
+/// Streamable HTTP session (restart) and the call is worth one re-handshake;
+/// `unauthorized` means a 401 worth one token refresh before surfacing.
 struct HttpError {
     msg: String,
     session_gone: bool,
+    unauthorized: bool,
 }
 
 /// Streamable HTTP: POST JSON-RPC, accept `application/json` or SSE stream.
+/// A stored OAuth token (`dex mcp login <server>`) is injected per request
+/// unless the config already sets `authorization` — so login/logout take
+/// effect without a reconnect.
 pub(crate) struct HttpTransport {
+    server: String,
     url: String,
     headers: BTreeMap<String, String>,
     timeout: Duration,
@@ -741,8 +758,9 @@ pub(crate) struct HttpTransport {
 }
 
 impl HttpTransport {
-    pub(crate) fn new(cfg: &McpServerConfig) -> Self {
+    pub(crate) fn new(server: &str, cfg: &McpServerConfig) -> Self {
         Self {
+            server: server.to_string(),
             url: cfg.url.clone().unwrap_or_default(),
             headers: cfg.headers.clone(),
             timeout: Duration::from_secs(cfg.timeout_secs.max(1)),
@@ -783,6 +801,31 @@ impl HttpTransport {
                     .await;
                 self.roundtrip(method, params).await.map_err(|e| e.msg)
             }
+            Err(e) if e.unauthorized => {
+                // One silent refresh when the stored token is refreshable,
+                // then a single retry. A dead refresh token (`invalid_grant`)
+                // is dropped so later calls fail fast with the login hint.
+                // Transient failures back off 60s so a down AS is not hammered
+                // on every tool call.
+                if let Some(saved) = oauth::load_token(&self.server) {
+                    if saved.refreshable() && !oauth::refresh_backoff_active(&self.server) {
+                        match oauth::refresh_access_token(&saved).await {
+                            Ok(fresh) => {
+                                let _ = oauth::save_token(&self.server, &fresh);
+                                oauth::clear_refresh_backoff(&self.server);
+                                return self.roundtrip(method, params).await.map_err(|e| e.msg);
+                            }
+                            Err(e) if e.contains("invalid_grant") => {
+                                let _ = oauth::clear_token(&self.server);
+                            }
+                            Err(_) => {
+                                oauth::note_refresh_failure(&self.server);
+                            }
+                        }
+                    }
+                }
+                Err(e.msg)
+            }
             Err(e) => Err(e.msg),
         }
     }
@@ -791,6 +834,7 @@ impl HttpTransport {
         let fail = |msg: String| HttpError {
             msg,
             session_gone: false,
+            unauthorized: false,
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = rpc_request(id, method, params);
@@ -801,6 +845,15 @@ impl HttpTransport {
             .timeout(self.timeout);
         for (k, v) in &self.headers {
             req = req.header(k, v);
+        }
+        if !self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"))
+        {
+            if let Some(tok) = oauth::valid_token(&self.server) {
+                req = req.header("authorization", format!("Bearer {}", tok.access_token));
+            }
         }
         let had_session = self.session.lock().await.clone();
         if let Some(s) = had_session.clone() {
@@ -823,6 +876,26 @@ impl HttpTransport {
             return Err(HttpError {
                 msg: format!("mcp http 404 (session expired): {method}"),
                 session_gone: true,
+                unauthorized: false,
+            });
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let bearer = resp
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(oauth::is_bearer_challenge);
+            let mut msg = format!("mcp http {status}: {method}");
+            if bearer {
+                msg.push_str(&format!(
+                    " (OAuth required — run 'dex mcp login {}')",
+                    self.server
+                ));
+            }
+            return Err(HttpError {
+                msg,
+                session_gone: false,
+                unauthorized: true,
             });
         }
         if !status.is_success() {
@@ -1073,7 +1146,7 @@ impl McpManager {
             return;
         }
         let transport: Result<Box<dyn McpTransport>, String> = if cfg.is_http() {
-            Ok(Box::new(HttpTransport::new(cfg)))
+            Ok(Box::new(HttpTransport::new(name, cfg)))
         } else {
             match StdioTransport::spawn(cfg).await {
                 Ok(t) => Ok(Box::new(t)),

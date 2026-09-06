@@ -46,6 +46,13 @@ pub(crate) enum Mode {
     Help,
     /// Print version (`dex --version`/`-V`).
     Version,
+    /// MCP OAuth (`dex mcp [status|login <server>|logout <server>]`).
+    Mcp {
+        /// Subcommand (`status` when omitted).
+        action: String,
+        /// Server name for `login`/`logout`.
+        server: Option<String>,
+    },
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -140,6 +147,24 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
             Mode::Connect { url }
         }
         Some("--tool") => Mode::Tool,
+        Some("mcp") => {
+            // Strict: extra args are an error, not silently dropped
+            // (`dex mcp login a b` used to ignore `b`).
+            if args.rest.len() > 3 {
+                return Mode::Mcp {
+                    action: "__invalid__".to_string(),
+                    server: None,
+                };
+            }
+            Mode::Mcp {
+                action: args
+                    .rest
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "status".to_string()),
+                server: args.rest.get(2).cloned(),
+            }
+        }
         Some("run") if args.rest.len() >= 2 => Mode::RunTool {
             name: args.rest[1].clone(),
             args: args.rest[2..].to_vec(),
@@ -247,5 +272,25 @@ mod tests {
             resolve_mode(&args_with_rest(&["explain", "--help"])),
             Mode::OneShot { .. }
         ));
+    }
+
+    #[test]
+    fn mcp_resolves_to_mcp_mode() {
+        assert!(matches!(
+            resolve_mode(&args_with_rest(&["mcp"])),
+            Mode::Mcp { .. }
+        ));
+        match resolve_mode(&args_with_rest(&["mcp", "login", "github"])) {
+            Mode::Mcp { action, server } => {
+                assert_eq!(action, "login");
+                assert_eq!(server.as_deref(), Some("github"));
+            }
+            other => panic!("expected Mode::Mcp, got {other:?}"),
+        }
+        // Extra args are invalid, never silently dropped.
+        match resolve_mode(&args_with_rest(&["mcp", "login", "a", "b"])) {
+            Mode::Mcp { action, .. } => assert_eq!(action, "__invalid__"),
+            other => panic!("expected invalid Mcp, got {other:?}"),
+        }
     }
 }

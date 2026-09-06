@@ -1,10 +1,8 @@
-use std::sync::{Arc, OnceLock};
-
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{block::Padding, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks, TreeSitterHighlighter};
+use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks};
 use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 use ratatui_markdown::ThemeConfig;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -16,6 +14,7 @@ use super::TAB_WIDTH;
 use super::{
     theme, transcript_indent, App, InputField, Selection, WrappedBlock, TRANSCRIPT_INDENT,
 };
+use crate::core::highlight;
 use crate::core::markdown as md;
 
 pub(super) fn surface_padding() -> Padding {
@@ -123,25 +122,6 @@ pub(super) fn compute_layout(
     })
 }
 
-/// Fence info-string -> tree-sitter key (`ratatui-markdown::get_lang` only
-/// matches exact lowercase tags). Strips our legacy trailing `:`, drops
-/// params (`rust ignore`, `js linenums`), lowercases, and maps the common
-/// `rs` shorthand the CLI highlighter already accepts.
-fn normalize_code_lang(info: &str) -> String {
-    let token = info
-        .trim()
-        .trim_end_matches(':')
-        .split([' ', '\t', ',', ';', '{', '}'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(':');
-    let lower = token.to_ascii_lowercase();
-    match lower.as_str() {
-        "rs" => "rust".to_string(),
-        _ => lower,
-    }
-}
-
 pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     let lines: Vec<&str> = s.lines().collect();
     let mut blocks = Vec::new();
@@ -149,7 +129,7 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     while i < lines.len() {
         let t = lines[i].trim_start();
         if t.starts_with("```") {
-            let lang = normalize_code_lang(t.trim_start_matches('`'));
+            let lang = crate::core::lang::normalize_code_lang(t.trim_start_matches('`'));
             let mut body = String::new();
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {
@@ -275,76 +255,126 @@ fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
 }
 
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
-    let highlighter = highlighter();
+    // Combined tree-sitter + generic-lexer highlighter, so fenced blocks
+    // highlight exactly like read previews and headless output (dockerfile /
+    // kotlin / groovy fall back instead of going dim in the TUI only).
+    let highlighter = highlight::shared_markdown_highlighter();
     let blocks = split_markdown(s);
-    let renderer = MarkdownRenderer::new(0)
-        .with_render_hooks(Box::new(HighlightHooks::new(highlighter, usize::MAX)));
-    renderer.render(&blocks, &ThemeConfig::default())
+    let renderer = MarkdownRenderer::new(0).with_render_hooks(Box::new(
+        HighlightHooks::new(highlighter, usize::MAX).with_border_color(theme::muted_fg()),
+    ));
+    renderer.render(&blocks, &markdown_theme())
 }
 
-fn highlighter() -> Arc<TreeSitterHighlighter> {
-    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
-    HIGHLIGHTER
-        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
-        .clone()
+/// Theme-aware markdown palette: prose/borders use the terminal's real
+/// foreground (readable on light + tinted themes, where the default
+/// `White`/`DarkGray` slots vanish or clash); semantic hues stay ANSI so the
+/// terminal remaps them. Code neutrals (variable/comment/punctuation) follow
+/// the foreground instead of fixed `White`/`DarkGray`. The palette itself
+/// lives in `core::highlight` so headless output uses identical colors.
+fn markdown_theme() -> ThemeConfig {
+    ThemeConfig::default()
+        .with_text_color(theme::surface_fg())
+        .with_muted_text_color(theme::muted_fg())
+        .with_border_color(theme::muted_fg())
+        .with_focused_border_color(theme::surface_fg())
+        .with_code_colors(highlight::code_colors())
 }
 
 /// Highlight a multi-line snippet in ONE tree-sitter pass and split the
 /// result back into per-line spans, so multi-line constructs (block
-/// comments, triple-quoted strings) keep their style across rows. Returns
-/// `None` when the language is unknown or yields nothing — callers keep the
-/// dim fallback, so highlighting never regresses to plain.
+/// comments, triple-quoted strings) keep their style across rows. Tree-sitter
+/// misses (sql, dockerfile, kotlin/groovy) fall back to the generic lexer; `None`
+/// means nothing colorable — callers keep the dim fallback.
 /// ponytail: byte-safe slicing throughout; a bad split falls back to dim
 /// rather than panicking mid-frame.
-pub(super) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    let mut segs = highlighter().highlight(lang, code);
-    if segs.is_empty() {
-        return None;
+    let mut segs = highlight::shared_highlighter().highlight(lang, code);
+    if !segs.is_empty() {
+        segs.sort_by_key(|s| (s.start, s.end));
+        return highlight::code_block_spans(code, &segs);
     }
-    segs.sort_by_key(|s| (s.start, s.end));
-    // Byte range of each `\n`-separated row in the joined text.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    for line in code.split('\n') {
-        ranges.push((start, start + line.len()));
-        start += line.len() + 1;
-    }
-    let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(ranges.len());
-    for (lo, hi) in ranges {
-        let mut spans = Vec::new();
-        let mut pos = lo;
-        for seg in segs.iter() {
-            if seg.end <= lo || seg.start >= hi || seg.end <= seg.start {
-                continue;
+    highlight::fallback_code_block(lang, code)
+}
+
+/// Transcript `▸ tool arg` row. Bash commands highlight via the compiled
+/// bash grammar (keywords/strings/flags read apart instead of one dim
+/// blob); every other tool keeps the dim arg. Unknown/unhighlightable bash
+/// falls back to dim, so this never regresses.
+pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("▸ ", Style::default().fg(Color::Yellow)),
+        Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
+    ];
+    // Single-line commands only: highlight_code_block splits per row and
+    // only the first row is appended — multi-line would drop lines 2+.
+    if name == "bash" && !arg.is_empty() && !arg.contains('\n') {
+        if let Some(mut rows) = highlight_code_block("bash", arg) {
+            if let Some(first) = rows.first_mut() {
+                if !first.is_empty() {
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        Style::default().fg(theme::tool_input_fg()),
+                    ));
+                    spans.append(first);
+                    return super::indent_transcript_line(Line::from(spans));
+                }
             }
-            // Clip the segment to this row; anything unsliceable aborts
-            // the whole block to dim (never half-highlighted rows).
-            let s = seg.start.max(lo);
-            let e = seg.end.min(hi);
-            if s < pos {
-                continue;
-            }
-            let gap = code.get(pos..s)?;
-            if !gap.is_empty() {
-                spans.push(Span::raw(gap.to_string()));
-            }
-            let text = code.get(s..e)?;
-            if text.is_empty() {
-                continue;
-            }
-            spans.push(Span::styled(text.to_string(), seg.style));
-            pos = e;
         }
-        let tail = code.get(pos..hi)?;
-        if !tail.is_empty() {
-            spans.push(Span::raw(tail.to_string()));
-        }
-        out.push(spans);
     }
-    Some(out)
+    spans.push(Span::styled(
+        format!(" {arg}"),
+        Style::default().fg(theme::tool_input_fg()),
+    ));
+    super::indent_transcript_line(Line::from(spans))
+}
+
+/// Approval-overlay detail row. Bash commands highlight the code after the
+/// `$ `/indent prefix (same grammar as the transcript); paths and diff
+/// markers keep their existing colors.
+pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> {
+    if name == "bash" {
+        let (prefix, code) = if let Some(rest) = detail.strip_prefix("$ ") {
+            ("$ ", rest)
+        } else if detail.starts_with("$") && detail.trim() == "$" {
+            return Line::from(Span::styled(
+                detail.to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if let Some(rest) = detail.strip_prefix("  ") {
+            ("  ", rest)
+        } else {
+            ("", detail)
+        };
+        // Single-line only (same first-row truncation as render_tool_input).
+        if !code.is_empty() && !code.contains('\n') {
+            if let Some(mut rows) = highlight_code_block("bash", code) {
+                if let Some(first) = rows.first_mut() {
+                    if !first.is_empty() {
+                        let mut spans = vec![Span::styled(
+                            prefix.to_string(),
+                            Style::default().fg(Color::Cyan),
+                        )];
+                        spans.append(first);
+                        return Line::from(spans);
+                    }
+                }
+            }
+        }
+    }
+    let style = if detail.starts_with('$') || detail.starts_with("path:") {
+        Style::default().fg(Color::Cyan)
+    } else if detail.starts_with("  −") {
+        Style::default().fg(Color::LightRed)
+    } else if detail.starts_with("  +") {
+        Style::default().fg(Color::LightGreen)
+    } else {
+        Style::default().fg(theme::tool_input_fg())
+    };
+    Line::from(Span::styled(detail.to_string(), style))
 }
 
 /// Split read's `{:>4}  content` gutter: the leading number plus its
@@ -403,7 +433,7 @@ pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
                 .trim_end_matches("<==")
                 .trim();
             let path = inner.split_whitespace().next().unwrap_or(inner);
-            let lang = md::lang_from_path(path).to_string();
+            let lang = crate::core::lang::lang_from_path(path).to_string();
             cur = Section {
                 header: Some(line.as_str()),
                 lang,
@@ -1126,19 +1156,8 @@ impl ApprovalOverlay {
             chunks[1],
         );
         let detail_lines: Vec<Line> = details
-            .into_iter()
-            .map(|d| {
-                let style = if d.starts_with('$') || d.starts_with("path:") {
-                    Style::default().fg(Color::Cyan)
-                } else if d.starts_with("  −") {
-                    Style::default().fg(Color::LightRed)
-                } else if d.starts_with("  +") {
-                    Style::default().fg(Color::LightGreen)
-                } else {
-                    Style::default().fg(theme::tool_input_fg())
-                };
-                Line::from(Span::styled(d, style))
-            })
+            .iter()
+            .map(|d| render_approval_detail(&approval.name, d))
             .collect();
         f.render_widget(
             Paragraph::new(detail_lines).wrap(Wrap { trim: false }),
@@ -1603,6 +1622,7 @@ mod tests {
             thinking_open: false,
             plan: crate::core::types::Plan::default(),
             assistant_pending: String::new(),
+            assistant_gap: crate::core::markdown::GapState::new(),
             stream_last_flush: std::time::Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
@@ -2587,6 +2607,25 @@ mod tests {
     }
 
     #[test]
+    fn blank_runs_render_one_air_row() {
+        // Double/triple blank lines collapse to one air row (CommonMark and
+        // pi/codex/opencode all render a single separator for a blank run).
+        let src = crate::core::markdown::normalize_gaps(
+            "",
+            "para one\n\n\n\npara two\n\n\n- a\n- b\n\n\ntail",
+        );
+        let lines = markdown_lines(&src);
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["para one", "", "para two", "", "•  a", "•  b", "", "tail"],
+        );
+    }
+
+    #[test]
     fn normalized_source_renders_gapped() {
         // The gap rule lives in `core::markdown` (unit-tested there); this
         // pins the render layer end to end: normalized dense source renders
@@ -2822,5 +2861,108 @@ mod tests {
         // Same for the delimiter row following a header.
         let out = crate::core::markdown::normalize_gaps("| a | b |\n", "|---|---|");
         assert_eq!(out, "|---|---|\n");
+    }
+
+    #[test]
+    fn bash_tool_input_highlights_while_other_tools_stay_dim() {
+        // A bash command with a string + comment must split into styled spans
+        // past the `\u25b8 bash ` prefix; a plain tool arg stays one dim span.
+        let line = render_tool_input("bash", "echo \"hi\" # done");
+        // indent + `\u25b8 ` + name + ` ` + highlighted code spans.
+        assert!(line.spans.len() > 4, "bash should highlight: {line:?}");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("echo"), "{text}");
+
+        let line = render_tool_input("read", "src/main.rs:1-20");
+        // indent + `\u25b8 ` + name + dim arg: no highlight split.
+        assert_eq!(line.spans.len(), 4, "{line:?}");
+
+        // Multi-line bash keeps the full dim arg (highlighting splits per
+        // row; appending only the first would silently drop lines 2+).
+        let line = render_tool_input("bash", "echo a\necho b");
+        assert_eq!(line.spans.len(), 4, "{line:?}");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('\n'), "{text}");
+    }
+
+    #[test]
+    fn bash_approval_detail_highlights_code_after_prefix() {
+        let line = render_approval_detail("bash", "$ echo \"hi\"");
+        assert!(line.spans.len() > 1, "{line:?}");
+        assert!(line.spans[0].content.as_ref() == "$ ");
+        // Non-bash details keep their single-span colors.
+        let line = render_approval_detail("read", "path: src/main.rs");
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+
+        // Multi-line code stays one full-detail span (never truncated).
+        let line = render_approval_detail("bash", "$ echo a\necho b");
+        assert_eq!(line.spans.len(), 1);
+        assert!(line.spans[0].content.contains('\n'), "{line:?}");
+    }
+
+    #[test]
+    fn bash_fence_highlights_via_tree_sitter() {
+        // The grammar must yield segments for typical shell (strings,
+        // comments, keywords) so ```bash blocks never fall back to yellow.
+        let highlighted = highlight_code_block("bash", "echo \"hi\" # done\nif x; then y; fi\n");
+        assert!(highlighted.is_some(), "bash grammar yielded nothing");
+        // Plain prose with no colorable tokens keeps the dim fallback.
+        let unknown = highlight_code_block("definitely-not-a-lang", "plain");
+        assert!(unknown.is_none());
+    }
+
+    #[test]
+    fn dockerfile_fence_highlights_via_fallback_while_unknown_stays_dim() {
+        // sql/dockerfile have no tree-sitter grammar: the generic lexer
+        // colors them instead of dim. html now has a real grammar.
+        // Truly unknown tags stay dim instead of guessing.
+        for (lang, code) in [
+            ("sql", "SELECT a FROM t WHERE x = 1\n"),
+            ("dockerfile", "FROM rust:1\nRUN cargo build\n"),
+            ("html", "<div>hi</div>\n"),
+        ] {
+            let rows = highlight_code_block(lang, code).expect("{lang} must highlight");
+            let text: String = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|s| s.content.as_ref().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(code.lines().next().unwrap_or("")), "{lang}");
+            assert!(
+                rows.iter()
+                    .flat_map(|r| r.iter())
+                    .any(|s| s.style.fg.is_some()),
+                "{lang} emitted no styles"
+            );
+        }
+        assert!(highlight_code_block("definitely-not-a-lang", "def x = 42\n").is_none());
+        assert!(highlight_code_block("text", "SELECT 1\n").is_none());
+    }
+
+    #[test]
+    fn markdown_fences_use_tree_sitter_and_fallback() {
+        // TUI fences must agree with previews/headless: tree-sitter for html,
+        // the generic lexer for sql/dockerfile, dim for truly unknown.
+        let lines = markdown_lines("```html\n<div>hi</div>\n```");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.fg.is_some()),
+            "html fence should highlight: {lines:?}"
+        );
+        let lines = markdown_lines("```sql\nSELECT a FROM t\n```");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.fg.is_some()),
+            "dockerfile fence should fallback-highlight: {lines:?}"
+        );
     }
 }

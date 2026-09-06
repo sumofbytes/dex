@@ -383,6 +383,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         show_thinking: false,
         thinking_open: false,
         assistant_pending: String::new(),
+        assistant_gap: crate::core::markdown::GapState::new(),
         stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
@@ -1562,6 +1563,23 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                 ),
             }
         }
+        _ if line.starts_with("/mcp ") => {
+            // Same grammar as local `/mcp`: only `help` is valid; anything
+            // else is usage (login itself runs in the CLI on the daemon host).
+            match line["/mcp ".len()..].trim() {
+                "help" => {
+                    push_info(
+                        &mut remote.app,
+                        "/mcp shows server status including auth.".to_string(),
+                    );
+                    push_info(
+                        &mut remote.app,
+                        "MCP OAuth runs in the CLI: `dex mcp login <server>` (on the daemon host when remote).".to_string(),
+                    );
+                }
+                _ => push_info(&mut remote.app, "usage: /mcp [help]".to_string()),
+            }
+        }
         "/mcp" => {
             // Explicit arm (not the `handle_slash` fallthrough below): the
             // daemon owns the MCP connections, so status must come from
@@ -1585,6 +1603,11 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     // No per-tool detail over the wire yet: headers + errors.
                     let truncated = body["truncated"].as_u64().unwrap_or(0) as usize;
                     for line in crate::core::format::render_mcp_panel(&statuses, &[], truncated) {
+                        push_info(&mut remote.app, line);
+                    }
+                    // Auth rides the same body (`auth`, null for stdio) so a
+                    // remote TUI never needs the daemon host's token files.
+                    for line in crate::client::http::mcp_auth_lines(&body) {
                         push_info(&mut remote.app, line);
                     }
                 }
