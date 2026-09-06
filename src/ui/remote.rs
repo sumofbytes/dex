@@ -1478,9 +1478,10 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
         options.plan = Some(remote.app.plan.to_json());
     }
     // P10 idempotency: a unique key per submission. If the connection drops
-    // mid-turn the worker re-POSTs with the SAME key — the daemon replays the
-    // recorded terminal event instead of re-running the effects (no duplicate
-    // prompt, no doubled edits).
+    // mid-turn the worker re-POSTs with the SAME key — a COMPLETED turn
+    // replays its recorded terminal event instead of re-running effects.
+    // A turn that died mid-way (no terminal recorded) re-executes on
+    // retry; only completed turns dedup. A still-running turn answers 409.
     options.idempotency_key = Some(uuid::Uuid::new_v4().to_string());
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
@@ -1519,7 +1520,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                         }
                         _ => None,
                     };
-                    last_seq = stream.last_seq();
+                    last_seq = last_seq.max(stream.last_seq());
                     // Backpressured: awaits UI drain instead of dropping when
                     // the transcript bursts faster than the 8fps redraw.
                     if event_tx.send(WorkerMessage::Stream(event)).await.is_err() {
@@ -1543,12 +1544,15 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                 // A transport failure (`Some(Err)`) or a close without a
                 // terminal event (`None`): one reattach attempt replays the
                 // journal from our cursor and re-POSTs with the same
-                // idempotency key.
+                // idempotency key (completed turns dedup; mid-way deaths
+                // re-execute; still-running turns get 409).
                 outcome => {
                     let transport_error = match outcome {
                         Some(Err(e)) => Some(e),
                         None => None,
-                        Some(Ok(_)) => unreachable!("handled above"),
+                        // First arm handles every `Some(Ok)`; treat a stray
+                        // as no error rather than panicking.
+                        Some(Ok(_)) => None,
                     };
                     if saw_terminal {
                         // The daemon always closes right after the terminal
@@ -1563,7 +1567,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                             &session_id,
                             &prompt,
                             &options,
-                            last_seq,
+                            &mut last_seq,
                             &event_tx,
                         )
                         .await
@@ -1617,26 +1621,27 @@ enum Reconnect {
 /// Recovery after a lost connection mid-turn: replay the daemon's journaled
 /// events past our cursor (the terminal event arrives there if the turn
 /// finished while we were gone), then re-POST the turn with the SAME
-/// idempotency key — a completed turn replays its recorded terminal event
-/// instead of running again. A still-running turn answers 409 CONFLICT, so
-/// no second stacked turn is ever created. Approvals in the replay are
-/// forwarded for visibility but not re-decided: parked approvals die with
-/// their turn on the daemon.
+/// idempotency key. A completed turn replays its recorded terminal event
+/// instead of running again; a still-running turn answers 409 CONFLICT, so
+/// no second stacked turn is ever created; a turn that died with no terminal
+/// re-executes (idempotency can't dedup what never finished). Approvals in
+/// the replay are forwarded for visibility but not re-decided: parked
+/// approvals die with their turn on the daemon.
 async fn try_reconnect(
     client: &DaemonClient,
     session_id: &str,
     prompt: &str,
     options: &ChatOptions,
-    last_seq: u64,
+    last_seq: &mut u64,
     event_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Reconnect {
     // The journal call's error is non-Send (plain `Box<dyn Error>`); match it
     // out immediately so the non-Send type never spans a later `.await`.
-    let replayed = match client.events_async(session_id, last_seq).await {
+    let replayed = match client.events_async(session_id, *last_seq).await {
         Ok(resp) => resp,
         Err(_) => EventsResponse {
             events: Vec::new(),
-            next_seq: 0,
+            next_seq: *last_seq,
         },
     };
     {
@@ -1656,6 +1661,9 @@ async fn try_reconnect(
                 return Reconnect::Failed("ui closed while replaying events".into());
             }
         }
+        // Advance the resume cursor past everything just forwarded so a
+        // second drop doesn't re-replay the same range.
+        *last_seq = (*last_seq).max(replayed.next_seq);
         if terminal {
             return Reconnect::Terminal;
         }

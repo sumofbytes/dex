@@ -22,9 +22,14 @@ use crate::tools::{execute_outcome, ToolOutcome};
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
     let mut paths = std::collections::HashSet::new();
     calls.iter().any(|call| {
+        // Fail closed: unparseable args serialize the batch rather than
+        // risk a concurrent same-file race we couldn't check.
         let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments) else {
-            return false;
+            return true;
         };
+        // Calls without a `path` (e.g. `bash`, which can still touch files
+        // via redirection) can't be checked — they never force
+        // serialization on their own.
         let Some(path) = value.get("path").and_then(Value::as_str) else {
             return false;
         };
@@ -50,11 +55,13 @@ pub(crate) fn persist_pending(
     Ok(())
 }
 
-/// Per-turn cap on tool rounds. A model that loops (re-issuing the same
-/// failing call in new words, ping-ponging two files) burns unlimited tokens
-/// without one; the repeated-call detector only stops *identical* calls.
-/// Bounded, preserved partial progress; the user can continue with another
-/// prompt. `DEX_MAX_TOOL_ITERATIONS` overrides.
+/// Per-turn cap on tool rounds (one round = one assistant batch with tool
+/// calls, regardless of how many calls the batch fans out). A model that
+/// loops (re-issuing the same failing call in new words, ping-ponging two
+/// files) burns unlimited tokens without one; the repeated-call detector
+/// only stops *identical* calls. Bounded, preserved partial progress; the
+/// user can continue with another prompt. `DEX_MAX_TOOL_ITERATIONS`
+/// overrides.
 fn max_tool_iterations() -> usize {
     std::env::var("DEX_MAX_TOOL_ITERATIONS")
         .ok()
@@ -64,17 +71,29 @@ fn max_tool_iterations() -> usize {
 }
 
 /// Provider wording for "the input no longer fits the context window".
-/// Matched on lowercase; providers phrase it many ways.
+/// Matched on lowercase; providers phrase it many ways. The generic
+/// "reduce the length" only counts with a context/token/prompt/input
+/// anchor so unrelated length validations (filenames, etc.) don't trigger
+/// a wasteful emergency compaction.
 fn is_context_overflow(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("context length")
         || message.contains("context_length")
         || message.contains("maximum context")
         || message.contains("context window")
+        || message.contains("context size")
+        || message.contains("context too large")
         || message.contains("input length")
+        || message.contains("input is too long")
         || message.contains("prompt is too long")
+        || message.contains("prompt too long")
         || message.contains("too many tokens")
-        || message.contains("reduce the length")
+        || message.contains("token limit")
+        || (message.contains("reduce the length")
+            && (message.contains("context")
+                || message.contains("token")
+                || message.contains("prompt")
+                || message.contains("input")))
 }
 
 /// Shared per-call accounting: live context usage in `state`, the sink
@@ -531,6 +550,8 @@ pub(crate) async fn process_turn(
             // burns unbounded tokens; the repeated-call detector only stops
             // bit-identical repeats. The completed batch above is persisted
             // first, so the transcript stays coherent for the next prompt.
+            // Counts batches (rounds), not individual calls: one fan-out of
+            // N parallel calls is one round.
             tool_iterations += 1;
             if tool_iterations >= tool_budget {
                 let note = format!(
@@ -541,6 +562,10 @@ pub(crate) async fn process_turn(
                 } else {
                     with_console(false, || eprintln!("[dex] {note}"));
                 }
+                // Leave a transcript marker so the resume shows why the
+                // turn stopped (User-role + name tag, like steering/summary).
+                messages.push(ChatMessage::user_named(note.clone(), "budget"));
+                let _ = persist_pending(&mut session, messages, &mut persisted_cursor);
                 return Err(note.into());
             }
             if !budget_warned && tool_iterations * 5 >= tool_budget * 4 {
@@ -822,11 +847,18 @@ mod tests {
             "input length exceeds context window",
             "your prompt is too long",
             "400 Too many tokens in request",
+            "context size exceeds limit",
+            "prompt too long for context",
+            "token limit exceeded",
+            "please reduce the length of the context",
         ] {
             assert!(is_context_overflow(msg), "{msg}");
         }
         assert!(!is_context_overflow("API error: invalid api key"));
         assert!(!is_context_overflow("stream idle for over 90s"));
+        // Generic length validation without a context anchor must not
+        // trigger a wasteful emergency compaction.
+        assert!(!is_context_overflow("reduce the length of your filename"));
     }
 
     /// A model that stalls in a tool-call loop is cut off by the per-turn

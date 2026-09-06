@@ -772,30 +772,46 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
 /// until the dangling call was hand-edited out. Synthesize a deterministic
 /// placeholder instead: the model sees an honest failure marker and can
 /// re-issue the call after checking what actually happened.
+///
+/// Placeholders are inserted immediately after their assistant message (in
+/// call order), not appended at the end, so causality survives even for a
+/// historic middle-batch gap. In-memory only — the journal file keeps its
+/// bytes, so every load re-synthesizes deterministically instead of
+/// accumulating duplicates.
 fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
-    let mut open: Vec<String> = Vec::new();
-    for msg in messages.iter() {
-        match msg.role {
-            Role::Assistant => {
-                if let Some(calls) = &msg.tool_calls {
-                    open.extend(calls.iter().map(|c| c.id.clone()));
+    use std::collections::HashSet;
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    // (assistant_idx, call_id) for calls with no result anywhere.
+    let mut dangling: Vec<(usize, String)> = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        if let Some(calls) = &msg.tool_calls {
+            for c in calls {
+                if !answered.contains(c.id.as_str()) {
+                    dangling.push((idx, c.id.clone()));
                 }
             }
-            Role::Tool => {
-                if let Some(id) = &msg.tool_call_id {
-                    open.retain(|open_id| open_id != id);
-                }
-            }
-            Role::User | Role::System => {}
         }
     }
-    for id in open {
-        messages.push(ChatMessage::tool_result(
-            id,
-            crate::core::format::model_tool_result(
-                "Error: tool result missing — the agent exited before it was recorded; the call may have executed. Verify the effect on disk before retrying.",
+    // Insert in reverse so earlier indices stay valid; same-index inserts
+    // iterate reversed to keep the original call order after the assistant.
+    for (assistant_idx, id) in dangling.into_iter().rev() {
+        let pos = (assistant_idx + 1).min(messages.len());
+        messages.insert(
+            pos,
+            ChatMessage::tool_result(
+                id,
+                crate::core::format::model_tool_result(
+                    "Error: tool result missing — the agent exited before it was recorded; the call may have executed. Verify the effect on disk before retrying.",
+                ),
             ),
-        ));
+        );
     }
 }
 
@@ -1439,5 +1455,31 @@ mod tests {
         let messages = load_messages_from_session(&path).unwrap();
         assert_eq!(messages.len(), 2, "no placeholder for a complete batch");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dangling_middle_batch_repairs_in_place_not_at_end() {
+        // A historic middle-batch gap gets its placeholder right after its
+        // assistant message, preserving causality for the model.
+        let mut messages = vec![
+            ChatMessage::user("goal"),
+            ChatMessage::assistant_calls(
+                None,
+                vec![crate::core::types::LlmToolCall {
+                    id: "mid-1".into(),
+                    call_type: "function".into(),
+                    function: crate::core::types::FunctionCall {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
+            ChatMessage::user("follow-up"),
+        ];
+        super::repair_dangling_tool_calls(&mut messages);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].role, crate::core::types::Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("mid-1"));
+        assert_eq!(messages[3].content.as_deref(), Some("follow-up"));
     }
 }

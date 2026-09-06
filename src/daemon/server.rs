@@ -47,7 +47,9 @@ async fn require_bearer(
                 .map(str::trim);
             let ok = provided.is_some_and(|p| {
                 p.len() == expected.len() && {
-                    // Constant-time-ish compare: leaks at most the prefix length.
+                    // Constant-time-ish compare over the secret bytes.
+                    // Length leaks (tokens are fixed-length UUIDs); content
+                    // does not short-circuit.
                     p.bytes()
                         .zip(expected.bytes())
                         .fold(0u8, |acc, (a, b)| acc | (a ^ b))

@@ -484,22 +484,20 @@ impl SseDriver {
     }
 }
 
-/// Idle cap between SSE chunks. Providers stall (silent proxy drops, hung
-/// upstreams); without a floor the stream reader waits forever and the turn
-/// looks alive while nothing moves. Every chunk resets the timer, so a
-/// healthy long generation is never cut. `DEX_STREAM_IDLE_TIMEOUT_SECS`
-/// overrides (0 disables).
 /// Idle cap between SSE chunks. Providers stall (silent proxies, hung
-/// upstreams); without a floor the stream reader waits forever and the turn
-/// never terminates. Every chunk (including keep-alives) resets the timer.
-/// `DEX_STREAM_IDLE_TIMEOUT_SECS` overrides; `0` disables the watchdog, which
-/// maps to a deadline so large the branch never fires.
-fn stream_idle_timeout() -> Duration {
-    const DISABLED: Duration = Duration::from_secs(u64::MAX);
+/// upstreams); without a watchdog the stream reader waits forever and the
+/// turn never terminates. Every chunk (including keep-alives) resets the
+/// timer. `DEX_STREAM_IDLE_TIMEOUT_SECS` overrides; `0` disables the
+/// watchdog entirely (no timer armed).
+///
+/// Note: providers that buffer slow reasoning for longer than this without
+/// emitting a chunk trip the watchdog even though the turn is healthy —
+/// raise it for thinking models (`DEX_STREAM_IDLE_TIMEOUT_SECS=300`).
+fn stream_idle_timeout() -> Option<Duration> {
     match env_secs("DEX_STREAM_IDLE_TIMEOUT_SECS") {
-        Some(0) => DISABLED,
-        Some(secs) => Duration::from_secs(secs),
-        None => Duration::from_secs(90),
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None => Some(Duration::from_secs(90)),
     }
 }
 
@@ -545,24 +543,32 @@ async fn run_sse<P: StreamParser>(
             // Idle watchdog: every chunk (including keep-alives) resets this
             // timer, so it only fires when the provider truly stopped
             // sending. Without it a stalled stream parks the turn forever.
-            // A disabled watchdog is an effectively infinite deadline, so the
-            // chunk branch always stays armed.
-            chunk_res = tokio::time::timeout(idle_timeout, response.chunk()) => {
+            // Disabled (`None`) arms no timer at all — no overflow-prone
+            // infinite deadline.
+            chunk_res = async {
+                match idle_timeout {
+                    Some(t) => match tokio::time::timeout(t, response.chunk()).await {
+                        Err(_) => Err(None),
+                        Ok(r) => r.map_err(|e| Some(e.to_string())),
+                    },
+                    None => response.chunk().await.map_err(|e| Some(e.to_string())),
+                }
+            } => {
                 match chunk_res {
-                    Err(_elapsed) => {
+                    Err(None) => {
+                        let secs = idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
                         return Err(stream_err(
                             &format!(
-                                "stream idle for over {}s; the provider stalled or the connection dropped (tune with DEX_STREAM_IDLE_TIMEOUT_SECS)",
-                                idle_timeout.as_secs()
+                                "stream idle for over {secs}s; the provider stalled or the connection dropped (tune with DEX_STREAM_IDLE_TIMEOUT_SECS)"
                             ),
                             driver.output_flowed,
                         ));
                     }
-                    Ok(Err(e)) => {
-                        return Err(stream_err(&e.to_string(), driver.output_flowed));
+                    Err(Some(msg)) => {
+                        return Err(stream_err(&msg, driver.output_flowed));
                     }
-                    Ok(Ok(None)) => break,
-                      Ok(Ok(Some(bytes))) => {
+                    Ok(None) => break,
+                      Ok(Some(bytes)) => {
                           buf.extend_from_slice(&bytes);
                           // Extract complete lines; keep partial tail buffered.
                           while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -1332,14 +1338,14 @@ mod tests {
     fn idle_timeout_env_parses() {
         let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "7");
-        assert_eq!(stream_idle_timeout(), Duration::from_secs(7));
-        // 0 disables the watchdog entirely (an effectively infinite deadline,
-        // not an immediate timeout).
+        assert_eq!(stream_idle_timeout(), Some(Duration::from_secs(7)));
+        // 0 disables the watchdog entirely (no timer armed, not an
+        // immediate timeout and not an infinite deadline).
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "0");
-        assert_eq!(stream_idle_timeout(), Duration::from_secs(u64::MAX));
+        assert_eq!(stream_idle_timeout(), None);
         // Garbage falls back to the 90s default.
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "junk");
-        assert_eq!(stream_idle_timeout(), Duration::from_secs(90));
+        assert_eq!(stream_idle_timeout(), Some(Duration::from_secs(90)));
         match prev {
             Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
             None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),

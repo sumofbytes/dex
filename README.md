@@ -253,7 +253,16 @@ dex connect http://10.0.0.5:8420 "explain the Cargo.toml dependencies"  # one-sh
 
 A non-loopback bind always requires a bearer token: the daemon generates one
 and prints it, clients present `DEX_DAEMON_TOKEN=<token>` (or the token file
-at `$XDG_DATA_HOME/dex/daemon.token`). Loopback-only daemons need no token.
+at `$XDG_DATA_HOME/dex/daemon.token`). Loopback-only daemons need no token
+unless `DEX_DAEMON_TOKEN` is set (explicit env wins everywhere). One machine,
+one token file: two daemons share it (second overwrites), so multi-daemon
+clients must pass per-host `DEX_DAEMON_TOKEN` explicitly.
+
+Reconnects: a dropped TUI replays the journal from its cursor and re-POSTs
+with the same idempotency key. Completed turns replay their terminal event;
+still-running turns answer 409 (reattach with `--reattach`); turns that died
+with no terminal re-execute (idempotency can't dedup what never finished).
+One reconnect per turn, then an honest error.
 
 The TUI behaves exactly like the local one: assistant text streams live,
 tool calls and results appear as they happen, tool approvals pop up as an
@@ -435,8 +444,8 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_HTTP_REQUEST_TIMEOUT_SECS` | Total request bound, applied only when explicitly set — streaming LLM/chat paths default to no total timeout so long turns aren't killed. |
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
-| `DEX_STREAM_IDLE_TIMEOUT_SECS` | SSE idle watchdog: fail the stream when no chunk (or keep-alive) arrives for this long (default 90; `0` disables). |
-| `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap on tool rounds (default 200). A looping model is stopped with partial progress preserved. |
+| `DEX_STREAM_IDLE_TIMEOUT_SECS` | SSE idle watchdog: fail the stream when no chunk (or keep-alive) arrives for this long (default 90; `0` disables). Slow reasoning models that buffer longer than this trip it while healthy — raise it (e.g. 300). |
+| `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap on tool rounds — one round per assistant batch with calls, not per call (default 200). A looping model is stopped with partial progress preserved and a transcript marker. |
 | `DEX_DAEMON_TOKEN` | Bearer token for the daemon API. Required by clients when `dex serve` binds a non-loopback address (auto-generated and written to `$XDG_DATA_HOME/dex/daemon.token`, 0600) or when the operator sets one. Loopback-only daemons need no token. |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
 | `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback). |

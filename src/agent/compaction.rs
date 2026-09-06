@@ -721,12 +721,13 @@ pub(crate) async fn compact_history(
     // from index 1, which left BOTH the old and the new summary in the
     // transcript — the model then re-read a stale checkpoint (and the old
     // one won on recency in some providers). The new summary subsumes the
-    // previous one, so the splice starts at the previous summary's position
-    // when one exists, keeping exactly one summary entry in history.
+    // previous one, so the splice starts at the FIRST summary's position
+    // when one exists, keeping exactly one summary entry in history. First
+    // (not last) also heals transcripts already stacked by the old bug.
     let summary_msg = ChatMessage::user_named(summarized.trim().to_string(), "summary");
     let splice_start = messages
         .iter()
-        .rposition(|m| m.name.as_deref() == Some("summary"))
+        .position(|m| m.name.as_deref() == Some("summary"))
         .unwrap_or(1);
     messages.splice(splice_start..first_kept, std::iter::once(summary_msg));
     Ok((true, usage_total))
@@ -975,6 +976,43 @@ mod tests {
             .collect();
         assert_eq!(summaries.len(), 1, "one checkpoint, not a stack");
         // The system prompt stays at the head.
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].name.as_deref(), Some("summary"));
+    }
+
+    /// Transcripts already stacked by the old bug (two summaries) heal to
+    /// one: the splice starts at the FIRST summary, not the last.
+    #[tokio::test]
+    async fn stacked_summaries_heal_to_a_single_summary() {
+        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
+        std::env::remove_var("DEX_COMPACTION_LLM");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        let mut s1 = msg(Role::User, "old checkpoint");
+        s1.name = Some("summary".into());
+        let mut s2 = msg(Role::User, "stale checkpoint");
+        s2.name = Some("summary".into());
+        messages.push(s1);
+        messages.push(msg(Role::User, "goal: build the thing"));
+        messages.push(s2);
+        for i in 0..20 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "compaction must run");
+        let summaries = messages
+            .iter()
+            .filter(|m| m.name.as_deref() == Some("summary"))
+            .count();
+        assert_eq!(summaries, 1, "stacked checkpoints must heal to one");
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].name.as_deref(), Some("summary"));
     }

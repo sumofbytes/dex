@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -25,16 +25,53 @@ pub(crate) fn daemon_token_file() -> Option<PathBuf> {
     Some(base.join("dex/daemon.token"))
 }
 
-/// Token required by this daemon process, resolved once at serve time:
+/// Token required by this daemon process, resolved at serve time:
 ///
 /// - `DEX_DAEMON_TOKEN` always wins — the operator chose the credential.
 /// - A loopback bind needs no token (the co-located TUI / one-shot client
-///   keeps working with zero configuration).
-/// - Any other bind generates one, writes it to `daemon.token` (0600) and
-///   prints it once. Serving a workspace-running agent on a reachable
-///   interface with no authentication would hand arbitrary code execution
-///   to anything on the network.
-static REQUIRED_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+///   keeps working with zero configuration), unless `DEX_DAEMON_TOKEN` is set.
+/// - Any other bind generates one, writes it to `daemon.token` (0600,
+///   created atomically so it is never world-readable) and prints it once.
+///   Serving a workspace-running agent on a reachable interface with no
+///   authentication would hand arbitrary code execution to anyone on the
+///   network.
+///
+/// Single-global file: two daemons on one machine share `daemon.token` —
+/// the second overwrites the first. Clients connecting to multiple daemons
+/// must pass per-host `DEX_DAEMON_TOKEN` explicitly.
+static REQUIRED_TOKEN: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+/// Atomically write `token` to `path` with 0600 (no world-readable window).
+fn write_token_file(path: &PathBuf, token: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let content = format!("{token}\n");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                f.write_all(content.as_bytes()).is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::write(path, format!("{token}\n")) {
+            Ok(()) => true,
+            Err(_) => false,
+        }
+    }
+}
 
 pub(crate) fn prepare_daemon_token(addr: &std::net::SocketAddr) {
     let token = std::env::var("DEX_DAEMON_TOKEN")
@@ -47,25 +84,7 @@ pub(crate) fn prepare_daemon_token(addr: &std::net::SocketAddr) {
             }
             let token = uuid::Uuid::new_v4().to_string();
             let published = match daemon_token_file() {
-                Some(path) => {
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match std::fs::write(&path, format!("{token}\n")) {
-                        Ok(()) => {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt as _;
-                                let _ = std::fs::set_permissions(
-                                    &path,
-                                    std::fs::Permissions::from_mode(0o600),
-                                );
-                            }
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                }
+                Some(path) => write_token_file(&path, &token),
                 None => false,
             };
             eprintln!(
@@ -74,13 +93,23 @@ pub(crate) fn prepare_daemon_token(addr: &std::net::SocketAddr) {
             eprintln!("daemon: clients connect with DEX_DAEMON_TOKEN=<token>");
             Some(token)
         });
-    let _ = REQUIRED_TOKEN.set(token);
+    *REQUIRED_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
 }
 
-/// The credential this daemon process requires (`None` → unauthenticated,
-/// loopback-only as resolved at serve time).
-pub(crate) fn required_token() -> Option<&'static str> {
-    REQUIRED_TOKEN.get().and_then(|t| t.as_deref())
+/// The credential this daemon process requires (`None` → unauthenticated).
+/// Cloned (not `&'static`) so tests can re-resolve per case without
+/// poisoning a process-global `OnceLock`.
+pub(crate) fn required_token() -> Option<String> {
+    REQUIRED_TOKEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .flatten()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_daemon_token_for_tests() {
+    *REQUIRED_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// A pending tool execution awaiting the client's approval decision.
@@ -520,28 +549,55 @@ mod tests {
     }
 
     /// A non-loopback bind without an explicit token generates one, publishes
-    /// it to `daemon.token` (0600) and the server then requires it on
-    /// `/api/*` while `/health` stays open. `prepare_daemon_token` runs once
-    /// per process, so this test fixes the global token; keep it alone.
+    /// it to `daemon.token` (0600, atomically) and the server then requires
+    /// it on `/api/*` while `/health` stays open. Panic-safe env restore via
+    /// Drop guards; global token is re-resolvable per case (no `OnceLock`
+    /// poisoning).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn bearer_token_generated_for_non_loopback_bind_and_enforced() {
+        struct Restore {
+            xdg: Option<std::ffi::OsString>,
+            token: Option<std::ffi::OsString>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.xdg.take() {
+                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+                match self.token.take() {
+                    Some(v) => std::env::set_var("DEX_DAEMON_TOKEN", v),
+                    None => std::env::remove_var("DEX_DAEMON_TOKEN"),
+                }
+                reset_daemon_token_for_tests();
+            }
+        }
         let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _restore = Restore {
+            xdg: std::env::var_os("XDG_DATA_HOME"),
+            token: std::env::var_os("DEX_DAEMON_TOKEN"),
+        };
         let dir = std::env::temp_dir().join(format!("dex-token-{}", std::process::id()));
-        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &dir);
-        let prev_token = std::env::var_os("DEX_DAEMON_TOKEN");
+        std::env::remove_var("DEX_DAEMON_TOKEN");
+        // Loopback needs no token; explicit env wins even on loopback.
+        let loopback: std::net::SocketAddr = "127.0.0.1:8420".parse().unwrap();
+        prepare_daemon_token(&loopback);
+        assert_eq!(required_token(), None, "loopback stays unauthenticated");
+        std::env::set_var("DEX_DAEMON_TOKEN", "env-wins");
+        prepare_daemon_token(&loopback);
+        assert_eq!(
+            required_token().as_deref(),
+            Some("env-wins"),
+            "explicit DEX_DAEMON_TOKEN wins even on loopback"
+        );
         std::env::remove_var("DEX_DAEMON_TOKEN");
         let addr: std::net::SocketAddr = "203.0.113.7:8420".parse().unwrap();
         prepare_daemon_token(&addr);
-        let required = required_token().map(String::from);
-        // Restore env before anything else so a panic can't leak it.
-        match prev_token {
-            Some(v) => std::env::set_var("DEX_DAEMON_TOKEN", v),
-            None => std::env::remove_var("DEX_DAEMON_TOKEN"),
-        }
+        let required = required_token();
         let token = required.expect("non-loopback bind must generate a token");
         let token_path = dir.join("dex/daemon.token");
         let written = std::fs::read_to_string(&token_path)
@@ -592,10 +648,6 @@ mod tests {
             .await
             .unwrap();
         assert!(allowed.status().is_success(), "{}", allowed.status());
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

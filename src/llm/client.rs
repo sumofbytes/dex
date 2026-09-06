@@ -78,18 +78,33 @@ pub(crate) fn retryable_status(status: reqwest::StatusCode) -> bool {
 }
 
 /// `Retry-After` header value → duration. Seconds form plus the HTTP-date
-/// form; capped so a hostile header cannot park the turn for hours. `None`
-/// when absent or unparseable.
+/// form (IMF-fixdate `... GMT`, parsed via a `+0000` rewrite); capped so a
+/// hostile header cannot park the turn for hours. `None` when absent or
+/// unparsable.
 fn retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
     if let Ok(secs) = value.parse::<u64>() {
         return Some(Duration::from_secs(secs.min(RETRY_AFTER_CAP_SECS)));
     }
-    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let delta = date.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    let date = parse_retry_after_date(value)?;
+    let delta = date - chrono::Utc::now();
     Some(Duration::from_secs(
         delta.num_seconds().clamp(0, RETRY_AFTER_CAP_SECS as i64) as u64,
     ))
+}
+
+/// Parse seconds-form already handled; here HTTP-date. `chrono` parses
+/// RFC 2822 (`...+0000`) but wire dates use IMF-fixdate (`... GMT`).
+fn parse_retry_after_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(d) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(d.with_timezone(&chrono::Utc));
+    }
+    // "Sun, 06 Nov 1994 08:49:37 GMT" → "Sun, 06 Nov 1994 08:49:37 +0000"
+    let stripped = value.strip_suffix("GMT").map(str::trim_end)?;
+    let rewritten = format!("{stripped} +0000");
+    chrono::DateTime::parse_from_rfc2822(&rewritten)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
 }
 
 /// Backoff for attempt `attempt` (0-based): exponential base with ±25%
@@ -347,6 +362,11 @@ mod tests {
         let formatted = soon.to_rfc2822();
         let parsed = retry_after(&formatted).expect("rfc2822 retry-after parses");
         assert!(parsed >= Duration::from_secs(1) && parsed <= Duration::from_secs(10));
+        // Wire IMF-fixdate form (`... GMT`), which `parse_from_rfc2822`
+        // alone rejects.
+        let gmt = soon.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let parsed_gmt = retry_after(&gmt).expect("IMF-fixdate retry-after parses");
+        assert!(parsed_gmt <= Duration::from_secs(10));
     }
 
     #[test]
