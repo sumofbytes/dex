@@ -56,11 +56,14 @@ struct CutPoint {
 /// Pi's `findCutPoint` — walk backwards until `keepRecentTokens`, cut at
 /// next valid user/assistant boundary, handle split turns.
 /// `start` is boundaryStart (after previous compaction), `end` is messages.len().
+/// `min_keep_messages` is the fallback recent-window size (12 normally,
+/// 4 when an emergency compaction must cut below the comfort floor).
 fn find_cut_point(
     messages: &[ChatMessage],
     start: usize,
     end: usize,
     keep_recent_tokens: u64,
+    min_keep_messages: usize,
 ) -> Option<CutPoint> {
     let cut_points = find_valid_cut_points(messages, start, end);
     if cut_points.is_empty() {
@@ -92,10 +95,10 @@ fn find_cut_point(
     if !hit_budget {
         // pi returns undefined when nothing to summarize; dex keeps fallback window
         // so many short messages still compact (dex compat).
-        if end - start <= 1 + KEEP_RECENT_MESSAGES {
+        if end - start <= 1 + min_keep_messages {
             return None;
         }
-        cut_index = end - KEEP_RECENT_MESSAGES;
+        cut_index = end - min_keep_messages;
         // snap to valid cut point at or after
         let mut snapped = None;
         for &cp in &cut_points {
@@ -524,7 +527,13 @@ pub(crate) fn find_cutoff_by_tokens(
     if boundary_start >= total {
         return None;
     }
-    if let Some(cp) = find_cut_point(messages, boundary_start, total, keep_recent_tokens) {
+    if let Some(cp) = find_cut_point(
+        messages,
+        boundary_start,
+        total,
+        keep_recent_tokens,
+        KEEP_RECENT_MESSAGES,
+    ) {
         if cp.first_kept_index <= boundary_start + MIN_MESSAGES_TO_SUMMARIZE {
             return None;
         }
@@ -544,6 +553,7 @@ pub(crate) async fn compact_history(
     _config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
     _cancel: &(dyn CancellationSource + Send + Sync),
+    emergency: bool,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -554,17 +564,33 @@ pub(crate) async fn compact_history(
         .rposition(|m| m.name.as_deref() == Some("summary"))
         .map(|idx| idx + 1)
         .unwrap_or(1);
+    // Emergency cut: the provider has already declared the input over its
+    // real limit, so the comfort floors that normally protect recency are
+    // what stop the retry. Shrink the keep window and the minimum-summarize
+    // guard to a floor that still leaves a coherent transcript.
+    let keep_recent_tokens = if emergency {
+        _config.keep_recent_tokens().saturating_div(4)
+    } else {
+        _config.keep_recent_tokens()
+    };
+    let min_keep_messages = if emergency { 4 } else { KEEP_RECENT_MESSAGES };
+    let min_to_summarize = if emergency {
+        1
+    } else {
+        MIN_MESSAGES_TO_SUMMARIZE
+    };
     let cp = match find_cut_point(
         messages,
         boundary_start,
         total,
-        _config.keep_recent_tokens(),
+        keep_recent_tokens,
+        min_keep_messages,
     ) {
         Some(c) => c,
         None => return Ok((false, None)),
     };
     let first_kept = cp.first_kept_index;
-    if first_kept <= boundary_start + MIN_MESSAGES_TO_SUMMARIZE {
+    if first_kept <= boundary_start + min_to_summarize {
         return Ok((false, None));
     }
     if first_kept >= total {
@@ -690,23 +716,54 @@ pub(crate) async fn compact_history(
         )
     };
 
-    // Pi's `firstKeptEntryId` is the kept boundary; dex splices from boundary_start..first_kept
+    // Pi's `firstKeptEntryId` is the kept boundary; dex splices from
+    // boundary_start..first_kept. Repeated compactions previously spliced
+    // from index 1, which left BOTH the old and the new summary in the
+    // transcript — the model then re-read a stale checkpoint (and the old
+    // one won on recency in some providers). The new summary subsumes the
+    // previous one, so the splice starts at the FIRST summary's position
+    // when one exists, keeping exactly one summary entry in history. First
+    // (not last) also heals transcripts already stacked by the old bug.
     let summary_msg = ChatMessage::user_named(summarized.trim().to_string(), "summary");
-    // If boundary_start !=1, we keep system (0) and summary subsumes previous summary,
-    // so splice from boundary_start..first_kept, but keep earlier summary? Pi's new summary subsumes previous,
-    // so we replace from boundary_start (which is after previous summary) — but previous summary is at boundary_start-1,
-    // we need to replace it too. For dex compat, we replace from 1..first_kept to subsume previous summary.
-    messages.splice(1..first_kept, std::iter::once(summary_msg));
+    let splice_start = messages
+        .iter()
+        .position(|m| m.name.as_deref() == Some("summary"))
+        .unwrap_or(1);
+    messages.splice(splice_start..first_kept, std::iter::once(summary_msg));
     Ok((true, usage_total))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        deterministic_summary, estimate_tokens, extract_file_ops_from_message,
+        compact_history, deterministic_summary, estimate_tokens, extract_file_ops_from_message,
         find_cutoff_by_tokens, ChatMessage, FileOps, KEEP_RECENT_MESSAGES,
     };
     use crate::core::types::{FunctionCall, LlmToolCall, Role};
+
+    /// Save/restore process env around tests that flip dex env vars.
+    struct EnvRestore {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn take(keys: &[&'static str]) -> Self {
+            Self {
+                vars: keys.iter().map(|k| (*k, std::env::var_os(k))).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, prev) in self.vars.drain(..) {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         let mut m = ChatMessage::user(content);
@@ -874,5 +931,133 @@ mod tests {
         );
         assert!(summary.contains("<read-files>"), "file ops missing");
         assert!(summary.contains("src/foo.rs"));
+    }
+
+    /// Repeated compactions must keep exactly ONE summary entry: the new
+    /// checkpoint subsumes the previous one. The old splice (from index 1)
+    /// stacked summaries, so the model kept re-reading a stale checkpoint.
+    #[tokio::test]
+    async fn repeated_compaction_keeps_a_single_summary() {
+        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
+        std::env::remove_var("DEX_COMPACTION_LLM");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..20 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "first compaction must run");
+        // Grow the history again and compact a second time.
+        for i in 20..40 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "second compaction must run");
+        let summaries: Vec<_> = messages
+            .iter()
+            .filter(|m| m.name.as_deref() == Some("summary"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "one checkpoint, not a stack");
+        // The system prompt stays at the head.
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].name.as_deref(), Some("summary"));
+    }
+
+    /// Transcripts already stacked by the old bug (two summaries) heal to
+    /// one: the splice starts at the FIRST summary, not the last.
+    #[tokio::test]
+    async fn stacked_summaries_heal_to_a_single_summary() {
+        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
+        std::env::remove_var("DEX_COMPACTION_LLM");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        let mut s1 = msg(Role::User, "old checkpoint");
+        s1.name = Some("summary".into());
+        let mut s2 = msg(Role::User, "stale checkpoint");
+        s2.name = Some("summary".into());
+        messages.push(s1);
+        messages.push(msg(Role::User, "goal: build the thing"));
+        messages.push(s2);
+        for i in 0..20 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "compaction must run");
+        let summaries = messages
+            .iter()
+            .filter(|m| m.name.as_deref() == Some("summary"))
+            .count();
+        assert_eq!(summaries, 1, "stacked checkpoints must heal to one");
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].name.as_deref(), Some("summary"));
+    }
+
+    /// Emergency compaction must be able to cut below the comfort floor:
+    /// after the provider has declared the input over-limit, the normal
+    /// 20k keep-window and 8-message minimum would refuse to shrink at all.
+    #[tokio::test]
+    async fn emergency_compaction_cuts_below_the_comfort_floor() {
+        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
+        std::env::remove_var("DEX_COMPACTION_LLM");
+        let config = crate::llm::config::tests::test_cfg();
+        // A history the normal path would refuse to cut: 12 messages, under
+        // the fallback window (1 + 12 kept) it requires.
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal"));
+        for i in 0..5 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(80))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(80))));
+        }
+        let (normal, _) = compact_history(
+            &config,
+            &mut messages.clone(),
+            &crate::agent::state::GlobalCancellation,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!normal, "normal path declines a short history");
+        let (forced, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(forced, "emergency path must cut");
+        assert!(
+            messages.len() < 12,
+            "emergency keeps only a small recent window: {}",
+            messages.len()
+        );
+        // Transcript coherence: system first, then the summary.
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].name.as_deref(), Some("summary"));
     }
 }

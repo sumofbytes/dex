@@ -22,13 +22,22 @@ use crate::tools::{execute_outcome, ToolOutcome};
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
     let mut paths = std::collections::HashSet::new();
     calls.iter().any(|call| {
+        // Fail closed: unparseable args serialize the batch rather than
+        // risk a concurrent same-file race we couldn't check.
         let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments) else {
-            return false;
+            return true;
         };
+        // Calls without a `path` (e.g. `bash`, which can still touch files
+        // via redirection) can't be checked — they never force
+        // serialization on their own.
         let Some(path) = value.get("path").and_then(Value::as_str) else {
             return false;
         };
-        !paths.insert(path.to_string())
+        // Normalize before comparing: `./foo.rs` and `foo.rs` (or an
+        // absolute vs relative spelling of one file) must collide, or the
+        // fan-out runs two edits against one file concurrently and the
+        // second silently clobbers the first.
+        !paths.insert(crate::tools::normalize_conflict_path(path))
     })
 }
 
@@ -44,6 +53,47 @@ pub(crate) fn persist_pending(
         *cursor = messages.len();
     }
     Ok(())
+}
+
+/// Per-turn cap on tool rounds (one round = one assistant batch with tool
+/// calls, regardless of how many calls the batch fans out). A model that
+/// loops (re-issuing the same failing call in new words, ping-ponging two
+/// files) burns unlimited tokens without one; the repeated-call detector
+/// only stops *identical* calls. Bounded, preserved partial progress; the
+/// user can continue with another prompt. `DEX_MAX_TOOL_ITERATIONS`
+/// overrides.
+fn max_tool_iterations() -> usize {
+    std::env::var("DEX_MAX_TOOL_ITERATIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(200)
+}
+
+/// Provider wording for "the input no longer fits the context window".
+/// Matched on lowercase; providers phrase it many ways. The generic
+/// "reduce the length" only counts with a context/token/prompt/input
+/// anchor so unrelated length validations (filenames, etc.) don't trigger
+/// a wasteful emergency compaction.
+fn is_context_overflow(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("context length")
+        || message.contains("context_length")
+        || message.contains("maximum context")
+        || message.contains("context window")
+        || message.contains("context size")
+        || message.contains("context too large")
+        || message.contains("input length")
+        || message.contains("input is too long")
+        || message.contains("prompt is too long")
+        || message.contains("prompt too long")
+        || message.contains("too many tokens")
+        || message.contains("token limit")
+        || (message.contains("reduce the length")
+            && (message.contains("context")
+                || message.contains("token")
+                || message.contains("prompt")
+                || message.contains("input")))
 }
 
 /// Shared per-call accounting: live context usage in `state`, the sink
@@ -114,6 +164,41 @@ async fn execute_tool_call(
     (name, input, outcome)
 }
 
+/// Force up to three compaction rounds regardless of the token threshold —
+/// the provider has already said the input is over the real limit, so the
+/// estimator's opinion no longer matters. Returns true when history shrank.
+async fn emergency_compact(
+    config: &LlmConfig,
+    messages: &mut Vec<ChatMessage>,
+    state: &mut ToolState,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    console: &Console,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut compacted_any = false;
+    for _ in 0..3 {
+        match compact_history(config, messages, cancel, true).await {
+            Ok((true, usage)) => {
+                compacted_any = true;
+                if let Some(u) = usage {
+                    record_usage(config, state, console, u).await;
+                }
+            }
+            _ => break,
+        }
+    }
+    let note = if compacted_any {
+        "context overflow: compacted history and retrying the model call once".to_string()
+    } else {
+        "context overflow: nothing compactable; the input (likely one message or tool result) is too large".to_string()
+    };
+    if console.sink().is_some() {
+        console.emit_async(SinkLine::System(note)).await;
+    } else {
+        with_console(false, || eprintln!("[dex] {note}"));
+    }
+    Ok(compacted_any)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_turn(
     config: &LlmConfig,
@@ -131,6 +216,13 @@ pub(crate) async fn process_turn(
     let mut last_usage: Option<u64> = state.last_usage;
     let cancellation = cancel;
     let mut persisted_cursor = messages.len();
+    let tool_budget = max_tool_iterations();
+    let mut tool_iterations = 0usize;
+    // One context-overflow retry per turn: after an emergency compaction the
+    // model call is re-issued exactly once; a second overflow is a real
+    // failure (single message too large), not something more slicing fixes.
+    let mut overflow_retried = false;
+    let mut budget_warned = false;
 
     for _iteration in 0..1_000_000 {
         persist_pending(&mut session, messages, &mut persisted_cursor)?;
@@ -167,7 +259,7 @@ pub(crate) async fn process_turn(
             if !need_by_tokens && !need_by_count {
                 break;
             }
-            match compact_history(config, messages, cancel).await {
+            match compact_history(config, messages, cancel, false).await {
                 Ok((true, compacted)) => {
                     compaction_attempts += 1;
                     // Summarizer calls are billed like any other; account
@@ -204,6 +296,36 @@ pub(crate) async fn process_turn(
                     let msg = e.to_string();
                     if msg == "interrupted" || msg == "cancelled" {
                         return Err("cancelled by user".into());
+                    }
+                    // The provider rejected the request because the input no
+                    // longer fits: emergency-compact and re-issue once
+                    // instead of failing the whole turn. The proactive
+                    // compaction above runs on an estimate; real provider
+                    // limits (tool schemas, a huge single tool result) can
+                    // still overshoot it.
+                    if !overflow_retried && is_context_overflow(&msg) {
+                        overflow_retried = true;
+                        match emergency_compact(
+                            config,
+                            messages,
+                            state,
+                            cancellation,
+                            console,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                if let Some(session) = session.as_deref_mut() {
+                                    session.clear_messages()?;
+                                    for message in messages.iter().skip(1) {
+                                        session.append_message(message.clone())?;
+                                    }
+                                }
+                                persisted_cursor = messages.len();
+                                continue;
+                            }
+                            _ => return Err(msg.into()),
+                        }
                     }
                     return Err(msg.into());
                 }
@@ -422,6 +544,38 @@ pub(crate) async fn process_turn(
                     model_tool_result(&result),
                 ));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
+            }
+            // Per-turn tool budget: a model that churns without converging
+            // (rephrasing the same failing call, ping-ponging two files)
+            // burns unbounded tokens; the repeated-call detector only stops
+            // bit-identical repeats. The completed batch above is persisted
+            // first, so the transcript stays coherent for the next prompt.
+            // Counts batches (rounds), not individual calls: one fan-out of
+            // N parallel calls is one round.
+            tool_iterations += 1;
+            if tool_iterations >= tool_budget {
+                let note = format!(
+                    "turn budget exhausted after {tool_iterations} tool rounds; partial progress preserved — send another prompt to continue"
+                );
+                if console.sink().is_some() {
+                    console.emit_async(SinkLine::System(note.clone())).await;
+                } else {
+                    with_console(false, || eprintln!("[dex] {note}"));
+                }
+                // Leave a transcript marker so the resume shows why the
+                // turn stopped (User-role + name tag, like steering/summary).
+                messages.push(ChatMessage::user_named(note.clone(), "budget"));
+                let _ = persist_pending(&mut session, messages, &mut persisted_cursor);
+                return Err(note.into());
+            }
+            if !budget_warned && tool_iterations * 5 >= tool_budget * 4 {
+                budget_warned = true;
+                let note = format!("{tool_iterations}/{tool_budget} tool rounds used this turn");
+                if console.sink().is_some() {
+                    console.emit_async(SinkLine::System(note)).await;
+                } else {
+                    with_console(false, || eprintln!("[dex] {note}"));
+                }
             }
             // Write-through persist (best-effort, tiny JSON): awaited so a
             // process exit right after the turn can't lose it — a detached
@@ -684,6 +838,175 @@ mod tests {
             },
         ];
         assert!(!tool_calls_conflict(&different));
+    }
+
+    #[test]
+    fn overflow_wording_is_recognized() {
+        for msg in [
+            "API error: This model's maximum context length is 8192 tokens",
+            "input length exceeds context window",
+            "your prompt is too long",
+            "400 Too many tokens in request",
+            "context size exceeds limit",
+            "prompt too long for context",
+            "token limit exceeded",
+            "please reduce the length of the context",
+        ] {
+            assert!(is_context_overflow(msg), "{msg}");
+        }
+        assert!(!is_context_overflow("API error: invalid api key"));
+        assert!(!is_context_overflow("stream idle for over 90s"));
+        // Generic length validation without a context anchor must not
+        // trigger a wasteful emergency compaction.
+        assert!(!is_context_overflow("reduce the length of your filename"));
+    }
+
+    /// A model that stalls in a tool-call loop is cut off by the per-turn
+    /// budget instead of burning unbounded tokens; the transcript stays
+    /// coherent (every call has its result).
+    #[tokio::test]
+    async fn turn_budget_stops_an_endless_tool_loop() {
+        #[derive(Clone)]
+        struct AlwaysTool;
+        impl ModelClient for AlwaysTool {
+            async fn complete(
+                &self,
+                _m: &[ChatMessage],
+                _w: bool,
+                _s: Option<mpsc::Sender<SinkLine>>,
+                _c: &(dyn CancellationSource + Send + Sync),
+            ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Turn {
+                    message: ChatMessage::assistant_calls(
+                        Some("thinking about it".to_string()),
+                        vec![crate::core::types::LlmToolCall {
+                            id: format!("c{}", uuid::Uuid::new_v4().simple()),
+                            call_type: "function".into(),
+                            function: crate::core::types::FunctionCall {
+                                name: "read".into(),
+                                arguments: r#"{"path":"README.md"}"#.into(),
+                            },
+                        }],
+                    ),
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 0,
+                        cached_tokens: None,
+                    }),
+                    stop_reason: None,
+                })
+            }
+        }
+        let prev = std::env::var("DEX_MAX_TOOL_ITERATIONS").ok();
+        std::env::set_var("DEX_MAX_TOOL_ITERATIONS", "2");
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let err = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &AlwaysTool,
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        match prev {
+            Some(v) => std::env::set_var("DEX_MAX_TOOL_ITERATIONS", v),
+            None => std::env::remove_var("DEX_MAX_TOOL_ITERATIONS"),
+        }
+        assert!(err.contains("turn budget exhausted"), "{err}");
+        // Transcript coherence: every assistant batch has its tool result.
+        let unanswered = messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| m.tool_calls.as_ref().map(|c| c.len()).unwrap_or_default())
+            .sum::<usize>();
+        let answered = messages.iter().filter(|m| m.role == Role::Tool).count();
+        assert_eq!(
+            answered, unanswered,
+            "budget stop must leave a coherent transcript"
+        );
+    }
+
+    /// When the provider rejects the request because the history no longer
+    /// fits, the loop emergency-compacts and retries once instead of failing
+    /// the turn.
+    #[tokio::test]
+    async fn context_overflow_compacts_and_retries_once() {
+        #[derive(Clone)]
+        struct OverflowThenOk {
+            round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ModelClient for OverflowThenOk {
+            async fn complete(
+                &self,
+                messages: &[ChatMessage],
+                _w: bool,
+                _s: Option<mpsc::Sender<SinkLine>>,
+                _c: &(dyn CancellationSource + Send + Sync),
+            ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+                let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if round == 0 {
+                    return Err("API error: maximum context length exceeded".into());
+                }
+                // After compaction the history must actually have shrunk.
+                assert!(
+                    messages.len() < 20,
+                    "compaction must cut history before the retry"
+                );
+                Ok(Turn {
+                    message: ChatMessage::assistant("recovered"),
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 0,
+                        cached_tokens: None,
+                    }),
+                    stop_reason: None,
+                })
+            }
+        }
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        messages.push(ChatMessage::user("goal: fix the flaky test"));
+        // Enough medium-size turns that compaction has something to cut.
+        for i in 0..20 {
+            messages.push(ChatMessage::user(format!("u{i}: {}", "x".repeat(300))));
+            messages.push(ChatMessage::assistant(format!("a{i}: {}", "y".repeat(300))));
+        }
+        let mut state = ToolState::default();
+        let result = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &OverflowThenOk {
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "overflow must compact and retry: {result:?}"
+        );
+        // Exactly one summary entry, and the failed prompt round did not
+        // leave the transcript wedged.
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.name.as_deref() == Some("summary"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

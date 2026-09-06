@@ -761,7 +761,58 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
             }
         }
     }
+    repair_dangling_tool_calls(&mut messages);
     Ok(messages)
+}
+
+/// Repair a transcript that ends mid-batch: an assistant tool call whose
+/// result never landed (a crash between the assistant message and the tool
+/// result, or a truncated journal line). Providers reject a `tool_calls`
+/// batch without its results, so a resume would fail the very next request
+/// until the dangling call was hand-edited out. Synthesize a deterministic
+/// placeholder instead: the model sees an honest failure marker and can
+/// re-issue the call after checking what actually happened.
+///
+/// Placeholders are inserted immediately after their assistant message (in
+/// call order), not appended at the end, so causality survives even for a
+/// historic middle-batch gap. In-memory only — the journal file keeps its
+/// bytes, so every load re-synthesizes deterministically instead of
+/// accumulating duplicates.
+fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
+    use std::collections::HashSet;
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    // (assistant_idx, call_id) for calls with no result anywhere.
+    let mut dangling: Vec<(usize, String)> = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        if let Some(calls) = &msg.tool_calls {
+            for c in calls {
+                if !answered.contains(c.id.as_str()) {
+                    dangling.push((idx, c.id.clone()));
+                }
+            }
+        }
+    }
+    // Insert in reverse so earlier indices stay valid; same-index inserts
+    // iterate reversed to keep the original call order after the assistant.
+    for (assistant_idx, id) in dangling.into_iter().rev() {
+        let pos = (assistant_idx + 1).min(messages.len());
+        messages.insert(
+            pos,
+            ChatMessage::tool_result(
+                id,
+                crate::core::format::model_tool_result(
+                    "Error: tool result missing — the agent exited before it was recorded; the call may have executed. Verify the effect on disk before retrying.",
+                ),
+            ),
+        );
+    }
 }
 
 /// Read only the first line of a file: session listings only ever need the
@@ -1328,5 +1379,107 @@ mod tests {
         let async_list = Session::list_all_async().await.unwrap();
         assert_eq!(sync_list.len(), async_list.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dangling_tool_call_is_synthesized_on_load() {
+        // A crash between the assistant call and its result must not wedge
+        // the next resume: providers reject an unanswered tool_call batch.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+        let dir = std::env::temp_dir().join(format!("dex-sess-repair-{}", std::process::id()));
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut s = Session::new("/tmp/dex-repair-cwd".into(), None).unwrap();
+        s.append_message(ChatMessage::user("goal")).unwrap();
+        s.append_message(ChatMessage::assistant_calls(
+            None,
+            vec![crate::core::types::LlmToolCall {
+                id: "call-1".into(),
+                call_type: "function".into(),
+                function: crate::core::types::FunctionCall {
+                    name: "edit".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                },
+            }],
+        ))
+        .unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+        let messages = load_messages_from_session(&path).unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "assistant call must get a synthesized result"
+        );
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, crate::core::types::Role::Tool);
+        assert_eq!(last.tool_call_id.as_deref(), Some("call-1"));
+        assert!(
+            last.content
+                .as_deref()
+                .unwrap()
+                .contains("tool result missing"),
+            "synthesized result must say what happened: {:?}",
+            last.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn complete_tool_batch_loads_without_synthesis() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+        let dir = std::env::temp_dir().join(format!("dex-sess-clean-{}", std::process::id()));
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let mut s = Session::new("/tmp/dex-clean-cwd".into(), None).unwrap();
+        s.append_message(ChatMessage::assistant_calls(
+            None,
+            vec![crate::core::types::LlmToolCall {
+                id: "call-1".into(),
+                call_type: "function".into(),
+                function: crate::core::types::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+        ))
+        .unwrap();
+        s.append_message(ChatMessage::tool_result("call-1", "contents"))
+            .unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        drop(s);
+        let messages = load_messages_from_session(&path).unwrap();
+        assert_eq!(messages.len(), 2, "no placeholder for a complete batch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dangling_middle_batch_repairs_in_place_not_at_end() {
+        // A historic middle-batch gap gets its placeholder right after its
+        // assistant message, preserving causality for the model.
+        let mut messages = vec![
+            ChatMessage::user("goal"),
+            ChatMessage::assistant_calls(
+                None,
+                vec![crate::core::types::LlmToolCall {
+                    id: "mid-1".into(),
+                    call_type: "function".into(),
+                    function: crate::core::types::FunctionCall {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
+            ChatMessage::user("follow-up"),
+        ];
+        super::repair_dangling_tool_calls(&mut messages);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].role, crate::core::types::Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("mid-1"));
+        assert_eq!(messages[3].content.as_deref(), Some("follow-up"));
     }
 }

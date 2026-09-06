@@ -62,6 +62,26 @@ where
 pub(crate) struct DaemonClient {
     base_url: String,
     http: reqwest::Client,
+    /// Bearer token for the daemon API, when it requires one: `DEX_DAEMON_TOKEN`
+    /// wins, else the token file the daemon publishes for non-loopback binds.
+    /// Loopback daemons run without a token, so a missing file is not an error.
+    token: Option<String>,
+}
+
+/// Credential a client presents to a dex daemon. Same resolution as
+/// `daemon::daemon_token_file`; kept client-side so `dex connect` and the
+/// in-process TUI need no setup beyond copying the file's contents.
+fn client_daemon_token() -> Option<String> {
+    if let Ok(t) = std::env::var("DEX_DAEMON_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    crate::daemon::daemon_token_file()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Process-wide shared async client. `Client::new()` initializes a TLS
@@ -106,10 +126,13 @@ pub(crate) fn shared_streaming_client() -> reqwest::Client {
 /// Byte framing for SSE `data:` lines. Pure buffer logic (no I/O, no runtime)
 /// shared by `ChatStream`; split lines across TCP chunks are reassembled,
 /// keep-alives and junk skipped, trailing partial line held for `finish()`.
+/// Also tracks the highest envelope `seq` seen, so a caller can resume after
+/// a dropped connection by replaying the journal from that cursor.
 #[derive(Default)]
 struct SseFramer {
     buf: Vec<u8>,
     pending: std::collections::VecDeque<StreamEvent>,
+    last_seq: u64,
 }
 
 impl SseFramer {
@@ -117,8 +140,9 @@ impl SseFramer {
         self.buf.extend_from_slice(bytes);
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            if let Some(event) = DaemonClient::parse_sse_line(&String::from_utf8_lossy(&line)) {
-                self.pending.push_back(event);
+            if let Some(env) = Self::parse_envelope(&String::from_utf8_lossy(&line)) {
+                self.last_seq = self.last_seq.max(env.seq);
+                self.pending.push_back(env.event);
             }
         }
     }
@@ -128,10 +152,27 @@ impl SseFramer {
         if !self.buf.is_empty() {
             let tail = String::from_utf8_lossy(&self.buf).into_owned();
             self.buf.clear();
-            if let Some(event) = DaemonClient::parse_sse_line(&tail) {
-                self.pending.push_back(event);
+            if let Some(env) = Self::parse_envelope(&tail) {
+                self.last_seq = self.last_seq.max(env.seq);
+                self.pending.push_back(env.event);
             }
         }
+    }
+
+    /// Parse one raw SSE line into a full envelope (event + journal seq).
+    /// Pure (no I/O, no runtime) so it is safe from any context and trivial
+    /// to unit-test. Returns `None` for keep-alives (`ping`), blanks,
+    /// non-`data:` lines, and unparsable payloads.
+    fn parse_envelope(line: &str) -> Option<StreamEnvelope> {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let data = trimmed.strip_prefix("data:")?.trim();
+        if data.is_empty() || data == "ping" {
+            return None;
+        }
+        serde_json::from_str::<StreamEnvelope>(data).ok()
     }
 }
 
@@ -145,6 +186,12 @@ pub(crate) struct ChatStream {
 }
 
 impl ChatStream {
+    /// Highest journal seq delivered so far — the resume cursor for a
+    /// reattach after the connection drops mid-turn.
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.framer.last_seq
+    }
+
     pub(crate) async fn next_event(&mut self) -> Option<Result<StreamEvent, String>> {
         loop {
             if let Some(event) = self.framer.pending.pop_front() {
@@ -185,6 +232,7 @@ impl DaemonClient {
         Ok(Self {
             base_url,
             http: shared_async_client(),
+            token: client_daemon_token(),
         })
     }
 
@@ -266,6 +314,11 @@ impl DaemonClient {
         if let Ok(value) = reqwest::header::HeaderValue::from_str("1") {
             headers.insert("x-dex-protocol", value);
         }
+        if let Some(token) = &self.token {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+        }
         headers
     }
 
@@ -334,17 +387,7 @@ impl DaemonClient {
     /// unit-test. Returns `None` for keep-alives (`ping`), blanks, non-`data:`
     /// lines, and unparsable payloads (skipped, matching prior behavior).
     pub(crate) fn parse_sse_line(line: &str) -> Option<StreamEvent> {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let data = trimmed.strip_prefix("data:")?.trim();
-        if data.is_empty() || data == "ping" {
-            return None;
-        }
-        serde_json::from_str::<StreamEnvelope>(data)
-            .ok()
-            .map(|env| env.event)
+        Some(SseFramer::parse_envelope(line)?.event)
     }
 
     /// Async-native SSE transport: POSTs the chat request and yields parsed
@@ -831,6 +874,29 @@ mod tests {
             DaemonClient::parse_sse_line(&line),
             Some(StreamEvent::AssistantText(t)) if t == "hi"
         ));
+    }
+
+    /// The framer tracks the highest envelope seq so a reconnect can resume
+    /// the journal from exactly where the stream died.
+    #[test]
+    fn sse_framer_tracks_the_replay_cursor() {
+        let env1 = StreamEnvelope {
+            seq: 3,
+            event: StreamEvent::AssistantText("a".to_string()),
+        };
+        let env2 = StreamEnvelope {
+            seq: 7,
+            event: StreamEvent::System("b".to_string()),
+        };
+        let mut framer = SseFramer::default();
+        framer.push_bytes(format!("data: {}\n", serde_json::to_string(&env1).unwrap()).as_bytes());
+        framer.push_bytes(format!("data: {}\n", serde_json::to_string(&env2).unwrap()).as_bytes());
+        framer.push_bytes(b"data: ping\n");
+        framer.push_bytes(b"data: not-json\n");
+        assert_eq!(framer.last_seq, 7);
+        assert_eq!(framer.pending.len(), 2);
+        framer.finish();
+        assert_eq!(framer.last_seq, 7);
     }
 
     #[test]
