@@ -776,13 +776,22 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ));
             }
             let output = indent_transcript_line(Line::from(spans));
-            // write/edit previews are a git diff: color it like git does.
+            // write/edit previews are a git diff: color like git does. read
+            // previews keep the numbered gutter dim and highlight the code
+            // by extension (opencode/Claude Code style); anything
+            // unhighlightable stays dim so it never regresses to plain.
             let is_diff = matches!(name.as_str(), "write" | "edit");
+            let is_read = matches!(name.as_str(), "read") && success;
+            let mut read_lang = String::new();
+            if is_read {
+                read_lang = read_preview_lang(app);
+            }
+            let mut cur_lang = read_lang.clone();
             let preview_lines: Vec<Line<'static>> = preview
                 .iter()
                 .map(|line| {
-                    let style = if is_diff {
-                        if line.starts_with('+') && !line.starts_with("+++") {
+                    if is_diff {
+                        let style = if line.starts_with('+') && !line.starts_with("+++") {
                             Style::default().fg(Color::LightGreen)
                         } else if line.starts_with('-') && !line.starts_with("---") {
                             Style::default().fg(Color::LightRed)
@@ -790,11 +799,19 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                             Style::default().fg(Color::Cyan)
                         } else {
                             Style::default().fg(theme::tool_preview_fg())
-                        }
-                    } else {
-                        Style::default().fg(theme::tool_preview_fg())
-                    };
-                    indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
+                        };
+                        return indent_transcript_line(Line::from(Span::styled(
+                            format!("  {line}"),
+                            style,
+                        )));
+                    }
+                    if is_read {
+                        return read_preview_line(line, &mut cur_lang);
+                    }
+                    indent_transcript_line(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(theme::tool_preview_fg()),
+                    )))
                 })
                 .collect();
             app.assistant_open = false;
@@ -889,6 +906,86 @@ fn dim_intermediate_assistant_block(app: &mut App) {
         }
         *stamp = stamp.wrapping_add(1);
     }
+}
+
+/// Language for the open `read` preview, from its `▸ read <path>` input
+/// line (`path:1-20`, globs, bare paths). Fan-out (`2 files`) has no single
+/// language — per-file `==> … <==` headers re-target it below.
+fn read_preview_lang(app: &App) -> String {
+    let Some(TranscriptBlock::Tool { input, output, .. }) = app.transcript.last() else {
+        return String::new();
+    };
+    if output.is_some() {
+        return String::new();
+    }
+    let text: String = input.spans.iter().map(|s| s.content.as_ref()).collect();
+    let arg = text
+        .trim_start()
+        .strip_prefix('▸')
+        .unwrap_or(&text)
+        .trim_start();
+    let arg = arg.splitn(2, ' ').nth(1).unwrap_or("").trim();
+    // First token only (`path:1-20` → `path`); globs keep their extension.
+    let path = arg.split_whitespace().next().unwrap_or("");
+    let path = path.split(':').next().unwrap_or(path);
+    crate::ui::render::lang_from_path(path).to_string()
+}
+
+/// One `read` preview row: `==> file <==` headers stay dim landmarks (and
+/// re-target the highlight language for the rows below them); `… +N more`
+/// tails stay dim; numbered `{:>4}  code` rows keep the gutter dim and
+/// highlight the code, falling back to dim when unhighlightable.
+fn read_preview_line(line: &str, cur_lang: &mut String) -> Line<'static> {
+    let dim = Style::default().fg(theme::tool_preview_fg());
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("==>") {
+        // `==> path <==`: re-target language for the following snippet.
+        let inner = trimmed
+            .strip_prefix("==>")
+            .unwrap_or("")
+            .trim_end_matches("<==")
+            .trim();
+        let path = inner.split_whitespace().next().unwrap_or(inner);
+        let lang = crate::ui::render::lang_from_path(path);
+        *cur_lang = lang.to_string();
+        return indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)));
+    }
+    if trimmed.starts_with('…') || trimmed.starts_with("[...") {
+        return indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)));
+    }
+    if let Some((gutter, code)) = split_read_gutter(line) {
+        if let Some(spans) = crate::ui::render::highlight_code_spans(cur_lang, code) {
+            let mut all = vec![Span::styled(gutter.to_string(), dim)];
+            all.extend(spans);
+            return indent_transcript_line(Line::from(all));
+        }
+        return indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)));
+    }
+    // Unnumbered (glob hits, plain text): try whole-line highlight, else dim.
+    if let Some(spans) = crate::ui::render::highlight_code_spans(cur_lang, line) {
+        let mut all = vec![Span::styled("  ".to_string(), dim)];
+        all.extend(spans);
+        return indent_transcript_line(Line::from(all));
+    }
+    indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)))
+}
+
+/// Split read's `{:>4}  content` gutter: leading number + two-space gap is
+/// structural (so `123abc` code is never mistaken for a gutter).
+fn split_read_gutter(line: &str) -> Option<(String, &str)> {
+    let trimmed_start = line.len() - line.trim_start().len();
+    let rest = &line[trimmed_start..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    let after = &rest[digits..];
+    if !after.starts_with("  ") {
+        return None;
+    }
+    let code_start = trimmed_start + digits + 2;
+    // `  ` prefix below mirrors the generic preview's two-space indent.
+    Some((format!("  {}", &line[..code_start]), &line[code_start..]))
 }
 
 /// Send the user's approval decision for the pending tool execution.

@@ -139,39 +139,35 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
             }
             i += 1;
             blocks.push(MarkdownBlock::code_block(lang, body));
-        } else if let Some(rest) = t.strip_prefix("### ") {
-            blocks.push(MarkdownBlock::Heading3(rest.to_string()));
+        } else if let Some(rest) = heading_text(t) {
+            // H1-H3 map to their block; H4-H6 render as H3 (crate has no
+            // H4+ variant — same as upstream parsers and glow/mdcat).
+            match heading_level(t) {
+                1 => blocks.push(MarkdownBlock::Heading1(rest.to_string())),
+                2 => blocks.push(MarkdownBlock::Heading2(rest.to_string())),
+                _ => blocks.push(MarkdownBlock::Heading3(rest.to_string())),
+            }
             i += 1;
-        } else if let Some(rest) = t.strip_prefix("## ") {
-            blocks.push(MarkdownBlock::Heading2(rest.to_string()));
-            i += 1;
-        } else if let Some(rest) = t.strip_prefix("# ") {
-            blocks.push(MarkdownBlock::Heading1(rest.to_string()));
-            i += 1;
-        } else if t == "---" {
+        } else if is_hr(t) {
             blocks.push(MarkdownBlock::HorizontalRule);
             i += 1;
-        } else if let Some(rest) = t.strip_prefix("> ") {
+        } else if let Some(rest) = blockquote_text(t) {
             blocks.push(MarkdownBlock::blockquote_text(rest.to_string()));
             i += 1;
-        } else if let Some(rest) = t.strip_prefix("- [ ] ") {
+        } else if let Some((rest, checked)) = task_text(t) {
             blocks.push(MarkdownBlock::TaskItem {
                 text: rest.to_string(),
                 indent: 0,
-                checked: false,
-            });
-            i += 1;
-        } else if let Some(rest) = t.strip_prefix("- [x] ") {
-            blocks.push(MarkdownBlock::TaskItem {
-                text: rest.to_string(),
-                indent: 0,
-                checked: true,
+                checked,
             });
             i += 1;
         } else if let Some(rest) = t.strip_prefix("- ") {
             blocks.push(MarkdownBlock::ListItem(rest.to_string(), 0));
             i += 1;
         } else if let Some(rest) = t.strip_prefix("* ") {
+            blocks.push(MarkdownBlock::ListItem(rest.to_string(), 0));
+            i += 1;
+        } else if let Some(rest) = t.strip_prefix("+ ") {
             blocks.push(MarkdownBlock::ListItem(rest.to_string(), 0));
             i += 1;
         } else if t.is_empty() {
@@ -209,17 +205,69 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     blocks
 }
 
+/// ATX heading text for H1-H6 (`# ` … `###### `), like CommonMark (up to
+/// 3 leading spaces already trimmed by callers). Returns the text after the
+/// markers. Deeper levels are handled by callers (mapped to H3). Mirrors
+/// glow/mdcat/opencode: `#` markers never render literally.
+fn heading_text(t: &str) -> Option<&str> {
+    let hashes = t.len() - t.trim_start_matches('#').len();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    t[hashes..].strip_prefix(' ').or(t[hashes..].strip_prefix('\t'))
+}
+
+fn heading_level(t: &str) -> usize {
+    t.len() - t.trim_start_matches('#').len()
+}
+
+/// Setext-style horizontal rule: 3+ of `-`/`*`/`_` (CommonMark / markdownlint
+/// MD035). `***` and `___` are rules, not emphasis, when alone on a line.
+fn is_hr(t: &str) -> bool {
+    let s: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.len() < 3 {
+        return false;
+    }
+    let c = s.chars().next().unwrap();
+    matches!(c, '-' | '*' | '_') && s.chars().all(|x| x == c)
+}
+
+/// Blockquote body for `>` with or without a following space (CommonMark
+/// allows `>quote`). Empty `>` is a blank quote line.
+fn blockquote_text(t: &str) -> Option<&str> {
+    let rest = t.strip_prefix('>')?;
+    Some(rest.strip_prefix(' ').or(rest.strip_prefix('\t')).unwrap_or(rest))
+}
+
+fn is_blockquote(t: &str) -> bool {
+    t.starts_with('>')
+}
+
+/// Task item body + checked flag for `- [ ]`, `- [x]`/`- [X]` (and `*`/`+`
+/// variants), like GitHub / opencode.
+fn task_text(t: &str) -> Option<(&str, bool)> {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = t.strip_prefix(marker) {
+            if let Some(text) = rest.strip_prefix("[ ] ") {
+                return Some((text, false));
+            }
+            if let Some(text) = rest.strip_prefix("[x] ").or(rest.strip_prefix("[X] ")) {
+                return Some((text, true));
+            }
+        }
+    }
+    None
+}
+
 fn is_block_start(t: &str) -> bool {
     t.starts_with("```")
-        || t.starts_with("# ")
-        || t.starts_with("## ")
-        || t.starts_with("### ")
-        || t == "---"
-        || t.starts_with("> ")
+        || heading_text(t).is_some()
+        || is_hr(t)
+        || is_blockquote(t)
         || t.starts_with("- ")
         || t.starts_with("* ")
-        || t.starts_with("- [ ] ")
-        || t.starts_with("- [x] ")
+        || t.starts_with("+ ")
+        || task_text(t).is_some()
 }
 
 /// A GFM pipe-table line: `| a | b |`, `a | b | c`, `|---|:---:|`. Mirrors
@@ -314,7 +362,7 @@ fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
 }
 
 fn is_heading(t: &str) -> bool {
-    t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ")
+    heading_text(t).is_some()
 }
 
 /// Ordered-list marker (`1. `, `12) `) — models often butt these against
@@ -328,9 +376,10 @@ fn is_ordered_item(t: &str) -> bool {
     rest.starts_with(". ") || rest.starts_with(") ")
 }
 
-/// List continuity class: consecutive items of the same class stay tight.
+/// List continuity class: consecutive items of the same class stay tight
+/// (industry standard: tight inside a list, blank around it).
 fn list_kind(t: &str) -> u8 {
-    if t.starts_with("- ") || t.starts_with("* ") {
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
         1
     } else if is_ordered_item(t) {
         2
@@ -339,16 +388,22 @@ fn list_kind(t: &str) -> u8 {
     }
 }
 
-/// Insert blank lines where the model butts block-level markdown (headings,
-/// lists, fences, rules) against surrounding text, so the transcript doesn't
-/// render wall-to-wall. `pending` is the assistant text already buffered for
-/// the streaming seam (or empty for whole-message replay). Never inserts
-/// inside code fences; consecutive list items stay tight; existing blank
-/// lines are never doubled.
+/// Blanks around block-level markdown (CommonMark / markdownlint MD022,
+/// MD031, MD032, MD058 — the same rule glow/mdcat/opencode/Claude Code
+/// follow): exactly one blank line before AND after each heading, fence,
+/// list block, table, rule and quote; tight inside lists, tables and quotes.
+/// `pending` is the assistant text already buffered for the streaming seam
+/// (or empty for whole-message replay). Never inserts inside code fences;
+/// existing blank lines are never doubled.
 pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
     let trimmed = pending.strip_suffix('\n').unwrap_or(pending);
-    let mut prev = trimmed.rsplit('\n').next().unwrap_or("").trim_start();
-    let mut air = is_heading(prev);
+    let mut prev: &str = trimmed.rsplit('\n').next().unwrap_or("").trim_start();
+    // Leak a small owned copy only when the seam splits a table: the
+    // borrowed `prev` points into `pending`, but table continuity needs the
+    // trimmed first line of the new chunk when `pending` is empty of it.
+    // ponytail: keep the hot path borrow-only; no allocation per line.
+    let mut prev_table = is_table_line(prev);
+    let mut air = needs_air_after(prev, prev_table);
     let mut fenced = trimmed
         .lines()
         .filter(|l| l.trim_start().starts_with("```"))
@@ -366,21 +421,28 @@ pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
             if !fenced {
                 // closing fence gets air after it too
                 air = true;
-                prev = t;
+                prev_table = false;
+                // Point `prev` at something non-empty/block so the next
+                // prose line sees the air. `t` borrows `line` (ends this
+                // iteration), so use a static fence marker instead.
+                prev = "```";
             }
+        } else if fenced {
+            out.push_str(line);
+            out.push('\n');
+            continue;
         } else {
-            if !fenced && !prev.is_empty() && !t.is_empty() {
-                let starts_block = is_block_start(t) || is_ordered_item(t);
-                let kt = list_kind(t);
-                let kp = list_kind(prev);
-                if air || (starts_block && !(kt > 0 && kt == kp)) {
+            let curr_table = is_table_line(t);
+            if !prev.is_empty() && !t.is_empty() && !is_continuation(prev, prev_table, t, curr_table) {
+                let starts_block =
+                    is_block_start(t) || is_ordered_item(t) || (curr_table && !prev_table);
+                if air || starts_block {
                     out.push('\n');
                 }
             }
-            if !fenced {
-                prev = t;
-                air = is_heading(t);
-            }
+            prev = t;
+            prev_table = curr_table;
+            air = needs_air_after(t, curr_table);
         }
         out.push_str(line);
         out.push('\n');
@@ -388,15 +450,117 @@ pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
     out
 }
 
+/// Trailing air: prose after one of these needs exactly one blank line
+/// (MD022/MD032/MD058). Plain prose needs none (soft break stays joined).
+fn needs_air_after(t: &str, is_table: bool) -> bool {
+    is_table || is_heading(t) || is_hr(t) || is_blockquote(t) || list_kind(t) > 0 || task_text(t).is_some()
+}
+
+/// Tight-inside continuity: same-list items, consecutive table rows and
+/// consecutive quote lines never get air between them.
+fn is_continuation(prev: &str, prev_table: bool, curr: &str, curr_table: bool) -> bool {
+    if curr_table && prev_table {
+        return true;
+    }
+    let kt = list_kind(curr);
+    if kt > 0 && kt == list_kind(prev) {
+        return true;
+    }
+    // Task items share the `-`/`*`/`+` prefix, so `list_kind` already covers
+    // `- [ ]` → `- [ ]`; keep the explicit check for `* [x]` → `- [x]`
+    // style switches which read as one list to a human.
+    if task_text(curr).is_some() && task_text(prev).is_some() {
+        return true;
+    }
+    if is_blockquote(curr) && is_blockquote(prev) {
+        return true;
+    }
+    false
+}
+
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
-    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
-    let highlighter = HIGHLIGHTER
-        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
-        .clone();
+    let highlighter = highlighter();
     let blocks = split_markdown(s);
     let renderer = MarkdownRenderer::new(0)
         .with_render_hooks(Box::new(HighlightHooks::new(highlighter, usize::MAX)));
     renderer.render(&blocks, &ThemeConfig::default())
+}
+
+fn highlighter() -> Arc<TreeSitterHighlighter> {
+    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    HIGHLIGHTER
+        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+        .clone()
+}
+
+/// Tree-sitter language for a file path, covering the grammars compiled in
+/// via Cargo features plus common aliases other agents highlight (opencode
+/// highlights reads by extension; unknown extensions stay dim).
+pub(super) fn lang_from_path(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    // Strip `:line` / `:line-col` goto suffixes (`main.rs:12-20`).
+    let ext = ext.split(':').next().unwrap_or(&ext);
+    match ext.as_str() {
+        "rs" => "rust",
+        "py" | "pyw" => "python",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" | "tsx" => "typescript",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "hpp" | "cc" | "hh" | "cxx" => "cpp",
+        "json" | "jsonc" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "sh" | "bash" | "zsh" => "bash",
+        _ => "",
+    }
+}
+
+/// Highlighted spans for one code line, or `None` when the language is
+/// unknown / the highlighter yields nothing (caller keeps the dim fallback).
+/// ponytail: byte-safe slicing — tree-sitter ranges are bytes, a bad split
+/// falls back to dim rather than panicking mid-frame.
+pub(super) fn highlight_code_spans(lang: &str, code: &str) -> Option<Vec<Span<'static>>> {
+    if lang.is_empty() || code.is_empty() {
+        return None;
+    }
+    let hl = highlighter();
+    let segs = hl.highlight(lang, code);
+    if segs.is_empty() {
+        return None;
+    }
+    let mut segs = segs;
+    segs.sort_by_key(|s| (s.start, s.end));
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for seg in segs {
+        if seg.start < pos || seg.end <= seg.start {
+            continue;
+        }
+        if seg.start > pos {
+            if let Some(gap) = code.get(pos..seg.start) {
+                if !gap.is_empty() {
+                    out.push(Span::raw(gap.to_string()));
+                }
+                pos = seg.start;
+            } else {
+                continue;
+            }
+        }
+        if let Some(text) = code.get(seg.start..seg.end) {
+            out.push(Span::styled(text.to_string(), seg.style));
+            pos = seg.end;
+        }
+    }
+    if pos < code.len() {
+        if let Some(tail) = code.get(pos..) {
+            out.push(Span::raw(tail.to_string()));
+        } else {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Render a streamed thinking block: collapsed = a single dim
