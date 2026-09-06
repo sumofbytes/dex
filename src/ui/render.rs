@@ -732,7 +732,10 @@ impl TranscriptView {
                     {
                         thinking_row = Some(cum + rows - 1);
                     }
-                    if matches!(block, super::TranscriptBlock::Activity { .. }) {
+                    if matches!(
+                        block,
+                        super::TranscriptBlock::Activity { settled: None, .. }
+                    ) {
                         activity_row = Some(cum + rows - 1);
                     }
                 }
