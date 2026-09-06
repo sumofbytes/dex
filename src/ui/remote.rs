@@ -383,6 +383,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         show_thinking: false,
         thinking_open: false,
         assistant_pending: String::new(),
+        assistant_gap: crate::core::markdown::GapState::new(),
         stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,

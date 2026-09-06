@@ -1,6 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter};
 use ratatui_markdown::CodeColors;
 
@@ -13,6 +14,8 @@ const DIM: &str = "\x1b[2m";
 /// Render an assistant message to the terminal as markdown, with fenced
 /// code blocks highlighted by the same tree-sitter engine the TUI uses —
 /// no external `bat` process, so headless and TUI output always agree.
+/// Tree-sitter misses (sql, dockerfile, unknown) fall back to the generic
+/// lexer below instead of dim.
 pub(crate) fn print_code_block(lang: &str, body: &str) {
     let lower = lang.to_ascii_lowercase();
     let canon = canonical_lang(&lower);
@@ -21,10 +24,11 @@ pub(crate) fn print_code_block(lang: &str, body: &str) {
     } else {
         canon
     };
-    match highlight_ansi(tag, body) {
-        Some(colored) => print!("{colored}"),
-        // Unknown language: dim fallback like the TUI, never guess.
-        None => print!("{DIM}{body}{RESET}"),
+    if let Some(colored) = highlight_ansi(tag, body).or_else(|| fallback_highlight_ansi(tag, body))
+    {
+        print!("{colored}");
+    } else {
+        print!("{DIM}{body}{RESET}");
     }
 }
 
@@ -60,7 +64,7 @@ pub(crate) fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
 
 /// Highlight a snippet to an ANSI-escaped string in ONE tree-sitter pass.
 /// Returns `None` when the language is unknown or yields nothing — callers
-/// keep the dim fallback, so highlighting never regresses to plain.
+/// try the generic lexer next, then dim.
 pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
     if lang.is_empty() || code.is_empty() {
         return None;
@@ -90,6 +94,746 @@ pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
         out.push_str(code.get(pos..).unwrap_or(""));
     }
     Some(out)
+}
+
+/// Generic fallback lexer for tree-sitter misses (`sql`, `dockerfile`,
+/// unknown): single-pass, dependency-free, byte-safe. Emits keyword /
+/// string / number / comment runs using the same palette as tree-sitter so
+/// headless and TUI output agree. `text`/`plain` stay `None` (dim).
+pub(crate) fn fallback_highlight_ansi(lang: &str, code: &str) -> Option<String> {
+    if lang.is_empty() || code.is_empty() {
+        return None;
+    }
+    if matches!(lang, "text" | "plain" | "txt") {
+        return None;
+    }
+    let segs = fallback_segments(lang, code);
+    if segs.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(code.len() + code.len() / 4);
+    let mut pos = 0;
+    for seg in &segs {
+        if seg.start > pos {
+            out.push_str(code.get(pos..seg.start).unwrap_or(""));
+        }
+        if let Some(slice) = code.get(seg.start..seg.end) {
+            push_styled(&mut out, &seg.style, slice);
+        }
+        pos = pos.max(seg.end);
+    }
+    if pos < code.len() {
+        out.push_str(code.get(pos..).unwrap_or(""));
+    }
+    Some(out)
+}
+
+/// TUI twin of [`fallback_highlight_ansi`]: the same segments split into
+/// per-line spans so multi-line block comments keep their style across rows.
+/// Returns `None` when nothing is colorable (callers keep dim).
+pub(crate) fn fallback_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+    if lang.is_empty() || code.is_empty() {
+        return None;
+    }
+    if matches!(lang, "text" | "plain" | "txt") {
+        return None;
+    }
+    let segs = fallback_segments(lang, code);
+    if segs.is_empty() {
+        return None;
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for line in code.split('\n') {
+        ranges.push((start, start + line.len()));
+        start += line.len() + 1;
+    }
+    let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        let mut spans = Vec::new();
+        let mut pos = lo;
+        for seg in segs.iter() {
+            if seg.end <= lo || seg.start >= hi || seg.end <= seg.start {
+                continue;
+            }
+            let s = seg.start.max(lo);
+            let e = seg.end.min(hi);
+            if s < pos {
+                continue;
+            }
+            let gap = code.get(pos..s)?;
+            if !gap.is_empty() {
+                spans.push(Span::raw(gap.to_string()));
+            }
+            let text = code.get(s..e)?;
+            if text.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(text.to_string(), seg.style));
+            pos = e;
+        }
+        let tail = code.get(pos..hi)?;
+        if !tail.is_empty() {
+            spans.push(Span::raw(tail.to_string()));
+        }
+        out.push(spans);
+    }
+    Some(out)
+}
+
+struct FallbackSeg {
+    start: usize,
+    end: usize,
+    style: Style,
+}
+
+fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
+    let colors = code_colors();
+    let kw = Style::default()
+        .fg(colors.keyword)
+        .add_modifier(Modifier::BOLD);
+    let string = Style::default().fg(colors.string);
+    let number = Style::default().fg(colors.number);
+    let comment = Style::default()
+        .fg(colors.comment)
+        .add_modifier(Modifier::ITALIC);
+    let hash = fallback_hash_comment(lang);
+    let slash = fallback_slash_comment(lang);
+    let dash = fallback_dash_comment(lang);
+    let block = fallback_block_comment(lang);
+    let html = matches!(lang, "html");
+    let bytes = code.as_bytes();
+    let len = bytes.len();
+    let mut segs: Vec<FallbackSeg> = Vec::new();
+    let mut pos = 0;
+    let mut block_start: Option<usize> = None;
+    let mut html_start: Option<usize> = None;
+    // Advance by one char (not one byte) so `pos` stays on a char boundary.
+    let char_len_at = |p: usize| code[p..].chars().next().map_or(1, |c| c.len_utf8());
+    while pos < len {
+        if let Some(s) = block_start {
+            if pos + 1 < len && bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                pos += 2;
+                segs.push(FallbackSeg {
+                    start: s,
+                    end: pos,
+                    style: comment,
+                });
+                block_start = None;
+            } else {
+                pos += char_len_at(pos);
+                if pos >= len {
+                    segs.push(FallbackSeg {
+                        start: s,
+                        end: len,
+                        style: comment,
+                    });
+                }
+            }
+            continue;
+        }
+        if let Some(s) = html_start {
+            if pos + 2 < len
+                && bytes[pos] == b'-'
+                && bytes[pos + 1] == b'-'
+                && bytes[pos + 2] == b'>'
+            {
+                pos += 3;
+                segs.push(FallbackSeg {
+                    start: s,
+                    end: pos,
+                    style: comment,
+                });
+                html_start = None;
+            } else {
+                pos += char_len_at(pos);
+                if pos >= len {
+                    segs.push(FallbackSeg {
+                        start: s,
+                        end: len,
+                        style: comment,
+                    });
+                }
+            }
+            continue;
+        }
+        let b = bytes[pos];
+        if block && pos + 1 < len && b == b'/' && bytes[pos + 1] == b'*' {
+            block_start = Some(pos);
+            pos += 2;
+            continue;
+        }
+        if html
+            && pos + 3 < len
+            && b == b'<'
+            && bytes[pos + 1] == b'!'
+            && bytes[pos + 2] == b'-'
+            && bytes[pos + 3] == b'-'
+        {
+            html_start = Some(pos);
+            pos += 4;
+            continue;
+        }
+        if slash && pos + 1 < len && b == b'/' && bytes[pos + 1] == b'/' {
+            let mut end = pos + 2;
+            while end < len && bytes[end] != b'\n' {
+                end += 1;
+            }
+            segs.push(FallbackSeg {
+                start: pos,
+                end,
+                style: comment,
+            });
+            pos = end;
+            continue;
+        }
+        if dash && pos + 1 < len && b == b'-' && bytes[pos + 1] == b'-' {
+            let mut end = pos + 2;
+            while end < len && bytes[end] != b'\n' {
+                end += 1;
+            }
+            segs.push(FallbackSeg {
+                start: pos,
+                end,
+                style: comment,
+            });
+            pos = end;
+            continue;
+        }
+        if hash && b == b'#' {
+            let mut end = pos + 1;
+            while end < len && bytes[end] != b'\n' {
+                end += 1;
+            }
+            segs.push(FallbackSeg {
+                start: pos,
+                end,
+                style: comment,
+            });
+            pos = end;
+            continue;
+        }
+        if b == b'"' || b == b'\'' || b == b'`' {
+            let quote = b;
+            let mut end = pos + 1;
+            let mut closed = false;
+            while end < len {
+                let eb = bytes[end];
+                if eb == b'\n' && quote != b'`' {
+                    break;
+                }
+                if eb == b'\\' {
+                    end += 1;
+                    if end < len {
+                        end += char_len_at(end);
+                    }
+                    continue;
+                }
+                if lang == "sql"
+                    && quote == b'\''
+                    && eb == b'\''
+                    && end + 1 < len
+                    && bytes[end + 1] == b'\''
+                {
+                    end += 2;
+                    continue;
+                }
+                if eb == quote {
+                    end += 1;
+                    closed = true;
+                    break;
+                }
+                end += if eb < 0x80 { 1 } else { char_len_at(end) };
+            }
+            // Unclosed strings still color to EOL/EOF rather than vanishing.
+            if end > pos + 1 || closed {
+                segs.push(FallbackSeg {
+                    start: pos,
+                    end: end.min(len),
+                    style: string,
+                });
+            }
+            pos = end.min(len).max(pos + 1);
+            continue;
+        }
+        if b.is_ascii_digit() {
+            let mut end = pos + 1;
+            while end < len
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'.' || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            segs.push(FallbackSeg {
+                start: pos,
+                end,
+                style: number,
+            });
+            pos = end;
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let mut end = pos + 1;
+            while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let is_kw = code
+                .get(pos..end)
+                .is_some_and(|w| fallback_is_keyword(lang, w));
+            if is_kw {
+                segs.push(FallbackSeg {
+                    start: pos,
+                    end,
+                    style: kw,
+                });
+            }
+            pos = end;
+            continue;
+        }
+        pos += if b < 0x80 { 1 } else { char_len_at(pos) };
+    }
+    segs
+}
+
+fn fallback_hash_comment(lang: &str) -> bool {
+    matches!(
+        lang,
+        "python"
+            | "py"
+            | "pyw"
+            | "ruby"
+            | "rb"
+            | "bash"
+            | "sh"
+            | "shell"
+            | "zsh"
+            | "console"
+            | "terminal"
+            | "sh-session"
+            | "shell-session"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "nix"
+            | "dockerfile"
+            | "docker"
+            | "containerfile"
+            | "perl"
+            | "php"
+    )
+}
+
+fn fallback_slash_comment(lang: &str) -> bool {
+    matches!(
+        lang,
+        "rust"
+            | "rs"
+            | "javascript"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "jsx"
+            | "typescript"
+            | "ts"
+            | "mts"
+            | "cts"
+            | "tsx"
+            | "go"
+            | "golang"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "c++"
+            | "hpp"
+            | "cc"
+            | "hh"
+            | "cxx"
+            | "csharp"
+            | "cs"
+            | "c#"
+            | "dart"
+            | "kotlin"
+            | "kt"
+            | "kts"
+            | "scala"
+            | "swift"
+            | "php"
+            | "css"
+    )
+}
+
+fn fallback_dash_comment(lang: &str) -> bool {
+    // `--` is a comment only in SQL/Lua. Bash `grep -- -x` must not comment.
+    matches!(lang, "sql" | "lua")
+}
+
+fn fallback_block_comment(lang: &str) -> bool {
+    matches!(
+        lang,
+        "rust"
+            | "rs"
+            | "javascript"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "jsx"
+            | "typescript"
+            | "ts"
+            | "mts"
+            | "cts"
+            | "tsx"
+            | "go"
+            | "golang"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "c++"
+            | "hpp"
+            | "cc"
+            | "hh"
+            | "cxx"
+            | "csharp"
+            | "cs"
+            | "c#"
+            | "dart"
+            | "kotlin"
+            | "kt"
+            | "kts"
+            | "scala"
+            | "swift"
+            | "php"
+            | "css"
+            | "sql"
+    )
+}
+
+fn fallback_is_keyword(lang: &str, word: &str) -> bool {
+    match lang {
+        "rust" | "rs" => matches!(
+            word,
+            "as" | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+                | "async"
+                | "await"
+                | "dyn"
+        ),
+        "python" | "py" | "pyw" | "ruby" | "rb" => matches!(
+            word,
+            "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "do"
+                | "elif"
+                | "else"
+                | "elsif"
+                | "end"
+                | "except"
+                | "False"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "module"
+                | "next"
+                | "nil"
+                | "None"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "redo"
+                | "rescue"
+                | "retry"
+                | "return"
+                | "self"
+                | "super"
+                | "True"
+                | "try"
+                | "unless"
+                | "until"
+                | "while"
+                | "with"
+                | "yield"
+        ),
+        "javascript" | "js" | "mjs" | "cjs" | "jsx" | "typescript" | "ts" | "mts" | "cts"
+        | "tsx" => matches!(
+            word,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "delete"
+                | "else"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "import"
+                | "in"
+                | "let"
+                | "new"
+                | "null"
+                | "of"
+                | "return"
+                | "static"
+                | "super"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typeof"
+                | "var"
+                | "while"
+                | "with"
+                | "yield"
+        ),
+        "go" | "golang" => matches!(
+            word,
+            "break"
+                | "case"
+                | "const"
+                | "continue"
+                | "default"
+                | "defer"
+                | "else"
+                | "fallthrough"
+                | "for"
+                | "func"
+                | "go"
+                | "goto"
+                | "if"
+                | "import"
+                | "interface"
+                | "map"
+                | "package"
+                | "range"
+                | "return"
+                | "select"
+                | "struct"
+                | "switch"
+                | "type"
+                | "var"
+        ),
+        "bash" | "sh" | "shell" | "zsh" | "console" | "terminal" | "sh-session"
+        | "shell-session" => {
+            matches!(
+                word,
+                "if" | "then"
+                    | "else"
+                    | "elif"
+                    | "fi"
+                    | "for"
+                    | "while"
+                    | "until"
+                    | "in"
+                    | "do"
+                    | "done"
+                    | "case"
+                    | "esac"
+                    | "function"
+                    | "select"
+                    | "time"
+                    | "coproc"
+                    | "echo"
+                    | "cd"
+                    | "pwd"
+                    | "export"
+                    | "local"
+                    | "readonly"
+                    | "declare"
+                    | "typeset"
+                    | "unset"
+                    | "alias"
+                    | "unalias"
+                    | "source"
+                    | "exec"
+                    | "exit"
+                    | "return"
+                    | "trap"
+                    | "shift"
+                    | "true"
+                    | "false"
+                    | "test"
+            )
+        }
+        "sql" => matches!(
+            word.to_ascii_lowercase().as_str(),
+            "select"
+                | "from"
+                | "where"
+                | "join"
+                | "on"
+                | "group"
+                | "by"
+                | "order"
+                | "having"
+                | "limit"
+                | "offset"
+                | "insert"
+                | "into"
+                | "values"
+                | "update"
+                | "set"
+                | "delete"
+                | "create"
+                | "table"
+                | "alter"
+                | "drop"
+                | "index"
+                | "view"
+                | "as"
+                | "and"
+                | "or"
+                | "not"
+                | "null"
+                | "primary"
+                | "key"
+                | "foreign"
+                | "references"
+                | "distinct"
+                | "count"
+                | "sum"
+                | "avg"
+                | "min"
+                | "max"
+                | "union"
+                | "all"
+                | "inner"
+                | "outer"
+                | "left"
+                | "right"
+                | "case"
+                | "when"
+                | "then"
+                | "else"
+                | "end"
+                | "like"
+                | "in"
+                | "is"
+                | "between"
+                | "exists"
+        ),
+        "dockerfile" | "docker" | "containerfile" => matches!(
+            word.to_ascii_lowercase().as_str(),
+            "from"
+                | "run"
+                | "cmd"
+                | "label"
+                | "maintainer"
+                | "expose"
+                | "env"
+                | "add"
+                | "copy"
+                | "entrypoint"
+                | "volume"
+                | "user"
+                | "workdir"
+                | "arg"
+                | "onbuild"
+                | "stopsignal"
+                | "healthcheck"
+                | "shell"
+        ),
+        _ => matches!(
+            word,
+            "and"
+                | "as"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "def"
+                | "do"
+                | "else"
+                | "end"
+                | "false"
+                | "fn"
+                | "for"
+                | "fun"
+                | "function"
+                | "if"
+                | "import"
+                | "in"
+                | "let"
+                | "match"
+                | "mut"
+                | "new"
+                | "null"
+                | "object"
+                | "or"
+                | "pub"
+                | "return"
+                | "self"
+                | "static"
+                | "struct"
+                | "true"
+                | "try"
+                | "type"
+                | "val"
+                | "var"
+                | "while"
+                | "with"
+                | "yield"
+                | "select"
+                | "from"
+                | "where"
+        ),
+    }
 }
 
 /// Append `text` wrapped in its style's SGR codes; unstyled text is appended
@@ -399,5 +1143,86 @@ mod tests {
             render_inline("`unclosed code"),
             "\x1b[0;36munclosed code\x1b[0m"
         );
+    }
+
+    #[test]
+    fn fallback_covers_sql_dockerfile_and_unknown() {
+        for (lang, code) in [
+            ("sql", "SELECT a FROM t WHERE x = 1 -- hi\n"),
+            ("sql", "select a from t where x = 'it''s'\n"),
+            ("dockerfile", "FROM rust:1 AS b\nRUN cargo build\n"),
+            ("groovy", "def x = 42 // hi\n"),
+            ("kotlin", "fun main() { val x = 1 }\n"),
+        ] {
+            // Tree-sitter misses these; the generic lexer must color them.
+            assert!(
+                highlight_ansi(lang, code).is_none(),
+                "{lang} unexpectedly tree-sitter"
+            );
+            let out = fallback_highlight_ansi(lang, code).expect("{lang} must fallback");
+            assert_eq!(strip_sgr(&out), code, "{lang} lost bytes");
+            assert!(out.contains("\x1b["), "{lang} emitted no SGR");
+        }
+    }
+
+    #[test]
+    fn fallback_sql_keywords_case_insensitive() {
+        let lower = fallback_highlight_ansi("sql", "select a from t\n").expect("lower");
+        let upper = fallback_highlight_ansi("sql", "SELECT a FROM t\n").expect("upper");
+        assert!(lower.contains("\x1b["));
+        assert!(upper.contains("\x1b["));
+        assert_eq!(strip_sgr(&lower), "select a from t\n");
+        assert_eq!(strip_sgr(&upper), "SELECT a FROM t\n");
+    }
+
+    #[test]
+    fn fallback_keeps_bash_flags_uncommented() {
+        // `--` is a comment only in sql/lua: flags alone must not count as a
+        // comment (no false color), while a real `#` comment still colors.
+        assert!(fallback_highlight_ansi("bash", "grep -- -x foo\n").is_none());
+        let code = "grep -- -x foo # hi\n";
+        let out = fallback_highlight_ansi("bash", code).expect("bash comment");
+        assert_eq!(strip_sgr(&out), code);
+        let sql = fallback_highlight_ansi("sql", "select 1 -- hi\n").expect("sql");
+        assert_eq!(strip_sgr(&sql), "select 1 -- hi\n");
+        assert!(sql.contains("\x1b["));
+    }
+
+    #[test]
+    fn fallback_block_comment_spans_lines_and_stays_byte_safe() {
+        let code = "/* multi\nline 日本語 */\nlet x = 1\n";
+        let out = fallback_highlight_ansi("rust", code).expect("block comment");
+        assert_eq!(strip_sgr(&out), code);
+        assert!(out.contains("\x1b["));
+        let rows = fallback_code_block("rust", code).expect("spans");
+        assert_eq!(rows.len(), 4);
+        let text: String = rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|s| s.content.as_ref().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("multi"));
+        // Unclosed strings/blocks never panic and preserve bytes.
+        let evil = "let s = \"unclosed\n/* unclosed\n";
+        let out = fallback_highlight_ansi("rust", evil).expect("unclosed");
+        assert_eq!(strip_sgr(&out), evil);
+        let uni = "let x = \"日本語\" # コメント\n";
+        let out = fallback_highlight_ansi("python", uni).expect("unicode");
+        assert_eq!(strip_sgr(&out), uni);
+    }
+
+    #[test]
+    fn fallback_plain_text_stays_dim() {
+        assert!(fallback_highlight_ansi("text", "select 1\n").is_none());
+        assert!(fallback_highlight_ansi("plain", "select 1\n").is_none());
+        assert!(fallback_highlight_ansi("", "select 1\n").is_none());
+        assert!(fallback_highlight_ansi("sql", "").is_none());
+        // No colorable tokens: no keywords/numbers/strings/comments.
+        assert!(fallback_highlight_ansi("groovy", "plain\n").is_none());
+        assert!(fallback_code_block("text", "select 1\n").is_none());
     }
 }

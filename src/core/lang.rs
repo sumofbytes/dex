@@ -1,12 +1,15 @@
-//! Single source of truth for tree-sitter language keys: fence info tags
+//! Single source of truth for highlight language keys: fence info tags
 //! (`ui::render`) and file extensions (`lang_from_path`) canonicalize
 //! through one table, so both paths always agree. Keys are the primary
 //! `ratatui-markdown::get_lang` names (which also accepts most of these
-//! aliases natively); unknown tokens return `""` and callers keep the dim
-//! fallback instead of guessing.
+//! aliases natively) plus fallback-only keys (`sql`, `dockerfile`, `html`,
+//! `css`) served by the generic lexer in `core::highlight`; unknown tokens
+//! return `""` and callers keep the dim fallback instead of guessing.
 
-/// Canonical tree-sitter key for a lowercase fence tag or extension.
-/// Unknown tokens return `""`.
+/// Canonical highlight key for a lowercase fence tag or extension.
+/// Tree-sitter grammars cover most keys; `sql`/`dockerfile`/`html`/`css`
+/// are fallback-only (no compiled grammar) and highlight via the generic
+/// lexer. Unknown tokens return `""`.
 pub(crate) fn canonical_lang(token: &str) -> &'static str {
     match token {
         "rust" | "rs" => "rust",
@@ -31,13 +34,19 @@ pub(crate) fn canonical_lang(token: &str) -> &'static str {
         "ruby" | "rb" => "ruby",
         "scala" => "scala",
         "swift" => "swift",
+        "sql" => "sql",
+        "dockerfile" | "docker" | "containerfile" => "dockerfile",
+        "html" | "htm" | "xml" => "html",
+        "css" => "css",
         _ => "",
     }
 }
 
-/// Tree-sitter language for a file path, covering the grammars compiled in
-/// via Cargo features plus common aliases. Unknown extensions return `""`
-/// and callers keep the dim fallback (never guess).
+/// Highlight language for a file path, covering compiled grammars plus
+/// fallback-only keys and common aliases. Unknown extensions return `""`
+/// and callers keep the dim fallback (never guess). Extensionless
+/// `Dockerfile`/`Containerfile` work because the whole file name is the
+/// token.
 pub(crate) fn lang_from_path(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let ext = ext.split(':').next().unwrap_or(&ext);
@@ -66,6 +75,11 @@ mod tests {
         assert_eq!(lang_from_path("a.rb"), "ruby");
         assert_eq!(lang_from_path("a.scala"), "scala");
         assert_eq!(lang_from_path("a.swift"), "swift");
+        // Fallback-only keys served by the generic lexer (no compiled grammar).
+        assert_eq!(lang_from_path("q.sql"), "sql");
+        assert_eq!(lang_from_path("Dockerfile"), "dockerfile");
+        assert_eq!(lang_from_path("a.sql:12-20"), "sql");
+        assert_eq!(lang_from_path("index.html"), "html");
     }
 
     #[test]
@@ -92,7 +106,8 @@ mod tests {
             assert!(!from_path.is_empty(), "{path}");
             assert_eq!(from_path, canonical_lang(tag), "{path} vs ```{tag}");
         }
-        assert_eq!(canonical_lang("dockerfile"), "");
+        assert_eq!(canonical_lang("dockerfile"), "dockerfile");
+        assert_eq!(canonical_lang("sql"), "sql");
         assert_eq!(canonical_lang("text"), "");
     }
 }

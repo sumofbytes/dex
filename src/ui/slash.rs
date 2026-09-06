@@ -204,6 +204,7 @@ pub(super) fn reset_session_state(app: &mut App) {
     app.plan = crate::core::types::Plan::default();
     app.transcript.clear();
     app.assistant_pending.clear();
+    app.assistant_gap.reset();
     app.assistant_open = false;
     app.thinking_open = false;
     app.autoscroll = true;
