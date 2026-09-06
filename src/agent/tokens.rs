@@ -62,5 +62,27 @@ pub(crate) fn effective_tokens(
 ) -> u64 {
     estimate_tokens(messages)
         + estimate_ephemeral_tokens(ephemeral)
-        + if with_tools { TOOL_SCHEMA_TOKENS } else { 0 }
+        + if with_tools {
+            // Native schema is a flat estimate; the MCP slice is live —
+            // without it the compaction threshold ignores the per-request
+            // schema cost that actually fills the window.
+            TOOL_SCHEMA_TOKENS + crate::mcp::cached_schema_tokens()
+        } else {
+            0
+        }
+}
+
+/// Token cost of the live MCP tool-schema slice (`mcp.rs:cached_tools`).
+/// Same ~4-chars-per-token heuristic as [`estimate_tokens`]: namespaced
+/// name + description + serialized parameters per definition.
+pub(crate) fn schema_token_estimate(defs: &[crate::core::types::ToolDefinition]) -> u64 {
+    let chars: usize = defs
+        .iter()
+        .map(|d| {
+            d.function.name.len()
+                + d.function.description.len()
+                + d.function.parameters.to_string().len()
+        })
+        .sum();
+    (chars as u64) / 4 + (defs.len() as u64 * PER_MESSAGE_OVERHEAD)
 }

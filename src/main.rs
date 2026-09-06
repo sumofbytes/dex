@@ -28,6 +28,9 @@ use std::env;
 use std::io::{self, Write};
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // MCP bootstrap (background connect; schema merges whatever is cached).
+    // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
+    crate::mcp::global_manager();
     let mut config = LlmConfig::from_env(
         args.base_url.clone(),
         args.model.clone(),

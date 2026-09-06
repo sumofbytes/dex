@@ -502,6 +502,28 @@ impl DaemonClient {
         block_on(self.list_skills_async()).map_err(|e| -> Box<dyn std::error::Error> { e })
     }
 
+    /// MCP server status from the daemon (`GET /api/mcp`): per-server
+    /// name/state/tool-count/error plus the schema-cap drop count. Returned
+    /// raw — the caller renders it with `render_mcp_panel`.
+    pub async fn mcp_status_async(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let resp: serde_json::Value = self
+            .http
+            .get(format!("{}/api/mcp", self.base_url))
+            .headers(self.api_headers())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp)
+    }
+
+    pub fn mcp_status(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        block_on(self.mcp_status_async()).map_err(|e| -> Box<dyn std::error::Error> { e })
+    }
+
     /// Load a skill by name into the daemon's session history.
     pub async fn load_skill_async(
         &self,

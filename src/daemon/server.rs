@@ -34,6 +34,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/git", get(get_git))
         .route("/api/mcp", get(get_mcp))
+        .route("/api/mcp/{server}/reconnect", post(mcp_reconnect))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
@@ -174,13 +175,25 @@ async fn get_git() -> Json<GitInfo> {
 
 async fn get_mcp() -> Json<serde_json::Value> {
     // Reads the process-wide cache; never spawns, never blocks the loop.
+    // `error` carries the last connect/probe failure so operators see *why*
+    // a server is down; `truncated` counts schema-cap drops (see loop.rs).
     let servers: Vec<serde_json::Value> = crate::mcp::global_manager()
         .statuses()
         .await
         .into_iter()
-        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools}))
+        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools, "error": s.error}))
         .collect();
-    Json(json!({ "servers": servers }))
+    Json(json!({ "servers": servers, "truncated": crate::mcp::cached_truncated() }))
+}
+
+/// Drop the client and reconnect now; surfaces the error instead of only
+/// recording `down`. Operators hit this after fixing a crashed server
+/// instead of restarting the daemon.
+async fn mcp_reconnect(Path(server): Path<String>) -> Json<serde_json::Value> {
+    match crate::mcp::global_manager().reconnect(&server).await {
+        Ok(tools) => Json(json!({ "server": server, "state": "up", "tools": tools })),
+        Err(error) => Json(json!({ "server": server, "state": "down", "error": error })),
+    }
 }
 
 async fn list_skills() -> Json<serde_json::Value> {
@@ -1593,6 +1606,30 @@ mod handler_tests {
         headers.insert("x-dex-protocol", "2".parse().unwrap());
         let r = chat(State(state), Path("nope".into()), headers, Json(req)).await;
         assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn mcp_status_and_reconnect_shape() {
+        // Serialized with the MCP env tests (TEST_ENV_LOCK) and hermetic via
+        // DEX_NO_MCP=1: this first-touch init of the global manager must stay
+        // config-free, so a dev machine's servers can't leak into the shared
+        // schema cache (the exact-schema test depends on it).
+        let _env = crate::mcp::TEST_ENV_LOCK.lock().await;
+        let prev = std::env::var("DEX_NO_MCP").ok();
+        unsafe { std::env::set_var("DEX_NO_MCP", "1") };
+        let body = get_mcp().await.0;
+        assert!(body.get("servers").and_then(|v| v.as_array()).is_some());
+        assert!(body.get("truncated").and_then(|v| v.as_u64()).is_some());
+        // Smoke: unknown server surfaces down+error, never panics.
+        let r = mcp_reconnect(Path("no-such-server".into())).await.0;
+        assert_eq!(r.get("state").and_then(|v| v.as_str()), Some("down"));
+        assert!(r.get("error").and_then(|v| v.as_str()).is_some());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DEX_NO_MCP", v),
+                None => std::env::remove_var("DEX_NO_MCP"),
+            }
+        }
     }
 
     #[tokio::test]

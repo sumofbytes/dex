@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, effective_tokens, KEEP_RECENT_MESSAGES};
-use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
+use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::core::console::{
     with_console, Console, SpinnerGuard, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK,
     TOOL_OUTPUT_COLOR,
@@ -76,19 +76,6 @@ async fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Conso
         })
         .await;
     state.total_cost += cost;
-}
-
-/// Async wait for cancellation on the sync trait: polls with async sleep
-/// (10ms) so `select!` wakes within ~10ms without a 50ms `recv_timeout`
-/// quantum. One path covers `CancellationToken`, `GlobalCancellation` and
-/// test doubles while keeping `CancellationSource` sync per plan.
-async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
-    loop {
-        if cancel.is_cancelled() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 async fn execute_tool_call(
@@ -166,7 +153,12 @@ pub(crate) async fn process_turn(
         }
 
         // Proactive compaction BEFORE model call
-        let ephemerals: [Option<String>; 0] = [];
+        // Ephemeral MCP status line: priced in the budget below but never
+        // stored in `messages` (call-time preamble, not transcript).
+        // Sync snapshot, never initializes the manager: no MCP tools are
+        // in the schema before bootstrap either, so the budget stays exact
+        // and a budget probe never spawns the background refresh.
+        let ephemerals = [crate::mcp::ephemeral_line()];
         let mut compaction_attempts = 0;
         while compaction_attempts < 3 {
             let eff = effective_tokens(messages, &ephemerals, true);
@@ -317,6 +309,16 @@ pub(crate) async fn process_turn(
                     .map(|(_, n, i, o, d)| (n, i, o, d))
                     .collect::<Vec<(String, String, ToolOutcome, Duration)>>()
             };
+
+            // Cancel landed during tool IO: the per-tool "cancelled"
+            // errors above are shutdown noise, not model input. Suppress
+            // the fan-out and unwind — the turn was going to abort at the
+            // next loop-top check anyway, and skipping the persist keeps
+            // a transcript the model never saw out of the session.
+            if cancellation.is_cancelled() {
+                let _ = cancellation.take_cancelled();
+                return Err("cancelled by user".into());
+            }
 
             // Hoisted: one getcwd per iteration, not per tool result.
             let turn_cwd = std::env::current_dir()
@@ -728,6 +730,87 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "cancel must preempt hanging LLM without 50ms quanta pile-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_tool_io_suppresses_result_fanout() {
+        // Cancel lands while the bash tool runs: the per-tool "cancelled"
+        // error is shutdown noise, not model input — the turn unwinds
+        // without persisting a tool result the model never saw.
+        #[derive(Clone)]
+        struct SleepOnce {
+            round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ModelClient for SleepOnce {
+            async fn complete(
+                &self,
+                _m: &[ChatMessage],
+                _w: bool,
+                _s: Option<mpsc::Sender<SinkLine>>,
+                _c: &(dyn CancellationSource + Send + Sync),
+            ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+                let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let message = if round == 0 {
+                    ChatMessage::assistant_calls(
+                        None,
+                        vec![crate::core::types::LlmToolCall {
+                            id: "call-1".into(),
+                            call_type: "function".into(),
+                            function: crate::core::types::FunctionCall {
+                                name: "bash".into(),
+                                arguments: r#"{"command":"sleep 30"}"#.into(),
+                            },
+                        }],
+                    )
+                } else {
+                    ChatMessage::assistant("done")
+                };
+                Ok(Turn {
+                    message,
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 0,
+                        cached_tokens: None,
+                    }),
+                    stop_reason: None,
+                })
+            }
+        }
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let cancel = crate::core::console::CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel2.cancel();
+        });
+        let start = std::time::Instant::now();
+        let err = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &SleepOnce {
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            &cancel,
+            &crate::core::console::Console::none(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "cancelled by user");
+        assert_eq!(messages.len(), 2, "only system + assistant call persist");
+        assert!(
+            !messages.iter().any(|m| m.role == Role::Tool),
+            "cancelled tool errors must not reach the transcript"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "cancel must preempt tool IO without waiting out the command"
         );
     }
 }
