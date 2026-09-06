@@ -80,9 +80,8 @@ async fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Conso
 
 /// Async wait for cancellation on the sync trait: polls with async sleep
 /// (10ms) so `select!` wakes within ~10ms without a 50ms `recv_timeout`
-/// quantum. Concrete `CancellationToken::cancelled()` (Notify) wakes
-/// instantly; this generic path covers `GlobalCancellation`/test doubles
-/// while keeping `CancellationSource` sync per plan.
+/// quantum. One path covers `CancellationToken`, `GlobalCancellation` and
+/// test doubles while keeping `CancellationSource` sync per plan.
 async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
     loop {
         if cancel.is_cancelled() {
@@ -200,8 +199,7 @@ pub(crate) async fn process_turn(
         }
 
         // Async LLM call with prompt cancel: `select!(cancelled, complete)`
-        // wakes within ~10ms on the generic path (instant on the concrete
-        // Notify token). No message `to_vec` clone beyond what the call
+        // wakes within ~10ms. No message `to_vec` clone beyond what the call
         // needs and no parked thread (S6 resource win).
         let cancel_ref: &(dyn CancellationSource + Send + Sync) = cancel;
         let turn: Turn = tokio::select! {

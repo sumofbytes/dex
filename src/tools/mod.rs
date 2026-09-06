@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_cancel_is_instant_not_poll_quantized() {
+    async fn bash_cancel_is_prompt_not_poll_quantized() {
         // TDD Phase 3: cancel via select!, not 25ms poll.
         use crate::core::console::CancellationToken;
         let token = CancellationToken::new();

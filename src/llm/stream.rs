@@ -484,16 +484,15 @@ async fn run_sse<P: StreamParser>(
     driver.finish_turn_async(parser, sink_is_some).await
 }
 
-/// Helper to get a `Send`-compatible future for `CancellationToken`.
-/// `cancelled()` borrows the token; the returned future holds only the
-/// atomic + Notify Arcs, so it is Send.
+/// Poll-based cancel wait that stays `Send`: the sync trait offers no
+/// future, so poll `is_cancelled()` with async sleep (~10ms granularity)
+/// instead of holding a non-`Send` borrow. One path covers every
+/// `CancellationSource` (`CancellationToken`, `GlobalCancellation`, test
+/// doubles) — deliberately not the concrete `Notify`, whose future would
+/// need a separate signature for zero user-visible gain.
 async fn cancel_cancelled(cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync)) {
-    // Poll-based fallback that is Send: the concrete async token also
-    // offers `cancelled().await`, but via the sync trait we poll with
-    // async sleep for instant-ish (10ms) granularity without holding a
-    // non-Send future. Concrete `CancellationToken::cancelled()` users
-    // (LLM paths with the concrete type) get true Notify instant wake;
-    // this generic path covers trait objects.
+    // Poll with async sleep for ~10ms granularity without holding a
+    // non-Send future.
     loop {
         if cancel.is_cancelled() {
             return;
