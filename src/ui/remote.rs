@@ -26,7 +26,10 @@ use crate::core::types::{
 use crate::protocol::{ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, StreamEvent};
 use crate::session::Session;
 
-use super::slash::{complete_slash, handle_slash, reset_session_state, slash_suggestions};
+use super::slash::{
+    complete_slash, expand_bare_command, handle_slash, reset_session_state, slash_suggestions,
+    EXPAND_ON_ENTER,
+};
 use super::{
     append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
     line_width, mouse_display_cell, push_banner, push_info, push_info_line, render_user_prompt,
@@ -1270,14 +1273,37 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 app.slash_selected = (app.slash_selected + 1).min(last);
             }
             KeyCode::Tab => {
-                complete_slash(app);
+                if !expand_bare_command(app) {
+                    complete_slash(app);
+                }
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Single Enter both completes the highlighted suggestion
-                // and submits. The old two-step (complete → second Enter)
-                // made `/resume` feel broken — selecting 0 left an empty
-                // transcript until the next Enter.
-                complete_slash(app);
+                // Bare picker command (`/model`, `/provider`, `/resume`):
+                // first Enter expands to `"<cmd> "` and shows the popup
+                // instead of submitting the bare form (which would only
+                // print info into the transcript).
+                if expand_bare_command(app) {
+                    return;
+                }
+                // Command-name completion without an argument yet (`/mod` →
+                // `/model `): complete but don't submit while the result is
+                // still a bare picker command. Argument-less commands
+                // (`/clear`) still submit immediately, and argument
+                // completions (`/model foo`, `/resume 0`) complete + submit
+                // the highlighted choice as before.
+                let before = app.input.text();
+                if !before.contains(' ') && !before.contains('\n') {
+                    let before_bare = before.trim().to_string();
+                    if complete_slash(app) {
+                        let bare = app.input.text().trim().to_string();
+                        if EXPAND_ON_ENTER.contains(&bare.as_str()) && before_bare != bare {
+                            app.slash_selected = 0;
+                            return;
+                        }
+                    }
+                } else {
+                    complete_slash(app);
+                }
                 let is_followup = key.modifiers.contains(KeyModifiers::ALT);
                 submit_prompt(remote, is_followup);
             }

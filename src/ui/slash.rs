@@ -176,6 +176,37 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
     true
 }
 
+/// Bare slash commands that open a picker (`/model` + `/provider` complete
+/// from the catalog, `/resume` from the session list). Enter on the bare
+/// form expands to `"<cmd> "` and keeps the popup open instead of
+/// submitting — the bare form would only print info into the transcript
+/// ("current model: …", "sessions: …"), which is never what Enter means
+/// when the popup is offering a choice.
+pub(super) const EXPAND_ON_ENTER: &[&str] = &["/model", "/provider", "/resume"];
+
+/// Rewrite a bare picker command (`/model`, `/provider`, `/resume`) to
+/// `"<cmd> "` so the popup shows the full choice list. Returns true when
+/// it expanded — the caller must not submit. Anything with an argument
+/// already (`/model foo`, `/resume 0`), a newline, or a non-picker command
+/// (`/clear`) is left untouched.
+///
+/// `/resume` needs the direct rewrite: its suggestions are session args, so
+/// `complete_slash` would jump straight to `/resume 0` and resume the first
+/// session instead of showing the list.
+pub(super) fn expand_bare_command(app: &mut App) -> bool {
+    let text = app.input.text();
+    if text.contains(' ') || text.contains('\n') {
+        return false;
+    }
+    let trimmed = text.trim();
+    if EXPAND_ON_ENTER.contains(&trimmed) {
+        app.input = InputField::from_text(&format!("{trimmed} "));
+        app.slash_selected = 0;
+        return true;
+    }
+    false
+}
+
 /// Clear per-session TUI state for `/clear` (same session) and `/new`
 /// (fresh session). Keeps connection/config/skills/history — everything else
 /// (transcript, token spend, plan, queued steering/follow-ups, turn markers)

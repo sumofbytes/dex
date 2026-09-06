@@ -1682,4 +1682,51 @@ mod tests {
                   .any(|b| matches!(b, TranscriptBlock::Info { line, .. } if line.spans.iter().any(|s| s.content.contains("turn is running"))))
         );
     }
+
+    #[test]
+    fn enter_expands_bare_picker_commands_instead_of_submitting() {
+        // `/model`, `/provider`, `/resume` open a popup picker: Enter on the
+        // bare form must expand to `"<cmd> "` (popup stays open) rather than
+        // submit and print info into the transcript.
+        for cmd in ["/model", "/provider", "/resume"] {
+            let mut app = test_app();
+            app.input = crate::ui::input::InputField::from_text(cmd);
+            app.slash_selected = 5;
+            assert!(
+                crate::ui::slash::expand_bare_command(&mut app),
+                "{cmd} must expand"
+            );
+            assert_eq!(app.input.text(), format!("{cmd} "));
+            assert_eq!(app.slash_selected, 0);
+        }
+    }
+
+    #[test]
+    fn enter_expansion_leaves_other_input_untouched() {
+        // Argument-less commands (`/clear`), partial prefixes (`/mod`), and
+        // inputs that already carry an argument keep the old path: the Enter
+        // handler's completion step (not the bare-command expansion) owns
+        // them.
+        for input in ["/clear", "/mod", "/model foo", "/resume 0", "hello"] {
+            let mut app = test_app();
+            app.input = crate::ui::input::InputField::from_text(input);
+            assert!(
+                !crate::ui::slash::expand_bare_command(&mut app),
+                "{input} must not expand"
+            );
+            assert_eq!(app.input.text(), input);
+        }
+    }
+
+    #[test]
+    fn command_prefix_completes_to_bare_picker_form() {
+        // `/mod` + completion → `/model `: the Enter handler sees a bare
+        // picker form in `EXPAND_ON_ENTER` and holds the submit so the popup
+        // stays open for the actual choice.
+        let mut app = test_app();
+        app.input = crate::ui::input::InputField::from_text("/mod");
+        assert!(crate::ui::slash::complete_slash(&mut app));
+        assert_eq!(app.input.text(), "/model ");
+        assert!(crate::ui::slash::EXPAND_ON_ENTER.contains(&"/model"));
+    }
 }

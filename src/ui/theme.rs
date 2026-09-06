@@ -53,6 +53,17 @@ pub(crate) fn popup_bg() -> Color {
     }
 }
 
+/// Highlight row inside a popup: one step above [`popup_bg`] so the selected
+/// slash-completion row reads without a harsh Black-on-Yellow bar. Still
+/// derived from the terminal palette, so it keeps the theme's hue.
+pub(crate) fn popup_select_bg() -> Color {
+    match background() {
+        Background::Dark => raised(0.32),
+        Background::Light => raised(0.22),
+        Background::Unknown => Color::Reset,
+    }
+}
+
 /// Foreground for prominent text on the composer/surface: the terminal's own
 /// default foreground, so it always contrasts with the background and with
 /// the surfaces derived from it. Fixed ANSI slots (`Color::Black` /
@@ -132,7 +143,7 @@ mod tests {
         // Whatever the detected background, surfaces must resolve without
         // panicking and stay on-theme: Reset when the theme is unknown, or
         // RGB derived from the queried palette.
-        for color in [surface_bg(), popup_bg()] {
+        for color in [surface_bg(), popup_bg(), popup_select_bg()] {
             match color {
                 Color::Reset => {}
                 Color::Rgb(..) if background() != Background::Unknown => {}
@@ -149,6 +160,7 @@ mod tests {
         if background() == Background::Unknown {
             assert_eq!(surface_fg(), Color::Reset);
             assert_eq!(surface_bg(), Color::Reset);
+            assert_eq!(popup_select_bg(), Color::Reset);
         }
     }
 }
