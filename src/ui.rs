@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 use crossterm::Command;
 use ratatui::layout::Rect;
@@ -324,7 +324,7 @@ impl App {
 pub(crate) struct PendingApproval {
     pub(crate) name: String,
     pub(crate) input: String,
-    pub(crate) response: mpsc::Sender<crate::core::types::ApprovalDecision>,
+    pub(crate) response: tokio::sync::mpsc::Sender<crate::core::types::ApprovalDecision>,
     pub(crate) selected: usize,
 }
 
@@ -894,7 +894,7 @@ fn dim_intermediate_assistant_block(app: &mut App) {
 /// Send the user's approval decision for the pending tool execution.
 pub(super) fn resolve_approval(app: &mut App, decision: crate::core::types::ApprovalDecision) {
     if let Some(approval) = app.pending_approval.take() {
-        let _ = approval.response.send(decision);
+        let _ = approval.response.try_send(decision);
     }
 }
 
@@ -1019,7 +1019,7 @@ mod tests {
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
-                client: reqwest::blocking::Client::new(),
+                client: reqwest::Client::new(),
             },
             messages: Vec::new(),
             tool_state: crate::agent::state::ToolState::default(),

@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-pub(crate) trait CancellationSource {
+pub(crate) trait CancellationSource: Send + Sync {
     fn is_cancelled(&self) -> bool;
     fn take_cancelled(&self) -> bool;
 }
@@ -120,6 +120,39 @@ impl ToolState {
             }
             if let Ok(json) = serde_json::to_string(&self.cache) {
                 let _ = fs::write(&path, json);
+            }
+        }
+    }
+
+    /// Async load: cache hits are cheap; file read goes through async fs
+    /// (Phase 6). Best-effort, never fails the turn.
+    pub(crate) async fn load_async() -> Self {
+        let mut state = Self::default();
+        if env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
+            return state;
+        }
+        if let Some(path) = cache_file_path() {
+            if let Ok(contents) = tokio::fs::read_to_string(&path).await {
+                if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&contents) {
+                    state.cache = map;
+                }
+            }
+        }
+        state
+    }
+
+    /// Async save: spawned so turn teardown never waits on it (today it
+    /// already does not fail the turn; keep that).
+    pub(crate) async fn save_async(&self) {
+        if !self.dirty || env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
+            return;
+        }
+        if let Some(path) = cache_file_path() {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Ok(json) = serde_json::to_string(&self.cache) {
+                let _ = tokio::fs::write(&path, json).await;
             }
         }
     }

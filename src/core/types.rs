@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Skill {
@@ -129,7 +128,7 @@ pub(crate) enum ApprovalDecision {
 pub(crate) struct ApprovalRequest {
     pub name: String,
     pub input: String,
-    pub response: mpsc::Sender<ApprovalDecision>,
+    pub response: tokio::sync::mpsc::Sender<ApprovalDecision>,
 }
 
 /// Width of a string as displayed, ignoring ANSI escape sequences.

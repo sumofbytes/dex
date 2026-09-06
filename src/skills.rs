@@ -97,7 +97,7 @@ pub(crate) fn discover_skills_fresh(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         let mut entries: Vec<_> = entries.flatten().collect();
@@ -120,6 +120,126 @@ pub(crate) fn discover_skills_fresh(dirs: &[PathBuf]) -> Vec<Skill> {
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> {
+    // Async dir scans (`read_dir`, concurrent `SKILL.md` reads): 10s cache
+    // lives in `discover_skills`; explicit `/skill` loads bypass it.
+    let mut dir_entries: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    for dir in dirs {
+        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+            continue;
+        };
+        let mut subdirs = Vec::new();
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            // is_dir via file_type to avoid extra stat; fallback to path check.
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or_else(|_| path.is_dir());
+            if is_dir {
+                subdirs.push(path);
+            }
+        }
+        subdirs.sort();
+        dir_entries.push((dir.clone(), subdirs));
+    }
+    // Concurrent SKILL.md reads under the existing sort + first-wins + dup warning.
+    let mut set = tokio::task::JoinSet::new();
+    for (_, subdirs) in dir_entries {
+        for path in subdirs {
+            let skill_path = path.join("SKILL.md");
+            // Fast existence check without extra stat storm: attempt read directly.
+            set.spawn(async move {
+                let content = tokio::fs::read_to_string(&skill_path).await.ok()?;
+                // Parse without blocking: frontmatter is tiny, parse inline.
+                // Reuse sync parser by writing to temp? Instead parse here (duplicate tiny logic).
+                // To reuse helpers and avoid duplication, parse via blocking task for CPU? Frontmatter parse is trivial (<1ms), inline.
+                let mut lines = content.lines();
+                if lines.next()?.trim() != "---" {
+                    return None;
+                }
+                let mut name = None;
+                let mut description = None;
+                for line in lines {
+                    if line.trim() == "---" {
+                        break;
+                    }
+                    let line = line.trim();
+                    if let Some(val) = line.strip_prefix("name:") {
+                        name = Some(unquote(val.trim()));
+                    } else if let Some(val) = line.strip_prefix("description:") {
+                        description = Some(unquote(val.trim()));
+                    }
+                }
+                let name = name?;
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return None;
+                }
+                Some(crate::core::types::Skill {
+                    name,
+                    description: description.unwrap_or_default(),
+                    path: skill_path,
+                })
+            });
+        }
+    }
+    let mut found: Vec<crate::core::types::Skill> = Vec::new();
+    while let Some(r) = set.join_next().await {
+        if let Ok(Some(s)) = r {
+            found.push(s);
+        }
+    }
+    // Sort + first-wins dedup to match sync contract (sorted by name, first wins).
+    // Since JoinSet completion is nondeterministic, sort by path first for determinism,
+    // then by name for output, keeping first path per name.
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut seen = std::collections::HashSet::new();
+    let mut skills = Vec::new();
+    for skill in found {
+        if seen.insert(skill.name.clone()) {
+            skills.push(skill);
+        } else {
+            eprintln!(
+                "[skills] ignoring duplicate skill '{}' at {}",
+                skill.name,
+                skill.path.display()
+            );
+        }
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) async fn discover_skills_async(dirs: &[PathBuf]) -> Vec<Skill> {
+    // 10s cache keyed by dir list (same as sync); hits are a mutex bump inline,
+    // misses run the async scan above (no spawn_blocking needed — dir scans are async).
+    static CACHE_ASYNC: std::sync::OnceLock<
+        std::sync::Mutex<Option<(Vec<PathBuf>, std::time::Instant, Vec<Skill>)>>,
+    > = std::sync::OnceLock::new();
+    if let Some(hit) = CACHE_ASYNC
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(key, at, _)| key == dirs && at.elapsed() < Duration::from_secs(10))
+    {
+        return hit.2.clone();
+    }
+    let skills = discover_skills_fresh_async(dirs).await;
+    CACHE_ASYNC
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace((dirs.to_vec(), Instant::now(), skills.clone()));
     skills
 }
 
@@ -237,5 +357,35 @@ mod tests {
         let out = format_skills_for_prompt(&skills);
         assert!(out.contains("x: does x"));
         assert!(out.contains("/skill:"));
+    }
+
+    #[tokio::test]
+    async fn discover_async_matches_sync_and_dedups() {
+        // TDD Phase 6: async dir scans + concurrent reads, same sort + first-wins + dup warning.
+        let base = std::env::temp_dir().join(format!("dex-discover-async-{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        let _ = tokio::fs::create_dir_all(a.join("s1")).await;
+        let _ = tokio::fs::create_dir_all(b.join("s1")).await;
+        tokio::fs::write(
+            a.join("s1/SKILL.md"),
+            "---\nname: dup\ndescription: a\n---\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            b.join("s1/SKILL.md"),
+            "---\nname: dup\ndescription: b\n---\n",
+        )
+        .await
+        .unwrap();
+        let dirs = vec![a, b];
+        let sync_res = discover_skills_fresh(&dirs);
+        let async_res = discover_skills_fresh_async(&dirs).await;
+        assert_eq!(sync_res.len(), async_res.len());
+        assert_eq!(sync_res[0].name, async_res[0].name);
+        // First wins (a before b)
+        assert_eq!(async_res[0].description, "a");
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

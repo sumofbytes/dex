@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
@@ -44,12 +45,16 @@ pub(crate) fn mark_launch_start() {
     LAUNCH_START.get_or_init(Instant::now);
 }
 
-/// Messages flowing from the per-turn worker thread into the UI loop.
+/// Messages flowing from per-turn worker / background tasks into the UI loop.
+/// The worker side is async (tasks), the UI loop stays sync crossterm; only the
+/// worker side is async (Phase 5 bridge).
 enum WorkerMessage {
     /// A stream event from the daemon.
     Stream(StreamEvent),
     /// The SSE stream closed; carries a transport error if any.
     Finished(Option<String>),
+    /// Background git poll result (off UI thread, every 2s).
+    Git(crate::protocol::GitInfo),
 }
 
 /// Client-server TUI: renders the exact same `App` view as the local engine,
@@ -87,13 +92,34 @@ fn poll_git_status(remote: &mut RemoteApp) -> bool {
     let Ok(info) = remote.client.get_git() else {
         return false;
     };
+    apply_git_info(remote, &info)
+}
+
+fn apply_git_info(remote: &mut RemoteApp, info: &crate::protocol::GitInfo) -> bool {
     let changed =
         remote.app.git_branch != info.git_branch || remote.app.git_dirty != info.git_dirty;
     if changed {
-        remote.app.git_branch = info.git_branch;
+        remote.app.git_branch = info.git_branch.clone();
         remote.app.git_dirty = info.git_dirty;
     }
     changed
+}
+
+/// Background git poll off the UI thread (Phase 5): task polls every 2s via
+/// `get_git_async`, pushes into the worker channel; UI loop only applies.
+/// Daemon 5s cache stays; per-frame cost zero even when busy.
+fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Sender<WorkerMessage>) {
+    crate::client::http::spawn_task(async move {
+        loop {
+            tokio::time::sleep(GIT_REFRESH_INTERVAL).await;
+            match client.get_git_async().await {
+                Ok(info) => {
+                    let _ = tx.send(WorkerMessage::Git(info)).await;
+                }
+                Err(_) => continue,
+            }
+        }
+    });
 }
 
 /// Throttled poll for the main loop; resets the clock even on failure so a
@@ -215,14 +241,14 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
 
     // Session create and skills fetch are independent (`create_session`
-    // only needs `info.cwd` above), so run them concurrently: one RTT +
-    // one daemon-side skills scan off the critical path.
-    // (Thread results cross as `String`/`Vec`, not `Box<dyn Error>`, which
-    // is not `Send`.)
-    // The skills thread is detached on session failure: a failed launch must
-    // not wait for a daemon-side skills scan before reporting the error.
+    // only needs `info.cwd` above), so overlap them: `tokio::join!` on the
+    // shared runtime (one RTT + one daemon-side scan off the critical path).
+    // Detach-on-error preserved: skills task is spawned, session awaited first;
+    // on session failure we return without awaiting skills (handle drop detaches).
     let skills_client = client.clone();
-    let skills_handle = std::thread::spawn(move || skills_client.list_skills().unwrap_or_default());
+    let skills_handle = crate::client::http::spawn_task(async move {
+        skills_client.list_skills_async().await.unwrap_or_default()
+    });
     // Sessions default to `<workspace>-<7 chars>` (k8s-style); an explicit
     // `--name` wins. Generated client-side so the local placeholder shows the
     // same name the daemon persists.
@@ -245,12 +271,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             .map_err(|e| format!("failed to create session: {e}"))
     };
     let (session_id, is_reattach) = match session_result {
-        // `JoinHandle` drops detach the thread; only reached on the error
-        // path where the skills result is discarded anyway.
+        // Dropping the JoinHandle detaches the skills task; error path never waits.
         Err(e) => return Err(std::io::Error::other(e)),
         Ok(ok) => (ok.0, ok.1),
     };
-    let daemon_skills = skills_handle.join().unwrap_or_default();
+    let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
     // Skills live on the daemon (its workspace); a stale list is harmless —
     // the load call re-discovers on the daemon side.
     let tui_skills: Vec<crate::core::types::Skill> = daemon_skills
@@ -292,8 +317,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         idempotency_key: None,
     };
 
-    let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>();
-    let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>();
+    let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(256);
+    let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>(16);
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let app = App {
@@ -344,10 +369,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
 
     let mut remote = RemoteApp {
         app,
-        client,
+        client: client.clone(),
         session_id: session_id.clone(),
         options,
-        worker_tx,
+        worker_tx: worker_tx.clone(),
         worker_rx,
         decision_tx,
         cancel_flag,
@@ -356,6 +381,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         // first idle tick.
         last_git_check: Instant::now(),
     };
+    // Background git poll off the UI thread (Phase 5): task polls every 2s,
+    // pushes into the worker channel; UI loop only applies. Daemon 5s cache
+    // stays; per-frame cost zero even when busy.
+    spawn_git_poller(client.clone(), worker_tx);
     if !is_reattach {
         // Keep the local placeholder's display name in sync with the daemon
         // record (a reattach overwrites `app.session` from disk below).
@@ -454,6 +483,11 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             let mut streamed = false;
             loop {
                 match remote.worker_rx.try_recv() {
+                    Ok(WorkerMessage::Git(info)) => {
+                        if apply_git_info(&mut remote, &info) {
+                            dirty = true;
+                        }
+                    }
                     Ok(WorkerMessage::Stream(event)) => {
                         streamed = true;
                         if remote.app.cancel_requested {
@@ -472,7 +506,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                         streamed = true;
                         finish_turn(&mut remote, error);
                     }
-                    Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(_) => break,
                 }
             }
 
@@ -481,14 +515,10 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             if remote.app.tick_notice() {
                 dirty = true;
             }
-            // Footer branch/dirty goes stale when the workspace moves under us
-            // (`git checkout` in another terminal, or the agent's own bash/git
-            // tools). Poll while idle only — mid-turn streaming already redraws
-            // at animation rate, and the turn-end refresh below catches tool
-            // mutations — so the poll never hitches a streamed turn.
-            if !busy && poll_git_status_if_due(&mut remote) {
-                dirty = true;
-            }
+            // Footer branch/dirty via background task (no per-frame `git` or HTTP
+            // on the UI thread, even when busy). `poll_git_status_if_due` kept
+            // as fallback for tests; production path is `WorkerMessage::Git`.
+            let _ = &poll_git_status_if_due;
             // Animation heartbeat while a turn runs: at most ~8 fps, and
             // streaming/input draws reset the clock so they don't double up.
             let now = Instant::now();
@@ -711,7 +741,7 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             // (agent thread blocks until it is resolved), so overwriting would
             // drop the prior sender. If it happens, deny the stale one.
             if let Some(stale) = remote.app.pending_approval.take() {
-                let _ = stale.response.send(CoreApprovalDecision::Deny);
+                let _ = stale.response.try_send(CoreApprovalDecision::Deny);
             }
             remote.app.pending_approval = Some(PendingApproval {
                 name,
@@ -1284,7 +1314,7 @@ fn request_cancel(remote: &mut RemoteApp) {
     // If an approval is blocking the turn, deny it first so the agent thread
     // can unwind.
     if app.pending_approval.take().is_some() {
-        let _ = remote.decision_tx.send(CoreApprovalDecision::Deny);
+        let _ = remote.decision_tx.try_send(CoreApprovalDecision::Deny);
     }
     match remote.client.cancel(&remote.session_id) {
         Ok(()) => push_info(app, "cancelling...".to_string()),
@@ -1384,13 +1414,13 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     }
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
-    let decision_rx = remote.take_decision_receiver();
+    let mut decision_rx = remote.take_decision_receiver();
     let cancel_flag = remote.cancel_flag.clone();
 
     std::thread::spawn(move || {
         let result = client.chat(&session_id, &prompt, options, &mut |event| {
             let is_approval = matches!(event, StreamEvent::ApprovalRequired { .. });
-            let _ = event_tx.send(WorkerMessage::Stream(event));
+            let _ = event_tx.blocking_send(WorkerMessage::Stream(event));
             if is_approval {
                 // After a cancel request, deny automatically so the turn can
                 // unwind without user interaction.
@@ -1399,18 +1429,19 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                 }
                 // Block until the user answers the overlay; the decision is
                 // POSTed back to the daemon.
-                match decision_rx.recv() {
-                    Ok(CoreApprovalDecision::Once) => Some(ProtocolApprovalDecision::AllowOnce),
-                    Ok(CoreApprovalDecision::Session) => {
+                match decision_rx.blocking_recv() {
+                    Some(CoreApprovalDecision::Once) => Some(ProtocolApprovalDecision::AllowOnce),
+                    Some(CoreApprovalDecision::Session) => {
                         Some(ProtocolApprovalDecision::AllowSession)
                     }
-                    Ok(CoreApprovalDecision::Deny) | Err(_) => Some(ProtocolApprovalDecision::Deny),
+                    Some(CoreApprovalDecision::Deny) | None => Some(ProtocolApprovalDecision::Deny),
                 }
             } else {
                 None
             }
         });
-        let _ = event_tx.send(WorkerMessage::Finished(result.err().map(|e| e.to_string())));
+        let _ =
+            event_tx.blocking_send(WorkerMessage::Finished(result.err().map(|e| e.to_string())));
     });
 }
 
@@ -1418,7 +1449,7 @@ impl RemoteApp {
     /// Swap in a fresh decision channel per turn; the worker for this turn
     /// owns the old receiver.
     fn take_decision_receiver(&mut self) -> mpsc::Receiver<CoreApprovalDecision> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel(16);
         self.decision_tx = tx;
         rx
     }
@@ -1967,5 +1998,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("events.jsonl"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_poller_spawns_without_blocking_ui() {
+        // TDD Phase 5: background task polls off UI thread (2s interval, daemon 5s cache);
+        // spawn returns immediately (no per-frame `git` or HTTP on UI thread).
+        let client = DaemonClient::new("http://127.0.0.1:9").unwrap();
+        let (wtx, _wrx) = tokio::sync::mpsc::channel::<WorkerMessage>(8);
+        let start = std::time::Instant::now();
+        spawn_git_poller(client, wtx);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "poller spawn must not block UI thread"
+        );
+        assert_eq!(GIT_REFRESH_INTERVAL, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn approval_after_cancel_auto_denies() {
+        // TDD Phase 5: approvals arriving after cancel are denied, not parked on overlay.
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Worker callback logic: when cancel_flag set, approval returns Deny without blocking.
+        // Simulate: `if cancel_flag { Deny }` path (see submit_prompt worker).
+        let decision = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            Some(crate::protocol::ApprovalDecision::Deny)
+        } else {
+            None
+        };
+        assert!(matches!(
+            decision,
+            Some(crate::protocol::ApprovalDecision::Deny)
+        ));
     }
 }

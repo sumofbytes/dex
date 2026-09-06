@@ -1,6 +1,5 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 use serde_json::Value;
-use std::process::Command;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Per-line character budget: protects against minified/binary-ish content
@@ -868,6 +867,7 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
 
 /// Git branch + dirty flag for a working directory, for status displays.
 pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
+    use std::process::Command;
     let branch = Command::new("git")
         .args(["-C", cwd, "branch", "--show-current"])
         .stdin(std::process::Stdio::null())
@@ -887,6 +887,35 @@ pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
             .output()
             .ok()
             .is_some_and(|output| !output.stdout.is_empty());
+    (branch, dirty)
+}
+
+pub(crate) async fn git_context_async(cwd: &str) -> (Option<String>, bool) {
+    use tokio::process::Command as AsyncCommand;
+    let branch = AsyncCommand::new("git")
+        .args(["-C", cwd, "branch", "--show-current"])
+        .stdin(std::process::Stdio::null())
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty());
+    let dirty = if branch.is_some() {
+        AsyncCommand::new("git")
+            .args(["-C", cwd, "status", "--porcelain"])
+            .stdin(std::process::Stdio::null())
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .output()
+            .await
+            .ok()
+            .is_some_and(|output| !output.stdout.is_empty())
+    } else {
+        false
+    };
     (branch, dirty)
 }
 
@@ -1111,5 +1140,17 @@ mod tests {
             tool_result_summary("fffind", "{}", "a.rs\n", true),
             "1 entry"
         );
+    }
+
+    #[tokio::test]
+    async fn git_context_async_matches_sync() {
+        // TDD Phase 6: tokio::process git spawns under cache, same branch/dirty.
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let sync_res = super::git_context(&cwd);
+        let async_res = super::git_context_async(&cwd).await;
+        assert_eq!(sync_res, async_res);
     }
 }

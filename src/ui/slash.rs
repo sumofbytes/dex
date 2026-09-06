@@ -189,7 +189,7 @@ pub(super) fn reset_session_state(app: &mut App) {
     if let Some(approval) = app.pending_approval.take() {
         let _ = approval
             .response
-            .send(crate::core::types::ApprovalDecision::Deny);
+            .try_send(crate::core::types::ApprovalDecision::Deny);
     }
     app.approval_rx = None;
     app.steering_rx = None;

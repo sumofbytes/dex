@@ -6,8 +6,9 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::sync::mpsc;
+use std::io::{self, Write};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 use crate::core::console::with_console;
 use crate::core::highlight::{print_code_block, print_markdown_text};
@@ -51,11 +52,10 @@ impl StreamPrinter {
         if trimmed.starts_with("```") {
             if self.in_code {
                 if let Some(sink) = &self.sink {
-                    sink.send(SinkLine::Assistant(format!(
+                    let _ = sink.try_send(SinkLine::Assistant(format!(
                         "```{}:\n{}\n```",
                         self.code_lang, self.code_body
-                    )))
-                    .ok();
+                    )));
                 } else {
                     print_code_block(&self.code_lang, &self.code_body);
                 }
@@ -71,7 +71,7 @@ impl StreamPrinter {
             self.code_body.push('\n');
         } else {
             if let Some(sink) = &self.sink {
-                sink.send(SinkLine::Assistant(line.to_string())).ok();
+                let _ = sink.try_send(SinkLine::Assistant(line.to_string()));
             } else {
                 print_markdown_text(line);
             }
@@ -81,11 +81,10 @@ impl StreamPrinter {
     pub(crate) fn finish(self) {
         if self.in_code && !self.code_body.is_empty() {
             if let Some(sink) = &self.sink {
-                sink.send(SinkLine::Assistant(format!(
+                let _ = sink.try_send(SinkLine::Assistant(format!(
                     "```{}:\n{}\n```",
                     self.code_lang, self.code_body
-                )))
-                .ok();
+                )));
             } else {
                 with_console(self.sink.is_some(), || {
                     print_code_block(&self.code_lang, &self.code_body)
@@ -123,7 +122,7 @@ impl std::error::Error for MidStreamError {}
 /// Wrap a stream failure as [`MidStreamError`] only once output has flowed;
 /// a failure before any output is retryable (protocol fallback may re-run
 /// the turn without duplicating anything).
-fn stream_err(message: &str, output_flowed: bool) -> Box<dyn std::error::Error> {
+fn stream_err(message: &str, output_flowed: bool) -> Box<dyn std::error::Error + Send + Sync> {
     if output_flowed {
         Box::new(MidStreamError(message.to_string()))
     } else {
@@ -173,123 +172,244 @@ pub(crate) struct Turn {
     pub(crate) stop_reason: Option<StopReason>,
 }
 
-/// Shared SSE driver: feeds each line to the parser, prints text/reasoning
-/// as it arrives, tracks usage and the terminal condition, and assembles the
-/// final turn. Fails with [`MidStreamError`] once any output has been
-/// emitted — a retry would duplicate it.
-fn run_sse<P: StreamParser>(
-    response: reqwest::blocking::Response,
-    sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &dyn crate::agent::state::CancellationSource,
-    mut parser: P,
-) -> Result<Turn, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(response);
-    let mut line = String::new();
-    let mut content = String::new();
-    let mut pending = String::new(); // partial line not yet printed
-    let mut printer = StreamPrinter::new(sink.clone());
-    let mut usage: Option<Usage> = None;
-    let mut stop_reason: Option<StopReason> = None;
-    let mut output_flowed = false;
+/// Shared SSE driver state: feeds each line to the parser, prints
+/// text/reasoning as it arrives, tracks usage and the terminal condition,
+/// and assembles the final turn. Fails with [`MidStreamError`] once any
+/// output has been emitted — a retry would duplicate it.
+struct SseDriver {
+    content: String,
+    pending: String,
+    printer: StreamPrinter,
+    usage: Option<Usage>,
+    stop_reason: Option<StopReason>,
+    output_flowed: bool,
+}
 
-    loop {
-        if cancel.take_cancelled() {
-            // Cancellation during generation: stop consuming the stream and
-            // unwind so control returns to the prompt.
-            with_console(sink.is_some(), || println!());
-            io::stdout().flush()?;
-            return Err(stream_err("cancelled", output_flowed));
+impl SseDriver {
+    fn new(sink: Option<mpsc::Sender<SinkLine>>) -> Self {
+        Self {
+            content: String::new(),
+            pending: String::new(),
+            printer: StreamPrinter::new(sink.clone()),
+            usage: None,
+            stop_reason: None,
+            output_flowed: false,
         }
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
+    }
+
+    fn sink(&self) -> Option<&mpsc::Sender<SinkLine>> {
+        self.printer.sink.as_ref()
+    }
+
+    /// Feed one raw SSE line; returns true when the parser signalled Done.
+    fn feed_raw(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
         let mut done = false;
-        for event in parser.feed(&line) {
+        for event in parser.feed(line) {
             match event {
                 StreamEvent::Thinking(thought) => {
                     // Reasoning counts as flowed output: it renders live on the
                     // transcript, so a retry after a drop here would duplicate
                     // it, even though reasoning is never persisted to the
                     // session journal. Deliberate — don't narrow this to Text.
-                    output_flowed = true;
-                    if let Some(sink) = &sink {
-                        sink.send(SinkLine::Thinking(thought)).ok();
+                    self.output_flowed = true;
+                    if let Some(sink) = self.sink() {
+                        let _ = sink.try_send(SinkLine::Thinking(thought));
                     }
                 }
                 StreamEvent::Text(text) => {
-                    output_flowed = true;
-                    content.push_str(&text);
+                    self.output_flowed = true;
+                    self.content.push_str(&text);
                     // Print complete lines live; keep any partial tail buffered.
-                    pending.push_str(&text);
-                    while let Some(pos) = pending.find('\n') {
-                        // Memmove the remainder to the front instead of
-                        // collecting a new String per completed line.
-                        let complete = &pending[..=pos];
-                        printer.feed_line(complete.trim_end_matches('\n'));
-                        pending.replace_range(..=pos, "");
+                    self.pending.push_str(&text);
+                    // Collect completed lines first to avoid borrow fights.
+                    let mut completed: Vec<String> = Vec::new();
+                    while let Some(pos) = self.pending.find('\n') {
+                        let complete = self.pending[..=pos].to_string();
+                        self.pending.replace_range(..=pos, "");
+                        completed.push(complete);
                     }
-                    // One flush per delta is a syscall per token; sink consumers
-                    // get their liveness from the channel (console printing needs
-                    // the flush).
-                    if sink.is_none() {
-                        io::stdout().flush()?;
+                    for c in completed {
+                        self.printer.feed_line(c.trim_end_matches('\n'));
+                    }
+                    if self.sink().is_none() {
+                        let _ = io::stdout().flush();
                     }
                 }
-                StreamEvent::Usage(u) => usage = Some(u),
-                StreamEvent::Stop(reason) => stop_reason = Some(reason),
+                StreamEvent::Usage(u) => self.usage = Some(u),
+                StreamEvent::Stop(reason) => self.stop_reason = Some(reason),
                 StreamEvent::Done => done = true,
             }
         }
-        if done {
+        done
+    }
+
+    fn finish_turn(
+        mut self,
+        parser: impl StreamParser,
+        sink_is_some: bool,
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            self.printer.feed_line(&tail);
+            let _ = io::stdout().flush();
+        }
+        self.printer.finish();
+        let _ = io::stdout().flush();
+        if !self.content.is_empty() {
+            with_console(sink_is_some, || println!());
+            let _ = io::stdout().flush();
+        }
+        let parsed = parser.finish();
+        Ok(Turn {
+            message: ChatMessage {
+                role: Role::Assistant,
+                content: (!self.content.is_empty()).then_some(self.content),
+                tool_calls: (!parsed.tool_calls.is_empty()).then_some(parsed.tool_calls),
+                tool_call_id: None,
+                name: None,
+                reasoning_items: parsed.reasoning_items,
+                reasoning_content: parsed.reasoning_content,
+            },
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        })
+    }
+}
+
+/// Shared async SSE driver over `response.chunk()`: buffer bytes,
+/// split on `\n`, feed the existing `StreamParser`s unchanged (pure
+/// functions over `&str`). Cancel via `select!(cancelled(),
+/// chunk = response.chunk())` — a stalled chunk no longer stalls cancel.
+/// Preserves `MidStreamError` semantics exactly.
+async fn run_sse<P: StreamParser>(
+    mut response: reqwest::Response,
+    sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    mut parser: P,
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+    let sink_is_some = sink.is_some();
+    // Fast-path: pre-cancelled token unwinds before reading anything,
+    // preserving cancel-before-first-delta fallback semantics.
+    if cancel.is_cancelled() {
+        with_console(sink_is_some, || println!());
+        let _ = io::stdout().flush();
+        return Err(stream_err("cancelled", false));
+    }
+    let mut driver = SseDriver::new(sink.clone());
+    let mut buf: Vec<u8> = Vec::new();
+    // Pin the cancel future once; `cancelled()` loops until set, so a
+    // single future covers the whole stream.
+    let cancel_fut = cancel_cancelled(cancel);
+    tokio::pin!(cancel_fut);
+    loop {
+        tokio::select! {
+            _ = &mut cancel_fut => {
+                with_console(sink_is_some, || println!());
+                let _ = io::stdout().flush();
+                return Err(stream_err("cancelled", driver.output_flowed));
+            }
+            chunk_res = response.chunk() => {
+                match chunk_res {
+                    Err(e) => {
+                        return Err(stream_err(&e.to_string(), driver.output_flowed));
+                    }
+                    Ok(None) => break,
+                    Ok(Some(bytes)) => {
+                        buf.extend_from_slice(&bytes);
+                        // Extract complete lines; keep partial tail buffered.
+                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                            let raw: Vec<u8> = buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&raw).into_owned();
+                            if driver.feed_raw(&line, &mut parser) {
+                                // Chat-completions [DONE]: stop reading.
+                                let sink_is_some = sink.is_some();
+                                return driver.finish_turn(parser, sink_is_some);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Cooperative preemption: a synchronous `take_cancelled` consumer
+        // (tests) still observes promptly between chunks.
+        if cancel.is_cancelled() {
+            with_console(sink_is_some, || println!());
+            let _ = io::stdout().flush();
+            return Err(stream_err("cancelled", driver.output_flowed));
+        }
+    }
+    // EOF: flush trailing partial line (responses API ends at EOF).
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf).into_owned();
+        // Feed as one final line even without trailing newline.
+        let done = driver.feed_raw(&line, &mut parser);
+        let _ = done;
+    }
+    let sink_is_some = sink.is_some();
+    driver.finish_turn(parser, sink_is_some)
+}
+
+/// Helper to get a `Send`-compatible future for `CancellationToken`.
+/// `cancelled()` borrows the token; the returned future holds only the
+/// atomic + Notify Arcs, so it is Send.
+async fn cancel_cancelled(cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync)) {
+    // Poll-based fallback that is Send: the concrete async token also
+    // offers `cancelled().await`, but via the sync trait we poll with
+    // async sleep for instant-ish (10ms) granularity without holding a
+    // non-Send future. Concrete `CancellationToken::cancelled()` users
+    // (LLM paths with the concrete type) get true Notify instant wake;
+    // this generic path covers trait objects.
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Test-only driver over in-memory lines (no HTTP): parser tests need no
+/// server, per plan Phase 1.
+#[cfg(test)]
+fn run_sse_lines<P: StreamParser>(
+    lines: &[&str],
+    sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    mut parser: P,
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+    let sink_is_some = sink.is_some();
+    if cancel.is_cancelled() {
+        return Err(stream_err("cancelled", false));
+    }
+    let mut driver = SseDriver::new(sink.clone());
+    for line in lines {
+        if cancel.is_cancelled() {
+            return Err(stream_err("cancelled", driver.output_flowed));
+        }
+        // Re-add newline: `feed` expects raw SSE lines.
+        let owned = format!("{line}\n");
+        if driver.feed_raw(&owned, &mut parser) {
             break;
         }
     }
-
-    // Flush any trailing partial line, then close out buffered code blocks.
-    if !pending.is_empty() {
-        printer.feed_line(&pending);
-        io::stdout().flush()?;
-    }
-    printer.finish();
-    io::stdout().flush()?;
-    if !content.is_empty() {
-        with_console(sink.is_some(), || println!());
-        io::stdout().flush()?;
-    }
-
-    let parsed = parser.finish();
-    Ok(Turn {
-        message: ChatMessage {
-            role: Role::Assistant,
-            content: (!content.is_empty()).then_some(content),
-            tool_calls: (!parsed.tool_calls.is_empty()).then_some(parsed.tool_calls),
-            tool_call_id: None,
-            name: None,
-            reasoning_items: parsed.reasoning_items,
-            reasoning_content: parsed.reasoning_content,
-        },
-        usage,
-        stop_reason,
-    })
+    driver.finish_turn(parser, sink_is_some)
 }
 
 /// Read a chat-completions SSE body into a turn.
-pub(crate) fn read_stream(
-    response: reqwest::blocking::Response,
+pub(crate) async fn read_stream(
+    response: reqwest::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<Turn, Box<dyn std::error::Error>> {
-    run_sse(response, sink, cancel, ChatCompletionsParser::default())
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+    run_sse(response, sink, cancel, ChatCompletionsParser::default()).await
 }
 
 /// Read a responses-API SSE body into a turn.
-pub(crate) fn read_responses_stream(
-    response: reqwest::blocking::Response,
+pub(crate) async fn read_responses_stream(
+    response: reqwest::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<Turn, Box<dyn std::error::Error>> {
-    run_sse(response, sink, cancel, ResponsesParser::default())
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+    run_sse(response, sink, cancel, ResponsesParser::default()).await
 }
 
 fn stop_reason_from_finish(finish: &str) -> Option<StopReason> {
@@ -559,14 +679,11 @@ impl StreamParser for ResponsesParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        delta_thought, read_responses_stream, read_stream, stream_err, SinkLine, StreamDelta,
-        StreamPrinter, Usage,
-    };
+    use super::{delta_thought, stream_err, SinkLine, StreamDelta, StreamPrinter, Usage};
     use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
     use crate::llm::streaming::is_mid_stream;
-    use std::sync::mpsc;
+    use tokio::sync::mpsc;
 
     /// The compaction summarizer (and any in-process caller) must be able to
     /// pass a sink and have ALL streamed output routed into the channel —
@@ -576,7 +693,7 @@ mod tests {
     /// beside a TUI must always pass a sink.
     #[test]
     fn stream_printer_with_sink_routes_lines_to_channel_not_stdout() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(32);
         let mut printer = StreamPrinter::new(Some(tx));
         printer.feed_line("Key facts: internal summary line");
         printer.feed_line("```rust");
@@ -584,7 +701,13 @@ mod tests {
         printer.feed_line("```");
         printer.finish();
 
-        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        let lines: Vec<SinkLine> = {
+            let mut out = Vec::new();
+            while let Ok(v) = rx.try_recv() {
+                out.push(v);
+            }
+            out
+        };
         assert!(lines
             .iter()
             .any(|l| matches!(l, SinkLine::Assistant(s) if s.contains("Key facts"))));
@@ -629,27 +752,34 @@ mod tests {
     // http::Response with a raw SSE body, so both wire parsers are exercised
     // end to end without a server. ----
 
-    fn sse_response(lines: &[&str]) -> reqwest::blocking::Response {
-        let body = lines.join("\n\n") + "\n\n";
-        http::Response::builder()
-            .status(200)
-            .body(body)
-            .unwrap()
-            .into()
+    fn read_chat_lines(
+        lines: &[&str],
+        sink: Option<tokio::sync::mpsc::Sender<SinkLine>>,
+        cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
+        super::run_sse_lines(lines, sink, cancel, super::ChatCompletionsParser::default())
+    }
+
+    fn read_responses_lines(
+        lines: &[&str],
+        sink: Option<tokio::sync::mpsc::Sender<SinkLine>>,
+        cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
+        super::run_sse_lines(lines, sink, cancel, super::ResponsesParser::default())
     }
 
     /// A reasoning output item with encrypted_content is captured onto the
     /// message for stateless replay; summary-only items are not.
     #[test]
     fn responses_stream_captures_replayable_reasoning_items() {
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1","summary":[],"encrypted_content":"blob1"}}"#,
             r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"r2","summary":[{"type":"summary_text","text":"visible"}]}}"#,
             r#"data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read","arguments":"{}"}}"#,
             "data: [DONE]",
-        ]);
-        let msg = read_responses_stream(resp, Some(tx), &CancellationToken::new())
+        ];
+        let msg = read_responses_lines(lines, Some(tx), &CancellationToken::new())
             .unwrap()
             .message;
         let items = msg.reasoning_items.expect("replayable items captured");
@@ -662,13 +792,13 @@ mod tests {
     /// an empty blob would corrupt the thread if sent back.
     #[test]
     fn responses_stream_skips_null_and_empty_encrypted_content() {
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1","summary":[],"encrypted_content":""}}"#,
             r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"r2","summary":[],"encrypted_content":null}}"#,
             "data: [DONE]",
-        ]);
-        let msg = read_responses_stream(resp, Some(tx), &CancellationToken::new())
+        ];
+        let msg = read_responses_lines(lines, Some(tx), &CancellationToken::new())
             .unwrap()
             .message;
         assert!(
@@ -683,15 +813,15 @@ mod tests {
     /// UI-only and must not leak into the replay field.
     #[test]
     fn chat_stream_captures_reasoning_content_for_replay() {
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"choices":[{"delta":{"reasoning_content":"step 1"}}]}"#,
             r#"data: {"choices":[{"delta":{"reasoning":"openrouter-style"}}]}"#,
             r#"data: {"choices":[{"delta":{"reasoning_content":" step 2"}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"done"}}]}"#,
             "data: [DONE]",
-        ]);
-        let msg = read_stream(resp, Some(tx), &CancellationToken::new())
+        ];
+        let msg = read_chat_lines(lines, Some(tx), &CancellationToken::new())
             .unwrap()
             .message;
         assert_eq!(msg.reasoning_content.as_deref(), Some("step 1 step 2"));
@@ -703,8 +833,8 @@ mod tests {
     /// call; the usage chunk (with cache detail) surfaces as `Some(Usage)`.
     #[test]
     fn chat_stream_assembles_content_tools_and_usage() {
-        let (tx, rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, mut rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"hello "}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"world\n"}}]}"#,
@@ -713,8 +843,8 @@ mod tests {
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]}}]}"#,
             r#"data: {"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":7}}}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_chat_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         let usage = turn.usage;
         let msg = turn.message;
         assert_eq!(msg.content.as_deref(), Some("hello world\nsecond line"));
@@ -731,7 +861,13 @@ mod tests {
                 cached_tokens: Some(7)
             })
         );
-        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        let lines: Vec<SinkLine> = {
+            let mut out = Vec::new();
+            while let Ok(v) = rx.try_recv() {
+                out.push(v);
+            }
+            out
+        };
         assert!(matches!(&lines[0], SinkLine::Assistant(s) if s == "hello world"));
         assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "second line"));
     }
@@ -740,27 +876,33 @@ mod tests {
     /// prose before/after streams line by line.
     #[test]
     fn chat_stream_buffers_code_fences() {
-        let (tx, rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, mut rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"choices":[{"delta":{"content":"```rust\n"}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"fn main() {}\n"}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"```\n"}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"trailing prose"}}]}"#,
             "data: [DONE]",
-        ]);
-        let msg = read_stream(resp, Some(tx), &CancellationToken::new())
+        ];
+        let msg = read_chat_lines(lines, Some(tx), &CancellationToken::new())
             .unwrap()
             .message;
         assert_eq!(
             msg.content.as_deref(),
             Some("```rust\nfn main() {}\n```\ntrailing prose")
         );
-        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        let lines: Vec<SinkLine> = {
+            let mut out = Vec::new();
+            while let Ok(v) = rx.try_recv() {
+                out.push(v);
+            }
+            out
+        };
         // The fence body keeps its streamed trailing newline and the close
         // adds one more — current sink contract; consumers re-parse the block.
         assert!(
             matches!(&lines[0], SinkLine::Assistant(s)
-            if s == "```rust:\nfn main() {}\n\n```"),
+              if s == "```rust:\nfn main() {}\n\n```"),
             "{lines:?}"
         );
         assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "trailing prose"));
@@ -777,23 +919,23 @@ mod tests {
             ("function_call", StopReason::ToolUse),
             ("content_filter", StopReason::ContentFilter),
         ] {
-            let (tx, _rx) = mpsc::channel();
-            let resp = sse_response(&[
+            let (tx, _rx) = mpsc::channel(32);
+            let lines: &[&str] = &[
                 r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
                 &format!(r#"data: {{"choices":[{{"delta":{{}},"finish_reason":"{finish}"}}]}}"#),
                 "data: [DONE]",
-            ]);
-            let turn = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+            ];
+            let turn = read_chat_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
             assert_eq!(turn.stop_reason, Some(expected), "finish_reason={finish}");
             assert_eq!(turn.message.content.as_deref(), Some("hi"));
         }
         // Unrecognized reasons stay unset instead of being guessed.
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"choices":[{"delta":{},"finish_reason":"junk"}]}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_chat_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.stop_reason, None);
     }
 
@@ -802,9 +944,9 @@ mod tests {
     fn chat_stream_returns_cancelled_error_when_token_set() {
         let token = CancellationToken::new();
         token.cancel();
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[r#"data: {"choices":[{"delta":{"content":"x"}}]}"#]);
-        let err = read_stream(resp, Some(tx), &token).unwrap_err();
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[r#"data: {"choices":[{"delta":{"content":"x"}}]}"#];
+        let err = read_chat_lines(lines, Some(tx), &token).unwrap_err();
         assert_eq!(err.to_string(), "cancelled");
     }
 
@@ -813,8 +955,8 @@ mod tests {
     /// completed calls without an id must be dropped, not executed.
     #[test]
     fn responses_stream_reassembles_tool_calls_with_early_deltas() {
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.output_text.delta","delta":"hello\n"}"#,
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"read","arguments":""}}"#,
             r#"data: {"type":"response.function_call_arguments.delta","item_id":"item_2","delta":"EARLY"}"#,
@@ -823,8 +965,8 @@ mod tests {
             r#"data: {"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","name":"ghost"}}"#,
             r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":9,"input_tokens_details":{"cached_tokens":5}}}}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_responses_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         let usage = turn.usage;
         let msg = turn.message;
         assert_eq!(msg.content.as_deref(), Some("hello\n"));
@@ -853,19 +995,25 @@ mod tests {
     /// with no output yields an empty assistant message.
     #[test]
     fn responses_stream_tolerates_garbage_and_extracts_reasoning() {
-        let (tx, rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, mut rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             "data: not json at all",
             "data: ",
             r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
             r#"data: {"type":"response.reasoning_text.delta","delta":" more"}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_responses_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.message.content, None);
         assert!(turn.message.tool_calls.is_none());
         assert_eq!(turn.usage, None);
-        let lines: Vec<SinkLine> = rx.try_iter().collect();
+        let lines: Vec<SinkLine> = {
+            let mut out = Vec::new();
+            while let Ok(v) = rx.try_recv() {
+                out.push(v);
+            }
+            out
+        };
         assert!(matches!(&lines[0], SinkLine::Thinking(s) if s == "thinking"));
         assert!(matches!(&lines[1], SinkLine::Thinking(s) if s == " more"));
     }
@@ -875,13 +1023,13 @@ mod tests {
     /// ContentFilter); an unrecognized reason stays unset.
     #[test]
     fn responses_stream_maps_terminal_events_to_stop_reasons() {
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.output_text.delta","delta":"partial"}"#,
             r#"data: {"type":"response.incomplete","response":{"usage":{"input_tokens":10,"output_tokens":99},"incomplete_details":{"reason":"max_output_tokens"}}}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_responses_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.stop_reason, Some(StopReason::Length));
         assert_eq!(
             turn.usage,
@@ -892,30 +1040,30 @@ mod tests {
             })
         );
 
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":4}}}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_responses_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.stop_reason, Some(StopReason::Stop));
 
         // Incomplete for a content filter is a partial reply too.
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_responses_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.stop_reason, Some(StopReason::ContentFilter));
 
         // An unrecognized incomplete reason must not claim a clean stop.
-        let (tx, _rx) = mpsc::channel();
-        let resp = sse_response(&[
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
             r#"data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"junk"}}}"#,
             "data: [DONE]",
-        ]);
-        let turn = read_responses_stream(resp, Some(tx), &CancellationToken::new()).unwrap();
+        ];
+        let turn = read_responses_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
         assert_eq!(turn.stop_reason, None);
     }
 

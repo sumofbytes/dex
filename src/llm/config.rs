@@ -909,8 +909,8 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
 /// Fetches https://models.dev/api.json (no auth) and caches to
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
 /// and autocomplete without network. Falls back to opencode /models if needed.
-pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::builder()
+pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
@@ -919,14 +919,19 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         "https://models.dev/api.json",
         "https://models.dev/catalog.json",
     ] {
-        if let Ok(resp) = client.get(url).send().and_then(|r| r.error_for_status()) {
-            if let Ok(text) = resp.text() {
+        if let Ok(resp) = client
+            .get(url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            if let Ok(text) = resp.text().await {
                 if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
                     if let Some(path) = dex_catalog_cache_path() {
                         if let Some(parent) = path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                            let _ = tokio::fs::create_dir_all(parent).await;
                         }
-                        std::fs::write(&path, &text)?;
+                        tokio::fs::write(&path, &text).await?;
                         println!("cached models.dev {} to {}", url, path.display());
                         fetched = true;
                         break;
@@ -944,6 +949,12 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     Err("could not fetch models.dev catalog — check network".into())
+}
+
+/// Sync wrapper for CLI paths that stay sync (`dex update --models`):
+/// blocks on the shared runtime handle.
+pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
+    crate::client::http::block_on(refresh_models_cache_async())
 }
 
 /// Auto-detect a verification command (P9) when none is configured: a
@@ -1201,7 +1212,7 @@ pub(crate) struct LlmConfig {
     /// `--header` / per-request overrides. Never carries `authorization`
     /// (the api key owns that) — it is dropped at send time.
     pub(crate) extra_headers: BTreeMap<String, String>,
-    pub(crate) client: reqwest::blocking::Client,
+    pub(crate) client: reqwest::Client,
 }
 
 /// Base wire protocol + baked pin from the provider entry's `api:` pin and
@@ -1344,15 +1355,13 @@ impl LlmConfig {
             .unwrap_or(300);
         // The default-timeouts path (every daemon turn + TUI launch) reuses
         // the process-wide client instead of re-initializing TLS + pool.
-        // Custom timeouts still build a dedicated client.
+        // Custom timeouts still build a dedicated client. The async client
+        // is Clone (atomic bump); TLS init happens once.
         let client = if connect_secs == 10 && request_secs == 300 {
-            crate::client::http::shared_blocking_client()
+            crate::client::http::shared_async_client()
         } else {
-            reqwest::blocking::Client::builder()
+            reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(connect_secs))
-                // Note: for the blocking client this deadline applies to the
-                // connect and to each individual body read (not to the whole
-                // streamed response), so long-lived SSE streams are safe.
                 .timeout(Duration::from_secs(request_secs))
                 .build()?
         };
@@ -1401,6 +1410,29 @@ impl LlmConfig {
             this.refresh_thinking_effort();
         }
         Ok(this)
+    }
+
+    /// Async entry for the daemon turn: same precedence/errors as `from_env`,
+    /// but off the runtime worker. Cache hits are a mutex bump (inline);
+    /// on miss the 4MB catalog parse runs in `spawn_blocking`.
+    pub(crate) async fn from_env_async(
+        base_url_override: Option<String>,
+        model_override: Option<String>,
+        permission_override: Option<PermissionMode>,
+        header_overrides: Vec<String>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        tokio::task::spawn_blocking(move || {
+            Self::from_env(
+                base_url_override,
+                model_override,
+                permission_override,
+                &header_overrides,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }
 
     /// Wire protocol for a fresh model selection: an explicit per-model
@@ -1815,7 +1847,7 @@ pub(crate) mod tests {
             permission: PermissionMode::AskWrites,
             verify_command: None,
             extra_headers: Default::default(),
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
             provider_entries: Default::default(),
             provider_headers: Default::default(),
         }

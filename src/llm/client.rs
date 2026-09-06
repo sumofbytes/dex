@@ -3,9 +3,9 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
+
+use tokio::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
 use crate::core::console::with_console;
@@ -14,32 +14,37 @@ use crate::llm::config::{insert_extra_header, LlmConfig};
 use crate::llm::protocol::{responses_input, responses_tools, tools_schema};
 use crate::llm::stream::{read_responses_stream, read_stream, Turn};
 
-pub(crate) trait ModelClient {
-    fn complete(
+pub(crate) trait ModelClient: Clone + Send + Sync {
+    async fn complete(
         &self,
         messages: &[ChatMessage],
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
-        cancel: &dyn CancellationSource,
-    ) -> Result<Turn, Box<dyn std::error::Error>>;
+        cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 impl ModelClient for LlmConfig {
-    fn complete(
+    async fn complete(
         &self,
         messages: &[ChatMessage],
         with_tools: bool,
         sink: Option<mpsc::Sender<SinkLine>>,
-        cancel: &dyn CancellationSource,
-    ) -> Result<Turn, Box<dyn std::error::Error>> {
+        cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         crate::llm::streaming::complete(self, messages, with_tools, sink, cancel)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                Box::<dyn std::error::Error + Send + Sync>::from(msg)
+            })
     }
 }
 
 pub(crate) fn authenticated_request(
-    request: reqwest::blocking::RequestBuilder,
+    request: reqwest::RequestBuilder,
     config: &LlmConfig,
-) -> reqwest::blocking::RequestBuilder {
+) -> reqwest::RequestBuilder {
     let request =
         config
             .provider
@@ -95,12 +100,12 @@ pub(crate) fn provider_log(event: &str, detail: &str) {
 /// Send a provider request with shared retry/backoff, 401 credential refresh
 /// (OpenAI Codex), and provider logging. The protocol-specific request body
 /// and post-success reader are supplied by the caller.
-fn post_with_retry(
+async fn post_with_retry(
     config: &LlmConfig,
     url: &str,
     body: &impl serde::Serialize,
     sink: Option<&mpsc::Sender<SinkLine>>,
-) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     const MAX_RETRIES: u32 = 3;
     let mut active_config = config.clone();
     for attempt in 0..=MAX_RETRIES {
@@ -108,6 +113,7 @@ fn post_with_retry(
         let resp = match authenticated_request(request, &active_config)
             .json(body)
             .send()
+            .await
         {
             Ok(resp) => resp,
             Err(e) if attempt < MAX_RETRIES => {
@@ -115,18 +121,18 @@ fn post_with_retry(
                 with_console(sink.is_some(), || {
                     eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay)
                 });
-                thread::sleep(delay);
+                tokio::time::sleep(delay).await;
                 continue;
             }
             Err(e) => {
                 provider_log("request_failed", &e.to_string());
-                return Err(e.into());
+                return Err(Box::new(e));
             }
         };
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body_text = resp.text()?;
+            let body_text = resp.text().await.map_err(Box::new)?;
             if status == reqwest::StatusCode::UNAUTHORIZED
                 && active_config.provider.credentials_refreshable()
                 && attempt < MAX_RETRIES
@@ -146,7 +152,7 @@ fn post_with_retry(
                 with_console(sink.is_some(), || {
                     eprintln!("[llm] API error {}: retrying in {:?}", status, delay)
                 });
-                thread::sleep(delay);
+                tokio::time::sleep(delay).await;
                 continue;
             }
             provider_log("api_error", &format!("{}: {}", status, body_text));
@@ -175,13 +181,13 @@ fn post_with_retry(
     unreachable!()
 }
 
-pub(crate) fn call_chat_completions(
+pub(crate) async fn call_chat_completions(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &dyn CancellationSource,
-) -> Result<Turn, Box<dyn std::error::Error>> {
+    cancel: &(dyn CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let req = ChatRequest {
         model: &config.model,
         messages,
@@ -201,17 +207,18 @@ pub(crate) fn call_chat_completions(
         &format!("{}/chat/completions", config.base_url),
         &req,
         sink.as_ref(),
-    )?;
-    read_stream(resp, sink, cancel)
+    )
+    .await?;
+    read_stream(resp, sink, cancel).await
 }
 
-pub(crate) fn call_responses(
+pub(crate) async fn call_responses(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
     sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &dyn CancellationSource,
-) -> Result<Turn, Box<dyn std::error::Error>> {
+    cancel: &(dyn CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let (instructions, input) = responses_input(messages);
     let mut body = json!({
         "model": config.model,
@@ -237,12 +244,13 @@ pub(crate) fn call_responses(
         &format!("{}/responses", config.base_url),
         &body,
         sink.as_ref(),
-    )?;
+    )
+    .await?;
     // Mid-stream failures (output already flowed) are marked by the stream
     // driver itself, so the protocol-fallback gate won't re-run a turn whose
     // partial text is already on the transcript — while a drop before the
     // first delta stays retryable.
-    read_responses_stream(resp, sink, cancel)
+    read_responses_stream(resp, sink, cancel).await
 }
 
 #[cfg(test)]
@@ -250,16 +258,17 @@ mod tests {
     use super::*;
     use crate::core::types::Usage;
 
+    #[derive(Clone)]
     struct MockModel;
 
     impl ModelClient for MockModel {
-        fn complete(
+        async fn complete(
             &self,
             _messages: &[ChatMessage],
             _with_tools: bool,
             _sink: Option<mpsc::Sender<SinkLine>>,
-            _cancel: &dyn CancellationSource,
-        ) -> Result<Turn, Box<dyn std::error::Error>> {
+            _cancel: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Turn {
                 message: ChatMessage::assistant("mock response"),
                 usage: Some(Usage {
@@ -338,10 +347,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_boundary_supports_deterministic_mock() {
+    #[tokio::test]
+    async fn model_boundary_supports_deterministic_mock() {
         let turn = MockModel
             .complete(&[], false, None, &crate::agent::state::GlobalCancellation)
+            .await
             .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("mock response"));
         assert_eq!(

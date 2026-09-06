@@ -65,16 +65,17 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     !err.contains("cancelled")
 }
 
-pub(crate) fn complete(
+pub(crate) async fn complete(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
-    sink: Option<::std::sync::mpsc::Sender<crate::core::types::SinkLine>>,
-    cancel: &dyn crate::agent::state::CancellationSource,
-) -> Result<Turn, Box<dyn std::error::Error>> {
+    sink: Option<tokio::sync::mpsc::Sender<crate::core::types::SinkLine>>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     match effective_api(config) {
         ApiProtocol::ChatCompletions => {
             crate::llm::client::call_chat_completions(config, messages, with_tools, sink, cancel)
+                .await
         }
         ApiProtocol::Responses => {
             match crate::llm::client::call_responses(
@@ -83,7 +84,9 @@ pub(crate) fn complete(
                 with_tools,
                 sink.clone(),
                 cancel,
-            ) {
+            )
+            .await
+            {
                 Ok(ok) => Ok(ok),
                 Err(e) if !is_mid_stream(&*e) && try_responses_fallback(config, &e.to_string()) => {
                     // Empirical protocol inference: responses API rejected the
@@ -99,7 +102,9 @@ pub(crate) fn complete(
                         with_tools,
                         sink.clone(),
                         cancel,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(ok) => {
                             probed_apis()
                                 .lock()
@@ -115,11 +120,12 @@ pub(crate) fn complete(
                                 ApiProtocol::ChatCompletions,
                             );
                             if let Some(sink) = &sink {
-                                sink.send(SinkLine::System(format!(
-                                    "auto: {} speaks openai-completions (responses API failed); remembered for future runs",
-                                    config.model
-                                )))
-                                .ok();
+                                let _ = sink
+                                    .send(SinkLine::System(format!(
+                                        "auto: {} speaks openai-completions (responses API failed); remembered for future runs",
+                                        config.model
+                                    )))
+                                    .await;
                             }
                             Ok(ok)
                         }
@@ -221,12 +227,13 @@ mod tests {
 
     #[test]
     fn mid_stream_marker_blocks_fallback_and_keeps_message() {
-        let err: Box<dyn std::error::Error> = Box::new(MidStreamError("cancelled".into()));
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(MidStreamError("cancelled".into()));
         assert!(is_mid_stream(&*err));
         // Display passes the message through untouched so callers matching on
         // `"cancelled"` (exact or substring) keep working.
         assert_eq!(err.to_string(), "cancelled");
-        let plain: Box<dyn std::error::Error> = "API error: boom".into();
+        let plain: Box<dyn std::error::Error + Send + Sync> = "API error: boom".into();
         assert!(!is_mid_stream(&*plain));
     }
 }
