@@ -399,7 +399,7 @@ cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `wri
 | `CODEX_ACCOUNT_ID`   | Account ID paired with `CODEX_ACCESS_TOKEN`.               |
 | `DEX_MODELS` | Comma-separated models for `/model` autocomplete (default: catalog cache). |
 | `DEX_HTTP_CONNECT_TIMEOUT_SECS` | HTTP connect timeout (default 10). |
-| `DEX_HTTP_REQUEST_TIMEOUT_SECS` | HTTP per-read timeout (default 300; streaming-safe). |
+| `DEX_HTTP_REQUEST_TIMEOUT_SECS` | Total request bound, applied only when explicitly set — streaming LLM/chat paths default to no total timeout so long turns aren't killed. |
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
