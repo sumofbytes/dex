@@ -2,14 +2,14 @@
 //! (`ui::render`) and file extensions (`lang_from_path`) canonicalize
 //! through one table, so both paths always agree. Keys are the primary
 //! `ratatui-markdown::get_lang` names (which also accepts most of these
-//! aliases natively) plus fallback-only keys (`sql`, `dockerfile`, `html`,
-//! `css`) served by the generic lexer in `core::highlight`; unknown tokens
-//! return `""` and callers keep the dim fallback instead of guessing.
+//! aliases natively) plus fallback-only keys (`sql`, `dockerfile`) served by
+//! the generic lexer in `core::highlight`; unknown tokens return `""` and
+//! callers keep the dim fallback instead of guessing.
 
 /// Canonical highlight key for a lowercase fence tag or extension.
-/// Tree-sitter grammars cover most keys; `sql`/`dockerfile`/`html`/`css`
-/// are fallback-only (no compiled grammar) and highlight via the generic
-/// lexer. Unknown tokens return `""`.
+/// Tree-sitter grammars cover every key except `sql` (dependency conflict —
+/// see Cargo.toml) and `dockerfile` (no upstream grammar), which highlight
+/// via the generic lexer. Unknown tokens return `""`.
 pub(crate) fn canonical_lang(token: &str) -> &'static str {
     match token {
         "rust" | "rs" => "rust",
@@ -36,21 +36,32 @@ pub(crate) fn canonical_lang(token: &str) -> &'static str {
         "swift" => "swift",
         "sql" => "sql",
         "dockerfile" | "docker" | "containerfile" => "dockerfile",
-        "html" | "htm" | "xml" => "html",
+        "html" | "htm" => "html",
+        "xml" | "svg" | "xsd" => "xml",
         "css" => "css",
         _ => "",
     }
 }
 
 /// Highlight language for a file path, covering compiled grammars plus
-/// fallback-only keys and common aliases. Unknown extensions return `""`
-/// and callers keep the dim fallback (never guess). Extensionless
-/// `Dockerfile`/`Containerfile` work because the whole file name is the
-/// token.
+/// the fallback-only `dockerfile` key and common aliases. Unknown extensions
+/// return `""` and callers keep the dim fallback (never guess). The basename
+/// is used so dotted directories (`my.dir/file`) never leak into the
+/// extension; extensionless `Dockerfile`/`Containerfile` work because the
+/// whole file name is the token.
 pub(crate) fn lang_from_path(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let ext = ext.split(':').next().unwrap_or(&ext);
-    canonical_lang(ext)
+    let base = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .split(':')
+        .next()
+        .unwrap_or(path);
+    if base.eq_ignore_ascii_case("dockerfile") || base.eq_ignore_ascii_case("containerfile") {
+        return "dockerfile";
+    }
+    let ext = base.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    canonical_lang(&ext)
 }
 
 /// Fence info string -> highlight key (`ratatui-markdown::get_lang` only
@@ -99,11 +110,18 @@ mod tests {
         assert_eq!(lang_from_path("a.rb"), "ruby");
         assert_eq!(lang_from_path("a.scala"), "scala");
         assert_eq!(lang_from_path("a.swift"), "swift");
-        // Fallback-only keys served by the generic lexer (no compiled grammar).
+        // Compiled grammars (tree-sitter), including sql/html/css/xml.
         assert_eq!(lang_from_path("q.sql"), "sql");
         assert_eq!(lang_from_path("Dockerfile"), "dockerfile");
+        assert_eq!(lang_from_path("Containerfile"), "dockerfile");
         assert_eq!(lang_from_path("a.sql:12-20"), "sql");
         assert_eq!(lang_from_path("index.html"), "html");
+        assert_eq!(lang_from_path("a.xml"), "xml");
+        assert_eq!(lang_from_path("a.css"), "css");
+        // Dotted directories never leak into the extension.
+        assert_eq!(lang_from_path("my.dir/file"), "");
+        assert_eq!(lang_from_path("my.dir/a.rs"), "rust");
+        assert_eq!(lang_from_path("my.dir/Dockerfile"), "dockerfile");
     }
 
     #[test]
@@ -133,6 +151,8 @@ mod tests {
         }
         assert_eq!(canonical_lang("dockerfile"), "dockerfile");
         assert_eq!(canonical_lang("sql"), "sql");
+        assert_eq!(canonical_lang("xml"), "xml");
+        assert_eq!(canonical_lang("html"), "html");
         assert_eq!(canonical_lang("text"), "");
     }
 

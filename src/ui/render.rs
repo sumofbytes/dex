@@ -255,7 +255,10 @@ fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
 }
 
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
-    let highlighter = highlight::shared_highlighter();
+    // Combined tree-sitter + generic-lexer highlighter, so fenced blocks
+    // highlight exactly like read previews and headless output (dockerfile /
+    // kotlin / groovy fall back instead of going dim in the TUI only).
+    let highlighter = highlight::shared_markdown_highlighter();
     let blocks = split_markdown(s);
     let renderer = MarkdownRenderer::new(0).with_render_hooks(Box::new(
         HighlightHooks::new(highlighter, usize::MAX).with_border_color(theme::muted_fg()),
@@ -281,7 +284,7 @@ fn markdown_theme() -> ThemeConfig {
 /// Highlight a multi-line snippet in ONE tree-sitter pass and split the
 /// result back into per-line spans, so multi-line constructs (block
 /// comments, triple-quoted strings) keep their style across rows. Tree-sitter
-/// misses (sql, dockerfile, unknown) fall back to the generic lexer; `None`
+/// misses (sql, dockerfile, kotlin/groovy) fall back to the generic lexer; `None`
 /// means nothing colorable — callers keep the dim fallback.
 /// ponytail: byte-safe slicing throughout; a bad split falls back to dim
 /// rather than panicking mid-frame.
@@ -2949,14 +2952,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_sql_fences_highlight_via_fallback() {
-        // Tree-sitter misses these; the generic lexer colors them instead of dim.
+    fn dockerfile_fence_highlights_via_fallback_while_unknown_stays_dim() {
+        // sql/dockerfile have no tree-sitter grammar: the generic lexer
+        // colors them instead of dim. html now has a real grammar.
+        // Truly unknown tags stay dim instead of guessing.
         for (lang, code) in [
             ("sql", "SELECT a FROM t WHERE x = 1\n"),
             ("dockerfile", "FROM rust:1\nRUN cargo build\n"),
-            ("definitely-not-a-lang", "def x = 42\n"),
+            ("html", "<div>hi</div>\n"),
         ] {
-            let rows = highlight_code_block(lang, code).expect("{lang} must fallback");
+            let rows = highlight_code_block(lang, code).expect("{lang} must highlight");
             let text: String = rows
                 .iter()
                 .map(|r| {
@@ -2974,6 +2979,29 @@ mod tests {
                 "{lang} emitted no styles"
             );
         }
+        assert!(highlight_code_block("definitely-not-a-lang", "def x = 42\n").is_none());
         assert!(highlight_code_block("text", "SELECT 1\n").is_none());
+    }
+
+    #[test]
+    fn markdown_fences_use_tree_sitter_and_fallback() {
+        // TUI fences must agree with previews/headless: tree-sitter for html,
+        // the generic lexer for sql/dockerfile, dim for truly unknown.
+        let lines = markdown_lines("```html\n<div>hi</div>\n```");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.fg.is_some()),
+            "html fence should highlight: {lines:?}"
+        );
+        let lines = markdown_lines("```sql\nSELECT a FROM t\n```");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.style.fg.is_some()),
+            "dockerfile fence should fallback-highlight: {lines:?}"
+        );
     }
 }

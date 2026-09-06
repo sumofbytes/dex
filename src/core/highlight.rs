@@ -5,6 +5,7 @@ use ratatui::text::Span;
 use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter};
 use ratatui_markdown::CodeColors;
 
+use super::lang::canonical_lang;
 use super::palette::{fg_rgb, muted_rgb};
 use crate::core::console::RESET;
 
@@ -13,8 +14,8 @@ const DIM: &str = "\x1b[2m";
 /// Render an assistant message to the terminal as markdown, with fenced
 /// code blocks highlighted by the same tree-sitter engine the TUI uses —
 /// no external `bat` process, so headless and TUI output always agree.
-/// Tree-sitter misses (sql, dockerfile, unknown) fall back to the generic
-/// lexer below instead of dim.
+/// Tree-sitter misses (sql, dockerfile, kotlin/groovy) fall back to the
+/// generic lexer below instead of dim.
 pub(crate) fn print_code_block(lang: &str, body: &str) {
     let tag = super::lang::normalize_code_lang(lang);
     if let Some(colored) =
@@ -47,13 +48,62 @@ pub(crate) fn code_colors() -> CodeColors {
 }
 
 /// The single tree-sitter parser for the process, shared by the TUI spans
-/// adapter (`ui::render::highlight_code_block`) and the headless ANSI
-/// adapter below — one palette, one grammar set, no drift.
+/// adapter (`ui::render::highlight_code_block`), the markdown fence renderer
+/// below, and the headless ANSI adapter — one palette, one grammar set, no
+/// drift.
 pub(crate) fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
     static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
     HIGHLIGHTER
         .get_or_init(|| Arc::new(TreeSitterHighlighter::new().with_code_colors(code_colors())))
         .clone()
+}
+
+/// Tree-sitter + generic-lexer fallback as one [`CodeHighlighter`], so TUI
+/// fenced code blocks (`ui::render::markdown_lines`) highlight exactly like
+/// [`highlight_code_block`] and headless [`print_code_block`]: tree-sitter
+/// first, the generic lexer on a miss, dim when neither colors anything.
+/// Without this, fences for sql/dockerfile/kotlin/groovy rendered dim in
+/// the TUI while previews and headless output colored them.
+pub(crate) fn shared_markdown_highlighter() -> Arc<CombinedHighlighter> {
+    static COMBINED: OnceLock<Arc<CombinedHighlighter>> = OnceLock::new();
+    COMBINED
+        .get_or_init(|| {
+            Arc::new(CombinedHighlighter {
+                tree: shared_highlighter(),
+            })
+        })
+        .clone()
+}
+
+pub(crate) struct CombinedHighlighter {
+    tree: Arc<TreeSitterHighlighter>,
+}
+
+impl CodeHighlighter for CombinedHighlighter {
+    fn highlight(&self, lang: &str, code: &str) -> Vec<ratatui_markdown::highlight::StyleSegment> {
+        let segs = self.tree.highlight(lang, code);
+        if !segs.is_empty() {
+            return segs;
+        }
+        fallback_style_segments(lang, code)
+    }
+}
+
+/// Fallback segments as tree-sitter [`StyleSegment`]s for the combined
+/// highlighter above. Empty when the language is unknown or nothing is
+/// colorable, so callers keep the dim fallback.
+fn fallback_style_segments(
+    lang: &str,
+    code: &str,
+) -> Vec<ratatui_markdown::highlight::StyleSegment> {
+    fallback_segments(lang, code)
+        .into_iter()
+        .map(|s| ratatui_markdown::highlight::StyleSegment {
+            start: s.start,
+            end: s.end,
+            style: s.style,
+        })
+        .collect()
 }
 
 /// Highlight a snippet to an ANSI-escaped string in ONE tree-sitter pass.
@@ -72,7 +122,8 @@ pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
     let mut pos = 0;
     for seg in &segs {
         // Byte-safe: a bad range falls back to plain rather than panicking.
-        let start = seg.start.min(code.len());
+        // Clip to `pos` so overlapping segments never duplicate bytes.
+        let start = seg.start.min(code.len()).max(pos);
         let end = seg.end.min(code.len());
         if start > pos {
             out.push_str(code.get(pos..start).unwrap_or(""));
@@ -91,14 +142,16 @@ pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
 }
 
 /// Generic fallback lexer for tree-sitter misses (`sql`, `dockerfile`,
-/// unknown): single-pass, dependency-free, byte-safe. Emits keyword /
-/// string / number / comment runs using the same palette as tree-sitter so
-/// headless and TUI output agree. `text`/`plain` stay `None` (dim).
+/// kotlin — whose upstream query panics — groovy, and any compiled language
+/// whose grammar yields nothing): single-pass, dependency-free, byte-safe. Emits
+/// keyword / string / number / comment runs using the same palette as
+/// tree-sitter so headless and TUI output agree. `text`/`plain` and truly
+/// unknown languages stay `None` (dim) instead of guessing.
 pub(crate) fn fallback_highlight_ansi(lang: &str, code: &str) -> Option<String> {
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    if matches!(lang, "text" | "plain" | "txt") {
+    if !fallback_enabled(lang) {
         return None;
     }
     let segs = fallback_segments(lang, code);
@@ -108,8 +161,11 @@ pub(crate) fn fallback_highlight_ansi(lang: &str, code: &str) -> Option<String> 
     let mut out = String::with_capacity(code.len() + code.len() / 4);
     let mut pos = 0;
     for seg in &segs {
-        if seg.start > pos {
-            out.push_str(code.get(pos..seg.start).unwrap_or(""));
+        // Segments are non-overlapping by construction; still clip so a
+        // future lexer change can never duplicate bytes.
+        let start = seg.start.max(pos);
+        if start > pos {
+            out.push_str(code.get(pos..start).unwrap_or(""));
         }
         if let Some(slice) = code.get(seg.start..seg.end) {
             push_styled(&mut out, &seg.style, slice);
@@ -129,7 +185,7 @@ pub(crate) fn fallback_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    if matches!(lang, "text" | "plain" | "txt") {
+    if !fallback_enabled(lang) {
         return None;
     }
     let segs = fallback_segments(lang, code);
@@ -181,7 +237,37 @@ struct FallbackSeg {
     style: Style,
 }
 
+/// Whether the generic lexer may color `lang`. Every canonical key (compiled
+/// or `dockerfile`) plus `groovy` (no upstream grammar, but common enough to
+/// deserve keywords) is allowed; `text`/`plain` and truly unknown fence tags
+/// stay dim instead of guessing.
+fn fallback_enabled(lang: &str) -> bool {
+    if lang.is_empty() || matches!(lang, "text" | "plain" | "txt") {
+        return false;
+    }
+    if !canonical_lang(lang).is_empty() {
+        return true;
+    }
+    matches!(lang, "groovy")
+}
+
+/// Canonical key for fallback comment/keyword lookup. Callers already pass
+/// canonical keys; raw aliases (`py`, `js`, …) map through the same table so
+/// they still highlight instead of going dim.
+fn fallback_key(lang: &str) -> &str {
+    let canon = canonical_lang(lang);
+    if canon.is_empty() {
+        lang
+    } else {
+        canon
+    }
+}
+
 fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
+    if !fallback_enabled(lang) {
+        return Vec::new();
+    }
+    let lang = fallback_key(lang);
     let colors = code_colors();
     let kw = Style::default()
         .fg(colors.keyword)
@@ -195,7 +281,7 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
     let slash = fallback_slash_comment(lang);
     let dash = fallback_dash_comment(lang);
     let block = fallback_block_comment(lang);
-    let html = matches!(lang, "html");
+    let html = matches!(lang, "html" | "xml");
     let bytes = code.as_bytes();
     let len = bytes.len();
     let mut segs: Vec<FallbackSeg> = Vec::new();
@@ -391,68 +477,27 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<FallbackSeg> {
 fn fallback_hash_comment(lang: &str) -> bool {
     matches!(
         lang,
-        "python"
-            | "py"
-            | "pyw"
-            | "ruby"
-            | "rb"
-            | "bash"
-            | "sh"
-            | "shell"
-            | "zsh"
-            | "console"
-            | "terminal"
-            | "sh-session"
-            | "shell-session"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "nix"
-            | "dockerfile"
-            | "docker"
-            | "containerfile"
-            | "perl"
-            | "php"
+        "python" | "ruby" | "bash" | "yaml" | "toml" | "nix" | "dockerfile" | "php"
     )
 }
 
 fn fallback_slash_comment(lang: &str) -> bool {
+    // CSS has no `//` comments — only `/* */` (covered by the block rule).
     matches!(
         lang,
         "rust"
-            | "rs"
             | "javascript"
-            | "js"
-            | "mjs"
-            | "cjs"
-            | "jsx"
             | "typescript"
-            | "ts"
-            | "mts"
-            | "cts"
-            | "tsx"
             | "go"
-            | "golang"
             | "java"
             | "c"
-            | "h"
             | "cpp"
-            | "c++"
-            | "hpp"
-            | "cc"
-            | "hh"
-            | "cxx"
             | "csharp"
-            | "cs"
-            | "c#"
             | "dart"
             | "kotlin"
-            | "kt"
-            | "kts"
             | "scala"
             | "swift"
             | "php"
-            | "css"
     )
 }
 
@@ -465,35 +510,15 @@ fn fallback_block_comment(lang: &str) -> bool {
     matches!(
         lang,
         "rust"
-            | "rs"
             | "javascript"
-            | "js"
-            | "mjs"
-            | "cjs"
-            | "jsx"
             | "typescript"
-            | "ts"
-            | "mts"
-            | "cts"
-            | "tsx"
             | "go"
-            | "golang"
             | "java"
             | "c"
-            | "h"
             | "cpp"
-            | "c++"
-            | "hpp"
-            | "cc"
-            | "hh"
-            | "cxx"
             | "csharp"
-            | "cs"
-            | "c#"
             | "dart"
             | "kotlin"
-            | "kt"
-            | "kts"
             | "scala"
             | "swift"
             | "php"
@@ -504,7 +529,7 @@ fn fallback_block_comment(lang: &str) -> bool {
 
 fn fallback_is_keyword(lang: &str, word: &str) -> bool {
     match lang {
-        "rust" | "rs" => matches!(
+        "rust" => matches!(
             word,
             "as" | "break"
                 | "const"
@@ -544,7 +569,7 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "await"
                 | "dyn"
         ),
-        "python" | "py" | "pyw" | "ruby" | "rb" => matches!(
+        "python" | "ruby" => matches!(
             word,
             "and"
                 | "as"
@@ -594,8 +619,7 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "with"
                 | "yield"
         ),
-        "javascript" | "js" | "mjs" | "cjs" | "jsx" | "typescript" | "ts" | "mts" | "cts"
-        | "tsx" => matches!(
+        "javascript" | "typescript" => matches!(
             word,
             "as" | "async"
                 | "await"
@@ -634,7 +658,7 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "with"
                 | "yield"
         ),
-        "go" | "golang" => matches!(
+        "go" => matches!(
             word,
             "break"
                 | "case"
@@ -661,8 +685,7 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "type"
                 | "var"
         ),
-        "bash" | "sh" | "shell" | "zsh" | "console" | "terminal" | "sh-session"
-        | "shell-session" => {
+        "bash" => {
             matches!(
                 word,
                 "if" | "then"
@@ -760,7 +783,7 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "between"
                 | "exists"
         ),
-        "dockerfile" | "docker" | "containerfile" => matches!(
+        "dockerfile" => matches!(
             word.to_ascii_lowercase().as_str(),
             "from"
                 | "run"
@@ -781,7 +804,11 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "healthcheck"
                 | "shell"
         ),
-        _ => matches!(
+        // Generic keywords for compiled languages without their own table
+        // (plus groovy, which has no grammar). Truly unknown languages stay
+        // dim instead of guessing.
+        "java" | "c" | "cpp" | "csharp" | "dart" | "kotlin" | "lua" | "nix" | "php" | "scala"
+        | "swift" | "html" | "xml" | "css" | "json" | "toml" | "yaml" | "groovy" => matches!(
             word,
             "and"
                 | "as"
@@ -827,6 +854,7 @@ fn fallback_is_keyword(lang: &str, word: &str) -> bool {
                 | "from"
                 | "where"
         ),
+        _ => false,
     }
 }
 
@@ -1077,6 +1105,9 @@ mod tests {
             ("ruby", "def foo # hi\nend\n"),
             ("scala", "object A { val x = 1 }\n"),
             ("swift", "func f() { let x = 1 }\n"),
+            ("html", "<div class=\"a\">hi</div>\n"),
+            ("css", ".a { color: red; }\n"),
+            ("xml", "<note><to>a</to></note>\n"),
         ] {
             let out = highlight_ansi(lang, code).expect("{lang} must highlight");
             assert_eq!(strip_sgr(&out), code, "{lang} lost bytes");
@@ -1140,22 +1171,34 @@ mod tests {
     }
 
     #[test]
-    fn fallback_covers_sql_dockerfile_and_unknown() {
+    fn fallback_covers_dockerfile_and_uncompiled() {
+        // Tree-sitter misses these (sql has no usable grammar per Cargo.toml,
+        // dockerfile has none, kotlin's upstream query panics so it stays
+        // disabled, groovy has none); the generic lexer must color them.
+        // html/css/xml now have real grammars (see
+        // highlight_covers_new_grammars) and don't need it.
         for (lang, code) in [
+            ("dockerfile", "FROM rust:1 AS b\nRUN cargo build\n"),
             ("sql", "SELECT a FROM t WHERE x = 1 -- hi\n"),
             ("sql", "select a from t where x = 'it''s'\n"),
-            ("dockerfile", "FROM rust:1 AS b\nRUN cargo build\n"),
             ("groovy", "def x = 42 // hi\n"),
             ("kotlin", "fun main() { val x = 1 }\n"),
         ] {
-            // Tree-sitter misses these; the generic lexer must color them.
+            let out = fallback_highlight_ansi(lang, code).expect("{lang} must fallback");
+            assert_eq!(strip_sgr(&out), code, "{lang} lost bytes");
+            assert!(out.contains("\x1b["), "{lang} emitted no SGR");
+        }
+        // sql/dockerfile/kotlin/groovy really are tree-sitter misses.
+        for (lang, code) in [
+            ("sql", "SELECT a FROM t\n"),
+            ("dockerfile", "FROM rust:1 AS b\n"),
+            ("groovy", "def x = 1\n"),
+            ("kotlin", "fun main() { val x = 1 }\n"),
+        ] {
             assert!(
                 highlight_ansi(lang, code).is_none(),
                 "{lang} unexpectedly tree-sitter"
             );
-            let out = fallback_highlight_ansi(lang, code).expect("{lang} must fallback");
-            assert_eq!(strip_sgr(&out), code, "{lang} lost bytes");
-            assert!(out.contains("\x1b["), "{lang} emitted no SGR");
         }
     }
 
@@ -1218,5 +1261,36 @@ mod tests {
         // No colorable tokens: no keywords/numbers/strings/comments.
         assert!(fallback_highlight_ansi("groovy", "plain\n").is_none());
         assert!(fallback_code_block("text", "select 1\n").is_none());
+        // Truly unknown fence tags stay dim instead of guessing keywords.
+        assert!(fallback_highlight_ansi("definitely-not-a-lang", "def x = 42\n").is_none());
+        assert!(fallback_highlight_ansi("definitely-not-a-lang", "plain 42\n").is_none());
+        assert!(fallback_code_block("definitely-not-a-lang", "def x = 42\n").is_none());
+        // Raw aliases still resolve through the canonical table.
+        let out = fallback_highlight_ansi("py", "def foo:\n    pass\n").expect("py alias");
+        assert!(out.contains("\x1b["));
+    }
+
+    #[test]
+    fn fallback_css_has_no_slash_comments() {
+        // CSS only has `/* */`: a `//` line must not count as a comment.
+        assert!(fallback_highlight_ansi("css", "// hi\n").is_none());
+        let out = fallback_highlight_ansi("css", "/* hi */\n").expect("block comment");
+        assert!(out.contains("\x1b["));
+        assert_eq!(strip_sgr(&out), "/* hi */\n");
+    }
+
+    #[test]
+    fn combined_highlighter_falls_back_for_dockerfile() {
+        use ratatui_markdown::highlight::CodeHighlighter;
+        let h = shared_markdown_highlighter();
+        // Tree-sitter hit passes through.
+        assert!(!h.highlight("rust", "fn main() {}\n").is_empty());
+        // Tree-sitter miss falls back to the generic lexer.
+        assert!(!h.highlight("dockerfile", "FROM rust:1\n").is_empty());
+        // Truly unknown stays empty (dim).
+        assert!(h
+            .highlight("definitely-not-a-lang", "def x = 42\n")
+            .is_empty());
+        assert!(h.highlight("text", "select 1\n").is_empty());
     }
 }
