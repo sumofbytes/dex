@@ -145,6 +145,24 @@ pub(crate) fn status_line(server: &str) -> String {
     }
 }
 
+/// Auth status for one server, or `None` when there is nothing to log in
+/// to: stdio servers carry no OAuth, so `/mcp` and `dex mcp status` skip
+/// them instead of crying "not logged in".
+pub(crate) fn auth_line(server: &str) -> Option<String> {
+    let http = super::load_server_configs()
+        .get(&super::sanitize_server_name(server))
+        .is_some_and(|cfg| cfg.is_http());
+    http.then(|| status_line(server))
+}
+
+/// Auth statuses for every HTTP server (sorted by name).
+pub(crate) fn auth_lines() -> Vec<String> {
+    super::load_server_configs()
+        .keys()
+        .filter_map(|name| auth_line(name))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Small pure helpers (unit-tested)
 // ---------------------------------------------------------------------------
@@ -174,9 +192,7 @@ pub(crate) fn parse_resource_metadata_url(header: &str) -> Option<String> {
             continue;
         }
         rest += 1;
-        let Some(end) = header[rest..].find('"') else {
-            return None;
-        };
+        let end = header[rest..].find('"')?;
         let url = header[rest..rest + end].trim();
         if url.starts_with("https://") || url.starts_with("http://") {
             return Some(url.to_string());
@@ -245,7 +261,7 @@ pub(crate) fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// RFC7636 §4.2 test-vector target: `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c`.
+/// RFC7636 §4.2 test-vector target: `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`.
 pub(crate) fn code_challenge(verifier: &str) -> String {
     use sha2::Digest as _;
     base64_url_no_pad(&sha2::Sha256::digest(verifier.as_bytes()))
@@ -563,6 +579,9 @@ async fn exchange_code(
 /// One silent refresh. `invalid_grant` means the stored token is dead: the
 /// caller drops the file so later requests fail fast with the login hint.
 pub(crate) async fn refresh_access_token(saved: &OAuthToken) -> Result<OAuthToken, String> {
+    if !saved.refreshable() {
+        return Err("mcp oauth: stored token is not refreshable (log in again)".to_string());
+    }
     let http = crate::client::http::shared_async_client();
     let refresh = saved.refresh_token.clone().unwrap_or_default();
     let mut pairs = vec![
@@ -894,9 +913,11 @@ mod tests {
 
     #[test]
     fn pkce_matches_rfc7636_vector() {
+        // The RFC's printed Appendix B challenge drops the final char (42
+        // chars cannot encode a 32-byte digest); the true value ends `-cM`.
         assert_eq!(
             code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c"
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
         let (verifier, challenge) = pkce_pair();
         assert_eq!(verifier.len(), 43);

@@ -165,6 +165,20 @@ impl ChatStream {
     }
 }
 
+/// Auth lines from a `GET /api/mcp` body: the non-null `auth` fields in
+/// server order. `null` means stdio (no login possible) — skipped, so
+/// `/mcp` never nags about servers that can't take a login.
+pub fn mcp_auth_lines(body: &serde_json::Value) -> Vec<String> {
+    body["servers"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v["auth"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl DaemonClient {
     pub fn new(base_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let base_url = base_url.trim_end_matches('/').to_string();
@@ -503,8 +517,9 @@ impl DaemonClient {
     }
 
     /// MCP server status from the daemon (`GET /api/mcp`): per-server
-    /// name/state/tool-count/error plus the schema-cap drop count. Returned
-    /// raw — the caller renders it with `render_mcp_panel`.
+    /// name/state/tool-count/error/auth plus the schema-cap drop count.
+    /// Returned raw — the caller renders it with `render_mcp_panel` and
+    /// prints `mcp_auth_lines` after it.
     pub async fn mcp_status_async(
         &self,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -772,6 +787,17 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_auth_lines_skips_null_stdio() {
+        let body = serde_json::json!({"servers": [
+            {"name": "gh", "auth": "gh: logged in"},
+            {"name": "local", "auth": null},
+            {"name": "nope"},
+        ]});
+        assert_eq!(mcp_auth_lines(&body), vec!["gh: logged in".to_string()]);
+        assert!(mcp_auth_lines(&serde_json::json!({})).is_empty());
+    }
 
     #[tokio::test]
     async fn wait_until_ready_async_errors_after_timeout() {

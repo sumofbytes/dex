@@ -17,7 +17,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/session", "Show current session details"),
     ("/resume", "List or resume a session"),
     ("/permissions", "Show permission mode and workspace"),
-    ("/mcp", "Show MCP server status"),
+    ("/mcp", "Show MCP server status and auth"),
+    ("/mcp help", "MCP OAuth help (login/logout run in the CLI)"),
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
     ("/provider", "Show or switch the provider"),
@@ -259,6 +260,16 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             push_info(app, format!("permission mode: {:?}", app.config.permission));
             push_info(app, format!("workspace: {}", app.cwd));
         }
+        _ if line.starts_with("/mcp ") => match line["/mcp ".len()..].trim() {
+            "help" => {
+                push_info(app, "/mcp shows server status including auth.".to_string());
+                push_info(
+                    app,
+                    "MCP OAuth runs in the CLI: `dex mcp login <server>`, `dex mcp logout <server>`, `dex mcp status`.".to_string(),
+                );
+            }
+            _ => push_info(app, "usage: /mcp [help]".to_string()),
+        },
         "/mcp" => {
             // Sync snapshot only: a slash handler must not initialize the
             // manager (that would spawn background connects from the TUI
@@ -273,6 +284,9 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     let truncated = crate::mcp::cached_truncated();
                     for line in crate::core::format::render_mcp_panel(&statuses, &tools, truncated)
                     {
+                        push_info(app, line);
+                    }
+                    for line in crate::mcp::oauth::auth_lines() {
                         push_info(app, line);
                     }
                 }
