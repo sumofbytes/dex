@@ -51,7 +51,7 @@ pub(crate) fn persist_pending(
 /// cost, so the remote client never re-prices locally), and the
 /// session-cumulative USD cost. Also used for compaction summarizer calls,
 /// which are billed too.
-fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
+async fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
     state.last_usage = Some(u.prompt_tokens);
     state.last_cached = u.cached_tokens;
     let cost =
@@ -67,22 +67,22 @@ fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u:
                     (u.prompt_tokens + u.completion_tokens) as f64 * rate_per_1k / 1000.0
                 }
             });
-    if let Some(sink) = console.sink() {
-        let _ = sink.try_send(SinkLine::Usage {
+    console
+        .emit_async(SinkLine::Usage {
             tokens: u.prompt_tokens,
             cached: u.cached_tokens,
             cost,
             output: u.completion_tokens,
-        });
-    }
+        })
+        .await;
     state.total_cost += cost;
 }
 
 /// Async wait for cancellation on the sync trait: polls with async sleep
-/// (10ms) so `select!` wakes promptly without a 50ms `recv_timeout` quantum.
-/// Concrete `CancellationToken::cancelled()` (Notify) is instant; this generic
-/// path covers `GlobalCancellation`/test doubles while keeping
-/// `CancellationSource` sync per plan.
+/// (10ms) so `select!` wakes within ~10ms without a 50ms `recv_timeout`
+/// quantum. Concrete `CancellationToken::cancelled()` (Notify) wakes
+/// instantly; this generic path covers `GlobalCancellation`/test doubles
+/// while keeping `CancellationSource` sync per plan.
 async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
     loop {
         if cancel.is_cancelled() {
@@ -182,7 +182,7 @@ pub(crate) async fn process_turn(
                     // Summarizer calls are billed like any other; account
                     // them so the status-bar spend includes compaction.
                     if let Some(u) = compacted {
-                        record_usage(config, state, console, u);
+                        record_usage(config, state, console, u).await;
                     }
                     if let Some(session) = session.as_deref_mut() {
                         session.clear_messages()?;
@@ -199,9 +199,10 @@ pub(crate) async fn process_turn(
             }
         }
 
-        // Async LLM call with instant cancel: `select!(cancelled, complete)`.
-        // No message `to_vec` clone beyond what the call needs and no parked
-        // thread (S6 resource win).
+        // Async LLM call with prompt cancel: `select!(cancelled, complete)`
+        // wakes within ~10ms on the generic path (instant on the concrete
+        // Notify token). No message `to_vec` clone beyond what the call
+        // needs and no parked thread (S6 resource win).
         let cancel_ref: &(dyn CancellationSource + Send + Sync) = cancel;
         let turn: Turn = tokio::select! {
             _ = wait_cancelled(cancel_ref) => {
@@ -220,26 +221,31 @@ pub(crate) async fn process_turn(
         };
         if let Some(u) = turn.usage {
             last_usage = Some(u.prompt_tokens);
-            record_usage(config, state, console, u);
+            record_usage(config, state, console, u).await;
         }
         // The provider cut the reply off mid-generation (output-token limit
         // or a content filter): whatever landed is likely incomplete. Say so
         // instead of silently keeping a truncated reply as if it were complete.
         match console.sink() {
-            Some(sink) => match turn.stop_reason {
-                Some(StopReason::Length) => {
-                    let _ = sink.try_send(SinkLine::System(
-                        "model output hit the output-token limit and may be truncated".to_string(),
-                    ));
+            Some(_) => {
+                match turn.stop_reason {
+                    Some(StopReason::Length) => {
+                        console
+                            .emit_async(SinkLine::System(
+                                "model output hit the output-token limit and may be truncated"
+                                    .to_string(),
+                            ))
+                            .await;
+                    }
+                    Some(StopReason::ContentFilter) => {
+                        console.emit_async(SinkLine::System(
+                          "model output was cut off by a content filter and may be incomplete"
+                              .to_string(),
+                      )).await;
+                    }
+                    _ => {}
                 }
-                Some(StopReason::ContentFilter) => {
-                    let _ = sink.try_send(SinkLine::System(
-                        "model output was cut off by a content filter and may be incomplete"
-                            .to_string(),
-                    ));
-                }
-                _ => {}
-            },
+            }
             None => with_console(false, || match turn.stop_reason {
                 Some(StopReason::Length) => {
                     eprintln!("[dex] model output hit the output-token limit and may be truncated")
@@ -338,12 +344,14 @@ pub(crate) async fn process_turn(
                     last_tools.push(cache_key.clone());
                 }
                 let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
-                if let Some(sink) = console.sink() {
-                    let _ = sink.try_send(SinkLine::ToolInput(format!(
-                        "{} {}",
-                        call.function.name,
-                        short_arg(&name, &input)
-                    )));
+                if console.sink().is_some() {
+                    console
+                        .emit_async(SinkLine::ToolInput(format!(
+                            "{} {}",
+                            call.function.name,
+                            short_arg(&name, &input)
+                        )))
+                        .await;
                 } else {
                     with_console(console.sink().is_some(), || {
                         eprintln!(
@@ -380,7 +388,7 @@ pub(crate) async fn process_turn(
                     }
                     outcome.text
                 };
-                if let Some(sink) = console.sink() {
+                if console.sink().is_some() {
                     let mut summary = tool_result_summary(&name, &input, &result, ok);
                     if cache_hit {
                         summary = format!("cached · {summary}");
@@ -391,13 +399,15 @@ pub(crate) async fn process_turn(
                     );
                     let skip_first = !counts_only || !ok;
                     let preview = tool_preview(&name, ok, diff.as_deref(), &result, skip_first);
-                    let _ = sink.try_send(SinkLine::ToolOutput {
-                        name: name.clone(),
-                        summary,
-                        success: ok,
-                        preview,
-                        duration: elapsed.as_secs_f64(),
-                    });
+                    console
+                        .emit_async(SinkLine::ToolOutput {
+                            name: name.clone(),
+                            summary,
+                            success: ok,
+                            preview,
+                            duration: elapsed.as_secs_f64(),
+                        })
+                        .await;
                 } else {
                     with_console(console.sink().is_some(), || {
                         let body = tool_preview_body(&name, ok, diff.as_deref(), &result);
@@ -413,7 +423,9 @@ pub(crate) async fn process_turn(
                 ));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
-            // Best-effort persist without blocking teardown (Phase 6): spawn only when dirty, never waits.
+            // Write-through persist (best-effort, tiny JSON): awaited so a
+            // process exit right after the turn can't lose it — a detached
+            // spawn would be dropped on shutdown before it ever ran.
             if state.dirty {
                 let to_save = ToolState {
                     cache: state.cache.clone(),
@@ -425,9 +437,7 @@ pub(crate) async fn process_turn(
                     total_cost: state.total_cost,
                     verify_dirty: state.verify_dirty,
                 };
-                tokio::spawn(async move {
-                    to_save.save_async().await;
-                });
+                to_save.save_async().await;
                 state.dirty = false;
             }
         } else {

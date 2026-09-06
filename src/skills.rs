@@ -148,8 +148,12 @@ pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> 
         dir_entries.push((dir.clone(), subdirs));
     }
     // Concurrent SKILL.md reads under the existing sort + first-wins + dup warning.
+    // Each task carries its dir index so dedup honors dir priority (dirs[0]
+    // wins), not path sort order: sorting by path alone would let a
+    // lexicographically-small path in a low-priority dir shadow a
+    // high-priority dir.
     let mut set = tokio::task::JoinSet::new();
-    for (_, subdirs) in dir_entries {
+    for (dir_idx, (_, subdirs)) in dir_entries.into_iter().enumerate() {
         for path in subdirs {
             let skill_path = path.join("SKILL.md");
             // Fast existence check without extra stat storm: attempt read directly.
@@ -183,27 +187,31 @@ pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> 
                 {
                     return None;
                 }
-                Some(crate::core::types::Skill {
-                    name,
-                    description: description.unwrap_or_default(),
-                    path: skill_path,
-                })
+                Some((
+                    dir_idx,
+                    crate::core::types::Skill {
+                        name,
+                        description: description.unwrap_or_default(),
+                        path: skill_path,
+                    },
+                ))
             });
         }
     }
-    let mut found: Vec<crate::core::types::Skill> = Vec::new();
+    let mut found: Vec<(usize, crate::core::types::Skill)> = Vec::new();
     while let Some(r) = set.join_next().await {
         if let Ok(Some(s)) = r {
             found.push(s);
         }
     }
-    // Sort + first-wins dedup to match sync contract (sorted by name, first wins).
-    // Since JoinSet completion is nondeterministic, sort by path first for determinism,
-    // then by name for output, keeping first path per name.
-    found.sort_by(|a, b| a.path.cmp(&b.path));
+    // Sort + first-wins dedup to match sync contract (sorted by name, first
+    // dir wins). Since JoinSet completion is nondeterministic, sort by
+    // (dir index, path) first for determinism, then by name for output,
+    // keeping the first dir per name.
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
     let mut seen = std::collections::HashSet::new();
     let mut skills = Vec::new();
-    for skill in found {
+    for (_, skill) in found {
         if seen.insert(skill.name.clone()) {
             skills.push(skill);
         } else {
@@ -386,6 +394,35 @@ mod tests {
         assert_eq!(sync_res[0].name, async_res[0].name);
         // First wins (a before b)
         assert_eq!(async_res[0].description, "a");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn discover_async_dir_priority_beats_path_order() {
+        // Dir priority must win even when path sort order disagrees: the
+        // high-priority dir sorts AFTER the low-priority one lexically.
+        let base = std::env::temp_dir().join(format!("dex-discover-prio-{}", std::process::id()));
+        let high = base.join("z-high");
+        let low = base.join("a-low");
+        let _ = tokio::fs::create_dir_all(high.join("s1")).await;
+        let _ = tokio::fs::create_dir_all(low.join("s1")).await;
+        tokio::fs::write(
+            high.join("s1/SKILL.md"),
+            "---\nname: dup\ndescription: high\n---\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            low.join("s1/SKILL.md"),
+            "---\nname: dup\ndescription: low\n---\n",
+        )
+        .await
+        .unwrap();
+        let dirs = vec![high, low];
+        let sync_res = discover_skills_fresh(&dirs);
+        let async_res = discover_skills_fresh_async(&dirs).await;
+        assert_eq!(sync_res[0].description, "high");
+        assert_eq!(async_res[0].description, "high");
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

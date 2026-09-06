@@ -38,10 +38,24 @@ impl StreamPrinter {
         }
     }
 
+    /// Sync variant for the in-memory test driver only.
+    #[cfg(test)]
     pub(crate) fn feed_line(&mut self, line: &str) {
         if self.sink.is_some() {
             // Sink mode: no spinner to erase; stream directly.
             self.feed_line_inner(line);
+        } else {
+            with_console(self.sink.is_some(), || self.feed_line_inner(line));
+        }
+    }
+
+    /// Async variant for live network paths: back-pressured `send().await`
+    /// instead of `try_send`, so a full channel applies backpressure rather
+    /// than silently dropping transcript lines. The sync `feed_line` above
+    /// stays for the in-memory test driver (channel never fills there).
+    pub(crate) async fn feed_line_async(&mut self, line: &str) {
+        if self.sink.is_some() {
+            self.feed_line_inner_async(line).await;
         } else {
             with_console(self.sink.is_some(), || self.feed_line_inner(line));
         }
@@ -78,6 +92,38 @@ impl StreamPrinter {
         }
     }
 
+    async fn feed_line_inner_async(&mut self, line: &str) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if self.in_code {
+                if let Some(sink) = &self.sink {
+                    let _ = sink
+                        .send(SinkLine::Assistant(format!(
+                            "```{}:\n{}\n```",
+                            self.code_lang, self.code_body
+                        )))
+                        .await;
+                } else {
+                    print_code_block(&self.code_lang, &self.code_body);
+                }
+                self.code_body.clear();
+                self.code_lang.clear();
+                self.in_code = false;
+            } else {
+                self.in_code = true;
+                self.code_lang = trimmed.trim_start_matches('`').trim().to_string();
+            }
+        } else if self.in_code {
+            self.code_body.push_str(line);
+            self.code_body.push('\n');
+        } else if let Some(sink) = &self.sink {
+            let _ = sink.send(SinkLine::Assistant(line.to_string())).await;
+        } else {
+            print_markdown_text(line);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish(self) {
         if self.in_code && !self.code_body.is_empty() {
             if let Some(sink) = &self.sink {
@@ -85,6 +131,23 @@ impl StreamPrinter {
                     "```{}:\n{}\n```",
                     self.code_lang, self.code_body
                 )));
+            } else {
+                with_console(self.sink.is_some(), || {
+                    print_code_block(&self.code_lang, &self.code_body)
+                });
+            }
+        }
+    }
+
+    pub(crate) async fn finish_async(self) {
+        if self.in_code && !self.code_body.is_empty() {
+            if let Some(sink) = &self.sink {
+                let _ = sink
+                    .send(SinkLine::Assistant(format!(
+                        "```{}:\n{}\n```",
+                        self.code_lang, self.code_body
+                    )))
+                    .await;
             } else {
                 with_console(self.sink.is_some(), || {
                     print_code_block(&self.code_lang, &self.code_body)
@@ -202,6 +265,11 @@ impl SseDriver {
     }
 
     /// Feed one raw SSE line; returns true when the parser signalled Done.
+    /// Sync variant for the in-memory test driver (channel never fills).
+    /// Live network paths use [`SseDriver::feed_raw_async`], which
+    /// back-pressures with `send().await` instead of dropping on a full
+    /// channel.
+    #[cfg(test)]
     fn feed_raw(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
         let mut done = false;
         for event in parser.feed(line) {
@@ -243,6 +311,49 @@ impl SseDriver {
         done
     }
 
+    /// Async variant for live network paths: sink sends back-pressure with
+    /// `send().await` so transcript lines are never dropped on a full
+    /// channel.
+    async fn feed_raw_async(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
+        let mut done = false;
+        for event in parser.feed(line) {
+            match event {
+                StreamEvent::Thinking(thought) => {
+                    // Same output_flowed contract as `feed_raw`: reasoning
+                    // renders live, so a retry after a drop would duplicate it.
+                    self.output_flowed = true;
+                    if let Some(sink) = self.sink() {
+                        let _ = sink.send(SinkLine::Thinking(thought)).await;
+                    }
+                }
+                StreamEvent::Text(text) => {
+                    self.output_flowed = true;
+                    self.content.push_str(&text);
+                    // Print complete lines live; keep any partial tail buffered.
+                    self.pending.push_str(&text);
+                    // Collect completed lines first to avoid borrow fights.
+                    let mut completed: Vec<String> = Vec::new();
+                    while let Some(pos) = self.pending.find('\n') {
+                        let complete = self.pending[..=pos].to_string();
+                        self.pending.replace_range(..=pos, "");
+                        completed.push(complete);
+                    }
+                    for c in completed {
+                        self.printer.feed_line_async(c.trim_end_matches('\n')).await;
+                    }
+                    if self.sink().is_none() {
+                        let _ = io::stdout().flush();
+                    }
+                }
+                StreamEvent::Usage(u) => self.usage = Some(u),
+                StreamEvent::Stop(reason) => self.stop_reason = Some(reason),
+                StreamEvent::Done => done = true,
+            }
+        }
+        done
+    }
+
+    #[cfg(test)]
     fn finish_turn(
         mut self,
         parser: impl StreamParser,
@@ -253,7 +364,31 @@ impl SseDriver {
             self.printer.feed_line(&tail);
             let _ = io::stdout().flush();
         }
-        self.printer.finish();
+        let printer = std::mem::replace(&mut self.printer, StreamPrinter::new(None));
+        printer.finish();
+        self.finish_turn_tail(parser, sink_is_some)
+    }
+
+    async fn finish_turn_async(
+        mut self,
+        parser: impl StreamParser,
+        sink_is_some: bool,
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            self.printer.feed_line_async(&tail).await;
+            let _ = io::stdout().flush();
+        }
+        let printer = std::mem::replace(&mut self.printer, StreamPrinter::new(None));
+        printer.finish_async().await;
+        self.finish_turn_tail(parser, sink_is_some)
+    }
+
+    fn finish_turn_tail(
+        self,
+        parser: impl StreamParser,
+        sink_is_some: bool,
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let _ = io::stdout().flush();
         if !self.content.is_empty() {
             with_console(sink_is_some, || println!());
@@ -314,19 +449,19 @@ async fn run_sse<P: StreamParser>(
                         return Err(stream_err(&e.to_string(), driver.output_flowed));
                     }
                     Ok(None) => break,
-                    Ok(Some(bytes)) => {
-                        buf.extend_from_slice(&bytes);
-                        // Extract complete lines; keep partial tail buffered.
-                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                            let raw: Vec<u8> = buf.drain(..=pos).collect();
-                            let line = String::from_utf8_lossy(&raw).into_owned();
-                            if driver.feed_raw(&line, &mut parser) {
-                                // Chat-completions [DONE]: stop reading.
-                                let sink_is_some = sink.is_some();
-                                return driver.finish_turn(parser, sink_is_some);
-                            }
-                        }
-                    }
+                      Ok(Some(bytes)) => {
+                          buf.extend_from_slice(&bytes);
+                          // Extract complete lines; keep partial tail buffered.
+                          while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                              let raw: Vec<u8> = buf.drain(..=pos).collect();
+                              let line = String::from_utf8_lossy(&raw).into_owned();
+                              if driver.feed_raw_async(&line, &mut parser).await {
+                                  // Chat-completions [DONE]: stop reading.
+                                  let sink_is_some = sink.is_some();
+                                  return driver.finish_turn_async(parser, sink_is_some).await;
+                              }
+                          }
+                      }
                 }
             }
         }
@@ -342,11 +477,11 @@ async fn run_sse<P: StreamParser>(
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).into_owned();
         // Feed as one final line even without trailing newline.
-        let done = driver.feed_raw(&line, &mut parser);
+        let done = driver.feed_raw_async(&line, &mut parser).await;
         let _ = done;
     }
     let sink_is_some = sink.is_some();
-    driver.finish_turn(parser, sink_is_some)
+    driver.finish_turn_async(parser, sink_is_some).await
 }
 
 /// Helper to get a `Send`-compatible future for `CancellationToken`.

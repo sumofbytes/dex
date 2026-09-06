@@ -508,6 +508,31 @@ impl Stream for ReceiverStream {
     }
 }
 
+/// `Future::catch_unwind` without a new dependency: polls the inner future
+/// inside `std::panic::catch_unwind` per poll, so a panic in
+/// `run_turn_inner` becomes `Err("turn panicked")` (the pre-async contract)
+/// instead of aborting the spawned turn task with no terminal SSE event —
+/// the client would otherwise hang until keep-alive timeout with cleanup
+/// done (via `TurnGuard::drop`) but no `TurnFailed` ever sent.
+struct CatchUnwind<F>(std::panic::AssertUnwindSafe<F>);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, String>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // SAFETY: we never move `F` out of the pin; only project to poll it.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0 .0) };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(_) => std::task::Poll::Ready(Err("turn panicked".to_string())),
+        }
+    }
+}
+
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Async:
 /// spawned via `tokio::spawn`, bridges are tasks with `send().await`.
 #[allow(clippy::too_many_arguments)]
@@ -523,7 +548,8 @@ async fn run_agent_turn(
     followup_rx: Option<mpsc::Receiver<String>>,
 ) {
     // Use a guard so active_turns/cancel_tokens/pending approvals/steering
-    // are cleaned even when run_turn_inner panics inside spawn_blocking.
+    // are cleaned even when run_turn_inner panics inside the spawned task
+    // (`CatchUnwind` below still delivers `TurnFailed` in that case).
     struct TurnGuard {
         state: Arc<DaemonState>,
         session_id: String,
@@ -654,18 +680,23 @@ async fn run_agent_turn(
     // Own receivers mutably for the async turn (tokio try_recv needs &mut).
     let mut steering_rx = steering_rx;
     let mut followup_rx = followup_rx;
-    let result: Result<(String, Option<u64>, Option<u64>), String> = run_turn_inner(
-        &state,
-        &session_id,
-        &req,
-        &cancel,
-        &tx,
-        Some(&mut steering_rx),
-        Some(&steering_accepted_tx),
-        Some(&mut followup_rx),
-        Some(&followup_accepted_tx),
-    )
-    .await;
+    let result: Result<(String, Option<u64>, Option<u64>), String> =
+        match CatchUnwind(std::panic::AssertUnwindSafe(run_turn_inner(
+            &state,
+            &session_id,
+            &req,
+            &cancel,
+            &tx,
+            Some(&mut steering_rx),
+            Some(&steering_accepted_tx),
+            Some(&mut followup_rx),
+            Some(&followup_accepted_tx),
+        )))
+        .await
+        {
+            Ok(inner) => inner,
+            Err(panicked) => Err(panicked),
+        };
     // Drop the guard now before sending the terminal event so a new turn can
     // be accepted promptly; drop ordering handles pending approvals/active turns.
     drop(_guard);

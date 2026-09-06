@@ -533,10 +533,15 @@ async fn read_file_numbered(
     offset: usize,
     limit: usize,
 ) -> Result<(String, usize), ToolError> {
-    let mut bytes = tokio::fs::read(path).await.map_err(ToolError::Io)?;
-    if bytes.len() > READ_MAX_BYTES + 1 {
-        bytes.truncate(READ_MAX_BYTES + 1);
-    }
+    // Budgeted read: `take(MAX+1)` caps the read at the byte budget + one
+    // probe byte, so a multi-GB log never lands in memory whole. The extra
+    // byte distinguishes over-budget from exact-fit.
+    let file = tokio::fs::File::open(path).await.map_err(ToolError::Io)?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(READ_MAX_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(ToolError::Io)?;
     let over_budget = bytes.len() > READ_MAX_BYTES;
     bytes.truncate(READ_MAX_BYTES);
     if bytes.contains(&0) {
@@ -582,13 +587,18 @@ async fn read_file_numbered(
 #[allow(clippy::type_complexity)]
 async fn fanout_read(paths: Vec<PathBuf>, args: &Map<String, Value>) -> Result<String, ToolError> {
     // Concurrent reads (S1 latency win: 10x5ms serial ~50ms -> ~5-10ms).
-    // JoinSet <=10 concurrent, join + sort to input order, budget on join.
+    // JoinSet + semaphore: at most 10 files read concurrently no matter
+    // how the input caps evolve; join + sort restores input order, budget
+    // is enforced on join.
     let per_file = read_limit(args, READ_FANOUT_PER_FILE_LINES);
     let offset = read_offset(args);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
     let mut set = tokio::task::JoinSet::new();
     for (idx, path) in paths.iter().enumerate() {
         let path = path.clone();
+        let sem = sem.clone();
         set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
             let res = read_file_numbered(&path, offset, per_file).await;
             (idx, path.display().to_string(), res)
         });
