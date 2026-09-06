@@ -54,7 +54,7 @@ impl OAuthToken {
             .unwrap_or(true)
     }
 
-    fn refreshable(&self) -> bool {
+    pub(crate) fn refreshable(&self) -> bool {
         self.refresh_token.as_deref().is_some_and(|r| !r.is_empty())
             && !self.token_endpoint.is_empty()
             && !self.client_id.is_empty()
@@ -75,7 +75,10 @@ pub(crate) fn oauth_dir() -> PathBuf {
 }
 
 pub(crate) fn token_path(server: &str) -> PathBuf {
-    oauth_dir().join(format!("{server}.json"))
+    // Sanitize here (not just at call sites): `server` becomes a file name,
+    // so `../../x` must map to `______x.json` inside `oauth_dir`, never a
+    // traversal. Idempotent over already-sanitized names.
+    oauth_dir().join(format!("{}.json", super::sanitize_server_name(server)))
 }
 
 /// Any failure (missing/corrupt/empty) is "no token", never an error: auth
@@ -100,11 +103,27 @@ pub(crate) fn save_token(server: &str, tok: &OAuthToken) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("mcp oauth: {e}"))?;
     }
     let text = serde_json::to_string_pretty(tok).map_err(|e| format!("mcp oauth: {e}"))?;
-    std::fs::write(&path, text).map_err(|e| format!("mcp oauth: {e}"))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        // Create with 0600 from the start: `fs::write` + `set_permissions`
+        // leaves a world-readable window (umask 022). `open` does not chmod
+        // an existing file, so force the mode afterwards too.
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("mcp oauth: {e}"))?;
+        f.write_all(text.as_bytes())
+            .map_err(|e| format!("mcp oauth: {e}"))?;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, text).map_err(|e| format!("mcp oauth: {e}"))?;
     }
     Ok(())
 }
@@ -148,18 +167,23 @@ pub(crate) fn status_line(server: &str) -> String {
 /// Auth status for one server, or `None` when there is nothing to log in
 /// to: stdio servers carry no OAuth, so `/mcp` and `dex mcp status` skip
 /// them instead of crying "not logged in".
-pub(crate) fn auth_line(server: &str) -> Option<String> {
-    let http = super::load_server_configs()
+pub(crate) fn auth_line_with(
+    configs: &std::collections::BTreeMap<String, super::McpServerConfig>,
+    server: &str,
+) -> Option<String> {
+    let http = configs
         .get(&super::sanitize_server_name(server))
         .is_some_and(|cfg| cfg.is_http());
     http.then(|| status_line(server))
 }
 
-/// Auth statuses for every HTTP server (sorted by name).
+/// Auth statuses for every HTTP server (sorted by name). Loads the config
+/// once, then maps over statuses (no N+1 reloads).
 pub(crate) fn auth_lines() -> Vec<String> {
-    super::load_server_configs()
+    let configs = super::load_server_configs();
+    configs
         .keys()
-        .filter_map(|name| auth_line(name))
+        .filter_map(|name| auth_line_with(&configs, name))
         .collect()
 }
 
@@ -171,7 +195,9 @@ pub(crate) fn auth_lines() -> Vec<String> {
 /// Case-insensitive key, tolerates extra params/whitespace; only http(s).
 pub(crate) fn parse_resource_metadata_url(header: &str) -> Option<String> {
     const KEY: &str = "resource_metadata";
-    let lower = header.to_lowercase();
+    // `to_ascii_lowercase` preserves byte offsets; `to_lowercase` can expand
+    // non-ASCII and desync `lower` indexes from `header`/`bytes` indexes.
+    let lower = header.to_ascii_lowercase();
     let bytes = header.as_bytes();
     let mut search = 0;
     while let Some(rel) = lower[search..].find(KEY) {
@@ -217,6 +243,9 @@ pub(crate) fn percent_encode(s: &str) -> String {
 }
 
 pub(crate) fn percent_decode(s: &str) -> String {
+    // RFC3986: only `%XX` decodes. A literal `+` stays `+` — mapping it to
+    // space (form-encoding) corrupts authorization codes in the loopback
+    // callback query.
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -228,7 +257,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
                 continue;
             }
         }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        out.push(bytes[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -271,15 +300,100 @@ fn random_state() -> String {
     base64_url_no_pad(uuid::Uuid::new_v4().as_bytes())
 }
 
+/// True when `header` carries a `Bearer` WWW-Authenticate challenge.
+/// Matches the scheme token only (`Bearer`, `Bearer realm=…`,
+/// `Basic…, Bearer …`), not substrings like `Bearertoken`.
+pub(crate) fn is_bearer_challenge(header: &str) -> bool {
+    let lower = header.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find("bearer") {
+        let abs = i + rel;
+        let prev_ok = abs == 0 || matches!(bytes[abs - 1], b' ' | b'\t' | b',' | b'"');
+        let next = bytes.get(abs + 6).copied();
+        let next_ok = matches!(next, None | Some(b' ' | b'\t' | b',' | b'"'));
+        if prev_ok && next_ok {
+            return true;
+        }
+        i = abs + 6;
+        if i >= lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn host_is_loopback(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("https://[::1]")
+}
+
+/// Discovery/token URLs must be https, except loopback http for local dev.
+/// Blocks credential + metadata fetch over cleartext to a remote host.
+fn ensure_https_or_loopback(url: &str, context: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || host_is_loopback(url) {
+        return Ok(());
+    }
+    Err(format!(
+        "mcp oauth {context}: refusing non-https url (loopback http only)"
+    ))
+}
+
+/// Negative cache for failed refreshes: one failing AS must not be hammered
+/// on every tool call. `true` while a failure was recorded within 60s.
+fn refresh_fail_table(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static FAIL_AT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    FAIL_AT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn refresh_backoff_active(server: &str) -> bool {
+    let mut guard = refresh_fail_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = guard.get(server) {
+        if at.elapsed() < std::time::Duration::from_secs(60) {
+            return true;
+        }
+        guard.remove(server);
+    }
+    false
+}
+
+pub(crate) fn note_refresh_failure(server: &str) {
+    refresh_fail_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(server.to_string(), std::time::Instant::now());
+}
+
+pub(crate) fn clear_refresh_backoff(server: &str) {
+    refresh_fail_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(server);
+}
+
 /// `https://host:port/path` → `(origin, path)` without a URL parser.
+/// Query/fragment are stripped so they cannot leak into a derived
+/// `/.well-known/…` URL (`https://h.example?x` → origin `https://h.example`).
 pub(crate) fn split_origin(url: &str) -> (String, String) {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    let rest = clean.split_once("://").map(|(_, r)| r).unwrap_or(clean);
     match rest.find('/') {
         Some(i) => {
-            let origin = url[..url.len() - rest.len() + i].to_string();
+            let origin = clean[..clean.len() - rest.len() + i].to_string();
             (origin, rest[i..].to_string())
         }
-        None => (url.to_string(), String::new()),
+        None => (clean.to_string(), String::new()),
     }
 }
 
@@ -323,6 +437,7 @@ async fn fetch_resource_metadata(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<ResourceMetadata, String> {
+    ensure_https_or_loopback(url, "resource metadata")?;
     let resp = http
         .get(url)
         .header("accept", "application/json")
@@ -378,6 +493,7 @@ async fn fetch_auth_server_metadata(
     http: &reqwest::Client,
     issuer: &str,
 ) -> Result<AuthServerMetadata, String> {
+    ensure_https_or_loopback(issuer, "issuer")?;
     let issuer = issuer.trim_end_matches('/');
     let (origin, path) = split_origin(issuer);
     let path = path.trim_end_matches('/');
@@ -428,6 +544,12 @@ async fn fetch_auth_server_metadata(
             last = "metadata missing authorization/token endpoints".to_string();
             continue;
         }
+        if ensure_https_or_loopback(&authorization_endpoint, "authorization_endpoint").is_err()
+            || ensure_https_or_loopback(&token_endpoint, "token_endpoint").is_err()
+        {
+            last = "metadata endpoints must be https (loopback http only)".to_string();
+            continue;
+        }
         return Ok(AuthServerMetadata {
             authorization_endpoint,
             token_endpoint,
@@ -452,6 +574,7 @@ async fn register_client(
     endpoint: &str,
     redirect_uri: &str,
 ) -> Result<ClientRegistration, String> {
+    ensure_https_or_loopback(endpoint, "registration_endpoint")?;
     let body = serde_json::json!({
         "redirect_uris": [redirect_uri],
         "client_name": "dex",
@@ -538,6 +661,7 @@ async fn exchange_code(
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<OAuthToken, String> {
+    ensure_https_or_loopback(token_endpoint, "token_endpoint")?;
     let mut pairs = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -582,6 +706,7 @@ pub(crate) async fn refresh_access_token(saved: &OAuthToken) -> Result<OAuthToke
     if !saved.refreshable() {
         return Err("mcp oauth: stored token is not refreshable (log in again)".to_string());
     }
+    ensure_https_or_loopback(&saved.token_endpoint, "token_endpoint")?;
     let http = crate::client::http::shared_async_client();
     let refresh = saved.refresh_token.clone().unwrap_or_default();
     let mut pairs = vec![
@@ -658,13 +783,15 @@ fn launch_browser(url: &str) {
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", url])
+        .args(["/c", "start", "", url])
         .spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 /// Parse the loopback `GET …?code=…&state=…` (or `?error=…`) request line.
+/// The error code is preserved (`authorization denied (invalid_target): …`)
+/// so callers can retry without `resource` when the AS rejects it.
 fn parse_callback(req: &str) -> Result<(String, String), String> {
     let line = req.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
@@ -689,7 +816,11 @@ fn parse_callback(req: &str) -> Result<(String, String), String> {
                     })
                     .map(percent_decode)
                     .unwrap_or_else(|| percent_decode(v));
-                return Err(format!("authorization denied: {desc}"));
+                let code_name = percent_decode(v);
+                if desc == code_name || desc.is_empty() {
+                    return Err(format!("authorization denied ({code_name})"));
+                }
+                return Err(format!("authorization denied ({code_name}): {desc}"));
             }
             _ => {}
         }
@@ -698,7 +829,7 @@ fn parse_callback(req: &str) -> Result<(String, String), String> {
 }
 
 async fn wait_for_callback(
-    listener: tokio::net::TcpListener,
+    listener: &tokio::net::TcpListener,
     state: &str,
 ) -> Result<String, String> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -784,14 +915,22 @@ async fn probe_challenge(
     let Ok(resp) = req.json(&body).send().await else {
         return idle;
     };
-    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return idle;
-    }
-    let resource_metadata = resp
+    // 401 always means auth; some servers answer 400 + `WWW-Authenticate`
+    // instead (MCP spec drift) — treat that as challenged too, but only when
+    // the header actually carries a Bearer challenge.
+    let status = resp.status();
+    let www = resp
         .headers()
         .get("www-authenticate")
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_resource_metadata_url);
+        .unwrap_or("")
+        .to_string();
+    if status != reqwest::StatusCode::UNAUTHORIZED
+        && (status != reqwest::StatusCode::BAD_REQUEST || !is_bearer_challenge(&www))
+    {
+        return idle;
+    }
+    let resource_metadata = parse_resource_metadata_url(&www);
     ChallengeProbe {
         challenged: true,
         resource_metadata,
@@ -864,17 +1003,31 @@ pub(crate) async fn login(server: &str) -> Result<String, String> {
     };
 
     let (verifier, challenge) = pkce_pair();
-    let state = random_state();
-    launch_browser(&authorize_url(
-        &asm.authorization_endpoint,
-        &client_id,
-        &redirect_uri,
-        &scope,
-        &base,
-        &challenge,
-        &state,
-    ));
-    let code = wait_for_callback(listener, &state).await?;
+    // `resource` (RFC8707) is sent first; AS servers that do not understand
+    // it fail with `invalid_target` — then retry once without it.
+    let mut resource = base.clone();
+    let mut state = random_state();
+    let code = loop {
+        launch_browser(&authorize_url(
+            &asm.authorization_endpoint,
+            &client_id,
+            &redirect_uri,
+            &scope,
+            &resource,
+            &challenge,
+            &state,
+        ));
+        match wait_for_callback(&listener, &state).await {
+            Ok(code) => break code,
+            Err(e) if e.contains("invalid_target") && !resource.is_empty() => {
+                eprintln!("dex: server rejected `resource`; retrying without it…");
+                resource.clear();
+                state = random_state();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let tok = exchange_code(
         &http,
         &asm.token_endpoint,
@@ -956,11 +1109,46 @@ mod tests {
             percent_encode("http://127.0.0.1:9/cb?a=b c"),
             "http%3A%2F%2F127.0.0.1%3A9%2Fcb%3Fa%3Db%20c"
         );
-        assert_eq!(percent_decode("a%20b+c%2F"), "a b c/");
+        // RFC3986: `+` is literal, only `%XX` decodes (form `+`→space used
+        // to corrupt codes in the callback query).
+        assert_eq!(percent_decode("a%20b+c%2F"), "a b+c/");
         assert_eq!(
             percent_decode(percent_encode("code/x+y=z&").as_str()),
             "code/x+y=z&"
         );
+    }
+
+    #[test]
+    fn bearer_challenge_is_scheme_not_substring() {
+        assert!(is_bearer_challenge("Bearer"));
+        assert!(is_bearer_challenge(
+            r#"Bearer resource_metadata="https://a/x""#
+        ));
+        assert!(is_bearer_challenge(
+            r#"Basic realm="x", Bearer error="invalid_token""#
+        ));
+        assert!(!is_bearer_challenge("Basic realm=\"x\""));
+        assert!(!is_bearer_challenge("Bearertoken xyz"));
+        assert!(!is_bearer_challenge(""));
+    }
+
+    #[test]
+    fn https_required_except_loopback() {
+        assert!(ensure_https_or_loopback("https://a.example/token", "t").is_ok());
+        assert!(ensure_https_or_loopback("http://127.0.0.1:8080/x", "t").is_ok());
+        assert!(ensure_https_or_loopback("http://localhost:9/x", "t").is_ok());
+        assert!(ensure_https_or_loopback("http://a.example/token", "t").is_err());
+        assert!(ensure_https_or_loopback("http://a.example/token", "issuer").is_err());
+    }
+
+    #[test]
+    fn token_path_never_traverses() {
+        let p = token_path("../../etc/passwd");
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("______etc_passwd.json")
+        );
+        assert!(p.parent().is_some_and(|d| d.ends_with("dex/mcp")));
     }
 
     #[test]
@@ -973,8 +1161,17 @@ mod tests {
             split_origin("https://h.example"),
             ("https://h.example".to_string(), String::new())
         );
+        // Query/fragment never leak into derived well-known URLs.
+        assert_eq!(
+            split_origin("https://h.example/mcp?x=1#frag"),
+            ("https://h.example".to_string(), "/mcp".to_string())
+        );
         assert_eq!(
             well_known_resource_url("https://h.example/mcp"),
+            "https://h.example/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            well_known_resource_url("https://h.example/mcp?x=1"),
             "https://h.example/.well-known/oauth-protected-resource/mcp"
         );
     }
@@ -984,6 +1181,15 @@ mod tests {
         let (code, state) =
             parse_callback("GET /callback?code=abc%201&state=s7 HTTP/1.1\r\nHost: x\r\n").unwrap();
         assert_eq!((code.as_str(), state.as_str()), ("abc 1", "s7"));
+        // `+` in a code is literal (RFC3986), not a space.
+        let (code, _) = parse_callback("GET /callback?code=a%2Bb+c&state=s HTTP/1.1\r\n").unwrap();
+        assert_eq!(code, "a+b+c");
+        // Error code is preserved so login can retry without `resource` on
+        // `invalid_target`.
+        let err =
+            parse_callback("GET /callback?error=invalid_target&error_description=nope HTTP/1.1")
+                .unwrap_err();
+        assert!(err.contains("invalid_target"), "{err}");
         assert!(parse_callback("GET /callback?error=access_denied HTTP/1.1").is_err());
         assert!(parse_callback("POST /callback?code=x HTTP/1.1").is_err());
     }

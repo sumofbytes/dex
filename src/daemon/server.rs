@@ -179,11 +179,13 @@ async fn get_mcp() -> Json<serde_json::Value> {
     // a server is down; `truncated` counts schema-cap drops (see loop.rs).
     // `auth` carries the OAuth line for HTTP servers (`null` for stdio, which
     // needs no login, and for servers the daemon never configured).
+    // Config loads once and maps over statuses (no N+1 reloads).
+    let configs = crate::mcp::load_server_configs();
     let servers: Vec<serde_json::Value> = crate::mcp::global_manager()
         .statuses()
         .await
         .into_iter()
-        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools, "error": s.error, "auth": crate::mcp::oauth::auth_line(&s.name)}))
+        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools, "error": s.error, "auth": crate::mcp::oauth::auth_line_with(&configs, &s.name)}))
         .collect();
     Json(json!({ "servers": servers, "truncated": crate::mcp::cached_truncated() }))
 }

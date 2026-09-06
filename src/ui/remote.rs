@@ -1564,16 +1564,21 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             }
         }
         _ if line.starts_with("/mcp ") => {
-            // No inline login over the wire: OAuth is a CLI flow on the
-            // daemon host; the `/mcp` panel itself carries the auth lines.
-            push_info(
-                &mut remote.app,
-                "/mcp shows server status including auth.".to_string(),
-            );
-            push_info(
-                &mut remote.app,
-                "MCP OAuth runs in the CLI: `dex mcp login <server>` (on the daemon host when remote).".to_string(),
-            );
+            // Same grammar as local `/mcp`: only `help` is valid; anything
+            // else is usage (login itself runs in the CLI on the daemon host).
+            match line["/mcp ".len()..].trim() {
+                "help" => {
+                    push_info(
+                        &mut remote.app,
+                        "/mcp shows server status including auth.".to_string(),
+                    );
+                    push_info(
+                        &mut remote.app,
+                        "MCP OAuth runs in the CLI: `dex mcp login <server>` (on the daemon host when remote).".to_string(),
+                    );
+                }
+                _ => push_info(&mut remote.app, "usage: /mcp [help]".to_string()),
+            }
         }
         "/mcp" => {
             // Explicit arm (not the `handle_slash` fallthrough below): the

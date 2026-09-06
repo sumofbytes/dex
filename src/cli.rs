@@ -147,14 +147,24 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
             Mode::Connect { url }
         }
         Some("--tool") => Mode::Tool,
-        Some("mcp") => Mode::Mcp {
-            action: args
-                .rest
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "status".to_string()),
-            server: args.rest.get(2).cloned(),
-        },
+        Some("mcp") => {
+            // Strict: extra args are an error, not silently dropped
+            // (`dex mcp login a b` used to ignore `b`).
+            if args.rest.len() > 3 {
+                return Mode::Mcp {
+                    action: "__invalid__".to_string(),
+                    server: None,
+                };
+            }
+            Mode::Mcp {
+                action: args
+                    .rest
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "status".to_string()),
+                server: args.rest.get(2).cloned(),
+            }
+        }
         Some("run") if args.rest.len() >= 2 => Mode::RunTool {
             name: args.rest[1].clone(),
             args: args.rest[2..].to_vec(),
@@ -276,6 +286,11 @@ mod tests {
                 assert_eq!(server.as_deref(), Some("github"));
             }
             other => panic!("expected Mode::Mcp, got {other:?}"),
+        }
+        // Extra args are invalid, never silently dropped.
+        match resolve_mode(&args_with_rest(&["mcp", "login", "a", "b"])) {
+            Mode::Mcp { action, .. } => assert_eq!(action, "__invalid__"),
+            other => panic!("expected invalid Mcp, got {other:?}"),
         }
     }
 }

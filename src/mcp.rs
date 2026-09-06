@@ -805,21 +805,22 @@ impl HttpTransport {
                 // One silent refresh when the stored token is refreshable,
                 // then a single retry. A dead refresh token (`invalid_grant`)
                 // is dropped so later calls fail fast with the login hint.
+                // Transient failures back off 60s so a down AS is not hammered
+                // on every tool call.
                 if let Some(saved) = oauth::load_token(&self.server) {
-                    if saved
-                        .refresh_token
-                        .as_deref()
-                        .is_some_and(|r| !r.is_empty())
-                    {
+                    if saved.refreshable() && !oauth::refresh_backoff_active(&self.server) {
                         match oauth::refresh_access_token(&saved).await {
                             Ok(fresh) => {
                                 let _ = oauth::save_token(&self.server, &fresh);
+                                oauth::clear_refresh_backoff(&self.server);
                                 return self.roundtrip(method, params).await.map_err(|e| e.msg);
                             }
                             Err(e) if e.contains("invalid_grant") => {
                                 let _ = oauth::clear_token(&self.server);
                             }
-                            Err(_) => {}
+                            Err(_) => {
+                                oauth::note_refresh_failure(&self.server);
+                            }
                         }
                     }
                 }
@@ -883,9 +884,7 @@ impl HttpTransport {
                 .headers()
                 .get("www-authenticate")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("bearer");
+                .is_some_and(oauth::is_bearer_challenge);
             let mut msg = format!("mcp http {status}: {method}");
             if bearer {
                 msg.push_str(&format!(
