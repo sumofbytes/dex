@@ -17,6 +17,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/session", "Show current session details"),
     ("/resume", "List or resume a session"),
     ("/permissions", "Show permission mode and workspace"),
+    ("/mcp", "Show MCP server status"),
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
     ("/provider", "Show or switch the provider"),
@@ -257,6 +258,25 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             push_info(app, format!("permission mode: {:?}", app.config.permission));
             push_info(app, format!("workspace: {}", app.cwd));
         }
+        "/mcp" => {
+            // Sync snapshot only: a slash handler must not initialize the
+            // manager (that would spawn background connects from the TUI
+            // process) — remote clients fetch daemon state via /api/mcp.
+            match crate::mcp::cached_statuses() {
+                None => push_info(
+                    app,
+                    "MCP status unavailable (manager not initialized).".to_string(),
+                ),
+                Some(statuses) => {
+                    let tools = crate::mcp::cached_tools();
+                    let truncated = crate::mcp::cached_truncated();
+                    for line in crate::core::format::render_mcp_panel(&statuses, &tools, truncated)
+                    {
+                        push_info(app, line);
+                    }
+                }
+            }
+        }
         "/resume" => {
             let sessions = Session::list(&app.cwd).unwrap_or_default();
             let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
@@ -486,7 +506,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         "/help" => {
             push_info(
                 app,
-                "commands: /quit /clear /new /session /resume [index|path] /permissions /name <n> /skill:<name> /model [<m>] /provider [<name>] /thinking [<level>|clear]"
+                "commands: /quit /clear /new /session /resume [index|path] /permissions /mcp /name <n> /skill:<name> /model [<m>] /provider [<name>] /thinking [<level>|clear]"
                     .to_string(),
             );
             push_info(

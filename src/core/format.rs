@@ -865,6 +865,135 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
     }
 }
 
+/// Ephemeral MCP status line for the compaction budget (`agent::loop`
+/// counts it via the `ephemerals` preamble without storing it in the
+/// transcript). `None` when no servers are configured so the budget is
+/// unaffected. The schema already tells the model which tools exist; this
+/// names what it is *not* seeing — down servers and schema-cap drops.
+pub(crate) fn mcp_status_line(statuses: &[crate::mcp::ServerStatus]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = statuses
+        .iter()
+        .map(|s| {
+            if s.state.as_str() == "up" {
+                format!("{} ({} tools)", s.name, s.tools)
+            } else {
+                format!("{} (down)", s.name)
+            }
+        })
+        .collect();
+    let dropped = crate::mcp::cached_truncated();
+    if dropped > 0 {
+        parts.push(format!("{dropped} tools omitted (schema cap)"));
+    }
+    Some(format!("MCP servers: {}", parts.join(", ")))
+}
+
+/// Multi-line `/mcp` panel in Claude Code style: one header with totals,
+/// then per server a `✓ name — N tools` line (with each tool + its one-line
+/// description indented beneath) or a `✗ name — down: <reason>` line.
+/// `tools` is the cached schema slice; only `mcp__<server>__*` entries
+/// (plus the synthetic `_read_resource` reader) belong to a server.
+/// `truncated` is the schema-cap drop count (`GET /api/mcp` carries it for
+/// remote clients whose own process counter is always zero). Pure function
+/// over snapshots so both TUIs share the render.
+pub(crate) fn render_mcp_panel(
+    statuses: &[crate::mcp::ServerStatus],
+    tools: &[crate::core::types::ToolDefinition],
+    truncated: usize,
+) -> Vec<String> {
+    if statuses.is_empty() {
+        return vec!["no MCP servers configured.".to_string()];
+    }
+    let up = statuses.iter().filter(|s| s.state.as_str() == "up").count();
+    let total_tools: usize = statuses.iter().map(|s| s.tools).sum();
+    let mut lines = vec![format!(
+        "MCP servers ({} connected, {} down · {} tools):",
+        up,
+        statuses.len() - up,
+        total_tools
+    )];
+    for server in statuses {
+        if server.state.as_str() == "up" {
+            lines.push(format!(
+                "✓ {} — {} tool{}",
+                server.name,
+                server.tools,
+                if server.tools == 1 { "" } else { "s" }
+            ));
+            let mut names: Vec<(&str, &str)> = tools
+                .iter()
+                .filter_map(|t| {
+                    short_mcp_tool(&server.name, &t.function.name)
+                        .map(|short| (short, t.function.description.as_str()))
+                })
+                .collect();
+            names.sort();
+            for (short, desc) in names {
+                let one_line = desc
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                lines.push(format!("  · {short} — {}", truncate_chars(&one_line, 100)));
+            }
+        } else {
+            let reason = server
+                .error
+                .as_deref()
+                .map(|e| {
+                    e.lines()
+                        .next()
+                        .unwrap_or("unknown error")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "not connected".to_string());
+            lines.push(format!(
+                "✗ {} — down: {}",
+                server.name,
+                truncate_chars(&reason, 160)
+            ));
+        }
+    }
+    if truncated > 0 {
+        lines.push(format!(
+            "… and {truncated} more tool{} hidden by the schema cap (DEX_MCP_MAX_TOOLS).",
+            if truncated == 1 { "" } else { "s" }
+        ));
+    }
+    lines
+}
+
+/// Strip the `mcp__<server>__` prefix (or the single-underscore synthetic
+/// `_read_resource` reader) down to the bare tool name. `None` when the
+/// tool belongs to a different server.
+fn short_mcp_tool<'a>(server: &'a str, full: &'a str) -> Option<&'a str> {
+    let prefix = format!("mcp__{server}__");
+    if let Some(short) = full.strip_prefix(&prefix) {
+        return Some(short);
+    }
+    full.strip_prefix(&format!("mcp__{server}_"))
+}
+
+/// Char-boundary-safe truncation with an ellipsis marker.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let end = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    format!("{}…", &text[..end])
+}
+
 /// Git branch + dirty flag for a working directory, for status displays.
 pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
     use std::process::Command;
@@ -1152,5 +1281,100 @@ mod tests {
         let sync_res = super::git_context(&cwd);
         let async_res = super::git_context_async(&cwd).await;
         assert_eq!(sync_res, async_res);
+    }
+
+    #[test]
+    fn mcp_status_line_empty_when_no_servers() {
+        assert_eq!(mcp_status_line(&[]), None);
+    }
+
+    #[test]
+    fn mcp_status_line_names_up_and_down_servers() {
+        use crate::mcp::ServerStatus;
+        let line = mcp_status_line(&[
+            ServerStatus {
+                name: "gh".to_string(),
+                state: "up".to_string(),
+                tools: 3,
+                error: None,
+            },
+            ServerStatus {
+                name: "db".to_string(),
+                state: "down".to_string(),
+                tools: 0,
+                error: Some("refused".to_string()),
+            },
+        ])
+        .expect("non-empty statuses produce a line");
+        assert!(line.contains("gh (3 tools)"), "{line}");
+        assert!(line.contains("db (down)"), "{line}");
+    }
+
+    #[test]
+    fn render_mcp_panel_lists_tools_and_down_servers() {
+        use crate::core::types::{FunctionDef, ToolDefinition};
+        use crate::mcp::ServerStatus;
+        let tool = |name: &str, description: &str| ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: serde_json::json!({}),
+            },
+        };
+        let lines = render_mcp_panel(
+            &[
+                ServerStatus {
+                    name: "gh".to_string(),
+                    state: "up".to_string(),
+                    tools: 2,
+                    error: None,
+                },
+                ServerStatus {
+                    name: "db".to_string(),
+                    state: "down".to_string(),
+                    tools: 0,
+                    error: Some("spawn sqlite-mcp: No such file\nmore".to_string()),
+                },
+            ],
+            &[
+                tool("mcp__gh__search", "Search issues\nand pull requests."),
+                tool("mcp__gh_read_resource", "Read a resource by URI."),
+                tool("mcp__other__x", "Belongs to another server."),
+            ],
+            0,
+        );
+        assert_eq!(lines[0], "MCP servers (1 connected, 1 down · 2 tools):");
+        assert_eq!(lines[1], "✓ gh — 2 tools");
+        // Prefix stripped, description collapsed to its first line.
+        assert!(lines.contains(&"  · read_resource — Read a resource by URI.".to_string()));
+        assert!(lines.contains(&"  · search — Search issues".to_string()));
+        assert!(!lines.iter().any(|l| l.contains("other")));
+        // Down server shows the first error line only.
+        assert_eq!(
+            lines.last().unwrap(),
+            "✗ db — down: spawn sqlite-mcp: No such file"
+        );
+    }
+
+    #[test]
+    fn render_mcp_panel_empty_and_truncated() {
+        let lines = render_mcp_panel(&[], &[], 0);
+        assert_eq!(lines, vec!["no MCP servers configured."]);
+        use crate::mcp::ServerStatus;
+        let lines = render_mcp_panel(
+            &[ServerStatus {
+                name: "gh".to_string(),
+                state: "up".to_string(),
+                tools: 1,
+                error: None,
+            }],
+            &[],
+            3,
+        );
+        assert!(lines
+            .last()
+            .unwrap()
+            .contains("3 more tools hidden by the schema cap"));
     }
 }

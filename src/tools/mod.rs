@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::agent::state::CancellationSource;
+use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::format::clamp_lines;
 use tokio::io::AsyncReadExt as _;
 
@@ -365,14 +365,7 @@ async fn run_bash_with_limits(
     // Async drain tasks (replace the 2 reader threads).
     let out_h = tokio::spawn(read_limited_async(stdout, max_bytes.saturating_add(1)));
     let err_h = tokio::spawn(read_limited_async(stderr, max_bytes.saturating_add(1)));
-    async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
-        loop {
-            if cancel.is_cancelled() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
+
     let status = tokio::select! {
         st = child.wait() => st.map_err(ToolError::Io)?,
         _ = tokio::time::sleep(timeout) => {
@@ -1165,7 +1158,7 @@ pub(crate) async fn execute(
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
     if name.starts_with("mcp__") {
-        let result = crate::mcp::call_global(name, args).await;
+        let result = crate::mcp::call_global(name, args, cancel).await;
         let outcome = match &result {
             Ok(_) => "ok".to_string(),
             Err(e) => e.clone(),
@@ -1897,6 +1890,24 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "cancel must preempt sleep without 25ms quanta pile-up"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_reports_error_outcome_for_loop_suppression() {
+        // Producer side of the cancel-during-IO contract: a fired token
+        // turns the tool into ok:false, so the loop neither caches nor
+        // replays it — and `execute_outcome` never derives success from text.
+        use crate::core::console::CancellationToken;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "command".to_string(),
+            serde_json::Value::String("sleep 30".to_string()),
+        );
+        let outcome = execute_outcome("bash", &args, &cancel).await;
+        assert!(!outcome.ok);
+        assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
     }
 
     #[tokio::test]
