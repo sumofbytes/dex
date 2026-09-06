@@ -68,6 +68,9 @@ futures-core = "0.3"
 uuid = { version = "1", features = ["v4"] }
 terminal-colorsaurus = "1.0.3"
 fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
+# MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
+base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 http = "1"
