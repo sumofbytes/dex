@@ -4,6 +4,7 @@ mod client;
 mod core;
 mod daemon;
 mod llm;
+mod mcp;
 mod protocol;
 mod session;
 mod skills;

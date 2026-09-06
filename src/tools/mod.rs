@@ -192,6 +192,16 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             requires_shell: false,
             permission: PermissionRequirement::Write,
         },
+        // MCP tools are external processes: most restrictive gate (`ask`
+        // unless trusted), same as shell. Resolved dynamically so cached
+        // server tools don't need a static entry each.
+        _ if name.starts_with("mcp__") => ToolMetadata {
+            read_only: false,
+            mutating: true,
+            idempotent: false,
+            requires_shell: true,
+            permission: PermissionRequirement::Shell,
+        },
         _ => return None,
     })
 }
@@ -1154,6 +1164,15 @@ pub(crate) async fn execute(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
+    if name.starts_with("mcp__") {
+        let result = crate::mcp::call_global(name, args).await;
+        let outcome = match &result {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.clone(),
+        };
+        audit(name, args, &outcome);
+        return result.map_err(ToolError::Internal);
+    }
     if metadata(name).is_none() {
         let error = ToolError::Unknown(name.to_string());
         audit(name, args, &error.to_string());
