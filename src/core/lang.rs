@@ -20,7 +20,7 @@ pub(crate) fn canonical_lang(token: &str) -> &'static str {
         "java" => "java",
         "c" | "h" => "c",
         "cpp" | "c++" | "hpp" | "cc" | "hh" | "cxx" => "cpp",
-        "csharp" | "cs" | "c#" => "csharp",
+        "csharp" | "c-sharp" | "cs" | "c#" => "csharp",
         "bash" | "sh" | "shell" | "zsh" | "console" | "terminal" | "sh-session"
         | "shell-session" => "bash",
         "json" | "jsonc" => "json",
@@ -51,6 +51,30 @@ pub(crate) fn lang_from_path(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let ext = ext.split(':').next().unwrap_or(&ext);
     canonical_lang(ext)
+}
+
+/// Fence info string -> highlight key (`ratatui-markdown::get_lang` only
+/// matches exact lowercase tags). Strips our legacy trailing `:`, drops
+/// params (`rust ignore`, `js linenums`), lowercases, then canonicalizes
+/// through [`canonical_lang`]. Unknown tags pass through raw so `get_lang`
+/// can still match its own native aliases; plain-text tags stay empty (dim).
+/// Shared by the TUI renderer (`ui::render::split_markdown`) and the headless
+/// `print_code_block`, so both paths agree on every fence.
+pub(crate) fn normalize_code_lang(info: &str) -> String {
+    let token = info
+        .trim()
+        .trim_end_matches(':')
+        .split([' ', '\t', ',', ';', '{', '}'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(':');
+    let lower = token.to_ascii_lowercase();
+    let canon = canonical_lang(&lower);
+    if canon.is_empty() {
+        lower
+    } else {
+        canon.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +123,7 @@ mod tests {
             ("run.sh", "console"),
             ("run.sh", "sh-session"),
             ("a.cs", "c#"),
+            ("a.cs", "c-sharp"),
             ("a.kt", "kt"),
             ("a.rb", "rb"),
         ] {
@@ -109,5 +134,26 @@ mod tests {
         assert_eq!(canonical_lang("dockerfile"), "dockerfile");
         assert_eq!(canonical_lang("sql"), "sql");
         assert_eq!(canonical_lang("text"), "");
+    }
+
+    #[test]
+    fn fence_aliases_canonicalize_to_compiled_grammars() {
+        // Shell/file-extension aliases must hit the compiled grammars instead
+        // of the dim fallback; shared by the TUI renderer and the headless
+        // `print_code_block`, so both paths agree on every fence.
+        assert_eq!(normalize_code_lang("c-sharp"), "csharp");
+        assert_eq!(normalize_code_lang("mjs"), "javascript");
+        assert_eq!(normalize_code_lang("jsx"), "javascript");
+        assert_eq!(normalize_code_lang("mts"), "typescript");
+        assert_eq!(normalize_code_lang("cts"), "typescript");
+        assert_eq!(normalize_code_lang("jsonc"), "json");
+        assert_eq!(normalize_code_lang("pyw"), "python");
+        assert_eq!(normalize_code_lang("hpp"), "cpp");
+        assert_eq!(normalize_code_lang("console"), "bash");
+        assert_eq!(normalize_code_lang("terminal"), "bash");
+        assert_eq!(normalize_code_lang("rs"), "rust");
+        // Params and legacy colons still strip.
+        assert_eq!(normalize_code_lang("rust ignore"), "rust");
+        assert_eq!(normalize_code_lang("bash:"), "bash");
     }
 }

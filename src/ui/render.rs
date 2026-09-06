@@ -122,29 +122,6 @@ pub(super) fn compute_layout(
     })
 }
 
-/// Fence info-string -> tree-sitter key (`ratatui-markdown::get_lang` only
-/// matches exact lowercase tags). Strips our legacy trailing `:`, drops
-/// params (`rust ignore`, `js linenums`), lowercases, then canonicalizes
-/// through `core::lang` (the same table file-extension lookup uses, so both
-/// paths agree). Unknown tags pass through raw so `get_lang` can still match
-/// its own native aliases; plain-text tags stay empty (dim).
-fn normalize_code_lang(info: &str) -> String {
-    let token = info
-        .trim()
-        .trim_end_matches(':')
-        .split([' ', '\t', ',', ';', '{', '}'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(':');
-    let lower = token.to_ascii_lowercase();
-    let canon = crate::core::lang::canonical_lang(&lower);
-    if canon.is_empty() {
-        lower
-    } else {
-        canon.to_string()
-    }
-}
-
 pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     let lines: Vec<&str> = s.lines().collect();
     let mut blocks = Vec::new();
@@ -152,7 +129,7 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     while i < lines.len() {
         let t = lines[i].trim_start();
         if t.starts_with("```") {
-            let lang = normalize_code_lang(t.trim_start_matches('`'));
+            let lang = crate::core::lang::normalize_code_lang(t.trim_start_matches('`'));
             let mut body = String::new();
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {
@@ -368,7 +345,9 @@ pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
         Span::styled("▸ ", Style::default().fg(Color::Yellow)),
         Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
     ];
-    if name == "bash" && !arg.is_empty() {
+    // Single-line commands only: highlight_code_block splits per row and
+    // only the first row is appended — multi-line would drop lines 2+.
+    if name == "bash" && !arg.is_empty() && !arg.contains('\n') {
         if let Some(mut rows) = highlight_code_block("bash", arg) {
             if let Some(first) = rows.first_mut() {
                 if !first.is_empty() {
@@ -406,7 +385,8 @@ pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> 
         } else {
             ("", detail)
         };
-        if !code.is_empty() {
+        // Single-line only (same first-row truncation as render_tool_input).
+        if !code.is_empty() && !code.contains('\n') {
             if let Some(mut rows) = highlight_code_block("bash", code) {
                 if let Some(first) = rows.first_mut() {
                     if !first.is_empty() {
@@ -2920,25 +2900,6 @@ mod tests {
     }
 
     #[test]
-    fn fence_aliases_canonicalize_to_compiled_grammars() {
-        // Shell/file-extension aliases must hit the compiled grammars instead
-        // of the plain-yellow fallback.
-        assert_eq!(normalize_code_lang("mjs"), "javascript");
-        assert_eq!(normalize_code_lang("jsx"), "javascript");
-        assert_eq!(normalize_code_lang("mts"), "typescript");
-        assert_eq!(normalize_code_lang("cts"), "typescript");
-        assert_eq!(normalize_code_lang("jsonc"), "json");
-        assert_eq!(normalize_code_lang("pyw"), "python");
-        assert_eq!(normalize_code_lang("hpp"), "cpp");
-        assert_eq!(normalize_code_lang("console"), "bash");
-        assert_eq!(normalize_code_lang("terminal"), "bash");
-        assert_eq!(normalize_code_lang("rs"), "rust");
-        // Params and legacy colons still strip.
-        assert_eq!(normalize_code_lang("rust ignore"), "rust");
-        assert_eq!(normalize_code_lang("bash:"), "bash");
-    }
-
-    #[test]
     fn bash_tool_input_highlights_while_other_tools_stay_dim() {
         // A bash command with a string + comment must split into styled spans
         // past the `\u25b8 bash ` prefix; a plain tool arg stays one dim span.
@@ -2951,6 +2912,13 @@ mod tests {
         let line = render_tool_input("read", "src/main.rs:1-20");
         // indent + `\u25b8 ` + name + dim arg: no highlight split.
         assert_eq!(line.spans.len(), 4, "{line:?}");
+
+        // Multi-line bash keeps the full dim arg (highlighting splits per
+        // row; appending only the first would silently drop lines 2+).
+        let line = render_tool_input("bash", "echo a\necho b");
+        assert_eq!(line.spans.len(), 4, "{line:?}");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('\n'), "{text}");
     }
 
     #[test]
@@ -2962,6 +2930,11 @@ mod tests {
         let line = render_approval_detail("read", "path: src/main.rs");
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+
+        // Multi-line code stays one full-detail span (never truncated).
+        let line = render_approval_detail("bash", "$ echo a\necho b");
+        assert_eq!(line.spans.len(), 1);
+        assert!(line.spans[0].content.contains('\n'), "{line:?}");
     }
 
     #[test]

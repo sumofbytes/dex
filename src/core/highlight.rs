@@ -5,7 +5,6 @@ use ratatui::text::Span;
 use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter};
 use ratatui_markdown::CodeColors;
 
-use super::lang::canonical_lang;
 use super::palette::{fg_rgb, muted_rgb};
 use crate::core::console::RESET;
 
@@ -17,14 +16,9 @@ const DIM: &str = "\x1b[2m";
 /// Tree-sitter misses (sql, dockerfile, unknown) fall back to the generic
 /// lexer below instead of dim.
 pub(crate) fn print_code_block(lang: &str, body: &str) {
-    let lower = lang.to_ascii_lowercase();
-    let canon = canonical_lang(&lower);
-    let tag = if canon.is_empty() {
-        lower.as_str()
-    } else {
-        canon
-    };
-    if let Some(colored) = highlight_ansi(tag, body).or_else(|| fallback_highlight_ansi(tag, body))
+    let tag = super::lang::normalize_code_lang(lang);
+    if let Some(colored) =
+        highlight_ansi(&tag, body).or_else(|| fallback_highlight_ansi(&tag, body))
     {
         print!("{colored}");
     } else {
