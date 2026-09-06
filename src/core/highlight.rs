@@ -215,7 +215,9 @@ fn heading_body(t: &str) -> Option<&str> {
     if !(1..=6).contains(&hashes) {
         return None;
     }
-    t[hashes..].strip_prefix(' ').or(t[hashes..].strip_prefix('\t'))
+    t[hashes..]
+        .strip_prefix(' ')
+        .or(t[hashes..].strip_prefix('\t'))
 }
 
 fn task_body(t: &str) -> Option<(&str, bool)> {
@@ -243,7 +245,9 @@ fn is_headless_ordered(t: &str) -> bool {
 fn is_headless_hr(t: &str) -> bool {
     let s: String = t.chars().filter(|c| !c.is_whitespace()).collect();
     s.len() >= 3
-        && s.chars().next().is_some_and(|c| matches!(c, '-' | '*' | '_'))
+        && s.chars()
+            .next()
+            .is_some_and(|c| matches!(c, '-' | '*' | '_'))
         && {
             let c = s.chars().next().unwrap();
             s.chars().all(|x| x == c)
@@ -269,7 +273,10 @@ pub(crate) fn render_markdown_line(line: &str) -> String {
     }
     if let Some(rest) = trimmed.strip_prefix('>') {
         let body = rest.strip_prefix(' ').unwrap_or(rest);
-        return format!("\x1b[2m│\x1b[0m \x1b[3m{}\x1b[0m", render_inline(body.trim_start()));
+        return format!(
+            "\x1b[2m│\x1b[0m \x1b[3m{}\x1b[0m",
+            render_inline(body.trim_start())
+        );
     }
     if let Some((body, checked)) = task_body(trimmed) {
         let box_glyph = if checked { "☑" } else { "☐" };
@@ -284,10 +291,20 @@ pub(crate) fn render_markdown_line(line: &str) -> String {
     }
     if is_headless_ordered(trimmed) {
         // Keep the number (industry standard); style the body only.
-        let digits = trimmed.len() - trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let digits = trimmed.len()
+            - trimmed
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .len();
         let (num, sep_body) = trimmed.split_at(digits);
-        let body = sep_body.strip_prefix(". ").or(sep_body.strip_prefix(") ")).unwrap_or(sep_body);
-        let sep = if sep_body.starts_with(". ") { ". " } else { ") " };
+        let body = sep_body
+            .strip_prefix(". ")
+            .or(sep_body.strip_prefix(") "))
+            .unwrap_or(sep_body);
+        let sep = if sep_body.starts_with(". ") {
+            ". "
+        } else {
+            ") "
+        };
         return format!("\x1b[2m{num}{sep}\x1b[0m{}", render_inline(body));
     }
     render_inline(trimmed)
@@ -399,12 +416,22 @@ mod tests {
 
     #[test]
     fn markdown_render_headings_bullets() {
-        assert_eq!(render_markdown_line("# Title"), "\x1b[1m# Title\x1b[0m");
+        // Industry standard (glow/mdcat): `#` markers are stripped, H1 gets
+        // underline, H2+ bold; bullets collapse to `•`.
+        assert_eq!(render_markdown_line("# Title"), "\x1b[1;4mTitle\x1b[0m");
+        assert_eq!(render_markdown_line("## Sub"), "\x1b[1mSub\x1b[0m");
+        assert_eq!(render_markdown_line("### Deep"), "\x1b[1mDeep\x1b[0m");
         assert_eq!(render_markdown_line("- item"), "\x1b[2m•\x1b[0m item");
+        assert_eq!(render_markdown_line("+ plus"), "\x1b[2m•\x1b[0m plus");
         assert_eq!(
             render_markdown_line("  - indented"),
             "\x1b[2m•\x1b[0m indented"
         );
+        assert_eq!(render_markdown_line("1. first"), "\x1b[2m1. \x1b[0mfirst");
+        assert_eq!(render_markdown_line("- [x] done"), "\x1b[2m☑\x1b[0m done");
+        assert_eq!(render_markdown_line("---"), "\x1b[2m───\x1b[0m");
+        assert_eq!(render_markdown_line("***"), "\x1b[2m───\x1b[0m");
+        assert!(render_markdown_line("> quote").contains('│'));
         assert_eq!(render_markdown_line("plain text"), "plain text");
     }
 

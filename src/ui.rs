@@ -924,7 +924,7 @@ fn read_preview_lang(app: &App) -> String {
         .strip_prefix('▸')
         .unwrap_or(&text)
         .trim_start();
-    let arg = arg.splitn(2, ' ').nth(1).unwrap_or("").trim();
+    let arg = arg.split_once(' ').map(|x| x.1).unwrap_or("").trim();
     // First token only (`path:1-20` → `path`); globs keep their extension.
     let path = arg.split_whitespace().next().unwrap_or("");
     let path = path.split(':').next().unwrap_or(path);
@@ -1489,6 +1489,59 @@ mod tests {
         }
         assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
         assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
+    }
+
+    #[test]
+    fn read_preview_highlights_code_and_keeps_gutter_dim() {
+        // Industry standard (opencode/Claude Code): read snippets highlight
+        // by extension; the `{:>4}  ` gutter stays dim for alignment.
+        let mut app = test_app();
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("read src/main.rs:1-2".into()),
+        );
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "read".into(),
+                summary: "v 2 lines".into(),
+                success: true,
+                preview: vec!["   1  fn main() {}".into(), "… +1 more lines".into()],
+                duration: 0.0,
+            },
+        );
+        let TranscriptBlock::Tool { preview, .. } = &app.transcript[0] else {
+            panic!("expected Tool block");
+        };
+        assert_eq!(preview.len(), 2);
+        // Code row: indent + dim gutter + at least one highlighted span.
+        // spans[0] is the transcript indent (unstyled), spans[1] the gutter.
+        let gutter: String = preview[0].spans[1]
+            .content
+            .as_ref()
+            .chars()
+            .chain(
+                preview[0]
+                    .spans
+                    .get(2)
+                    .map(|s| s.content.as_ref())
+                    .unwrap_or("")
+                    .chars(),
+            )
+            .collect();
+        assert!(gutter.contains('1'), "{gutter}");
+        assert_eq!(preview[0].spans[1].style.fg, Some(theme::tool_preview_fg()));
+        assert!(
+            preview[0].spans[2..]
+                .iter()
+                .any(|s| s.style.fg != Some(theme::tool_preview_fg())),
+            "code should highlight, got {:?}",
+            preview[0]
+        );
+        // Tail row stays dim (spans[0] is the unstyled indent gutter).
+        assert!(preview[1].spans[1..]
+            .iter()
+            .all(|s| s.style.fg == Some(theme::tool_preview_fg())));
     }
 
     /// Write a minimal persisted session JSONL (same entry shapes

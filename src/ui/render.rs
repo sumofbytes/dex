@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{block::Padding, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui_markdown::highlight::{HighlightHooks, TreeSitterHighlighter};
+use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks, TreeSitterHighlighter};
 use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 use ratatui_markdown::ThemeConfig;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -214,7 +214,9 @@ fn heading_text(t: &str) -> Option<&str> {
     if !(1..=6).contains(&hashes) {
         return None;
     }
-    t[hashes..].strip_prefix(' ').or(t[hashes..].strip_prefix('\t'))
+    t[hashes..]
+        .strip_prefix(' ')
+        .or(t[hashes..].strip_prefix('\t'))
 }
 
 fn heading_level(t: &str) -> usize {
@@ -236,7 +238,11 @@ fn is_hr(t: &str) -> bool {
 /// allows `>quote`). Empty `>` is a blank quote line.
 fn blockquote_text(t: &str) -> Option<&str> {
     let rest = t.strip_prefix('>')?;
-    Some(rest.strip_prefix(' ').or(rest.strip_prefix('\t')).unwrap_or(rest))
+    Some(
+        rest.strip_prefix(' ')
+            .or(rest.strip_prefix('\t'))
+            .unwrap_or(rest),
+    )
 }
 
 fn is_blockquote(t: &str) -> bool {
@@ -433,7 +439,10 @@ pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
             continue;
         } else {
             let curr_table = is_table_line(t);
-            if !prev.is_empty() && !t.is_empty() && !is_continuation(prev, prev_table, t, curr_table) {
+            if !prev.is_empty()
+                && !t.is_empty()
+                && !is_continuation(prev, prev_table, t, curr_table)
+            {
                 let starts_block =
                     is_block_start(t) || is_ordered_item(t) || (curr_table && !prev_table);
                 if air || starts_block {
@@ -453,7 +462,12 @@ pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
 /// Trailing air: prose after one of these needs exactly one blank line
 /// (MD022/MD032/MD058). Plain prose needs none (soft break stays joined).
 fn needs_air_after(t: &str, is_table: bool) -> bool {
-    is_table || is_heading(t) || is_hr(t) || is_blockquote(t) || list_kind(t) > 0 || task_text(t).is_some()
+    is_table
+        || is_heading(t)
+        || is_hr(t)
+        || is_blockquote(t)
+        || list_kind(t) > 0
+        || task_text(t).is_some()
 }
 
 /// Tight-inside continuity: same-list items, consecutive table rows and
@@ -500,7 +514,7 @@ pub(super) fn lang_from_path(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     // Strip `:line` / `:line-col` goto suffixes (`main.rs:12-20`).
     let ext = ext.split(':').next().unwrap_or(&ext);
-    match ext.as_str() {
+    match ext {
         "rs" => "rust",
         "py" | "pyw" => "python",
         "js" | "mjs" | "cjs" | "jsx" => "javascript",
@@ -554,11 +568,8 @@ pub(super) fn highlight_code_spans(lang: &str, code: &str) -> Option<Vec<Span<'s
         }
     }
     if pos < code.len() {
-        if let Some(tail) = code.get(pos..) {
-            out.push(Span::raw(tail.to_string()));
-        } else {
-            return None;
-        }
+        let tail = code.get(pos..)?;
+        out.push(Span::raw(tail.to_string()));
     }
     Some(out)
 }
@@ -2697,10 +2708,30 @@ mod tests {
     fn block_gaps_whole_message_replay() {
         let msg = "Here's what I did:\n## Changes\n- Refactored the loop\n- Added a cache\n### Verification\ncargo test passed.\n1. run tests\n2. commit\nAll good.";
         let out = with_block_gaps("", msg);
+        // Industry standard (MD022/MD032): blank around headings AND around
+        // the list block — including after it, before trailing prose.
         assert_eq!(
             out,
-            "Here's what I did:\n\n## Changes\n\n- Refactored the loop\n- Added a cache\n\n### Verification\n\ncargo test passed.\n\n1. run tests\n2. commit\nAll good.\n"
+            "Here's what I did:\n\n## Changes\n\n- Refactored the loop\n- Added a cache\n\n### Verification\n\ncargo test passed.\n\n1. run tests\n2. commit\n\nAll good.\n"
         );
+    }
+
+    #[test]
+    fn block_gaps_cover_hr_quote_table_and_plus() {
+        // HR variants, `>` without space, `+` bullets and tables all behave
+        // like blocks: blank before/after, tight inside.
+        let out = with_block_gaps("", "text\n***\nmore");
+        assert_eq!(out, "text\n\n***\n\nmore\n");
+        let out = with_block_gaps("", "text\n> quote\nmore");
+        assert_eq!(out, "text\n\n> quote\n\nmore\n");
+        let out = with_block_gaps("", "> a\n> b\n");
+        assert_eq!(out, "> a\n> b\n");
+        let out = with_block_gaps("", "text\n+ a\n+ b\nmore");
+        assert_eq!(out, "text\n\n+ a\n+ b\n\nmore\n");
+        let out = with_block_gaps("", "#### Deep\ntext");
+        assert_eq!(out, "#### Deep\n\ntext\n");
+        let out = with_block_gaps("", "- [X] done\nmore");
+        assert_eq!(out, "- [X] done\n\nmore\n");
     }
 
     #[test]
@@ -2760,6 +2791,17 @@ mod tests {
             matches!(blocks[0], MarkdownBlock::Paragraph(_)),
             "{blocks:?}"
         );
+    }
+
+    #[test]
+    fn preview_lang_maps_extensions_and_highlights() {
+        assert_eq!(lang_from_path("src/main.rs"), "rust");
+        assert_eq!(lang_from_path("a.py:12-20"), "python");
+        assert_eq!(lang_from_path("*.tsx"), "typescript");
+        assert_eq!(lang_from_path("2 files"), "");
+        assert!(highlight_code_spans("rust", "fn main() {}").is_some());
+        assert!(highlight_code_spans("", "fn main() {}").is_none());
+        assert!(highlight_code_spans("no-such-lang", "text").is_none());
     }
 
     #[test]
