@@ -50,26 +50,30 @@ impl StreamPrinter {
 
     /// Blank line needed before headless `line` (never inside fences, never
     /// doubled, never between tight-continuation rows like list items).
+    /// Uses the shared rule (`core::markdown`) — the same one the TUI
+    /// throttle normalizes with — so both renderers agree on air.
     fn headless_gap(&self, line: &str) -> bool {
+        use crate::core::markdown as md;
         if line.trim().is_empty() {
             return false;
         }
-        if crate::core::highlight::markdown_is_continuation(&self.headless_prev, line) {
+        if md::is_continuation_lines(&self.headless_prev, line) {
             return false;
         }
-        self.headless_air
-            || crate::core::highlight::markdown_needs_gap(self.headless_empty, self.in_code, line)
+        self.headless_air || md::needs_gap_before(self.headless_empty, self.in_code, line)
     }
 
     fn headless_note(&mut self, line: &str) {
+        use crate::core::markdown as md;
         if line.trim().is_empty() {
             self.headless_empty = true;
             self.headless_air = false;
             self.headless_prev.clear();
         } else {
+            let t = line.trim_start();
             self.headless_empty = false;
-            self.headless_air = crate::core::highlight::markdown_leaves_air(line);
-            self.headless_prev = line.trim_start().to_string();
+            self.headless_air = md::block_leaves_air(t, md::is_table_line(t));
+            self.headless_prev = t.to_string();
         }
     }
 

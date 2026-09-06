@@ -142,143 +142,26 @@ pub(crate) fn print_markdown_text(line: &str) {
     println!("{}", render_markdown_line(line));
 }
 
-/// Whether `curr` (trimmed) starts a block that wants exactly one blank line
-/// before it when it follows prose (CommonMark / markdownlint MD022/MD032 —
-/// same rule as the TUI's `with_block_gaps`, mirrored for headless output).
-pub(crate) fn markdown_needs_gap(prev_empty: bool, prev_fenced: bool, curr: &str) -> bool {
-    if prev_empty || prev_fenced || curr.trim().is_empty() {
-        return false;
-    }
-    let t = curr.trim_start();
-    t.starts_with("```")
-        || heading_body(t).is_some()
-        || is_headless_hr(t)
-        || t.starts_with('>')
-        || t.starts_with("- ")
-        || t.starts_with("* ")
-        || t.starts_with("+ ")
-        || task_body(t).is_some()
-        || is_headless_ordered(t)
-        || is_headless_table_row(t)
-}
-
-/// Tight-inside continuity for headless output (mirrors the TUI): same-list
-/// items, consecutive table rows and consecutive quote lines never get air
-/// between them.
-pub(crate) fn markdown_is_continuation(prev: &str, curr: &str) -> bool {
-    let p = prev.trim_start();
-    let c = curr.trim_start();
-    if is_headless_table_row(p) && is_headless_table_row(c) {
-        return true;
-    }
-    let pk = headless_list_kind(p);
-    let ck = headless_list_kind(c);
-    if ck > 0 && ck == pk {
-        return true;
-    }
-    if task_body(c).is_some() && task_body(p).is_some() {
-        return true;
-    }
-    if c.starts_with('>') && p.starts_with('>') {
-        return true;
-    }
-    false
-}
-
-fn headless_list_kind(t: &str) -> u8 {
-    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
-        1
-    } else if is_headless_ordered(t) {
-        2
-    } else {
-        0
-    }
-}
-
-/// Whether `curr` leaves trailing air: prose right after it wants a blank
-/// line (headings, rules, quotes, lists, tables, fence-close).
-pub(crate) fn markdown_leaves_air(line: &str) -> bool {
-    let t = line.trim_start();
-    heading_body(t).is_some()
-        || is_headless_hr(t)
-        || t.starts_with('>')
-        || t.starts_with("- ")
-        || t.starts_with("* ")
-        || t.starts_with("+ ")
-        || task_body(t).is_some()
-        || is_headless_ordered(t)
-        || is_headless_table_row(t)
-}
-
-fn heading_body(t: &str) -> Option<&str> {
-    let hashes = t.len() - t.trim_start_matches('#').len();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    t[hashes..]
-        .strip_prefix(' ')
-        .or(t[hashes..].strip_prefix('\t'))
-}
-
-fn task_body(t: &str) -> Option<(&str, bool)> {
-    for marker in ["- ", "* ", "+ "] {
-        if let Some(rest) = t.strip_prefix(marker) {
-            if let Some(text) = rest.strip_prefix("[ ] ") {
-                return Some((text, false));
-            }
-            if let Some(text) = rest.strip_prefix("[x] ").or(rest.strip_prefix("[X] ")) {
-                return Some((text, true));
-            }
-        }
-    }
-    None
-}
-
-fn is_headless_ordered(t: &str) -> bool {
-    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    (1..=3).contains(&digits) && {
-        let rest = &t[digits..];
-        rest.starts_with(". ") || rest.starts_with(") ")
-    }
-}
-
-fn is_headless_hr(t: &str) -> bool {
-    let s: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-    s.len() >= 3
-        && s.chars()
-            .next()
-            .is_some_and(|c| matches!(c, '-' | '*' | '_'))
-        && {
-            let c = s.chars().next().unwrap();
-            s.chars().all(|x| x == c)
-        }
-}
-
-fn is_headless_table_row(t: &str) -> bool {
-    t.contains('|') && t.trim().len() > 1
-}
-
 pub(crate) fn render_markdown_line(line: &str) -> String {
+    use super::markdown as md;
     let trimmed = line.trim_start();
-    if let Some(body) = heading_body(trimmed) {
+    if let Some(body) = md::heading_text(trimmed) {
         // Strip the `#` markers (glow/mdcat style); H1 gets underline.
-        let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
-        if hashes == 1 {
+        if md::heading_level(trimmed) == 1 {
             return format!("\x1b[1;4m{}\x1b[0m", render_inline(body));
         }
         return format!("\x1b[1m{}\x1b[0m", render_inline(body));
     }
-    if is_headless_hr(trimmed) {
+    if md::is_hr(trimmed) {
         return "\x1b[2m───\x1b[0m".to_string();
     }
-    if let Some(rest) = trimmed.strip_prefix('>') {
-        let body = rest.strip_prefix(' ').unwrap_or(rest);
+    if let Some(body) = md::blockquote_text(trimmed) {
         return format!(
             "\x1b[2m│\x1b[0m \x1b[3m{}\x1b[0m",
             render_inline(body.trim_start())
         );
     }
-    if let Some((body, checked)) = task_body(trimmed) {
+    if let Some((body, checked)) = md::task_text(trimmed) {
         let box_glyph = if checked { "☑" } else { "☐" };
         return format!("\x1b[2m{box_glyph}\x1b[0m {}", render_inline(body));
     }
@@ -289,7 +172,7 @@ pub(crate) fn render_markdown_line(line: &str) -> String {
     {
         return format!("\x1b[2m•\x1b[0m {}", render_inline(rest));
     }
-    if is_headless_ordered(trimmed) {
+    if md::is_ordered_item(trimmed) {
         // Keep the number (industry standard); style the body only.
         let digits = trimmed.len()
             - trimmed

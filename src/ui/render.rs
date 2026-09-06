@@ -16,6 +16,7 @@ use super::TAB_WIDTH;
 use super::{
     theme, transcript_indent, App, InputField, Selection, WrappedBlock, TRANSCRIPT_INDENT,
 };
+use crate::core::markdown as md;
 
 pub(super) fn surface_padding() -> Padding {
     Padding {
@@ -139,22 +140,22 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
             }
             i += 1;
             blocks.push(MarkdownBlock::code_block(lang, body));
-        } else if let Some(rest) = heading_text(t) {
+        } else if let Some(rest) = md::heading_text(t) {
             // H1-H3 map to their block; H4-H6 render as H3 (crate has no
             // H4+ variant — same as upstream parsers and glow/mdcat).
-            match heading_level(t) {
+            match md::heading_level(t) {
                 1 => blocks.push(MarkdownBlock::Heading1(rest.to_string())),
                 2 => blocks.push(MarkdownBlock::Heading2(rest.to_string())),
                 _ => blocks.push(MarkdownBlock::Heading3(rest.to_string())),
             }
             i += 1;
-        } else if is_hr(t) {
+        } else if md::is_hr(t) {
             blocks.push(MarkdownBlock::HorizontalRule);
             i += 1;
-        } else if let Some(rest) = blockquote_text(t) {
+        } else if let Some(rest) = md::blockquote_text(t) {
             blocks.push(MarkdownBlock::blockquote_text(rest.to_string()));
             i += 1;
-        } else if let Some((rest, checked)) = task_text(t) {
+        } else if let Some((rest, checked)) = md::task_text(t) {
             blocks.push(MarkdownBlock::TaskItem {
                 text: rest.to_string(),
                 indent: 0,
@@ -173,12 +174,12 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
         } else if t.is_empty() {
             blocks.push(MarkdownBlock::BlankLine);
             i += 1;
-        } else if is_table_start(&lines, i) {
+        } else if md::is_table_start(&lines, i) {
             // Header + delimiter confirmed: buffer the whole table. Rows
             // accumulate until a non-table line (or a blank line) ends it.
             let mut buf = vec![lines[i].trim().to_string()];
             i += 1;
-            while i < lines.len() && is_table_line(lines[i].trim()) {
+            while i < lines.len() && md::is_table_line(lines[i].trim()) {
                 buf.push(lines[i].trim().to_string());
                 i += 1;
             }
@@ -189,8 +190,8 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
             let mut para = Vec::new();
             while i < lines.len()
                 && !lines[i].trim_start().is_empty()
-                && !is_block_start(lines[i].trim_start())
-                && !is_table_start(&lines, i)
+                && !md::is_block_start(lines[i].trim_start())
+                && !md::is_table_start(&lines, i)
             {
                 para.push(lines[i].to_string());
                 i += 1;
@@ -203,119 +204,6 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
         }
     }
     blocks
-}
-
-/// ATX heading text for H1-H6 (`# ` … `###### `), like CommonMark (up to
-/// 3 leading spaces already trimmed by callers). Returns the text after the
-/// markers. Deeper levels are handled by callers (mapped to H3). Mirrors
-/// glow/mdcat/opencode: `#` markers never render literally.
-fn heading_text(t: &str) -> Option<&str> {
-    let hashes = t.len() - t.trim_start_matches('#').len();
-    if !(1..=6).contains(&hashes) {
-        return None;
-    }
-    t[hashes..]
-        .strip_prefix(' ')
-        .or(t[hashes..].strip_prefix('\t'))
-}
-
-fn heading_level(t: &str) -> usize {
-    t.len() - t.trim_start_matches('#').len()
-}
-
-/// Setext-style horizontal rule: 3+ of `-`/`*`/`_` (CommonMark / markdownlint
-/// MD035). `***` and `___` are rules, not emphasis, when alone on a line.
-fn is_hr(t: &str) -> bool {
-    let s: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-    if s.len() < 3 {
-        return false;
-    }
-    let c = s.chars().next().unwrap();
-    matches!(c, '-' | '*' | '_') && s.chars().all(|x| x == c)
-}
-
-/// Blockquote body for `>` with or without a following space (CommonMark
-/// allows `>quote`). Empty `>` is a blank quote line.
-fn blockquote_text(t: &str) -> Option<&str> {
-    let rest = t.strip_prefix('>')?;
-    Some(
-        rest.strip_prefix(' ')
-            .or(rest.strip_prefix('\t'))
-            .unwrap_or(rest),
-    )
-}
-
-fn is_blockquote(t: &str) -> bool {
-    t.starts_with('>')
-}
-
-/// Task item body + checked flag for `- [ ]`, `- [x]`/`- [X]` (and `*`/`+`
-/// variants), like GitHub / opencode.
-fn task_text(t: &str) -> Option<(&str, bool)> {
-    for marker in ["- ", "* ", "+ "] {
-        if let Some(rest) = t.strip_prefix(marker) {
-            if let Some(text) = rest.strip_prefix("[ ] ") {
-                return Some((text, false));
-            }
-            if let Some(text) = rest.strip_prefix("[x] ").or(rest.strip_prefix("[X] ")) {
-                return Some((text, true));
-            }
-        }
-    }
-    None
-}
-
-fn is_block_start(t: &str) -> bool {
-    t.starts_with("```")
-        || heading_text(t).is_some()
-        || is_hr(t)
-        || is_blockquote(t)
-        || t.starts_with("- ")
-        || t.starts_with("* ")
-        || t.starts_with("+ ")
-        || task_text(t).is_some()
-}
-
-/// A GFM pipe-table line: `| a | b |`, `a | b | c`, `|---|:---:|`. Mirrors
-/// the crate's `MarkdownRenderer` table detection so both agree on what is
-/// buffered as a table candidate. Also used by the streaming buffer in
-/// `ui.rs` to hold markdown flushes until a table is complete.
-pub(super) fn is_table_line(t: &str) -> bool {
-    let t = t.trim();
-    if t.is_empty() || !t.contains('|') {
-        return false;
-    }
-    if t.starts_with('|') && t.ends_with('|') && t.len() > 1 {
-        return true;
-    }
-    let pipe_count = t.chars().filter(|&c| c == '|').count();
-    if pipe_count < 2 {
-        return false;
-    }
-    let non_sep = t
-        .chars()
-        .filter(|c| !matches!(c, '|' | '-' | ':' | ' '))
-        .count();
-    if non_sep > 0 {
-        return true;
-    }
-    let sep_chars: Vec<char> = t.chars().filter(|c| !matches!(c, '|' | ' ')).collect();
-    !sep_chars.is_empty() && sep_chars.iter().all(|c| *c == '-' || *c == ':')
-}
-
-/// A GFM delimiter row: only `|`, `-`, `:` and spaces with at least one dash.
-fn is_table_delimiter(t: &str) -> bool {
-    let t = t.trim();
-    !t.is_empty() && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
-}
-
-/// A table starts at line `i` when the line is a table line and the next
-/// line is a delimiter row (GFM requires the header + separator pair).
-fn is_table_start(lines: &[&str], i: usize) -> bool {
-    is_table_line(lines[i].trim())
-        && lines
-            .get(i + 1)
-            .is_some_and(|n| is_table_delimiter(n.trim()))
 }
 
 /// Split a table row into cells: outer pipes are structural, `\|` is a
@@ -354,142 +242,17 @@ fn split_table_row(line: &str) -> Vec<String> {
 /// delimiter row separates the header from the body; a table whose first
 /// line is itself a delimiter is not a table (fall back to a paragraph).
 fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
-    let sep = buf.iter().position(|l| is_table_delimiter(l))?;
+    let sep = buf.iter().position(|l| md::is_table_delimiter(l))?;
     if sep == 0 {
         return None;
     }
     let headers = split_table_row(&buf[sep - 1]);
     let rows: Vec<Vec<String>> = buf[sep + 1..]
         .iter()
-        .filter(|l| !is_table_delimiter(l))
+        .filter(|l| !md::is_table_delimiter(l))
         .map(|l| split_table_row(l))
         .collect();
     Some(MarkdownBlock::Table { headers, rows })
-}
-
-fn is_heading(t: &str) -> bool {
-    heading_text(t).is_some()
-}
-
-/// Ordered-list marker (`1. `, `12) `) — models often butt these against
-/// prose without a blank line.
-fn is_ordered_item(t: &str) -> bool {
-    let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    if !(1..=3).contains(&digits) {
-        return false;
-    }
-    let rest = &t[digits..];
-    rest.starts_with(". ") || rest.starts_with(") ")
-}
-
-/// List continuity class: consecutive items of the same class stay tight
-/// (industry standard: tight inside a list, blank around it).
-fn list_kind(t: &str) -> u8 {
-    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
-        1
-    } else if is_ordered_item(t) {
-        2
-    } else {
-        0
-    }
-}
-
-/// Blanks around block-level markdown (CommonMark / markdownlint MD022,
-/// MD031, MD032, MD058 — the same rule glow/mdcat/opencode/Claude Code
-/// follow): exactly one blank line before AND after each heading, fence,
-/// list block, table, rule and quote; tight inside lists, tables and quotes.
-/// `pending` is the assistant text already buffered for the streaming seam
-/// (or empty for whole-message replay). Never inserts inside code fences;
-/// existing blank lines are never doubled.
-pub(super) fn with_block_gaps(pending: &str, s: &str) -> String {
-    let trimmed = pending.strip_suffix('\n').unwrap_or(pending);
-    let mut prev: &str = trimmed.rsplit('\n').next().unwrap_or("").trim_start();
-    // Leak a small owned copy only when the seam splits a table: the
-    // borrowed `prev` points into `pending`, but table continuity needs the
-    // trimmed first line of the new chunk when `pending` is empty of it.
-    // ponytail: keep the hot path borrow-only; no allocation per line.
-    let mut prev_table = is_table_line(prev);
-    let mut air = needs_air_after(prev, prev_table);
-    let mut fenced = trimmed
-        .lines()
-        .filter(|l| l.trim_start().starts_with("```"))
-        .count()
-        % 2
-        == 1;
-    let mut out = String::new();
-    for line in s.lines() {
-        let t = line.trim_start();
-        if t.starts_with("```") {
-            if !fenced && !prev.is_empty() {
-                out.push('\n');
-            }
-            fenced = !fenced;
-            if !fenced {
-                // closing fence gets air after it too
-                air = true;
-                prev_table = false;
-                // Point `prev` at something non-empty/block so the next
-                // prose line sees the air. `t` borrows `line` (ends this
-                // iteration), so use a static fence marker instead.
-                prev = "```";
-            }
-        } else if fenced {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        } else {
-            let curr_table = is_table_line(t);
-            if !prev.is_empty()
-                && !t.is_empty()
-                && !is_continuation(prev, prev_table, t, curr_table)
-            {
-                let starts_block =
-                    is_block_start(t) || is_ordered_item(t) || (curr_table && !prev_table);
-                if air || starts_block {
-                    out.push('\n');
-                }
-            }
-            prev = t;
-            prev_table = curr_table;
-            air = needs_air_after(t, curr_table);
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-/// Trailing air: prose after one of these needs exactly one blank line
-/// (MD022/MD032/MD058). Plain prose needs none (soft break stays joined).
-fn needs_air_after(t: &str, is_table: bool) -> bool {
-    is_table
-        || is_heading(t)
-        || is_hr(t)
-        || is_blockquote(t)
-        || list_kind(t) > 0
-        || task_text(t).is_some()
-}
-
-/// Tight-inside continuity: same-list items, consecutive table rows and
-/// consecutive quote lines never get air between them.
-fn is_continuation(prev: &str, prev_table: bool, curr: &str, curr_table: bool) -> bool {
-    if curr_table && prev_table {
-        return true;
-    }
-    let kt = list_kind(curr);
-    if kt > 0 && kt == list_kind(prev) {
-        return true;
-    }
-    // Task items share the `-`/`*`/`+` prefix, so `list_kind` already covers
-    // `- [ ]` → `- [ ]`; keep the explicit check for `* [x]` → `- [x]`
-    // style switches which read as one list to a human.
-    if task_text(curr).is_some() && task_text(prev).is_some() {
-        return true;
-    }
-    if is_blockquote(curr) && is_blockquote(prev) {
-        return true;
-    }
-    false
 }
 
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
@@ -507,71 +270,197 @@ fn highlighter() -> Arc<TreeSitterHighlighter> {
         .clone()
 }
 
-/// Tree-sitter language for a file path, covering the grammars compiled in
-/// via Cargo features plus common aliases other agents highlight (opencode
-/// highlights reads by extension; unknown extensions stay dim).
-pub(super) fn lang_from_path(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    // Strip `:line` / `:line-col` goto suffixes (`main.rs:12-20`).
-    let ext = ext.split(':').next().unwrap_or(&ext);
-    match ext {
-        "rs" => "rust",
-        "py" | "pyw" => "python",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        "ts" | "mts" | "cts" | "tsx" => "typescript",
-        "go" => "go",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cpp" | "hpp" | "cc" | "hh" | "cxx" => "cpp",
-        "json" | "jsonc" => "json",
-        "toml" => "toml",
-        "yaml" | "yml" => "yaml",
-        "sh" | "bash" | "zsh" => "bash",
-        _ => "",
-    }
-}
-
-/// Highlighted spans for one code line, or `None` when the language is
-/// unknown / the highlighter yields nothing (caller keeps the dim fallback).
-/// ponytail: byte-safe slicing — tree-sitter ranges are bytes, a bad split
-/// falls back to dim rather than panicking mid-frame.
-pub(super) fn highlight_code_spans(lang: &str, code: &str) -> Option<Vec<Span<'static>>> {
+/// Highlight a multi-line snippet in ONE tree-sitter pass and split the
+/// result back into per-line spans, so multi-line constructs (block
+/// comments, triple-quoted strings) keep their style across rows. Returns
+/// `None` when the language is unknown or yields nothing — callers keep the
+/// dim fallback, so highlighting never regresses to plain.
+/// ponytail: byte-safe slicing throughout; a bad split falls back to dim
+/// rather than panicking mid-frame.
+pub(super) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    let hl = highlighter();
-    let segs = hl.highlight(lang, code);
+    let mut segs = highlighter().highlight(lang, code);
     if segs.is_empty() {
         return None;
     }
-    let mut segs = segs;
     segs.sort_by_key(|s| (s.start, s.end));
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    for seg in segs {
-        if seg.start < pos || seg.end <= seg.start {
-            continue;
-        }
-        if seg.start > pos {
-            if let Some(gap) = code.get(pos..seg.start) {
-                if !gap.is_empty() {
-                    out.push(Span::raw(gap.to_string()));
-                }
-                pos = seg.start;
-            } else {
+    // Byte range of each `\n`-separated row in the joined text.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for line in code.split('\n') {
+        ranges.push((start, start + line.len()));
+        start += line.len() + 1;
+    }
+    let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        let mut spans = Vec::new();
+        let mut pos = lo;
+        for seg in segs.iter() {
+            if seg.end <= lo || seg.start >= hi || seg.end <= seg.start {
                 continue;
             }
+            // Clip the segment to this row; anything unsliceable aborts
+            // the whole block to dim (never half-highlighted rows).
+            let s = seg.start.max(lo);
+            let e = seg.end.min(hi);
+            if s < pos {
+                continue;
+            }
+            let gap = code.get(pos..s)?;
+            if !gap.is_empty() {
+                spans.push(Span::raw(gap.to_string()));
+            }
+            let text = code.get(s..e)?;
+            if text.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(text.to_string(), seg.style));
+            pos = e;
         }
-        if let Some(text) = code.get(seg.start..seg.end) {
-            out.push(Span::styled(text.to_string(), seg.style));
-            pos = seg.end;
+        let tail = code.get(pos..hi)?;
+        if !tail.is_empty() {
+            spans.push(Span::raw(tail.to_string()));
         }
-    }
-    if pos < code.len() {
-        let tail = code.get(pos..)?;
-        out.push(Span::raw(tail.to_string()));
+        out.push(spans);
     }
     Some(out)
+}
+
+/// Split read's `{:>4}  content` gutter: the leading number plus its
+/// two-space gap is structural, so code starting with digits (e.g.
+/// `123abc`) is never mistaken for a gutter.
+fn split_read_gutter(line: &str) -> Option<(String, &str)> {
+    let trimmed_start = line.len() - line.trim_start().len();
+    let rest = &line[trimmed_start..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    if !rest[digits..].starts_with("  ") {
+        return None;
+    }
+    let code_start = trimmed_start + digits + 2;
+    // The `  ` prefix below mirrors the generic preview's two-space indent.
+    Some((format!("  {}", &line[..code_start]), &line[code_start..]))
+}
+
+/// Whole `read` preview rows: `==> file <==` headers stay dim landmarks
+/// (and re-target the highlight language for their section, so fan-out
+/// snippets highlight per file); `… +N more` tails stay dim; numbered rows
+/// keep the gutter dim and highlight the code via ONE tree-sitter pass per
+/// section, falling back to dim per row when unhighlightable.
+pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::tool_preview_fg());
+    // Section = header + its rows; headers re-target the language.
+    struct Section<'a> {
+        header: Option<&'a str>,
+        lang: String,
+        rows: Vec<Row<'a>>,
+    }
+    enum Row<'a> {
+        Meta(&'a str),
+        Code { gutter: String, code: &'a str },
+    }
+    let mut sections: Vec<Section> = Vec::new();
+    let mut cur = Section {
+        header: None,
+        lang: base_lang.to_string(),
+        rows: Vec::new(),
+    };
+    for line in preview {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("==>") {
+            if !cur.rows.is_empty() || cur.header.is_some() {
+                sections.push(cur);
+            }
+            let inner = trimmed
+                .strip_prefix("==>")
+                .unwrap_or("")
+                .trim_end_matches("<==")
+                .trim();
+            let path = inner.split_whitespace().next().unwrap_or(inner);
+            let lang = md::lang_from_path(path).to_string();
+            cur = Section {
+                header: Some(line.as_str()),
+                lang,
+                rows: Vec::new(),
+            };
+        } else if trimmed.starts_with('…') || trimmed.starts_with("[...") {
+            cur.rows.push(Row::Meta(line.as_str()));
+        } else if let Some((gutter, code)) = split_read_gutter(line) {
+            cur.rows.push(Row::Code { gutter, code });
+        } else if line.trim().is_empty() {
+            cur.rows.push(Row::Meta(line.as_str()));
+        } else {
+            // Unnumbered (glob hits, plain text): highlight whole-line.
+            cur.rows.push(Row::Code {
+                gutter: "  ".to_string(),
+                code: line.as_str(),
+            });
+        }
+    }
+    sections.push(cur);
+
+    let mut out = Vec::with_capacity(preview.len());
+    for section in &sections {
+        if let Some(header) = section.header {
+            out.push(super::indent_transcript_line(Line::from(Span::styled(
+                format!("  {header}"),
+                dim,
+            ))));
+        }
+        // One pass per section: collect code rows, highlight joined, split.
+        let code_rows: Vec<usize> = section
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| matches!(r, Row::Code { .. }).then_some(i))
+            .collect();
+        let joined = code_rows
+            .iter()
+            .map(|&i| match &section.rows[i] {
+                Row::Code { code, .. } => *code,
+                Row::Meta(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let highlighted = highlight_code_block(&section.lang, &joined);
+        for (idx, row) in section.rows.iter().enumerate() {
+            match row {
+                Row::Meta(text) => {
+                    out.push(super::indent_transcript_line(Line::from(Span::styled(
+                        format!("  {text}"),
+                        dim,
+                    ))));
+                }
+                Row::Code { gutter, .. } => {
+                    let pos = code_rows.iter().position(|&i| i == idx);
+                    let spans = pos
+                        .and_then(|p| highlighted.as_ref().and_then(|h| h.get(p)))
+                        .filter(|spans| !spans.is_empty());
+                    match spans {
+                        Some(spans) => {
+                            let mut all = vec![Span::styled(gutter.clone(), dim)];
+                            all.extend(spans.iter().cloned());
+                            out.push(super::indent_transcript_line(Line::from(all)));
+                        }
+                        None => {
+                            let text = match row {
+                                Row::Code { gutter, code } => format!("{gutter}{code}"),
+                                Row::Meta(_) => unreachable!(),
+                            };
+                            out.push(super::indent_transcript_line(Line::from(Span::styled(
+                                text, dim,
+                            ))));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Render a streamed thinking block: collapsed = a single dim
@@ -2673,65 +2562,27 @@ mod tests {
     }
 
     #[test]
-    fn block_gaps_around_headings_and_lists() {
-        let out = with_block_gaps("", "text\n## Changes\n- a\n- b\n1. run tests");
-        assert_eq!(out, "text\n\n## Changes\n\n- a\n- b\n\n1. run tests\n");
-    }
-
-    #[test]
-    fn block_gaps_respect_code_fence() {
-        let out = with_block_gaps("", "```rust\n# not a heading\n- not a list\n```\ntext");
-        assert_eq!(out, "```rust\n# not a heading\n- not a list\n```\n\ntext\n");
-    }
-
-    #[test]
-    fn block_gaps_streaming_seam_after_heading() {
-        // Heading landed at the end of the previous throttle window.
-        let out = with_block_gaps("## Changes\n", "- first item");
-        assert_eq!(out, "\n- first item\n");
-    }
-
-    #[test]
-    fn block_gaps_never_double_existing_blanks() {
-        let out = with_block_gaps("", "## H\n\n- a\n\ntail");
-        assert_eq!(out, "## H\n\n- a\n\ntail\n");
-    }
-
-    #[test]
-    fn block_gaps_open_fence_from_previous_window() {
-        // Fence opened in a previous flush; its content must stay untouched.
-        let out = with_block_gaps("```rust\nlet x = 1;\n", "# done");
-        assert_eq!(out, "# done\n");
-    }
-
-    #[test]
-    fn block_gaps_whole_message_replay() {
-        let msg = "Here's what I did:\n## Changes\n- Refactored the loop\n- Added a cache\n### Verification\ncargo test passed.\n1. run tests\n2. commit\nAll good.";
-        let out = with_block_gaps("", msg);
-        // Industry standard (MD022/MD032): blank around headings AND around
-        // the list block — including after it, before trailing prose.
-        assert_eq!(
-            out,
-            "Here's what I did:\n\n## Changes\n\n- Refactored the loop\n- Added a cache\n\n### Verification\n\ncargo test passed.\n\n1. run tests\n2. commit\n\nAll good.\n"
+    fn normalized_source_renders_gapped() {
+        // The gap rule lives in `core::markdown` (unit-tested there); this
+        // pins the render layer end to end: normalized dense source renders
+        // the heading, list and table separated instead of wall-to-wall.
+        let src = crate::core::markdown::normalize_gaps(
+            "",
+            "text\n## Changes\n- a\n| A | B |\n|---|---|\n| 1 | 2 |",
         );
-    }
-
-    #[test]
-    fn block_gaps_cover_hr_quote_table_and_plus() {
-        // HR variants, `>` without space, `+` bullets and tables all behave
-        // like blocks: blank before/after, tight inside.
-        let out = with_block_gaps("", "text\n***\nmore");
-        assert_eq!(out, "text\n\n***\n\nmore\n");
-        let out = with_block_gaps("", "text\n> quote\nmore");
-        assert_eq!(out, "text\n\n> quote\n\nmore\n");
-        let out = with_block_gaps("", "> a\n> b\n");
-        assert_eq!(out, "> a\n> b\n");
-        let out = with_block_gaps("", "text\n+ a\n+ b\nmore");
-        assert_eq!(out, "text\n\n+ a\n+ b\n\nmore\n");
-        let out = with_block_gaps("", "#### Deep\ntext");
-        assert_eq!(out, "#### Deep\n\ntext\n");
-        let out = with_block_gaps("", "- [X] done\nmore");
-        assert_eq!(out, "- [X] done\n\nmore\n");
+        let lines = markdown_lines(&src);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Changes"), "{text}");
+        assert!(text.contains('─'), "table not drawn: {text}");
+        let blank_rows = lines.iter().filter(|l| l.spans.is_empty()).count();
+        assert!(
+            blank_rows >= 2,
+            "expected air rows, got {blank_rows}: {text}"
+        );
     }
 
     #[test]
@@ -2794,14 +2645,52 @@ mod tests {
     }
 
     #[test]
-    fn preview_lang_maps_extensions_and_highlights() {
-        assert_eq!(lang_from_path("src/main.rs"), "rust");
-        assert_eq!(lang_from_path("a.py:12-20"), "python");
-        assert_eq!(lang_from_path("*.tsx"), "typescript");
-        assert_eq!(lang_from_path("2 files"), "");
-        assert!(highlight_code_spans("rust", "fn main() {}").is_some());
-        assert!(highlight_code_spans("", "fn main() {}").is_none());
-        assert!(highlight_code_spans("no-such-lang", "text").is_none());
+    fn block_highlight_splits_rows_and_falls_back_to_dim() {
+        let rows = highlight_code_block("rust", "fn main() {}").expect("highlight");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].iter().any(|s| s.style.fg.is_some()));
+        assert!(highlight_code_block("", "fn main() {}").is_none());
+        assert!(highlight_code_block("no-such-lang", "text").is_none());
+    }
+
+    #[test]
+    fn block_highlight_keeps_multiline_constructs_across_rows() {
+        // One tree-sitter pass over the whole snippet: a triple-quoted
+        // Python string stays a string on every row. Per-line highlighting
+        // would render the middle row plain.
+        let code = "x = \"\"\"\nhello\n\"\"\"";
+        let rows = highlight_code_block("python", code).expect("highlight");
+        assert_eq!(rows.len(), 3);
+        let text = |row: &Vec<Span<'static>>| -> String {
+            row.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert_eq!(text(&rows[1]), "hello");
+        assert!(
+            rows[1].iter().any(|s| s.style.fg.is_some()),
+            "middle row of a block string must stay highlighted: {:?}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn read_preview_renders_sections_with_gutter_and_tail() {
+        let preview = vec![
+            "==> src/main.rs <==".to_string(),
+            "   1  fn main() {}".to_string(),
+            "… +1 more lines".to_string(),
+        ];
+        let lines = render_read_preview(&preview, "");
+        assert_eq!(lines.len(), 3);
+        let text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        assert!(
+            text(&lines[0]).contains("src/main.rs"),
+            "{}",
+            text(&lines[0])
+        );
+        assert!(text(&lines[1]).contains("fn main"), "{}", text(&lines[1]));
+        // Gutter row carries highlight past the dim gutter span.
+        assert!(lines[1].spans.len() > 2, "{:?}", lines[1]);
     }
 
     #[test]
@@ -2865,13 +2754,13 @@ mod tests {
     }
 
     #[test]
-    fn block_gaps_keeps_table_rows_tight_across_seams() {
+    fn table_rows_stay_tight_across_seams() {
         // A throttle seam between table rows must not insert air: that would
         // split one table into two blocks mid-column.
-        let out = with_block_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
+        let out = crate::core::markdown::normalize_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
         assert_eq!(out, "| 1 | 2 |\n");
         // Same for the delimiter row following a header.
-        let out = with_block_gaps("| a | b |\n", "|---|---|");
+        let out = crate::core::markdown::normalize_gaps("| a | b |\n", "|---|---|");
         assert_eq!(out, "|---|---|\n");
     }
 }

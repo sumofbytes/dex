@@ -72,6 +72,12 @@ pub(crate) enum TranscriptBlock {
         input: Line<'static>,
         output: Option<Line<'static>>,
         preview: Vec<Line<'static>>,
+        /// Tool name + short arg as emitted by `ToolInput` (e.g. `read` +
+        /// `src/main.rs:1-20`). Stored — not parsed back out of the rendered
+        /// `input` line — so `ToolOutput` can pick the preview language for
+        /// syntax highlighting without span scraping.
+        tool_name: String,
+        tool_arg: String,
     },
     System {
         stamp: u64,
@@ -684,7 +690,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // paragraph structure across the throttle window. Normalize blank
             // lines around block-level markdown so dense model output still
             // renders with air between sections.
-            let chunk = render::with_block_gaps(&app.assistant_pending, &s);
+            let chunk = crate::core::markdown::normalize_gaps(&app.assistant_pending, &s);
             if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
                 app.assistant_pending.push('\n');
             }
@@ -700,7 +706,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 .rsplit('\n')
                 .next()
                 .unwrap_or("");
-            let holding_table = render::is_table_line(last_line);
+            let holding_table = crate::core::markdown::is_table_line(last_line);
             if stream_flush_due(app) && !holding_table {
                 flush_assistant(app);
             }
@@ -736,7 +742,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let arg = it.next().unwrap_or("").to_string();
             let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
-                Span::styled(name, Style::default().fg(Color::Yellow)),
+                Span::styled(name.clone(), Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!(" {arg}"),
                     Style::default().fg(theme::tool_input_fg()),
@@ -747,6 +753,8 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 input,
                 output: None,
                 preview: Vec::new(),
+                tool_name: name,
+                tool_arg: arg,
             });
         }
         SinkLine::ToolOutput {
@@ -778,19 +786,12 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let output = indent_transcript_line(Line::from(spans));
             // write/edit previews are a git diff: color like git does. read
             // previews keep the numbered gutter dim and highlight the code
-            // by extension (opencode/Claude Code style); anything
-            // unhighlightable stays dim so it never regresses to plain.
-            let is_diff = matches!(name.as_str(), "write" | "edit");
-            let is_read = matches!(name.as_str(), "read") && success;
-            let mut read_lang = String::new();
-            if is_read {
-                read_lang = read_preview_lang(app);
-            }
-            let mut cur_lang = read_lang.clone();
-            let preview_lines: Vec<Line<'static>> = preview
-                .iter()
-                .map(|line| {
-                    if is_diff {
+            // by extension (opencode/Claude Code style, one tree-sitter
+            // pass per file section); anything unhighlightable stays dim.
+            let preview_lines: Vec<Line<'static>> = if matches!(name.as_str(), "write" | "edit") {
+                preview
+                    .iter()
+                    .map(|line| {
                         let style = if line.starts_with('+') && !line.starts_with("+++") {
                             Style::default().fg(Color::LightGreen)
                         } else if line.starts_with('-') && !line.starts_with("---") {
@@ -800,20 +801,40 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                         } else {
                             Style::default().fg(theme::tool_preview_fg())
                         };
-                        return indent_transcript_line(Line::from(Span::styled(
+                        indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
+                    })
+                    .collect()
+            } else if matches!(name.as_str(), "read") && success {
+                // Language from the stored `ToolInput` arg (first token is
+                // the path: `src/main.rs:1-20`, a glob, or `N files`).
+                // `==> file <==` fan-out headers inside re-target per
+                // section in `render_read_preview`.
+                let arg_path = app
+                    .transcript
+                    .last()
+                    .and_then(|b| match b {
+                        TranscriptBlock::Tool {
+                            output: None,
+                            tool_arg,
+                            ..
+                        } => Some(tool_arg.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let path = arg_path.split_whitespace().next().unwrap_or("");
+                let path = path.split(':').next().unwrap_or(path);
+                render::render_read_preview(&preview, crate::core::markdown::lang_from_path(path))
+            } else {
+                preview
+                    .iter()
+                    .map(|line| {
+                        indent_transcript_line(Line::from(Span::styled(
                             format!("  {line}"),
-                            style,
-                        )));
-                    }
-                    if is_read {
-                        return read_preview_line(line, &mut cur_lang);
-                    }
-                    indent_transcript_line(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(theme::tool_preview_fg()),
-                    )))
-                })
-                .collect();
+                            Style::default().fg(theme::tool_preview_fg()),
+                        )))
+                    })
+                    .collect()
+            };
             app.assistant_open = false;
             // Complete the tool block started by ToolInput if it is still open.
             if let Some(TranscriptBlock::Tool {
@@ -831,6 +852,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 }
             }
             // Fallback: no open ToolInput (e.g. replay); synthesize a block.
+            // No arg is known here, so previews stay dim — the replay path
+            // (`rebuild_transcript`) always emits `ToolInput` first, which
+            // carries the arg for highlighting.
             app.transcript.push(TranscriptBlock::Tool {
                 stamp: 0,
                 input: indent_transcript_line(Line::from(Span::styled(
@@ -839,6 +863,8 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ))),
                 output: Some(output),
                 preview: preview_lines,
+                tool_name: name,
+                tool_arg: String::new(),
             });
         }
         SinkLine::System(s) => {
@@ -906,86 +932,6 @@ fn dim_intermediate_assistant_block(app: &mut App) {
         }
         *stamp = stamp.wrapping_add(1);
     }
-}
-
-/// Language for the open `read` preview, from its `▸ read <path>` input
-/// line (`path:1-20`, globs, bare paths). Fan-out (`2 files`) has no single
-/// language — per-file `==> … <==` headers re-target it below.
-fn read_preview_lang(app: &App) -> String {
-    let Some(TranscriptBlock::Tool { input, output, .. }) = app.transcript.last() else {
-        return String::new();
-    };
-    if output.is_some() {
-        return String::new();
-    }
-    let text: String = input.spans.iter().map(|s| s.content.as_ref()).collect();
-    let arg = text
-        .trim_start()
-        .strip_prefix('▸')
-        .unwrap_or(&text)
-        .trim_start();
-    let arg = arg.split_once(' ').map(|x| x.1).unwrap_or("").trim();
-    // First token only (`path:1-20` → `path`); globs keep their extension.
-    let path = arg.split_whitespace().next().unwrap_or("");
-    let path = path.split(':').next().unwrap_or(path);
-    crate::ui::render::lang_from_path(path).to_string()
-}
-
-/// One `read` preview row: `==> file <==` headers stay dim landmarks (and
-/// re-target the highlight language for the rows below them); `… +N more`
-/// tails stay dim; numbered `{:>4}  code` rows keep the gutter dim and
-/// highlight the code, falling back to dim when unhighlightable.
-fn read_preview_line(line: &str, cur_lang: &mut String) -> Line<'static> {
-    let dim = Style::default().fg(theme::tool_preview_fg());
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("==>") {
-        // `==> path <==`: re-target language for the following snippet.
-        let inner = trimmed
-            .strip_prefix("==>")
-            .unwrap_or("")
-            .trim_end_matches("<==")
-            .trim();
-        let path = inner.split_whitespace().next().unwrap_or(inner);
-        let lang = crate::ui::render::lang_from_path(path);
-        *cur_lang = lang.to_string();
-        return indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)));
-    }
-    if trimmed.starts_with('…') || trimmed.starts_with("[...") {
-        return indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)));
-    }
-    if let Some((gutter, code)) = split_read_gutter(line) {
-        if let Some(spans) = crate::ui::render::highlight_code_spans(cur_lang, code) {
-            let mut all = vec![Span::styled(gutter.to_string(), dim)];
-            all.extend(spans);
-            return indent_transcript_line(Line::from(all));
-        }
-        return indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)));
-    }
-    // Unnumbered (glob hits, plain text): try whole-line highlight, else dim.
-    if let Some(spans) = crate::ui::render::highlight_code_spans(cur_lang, line) {
-        let mut all = vec![Span::styled("  ".to_string(), dim)];
-        all.extend(spans);
-        return indent_transcript_line(Line::from(all));
-    }
-    indent_transcript_line(Line::from(Span::styled(format!("  {line}"), dim)))
-}
-
-/// Split read's `{:>4}  content` gutter: leading number + two-space gap is
-/// structural (so `123abc` code is never mistaken for a gutter).
-fn split_read_gutter(line: &str) -> Option<(String, &str)> {
-    let trimmed_start = line.len() - line.trim_start().len();
-    let rest = &line[trimmed_start..];
-    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    if digits == 0 {
-        return None;
-    }
-    let after = &rest[digits..];
-    if !after.starts_with("  ") {
-        return None;
-    }
-    let code_start = trimmed_start + digits + 2;
-    // `  ` prefix below mirrors the generic preview's two-space indent.
-    Some((format!("  {}", &line[..code_start]), &line[code_start..]))
 }
 
 /// Send the user's approval decision for the pending tool execution.
