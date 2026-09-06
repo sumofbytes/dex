@@ -68,7 +68,7 @@ pub(crate) struct DaemonClient {
 /// backend + connection pool (~tens of ms); the TUI used to build one per
 /// `DaemonClient` plus one per display config. Clones are an atomic bump.
 ///
-/// Timeout note: 10s connect / 300s per-read. `wait_until_ready` overrides
+/// Timeout note: 10s connect / 300s total. `wait_until_ready` overrides
 /// to 2s per poll.
 static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -78,6 +78,25 @@ pub(crate) fn shared_async_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(300))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
+/// Process-wide shared client for long-lived SSE streams (TUI↔daemon chat,
+/// daemon↔provider generations). Connect timeout only: reqwest's total
+/// `.timeout()` covers the whole streaming body, so any value here kills
+/// turns/generations that run longer than it (`error decoding response body`
+/// at exactly N seconds). A stalled stream ends via server keep-alive/EOF
+/// or user cancel instead.
+static STREAMING_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+pub(crate) fn shared_streaming_client() -> reqwest::Client {
+    STREAMING_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         })
@@ -326,7 +345,11 @@ impl DaemonClient {
         options: ChatOptions,
     ) -> Result<ChatStream, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/api/sessions/{}/chat", self.base_url, session_id);
-        let mut builder = self.http.post(&url).headers(self.api_headers());
+        // The chat SSE stream lives as long as the turn (often minutes);
+        // the shared client's total timeout would kill it mid-turn.
+        let mut builder = shared_streaming_client()
+            .post(&url)
+            .headers(self.api_headers());
         if let Some(key) = &options.idempotency_key {
             builder = builder.header("idempotency-key", key);
         }

@@ -382,14 +382,14 @@ pub(crate) struct PromptTokensDetails {
     pub(crate) cached_tokens: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct ToolDefinition {
     #[serde(rename = "type")]
     pub(crate) tool_type: String,
     pub(crate) function: FunctionDef,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct FunctionDef {
     pub(crate) name: String,
     pub(crate) description: String,

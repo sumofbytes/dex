@@ -33,6 +33,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/health", get(health))
         .route("/api/config", get(get_config))
         .route("/api/git", get(get_git))
+        .route("/api/mcp", get(get_mcp))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
@@ -169,6 +170,17 @@ async fn get_git() -> Json<GitInfo> {
         git_branch,
         git_dirty,
     })
+}
+
+async fn get_mcp() -> Json<serde_json::Value> {
+    // Reads the process-wide cache; never spawns, never blocks the loop.
+    let servers: Vec<serde_json::Value> = crate::mcp::global_manager()
+        .statuses()
+        .await
+        .into_iter()
+        .map(|s| json!({"name": s.name, "state": s.state, "tools": s.tools}))
+        .collect();
+    Json(json!({ "servers": servers }))
 }
 
 async fn list_skills() -> Json<serde_json::Value> {
