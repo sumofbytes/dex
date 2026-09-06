@@ -291,29 +291,6 @@ pub(crate) fn normalize_gaps(pending: &str, s: &str) -> String {
     out
 }
 
-/// Tree-sitter language for a file path, covering the grammars compiled in
-/// via Cargo features plus common aliases. Unknown extensions return `""`
-/// and callers keep the dim fallback (never guess).
-pub(crate) fn lang_from_path(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let ext = ext.split(':').next().unwrap_or(&ext);
-    match ext {
-        "rs" => "rust",
-        "py" | "pyw" => "python",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        "ts" | "mts" | "cts" | "tsx" => "typescript",
-        "go" => "go",
-        "java" => "java",
-        "c" | "h" => "c",
-        "cpp" | "hpp" | "cc" | "hh" | "cxx" => "cpp",
-        "json" | "jsonc" => "json",
-        "toml" => "toml",
-        "yaml" | "yml" => "yaml",
-        "sh" | "bash" | "zsh" => "bash",
-        _ => "",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,16 +360,6 @@ mod tests {
             normalize_gaps("```rust\nlet x = 1;\n", "# done"),
             "# done\n"
         );
-    }
-
-    #[test]
-    fn lang_map_covers_compiled_grammars() {
-        assert_eq!(lang_from_path("src/main.rs"), "rust");
-        assert_eq!(lang_from_path("a.py:12-20"), "python");
-        assert_eq!(lang_from_path("*.tsx"), "typescript");
-        assert_eq!(lang_from_path("run.SH"), "bash");
-        assert_eq!(lang_from_path("2 files"), "");
-        assert_eq!(lang_from_path("Makefile"), "");
     }
 
     #[test]

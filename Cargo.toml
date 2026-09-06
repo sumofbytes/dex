@@ -39,6 +39,18 @@ ratatui-markdown = { version = "0.3.6", default-features = false, features = [
     "highlight-lang-typescript",
     "highlight-lang-toml",
     "highlight-lang-yaml",
+      "highlight-lang-c-sharp",
+      "highlight-lang-dart",
+      # No highlight-lang-kotlin: ratatui-markdown 0.3.6's KOTLIN_HIGHLIGHTS
+      # query still references `(multiline_comment)`, renamed to
+      # `(block_comment)` in tree-sitter-kotlin-ng 1.1, so enabling the
+      # feature panics on any kotlin block. Re-add once upstream fixes it.
+      "highlight-lang-lua",
+    "highlight-lang-nix",
+    "highlight-lang-php",
+    "highlight-lang-ruby",
+    "highlight-lang-scala",
+    "highlight-lang-swift",
 ] }
 unicode-width = "0.1"
 similar = "2"

@@ -739,14 +739,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let mut it = s.splitn(2, ' ');
             let name = it.next().unwrap_or("").to_string();
             let arg = it.next().unwrap_or("").to_string();
-            let input = indent_transcript_line(Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(Color::Yellow)),
-                Span::styled(name, Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    format!(" {arg}"),
-                    Style::default().fg(theme::tool_input_fg()),
-                ),
-            ]));
+            let input = render::render_tool_input(&name, &arg);
             app.transcript.push(TranscriptBlock::Tool {
                 stamp: 0,
                 input,
@@ -821,7 +814,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                     .unwrap_or_default();
                 let path = arg_path.split_whitespace().next().unwrap_or("");
                 let path = path.split(':').next().unwrap_or(path);
-                render::render_read_preview(&preview, crate::core::markdown::lang_from_path(path))
+                render::render_read_preview(&preview, crate::core::lang::lang_from_path(path))
             } else {
                 preview
                     .iter()

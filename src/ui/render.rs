@@ -1,10 +1,8 @@
-use std::sync::{Arc, OnceLock};
-
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{block::Padding, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks, TreeSitterHighlighter};
+use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks};
 use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 use ratatui_markdown::ThemeConfig;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -16,6 +14,7 @@ use super::TAB_WIDTH;
 use super::{
     theme, transcript_indent, App, InputField, Selection, WrappedBlock, TRANSCRIPT_INDENT,
 };
+use crate::core::highlight;
 use crate::core::markdown as md;
 
 pub(super) fn surface_padding() -> Padding {
@@ -125,8 +124,10 @@ pub(super) fn compute_layout(
 
 /// Fence info-string -> tree-sitter key (`ratatui-markdown::get_lang` only
 /// matches exact lowercase tags). Strips our legacy trailing `:`, drops
-/// params (`rust ignore`, `js linenums`), lowercases, and maps the common
-/// `rs` shorthand the CLI highlighter already accepts.
+/// params (`rust ignore`, `js linenums`), lowercases, then canonicalizes
+/// through `core::lang` (the same table file-extension lookup uses, so both
+/// paths agree). Unknown tags pass through raw so `get_lang` can still match
+/// its own native aliases; plain-text tags stay empty (dim).
 fn normalize_code_lang(info: &str) -> String {
     let token = info
         .trim()
@@ -136,9 +137,11 @@ fn normalize_code_lang(info: &str) -> String {
         .unwrap_or("")
         .trim_end_matches(':');
     let lower = token.to_ascii_lowercase();
-    match lower.as_str() {
-        "rs" => "rust".to_string(),
-        _ => lower,
+    let canon = crate::core::lang::canonical_lang(&lower);
+    if canon.is_empty() {
+        lower
+    } else {
+        canon.to_string()
     }
 }
 
@@ -275,18 +278,27 @@ fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
 }
 
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
-    let highlighter = highlighter();
+    let highlighter = highlight::shared_highlighter();
     let blocks = split_markdown(s);
-    let renderer = MarkdownRenderer::new(0)
-        .with_render_hooks(Box::new(HighlightHooks::new(highlighter, usize::MAX)));
-    renderer.render(&blocks, &ThemeConfig::default())
+    let renderer = MarkdownRenderer::new(0).with_render_hooks(Box::new(
+        HighlightHooks::new(highlighter, usize::MAX).with_border_color(theme::muted_fg()),
+    ));
+    renderer.render(&blocks, &markdown_theme())
 }
 
-fn highlighter() -> Arc<TreeSitterHighlighter> {
-    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
-    HIGHLIGHTER
-        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
-        .clone()
+/// Theme-aware markdown palette: prose/borders use the terminal's real
+/// foreground (readable on light + tinted themes, where the default
+/// `White`/`DarkGray` slots vanish or clash); semantic hues stay ANSI so the
+/// terminal remaps them. Code neutrals (variable/comment/punctuation) follow
+/// the foreground instead of fixed `White`/`DarkGray`. The palette itself
+/// lives in `core::highlight` so headless output uses identical colors.
+fn markdown_theme() -> ThemeConfig {
+    ThemeConfig::default()
+        .with_text_color(theme::surface_fg())
+        .with_muted_text_color(theme::muted_fg())
+        .with_border_color(theme::muted_fg())
+        .with_focused_border_color(theme::surface_fg())
+        .with_code_colors(highlight::code_colors())
 }
 
 /// Highlight a multi-line snippet in ONE tree-sitter pass and split the
@@ -296,11 +308,11 @@ fn highlighter() -> Arc<TreeSitterHighlighter> {
 /// dim fallback, so highlighting never regresses to plain.
 /// ponytail: byte-safe slicing throughout; a bad split falls back to dim
 /// rather than panicking mid-frame.
-pub(super) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    let mut segs = highlighter().highlight(lang, code);
+    let mut segs = highlight::shared_highlighter().highlight(lang, code);
     if segs.is_empty() {
         return None;
     }
@@ -345,6 +357,80 @@ pub(super) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Spa
         out.push(spans);
     }
     Some(out)
+}
+
+/// Transcript `▸ tool arg` row. Bash commands highlight via the compiled
+/// bash grammar (keywords/strings/flags read apart instead of one dim
+/// blob); every other tool keeps the dim arg. Unknown/unhighlightable bash
+/// falls back to dim, so this never regresses.
+pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("▸ ", Style::default().fg(Color::Yellow)),
+        Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
+    ];
+    if name == "bash" && !arg.is_empty() {
+        if let Some(mut rows) = highlight_code_block("bash", arg) {
+            if let Some(first) = rows.first_mut() {
+                if !first.is_empty() {
+                    spans.push(Span::styled(
+                        " ".to_string(),
+                        Style::default().fg(theme::tool_input_fg()),
+                    ));
+                    spans.append(first);
+                    return super::indent_transcript_line(Line::from(spans));
+                }
+            }
+        }
+    }
+    spans.push(Span::styled(
+        format!(" {arg}"),
+        Style::default().fg(theme::tool_input_fg()),
+    ));
+    super::indent_transcript_line(Line::from(spans))
+}
+
+/// Approval-overlay detail row. Bash commands highlight the code after the
+/// `$ `/indent prefix (same grammar as the transcript); paths and diff
+/// markers keep their existing colors.
+pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> {
+    if name == "bash" {
+        let (prefix, code) = if let Some(rest) = detail.strip_prefix("$ ") {
+            ("$ ", rest)
+        } else if detail.starts_with("$") && detail.trim() == "$" {
+            return Line::from(Span::styled(
+                detail.to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+        } else if let Some(rest) = detail.strip_prefix("  ") {
+            ("  ", rest)
+        } else {
+            ("", detail)
+        };
+        if !code.is_empty() {
+            if let Some(mut rows) = highlight_code_block("bash", code) {
+                if let Some(first) = rows.first_mut() {
+                    if !first.is_empty() {
+                        let mut spans = vec![Span::styled(
+                            prefix.to_string(),
+                            Style::default().fg(Color::Cyan),
+                        )];
+                        spans.append(first);
+                        return Line::from(spans);
+                    }
+                }
+            }
+        }
+    }
+    let style = if detail.starts_with('$') || detail.starts_with("path:") {
+        Style::default().fg(Color::Cyan)
+    } else if detail.starts_with("  −") {
+        Style::default().fg(Color::LightRed)
+    } else if detail.starts_with("  +") {
+        Style::default().fg(Color::LightGreen)
+    } else {
+        Style::default().fg(theme::tool_input_fg())
+    };
+    Line::from(Span::styled(detail.to_string(), style))
 }
 
 /// Split read's `{:>4}  content` gutter: the leading number plus its
@@ -403,7 +489,7 @@ pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
                 .trim_end_matches("<==")
                 .trim();
             let path = inner.split_whitespace().next().unwrap_or(inner);
-            let lang = md::lang_from_path(path).to_string();
+            let lang = crate::core::lang::lang_from_path(path).to_string();
             cur = Section {
                 header: Some(line.as_str()),
                 lang,
@@ -1126,19 +1212,8 @@ impl ApprovalOverlay {
             chunks[1],
         );
         let detail_lines: Vec<Line> = details
-            .into_iter()
-            .map(|d| {
-                let style = if d.starts_with('$') || d.starts_with("path:") {
-                    Style::default().fg(Color::Cyan)
-                } else if d.starts_with("  −") {
-                    Style::default().fg(Color::LightRed)
-                } else if d.starts_with("  +") {
-                    Style::default().fg(Color::LightGreen)
-                } else {
-                    Style::default().fg(theme::tool_input_fg())
-                };
-                Line::from(Span::styled(d, style))
-            })
+            .iter()
+            .map(|d| render_approval_detail(&approval.name, d))
             .collect();
         f.render_widget(
             Paragraph::new(detail_lines).wrap(Wrap { trim: false }),
@@ -2822,5 +2897,60 @@ mod tests {
         // Same for the delimiter row following a header.
         let out = crate::core::markdown::normalize_gaps("| a | b |\n", "|---|---|");
         assert_eq!(out, "|---|---|\n");
+    }
+
+    #[test]
+    fn fence_aliases_canonicalize_to_compiled_grammars() {
+        // Shell/file-extension aliases must hit the compiled grammars instead
+        // of the plain-yellow fallback.
+        assert_eq!(normalize_code_lang("mjs"), "javascript");
+        assert_eq!(normalize_code_lang("jsx"), "javascript");
+        assert_eq!(normalize_code_lang("mts"), "typescript");
+        assert_eq!(normalize_code_lang("cts"), "typescript");
+        assert_eq!(normalize_code_lang("jsonc"), "json");
+        assert_eq!(normalize_code_lang("pyw"), "python");
+        assert_eq!(normalize_code_lang("hpp"), "cpp");
+        assert_eq!(normalize_code_lang("console"), "bash");
+        assert_eq!(normalize_code_lang("terminal"), "bash");
+        assert_eq!(normalize_code_lang("rs"), "rust");
+        // Params and legacy colons still strip.
+        assert_eq!(normalize_code_lang("rust ignore"), "rust");
+        assert_eq!(normalize_code_lang("bash:"), "bash");
+    }
+
+    #[test]
+    fn bash_tool_input_highlights_while_other_tools_stay_dim() {
+        // A bash command with a string + comment must split into styled spans
+        // past the `\u25b8 bash ` prefix; a plain tool arg stays one dim span.
+        let line = render_tool_input("bash", "echo \"hi\" # done");
+        // indent + `\u25b8 ` + name + ` ` + highlighted code spans.
+        assert!(line.spans.len() > 4, "bash should highlight: {line:?}");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("echo"), "{text}");
+
+        let line = render_tool_input("read", "src/main.rs:1-20");
+        // indent + `\u25b8 ` + name + dim arg: no highlight split.
+        assert_eq!(line.spans.len(), 4, "{line:?}");
+    }
+
+    #[test]
+    fn bash_approval_detail_highlights_code_after_prefix() {
+        let line = render_approval_detail("bash", "$ echo \"hi\"");
+        assert!(line.spans.len() > 1, "{line:?}");
+        assert!(line.spans[0].content.as_ref() == "$ ");
+        // Non-bash details keep their single-span colors.
+        let line = render_approval_detail("read", "path: src/main.rs");
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn bash_fence_highlights_via_tree_sitter() {
+        // The grammar must yield segments for typical shell (strings,
+        // comments, keywords) so ```bash blocks never fall back to yellow.
+        let highlighted = highlight_code_block("bash", "echo \"hi\" # done\nif x; then y; fi\n");
+        assert!(highlighted.is_some(), "bash grammar yielded nothing");
+        let unknown = highlight_code_block("definitely-not-a-lang", "plain");
+        assert!(unknown.is_none());
     }
 }

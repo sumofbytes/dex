@@ -1,137 +1,161 @@
-use std::env;
-use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
 
+use ratatui::style::{Color, Modifier, Style};
+use ratatui_markdown::highlight::{CodeHighlighter, TreeSitterHighlighter};
+use ratatui_markdown::CodeColors;
+
+use super::lang::canonical_lang;
+use super::palette::{fg_rgb, muted_rgb};
 use crate::core::console::RESET;
 
-/// Render an assistant message to the terminal as markdown, with
-/// fenced code blocks highlighted via `bat` when available.
+const DIM: &str = "\x1b[2m";
+
+/// Render an assistant message to the terminal as markdown, with fenced
+/// code blocks highlighted by the same tree-sitter engine the TUI uses —
+/// no external `bat` process, so headless and TUI output always agree.
 pub(crate) fn print_code_block(lang: &str, body: &str) {
-    // Try `bat` first (supports language tags + line numbers + theme).
-    let bat = ["bat", "batcat"]
-        .iter()
-        .find_map(|b| which(b).ok().map(|p| (b.to_string(), p)));
-    if let Some((bin, path)) = bat {
-        let mut cmd = Command::new(&path);
-        cmd.args([
-            "--color=always",
-            "--style=plain,header=fault",
-            "--paging=never",
-        ]);
-        if !lang.is_empty() {
-            cmd.args(["-l", lang]);
-        }
-        if let Ok(mut child) = cmd.arg("-").stdin(Stdio::piped()).spawn() {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(body.as_bytes());
-            }
-            drop(child.stdin.take());
-            if let Ok(out) = child.wait_with_output() {
-                if out.status.success() {
-                    print!("{}", String::from_utf8_lossy(&out.stdout));
-                    return;
-                }
-            }
-        }
-        let _ = bin;
+    let lower = lang.to_ascii_lowercase();
+    let canon = canonical_lang(&lower);
+    let tag = if canon.is_empty() {
+        lower.as_str()
+    } else {
+        canon
+    };
+    match highlight_ansi(tag, body) {
+        Some(colored) => print!("{colored}"),
+        // Unknown language: dim fallback like the TUI, never guess.
+        None => print!("{DIM}{body}{RESET}"),
     }
-    // Fallback: use a small lexer so terminals without bat still get useful
-    // syntax colours (strings/comments are consumed before keywords).
-    print_ansi_highlighted_code(lang, body);
 }
 
-pub(crate) fn print_ansi_highlighted_code(lang: &str, body: &str) {
-    const KEYWORD: &str = "\x1b[1;35m";
-    const STRING: &str = "\x1b[0;32m";
-    const NUMBER: &str = "\x1b[0;33m";
-    const COMMENT: &str = "\x1b[0;90m";
-    const PUNCT: &str = "\x1b[0;36m";
-    let lang = lang.to_ascii_lowercase();
-    let hash_comments = matches!(
-        lang.as_str(),
-        "python" | "py" | "ruby" | "rb" | "bash" | "sh" | "yaml" | "yml" | "toml" | "perl"
-    );
-    let keywords = match lang.as_str() {
-        "rust" | "rs" => "as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await dyn",
-        "python" | "py" => "and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None not or pass raise return True try while with yield",
-        "javascript" | "js" | "typescript" | "ts" => "as async await break case catch class const continue default delete else export extends false finally for function if import in let new null of return static super this throw true try typeof var while with yield",
-        "go" | "golang" => "break case const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var",
-        _ => "class const def else false fn for function if import let match mut new null pub return static struct true try type while async await",
+/// Theme-aware code palette shared by the TUI (`ui::render`) and headless
+/// renderers: prose neutrals follow the terminal's real foreground (readable
+/// on light + tinted themes, where fixed `White`/`DarkGray` slots vanish or
+/// clash); semantic hues stay ANSI so the terminal remaps them.
+pub(crate) fn code_colors() -> CodeColors {
+    let variable = match fg_rgb() {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => Color::Reset,
     };
-    let is_keyword = |word: &str| keywords.split_whitespace().any(|k| k == word);
+    let muted = match muted_rgb() {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => Color::Gray,
+    };
+    CodeColors::builder()
+        .variable(variable)
+        .comment(muted)
+        .punctuation(muted)
+        .build()
+}
 
-    for line in body.split_inclusive('\n') {
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if (c == '/' && i + 1 < chars.len() && chars[i + 1] == '/')
-                || (c == '#' && hash_comments)
-                || (c == '-' && i + 1 < chars.len() && chars[i + 1] == '-')
-            {
-                print!(
-                    "{}{}{}",
-                    COMMENT,
-                    chars[i..].iter().collect::<String>(),
-                    RESET
-                );
-                break;
-            } else if matches!(c, '\"' | '\'' | '`') {
-                let quote = c;
-                let start = i;
-                i += 1;
-                while i < chars.len() {
-                    if chars[i] == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    let closed = chars[i] == quote;
-                    i += 1;
-                    if closed {
-                        break;
-                    }
-                }
-                print!(
-                    "{}{}{}",
-                    STRING,
-                    chars[start..i.min(chars.len())].iter().collect::<String>(),
-                    RESET
-                );
-            } else if c.is_ascii_digit() {
-                let start = i;
-                while i < chars.len()
-                    && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '.' | '_'))
-                {
-                    i += 1;
-                }
-                print!(
-                    "{}{}{}",
-                    NUMBER,
-                    chars[start..i].iter().collect::<String>(),
-                    RESET
-                );
-            } else if c.is_ascii_alphabetic() || c == '_' {
-                let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                    i += 1;
-                }
-                let word: String = chars[start..i].iter().collect();
-                if is_keyword(&word) {
-                    print!("{}{}{}", KEYWORD, word, RESET);
-                } else {
-                    print!("{}", word);
-                }
-            } else {
-                i += 1;
-                if "{}[]()<>;:,.=+-*/%!&|?".contains(c) {
-                    print!("{}{}{}", PUNCT, c, RESET);
-                } else {
-                    print!("{}", c);
-                }
+/// The single tree-sitter parser for the process, shared by the TUI spans
+/// adapter (`ui::render::highlight_code_block`) and the headless ANSI
+/// adapter below — one palette, one grammar set, no drift.
+pub(crate) fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
+    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    HIGHLIGHTER
+        .get_or_init(|| Arc::new(TreeSitterHighlighter::new().with_code_colors(code_colors())))
+        .clone()
+}
+
+/// Highlight a snippet to an ANSI-escaped string in ONE tree-sitter pass.
+/// Returns `None` when the language is unknown or yields nothing — callers
+/// keep the dim fallback, so highlighting never regresses to plain.
+pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
+    if lang.is_empty() || code.is_empty() {
+        return None;
+    }
+    let mut segs = shared_highlighter().highlight(lang, code);
+    if segs.is_empty() {
+        return None;
+    }
+    segs.sort_by_key(|s| (s.start, s.end));
+    let mut out = String::with_capacity(code.len() + code.len() / 4);
+    let mut pos = 0;
+    for seg in &segs {
+        // Byte-safe: a bad range falls back to plain rather than panicking.
+        let start = seg.start.min(code.len());
+        let end = seg.end.min(code.len());
+        if start > pos {
+            out.push_str(code.get(pos..start).unwrap_or(""));
+        }
+        if end > start {
+            if let Some(slice) = code.get(start..end) {
+                push_styled(&mut out, &seg.style, slice);
             }
+            pos = pos.max(end);
         }
     }
+    if pos < code.len() {
+        out.push_str(code.get(pos..).unwrap_or(""));
+    }
+    Some(out)
+}
+
+/// Append `text` wrapped in its style's SGR codes; unstyled text is appended
+/// raw. Each styled run is self-contained (`...RESET`), so runs never bleed
+/// into each other across newlines.
+fn push_styled(out: &mut String, style: &Style, text: &str) {
+    let sgr = style_to_sgr(style);
+    if sgr.is_empty() {
+        out.push_str(text);
+    } else {
+        out.push_str(&sgr);
+        out.push_str(text);
+        out.push_str(RESET);
+    }
+}
+
+fn style_to_sgr(style: &Style) -> String {
+    let mut codes: Vec<String> = Vec::new();
+    if style.add_modifier.contains(Modifier::BOLD) {
+        codes.push("1".to_string());
+    }
+    if style.add_modifier.contains(Modifier::DIM) {
+        codes.push("2".to_string());
+    }
+    if style.add_modifier.contains(Modifier::ITALIC) {
+        codes.push("3".to_string());
+    }
+    if style.add_modifier.contains(Modifier::UNDERLINED) {
+        codes.push("4".to_string());
+    }
+    if let Some(fg) = style.fg.and_then(fg_sgr) {
+        codes.push(fg);
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// `ratatui::Color` -> SGR foreground params. `Reset` inherits the terminal
+/// default (the whole point of the theme-aware palette); RGB uses truecolor
+/// so headless output matches the TUI exactly.
+fn fg_sgr(color: Color) -> Option<String> {
+    let code = match color {
+        Color::Reset => return None,
+        Color::Black => "30",
+        Color::Red => "31",
+        Color::Green => "32",
+        Color::Yellow => "33",
+        Color::Blue => "34",
+        Color::Magenta => "35",
+        Color::Cyan => "36",
+        Color::Gray => "37",
+        Color::DarkGray => "90",
+        Color::LightRed => "91",
+        Color::LightGreen => "92",
+        Color::LightYellow => "93",
+        Color::LightBlue => "94",
+        Color::LightMagenta => "95",
+        Color::LightCyan => "96",
+        Color::White => "97",
+        Color::Rgb(r, g, b) => return Some(format!("38;2;{r};{g};{b}")),
+        Color::Indexed(n) => return Some(format!("38;5;{n}")),
+    };
+    Some(code.to_string())
 }
 
 /// Render one line of assistant markdown prose to the terminal. Replaces the
@@ -256,45 +280,86 @@ fn find_from(chars: &[char], from: usize, pat: &str) -> Option<usize> {
     (from..chars.len()).find(|&i| chars[i..].starts_with(&pat.chars().collect::<Vec<_>>()))
 }
 
-pub(crate) fn which(bin: &str) -> Result<PathBuf, io::Error> {
-    let path_var = env::var("PATH").unwrap_or_default();
-    for dir in env::split_paths(&path_var) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("{} not found", bin),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn which_finds_existing_binary_and_fails_for_missing() {
-        // sh should exist on any unix test image
-        assert!(which("sh").is_ok());
-        assert!(which("definitely-not-a-real-binary-dex-test-12345").is_err());
+    /// Strip SGR sequences so highlighting tests assert structure, not the
+    /// exact palette (which follows the terminal theme).
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
-    fn highlight_does_not_panic_on_various_langs() {
-        // Just ensure no panic; output goes to stdout and is not asserted.
-        print_ansi_highlighted_code("rust", "fn main() { let x = 42; // comment\n}");
-        print_ansi_highlighted_code("python", "def foo(): # hi\n    return \"str\"\n");
-        print_ansi_highlighted_code("unknown", "some plain text 123");
-        print_ansi_highlighted_code("", "");
+    fn highlight_returns_none_for_unknown_or_empty() {
+        assert!(highlight_ansi("groovy", "def x = 1\n").is_none());
+        assert!(highlight_ansi("", "let x = 1;\n").is_none());
+        assert!(highlight_ansi("rust", "").is_none());
     }
 
     #[test]
-    fn highlight_handles_hash_comments_per_lang() {
-        // hash-comments branch for python, plain for rust
-        print_ansi_highlighted_code("python", "# comment\nx = 1");
-        print_ansi_highlighted_code("rust", "# not a comment in rust\nlet x = 1;");
+    fn highlight_preserves_source_bytes_and_colors_tokens() {
+        let code = "fn main() { let x = 42; // comment\n}\n";
+        let out = highlight_ansi("rust", code).expect("rust must highlight");
+        // No bytes lost or reordered; styles are annotations only.
+        assert_eq!(strip_sgr(&out), code);
+        // Keyword (`fn`, bold) and comment (italic) carry SGR runs.
+        assert!(out.contains("\x1b["), "no SGR emitted: {out:?}");
+        let bold = out.split("fn").next().expect("keyword must survive");
+        assert!(
+            bold.rsplit("\x1b[")
+                .next()
+                .is_some_and(|sgr| sgr.starts_with('1')),
+            "keyword not bold: {out:?}"
+        );
+    }
+
+    #[test]
+    fn highlight_covers_new_grammars() {
+        // Every newly enabled grammar must yield segments, not the fallback.
+        for (lang, code) in [
+            ("csharp", "class A { void M() {} }\n"),
+            ("dart", "void main() { var x = 1; }\n"),
+            ("lua", "local x = 1 -- hi\n"),
+            ("nix", "{ pkgs }: pkgs.hello\n"),
+            ("php", "<?php echo $x; ?>\n"),
+            ("ruby", "def foo # hi\nend\n"),
+            ("scala", "object A { val x = 1 }\n"),
+            ("swift", "func f() { let x = 1 }\n"),
+        ] {
+            let out = highlight_ansi(lang, code).expect("{lang} must highlight");
+            assert_eq!(strip_sgr(&out), code, "{lang} lost bytes");
+            assert!(out.contains("\x1b["), "{lang} emitted no SGR");
+        }
+    }
+
+    #[test]
+    fn highlight_kotlin_degrades_gracefully() {
+        // `highlight-lang-kotlin` is disabled (see Cargo.toml): the grammar is
+        // unknown to the highlighter, so kotlin dims instead of panicking.
+        assert!(highlight_ansi("kotlin", "fun main() { val x = 1 }\n").is_none());
+    }
+
+    #[test]
+    fn bash_highlights_without_commenting_flags() {
+        // `--` flags and `$VAR` must survive as source bytes (the old hand
+        // lexer special-cased these; tree-sitter parses them properly).
+        let code = "grep -- -x foo # comment\necho $HOME\n";
+        let out = highlight_ansi("bash", code).expect("bash must highlight");
+        assert_eq!(strip_sgr(&out), code);
     }
 
     #[test]

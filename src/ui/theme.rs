@@ -7,10 +7,9 @@
 //! background blended a step toward the foreground, so it keeps the theme's
 //! hue and always contrasts with text on it.
 
-use std::sync::OnceLock;
-
 use ratatui::style::Color;
-use terminal_colorsaurus::{color_palette, QueryOptions, ThemeMode};
+
+use crate::core::palette::{blend, fg_rgb, muted_rgb, term_palette};
 
 /// Which side of the light/dark split the terminal background sits on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -21,42 +20,11 @@ pub(crate) enum Background {
     Unknown,
 }
 
-/// The terminal's real colors, queried once via OSC 11 and memoized.
-struct Palette {
-    mode: ThemeMode,
-    background: (u8, u8, u8),
-    foreground: (u8, u8, u8),
-}
-
-fn palette() -> Option<&'static Palette> {
-    static PALETTE: OnceLock<Option<Palette>> = OnceLock::new();
-    PALETTE
-        .get_or_init(|| {
-            let p = color_palette(QueryOptions::default()).ok()?;
-            Some(Palette {
-                mode: p.theme_mode(),
-                background: p.background.scale_to_8bit(),
-                foreground: p.foreground.scale_to_8bit(),
-            })
-        })
-        .as_ref()
-}
-
-/// Blend `base` toward `toward` by `amount` (0.0 = base, 1.0 = toward).
-fn blend(base: (u8, u8, u8), toward: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
-    let mix = |b: u8, t: u8| (f32::from(b) + (f32::from(t) - f32::from(b)) * amount).round() as u8;
-    (
-        mix(base.0, toward.0),
-        mix(base.1, toward.1),
-        mix(base.2, toward.2),
-    )
-}
-
 /// A raised surface: the terminal's actual background lifted a step toward
 /// its foreground, so the hue matches the active theme. `amount` controls how
 /// far the surface sits above the background (larger = more prominent).
 fn raised(amount: f32) -> Color {
-    match palette() {
+    match term_palette() {
         Some(p) => {
             let (r, g, b) = blend(p.background, p.foreground, amount);
             Color::Rgb(r, g, b)
@@ -93,11 +61,8 @@ pub(crate) fn popup_bg() -> Color {
 /// color 0 to the cream background), which renders text unreadable. When the
 /// theme is unknown the default foreground is inherited (`Reset`) instead.
 pub(crate) fn surface_fg() -> Color {
-    match palette() {
-        Some(p) => {
-            let (r, g, b) = p.foreground;
-            Color::Rgb(r, g, b)
-        }
+    match fg_rgb() {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
         None => Color::Reset,
     }
 }
@@ -124,17 +89,10 @@ pub(crate) fn muted_fg() -> Color {
 /// and dark tinted backgrounds. Fixed ANSI grays (`DarkGray`/`Gray`)
 /// bypass the palette and clash with tinted themes.
 fn tool_muted_fg() -> Color {
-    match palette() {
-        Some(p) => {
-            // Blend foreground toward background just enough to read as
-            // detail rather than dialogue, while preserving contrast.
-            let amount = match p.mode {
-                ThemeMode::Dark => 0.38,
-                ThemeMode::Light => 0.42,
-            };
-            let (r, g, b) = blend(p.foreground, p.background, amount);
-            Color::Rgb(r, g, b)
-        }
+    // Blend foreground toward background just enough to read as detail
+    // rather than dialogue, while preserving contrast.
+    match muted_rgb() {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
         None => Color::Gray,
     }
 }
@@ -152,11 +110,9 @@ pub(crate) fn tool_input_fg() -> Color {
 }
 
 fn background() -> Background {
-    match palette() {
-        Some(p) => match p.mode {
-            ThemeMode::Dark => Background::Dark,
-            ThemeMode::Light => Background::Light,
-        },
+    match term_palette() {
+        Some(p) if p.dark => Background::Dark,
+        Some(_) => Background::Light,
         None => Background::Unknown,
     }
 }
