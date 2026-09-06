@@ -1144,6 +1144,10 @@ mod tests {
 
     #[test]
     fn events_journal_replays_after_seq_cursor() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-events-test".into(), None).unwrap();
         s.append_event(0, r#"{"type":"assistant_text","data":"a"}"#)
             .unwrap();
@@ -1183,6 +1187,10 @@ mod tests {
 
     #[test]
     fn change_ledger_records_then_undo_restores() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-undo-test".into(), None).unwrap();
         let work = s.path().unwrap().parent().unwrap().join("work.txt");
         fs::write(&work, b"before\n").unwrap();
@@ -1217,6 +1225,10 @@ mod tests {
 
     #[test]
     fn undo_refuses_when_file_moved_on() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-undo-concurrent".into(), None).unwrap();
         let work = s.path().unwrap().parent().unwrap().join("c.txt");
         fs::write(&work, b"v1\n").unwrap();
@@ -1247,6 +1259,10 @@ mod tests {
 
     #[test]
     fn effect_journal_records_intent_and_outcome() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-effect-test".into(), None).unwrap();
         s.effect_start("call-1", "edit", "abc").unwrap();
         s.turn_event("turn_start").unwrap();
@@ -1265,6 +1281,10 @@ mod tests {
 
     #[test]
     fn record_skills_writes_session_state_entry() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let skills = vec![crate::core::types::Skill {
             name: "demo".into(),
             description: "does demo things".into(),
@@ -1305,6 +1325,10 @@ mod tests {
 
     #[test]
     fn new_session_defaults_name_but_keeps_explicit() {
+        // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let s = Session::new("/tmp/dex-name-default".into(), None).unwrap();
         let name = s.name().unwrap().to_string();
         assert!(name.starts_with("dex-name-default-"), "got: {name}");
@@ -1330,6 +1354,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dex-sess-async-{}", std::process::id()));
+        let _env = EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
         std::env::set_var("XDG_DATA_HOME", &dir);
         let mut s = Session::new("/tmp/async-cwd".into(), None).unwrap();
         let msg = ChatMessage::user("hello async");

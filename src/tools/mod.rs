@@ -7,7 +7,6 @@ use similar::TextDiff;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -419,6 +418,8 @@ async fn kill_process_group_async(pid: Option<u32>, child: &mut tokio::process::
             let _ = kill(-(pid as i32), SIGKILL);
         }
     }
+    #[cfg(not(unix))]
+    let _ = pid;
     let _ = child.kill().await;
 }
 
