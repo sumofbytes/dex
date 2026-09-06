@@ -183,6 +183,9 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             },
         });
     }
+    // MCP tools merge from the background-refreshed cache: sync, never
+    // blocks the turn loop. Empty until the first refresh lands.
+    tools.extend(crate::mcp::cached_tools());
     tools
 }
 
