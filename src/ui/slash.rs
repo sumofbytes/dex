@@ -249,8 +249,6 @@ pub(super) fn expand_bare_command(app: &mut App) -> bool {
 pub(super) fn reset_session_state(app: &mut App) {
     app.messages.truncate(1);
     app.turn_start = 0;
-    app.turn_started = None;
-    app.last_activity = None;
     app.pending_steering.clear();
     app.pending_followups.clear();
     app.cancel_requested = false;

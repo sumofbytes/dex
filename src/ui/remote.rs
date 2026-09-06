@@ -33,8 +33,8 @@ use super::slash::{
 use super::{
     append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
     line_width, mouse_display_cell, push_banner, push_info, push_info_line, render_user_prompt,
-    resolve_approval, scroll_transcript, selection_text, view, word_bounds, App, EnableMouseScroll,
-    PendingApproval, Selection, TerminalCleanup,
+    resolve_approval, scroll_transcript, selection_text, settle_activity, start_activity, view,
+    word_bounds, App, EnableMouseScroll, PendingApproval, Selection, TerminalCleanup,
 };
 
 /// Process start for the `ready in …` session-start line. Marked at `main()`
@@ -362,8 +362,6 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         cwd: info.cwd.clone(),
         git_branch: info.git_branch.clone(),
         git_dirty: info.git_dirty,
-        turn_started: None,
-        last_activity: None,
         steering_rx: None,
         followup_rx: None,
         pending_steering: Vec::new(),
@@ -947,17 +945,11 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
     remote.cancel_flag.store(false, Ordering::SeqCst);
-    if let Some(started) = app.turn_started.take() {
-        let tokens = app
-            .tool_state
-            .last_usage
-            .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
-        app.last_activity = Some(format!(
-            "worked for {:.1}s · {} tokens",
-            started.elapsed().as_secs_f64(),
-            super::format_tokens(tokens)
-        ));
-    }
+    let tokens = app
+        .tool_state
+        .last_usage
+        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
+    settle_activity(app, tokens);
     // Tools (bash/git/write/edit) may have switched branches or dirtied the
     // tree mid-turn; refresh the footer now rather than waiting for the next
     // background poll. Async so the UI thread never blocks on HTTP (the
@@ -1461,8 +1453,9 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let app = &mut remote.app;
     app.busy = true;
     app.cancel_requested = false;
-    app.last_activity = None;
-    app.turn_started = Some(std::time::Instant::now());
+    // Live "● Working" indicator inside the transcript; settled to the
+    // "Worked for …" summary by `finish_turn`.
+    start_activity(app);
     remote.cancel_flag.store(false, Ordering::SeqCst);
 
     // Spawn the worker as an async task: it drives the daemon's SSE stream
