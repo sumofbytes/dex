@@ -1729,4 +1729,46 @@ mod tests {
         assert_eq!(app.input.text(), "/model ");
         assert!(crate::ui::slash::EXPAND_ON_ENTER.contains(&"/model"));
     }
+
+    #[test]
+    fn picker_rows_show_items_not_repeated_commands() {
+        // Inside a picker the popup rows show just the item (`gpt-5`), not
+        // the repeated command (`/model gpt-5`); outside a picker the
+        // command itself stays the label.
+        let label = crate::ui::slash::suggestion_label;
+        assert_eq!(label("/model ", "/model gpt-5"), "gpt-5");
+        assert_eq!(label("/model gp", "/model gpt-5"), "gpt-5");
+        assert_eq!(label("/provider ", "/provider opencode"), "opencode");
+        assert_eq!(label("/resume ", "/resume 0"), "0");
+        assert_eq!(label("/resume", "/resume 2"), "2");
+        assert_eq!(label("/resume old", "/resume 2"), "2");
+        assert_eq!(label("/", "/model"), "/model");
+        assert_eq!(label("/cl", "/clear"), "/clear");
+    }
+
+    #[test]
+    fn esc_dismiss_discards_draft_and_closes_popup() {
+        // Esc on an open popup discards the drafted slash command (which is
+        // what closes the popup — it is derived from the input) and resets
+        // the highlight, without submitting anything.
+        let mut app = test_app();
+        app.input = crate::ui::input::InputField::from_text("/mod");
+        app.slash_selected = 2;
+        assert!(crate::ui::slash::dismiss_slash(&mut app));
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.slash_selected, 0);
+        assert!(crate::ui::slash::slash_suggestions(&app).is_empty());
+        assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn esc_dismiss_reports_when_no_popup_open() {
+        // Plain text (or empty input) shows no popup: nothing to discard.
+        for input in ["hello", ""] {
+            let mut app = test_app();
+            app.input = crate::ui::input::InputField::from_text(input);
+            assert!(!crate::ui::slash::dismiss_slash(&mut app));
+            assert_eq!(app.input.text(), input);
+        }
+    }
 }

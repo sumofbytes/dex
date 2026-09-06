@@ -176,6 +176,41 @@ pub(super) fn complete_slash(app: &mut App) -> bool {
     true
 }
 
+/// Dismiss the slash popup without completing anything: clears the drafted
+/// command line and resets the highlight. Returns false when no popup is
+/// open (suggestions empty) so callers can fall through to other handling.
+/// The popup is derived from the input text, so clearing the draft is what
+/// actually closes it.
+pub(super) fn dismiss_slash(app: &mut App) -> bool {
+    if slash_suggestions(app).is_empty() {
+        return false;
+    }
+    app.input = InputField::from_text("");
+    app.slash_selected = 0;
+    true
+}
+
+/// Display label for a popup row. Inside an argument picker (`/model `,
+/// `/provider `, `/resume …`) the completion text repeats the command
+/// (`/model gpt-5`), so rows show just the item (`gpt-5`) — the popup
+/// header already names the picker. Outside a picker the command itself
+/// is the label.
+pub(super) fn suggestion_label<'a>(input: &str, command: &'a str) -> &'a str {
+    let prefix = if input.starts_with("/model ") {
+        Some("/model ")
+    } else if input.starts_with("/provider ") {
+        Some("/provider ")
+    } else if input == "/resume" || input.starts_with("/resume ") {
+        Some("/resume ")
+    } else {
+        None
+    };
+    match prefix {
+        Some(prefix) => command.strip_prefix(prefix).unwrap_or(command),
+        None => command,
+    }
+}
+
 /// Bare slash commands that open a picker (`/model` + `/provider` complete
 /// from the catalog, `/resume` from the session list). Enter on the bare
 /// form expands to `"<cmd> "` and keeps the popup open instead of

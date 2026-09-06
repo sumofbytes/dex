@@ -932,6 +932,7 @@ impl SlashSuggestionsView {
             return;
         }
         app.slash_selected = app.slash_selected.min(suggestions.len() - 1);
+        let input = app.input.text();
         // A bare `/model ` matches the whole catalog (50+ entries): cap the
         // visible rows so the popup stays a small list above the composer
         // instead of a full-transcript wall, and scroll it with the selection.
@@ -952,14 +953,15 @@ impl SlashSuggestionsView {
             .saturating_sub(visible.saturating_sub(1))
             .min(max_start);
         let window = &suggestions[start..start + visible];
-        // Size the popup to its content. The old fixed `{command:<20}` column
-        // glued the description onto any `/model <name>` longer than 20
-        // chars; the column now fits the longest visible command with a
-        // two-space gap before the description.
+        // Size the popup to its content: the label column fits the longest
+        // visible item with a two-space gap before the description. Inside a
+        // picker (`/model `, `/provider `, `/resume …`) rows show just the
+        // item (`> gpt-5`), not the repeated command (`/model gpt-5`) — the
+        // header already names the picker.
         let avail = area.width.saturating_sub(2) as usize;
         let cmd_col = window
             .iter()
-            .map(|(command, _)| UnicodeWidthStr::width(command.as_str()))
+            .map(|(command, _)| UnicodeWidthStr::width(slash::suggestion_label(&input, command)))
             .max()
             .unwrap_or(0)
             .min(48)
@@ -1015,7 +1017,8 @@ impl SlashSuggestionsView {
                 } else {
                     Style::default().fg(theme::secondary_fg()).bg(row_bg)
                 };
-                let cell = truncate_display(command, cmd_col as u16);
+                let label = slash::suggestion_label(&input, command);
+                let cell = truncate_display(label, cmd_col as u16);
                 let pad = cmd_col.saturating_sub(UnicodeWidthStr::width(cell.as_str()));
                 let mut cell = cell;
                 cell.push_str(&" ".repeat(pad + 2));
@@ -1025,13 +1028,12 @@ impl SlashSuggestionsView {
                     + UnicodeWidthStr::width(desc.as_str());
                 let tail = " ".repeat(inner_w.saturating_sub(used));
                 ListItem::new(Line::from(vec![
-                    Span::styled(if selected { "› " } else { "  " }, marker_style),
+                    Span::styled(if selected { "> " } else { "  " }, marker_style),
                     Span::styled(cell, command_style),
                     Span::styled(desc, description_style),
                     Span::styled(tail, Style::default().bg(row_bg)),
                 ]))
             });
-        let input = app.input.text();
         let base = if input.starts_with("/model ") {
             "Models"
         } else if input.starts_with("/provider ") {
@@ -2066,6 +2068,35 @@ mod tests {
         // Indented preview: " " + "  35\tlet" -> indent 1 + 2 spaces + 2 chars = col 5 before tab => 3 spaces
         assert!(symbols.contains("35   let cwd"), "{symbols}");
         assert!(!symbols.contains("35      let cwd") || true); // raw cell_safe check above covers 6-space case without indent
+    }
+
+    #[test]
+    fn picker_popup_shows_item_labels_with_marker() {
+        // `/model ` + Enter opens the picker: rows must read `> <item>`,
+        // not repeat the command (`/model <item>`).
+        let mut app = test_app();
+        app.config.available_models = vec!["alpha-model".to_string(), "beta-model".to_string()];
+        app.input = InputField::from_text("/model ");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // The popup anchors above the composer: pass the composer
+                // rect like the real layout does (`frame.area()` starts at
+                // y=0, which clamps the popup height to zero).
+                SlashSuggestionsView::render(frame, Rect::new(0, 21, 80, 3), &mut app);
+            })
+            .expect("render should succeed");
+        let symbols: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(symbols.contains("> alpha-model"), "{symbols}");
+        assert!(symbols.contains("  beta-model"), "{symbols}");
+        assert!(!symbols.contains("/model"), "{symbols}");
     }
 
     #[test]

@@ -27,8 +27,8 @@ use crate::protocol::{ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, 
 use crate::session::Session;
 
 use super::slash::{
-    complete_slash, expand_bare_command, handle_slash, reset_session_state, slash_suggestions,
-    EXPAND_ON_ENTER,
+    complete_slash, dismiss_slash, expand_bare_command, handle_slash, reset_session_state,
+    slash_suggestions, EXPAND_ON_ENTER,
 };
 use super::{
     append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
@@ -1265,6 +1265,11 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             bump_thinking_stamps(app);
         }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
+            KeyCode::Esc => {
+                // Discard the drafted slash command and close the popup
+                // without completing anything (busy+Esc still cancels).
+                dismiss_slash(app);
+            }
             KeyCode::Up => {
                 app.slash_selected = app.slash_selected.saturating_sub(1);
             }
