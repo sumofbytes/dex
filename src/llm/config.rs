@@ -1353,12 +1353,14 @@ impl LlmConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
-        // The default-timeouts path (every daemon turn + TUI launch) reuses
-        // the process-wide client instead of re-initializing TLS + pool.
-        // Custom timeouts still build a dedicated client. The async client
-        // is Clone (atomic bump); TLS init happens once.
+        // Streaming generations must not have a total request timeout:
+        // reqwest's `.timeout()` covers the whole SSE body, killing long
+        // generations with `error decoding response body`. The default path
+        // shares the process-wide streaming client (connect timeout only);
+        // an explicit DEX_HTTP_REQUEST_TIMEOUT_SECS still builds a bounded
+        // client for those who want a backstop.
         let client = if connect_secs == 10 && request_secs == 300 {
-            crate::client::http::shared_async_client()
+            crate::client::http::shared_streaming_client()
         } else {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(connect_secs))
