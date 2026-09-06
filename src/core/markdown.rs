@@ -85,10 +85,10 @@ pub(crate) fn task_text(t: &str) -> Option<(&str, bool)> {
 }
 
 /// Ordered-list marker (`1. `, `12) `) — models often butt these against
-/// prose without a blank line.
+/// prose without a blank line. CommonMark allows 1-9 digits.
 pub(crate) fn is_ordered_item(t: &str) -> bool {
     let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    if !(1..=3).contains(&digits) {
+    if !(1..=9).contains(&digits) {
         return false;
     }
     let rest = &t[digits..];
@@ -201,10 +201,21 @@ pub(crate) fn is_continuation_lines(prev: &str, curr: &str) -> bool {
     is_continuation(p, is_table_line(p), c, is_table_line(c))
 }
 
-/// Whether headless `curr` wants a blank line before it: never inside
-/// fences, never doubled, never between continuation rows.
-pub(crate) fn needs_gap_before(prev_empty: bool, in_fence: bool, curr: &str) -> bool {
-    if prev_empty || in_fence || curr.trim().is_empty() {
+/// Whether headless `curr` wants a blank line before it: never doubled,
+/// never between continuation rows. Callers only invoke outside fences.
+/// Table gaps need outer pipes (or a delimiter row): bare `a | b | c`
+/// prose stays gapless until a delimiter confirms a real table in the TUI
+/// path (`is_table_start`); models emit outer pipes in practice.
+pub(crate) fn is_table_gap_line(t: &str) -> bool {
+    let t = t.trim();
+    if !is_table_line(t) {
+        return false;
+    }
+    t.starts_with('|') || t.ends_with('|') || is_table_delimiter(t)
+}
+
+pub(crate) fn needs_gap_before(prev_empty: bool, curr: &str) -> bool {
+    if prev_empty || curr.trim().is_empty() {
         return false;
     }
     let t = curr.trim_start();
@@ -217,7 +228,7 @@ pub(crate) fn needs_gap_before(prev_empty: bool, in_fence: bool, curr: &str) -> 
         || t.starts_with("+ ")
         || task_text(t).is_some()
         || is_ordered_item(t)
-        || is_table_line(t)
+        || is_table_gap_line(t)
 }
 
 /// Insert blank lines where the model butts block-level markdown against
@@ -263,8 +274,9 @@ pub(crate) fn normalize_gaps(pending: &str, s: &str) -> String {
                 && !t.is_empty()
                 && !is_continuation(prev, prev_table, t, curr_table)
             {
-                let starts_block =
-                    is_block_start(t) || is_ordered_item(t) || (curr_table && !prev_table);
+                let starts_block = is_block_start(t)
+                    || is_ordered_item(t)
+                    || (is_table_gap_line(t) && !prev_table);
                 if air || starts_block {
                     out.push('\n');
                 }
@@ -323,7 +335,8 @@ mod tests {
         assert_eq!(task_text("+ [ ] t"), Some(("t", false)));
         assert!(task_text("- [?] x").is_none());
         assert!(is_ordered_item("1. a") && is_ordered_item("12) b"));
-        assert!(!is_ordered_item("1234. a"));
+        assert!(is_ordered_item("1234. a"));
+        assert!(!is_ordered_item("1234567890. a"));
         assert!(!is_ordered_item("a. b"));
         assert_eq!(list_kind("+ a"), 1);
         assert_eq!(list_kind("2. a"), 2);
@@ -380,5 +393,15 @@ mod tests {
         assert_eq!(lang_from_path("run.SH"), "bash");
         assert_eq!(lang_from_path("2 files"), "");
         assert_eq!(lang_from_path("Makefile"), "");
+    }
+
+    #[test]
+    fn table_gaps_need_outer_pipes() {
+        // Bare `a | b | c` shell prose stays gapless; outer-pipe tables gap.
+        assert!(!is_table_gap_line("a | b | c"));
+        assert!(is_table_gap_line("| a | b |"));
+        assert!(!needs_gap_before(false, "a | b | c"));
+        assert!(needs_gap_before(false, "| a | b |"));
+        assert_eq!(normalize_gaps("", "text\na | b | c"), "text\na | b | c\n");
     }
 }

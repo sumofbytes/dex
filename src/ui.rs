@@ -72,11 +72,10 @@ pub(crate) enum TranscriptBlock {
         input: Line<'static>,
         output: Option<Line<'static>>,
         preview: Vec<Line<'static>>,
-        /// Tool name + short arg as emitted by `ToolInput` (e.g. `read` +
-        /// `src/main.rs:1-20`). Stored — not parsed back out of the rendered
-        /// `input` line — so `ToolOutput` can pick the preview language for
-        /// syntax highlighting without span scraping.
-        tool_name: String,
+        /// Short arg as emitted by `ToolInput` (e.g. `src/main.rs:1-20`).
+        /// Stored — not parsed back out of the rendered `input` line — so
+        /// `ToolOutput` can pick the preview language for syntax
+        /// highlighting without span scraping.
         tool_arg: String,
     },
     System {
@@ -742,7 +741,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let arg = it.next().unwrap_or("").to_string();
             let input = indent_transcript_line(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Yellow)),
-                Span::styled(name.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(name, Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!(" {arg}"),
                     Style::default().fg(theme::tool_input_fg()),
@@ -753,7 +752,6 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 input,
                 output: None,
                 preview: Vec::new(),
-                tool_name: name,
                 tool_arg: arg,
             });
         }
@@ -863,7 +861,6 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 ))),
                 output: Some(output),
                 preview: preview_lines,
-                tool_name: name,
                 tool_arg: String::new(),
             });
         }

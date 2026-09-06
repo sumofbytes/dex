@@ -48,10 +48,10 @@ impl StreamPrinter {
         }
     }
 
-    /// Blank line needed before headless `line` (never inside fences, never
-    /// doubled, never between tight-continuation rows like list items).
-    /// Uses the shared rule (`core::markdown`) — the same one the TUI
-    /// throttle normalizes with — so both renderers agree on air.
+    /// Blank line needed before headless `line` (never doubled, never
+    /// between tight-continuation rows like list items). Uses the shared
+    /// rule (`core::markdown`) — the same one the TUI throttle normalizes
+    /// with — so both renderers agree on air. Only called outside fences.
     fn headless_gap(&self, line: &str) -> bool {
         use crate::core::markdown as md;
         if line.trim().is_empty() {
@@ -60,7 +60,7 @@ impl StreamPrinter {
         if md::is_continuation_lines(&self.headless_prev, line) {
             return false;
         }
-        self.headless_air || md::needs_gap_before(self.headless_empty, self.in_code, line)
+        self.headless_air || md::needs_gap_before(self.headless_empty, line)
     }
 
     fn headless_note(&mut self, line: &str) {
@@ -75,6 +75,30 @@ impl StreamPrinter {
             self.headless_air = md::block_leaves_air(t, md::is_table_line(t));
             self.headless_prev = t.to_string();
         }
+    }
+
+    /// Headless bookkeeping shared by the sync/async fence paths: closing
+    /// fence leaves air (MD031), opening fence gets air before it.
+    fn headless_on_fence_close(&mut self) {
+        self.headless_empty = false;
+        self.headless_air = true;
+        self.headless_prev = "```".to_string();
+    }
+
+    fn headless_on_fence_open(&mut self) {
+        if self.sink.is_none() && !self.headless_empty {
+            println!();
+            self.headless_empty = true;
+        }
+    }
+
+    /// Headless prose path shared by sync/async inners (both print sync).
+    fn headless_on_prose(&mut self, line: &str) {
+        if self.headless_gap(line) {
+            println!();
+        }
+        print_markdown_text(line);
+        self.headless_note(line);
     }
 
     /// Sync variant for the in-memory test driver only.
@@ -111,19 +135,13 @@ impl StreamPrinter {
                     )));
                 } else {
                     print_code_block(&self.code_lang, &self.code_body);
-                    // Closed fence leaves air like any block (MD031).
-                    self.headless_empty = false;
-                    self.headless_air = true;
-                    self.headless_prev = "```".to_string();
+                    self.headless_on_fence_close();
                 }
                 self.code_body.clear();
                 self.code_lang.clear();
                 self.in_code = false;
             } else {
-                if self.sink.is_none() && !self.headless_empty {
-                    println!();
-                    self.headless_empty = true;
-                }
+                self.headless_on_fence_open();
                 self.in_code = true;
                 self.code_lang = trimmed.trim_start_matches('`').trim().to_string();
             }
@@ -134,11 +152,7 @@ impl StreamPrinter {
             if let Some(sink) = &self.sink {
                 let _ = sink.try_send(SinkLine::Assistant(line.to_string()));
             } else {
-                if self.headless_gap(line) {
-                    println!();
-                }
-                print_markdown_text(line);
-                self.headless_note(line);
+                self.headless_on_prose(line);
             }
         }
     }
@@ -156,18 +170,13 @@ impl StreamPrinter {
                         .await;
                 } else {
                     print_code_block(&self.code_lang, &self.code_body);
-                    self.headless_empty = false;
-                    self.headless_air = true;
-                    self.headless_prev = "```".to_string();
+                    self.headless_on_fence_close();
                 }
                 self.code_body.clear();
                 self.code_lang.clear();
                 self.in_code = false;
             } else {
-                if self.sink.is_none() && !self.headless_empty {
-                    println!();
-                    self.headless_empty = true;
-                }
+                self.headless_on_fence_open();
                 self.in_code = true;
                 self.code_lang = trimmed.trim_start_matches('`').trim().to_string();
             }
@@ -177,11 +186,7 @@ impl StreamPrinter {
         } else if let Some(sink) = &self.sink {
             let _ = sink.send(SinkLine::Assistant(line.to_string())).await;
         } else {
-            if self.headless_gap(line) {
-                println!();
-            }
-            print_markdown_text(line);
-            self.headless_note(line);
+            self.headless_on_prose(line);
         }
     }
 

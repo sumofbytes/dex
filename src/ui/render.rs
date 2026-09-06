@@ -390,7 +390,10 @@ pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
     };
     for line in preview {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("==>") {
+        // Success headers (`==> path <==`) re-target the language per
+        // section. Fan-out errors (`==> path: error: …`, no `<==`) are dim
+        // landmarks, not sections.
+        if trimmed.starts_with("==>") && trimmed.contains("<==") {
             if !cur.rows.is_empty() || cur.header.is_some() {
                 sections.push(cur);
             }
@@ -406,7 +409,10 @@ pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
                 lang,
                 rows: Vec::new(),
             };
-        } else if trimmed.starts_with('…') || trimmed.starts_with("[...") {
+        } else if trimmed.starts_with('…')
+            || trimmed.starts_with("[...")
+            || trimmed.starts_with("==>")
+        {
             cur.rows.push(Row::Meta(line.as_str()));
         } else if let Some((gutter, code)) = split_read_gutter(line) {
             cur.rows.push(Row::Code { gutter, code });
@@ -2710,6 +2716,19 @@ mod tests {
         assert!(text(&lines[1]).contains("fn main"), "{}", text(&lines[1]));
         // Gutter row carries highlight past the dim gutter span.
         assert!(lines[1].spans.len() > 2, "{:?}", lines[1]);
+    }
+
+    #[test]
+    fn read_preview_error_header_stays_dim() {
+        // Fan-out errors (`==> path: error: …`, no `<==`) are landmarks,
+        // not sections: dim, never a language re-target.
+        let preview = vec!["==> src/missing.rs: error: not found".to_string()];
+        let lines = render_read_preview(&preview, "rust");
+        assert_eq!(lines.len(), 1);
+        // spans[0] is the unstyled transcript indent; the rest stays dim.
+        assert!(lines[0].spans[1..]
+            .iter()
+            .all(|s| s.style.fg == Some(crate::ui::theme::tool_preview_fg())));
     }
 
     #[test]
