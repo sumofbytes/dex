@@ -677,10 +677,12 @@ fn content_tail_mut(app: &mut App) -> Option<&mut TranscriptBlock> {
 /// busy-but-not-thinking), so its cached rows depend on `thinking_open` as
 /// well as its stamp — bump it whenever thinking opens or closes.
 fn bump_open_activity(app: &mut App) {
-    for block in &mut app.transcript {
-        if matches!(block, TranscriptBlock::Activity { settled: None, .. }) {
-            block.bump();
-        }
+    if let Some(pos) = app
+        .transcript
+        .iter()
+        .rposition(|b| matches!(b, TranscriptBlock::Activity { settled: None, .. }))
+    {
+        app.transcript[pos].bump();
     }
 }
 
@@ -1073,7 +1075,7 @@ fn move_activity_to_tail(app: &mut App) {
 
 /// Settle the open turn-activity block: move it to the transcript tail and
 /// swap the animated "● Working" indicator for the turn's summary —
-/// "Worked for 12.3s · 4.2k tokens". Duration is measured from the block's
+/// "Worked for 12s · 4.2k tokens". Duration is measured from the block's
 /// start, so it spans the whole turn (thinking included). Token count is
 /// read only once a block to settle exists, so replayed turns that never
 /// saw a turn start skip the estimate entirely.
@@ -1098,8 +1100,8 @@ pub(super) fn settle_activity(app: &mut App) {
         stamp: 0,
         started,
         settled: Some(format!(
-            "Worked for {:.1}s · {} tokens",
-            started.elapsed().as_secs_f64(),
+            "Worked for {} · {} tokens",
+            render::format_elapsed(started.elapsed()),
             format_tokens(tokens),
         )),
     });

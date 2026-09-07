@@ -229,9 +229,13 @@ fn main() {
             };
             if addr.ip().is_unspecified() {
                 eprintln!(
-                    "warning: daemon listening on {addr} is exposed on all interfaces and has no authentication — prefer 127.0.0.1 for local use"
+                    "warning: daemon listening on {addr} is exposed on all interfaces — a bearer token is required (set DEX_DAEMON_TOKEN or copy the generated daemon.token); prefer 127.0.0.1 for local use"
                 );
             }
+            // Non-loopback binds (or an explicit DEX_DAEMON_TOKEN) get a
+            // bearer token: the daemon runs tools in a workspace, so an
+            // unauthenticated reachable endpoint is remote code execution.
+            daemon::prepare_daemon_token(&addr);
             let listener = match std::net::TcpListener::bind(addr) {
                 Ok(listener) => listener,
                 Err(e) => {

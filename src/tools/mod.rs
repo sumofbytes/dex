@@ -83,6 +83,54 @@ fn resolve_workspace_path(root: &Path, raw: &str) -> Result<PathBuf, ToolError> 
     }
 }
 
+/// Normalize a tool-call `path` argument for same-path conflict detection:
+/// `./foo.rs`, `src/../foo.rs` and `foo.rs` are the same file, but the raw
+/// strings differ — the turn loop would then fan out two edits to one file
+/// concurrently and the second edit would silently clobber the first.
+/// Best-effort with known gaps: paths needing FS state we can't resolve
+/// (missing parent dirs), case-only differences on case-insensitive FS,
+/// and same-file writes via `bash` redirection (no `path` arg) still miss.
+/// Unresolvable paths fall back to a lexical clean (no symlink resolution),
+/// which still catches `./` and `a/../` spelling differences.
+pub(crate) fn normalize_conflict_path(raw: &str) -> String {
+    if let Ok(resolved) = workspace_path(raw) {
+        return resolved.display().to_string();
+    }
+    lexical_normalize_fallback(raw)
+}
+
+/// Join `raw` against the workspace root and clean `.`/`..` lexically
+/// without touching the FS. Catches `./newdir/f` vs `newdir/f` when the
+/// parent doesn't exist yet (canonicalize would fail).
+fn lexical_normalize_fallback(raw: &str) -> String {
+    let raw_path = Path::new(raw);
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        let root = workspace_root()
+            .ok()
+            .and_then(|r| r.canonicalize().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        root.join(raw_path)
+    };
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        use std::path::Component as C;
+        match comp {
+            C::CurDir => {}
+            C::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        raw.to_string()
+    } else {
+        out.display().to_string()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ToolError {
     Missing(&'static str),
@@ -704,9 +752,7 @@ async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
             .map_err(ToolError::Io)?;
     }
     let replaced = tokio::fs::metadata(&path).await.ok().map(|meta| meta.len());
-    tokio::fs::write(&path, &content)
-        .await
-        .map_err(ToolError::Io)?;
+    atomic_write(&path, &content).await?;
     Ok(match replaced {
         Some(old_bytes) => format!(
             "wrote {} (replaced {old_bytes} bytes with {})",
@@ -715,6 +761,57 @@ async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
         ),
         None => format!("wrote {}", path.display()),
     })
+}
+
+/// Durability for `write`/`edit`: content lands in a sibling temp file (same
+/// directory, so the rename stays on one filesystem), is fsynced, then is
+/// atomically renamed over the target. A crash mid-write can never leave a
+/// truncated or half-edited file behind — readers see either the old or the
+/// new content, never a mixture. The plain `tokio::fs::write` this replaces
+/// truncates in place: a power loss during the write corrupts the file the
+/// agent is editing.
+async fn atomic_write(path: &Path, content: &str) -> Result<(), ToolError> {
+    use tokio::io::AsyncWriteExt as _;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(
+        ".dex-write-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    // Preserve the existing file mode (e.g. executable scripts): rename
+    // replaces the inode, so re-apply after the swap. New files keep the
+    // default umask mode.
+    let orig_permissions = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    let result = async {
+        let mut file = tokio::fs::File::create(&tmp).await.map_err(ToolError::Io)?;
+        file.write_all(content.as_bytes())
+            .await
+            .map_err(ToolError::Io)?;
+        file.sync_all().await.map_err(ToolError::Io)?;
+        drop(file);
+        // Windows rename() refuses to clobber an existing destination.
+        #[cfg(windows)]
+        let _ = tokio::fs::remove_file(path).await;
+        tokio::fs::rename(&tmp, path).await.map_err(ToolError::Io)?;
+        if let Some(permissions) = orig_permissions {
+            let _ = tokio::fs::set_permissions(path, permissions).await;
+        }
+        // Best-effort: flush the directory entry so the rename itself is
+        // durable; failure here (e.g. exotic filesystems) is not fatal — the
+        // file content is already in place.
+        if let Ok(handle) = tokio::fs::File::open(dir).await {
+            let _ = handle.sync_all().await;
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
 }
 
 /// When a write/edit carries `expected_hash`, reject if the file on disk no
@@ -779,9 +876,7 @@ async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
         .await
         .map_err(ToolError::Io)?;
     let (updated, note) = apply_edit(&content, &old, &new, replace_all)?;
-    tokio::fs::write(&path, updated)
-        .await
-        .map_err(ToolError::Io)?;
+    atomic_write(&path, &updated).await?;
     Ok(format!("edited {}{note}", path.display()))
 }
 
@@ -1325,6 +1420,92 @@ mod tests {
             execute("ffgrep", &args, &GlobalCancellation).await,
             Err(ToolError::InvalidArgument(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_leave_no_temp_files_and_round_trip() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-atomic-write-test.txt";
+        let full = cwd.join(rel);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("first\n".into()));
+        assert!(execute("write", &args, &GlobalCancellation).await.is_ok());
+        // Content round-trips and no `.dex-write-*` temp file survives.
+        assert_eq!(fs::read_to_string(&full).unwrap(), "first\n");
+        args.insert("oldText".into(), Value::String("first".into()));
+        args.insert("newText".into(), Value::String("second".into()));
+        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
+        assert_eq!(fs::read_to_string(&full).unwrap(), "second\n");
+        let strays: Vec<_> = fs::read_dir(cwd.join("target"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(".dex-write-"))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "temp files must be renamed away, not left"
+        );
+        let _ = fs::remove_file(&full);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-atomic-mode-test.sh";
+        let full = cwd.join(rel);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("#!/bin/sh\n".into()));
+        assert!(execute("write", &args, &GlobalCancellation).await.is_ok());
+        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
+        args.insert("oldText".into(), Value::String("#!/bin/sh".into()));
+        args.insert("newText".into(), Value::String("#!/bin/sh\necho hi".into()));
+        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
+        let mode = std::fs::metadata(&full).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "edit must not strip +x");
+        let _ = fs::remove_file(&full);
+    }
+
+    #[test]
+    fn conflict_paths_normalize_spellings() {
+        // `./target` and `target` are the same directory; an absolute and a
+        // relative spelling of one file must collide too.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = "./target";
+        assert_eq!(
+            normalize_conflict_path(rel),
+            normalize_conflict_path("target")
+        );
+        let abs = cwd.join("target").display().to_string();
+        assert_eq!(
+            normalize_conflict_path(&abs),
+            normalize_conflict_path("target")
+        );
+        // Lexical fallback: new files in not-yet-existing dirs still
+        // collide across `./` spellings without touching the FS.
+        assert_eq!(
+            normalize_conflict_path("./newdir-dex-test/f.rs"),
+            normalize_conflict_path("newdir-dex-test/f.rs")
+        );
+        assert_eq!(
+            normalize_conflict_path("a/../newdir-dex-test/f.rs"),
+            normalize_conflict_path("newdir-dex-test/f.rs")
+        );
+        // Outside-workspace absolute paths clean lexically instead of
+        // crashing the check.
+        assert_eq!(
+            normalize_conflict_path("/definitely/not/here"),
+            "/definitely/not/here"
+        );
     }
 
     #[tokio::test]
