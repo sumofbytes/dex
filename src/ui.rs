@@ -1018,6 +1018,27 @@ pub(super) fn start_activity(app: &mut App) {
     app.autoscroll = true;
 }
 
+/// Clear the selection when rows at or below block `pos` no longer map to
+/// the same display rows (the block moved past them). A selection entirely
+/// above `pos` keeps pointing at unchanged rows, so it survives the
+/// streaming appends that re-trail the activity spinner.
+fn drop_shifted_selection(app: &mut App, pos: usize) {
+    // Start row of block `pos` in display space: cached rows plus the
+    // 1-row separator before each non-empty block after the first.
+    let first_shifted: usize = app
+        .wrapped_cache
+        .iter()
+        .take(pos)
+        .enumerate()
+        .map(|(j, wb)| wb.rows.len() + usize::from(j > 0 && !wb.rows.is_empty()))
+        .sum();
+    if let Some(sel) = app.selection {
+        if sel.norm().1 .0 >= first_shifted {
+            app.selection = None;
+        }
+    }
+}
+
 /// Move the open turn-activity block to the transcript tail so the animated
 /// "● Working" indicator always sits under the newest block. Called after
 /// every busy-time append; no-op without a running turn (settled blocks
@@ -1039,23 +1060,21 @@ fn move_activity_to_tail(app: &mut App) {
     else {
         return;
     };
-    if pos + 1 == app.transcript.len() {
-        return;
-    }
     let block = app.transcript.remove(pos);
     app.transcript.push(block);
     // Wrapped rows after `pos` shifted up a slot; drop their (tail few)
     // cache entries — TranscriptView re-wraps them.
     app.wrapped_cache.truncate(pos);
-    app.selection = None;
+    drop_shifted_selection(app, pos);
 }
 
 /// Settle the open turn-activity block: move it to the transcript tail and
 /// swap the animated "● Working" indicator for the turn's summary —
 /// "Worked for 12.3s · 4.2k tokens". Duration is measured from the block's
-/// start, so it spans the whole turn (thinking included). No-op when no
-/// turn ran (e.g. a replay that never saw the turn start).
-pub(super) fn settle_activity(app: &mut App, tokens: u64) {
+/// start, so it spans the whole turn (thinking included). Token count is
+/// read only once a block to settle exists, so replayed turns that never
+/// saw a turn start skip the estimate entirely.
+pub(super) fn settle_activity(app: &mut App) {
     let Some(pos) = app
         .transcript
         .iter()
@@ -1067,6 +1086,10 @@ pub(super) fn settle_activity(app: &mut App, tokens: u64) {
         TranscriptBlock::Activity { started, .. } => *started,
         _ => unreachable!(),
     };
+    let tokens = app
+        .tool_state
+        .last_usage
+        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
     app.transcript.remove(pos);
     app.transcript.push(TranscriptBlock::Activity {
         stamp: 0,
@@ -1078,7 +1101,7 @@ pub(super) fn settle_activity(app: &mut App, tokens: u64) {
         )),
     });
     app.wrapped_cache.truncate(pos);
-    app.selection = None;
+    drop_shifted_selection(app, pos);
 }
 
 /// Ctrl+T toggles expanded thinking. The wrapped rows of a thinking block
@@ -1666,7 +1689,8 @@ mod tests {
             app.transcript[app.transcript.len() - 2],
             TranscriptBlock::Tool { .. }
         ));
-        settle_activity(&mut app, 4200);
+        app.tool_state.last_usage = Some(4200);
+        settle_activity(&mut app);
         match app.transcript.last() {
             Some(TranscriptBlock::Activity {
                 settled: Some(summary),
@@ -1678,12 +1702,72 @@ mod tests {
             other => panic!("expected settled activity block, got {other:?}"),
         }
         // Settling again (e.g. a duplicate finish event) is a no-op.
-        settle_activity(&mut app, 1);
+        app.tool_state.last_usage = Some(1);
+        settle_activity(&mut app);
         assert!(matches!(
             app.transcript.last(),
             Some(TranscriptBlock::Activity { .. })
         ));
         assert_eq!(app.transcript.len(), 2);
+    }
+
+    #[test]
+    fn selection_above_retrailed_activity_survives_streaming() {
+        // Two rendered blocks (3 + 2 rows, one separator between) and the
+        // open spinner after them: it starts at display row 6. A streaming
+        // append lands an unwrapped block after the spinner, then the
+        // spinner re-trails to the tail.
+        for (sel_row, survives) in [(1, true), (6, false), (7, false)] {
+            let mut app = test_app();
+            app.busy = true;
+            app.transcript = vec![
+                TranscriptBlock::Assistant {
+                    stamp: 0,
+                    lines: vec![],
+                },
+                TranscriptBlock::Tool {
+                    stamp: 0,
+                    input: Line::default(),
+                    output: None,
+                    preview: Vec::new(),
+                    tool_arg: String::new(),
+                },
+                TranscriptBlock::Activity {
+                    stamp: 0,
+                    started: Instant::now(),
+                    settled: None,
+                },
+            ];
+            let rows = |n| (0..n).map(|_| Line::default()).collect::<Vec<_>>();
+            app.wrapped_cache = vec![
+                WrappedBlock {
+                    stamp: 0,
+                    rows: rows(3),
+                },
+                WrappedBlock {
+                    stamp: 0,
+                    rows: rows(2),
+                },
+                WrappedBlock {
+                    stamp: 0,
+                    rows: rows(1),
+                },
+            ];
+            app.transcript.push(TranscriptBlock::Assistant {
+                stamp: 0,
+                lines: vec![],
+            });
+            app.selection = Some(Selection {
+                anchor: (sel_row, 0),
+                end: (sel_row, 1),
+                sticky: false,
+                whole_line: false,
+            });
+            move_activity_to_tail(&mut app);
+            // Rows above the spinner keep pointing at unchanged rows; the
+            // spinner's own row (7) and the separator above it (6) moved.
+            assert_eq!(app.selection.is_some(), survives, "row {sel_row}");
+        }
     }
 
     #[test]

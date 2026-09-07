@@ -945,11 +945,7 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
     remote.cancel_flag.store(false, Ordering::SeqCst);
-    let tokens = app
-        .tool_state
-        .last_usage
-        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
-    settle_activity(app, tokens);
+    settle_activity(app);
     // Tools (bash/git/write/edit) may have switched branches or dirtied the
     // tree mid-turn; refresh the footer now rather than waiting for the next
     // background poll. Async so the UI thread never blocks on HTTP (the

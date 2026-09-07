@@ -724,35 +724,47 @@ impl TranscriptView {
         // The open thinking / activity rows animate in place: their cached
         // lines are rewritten every frame (O(1)) instead of invalidating
         // the cache, which would re-wrap the whole transcript at animation
-        // rate. Neither animated block is necessarily the display tail (the
-        // activity indicator sits under a streaming thinking block), so
-        // locate each open row by walking the parallel wrap cache.
+        // rate. Both animated blocks sit at the transcript tail — the open
+        // activity block is the tail block while busy, and the open
+        // thinking block is the last content block (any non-thinking sink
+        // line closes it) — so their display rows derive from the tail
+        // instead of walking the cache.
         let mut thinking_row: Option<usize> = None;
         let mut activity_row: Option<usize> = None;
         if (app.thinking_open && !app.show_thinking) || app.busy {
-            let mut cum = 0usize;
-            for (idx, block) in app.transcript.iter().enumerate() {
-                let rows = app.wrapped_cache[idx].rows.len();
-                // Gap accounting mirrors the display build above: a blank
-                // separator precedes every non-empty block except the first.
-                if idx > 0 && rows > 0 {
-                    cum += 1;
+            if let Some(tail) = app.transcript.len().checked_sub(1) {
+                let tail_open = matches!(
+                    &app.transcript[tail],
+                    super::TranscriptBlock::Activity { settled: None, .. }
+                );
+                let tail_rows = if tail_open {
+                    app.wrapped_cache[tail].rows.len()
+                } else {
+                    0
+                };
+                if tail_open && tail_rows > 0 {
+                    // Tail block: no separator after it, so its last row is
+                    // the last display row.
+                    activity_row = Some(app.display_cache.len() - 1);
                 }
-                if rows > 0 {
-                    if app.thinking_open
-                        && !app.show_thinking
-                        && matches!(block, super::TranscriptBlock::Thinking { .. })
-                    {
-                        thinking_row = Some(cum + rows - 1);
-                    }
-                    if matches!(
-                        block,
-                        super::TranscriptBlock::Activity { settled: None, .. }
-                    ) {
-                        activity_row = Some(cum + rows - 1);
+                if app.thinking_open && !app.show_thinking {
+                    if let Some(idx) = tail.checked_sub(usize::from(tail_open)) {
+                        if matches!(
+                            &app.transcript[idx],
+                            super::TranscriptBlock::Thinking { .. }
+                        ) {
+                            let rows = app.wrapped_cache[idx].rows.len();
+                            if rows > 0 {
+                                // Rows after the thinking block: only the
+                                // open activity (0 rows while thinking
+                                // streams) plus its 1-row separator when
+                                // non-empty.
+                                let sep = usize::from(tail_rows > 0);
+                                thinking_row = Some(app.display_cache.len() - tail_rows - sep - 1);
+                            }
+                        }
                     }
                 }
-                cum += rows;
             }
         }
         if let Some(row) = thinking_row {
@@ -878,8 +890,9 @@ struct ActivityView;
 impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         // Always clear the rect first: ratatui only repaints cells the
-        // widget writes, so a shorter "worked for …" line would otherwise
-        // leave trailing chars from a longer previous status text.
+        // widget writes, so a shorter line (e.g. fewer queued-steer
+        // badges) would otherwise leave trailing chars from the previous
+        // frame.
         f.render_widget(Clear, area);
         // The busy "● Working" spinner and the "worked for …" summary now
         // live in the transcript as the turn-activity block; this strip
