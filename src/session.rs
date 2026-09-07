@@ -627,7 +627,12 @@ impl Session {
         loop {
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                // EINTR: retry, never treat as EOF — that would silently
+                // truncate the replay mid-journal.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // Torn/invalid line: skip it (matches `max_event_seq`).
+                Err(_) => break,
                 Ok(_) => {}
             }
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
