@@ -337,17 +337,20 @@ pub(crate) async fn process_turn(
                 // Captured before `outcome.text` is moved below: the
                 // pre-mutation unified diff for write/edit results.
                 let diff = outcome.diff.clone();
-                // Occurrences before the (conditional) push below; the push
-                // itself adds one — same total as the old post-push filter,
-                // minus a `cache_key` clone per successful call.
-                let pre_count = last_tools.iter().filter(|k| **k == cache_key).count();
+                // Occurrences counted AFTER the push: when the ring is full
+                // the evicted front entry may itself be a match, so a
+                // pre-push count over-counts by one and can trip the
+                // `>= 3` guard a call early (regression:
+                // repeated_tool_guard_counts_after_ring_eviction). The
+                // filter borrows `cache_key`; that borrow ends before the
+                // `state.insert` move below.
                 if succeeded {
                     if last_tools.len() >= 6 {
                         last_tools.remove(0);
                     }
                     last_tools.push(cache_key.clone());
                 }
-                let repeated_count = pre_count + usize::from(succeeded);
+                let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
                 if console.sink().is_some() {
                     console
                         .emit_async(SinkLine::ToolInput(format!(
@@ -815,6 +818,138 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "cancel must preempt tool IO without waiting out the command"
+        );
+    }
+
+    #[derive(Clone)]
+    struct RepeatedGuardScript {
+        commands: Vec<&'static str>,
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RepeatedGuardScript {
+        fn new(commands: Vec<&'static str>) -> Self {
+            Self {
+                commands,
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ModelClient for RepeatedGuardScript {
+        async fn complete(
+            &self,
+            _m: &[ChatMessage],
+            _w: bool,
+            _s: Option<mpsc::Sender<SinkLine>>,
+            _c: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round < self.commands.len() {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![crate::core::types::LlmToolCall {
+                        id: format!("call-{round}"),
+                        call_type: "function".into(),
+                        function: crate::core::types::FunctionCall {
+                            name: "bash".into(),
+                            arguments: format!(r#"{{"command":"{}"}}"#, self.commands[round]),
+                        },
+                    }],
+                )
+            } else {
+                ChatMessage::assistant("done")
+            };
+            Ok(Turn {
+                message,
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    cached_tokens: None,
+                }),
+                stop_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_guard_counts_after_ring_eviction() {
+        // k, a, b, c, k, d, k: the ring is full (6) when the 7th identical
+        // call arrives, and the evicted front entry is itself a match.
+        // Counting after the push+eviction reads 2 — under the threshold.
+        // (A pre-push count would read 3 and feed the model a spurious
+        // "repeated identical tool call" error on this call.)
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
+        let _ = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &RepeatedGuardScript::new(vec![
+                "echo repeat-probe",
+                "echo other-a",
+                "echo other-b",
+                "echo other-c",
+                "echo repeat-probe",
+                "echo other-d",
+                "echo repeat-probe",
+            ]),
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        )
+        .await;
+        let guard_hits = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content.as_deref() == Some(guard_err))
+            .count();
+        assert_eq!(
+            guard_hits, 0,
+            "guard must not fire: ring eviction removed a match before counting"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_guard_fires_on_third_consecutive_call() {
+        // Positive control: three identical calls in a row must trip the
+        // guard on the third one only.
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
+        let _ = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &RepeatedGuardScript::new(vec!["echo probe", "echo probe", "echo probe"]),
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        )
+        .await;
+        let guard_hits = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content.as_deref() == Some(guard_err))
+            .count();
+        assert_eq!(
+            guard_hits, 1,
+            "exactly the third identical call trips: {guard_hits}"
+        );
+        let last_tool = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .and_then(|m| m.content.as_deref());
+        assert_eq!(
+            last_tool,
+            Some(guard_err),
+            "the guard error must land on the third call's result"
         );
     }
 }
