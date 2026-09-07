@@ -583,8 +583,9 @@ impl Stream for ReceiverStream {
 /// `run_turn_inner` becomes `Err("turn panicked")` (the pre-async contract)
 /// instead of aborting the spawned turn task with no terminal SSE event —
 /// the client would otherwise hang until keep-alive timeout with cleanup
-/// done (via `TurnGuard::drop`) but no `TurnFailed` ever sent.
-struct CatchUnwind<F>(std::panic::AssertUnwindSafe<F>);
+/// done (via `TurnGuard::drop`) but no `TurnFailed` ever sent. The inner
+/// future is boxed so polling needs no unsafe pin projection.
+struct CatchUnwind<F>(std::pin::Pin<Box<F>>);
 
 impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
     type Output = Result<F::Output, String>;
@@ -593,8 +594,9 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // SAFETY: we never move `F` out of the pin; only project to poll it.
-        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0 .0) };
+        // `CatchUnwind<F>` is `Unpin` (`Pin<Box<F>>` is), so `get_mut` is safe;
+        // polling stays in safe Rust (no pin projection).
+        let inner = self.get_mut().0.as_mut();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
             Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
@@ -751,7 +753,7 @@ async fn run_agent_turn(
     let mut steering_rx = steering_rx;
     let mut followup_rx = followup_rx;
     let result: Result<(String, Option<u64>, Option<u64>), String> =
-        match CatchUnwind(std::panic::AssertUnwindSafe(run_turn_inner(
+        match CatchUnwind(Box::pin(run_turn_inner(
             &state,
             &session_id,
             &req,
