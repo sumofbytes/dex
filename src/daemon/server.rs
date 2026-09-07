@@ -300,7 +300,7 @@ async fn load_skill(
             "skill",
         );
         session
-            .append_message(msg)
+            .append_message(&msg)
             .map_err(|e| format!("append: {e}"))?;
         Ok::<(), String>(())
     })
@@ -936,7 +936,7 @@ async fn run_turn_inner(
         .turn_event("turn_start")
         .map_err(|e| format!("failed to record turn_start: {e}"))?;
     session
-        .append_message(user_message.clone())
+        .append_message(&user_message)
         .map_err(|e| format!("failed to persist prompt: {e}"))?;
     messages.push(user_message);
 
@@ -1181,7 +1181,7 @@ async fn run_turn_inner(
                     }
                     let msg = ChatMessage::user_named(content.clone(), "follow-up");
                     session
-                        .append_message(msg.clone())
+                        .append_message(&msg)
                         .map_err(|e| format!("failed to persist followup: {e}"))?;
                     messages.push(msg);
                 }
@@ -1545,7 +1545,7 @@ async fn session_waive(
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
         // A waive is a recorded, user-authored message the model sees next.
-        session.append_message(ChatMessage::user_named(
+        session.append_message(&ChatMessage::user_named(
             format!("[verify waived] {reason}"),
             "waive",
         ))?;

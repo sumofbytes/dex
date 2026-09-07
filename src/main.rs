@@ -81,7 +81,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event("turn_start");
-        let _ = session.append_message(user.clone());
+        let _ = session.append_message(&user);
     }
     messages.push(user);
     let mut state = ToolState::load();

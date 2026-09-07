@@ -30,6 +30,9 @@ use input::InputField;
 const VERTICAL_GUTTER: u16 = 1;
 const HORIZONTAL_GUTTER: u16 = 1;
 const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
+// `render_user_prompt`'s borrowed pad span hardcodes the 1-wide gutter;
+// this equality is load-bearing, so trip at compile time if it changes.
+const _: () = assert!(HORIZONTAL_GUTTER == 1);
 const INPUT_BORDER_ROWS: u16 = 0;
 const INPUT_PAD_Y: u16 = 1;
 const STATUS_CONTENT_ROWS: u16 = 1;
@@ -1150,13 +1153,15 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
     let user_bg = Style::default()
         .fg(theme::surface_fg())
         .bg(theme::surface_bg());
-    let horizontal_pad = " ".repeat(TRANSCRIPT_INDENT);
+    // The left pad is the same one-space gutter as `edge_pad`
+    // (`TRANSCRIPT_INDENT == HORIZONTAL_GUTTER == 1`), so reuse the
+    // borrowed span instead of re-allocating the string per line.
     let edge_pad = Span::styled(" ", user_bg);
     let mut block_lines = Vec::new();
     block_lines.push(Line::from(edge_pad.clone()));
     for sub in line.split('\n') {
         block_lines.push(Line::from(vec![
-            Span::styled(horizontal_pad.clone(), user_bg),
+            edge_pad.clone(),
             Span::styled(sub.to_string(), user_bg),
             edge_pad.clone(),
         ]));

@@ -305,7 +305,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             match Session::new(cwd, None) {
                 Ok(mut s) => {
                     if let Some(system) = system {
-                        s.append_message(system).ok();
+                        s.append_message(&system).ok();
                     }
                     app.session = s;
                     push_info(app, "new session started.".to_string());
@@ -449,9 +449,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     format!("--- Skill: {} ---\n{}", skill.name, content),
                     "skill",
                 ));
-                let _ = app
-                    .session
-                    .append_message(app.messages.last().cloned().unwrap());
+                let _ = app.session.append_message(app.messages.last().unwrap());
                 push_info(app, format!("loaded skill: {}", skill.name));
             } else {
                 push_info(app, format!("skill not found: {}", name));
@@ -553,9 +551,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     format!("[verify waived] {reason}"),
                     "waive",
                 ));
-                let _ = app
-                    .session
-                    .append_message(app.messages.last().cloned().unwrap());
+                let _ = app.session.append_message(app.messages.last().unwrap());
                 let _ = app.session.set_state(
                     "verify",
                     &serde_json::json!({
