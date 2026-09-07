@@ -1,0 +1,155 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Creating the tag is the only manual step. This job bumps Cargo.toml +
+  # Cargo.lock on the default branch to the tag's version (bot commit) and
+  # hands that exact commit to the build jobs, so released binaries report
+  # the released version.
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump version to match tag
+        id: bump
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if ! printf '%s\n' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: tag '$GITHUB_REF_NAME' is not vX.Y.Z" >&2
+            exit 1
+          fi
+          cur="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$ver" != "$cur" ] &&
+            [ "$(printf '%s\n%s\n' "$cur" "$ver" | sort -V | head -n1)" = "$ver" ]; then
+            echo "error: tag v$ver is older than the current Cargo.toml version $cur" >&2
+            exit 1
+          fi
+          if [ "$ver" = "$cur" ]; then
+            echo "Cargo.toml already at $cur — no bump needed"
+          else
+            awk -v v="$ver" '!done && /^version = /{print "version = \"" v "\""; done = 1; next} {print}' \
+              Cargo.toml > Cargo.toml.new
+            mv Cargo.toml.new Cargo.toml
+            cargo update -p dex >/dev/null
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.toml Cargo.lock
+            git commit -q -m "chore(release): v$ver"
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: bump
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static Linux builds: no libssl/glibc constraints, run on any distro.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build the bump commit, not the tag: the tag's tree still has the
+          # old version, so `dex --version` would be stale.
+          ref: ${{ needs.bump.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install zig (Linux musl cross-linker)
+        if: matrix.cross
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild (Linux)
+        if: matrix.cross
+        run: cargo install cargo-zigbuild --locked
+      - name: Install qemu-user-static (Linux)
+        if: matrix.cross
+        run: sudo apt-get -y -q install qemu-user-static
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/dex"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            qemu-aarch64-static "$bin" --version
+          else
+            "$bin" --version
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          name="dex-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir dist
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            cp "target/x86_64-pc-windows-msvc/release/dex.exe" dist/
+            powershell -NoProfile -Command "Compress-Archive -Path dist/dex.exe -DestinationPath '$name.zip' -Force"
+          else
+            cp "target/${{ matrix.target }}/release/dex" dist/
+            tar -czf "$name.tar.gz" -C dist dex
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dex-${{ matrix.target }}
+          path: |
+            dex-*.tar.gz
+            dex-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+      - name: Publish release
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes dist/*
