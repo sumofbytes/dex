@@ -100,8 +100,16 @@ fn is_context_overflow(message: &str) -> bool {
 /// event the TUI accumulates spend from (carrying the daemon-priced USD
 /// cost, so the remote client never re-prices locally), and the
 /// session-cumulative USD cost. Also used for compaction summarizer calls,
-/// which are billed too.
-async fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Console, u: Usage) {
+/// which are billed too. `gen_ms` is the caller-measured wall-clock
+/// duration of the LLM call (`None` when untimed, e.g. compaction): it
+/// becomes the footer's tokens/s denominator on the client.
+async fn record_usage(
+    config: &LlmConfig,
+    state: &mut ToolState,
+    console: &Console,
+    u: Usage,
+    gen_ms: Option<u64>,
+) {
     state.last_usage = Some(u.prompt_tokens);
     state.last_cached = u.cached_tokens;
     let cost =
@@ -123,6 +131,7 @@ async fn record_usage(config: &LlmConfig, state: &mut ToolState, console: &Conso
             cached: u.cached_tokens,
             cost,
             output: u.completion_tokens,
+            gen_ms,
         })
         .await;
     state.total_cost += cost;
@@ -180,7 +189,7 @@ async fn emergency_compact(
             Ok((true, usage)) => {
                 compacted_any = true;
                 if let Some(u) = usage {
-                    record_usage(config, state, console, u).await;
+                    record_usage(config, state, console, u, None).await;
                 }
             }
             _ => break,
@@ -265,7 +274,7 @@ pub(crate) async fn process_turn(
                     // Summarizer calls are billed like any other; account
                     // them so the status-bar spend includes compaction.
                     if let Some(u) = compacted {
-                        record_usage(config, state, console, u).await;
+                        record_usage(config, state, console, u, None).await;
                     }
                     if let Some(session) = session.as_deref_mut() {
                         session.clear_messages()?;
@@ -286,6 +295,7 @@ pub(crate) async fn process_turn(
         // wakes within ~10ms. No message `to_vec` clone beyond what the call
         // needs and no parked thread (S6 resource win).
         let cancel_ref: &(dyn CancellationSource + Send + Sync) = cancel;
+        let call_started = std::time::Instant::now();
         let turn: Turn = tokio::select! {
             _ = wait_cancelled(cancel_ref) => {
                 return Err("cancelled by user".into());
@@ -331,9 +341,12 @@ pub(crate) async fn process_turn(
                 }
             },
         };
+        // Whole-call wall clock (connect + first token + stream): the honest
+        // denominator for the footer's output tokens/s rate.
+        let gen_ms = u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(u) = turn.usage {
             last_usage = Some(u.prompt_tokens);
-            record_usage(config, state, console, u).await;
+            record_usage(config, state, console, u, Some(gen_ms)).await;
         }
         // The provider cut the reply off mid-generation (output-token limit
         // or a content filter): whatever landed is likely incomplete. Say so
@@ -596,6 +609,7 @@ pub(crate) async fn process_turn(
                     total_usage: state.total_usage,
                     total_output: state.total_output,
                     total_cost: state.total_cost,
+                    last_tok_s: state.last_tok_s,
                     verify_dirty: state.verify_dirty,
                 };
                 to_save.save_async().await;

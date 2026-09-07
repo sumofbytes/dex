@@ -84,6 +84,16 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         let _ = session.append_message(&user);
     }
     messages.push(user);
+    // Console Go routing requires `x-opencode-session` (same pair pi sends);
+    // explicit `--header` flags already baked into `extra_headers` still win.
+    if let Some(session) = session.as_ref() {
+        crate::llm::config::apply_opencode_session_headers(
+            &mut config.extra_headers,
+            &config.provider,
+            &config.base_url,
+            session.id(),
+        );
+    }
     let mut state = ToolState::load();
     let console = crate::core::console::Console::none();
     let result = crate::client::http::block_on(process_turn(

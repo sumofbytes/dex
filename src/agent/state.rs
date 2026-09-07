@@ -89,6 +89,11 @@ pub(crate) struct ToolState {
     /// Accumulated per `Usage` event from provider pricing (catalog) or
     /// `DEX_COST_PER_1K` fallback. In-memory only, like `total_usage`.
     pub(crate) total_cost: f64,
+    /// Output-token rate (tokens/s) of the most recent LLM call, computed
+    /// client-side from the Usage event's completion count and the
+    /// daemon-measured call duration (`gen_ms`). Display-only; `None` until
+    /// the first timed call and reset by `/new`.
+    pub(crate) last_tok_s: Option<f64>,
     pub(crate) verify_dirty: bool,
 }
 
