@@ -11,7 +11,7 @@ cargo test --all-targets       # must pass
 cargo clippy --all-targets -- -D warnings  # must pass
 ```
 
-Requires Rust edition 2021. Config: `~/.config/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; env (`DEX_*`/`OPENAI_*`) and CLI flags override — see `README.md`.
+Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `README.md` § Configuration and `dex doctor`.
 
 ## Structure
 
@@ -19,11 +19,22 @@ Requires Rust edition 2021. Config: `~/.config/dex/config.yaml` (or `$DEX_CONFIG
 - `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Update`)
 - `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
 - `src/agent/` — `loop.rs` turn loop, `state.rs`, `compaction.rs`
-- `src/llm/` — provider clients, streaming parsers, `prompt.rs` (system prompt)
+- `src/llm/` — provider clients, streaming parsers, `config.rs` (provider/model/endpoint resolution, `/model` write-back, `dex doctor`), `prompt.rs` (system prompt)
 - `src/tools/` — workspace-confined tools (`mod.rs`, `fff.rs` for fff engine)
 - `src/session.rs` — append-only JSONL (`$XDG_DATA_HOME/dex/sessions/<slug>/*.jsonl`)
 - `src/skills.rs` / `src/ui/` / `src/core/` — skills discovery, TUI, formatting
 - This file + `CLAUDE.md` (if present, nearest parent wins) is auto-appended to the system prompt via `src/llm/prompt.rs:project_context()`.
+
+## Config surface
+
+All of this lives in `src/llm/config.rs` — don't add a second way to express any of it:
+
+- One selection knob: `model: <provider|endpoint>/<model>` (file `model:`, env `DEX_MODEL`, flag `--model`; bare provider name switches provider and keeps the model). `/model`/`/provider` write back that single key and drop the deprecated ones — never write back `active_provider:`/top-level `base_url:`.
+- Endpoints, model lists, pricing, context windows come from the models.dev catalog (cache via `dex update --models`); wire protocol is learned per endpoint+model (`learned-apis.json`), with `providers.<name>.api:` as the pin.
+- Per-provider keys live in `providers.<name>.api_key` or the provider's own catalog env var (opencode: `OPENCODE_API_KEY`). Never add per-provider default key env vars.
+- Extra headers precedence: file (provider-scoped `headers:` > global, per-key) < env (`ANTHROPIC_CUSTOM_HEADERS` < `OPENAI_HEADERS` < `DEX_HEADERS`) < `--header`; `authorization` can't be overridden.
+- Deprecated keys/env stay honored with `warn_once` + a pointer at the replacement; new knobs must do the same, add themselves to the unknown-key list in `load_config_file`, add a `dex doctor` origin row, and appear in the README env table.
+- `dex doctor` prints every resolved value with its origin — keep it in sync with `from_env` when resolution changes. Config tests use `EnvRestore` + `TEST_SESSIONS_ENV_LOCK` and hermetic `XDG_CACHE_HOME`/`DEX_CONFIG` paths.
 
 ## Working rules
 

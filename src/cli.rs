@@ -40,6 +40,8 @@ pub(crate) enum Mode {
     /// One-shot tool execution (`dex run <tool> <args...>`) so scripts can
     /// call tools locally and stitch pipelines without model round trips.
     RunTool { name: String, args: Vec<String> },
+    /// Print the resolved provider/model config and each value's origin.
+    Doctor,
     /// Refresh model catalog (`dex update --models`) — like `pi update --models`.
     Update { models: bool },
     /// Print usage (`dex --help`/`-h`) without touching config, network, or LLM.
@@ -130,6 +132,7 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
             let models = args.rest.iter().any(|a| a == "--models" || a == "--all");
             Mode::Update { models }
         }
+        Some("doctor") => Mode::Doctor,
         Some("serve") => {
             let bind = args
                 .rest
