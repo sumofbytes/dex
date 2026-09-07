@@ -39,7 +39,7 @@ pub(crate) fn persist_pending(
 ) -> std::io::Result<()> {
     if let Some(session) = session.as_deref_mut() {
         for message in messages.get(*cursor..).unwrap_or_default() {
-            session.append_message(message.clone())?;
+            session.append_message(message)?;
         }
         *cursor = messages.len();
     }
@@ -98,7 +98,7 @@ async fn execute_tool_call(
             )
         }
     };
-    let Some(args) = value.as_object().cloned() else {
+    let Some(args) = value.as_object() else {
         return (
             name,
             raw_args,
@@ -109,8 +109,8 @@ async fn execute_tool_call(
             },
         );
     };
-    let input = serde_json::to_string(&args).unwrap_or_default();
-    let outcome = execute_outcome(&name, &args, cancel).await;
+    let input = serde_json::to_string(args).unwrap_or_default();
+    let outcome = execute_outcome(&name, args, cancel).await;
     (name, input, outcome)
 }
 
@@ -178,7 +178,7 @@ pub(crate) async fn process_turn(
                     if let Some(session) = session.as_deref_mut() {
                         session.clear_messages()?;
                         for message in messages.iter().skip(1) {
-                            session.append_message(message.clone())?;
+                            session.append_message(message)?;
                         }
                     }
                     persisted_cursor = messages.len();
@@ -248,17 +248,17 @@ pub(crate) async fn process_turn(
                 _ => {}
             }),
         }
-        let message = turn.message;
+        let mut message = turn.message;
 
-        if let Some(calls) = message.tool_calls.clone() {
+        if let Some(calls) = message.tool_calls.take() {
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: message.content,
                 tool_calls: Some(calls.clone()),
                 tool_call_id: None,
                 name: None,
-                reasoning_items: message.reasoning_items.clone(),
-                reasoning_content: message.reasoning_content.clone(),
+                reasoning_items: message.reasoning_items,
+                reasoning_content: message.reasoning_content,
             });
 
             let serialize_batch = tool_calls_conflict(&calls);
@@ -337,13 +337,17 @@ pub(crate) async fn process_turn(
                 // Captured before `outcome.text` is moved below: the
                 // pre-mutation unified diff for write/edit results.
                 let diff = outcome.diff.clone();
+                // Occurrences before the (conditional) push below; the push
+                // itself adds one — same total as the old post-push filter,
+                // minus a `cache_key` clone per successful call.
+                let pre_count = last_tools.iter().filter(|k| **k == cache_key).count();
                 if succeeded {
                     if last_tools.len() >= 6 {
                         last_tools.remove(0);
                     }
                     last_tools.push(cache_key.clone());
                 }
-                let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
+                let repeated_count = pre_count + usize::from(succeeded);
                 if console.sink().is_some() {
                     console
                         .emit_async(SinkLine::ToolInput(format!(
@@ -379,7 +383,7 @@ pub(crate) async fn process_turn(
                         cache_hit = true;
                         cached.clone()
                     } else {
-                        state.insert(cache_key.clone(), outcome.text.clone());
+                        state.insert(cache_key, outcome.text.clone());
                         outcome.text
                     }
                 } else {
@@ -448,8 +452,8 @@ pub(crate) async fn process_turn(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-                reasoning_items: message.reasoning_items.clone(),
-                reasoning_content: message.reasoning_content.clone(),
+                reasoning_items: message.reasoning_items,
+                reasoning_content: message.reasoning_content,
             });
             if let Some(rx) = steering_rx.as_mut() {
                 let mut steering: Vec<String> = Vec::new();

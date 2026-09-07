@@ -526,8 +526,10 @@ async fn run_sse<P: StreamParser>(
                           buf.extend_from_slice(&bytes);
                           // Extract complete lines; keep partial tail buffered.
                           while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                              let raw: Vec<u8> = buf.drain(..=pos).collect();
-                              let line = String::from_utf8_lossy(&raw).into_owned();
+                              // Borrow the line before draining: skips a
+                              // throwaway byte Vec per SSE line.
+                              let line = String::from_utf8_lossy(&buf[..=pos]).into_owned();
+                              buf.drain(..=pos);
                               if driver.feed_raw_async(&line, &mut parser).await {
                                   // Chat-completions [DONE]: stop reading.
                                   let sink_is_some = sink.is_some();
