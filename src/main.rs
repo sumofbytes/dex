@@ -202,6 +202,7 @@ fn print_help() {
         serve [bind]              daemon on 127.0.0.1:8420\n  \
         connect <url> [prompt]    TUI or one-shot against a daemon\n  \
         run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
+        doctor                    show resolved provider/model config + origins\n  \
         mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
         update --models           refresh model catalog\n  \
         --tool                    raw JSON tool mode (stdin)\n\
@@ -280,6 +281,17 @@ fn main() {
                 eprintln!("client error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Mode::Doctor => {
+            print!(
+                "{}",
+                crate::llm::config::doctor(
+                    args.base_url.clone(),
+                    args.model.clone(),
+                    args.permission,
+                    &args.headers
+                )
+            );
         }
         Mode::Update { models } => {
             if models {
