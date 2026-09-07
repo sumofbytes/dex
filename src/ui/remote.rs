@@ -2265,7 +2265,7 @@ mod tests {
             crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
         std::env::set_var("XDG_DATA_HOME", &dir);
         let mut s = crate::session::Session::new("/tmp/dex-resume-cwd".into(), None).unwrap();
-        s.append_message(crate::core::types::ChatMessage::user("hi".to_string()))
+        s.append_message(&crate::core::types::ChatMessage::user("hi".to_string()))
             .unwrap();
         let id = s.id().to_string();
         let path = s.path().unwrap().to_path_buf();

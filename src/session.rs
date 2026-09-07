@@ -61,14 +61,17 @@ impl SessionHeader {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct SessionMessageEntry {
+/// Borrowed view of a message for append-time serialization: the journal
+/// line is built from references, so appending never clones the message.
+/// Reads parse entries back through `serde_json::Value`, not this struct.
+#[derive(Serialize)]
+struct SessionMessageEntry<'a> {
     #[serde(rename = "type")]
-    entry_type: String,
-    id: String,
-    timestamp: String,
+    entry_type: &'a str,
+    id: &'a str,
+    timestamp: &'a str,
     #[serde(flatten)]
-    message: ChatMessage,
+    message: &'a ChatMessage,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -427,14 +430,15 @@ impl Session {
         self.append_line(&entry)
     }
 
-    pub(crate) fn append_message(&mut self, message: ChatMessage) -> io::Result<()> {
-        let entry = SessionMessageEntry {
-            entry_type: "message".to_string(),
-            id: self.next_id(),
-            timestamp: Self::now_iso(),
+    pub(crate) fn append_message(&mut self, message: &ChatMessage) -> io::Result<()> {
+        let id = self.next_id();
+        let timestamp = Self::now_iso();
+        self.append_line(&SessionMessageEntry {
+            entry_type: "message",
+            id: &id,
+            timestamp: &timestamp,
             message,
-        };
-        self.append_line(&entry)
+        })
     }
 
     pub(crate) fn clear_messages(&mut self) -> io::Result<()> {
@@ -613,10 +617,25 @@ impl Session {
     /// SESSION file; the journal lives at `<session>.events.jsonl`.
     pub(crate) fn load_events(path: &Path, since: u64) -> io::Result<Vec<(u64, String)>> {
         let events_path = path.with_extension("events.jsonl");
-        let text = fs::read_to_string(&events_path)?;
+        // Stream line by line like `max_event_seq` — the journal is the hot
+        // file (one line per stream delta) and replay drops everything with
+        // `seq <= since`, so don't slurp it into memory first.
+        let file = File::open(&events_path)?;
         let mut out = Vec::new();
-        for line in text.lines() {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                // EINTR: retry, never treat as EOF — that would silently
+                // truncate the replay mid-journal.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // Torn/invalid line: skip it (matches `max_event_seq`).
+                Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
             let Some(seq) = value.get("seq").and_then(Value::as_u64) else {
@@ -1365,7 +1384,7 @@ mod tests {
         std::env::set_var("XDG_DATA_HOME", &dir);
         let mut s = Session::new("/tmp/async-cwd".into(), None).unwrap();
         let msg = ChatMessage::user("hello async");
-        s.append_message(msg.clone()).unwrap();
+        s.append_message(&msg).unwrap();
         let path = s.path().unwrap().to_path_buf();
         drop(s);
         let sync_msgs = load_messages_from_session(&path).unwrap();
@@ -1392,8 +1411,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dex-sess-repair-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &dir);
         let mut s = Session::new("/tmp/dex-repair-cwd".into(), None).unwrap();
-        s.append_message(ChatMessage::user("goal")).unwrap();
-        s.append_message(ChatMessage::assistant_calls(
+        s.append_message(&ChatMessage::user("goal")).unwrap();
+        s.append_message(&ChatMessage::assistant_calls(
             None,
             vec![crate::core::types::LlmToolCall {
                 id: "call-1".into(),
@@ -1436,7 +1455,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dex-sess-clean-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &dir);
         let mut s = Session::new("/tmp/dex-clean-cwd".into(), None).unwrap();
-        s.append_message(ChatMessage::assistant_calls(
+        s.append_message(&ChatMessage::assistant_calls(
             None,
             vec![crate::core::types::LlmToolCall {
                 id: "call-1".into(),
@@ -1448,7 +1467,7 @@ mod tests {
             }],
         ))
         .unwrap();
-        s.append_message(ChatMessage::tool_result("call-1", "contents"))
+        s.append_message(&ChatMessage::tool_result("call-1", "contents"))
             .unwrap();
         let path = s.path().unwrap().to_path_buf();
         drop(s);

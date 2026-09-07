@@ -25,6 +25,20 @@ pub(crate) fn estimate_ephemeral_tokens(parts: &[Option<String>]) -> u64 {
     (chars as u64) / 4 + (parts.len() as u64 * PER_MESSAGE_OVERHEAD)
 }
 
+/// Byte-counting sink for `serde_json::to_writer`: measures the serialized
+/// length without materializing the item text.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Byte length of a message's replayed payload (content, tool calls,
 /// reasoning, framing) — the shared body of the token estimator, used by
 /// `estimate_tokens` and the pi-style cut-point walk.
@@ -39,10 +53,16 @@ pub(crate) fn message_char_len(message: &ChatMessage) -> usize {
                 .sum()
         })
         + message.reasoning_content.as_deref().map_or(0, str::len)
-        + message
-            .reasoning_items
-            .as_ref()
-            .map_or(0, |items| items.iter().map(|v| v.to_string().len()).sum());
+        + message.reasoning_items.as_ref().map_or(0, |items| {
+            items
+                .iter()
+                .map(|item| {
+                    let mut counter = ByteCounter(0);
+                    let _ = serde_json::to_writer(&mut counter, item);
+                    counter.0
+                })
+                .sum()
+        });
     // Role and name framing
     len += message.role.as_str().len();
     if let Some(name) = &message.name {

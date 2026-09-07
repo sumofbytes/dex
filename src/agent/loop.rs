@@ -48,7 +48,7 @@ pub(crate) fn persist_pending(
 ) -> std::io::Result<()> {
     if let Some(session) = session.as_deref_mut() {
         for message in messages.get(*cursor..).unwrap_or_default() {
-            session.append_message(message.clone())?;
+            session.append_message(message)?;
         }
         *cursor = messages.len();
     }
@@ -148,7 +148,7 @@ async fn execute_tool_call(
             )
         }
     };
-    let Some(args) = value.as_object().cloned() else {
+    let Some(args) = value.as_object() else {
         return (
             name,
             raw_args,
@@ -159,8 +159,8 @@ async fn execute_tool_call(
             },
         );
     };
-    let input = serde_json::to_string(&args).unwrap_or_default();
-    let outcome = execute_outcome(&name, &args, cancel).await;
+    let input = serde_json::to_string(args).unwrap_or_default();
+    let outcome = execute_outcome(&name, args, cancel).await;
     (name, input, outcome)
 }
 
@@ -270,7 +270,7 @@ pub(crate) async fn process_turn(
                     if let Some(session) = session.as_deref_mut() {
                         session.clear_messages()?;
                         for message in messages.iter().skip(1) {
-                            session.append_message(message.clone())?;
+                            session.append_message(message)?;
                         }
                     }
                     persisted_cursor = messages.len();
@@ -318,7 +318,7 @@ pub(crate) async fn process_turn(
                                 if let Some(session) = session.as_deref_mut() {
                                     session.clear_messages()?;
                                     for message in messages.iter().skip(1) {
-                                        session.append_message(message.clone())?;
+                                        session.append_message(message)?;
                                     }
                                 }
                                 persisted_cursor = messages.len();
@@ -370,17 +370,17 @@ pub(crate) async fn process_turn(
                 _ => {}
             }),
         }
-        let message = turn.message;
+        let mut message = turn.message;
 
-        if let Some(calls) = message.tool_calls.clone() {
+        if let Some(calls) = message.tool_calls.take() {
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: message.content,
                 tool_calls: Some(calls.clone()),
                 tool_call_id: None,
                 name: None,
-                reasoning_items: message.reasoning_items.clone(),
-                reasoning_content: message.reasoning_content.clone(),
+                reasoning_items: message.reasoning_items,
+                reasoning_content: message.reasoning_content,
             });
 
             let serialize_batch = tool_calls_conflict(&calls);
@@ -459,6 +459,13 @@ pub(crate) async fn process_turn(
                 // Captured before `outcome.text` is moved below: the
                 // pre-mutation unified diff for write/edit results.
                 let diff = outcome.diff.clone();
+                // Occurrences counted AFTER the push: when the ring is full
+                // the evicted front entry may itself be a match, so a
+                // pre-push count over-counts by one and can trip the
+                // `>= 3` guard a call early (regression:
+                // repeated_tool_guard_counts_after_ring_eviction). The
+                // filter borrows `cache_key`; that borrow ends before the
+                // `state.insert` move below.
                 if succeeded {
                     if last_tools.len() >= 6 {
                         last_tools.remove(0);
@@ -501,7 +508,7 @@ pub(crate) async fn process_turn(
                         cache_hit = true;
                         cached.clone()
                     } else {
-                        state.insert(cache_key.clone(), outcome.text.clone());
+                        state.insert(cache_key, outcome.text.clone());
                         outcome.text
                     }
                 } else {
@@ -602,8 +609,8 @@ pub(crate) async fn process_turn(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-                reasoning_items: message.reasoning_items.clone(),
-                reasoning_content: message.reasoning_content.clone(),
+                reasoning_items: message.reasoning_items,
+                reasoning_content: message.reasoning_content,
             });
             if let Some(rx) = steering_rx.as_mut() {
                 let mut steering: Vec<String> = Vec::new();
@@ -632,6 +639,13 @@ pub(crate) async fn process_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that run `process_turn`: every turn reads
+    /// `DEX_MAX_TOOL_ITERATIONS` at entry, and the budget test parks the
+    /// var at "2" across its await — any concurrent `process_turn` would
+    /// exhaust early. An async mutex because the guard must span awaits
+    /// (clippy's `await_holding_lock` rejects the std one here).
+    static TEST_TURN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use crate::agent::state::{CancellationSource, ToolState};
     use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
     use crate::llm::client::ModelClient;
@@ -697,6 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_turn_completes_with_injected_client() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
@@ -770,6 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_result_streams_summary_preview_and_success() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
@@ -897,6 +913,10 @@ mod tests {
                 })
             }
         }
+        // Serialize with every other process_turn test: while this test's
+        // DEX_MAX_TOOL_ITERATIONS=2 is live across the process_turn await,
+        // any concurrent process_turn would read it and exhaust early.
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
         let prev = std::env::var("DEX_MAX_TOOL_ITERATIONS").ok();
         std::env::set_var("DEX_MAX_TOOL_ITERATIONS", "2");
         let config = test_config();
@@ -939,6 +959,7 @@ mod tests {
     /// the turn.
     #[tokio::test]
     async fn context_overflow_compacts_and_retries_once() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
         #[derive(Clone)]
         struct OverflowThenOk {
             round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1011,6 +1032,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_during_llm_call_unwinds_promptly() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
         // TDD Phase 2: select!(cancelled, complete) — no 50ms poll quantum.
         #[derive(Clone)]
         struct Hanging;
@@ -1058,6 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_during_tool_io_suppresses_result_fanout() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
         // Cancel lands while the bash tool runs: the per-tool "cancelled"
         // error is shutdown noise, not model input — the turn unwinds
         // without persisting a tool result the model never saw.
@@ -1134,6 +1157,142 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "cancel must preempt tool IO without waiting out the command"
+        );
+    }
+
+    #[derive(Clone)]
+    struct RepeatedGuardScript {
+        commands: Vec<&'static str>,
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RepeatedGuardScript {
+        fn new(commands: Vec<&'static str>) -> Self {
+            Self {
+                commands,
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ModelClient for RepeatedGuardScript {
+        async fn complete(
+            &self,
+            _m: &[ChatMessage],
+            _w: bool,
+            _s: Option<mpsc::Sender<SinkLine>>,
+            _c: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round < self.commands.len() {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![crate::core::types::LlmToolCall {
+                        id: format!("call-{round}"),
+                        call_type: "function".into(),
+                        function: crate::core::types::FunctionCall {
+                            name: "bash".into(),
+                            arguments: format!(r#"{{"command":"{}"}}"#, self.commands[round]),
+                        },
+                    }],
+                )
+            } else {
+                ChatMessage::assistant("done")
+            };
+            Ok(Turn {
+                message,
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    cached_tokens: None,
+                }),
+                stop_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_guard_counts_after_ring_eviction() {
+        // k, a, b, c, k, d, k: the ring is full (6) when the 7th identical
+        // call arrives, and the evicted front entry is itself a match.
+        // Counting after the push+eviction reads 2 — under the threshold.
+        // (A pre-push count would read 3 and feed the model a spurious
+        // "repeated identical tool call" error on this call.)
+        // Lock so the budget test's env window can't overlap this run.
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
+        let _ = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &RepeatedGuardScript::new(vec![
+                "echo repeat-probe",
+                "echo other-a",
+                "echo other-b",
+                "echo other-c",
+                "echo repeat-probe",
+                "echo other-d",
+                "echo repeat-probe",
+            ]),
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        )
+        .await;
+        let guard_hits = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content.as_deref() == Some(guard_err))
+            .count();
+        assert_eq!(
+            guard_hits, 0,
+            "guard must not fire: ring eviction removed a match before counting"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_guard_fires_on_third_consecutive_call() {
+        // Positive control: three identical calls in a row must trip the
+        // guard on the third one only.
+        // Lock so the budget test's env window can't overlap this run.
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
+        let _ = process_turn(
+            &config,
+            &mut messages,
+            &mut state,
+            None,
+            None,
+            None,
+            &RepeatedGuardScript::new(vec!["echo probe", "echo probe", "echo probe"]),
+            &NeverCancel,
+            &crate::core::console::Console::none(),
+        )
+        .await;
+        let guard_hits = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content.as_deref() == Some(guard_err))
+            .count();
+        assert_eq!(
+            guard_hits, 1,
+            "exactly the third identical call trips: {guard_hits}"
+        );
+        let last_tool = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .and_then(|m| m.content.as_deref());
+        assert_eq!(
+            last_tool,
+            Some(guard_err),
+            "the guard error must land on the third call's result"
         );
     }
 }

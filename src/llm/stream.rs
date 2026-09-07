@@ -572,8 +572,10 @@ async fn run_sse<P: StreamParser>(
                           buf.extend_from_slice(&bytes);
                           // Extract complete lines; keep partial tail buffered.
                           while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                              let raw: Vec<u8> = buf.drain(..=pos).collect();
-                              let line = String::from_utf8_lossy(&raw).into_owned();
+                              // Borrow the line before draining: skips a
+                              // throwaway byte Vec per SSE line.
+                              let line = String::from_utf8_lossy(&buf[..=pos]).into_owned();
+                              buf.drain(..=pos);
                               if driver.feed_raw_async(&line, &mut parser).await {
                                   // Chat-completions [DONE]: stop reading.
                                   let sink_is_some = sink.is_some();
@@ -1332,6 +1334,71 @@ mod tests {
         assert!(!is_mid_stream(&*stream_err("boom", false)));
         assert!(is_mid_stream(&*stream_err("boom", true)));
         assert_eq!(stream_err("cancelled", true).to_string(), "cancelled");
+    }
+
+    /// The async SSE driver must yield complete lines to the parser even
+    /// when a provider splits one SSE line across `response.chunk()`
+    /// boundaries, and must flush a final unterminated line at EOF (how the
+    /// Responses API ends its body). The sync `run_sse_lines` tests above
+    /// never exercise this: an in-memory body arrives as one giant chunk.
+    /// A localhost server writes the body in three deliberately straddled
+    /// writes; gaps between them keep each write a separate chunk.
+    #[tokio::test]
+    async fn run_sse_splits_lines_straddling_chunk_boundaries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.set_nodelay(true).unwrap();
+            // Drain the request head before responding.
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let c1 = r#"data: {"type":"response.output_text.delta","delta":"hel"#;
+            let c2 = r#"lo"}
+data: {"type":"response.output_text.delta","delta":" wor"#;
+            // Final line: no trailing newline — flushed at EOF.
+            let c3 = r#"ld"}
+data: {"type":"response.output_text.delta","delta":"!"}"#;
+            let mut body = String::new();
+            body.push_str(c1);
+            body.push_str(c2);
+            body.push_str(c3);
+            sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            for chunk in [c1, c2, c3] {
+                sock.write_all(chunk.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/responses"))
+            .send()
+            .await
+            .unwrap();
+        let turn = super::read_responses_stream(response, None, &CancellationToken::new())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(turn.message.content.as_deref(), Some("hello world!"));
     }
 
     #[test]
