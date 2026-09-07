@@ -36,10 +36,14 @@ pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
 /// entry always wins; otherwise a learned fallback overrides the configured
 /// default (`openai-responses`).
 fn effective_api(config: &LlmConfig) -> ApiProtocol {
-    if config.api_pinned
-        || crate::llm::config::model_api_from_env(&config.model, &config.model).is_some()
-    {
+    if config.api_pinned {
         return config.api;
+    }
+    // Return the table value itself, not `config.api`: a pinned endpoint
+    // (`--base-url` / file `base_url:`) skips `apply_model`, so `config.api`
+    // may still hold the global default while the table names completions.
+    if let Some(api) = crate::llm::config::model_api_from_env(&config.model, &config.model) {
+        return api;
     }
     probed_apis()
         .lock()
@@ -219,6 +223,29 @@ mod tests {
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");
             assert_eq!(effective_api(&cfg), ApiProtocol::Responses);
         }
+        probed_apis()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[test]
+    fn effective_api_returns_table_value_not_unresolved_default() {
+        // A pinned endpoint skips `apply_model`, so `config.api` may still
+        // hold the global default while the table names completions — the
+        // request must follow the table, not the stale default.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::clear(&["DEX_MODEL_APIS"]);
+        probed_apis()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let cfg = test_cfg();
+        assert_eq!(cfg.api, ApiProtocol::Responses);
+        std::env::set_var("DEX_MODEL_APIS", "m-r=openai-completions");
+        assert_eq!(effective_api(&cfg), ApiProtocol::ChatCompletions);
         probed_apis()
             .lock()
             .unwrap_or_else(|e| e.into_inner())

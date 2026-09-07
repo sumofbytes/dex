@@ -2092,33 +2092,44 @@ mod tests {
     #[test]
     fn ui_status_shows_cumulative_token_total() {
         let mut app = test_app();
-        // No LLM calls yet: no total suffix.
-        assert!(!ui_status(&app).contains("total"), "{}", ui_status(&app));
+        // No LLM calls yet: no totals.
+        assert!(!ui_status(&app).contains('↑'), "{}", ui_status(&app));
+        assert!(!ui_status(&app).contains('↓'), "{}", ui_status(&app));
         // After calls, the cumulative spend figure appears and grows.
         app.tool_state.total_usage = 42_000;
         let text = ui_status(&app);
-        assert!(text.contains("42.0k total"), "{text}");
+        assert!(text.contains("↑42k"), "{text}");
         app.tool_state.total_usage = 215_000;
         let text = ui_status(&app);
-        assert!(text.contains("215.0k total"), "{text}");
-        // Cumulative completion tokens render alongside the prompt total and
-        // stay hidden until the first output tokens are billed.
-        assert!(!ui_status(&app).contains("out"), "{}", ui_status(&app));
+        assert!(text.contains("↑215k"), "{text}");
+        // Cumulative completion tokens join the prompt total (one piece,
+        // arrows for direction) and stay hidden until the first output
+        // tokens are billed.
+        assert!(!ui_status(&app).contains('↓'), "{}", ui_status(&app));
         app.tool_state.total_output = 1_250;
         let text = ui_status(&app);
-        assert!(text.contains("1.2k out"), "{text}");
-        // Live context usage (% of window) still renders from last_usage.
+        assert!(text.contains("↓1.2k"), "{text}");
+        // Live context usage (% of window) still renders from last_usage,
+        // compacted to `ctx in/window %`.
         app.tool_state.last_usage = Some(12_000);
         let text = ui_status(&app);
-        assert!(text.contains("12.0k / 128.0k tokens (9%)"), "{text}");
+        assert!(text.contains("ctx 12k/128k 9%"), "{text}");
         // Cached-token subset appears once a provider reports it, and stays
-        // hidden when it is absent or zero.
+        // hidden when it is absent or zero. The old hit % is gone on
+        // purpose: it is the cached count over the ctx count, derivable by
+        // eye from the two adjacent numbers.
         assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
         app.tool_state.last_cached = Some(8_000);
         let text = ui_status(&app);
-        assert!(text.contains("8.0k cached"), "{text}");
+        assert!(text.contains("8k cached"), "{text}");
         app.tool_state.last_cached = Some(0);
         assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
+        // The last call's output rate appears once a timed call lands and
+        // is absent before that.
+        assert!(!ui_status(&app).contains("tok/s"), "{}", ui_status(&app));
+        app.tool_state.last_tok_s = Some(123.4);
+        let text = ui_status(&app);
+        assert!(text.contains("123 tok/s"), "{text}");
     }
 
     #[test]
@@ -2126,7 +2137,7 @@ mod tests {
         let mut app = test_app();
         let muted = theme::muted_fg();
         let fg_of = |app: &App, needle: &str| {
-            status_pieces(app)
+            status_pieces(app, true)
                 .into_iter()
                 .find(|(text, _)| text.contains(needle))
                 .map(|(_, style)| style.fg)
@@ -2135,7 +2146,11 @@ mod tests {
         // Quiet facts: model and token counts use the theme's muted fg.
         assert_eq!(fg_of(&app, "test-model"), Some(muted));
         app.tool_state.last_usage = Some(12_000);
-        assert_eq!(fg_of(&app, "tokens"), Some(muted));
+        assert_eq!(fg_of(&app, "ctx"), Some(muted));
+        // The output rate is a quiet fact too.
+        app.tool_state.last_tok_s = Some(84.0);
+        assert_eq!(fg_of(&app, "tok/s"), Some(muted));
+        app.tool_state.last_tok_s = None;
         // Repo state: clean branch reads as ok, the dirty marker warns.
         app.git_branch = Some("main".into());
         assert_eq!(fg_of(&app, "main"), Some(Color::LightGreen));
@@ -2145,9 +2160,9 @@ mod tests {
         // trigger (128k window - 16k reserve = 111_616): quiet, then
         // warning yellow at >=75% of it, red past it.
         app.tool_state.last_usage = Some(100_000);
-        assert_eq!(fg_of(&app, "tokens"), Some(Color::Yellow));
+        assert_eq!(fg_of(&app, "ctx"), Some(Color::Yellow));
         app.tool_state.last_usage = Some(112_000);
-        assert_eq!(fg_of(&app, "tokens"), Some(Color::LightRed));
+        assert_eq!(fg_of(&app, "ctx"), Some(Color::LightRed));
         // The scroll hint is an attention flag; a remote badge is an accent
         // while a local one stays quiet.
         app.autoscroll = false;
@@ -2182,9 +2197,15 @@ mod tests {
     fn footer_pins_connection_badge_right() {
         let mut app = test_app();
         app.connection = Some("[R] daemon.internal".into());
-        // Wide enough for left + badge: badge flush right, left at column 0.
-        let text = footer_text(&app, 60);
+        // Wide enough for the full line + badge: cwd leads, badge flush right.
+        let text = footer_text(&app, 80);
         assert!(text.starts_with("/tmp/dex-ui-test"), "{text}");
+        assert!(text.ends_with("[R] daemon.internal"), "{text}");
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 80);
+        // Narrower: the static cwd is shed first — the line still opens with
+        // live facts, never a dangling separator.
+        let text = footer_text(&app, 60);
+        assert!(text.starts_with("opencode/test-model"), "{text}");
         assert!(text.ends_with("[R] daemon.internal"), "{text}");
         assert_eq!(UnicodeWidthStr::width(text.as_str()), 60);
         // Narrow: badge survives, left degrades to the bare model name.

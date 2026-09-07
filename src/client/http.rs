@@ -90,12 +90,18 @@ fn client_daemon_token() -> Option<String> {
 ///
 /// Timeout note: 10s connect / 300s total. `wait_until_ready` overrides
 /// to 2s per poll.
+/// `User-Agent` sent on every outbound HTTP request (provider generations,
+/// catalog fetches, daemon/TUI traffic). Both reference agents identify
+/// themselves on the wire; a missing UA reads as bot traffic to some
+/// gateways. A per-request `User-Agent` header still overrides this default.
+pub(crate) const USER_AGENT: &str = concat!("dex/", env!("CARGO_PKG_VERSION"));
 static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub(crate) fn shared_async_client() -> reqwest::Client {
     SHARED_CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
+                .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(300))
                 .build()
@@ -116,6 +122,7 @@ pub(crate) fn shared_streaming_client() -> reqwest::Client {
     STREAMING_CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
+                .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
