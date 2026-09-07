@@ -283,7 +283,15 @@ fn main() {
             }
         }
         Mode::Doctor => {
-            print!("{}", crate::llm::config::doctor());
+            print!(
+                "{}",
+                crate::llm::config::doctor(
+                    args.base_url.clone(),
+                    args.model.clone(),
+                    args.permission,
+                    &args.headers
+                )
+            );
         }
         Mode::Update { models } => {
             if models {
