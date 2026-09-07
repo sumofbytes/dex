@@ -5,6 +5,7 @@ use ratatui::widgets::{block::Padding, Block, Borders, Clear, List, ListItem, Pa
 use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks};
 use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 use ratatui_markdown::ThemeConfig;
+use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::slash;
@@ -42,6 +43,9 @@ pub(super) fn input_outer_height(content_rows: u16) -> u16 {
 }
 
 pub(super) fn activity_height(item_count: u16) -> u16 {
+    if item_count == 0 {
+        return 0;
+    }
     item_count
         .saturating_mul(2)
         .saturating_sub(1)
@@ -518,14 +522,15 @@ pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
     out
 }
 
-/// Render a streamed thinking block: collapsed = a single dim
-/// "◌ Thinking" indicator whose dots animate while the block streams and
-/// settle at "◌ Thinking ..." once it closes; expanded (Ctrl+T) = the full
-/// text, dim.
+/// Render a streamed thinking block: collapsed = a single dim indicator
+/// that animates "◌ Thinking .." while the block streams and settles at
+/// "Thought for 4s" (or "◌ Thinking ..." when no span was measured) once it
+/// closes; expanded (Ctrl+T) = the full text, dim.
 fn thinking_display_lines(
     text: &str,
     expanded: bool,
     thinking_open: bool,
+    elapsed: Option<Duration>,
     tick: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -538,24 +543,40 @@ fn thinking_display_lines(
             .flat_map(|l| wrap_line_display(&line(l), width))
             .collect();
     }
-    vec![thinking_indicator_line(thinking_open, tick, width)]
+    vec![thinking_indicator_line(thinking_open, elapsed, tick, width)]
 }
 
-/// The collapsed indicator's text: while the block streams, the dot count
-/// cycles 1→3 every other animation frame (~0.24s at the ~8 fps busy
-/// heartbeat) — deliberately slower than the stream flush so the dots read
-/// as a calm pulse; once the block closes it freezes at "◌ Thinking ...".
-fn thinking_indicator_text(thinking_open: bool, tick: u16) -> String {
-    if !thinking_open {
-        return "◌ Thinking ...".to_string();
+/// The collapsed thinking indicator's text: while the block streams, the
+/// dot count cycles 1→3 every other animation frame (~0.24s at the ~8 fps
+/// busy heartbeat) — deliberately slower than the stream flush so the dots
+/// read as a calm pulse; once the block closes it settles at "Thought for
+/// <elapsed>", or falls back to the static dots when no span was measured.
+fn thinking_indicator_text(thinking_open: bool, elapsed: Option<Duration>, tick: u16) -> String {
+    if thinking_open {
+        return format!("◌ Thinking {}", dots_for_tick(tick));
     }
-    let dots = dots_for_tick(tick);
-    format!("◌ Thinking {dots}")
+    match elapsed {
+        Some(elapsed) => format!("Thought for {}", format_elapsed(elapsed)),
+        None => "◌ Thinking ...".to_string(),
+    }
+}
+
+/// "4s" under a minute; minutes + seconds above.
+pub(super) fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let mins = secs / 60;
+        let rest = secs % 60;
+        format!("{mins}m {rest}s")
+    }
 }
 
 /// Shared dot cadence: cycles 1→3 every other animation frame (~0.24s at
 /// the ~8 fps busy heartbeat) — deliberately slower than the stream flush
-/// so the dots read as a calm pulse.
+/// so the dots read as a calm pulse. Used by both the thinking and the
+/// turn-activity indicators.
 fn dots_for_tick(tick: u16) -> &'static str {
     match (tick / 2) % 3 {
         0 => ".",
@@ -564,30 +585,69 @@ fn dots_for_tick(tick: u16) -> &'static str {
     }
 }
 
-fn thinking_indicator_line(thinking_open: bool, tick: u16, width: u16) -> Line<'static> {
+fn thinking_indicator_line(
+    thinking_open: bool,
+    elapsed: Option<Duration>,
+    tick: u16,
+    width: u16,
+) -> Line<'static> {
     super::indent_transcript_line(Line::from(Span::styled(
-        truncate_display(&thinking_indicator_text(thinking_open, tick), width),
+        truncate_display(
+            &thinking_indicator_text(thinking_open, elapsed, tick),
+            width,
+        ),
+        Style::default().fg(theme::muted_fg()),
+    )))
+}
+
+/// The collapsed turn-activity block: "● Working .." with the shared dot
+/// cadence while the turn runs (animated by the per-frame overlay), then
+/// the green "Worked for 12s · 4.2k tokens" summary once it settles.
+fn activity_display_lines(settled: Option<&str>, tick: u16, width: u16) -> Vec<Line<'static>> {
+    match settled {
+        Some(summary) => vec![super::indent_transcript_line(Line::from(Span::styled(
+            truncate_display(summary, width),
+            Style::default().fg(Color::LightGreen),
+        )))],
+        None => vec![activity_indicator_line(tick, width)],
+    }
+}
+
+fn activity_indicator_line(tick: u16, width: u16) -> Line<'static> {
+    super::indent_transcript_line(Line::from(Span::styled(
+        truncate_display(&format!("● Working {}", dots_for_tick(tick)), width),
         Style::default().fg(theme::muted_fg()),
     )))
 }
 
 struct TranscriptView;
 
-/// Wrapped rows for a transcript block at `width`. Thinking blocks are
-/// cached in their settled form — collapsed "◌ Thinking ..." or the full dim
-/// text when expanded — so the streaming dots stay a per-frame overlay on
-/// the tail row and never trigger a re-wrap themselves.
+/// Wrapped rows for a transcript block at `width`. Thinking and activity
+/// blocks are cached in their settled form — collapsed indicator, duration
+/// summary or full dim text when expanded — so the live dots stay a
+/// per-frame overlay and never trigger a re-wrap themselves. An open
+/// turn-activity block wraps to zero rows while a thinking block streams:
+/// Working shows only when busy-but-not-thinking, so the transcript never
+/// stacks two live spinners.
 fn wrap_block(
     block: &super::TranscriptBlock,
     width: u16,
     show_thinking: bool,
+    thinking_open: bool,
 ) -> Vec<Line<'static>> {
     match block {
-        super::TranscriptBlock::Thinking { text, .. } => {
+        super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
-                thinking_display_lines(text, true, false, 0, width)
+                thinking_display_lines(text, true, false, None, 0, width)
             } else {
-                vec![thinking_indicator_line(false, 0, width)]
+                thinking_display_lines(text, false, false, *elapsed, 0, width)
+            }
+        }
+        super::TranscriptBlock::Activity { settled, .. } => {
+            if settled.is_none() && thinking_open {
+                Vec::new()
+            } else {
+                activity_display_lines(settled.as_deref(), 0, width)
             }
         }
         _ => block
@@ -642,7 +702,7 @@ impl TranscriptView {
             if app.wrapped_cache[idx].stamp == block.stamp() {
                 continue;
             }
-            let rows = wrap_block(block, area.width, app.show_thinking);
+            let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
             app.wrapped_cache[idx] = WrappedBlock {
                 stamp: block.stamp(),
                 rows,
@@ -654,28 +714,67 @@ impl TranscriptView {
             // runs only on content or width changes, never for scroll.
             let mut display: Vec<Line<'static>> = Vec::new();
             for (idx, wb) in app.wrapped_cache.iter().enumerate() {
-                if idx > 0 {
+                if idx > 0 && !wb.rows.is_empty() {
                     display.push(Line::default());
                 }
                 display.extend(wb.rows.iter().cloned());
             }
             app.display_cache = display;
         }
-        // The open thinking block's collapsed indicator animates in place:
-        // its cached line is rewritten every frame (O(1)) instead of
-        // invalidating the cache, which would re-wrap the whole transcript
-        // at animation rate. The block is the transcript tail while it is
-        // open (any other sink line closes it), so the last cached line is
-        // the indicator.
-        if app.thinking_open
-            && !app.show_thinking
-            && matches!(
-                app.transcript.last(),
-                Some(super::TranscriptBlock::Thinking { .. })
-            )
-        {
-            if let Some(last) = app.display_cache.last_mut() {
-                *last = thinking_indicator_line(true, app.tick, area.width);
+        // The open thinking / activity rows animate in place: their cached
+        // lines are rewritten every frame (O(1)) instead of invalidating
+        // the cache, which would re-wrap the whole transcript at animation
+        // rate. Both animated blocks sit at the transcript tail — the open
+        // activity block is the tail block while busy, and the open
+        // thinking block is the last content block (any non-thinking sink
+        // line closes it) — so their display rows derive from the tail
+        // instead of walking the cache.
+        let mut thinking_row: Option<usize> = None;
+        let mut activity_row: Option<usize> = None;
+        if (app.thinking_open && !app.show_thinking) || app.busy {
+            if let Some(tail) = app.transcript.len().checked_sub(1) {
+                let tail_open = matches!(
+                    &app.transcript[tail],
+                    super::TranscriptBlock::Activity { settled: None, .. }
+                );
+                let tail_rows = if tail_open {
+                    app.wrapped_cache[tail].rows.len()
+                } else {
+                    0
+                };
+                if tail_open && tail_rows > 0 {
+                    // Tail block: no separator after it, so its last row is
+                    // the last display row.
+                    activity_row = Some(app.display_cache.len() - 1);
+                }
+                if app.thinking_open && !app.show_thinking {
+                    if let Some(idx) = tail.checked_sub(usize::from(tail_open)) {
+                        if matches!(
+                            &app.transcript[idx],
+                            super::TranscriptBlock::Thinking { .. }
+                        ) {
+                            let rows = app.wrapped_cache[idx].rows.len();
+                            if rows > 0 {
+                                // Rows after the thinking block: only the
+                                // open activity (0 rows while thinking
+                                // streams) plus its 1-row separator when
+                                // non-empty.
+                                let sep = usize::from(tail_rows > 0);
+                                thinking_row = Some(app.display_cache.len() - tail_rows - sep - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(row) = thinking_row {
+            if let Some(line) = app.display_cache.get_mut(row) {
+                *line = thinking_indicator_line(true, None, app.tick, area.width);
+            }
+        }
+        if let Some(row) = activity_row {
+            if let Some(line) = app.display_cache.get_mut(row) {
+                *line = activity_indicator_line(app.tick, area.width);
             }
         }
         let total = app.display_cache.len();
@@ -791,38 +890,18 @@ struct ActivityView;
 impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         // Always clear the rect first: ratatui only repaints cells the
-        // widget writes, so a shorter "worked for …" line would otherwise
-        // leave trailing chars from a longer previous status text.
+        // widget writes, so a shorter line (e.g. fewer queued-steer
+        // badges) would otherwise leave trailing chars from the previous
+        // frame.
         f.render_widget(Clear, area);
-        if !(app.busy || app.last_activity.is_some()) {
+        // The busy "● Working" spinner and the "worked for …" summary now
+        // live in the transcript as the turn-activity block; this strip
+        // only carries the pending steer/follow-up queue.
+        if app.pending_steering.is_empty() && app.pending_followups.is_empty() {
             return;
         }
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
-        let (activity_text, activity_color) = if app.busy {
-            // Dots cycle 1→3 on the shared cadence, matching the
-            // "◌ Thinking .." indicator. The tool itself already shows in
-            // the transcript's ▸ block.
-            (
-                truncate_display(
-                    &format!("● Working {}", dots_for_tick(app.tick)),
-                    content_width,
-                ),
-                theme::muted_fg(),
-            )
-        } else {
-            (
-                truncate_display(
-                    app.last_activity.as_deref().unwrap_or_default(),
-                    content_width,
-                ),
-                Color::LightGreen,
-            )
-        };
-
-        let mut activity_lines = vec![Line::from(Span::styled(
-            activity_text,
-            Style::default().fg(activity_color),
-        ))];
+        let mut activity_lines = Vec::new();
         let mut shown = 0;
         for pending in app.pending_steering.iter().take(3) {
             activity_lines.push(Line::from(Span::styled(
@@ -1268,8 +1347,8 @@ impl ApprovalOverlay {
 pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     // Ratatui only repaints cells the widget touches; without a full clear,
-    // a shorter line (e.g. "worked for …" replacing the spinner, or a
-    // shrunken input) would leave trailing chars from the previous frame.
+    // a shorter line (e.g. fewer queued-steer badges, or a shrunken input)
+    // would leave trailing chars from the previous frame.
     f.render_widget(Clear, area);
     // ponytail: wrap the composer once — the rows size the layout and
     // render it, so don't pay `render_input` twice per frame.
@@ -1278,7 +1357,9 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let pending_total = app.pending_steering.len() + app.pending_followups.len();
     let visible_pending = pending_total.min(3) as u16;
     let extra_queue_line = u16::from(pending_total > 3);
-    let activity_items = 1 + visible_pending + extra_queue_line;
+    // The busy "● Working" status lives in the transcript (turn-activity
+    // block); this strip only sizes for the pending queue.
+    let activity_items = visible_pending + extra_queue_line;
     // Approval is a centered modal, not a bottom-pane split — don't reserve
     // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
     // no reason and push the composer up.
@@ -1601,6 +1682,7 @@ mod tests {
     use super::*;
     use crate::core::types::{ApiProtocol, PermissionMode, Provider};
     use ratatui::backend::TestBackend;
+    use std::time::Instant;
 
     fn test_app() -> super::super::App {
         let cwd = "/tmp/dex-ui-test".to_string();
@@ -1641,8 +1723,6 @@ mod tests {
             cwd,
             git_branch: None,
             git_dirty: false,
-            turn_started: None,
-            last_activity: None,
             steering_rx: None,
             followup_rx: None,
             pending_steering: Vec::new(),
@@ -1686,6 +1766,8 @@ mod tests {
             input_content_width(80),
             input_block().inner(Rect::new(0, 0, 80, 24)).width
         );
+        // Guard keeps the queue-only strip collapsed at zero items.
+        assert_eq!(activity_height(0), 0);
         assert_eq!(activity_height(1), 3);
         assert_eq!(activity_height(3), 7);
         assert_eq!(status_height(), 3);
@@ -1725,7 +1807,7 @@ mod tests {
     #[test]
     fn thinking_display_collapsed_previews_expanded_shows_all() {
         let text = "first line\n\nsecond line";
-        let collapsed = thinking_display_lines(text, false, false, 0, 80);
+        let collapsed = thinking_display_lines(text, false, false, None, 0, 80);
         assert_eq!(collapsed.len(), 1);
         let joined: String = collapsed[0]
             .spans
@@ -1738,7 +1820,7 @@ mod tests {
 
         // While streaming, the collapsed indicator animates its dots.
         // One step every other animation frame at the busy heartbeat.
-        let streaming = thinking_display_lines(text, false, true, 2, 80);
+        let streaming = thinking_display_lines(text, false, true, None, 2, 80);
         let streamed: String = streaming[0]
             .spans
             .iter()
@@ -1746,7 +1828,7 @@ mod tests {
             .collect();
         assert!(streamed.contains("◌ Thinking .."), "{streamed}");
 
-        let expanded = thinking_display_lines(text, true, false, 0, 80);
+        let expanded = thinking_display_lines(text, true, false, None, 0, 80);
         assert!(expanded.len() >= 3, "{}", expanded.len());
         let all: String = expanded
             .iter()
@@ -1758,14 +1840,121 @@ mod tests {
     #[test]
     fn thinking_indicator_cycles_while_streaming_and_settles() {
         // Dots grow 1→3 every other animation frame, then loop.
-        assert_eq!(thinking_indicator_text(true, 0), "◌ Thinking .");
-        assert_eq!(thinking_indicator_text(true, 2), "◌ Thinking ..");
-        assert_eq!(thinking_indicator_text(true, 4), "◌ Thinking ...");
-        assert_eq!(thinking_indicator_text(true, 6), "◌ Thinking .");
-        // Closed: static, never animated again.
+        assert_eq!(thinking_indicator_text(true, None, 0), "◌ Thinking .");
+        assert_eq!(thinking_indicator_text(true, None, 2), "◌ Thinking ..");
+        assert_eq!(thinking_indicator_text(true, None, 4), "◌ Thinking ...");
+        assert_eq!(thinking_indicator_text(true, None, 6), "◌ Thinking .");
+        // Closed without a measured span: static, never animated again.
         for tick in [0, 2, 4, 6, 999] {
-            assert_eq!(thinking_indicator_text(false, tick), "◌ Thinking ...");
+            assert_eq!(thinking_indicator_text(false, None, tick), "◌ Thinking ...");
         }
+        // Closed with a measured span: the elapsed time, still static.
+        let settled = Some(Duration::from_secs(94));
+        for tick in [0, 2, 4, 6, 999] {
+            assert_eq!(
+                thinking_indicator_text(false, settled, tick),
+                "Thought for 1m 34s"
+            );
+        }
+    }
+
+    #[test]
+    fn format_elapsed_secs_then_minutes() {
+        assert_eq!(format_elapsed(Duration::from_millis(400)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(4)), "4s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_elapsed(Duration::from_secs(94)), "1m 34s");
+    }
+
+    #[test]
+    fn closed_thinking_settles_to_thought_for_duration() {
+        let mut app = test_app();
+        app.transcript = vec![super::super::TranscriptBlock::Thinking {
+            stamp: 0,
+            text: "deep".into(),
+            started: Instant::now(),
+            elapsed: Some(Duration::from_secs(4)),
+        }];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let text =
+            |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let lines: Vec<String> = app
+            .display_cache
+            .iter()
+            .map(|l| text(l).trim().to_string())
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("Thought for 4s")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("◌ Thinking")), "{lines:?}");
+    }
+
+    #[test]
+    fn activity_block_animates_then_settles_to_worked_for() {
+        let mut app = test_app();
+        app.busy = true;
+        app.tick = 2; // animated frame for this tick is "● Working .."
+        app.transcript = vec![super::super::TranscriptBlock::Activity {
+            stamp: 0,
+            started: Instant::now(),
+            settled: None,
+        }];
+        let draw = |app: &mut super::super::App| {
+            let mut terminal =
+                ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+            terminal
+                .draw(|frame| view(frame, app))
+                .expect("render should succeed");
+        };
+        let lines = |app: &super::super::App| -> Vec<String> {
+            app.display_cache
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .trim()
+                        .to_string()
+                })
+                .collect()
+        };
+        draw(&mut app);
+        assert!(
+            app.display_cache.iter().any(|l| l
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .contains("● Working ..")),
+            "{:?}",
+            app.display_cache
+        );
+
+        app.busy = false;
+        app.transcript[0] = super::super::TranscriptBlock::Activity {
+            stamp: 1,
+            started: Instant::now(),
+            settled: Some("Worked for 12s · 4.2k tokens".into()),
+        };
+        draw(&mut app);
+        let settled = lines(&app);
+        assert!(
+            settled
+                .iter()
+                .any(|l| l.contains("Worked for 12s · 4.2k tokens")),
+            "{settled:?}"
+        );
+        assert!(
+            !settled.iter().any(|l| l.contains("● Working")),
+            "{settled:?}"
+        );
     }
 
     #[test]
@@ -1779,6 +1968,8 @@ mod tests {
             super::super::TranscriptBlock::Thinking {
                 stamp: 0,
                 text: "settled thoughts".into(),
+                started: Instant::now(),
+                elapsed: None,
             },
             super::super::TranscriptBlock::Assistant {
                 stamp: 0,
@@ -1789,6 +1980,8 @@ mod tests {
             super::super::TranscriptBlock::Thinking {
                 stamp: 0,
                 text: "live thoughts".into(),
+                started: Instant::now(),
+                elapsed: None,
             },
         ];
         app.thinking_open = true;
@@ -2527,7 +2720,7 @@ mod tests {
             let pending_total = app.pending_steering.len() + app.pending_followups.len();
             let visible_pending = pending_total.min(3) as u16;
             let extra = u16::from(pending_total > 3);
-            let activity_items = 1 + visible_pending + extra;
+            let activity_items = visible_pending + extra;
             let layout = compute_layout(area, input_rows, activity_items, false).unwrap();
             // Check every cell in input and footer does not contain ghost fragments
             // Ghost contains distinctive substrings that should never leak into chrome

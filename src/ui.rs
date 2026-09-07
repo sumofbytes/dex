@@ -66,6 +66,21 @@ pub(crate) enum TranscriptBlock {
     Thinking {
         stamp: u64,
         text: String,
+        /// When the first delta landed; the settled duration is measured
+        /// from here so the closed line can read "Thought for 4s".
+        started: Instant,
+        /// Set when the block closes; `None` while streaming.
+        elapsed: Option<Duration>,
+    },
+    /// Live turn activity: pushed when a turn starts and kept at the
+    /// transcript tail (moved on every busy-time append) so the animated
+    /// "● Working" indicator trails the newest block; on turn end it
+    /// settles into the "Worked for …" summary line.
+    Activity {
+        stamp: u64,
+        started: Instant,
+        /// Set on turn end; `None` while the turn runs.
+        settled: Option<String>,
     },
     Tool {
         stamp: u64,
@@ -108,6 +123,7 @@ impl TranscriptBlock {
             Self::User { stamp, .. }
             | Self::Assistant { stamp, .. }
             | Self::Thinking { stamp, .. }
+            | Self::Activity { stamp, .. }
             | Self::Tool { stamp, .. }
             | Self::System { stamp, .. }
             | Self::Error { stamp, .. }
@@ -121,6 +137,7 @@ impl TranscriptBlock {
             Self::User { stamp, .. }
             | Self::Assistant { stamp, .. }
             | Self::Thinking { stamp, .. }
+            | Self::Activity { stamp, .. }
             | Self::Tool { stamp, .. }
             | Self::System { stamp, .. }
             | Self::Error { stamp, .. }
@@ -147,6 +164,7 @@ impl TranscriptBlock {
             TranscriptBlock::User { lines, .. } => lines.iter().collect(),
             TranscriptBlock::Assistant { lines, .. } => lines.iter().collect(),
             TranscriptBlock::Thinking { .. } => vec![],
+            TranscriptBlock::Activity { .. } => vec![],
             TranscriptBlock::Tool {
                 input,
                 output,
@@ -184,8 +202,6 @@ pub(crate) struct App {
     pub(crate) cwd: String,
     pub(crate) git_branch: Option<String>,
     pub(crate) git_dirty: bool,
-    pub(crate) turn_started: Option<Instant>,
-    pub(crate) last_activity: Option<String>,
     pub(crate) steering_rx: Option<mpsc::Receiver<String>>,
     pub(crate) followup_rx: Option<mpsc::Receiver<String>>,
     pub(crate) pending_steering: Vec<String>,
@@ -583,6 +599,7 @@ pub(super) fn push_info_line(app: &mut App, line: Line<'static>) {
         stamp: 0,
         line: indent_transcript_line(line),
     });
+    move_activity_to_tail(app);
 }
 
 pub(super) fn push_info(app: &mut App, text: String) {
@@ -632,6 +649,40 @@ fn note_stream_flush(app: &mut App) {
     app.stream_last_flush = Instant::now();
 }
 
+/// Index of the last content block, skipping any trailing open
+/// turn-activity indicator. All streaming extension logic (assistant
+/// coalesce, thinking deltas, tool completion, dimming, close) must use
+/// this instead of `transcript.last*()` — the open `Activity` block trails
+/// at the tail while a turn runs, so `last` is the spinner, not content.
+fn content_tail_idx(app: &App) -> Option<usize> {
+    app.transcript
+        .iter()
+        .rposition(|b| !matches!(b, TranscriptBlock::Activity { settled: None, .. }))
+}
+
+fn content_tail(app: &App) -> Option<&TranscriptBlock> {
+    content_tail_idx(app).and_then(|i| app.transcript.get(i))
+}
+
+fn content_tail_mut(app: &mut App) -> Option<&mut TranscriptBlock> {
+    let idx = content_tail_idx(app)?;
+    app.transcript.get_mut(idx)
+}
+
+/// Re-wrap the open turn-activity block on thinking visibility flips. The
+/// spinner hides while a thinking block streams (Working shows only when
+/// busy-but-not-thinking), so its cached rows depend on `thinking_open` as
+/// well as its stamp — bump it whenever thinking opens or closes.
+fn bump_open_activity(app: &mut App) {
+    if let Some(pos) = app
+        .transcript
+        .iter()
+        .rposition(|b| matches!(b, TranscriptBlock::Activity { settled: None, .. }))
+    {
+        app.transcript[pos].bump();
+    }
+}
+
 /// Drain the buffered assistant deltas into the tail `Assistant` block,
 /// rendering the markdown once for the whole buffered chunk. Call before
 /// anything reads the transcript or pushes a non-assistant block, so pending
@@ -647,7 +698,7 @@ fn flush_assistant(app: &mut App) {
         .collect();
     app.assistant_pending.clear();
     if app.assistant_open {
-        if let Some(TranscriptBlock::Assistant { lines, stamp }) = app.transcript.last_mut() {
+        if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
             lines.extend(new_lines);
             *stamp = stamp.wrapping_add(1);
             return;
@@ -658,6 +709,9 @@ fn flush_assistant(app: &mut App) {
         lines: new_lines,
     });
     app.assistant_open = true;
+    // New block landed after the trailing spinner; re-trail it so the
+    // "● Working" indicator stays last during a turn. No-op when idle.
+    move_activity_to_tail(app);
 }
 
 /// Route a streamed console line into the transcript with the same styling
@@ -687,8 +741,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 // own `Line::default()`.
                 if app.assistant_open {
                     flush_assistant(app);
-                    if let Some(TranscriptBlock::Assistant { lines, stamp }) =
-                        app.transcript.last_mut()
+                    if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app)
                     {
                         if !lines.last().is_some_and(line_is_air) {
                             lines.push(Line::default());
@@ -742,17 +795,25 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // token; the block settles on close, which bumps unconditionally.
             // (Gate read before the mutable borrow; clock reset after it.)
             let due = stream_flush_due(app);
-            if let Some(TranscriptBlock::Thinking { text, stamp }) = app.transcript.last_mut() {
+            if let Some(TranscriptBlock::Thinking { text, stamp, .. }) = content_tail_mut(app) {
                 text.push_str(&s);
                 if due {
                     *stamp = stamp.wrapping_add(1);
                 }
             } else {
-                app.transcript
-                    .push(TranscriptBlock::Thinking { stamp: 0, text: s });
+                app.transcript.push(TranscriptBlock::Thinking {
+                    stamp: 0,
+                    text: s,
+                    started: Instant::now(),
+                    elapsed: None,
+                });
             }
             if due {
                 note_stream_flush(app);
+            }
+            if !app.thinking_open {
+                // Spinner hides while thinking streams; re-wrap it away.
+                bump_open_activity(app);
             }
             app.thinking_open = true;
         }
@@ -823,9 +884,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 // the path: `src/main.rs:1-20`, a glob, or `N files`).
                 // `==> file <==` fan-out headers inside re-target per
                 // section in `render_read_preview`.
-                let arg_path = app
-                    .transcript
-                    .last()
+                let arg_path = content_tail(app)
                     .and_then(|b| match b {
                         TranscriptBlock::Tool {
                             output: None,
@@ -851,12 +910,14 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             };
             app.assistant_open = false;
             // Complete the tool block started by ToolInput if it is still open.
+            // (Content tail: the open Activity spinner may sit at the
+            // transcript tail while busy.)
             if let Some(TranscriptBlock::Tool {
                 output: out,
                 preview: prev,
                 stamp,
                 ..
-            }) = app.transcript.last_mut()
+            }) = content_tail_mut(app)
             {
                 if out.is_none() {
                     *out = Some(output);
@@ -910,6 +971,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
     // ponytail: sticky autoscroll — don't force true on every append;
     // TranscriptView snaps only when already at bottom, so manual scroll
     // during streaming stays put instead of snapping back each chunk.
+    move_activity_to_tail(app);
 }
 
 /// Close the streaming thinking block, if any: stops the collapsed
@@ -920,10 +982,128 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
 pub(super) fn close_thinking(app: &mut App) {
     if app.thinking_open {
         app.thinking_open = false;
-        if let Some(block) = app.transcript.last_mut() {
-            block.bump();
+        // Working reappears once thinking settles; re-wrap the spinner.
+        bump_open_activity(app);
+        // Stamp bump forces a re-wrap so the settled row shows the elapsed
+        // "Thought for …" (and an expanded Ctrl+T block shows any text that
+        // arrived since the last throttled bump). Content tail: the open
+        // Activity spinner may sit at the transcript tail while busy.
+        if let Some(TranscriptBlock::Thinking {
+            started,
+            elapsed,
+            stamp,
+            ..
+        }) = content_tail_mut(app)
+        {
+            *elapsed = Some(started.elapsed());
+            *stamp = stamp.wrapping_add(1);
         }
     }
+}
+
+/// Push the live turn-activity block: an animated "● Working" indicator
+/// that trails the latest transcript block while the turn runs and settles
+/// into the "Worked for …" summary when it ends.
+pub(super) fn start_activity(app: &mut App) {
+    if app
+        .transcript
+        .iter()
+        .any(|b| matches!(b, TranscriptBlock::Activity { settled: None, .. }))
+    {
+        return;
+    }
+    app.transcript.push(TranscriptBlock::Activity {
+        stamp: 0,
+        started: Instant::now(),
+        settled: None,
+    });
+    app.autoscroll = true;
+}
+
+/// Clear the selection when rows at or below block `pos` no longer map to
+/// the same display rows (the block moved past them). A selection entirely
+/// above `pos` keeps pointing at unchanged rows, so it survives the
+/// streaming appends that re-trail the activity spinner.
+fn drop_shifted_selection(app: &mut App, pos: usize) {
+    // Start row of block `pos` in display space: cached rows plus the
+    // 1-row separator before each non-empty block after the first.
+    let first_shifted: usize = app
+        .wrapped_cache
+        .iter()
+        .take(pos)
+        .enumerate()
+        .map(|(j, wb)| wb.rows.len() + usize::from(j > 0 && !wb.rows.is_empty()))
+        .sum();
+    if let Some(sel) = app.selection {
+        if sel.norm().1 .0 >= first_shifted {
+            app.selection = None;
+        }
+    }
+}
+
+/// Move the open turn-activity block to the transcript tail so the animated
+/// "● Working" indicator always sits under the newest block. Called after
+/// every busy-time append; no-op without a running turn (settled blocks
+/// from finished turns stay where they settled).
+fn move_activity_to_tail(app: &mut App) {
+    if !app.busy {
+        return;
+    }
+    if matches!(
+        app.transcript.last(),
+        Some(TranscriptBlock::Activity { settled: None, .. })
+    ) {
+        return;
+    }
+    let Some(pos) = app
+        .transcript
+        .iter()
+        .rposition(|b| matches!(b, TranscriptBlock::Activity { settled: None, .. }))
+    else {
+        return;
+    };
+    let block = app.transcript.remove(pos);
+    app.transcript.push(block);
+    // Wrapped rows after `pos` shifted up a slot; drop their (tail few)
+    // cache entries — TranscriptView re-wraps them.
+    app.wrapped_cache.truncate(pos);
+    drop_shifted_selection(app, pos);
+}
+
+/// Settle the open turn-activity block: move it to the transcript tail and
+/// swap the animated "● Working" indicator for the turn's summary —
+/// "Worked for 12s · 4.2k tokens". Duration is measured from the block's
+/// start, so it spans the whole turn (thinking included). Token count is
+/// read only once a block to settle exists, so replayed turns that never
+/// saw a turn start skip the estimate entirely.
+pub(super) fn settle_activity(app: &mut App) {
+    let Some(pos) = app
+        .transcript
+        .iter()
+        .rposition(|b| matches!(b, TranscriptBlock::Activity { settled: None, .. }))
+    else {
+        return;
+    };
+    let started = match &app.transcript[pos] {
+        TranscriptBlock::Activity { started, .. } => *started,
+        _ => unreachable!(),
+    };
+    let tokens = app
+        .tool_state
+        .last_usage
+        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
+    app.transcript.remove(pos);
+    app.transcript.push(TranscriptBlock::Activity {
+        stamp: 0,
+        started,
+        settled: Some(format!(
+            "Worked for {} · {} tokens",
+            render::format_elapsed(started.elapsed()),
+            format_tokens(tokens),
+        )),
+    });
+    app.wrapped_cache.truncate(pos);
+    drop_shifted_selection(app, pos);
 }
 
 /// Ctrl+T toggles expanded thinking. The wrapped rows of a thinking block
@@ -937,7 +1117,7 @@ pub(super) fn bump_thinking_stamps(app: &mut App) {
 }
 
 fn dim_intermediate_assistant_block(app: &mut App) {
-    if let Some(TranscriptBlock::Assistant { lines, stamp }) = app.transcript.last_mut() {
+    if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
         for line in lines.iter_mut() {
             for span in &mut line.spans {
                 span.style = span.style.fg(theme::muted_fg());
@@ -986,6 +1166,7 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
         stamp: 0,
         lines: block_lines,
     });
+    move_activity_to_tail(app);
     app.autoscroll = true;
 }
 
@@ -1086,8 +1267,6 @@ mod tests {
             cwd: "/tmp".into(),
             git_branch: None,
             git_dirty: false,
-            turn_started: None,
-            last_activity: None,
             steering_rx: None,
             followup_rx: None,
             pending_steering: Vec::new(),
@@ -1473,6 +1652,220 @@ mod tests {
     }
 
     #[test]
+    fn thinking_close_records_elapsed_duration() {
+        let mut app = test_app();
+        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("h".into()));
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptBlock::Thinking { elapsed: None, .. }
+        ));
+        close_thinking(&mut app);
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptBlock::Thinking {
+                elapsed: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn activity_block_trails_the_tail_then_settles() {
+        let mut app = test_app();
+        app.busy = true;
+        start_activity(&mut app);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Activity { settled: None, .. })
+        ));
+        // A tool block lands after it: the indicator must move below it.
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash cargo test".into()),
+        );
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Activity { settled: None, .. })
+        ));
+        assert!(matches!(
+            app.transcript[app.transcript.len() - 2],
+            TranscriptBlock::Tool { .. }
+        ));
+        app.tool_state.last_usage = Some(4200);
+        settle_activity(&mut app);
+        match app.transcript.last() {
+            Some(TranscriptBlock::Activity {
+                settled: Some(summary),
+                ..
+            }) => {
+                assert!(summary.contains("Worked for"), "{summary}");
+                assert!(summary.contains("4.2k tokens"), "{summary}");
+            }
+            other => panic!("expected settled activity block, got {other:?}"),
+        }
+        // Settling again (e.g. a duplicate finish event) is a no-op.
+        app.tool_state.last_usage = Some(1);
+        settle_activity(&mut app);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Activity { .. })
+        ));
+        assert_eq!(app.transcript.len(), 2);
+    }
+
+    #[test]
+    fn selection_above_retrailed_activity_survives_streaming() {
+        // Two rendered blocks (3 + 2 rows, one separator between) and the
+        // open spinner after them: it starts at display row 6. A streaming
+        // append lands an unwrapped block after the spinner, then the
+        // spinner re-trails to the tail.
+        for (sel_row, survives) in [(1, true), (6, false), (7, false)] {
+            let mut app = test_app();
+            app.busy = true;
+            app.transcript = vec![
+                TranscriptBlock::Assistant {
+                    stamp: 0,
+                    lines: vec![],
+                },
+                TranscriptBlock::Tool {
+                    stamp: 0,
+                    input: Line::default(),
+                    output: None,
+                    preview: Vec::new(),
+                    tool_arg: String::new(),
+                },
+                TranscriptBlock::Activity {
+                    stamp: 0,
+                    started: Instant::now(),
+                    settled: None,
+                },
+            ];
+            let rows = |n| (0..n).map(|_| Line::default()).collect::<Vec<_>>();
+            app.wrapped_cache = vec![
+                WrappedBlock {
+                    stamp: 0,
+                    rows: rows(3),
+                },
+                WrappedBlock {
+                    stamp: 0,
+                    rows: rows(2),
+                },
+                WrappedBlock {
+                    stamp: 0,
+                    rows: rows(1),
+                },
+            ];
+            app.transcript.push(TranscriptBlock::Assistant {
+                stamp: 0,
+                lines: vec![],
+            });
+            app.selection = Some(Selection {
+                anchor: (sel_row, 0),
+                end: (sel_row, 1),
+                sticky: false,
+                whole_line: false,
+            });
+            move_activity_to_tail(&mut app);
+            // Rows above the spinner keep pointing at unchanged rows; the
+            // spinner's own row (7) and the separator above it (6) moved.
+            assert_eq!(app.selection.is_some(), survives, "row {sel_row}");
+        }
+    }
+
+    #[test]
+    fn thinking_coalesces_behind_activity_and_closes_with_elapsed() {
+        let mut app = test_app();
+        app.busy = true;
+        start_activity(&mut app);
+        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("a".into()));
+        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("b".into()));
+        // One thinking block + trailing spinner, not a fragment per delta.
+        assert_eq!(app.transcript.len(), 2);
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptBlock::Thinking { text, .. } if text == "ab"
+        ));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Activity { settled: None, .. })
+        ));
+        // Non-thinking line settles the duration even with the spinner last.
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash x".into()),
+        );
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptBlock::Thinking {
+                elapsed: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_output_completes_open_tool_behind_activity() {
+        let mut app = test_app();
+        app.busy = true;
+        start_activity(&mut app);
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolInput("bash cargo test".into()),
+        );
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::ToolOutput {
+                name: "bash".into(),
+                summary: "ok".into(),
+                success: true,
+                preview: vec![],
+                duration: 0.0,
+            },
+        );
+        // Open tool completed in place; no synthetic duplicate.
+        assert_eq!(app.transcript.len(), 2);
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptBlock::Tool {
+                output: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Activity { settled: None, .. })
+        ));
+    }
+
+    #[test]
+    fn assistant_coalesces_behind_activity() {
+        let mut app = test_app();
+        app.busy = true;
+        start_activity(&mut app);
+        app.stream_last_flush = Instant::now() - std::time::Duration::from_secs(1);
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("one".into()),
+        );
+        app.stream_last_flush = Instant::now() - std::time::Duration::from_secs(1);
+        append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("two".into()),
+        );
+        flush_assistant(&mut app);
+        let assistants = app
+            .transcript
+            .iter()
+            .filter(|b| matches!(b, TranscriptBlock::Assistant { .. }))
+            .count();
+        assert_eq!(assistants, 1);
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptBlock::Activity { settled: None, .. })
+        ));
+    }
+
+    #[test]
     fn indent_transcript_line_adds_gutter() {
         let line = Line::from("test");
         let indented = indent_transcript_line(line);
@@ -1650,7 +2043,11 @@ mod tests {
         app.pending_followups.push("follow".into());
         app.plan.steps.push(("step".into(), false));
         app.turn_start = 3;
-        app.last_activity = Some("worked".into());
+        app.transcript.push(TranscriptBlock::Activity {
+            stamp: 0,
+            started: Instant::now(),
+            settled: None,
+        });
         app.scroll = 9;
         app.autoscroll = false;
 
@@ -1668,7 +2065,10 @@ mod tests {
         assert!(app.pending_followups.is_empty());
         assert!(app.plan.is_empty());
         assert_eq!(app.turn_start, 0);
-        assert!(app.last_activity.is_none());
+        assert!(!app
+            .transcript
+            .iter()
+            .any(|b| matches!(b, TranscriptBlock::Activity { .. })));
     }
 
     #[test]
