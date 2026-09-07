@@ -193,8 +193,14 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     if with_cwd {
         pieces.push((compact_path(&app.cwd), Style::default().fg(Color::Cyan)));
     }
-    push_sep(&mut pieces);
-    pieces.extend(branch_pieces(app));
+    // The branch separator is part of the branch block: emitting it
+    // unconditionally doubled up with the one after an empty branch
+    // (`path ·  · model` in any non-repo directory).
+    let branch = branch_pieces(app);
+    if !branch.is_empty() {
+        push_sep(&mut pieces);
+        pieces.extend(branch);
+    }
     push_sep(&mut pieces);
     pieces.push(quiet(model_label(app)));
     pieces.push(sep());
@@ -265,8 +271,11 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
     // Narrow tier: cwd + branch + model + spend. Branch and cost share
     // helpers with the full line so the tiers cannot drift.
     let mut pieces = vec![(compact_path(&app.cwd), Style::default().fg(Color::Cyan))];
-    push_sep(&mut pieces);
-    pieces.extend(branch_pieces(app));
+    let branch = branch_pieces(app);
+    if !branch.is_empty() {
+        push_sep(&mut pieces);
+        pieces.extend(branch);
+    }
     push_sep(&mut pieces);
     pieces.push(quiet(app.config.model.clone()));
     push_cost(&mut pieces, app);

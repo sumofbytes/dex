@@ -2133,6 +2133,38 @@ mod tests {
     }
 
     #[test]
+    fn status_separators_never_double_without_branch() {
+        // Regression: the branch separator was pushed even when there was
+        // no branch, so any non-repo directory rendered `path ·  · model`.
+        let app = test_app();
+        for (label, pieces) in [
+            ("full tier", status_pieces(&app, true)),
+            ("no-cwd tier", status_pieces(&app, false)),
+        ] {
+            let text: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
+            assert!(!text.contains("·  ·"), "{label}: {text}");
+            assert!(!text.starts_with('·'), "{label}: {text}");
+        }
+        // With a branch the separators around it appear exactly once.
+        let mut branched = test_app();
+        branched.git_branch = Some("main".into());
+        let text = ui_status(&branched);
+        assert!(
+            text.contains("/tmp/dex-ui-test · main · opencode/test-model"),
+            "{text}"
+        );
+        // The compact tier (reached at 60 cols once the cumulative total
+        // widens the earlier tiers) keeps the same invariant.
+        let mut app = test_app();
+        app.connection = Some("[L] 127.0.0.1".into());
+        app.tool_state.total_usage = 45_100;
+        app.tool_state.total_cost = 0.023;
+        let narrow = footer_text(&app, 60);
+        assert!(narrow.starts_with("/tmp/dex-ui-test"), "{narrow}");
+        assert!(!narrow.contains("·  ·"), "{narrow}");
+    }
+
+    #[test]
     fn status_bar_colors_are_semantic_per_item() {
         let mut app = test_app();
         let muted = theme::muted_fg();
