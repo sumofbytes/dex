@@ -562,7 +562,7 @@ fn thinking_indicator_text(thinking_open: bool, elapsed: Option<Duration>, tick:
 }
 
 /// "4s" under a minute; minutes + seconds above.
-fn format_elapsed(elapsed: Duration) -> String {
+pub(super) fn format_elapsed(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     if secs < 60 {
         format!("{secs}s")
@@ -602,7 +602,7 @@ fn thinking_indicator_line(
 
 /// The collapsed turn-activity block: "● Working .." with the shared dot
 /// cadence while the turn runs (animated by the per-frame overlay), then
-/// the green "Worked for 12.3s · 4.2k tokens" summary once it settles.
+/// the green "Worked for 12s · 4.2k tokens" summary once it settles.
 fn activity_display_lines(settled: Option<&str>, tick: u16, width: u16) -> Vec<Line<'static>> {
     match settled {
         Some(summary) => vec![super::indent_transcript_line(Line::from(Span::styled(
@@ -1766,6 +1766,8 @@ mod tests {
             input_content_width(80),
             input_block().inner(Rect::new(0, 0, 80, 24)).width
         );
+        // Guard keeps the queue-only strip collapsed at zero items.
+        assert_eq!(activity_height(0), 0);
         assert_eq!(activity_height(1), 3);
         assert_eq!(activity_height(3), 7);
         assert_eq!(status_height(), 3);
@@ -1939,14 +1941,14 @@ mod tests {
         app.transcript[0] = super::super::TranscriptBlock::Activity {
             stamp: 1,
             started: Instant::now(),
-            settled: Some("Worked for 12.3s · 4.2k tokens".into()),
+            settled: Some("Worked for 12s · 4.2k tokens".into()),
         };
         draw(&mut app);
         let settled = lines(&app);
         assert!(
             settled
                 .iter()
-                .any(|l| l.contains("Worked for 12.3s · 4.2k tokens")),
+                .any(|l| l.contains("Worked for 12s · 4.2k tokens")),
             "{settled:?}"
         );
         assert!(
