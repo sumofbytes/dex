@@ -704,6 +704,21 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
     }
 }
 
+/// Output tokens/s of one LLM call: completion tokens over the
+/// daemon-measured wall-clock duration. Needs both a non-zero output and a
+/// positive duration; `None` otherwise (old daemon, untimed summarizer
+/// call, or an empty completion).
+fn output_rate(output: u64, gen_ms: Option<u64>) -> Option<f64> {
+    match gen_ms {
+        Some(ms) if ms > 0 && output > 0 =>
+        {
+            #[allow(clippy::cast_precision_loss)]
+            Some(output as f64 * 1000.0 / ms as f64)
+        }
+        _ => None,
+    }
+}
+
 fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
     match event {
         StreamEvent::AssistantText(text) => {
@@ -789,6 +804,7 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             cached,
             cost,
             output,
+            gen_ms,
         } => {
             // Live context usage: emitted by the daemon after every LLM call
             // so the status bar updates mid-turn, not just at completion.
@@ -803,6 +819,10 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             remote.app.tool_state.total_output =
                 remote.app.tool_state.total_output.saturating_add(output);
             remote.app.tool_state.total_cost += cost;
+            // Output rate of this call; untimed calls (compaction
+            // summarizer, old daemon) hide the rate instead of keeping a
+            // stale one.
+            remote.app.tool_state.last_tok_s = output_rate(output, gen_ms);
         }
         StreamEvent::TurnFailed { error } => {
             append_sink_line(&mut remote.app, SinkLine::Error(error));
@@ -2131,6 +2151,18 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_rate_needs_output_and_timing() {
+        assert_eq!(output_rate(500, Some(1_000)), Some(500.0));
+        // Sub-second durations scale up (2k tokens in 400ms -> 5k tok/s).
+        assert_eq!(output_rate(2_000, Some(400)), Some(5_000.0));
+        // No timing (old daemon / untimed compaction call) hides the rate.
+        assert_eq!(output_rate(500, None), None);
+        // A zero duration or an empty completion is not a rate.
+        assert_eq!(output_rate(500, Some(0)), None);
+        assert_eq!(output_rate(0, Some(1_000)), None);
+    }
 
     #[test]
     fn connection_labels_classify_host() {

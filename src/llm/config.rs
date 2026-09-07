@@ -911,6 +911,7 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
 /// and autocomplete without network. Falls back to opencode /models if needed.
 pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
+        .user_agent(crate::client::http::USER_AGENT)
         .timeout(Duration::from_secs(10))
         .build()?;
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
@@ -1113,6 +1114,40 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
         }
     }
     out.insert(name.to_string(), value.to_string());
+}
+
+/// Console Go routing affinity: the zen/go endpoint rejects requests without
+/// `x-opencode-session` (`MissingSessionID`). Same pair pi sends (its
+/// `getSessionHeaders`): gated to the opencode provider or an opencode.ai
+/// base URL, filled from the dex session id. Keys already present (any
+/// casing) are left alone, so explicit user headers always win regardless
+/// of call order.
+pub(crate) fn apply_opencode_session_headers(
+    out: &mut BTreeMap<String, String>,
+    provider: &Provider,
+    base_url: &str,
+    session_id: &str,
+) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let is_opencode = matches!(provider, Provider::OpenCode)
+        || reqwest::Url::parse(base_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .is_some_and(|h| h.eq_ignore_ascii_case("opencode.ai"));
+    if !is_opencode {
+        return;
+    }
+    for (name, value) in [
+        ("x-opencode-session", session_id),
+        ("x-opencode-client", "dex"),
+    ] {
+        if !out.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+            out.insert(name.to_string(), value.to_string());
+        }
+    }
 }
 
 fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml::Mapping) {
@@ -1363,6 +1398,7 @@ impl LlmConfig {
             crate::client::http::shared_streaming_client()
         } else {
             reqwest::Client::builder()
+                .user_agent(crate::client::http::USER_AGENT)
                 .connect_timeout(Duration::from_secs(connect_secs))
                 .timeout(Duration::from_secs(request_secs))
                 .build()?
@@ -1408,7 +1444,16 @@ impl LlmConfig {
         if !explicit_base_url {
             this.apply_model(&model, false)?;
         } else {
+            // The pinned endpoint only fixes routing, never the protocol:
+            // resolve from the original selection first (stripping below
+            // drops an `endpoint/id` prefix a full-key table entry may
+            // name), so a per-model pin and the learned fallback still
+            // apply instead of silently falling back to the global default.
+            let selection = model.clone();
             this.strip_routing_prefixes();
+            if let Some(api) = this.resolve_model_api(&selection) {
+                this.api = api;
+            }
             this.refresh_thinking_effort();
         }
         Ok(this)
@@ -2150,6 +2195,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn opencode_session_headers_gated_and_explicit_wins() {
+        use super::apply_opencode_session_headers;
+        use std::collections::BTreeMap;
+        // Opencode provider (zen or go endpoint) + session id → both headers.
+        let mut out = BTreeMap::new();
+        apply_opencode_session_headers(
+            &mut out,
+            &Provider::OpenCode,
+            "https://opencode.ai/zen/go/v1",
+            "sess-1",
+        );
+        assert_eq!(
+            out.get("x-opencode-session").map(String::as_str),
+            Some("sess-1")
+        );
+        assert_eq!(
+            out.get("x-opencode-client").map(String::as_str),
+            Some("dex")
+        );
+        // Generic provider on another host → nothing.
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        apply_opencode_session_headers(
+            &mut out,
+            &Provider::Generic("other".to_string()),
+            "https://other.example/v1",
+            "sess-1",
+        );
+        assert!(out.is_empty());
+        // Generic provider pointed at opencode.ai → headers (host fallback).
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        apply_opencode_session_headers(
+            &mut out,
+            &Provider::Generic("proxy".to_string()),
+            "https://opencode.ai/zen/v1",
+            "sess-1",
+        );
+        assert_eq!(out.len(), 2);
+        // Empty session id → nothing, even for opencode.
+        let mut out: BTreeMap<String, String> = BTreeMap::new();
+        apply_opencode_session_headers(
+            &mut out,
+            &Provider::OpenCode,
+            "https://opencode.ai/zen/v1",
+            "  ",
+        );
+        assert!(out.is_empty());
+        // Explicit user header wins (any casing); client header still fills.
+        let mut out: BTreeMap<String, String> =
+            BTreeMap::from([("X-Opencode-Session".to_string(), "mine".to_string())]);
+        apply_opencode_session_headers(
+            &mut out,
+            &Provider::OpenCode,
+            "https://opencode.ai/zen/v1",
+            "sess-1",
+        );
+        assert_eq!(
+            out.get("X-Opencode-Session").map(String::as_str),
+            Some("mine")
+        );
+        assert_eq!(
+            out.get("x-opencode-client").map(String::as_str),
+            Some("dex")
+        );
+    }
+
+    #[test]
     fn permission_parse_and_ordering() {
         assert_eq!(
             PermissionMode::parse("read-only").unwrap(),
@@ -2690,6 +2801,60 @@ pub(crate) mod tests {
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "m-zen");
         assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pinned_base_url_still_resolves_per_model_protocol() {
+        // A file `base_url:` pins routing only: the per-model table and the
+        // learned fallback must still decide the wire protocol. Otherwise a
+        // persisted `/model go/<id>` (which always writes `base_url:`)
+        // retries `/responses` on every restart and a `DEX_MODEL_APIS` pin
+        // is ignored for the request yet blocks the fallback — the exact
+        // error loop in the glm-5.3-flash report.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-pin-proto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache/dex")).unwrap();
+        std::fs::write(dir.join("cache/dex/models.dev.json"), "{}").unwrap();
+        // Persisted state after `/model go/m-go`: stripped id + pinned URL.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nbase_url: https://opencode.ai/zen/go/v1\nmodel: m-go\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        for key in ["DEX_PROVIDER", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
+            std::env::remove_var(key);
+        }
+        // Per-model table entry wins over the responses default.
+        std::env::set_var("DEX_MODEL_APIS", "m-go=openai-completions");
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.model, "m-go");
+        assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
+        // Without the table, the learned fallback decides instead.
+        std::env::remove_var("DEX_MODEL_APIS");
+        remember_learned_api(
+            "https://opencode.ai/zen/go/v1",
+            "m-go",
+            ApiProtocol::ChatCompletions,
+        );
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

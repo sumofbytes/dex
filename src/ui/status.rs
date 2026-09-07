@@ -117,19 +117,38 @@ fn cost_piece(app: &App) -> Option<Piece> {
     }
 }
 
+/// Model identity as one run: `provider/model`. Model ids that already
+/// carry a provider prefix (OpenRouter-style `openai/gpt-5.2`) render
+/// as-is instead of doubling it.
+fn model_label(app: &App) -> String {
+    let model = app.config.model.as_str();
+    if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{}/{}", app.config.provider.name(), model)
+    }
+}
+
 fn push_cost(pieces: &mut Vec<Piece>, app: &App) {
     if let Some(cost) = cost_piece(app) {
-        pieces.push(sep());
+        push_sep(pieces);
         pieces.push(cost);
     }
 }
 
+/// A separator joins items; it never opens a line (the no-cwd tier without
+/// a branch starts from nothing).
+fn push_sep(pieces: &mut Vec<Piece>) {
+    if !pieces.is_empty() {
+        pieces.push(sep());
+    }
+}
+
 /// Branch badge shared by the full and compact lines (single source so the
-/// two tiers cannot drift).
+/// two tiers cannot drift). Callers place the separating ` · ` themselves.
 fn branch_pieces(app: &App) -> Vec<Piece> {
     let mut pieces = Vec::new();
     if let Some(branch) = app.git_branch.as_ref() {
-        pieces.push(sep());
         pieces.push((branch.clone(), Style::default().fg(Color::LightGreen)));
         if app.git_dirty {
             pieces.push(("*".to_string(), Style::default().fg(Color::Yellow)));
@@ -143,7 +162,14 @@ fn branch_pieces(app: &App) -> Vec<Piece> {
 /// step up in prominence. Other accents reuse the app's semantic ANSI colors
 /// (Cyan identity, LightGreen clean branch, Yellow warnings, LightRed past
 /// the compaction trigger), which terminal themes remap to their own palette.
-pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
+///
+/// Width discipline: the full line must fit an ~110-column terminal or it
+/// falls to the next tier and every live number vanishes, so each item is
+/// written as tight as it stays readable — `ctx 12k/128k 9%`, `8k cached`,
+/// `↑42k ↓1.2k` (cumulative in/out), `123 tok/s`. Redundant detail is
+/// dropped, never information: the cached % is the adjacent pair divided by
+/// eye, and a trailing `.0` on scaled tokens says nothing.
+pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     // Transient notice (copy confirmation) takes over the line until it
     // expires: unmissable feedback beats the quiet facts for two seconds.
     if let Some((text, at)) = &app.notice {
@@ -151,7 +177,6 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
             return vec![(text.clone(), Style::default().fg(Color::Green))];
         }
     }
-    let cwd = compact_path(&app.cwd);
     let tokens = app
         .tool_state
         .last_usage
@@ -165,62 +190,69 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
             .unwrap_or(0)
     };
     let mut pieces = Vec::new();
-    pieces.push((cwd, Style::default().fg(Color::Cyan)));
-    pieces.extend(branch_pieces(app));
+    if with_cwd {
+        pieces.push((compact_path(&app.cwd), Style::default().fg(Color::Cyan)));
+    }
+    // The branch separator is part of the branch block: emitting it
+    // unconditionally doubled up with the one after an empty branch
+    // (`path ·  · model` in any non-repo directory).
+    let branch = branch_pieces(app);
+    if !branch.is_empty() {
+        push_sep(&mut pieces);
+        pieces.extend(branch);
+    }
+    push_sep(&mut pieces);
+    pieces.push(quiet(model_label(app)));
     pieces.push(sep());
-    pieces.push(quiet(format!(
-        "{} / {}",
-        app.config.provider.name(),
-        app.config.model
-    )));
-    pieces.push(sep());
-    pieces.push((
+    // Live context usage against the window. The % duplicates the pair, but
+    // it is the glanceable readout behind the pressure color, so it stays.
+    let ctx_text = if app.config.context_window > 0 {
         format!(
-            "{} / {} tokens ({}%)",
+            "ctx {}/{} {}%",
             format_tokens(tokens),
             format_tokens(app.config.context_window),
             context_pct
-        ),
-        context_style(app, tokens),
-    ));
+        )
+    } else {
+        format!("ctx {}", format_tokens(tokens))
+    };
+    pieces.push((ctx_text, context_style(app, tokens)));
     // Provider-reported cache-hit subset of the last call's prompt (billed
-    // at a fraction of full input price); omitted until a provider reports it.
+    // at a fraction of full input price); omitted until a provider reports
+    // it. The hit % is derivable from this and the ctx number, so only the
+    // absolute is shown.
     if let Some(cached) = app.tool_state.last_cached {
         if cached > 0 {
             pieces.push(sep());
-            if tokens > 0 {
-                let hit_pct = cached
-                    .saturating_mul(100)
-                    .checked_div(tokens)
-                    .unwrap_or(0)
-                    .min(100);
-                pieces.push(quiet(format!(
-                    "{} cached ({}%)",
-                    format_tokens(cached),
-                    hit_pct
-                )));
-            } else {
-                pieces.push(quiet(format!("{} cached", format_tokens(cached))));
-            }
+            pieces.push(quiet(format!("{} cached", format_tokens(cached))));
         }
     }
-    // Cumulative prompt tokens across all LLM calls this TUI process has
-    // made (per-call counts are conversation-sized, so this is the spend
-    // figure that grows across turns; the % above is live context usage),
-    // with the completion-token figure alongside it.
-    if app.tool_state.total_usage > 0 {
+    // Cumulative prompt (↑) and completion (↓) tokens across all LLM calls
+    // this TUI process has made — the spend-side figures that grow across
+    // turns, vs the % above which is live context usage. Each half appears
+    // only once billed.
+    if app.tool_state.total_usage > 0 || app.tool_state.total_output > 0 {
+        let mut flow = String::new();
+        if app.tool_state.total_usage > 0 {
+            flow.push_str(&format!("↑{}", format_tokens(app.tool_state.total_usage)));
+        }
+        if app.tool_state.total_output > 0 {
+            if !flow.is_empty() {
+                flow.push(' ');
+            }
+            flow.push_str(&format!("↓{}", format_tokens(app.tool_state.total_output)));
+        }
         pieces.push(sep());
-        pieces.push(quiet(format!(
-            "{} total",
-            format_tokens(app.tool_state.total_usage)
-        )));
+        pieces.push(quiet(flow));
     }
-    if app.tool_state.total_output > 0 {
-        pieces.push(sep());
-        pieces.push(quiet(format!(
-            "{} out",
-            format_tokens(app.tool_state.total_output)
-        )));
+    // Output rate of the most recent LLM call (completion tokens over the
+    // daemon-measured call duration). Sub-1 tok/s rounds to a lie, so it
+    // stays hidden.
+    if let Some(rate) = app.tool_state.last_tok_s {
+        if rate >= 1.0 {
+            pieces.push(sep());
+            pieces.push(quiet(format!("{rate:.0} tok/s")));
+        }
     }
     // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
     // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
@@ -229,7 +261,7 @@ pub(super) fn status_pieces(app: &App) -> Vec<Piece> {
 }
 
 pub(super) fn ui_status(app: &App) -> String {
-    status_pieces(app)
+    status_pieces(app, true)
         .into_iter()
         .map(|(text, _)| text)
         .collect()
@@ -239,8 +271,12 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
     // Narrow tier: cwd + branch + model + spend. Branch and cost share
     // helpers with the full line so the tiers cannot drift.
     let mut pieces = vec![(compact_path(&app.cwd), Style::default().fg(Color::Cyan))];
-    pieces.extend(branch_pieces(app));
-    pieces.push(sep());
+    let branch = branch_pieces(app);
+    if !branch.is_empty() {
+        push_sep(&mut pieces);
+        pieces.extend(branch);
+    }
+    push_sep(&mut pieces);
     pieces.push(quiet(app.config.model.clone()));
     push_cost(&mut pieces, app);
     pieces
@@ -322,14 +358,20 @@ fn truncate_pieces(pieces: Vec<Piece>, width: usize) -> Vec<Piece> {
 
 /// Connection badge pinned to the right edge. On a remote box knowing
 /// that beats any left-side detail, so it survives narrowing at the
-/// left's expense: first left candidate that leaves room for it wins,
-/// otherwise the widest left that fits alone, else bare model.
+/// left's expense. The left candidates shed width in order of how static
+/// they are: first the cwd (fixed for the whole session; every live number
+/// stays), then branch/model, then only model + spend.
 pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
     let width = width as usize;
     let hint = hint_pieces(app);
     let conn = conn_piece(app);
     let conn_w = pieces_width(std::slice::from_ref(&conn));
-    let candidates = [status_pieces(app), compact_pieces(app), bare_pieces(app)];
+    let candidates = [
+        status_pieces(app, true),
+        status_pieces(app, false),
+        compact_pieces(app),
+        bare_pieces(app),
+    ];
     let mut left_only: Option<Vec<Piece>> = None;
     for candidate in candidates {
         let mut left = hint.clone();

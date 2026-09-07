@@ -108,12 +108,15 @@ pub enum SinkLine {
     /// status bar can track context usage live instead of once per turn.
     /// `cached` is the provider-reported cached-token subset, when reported;
     /// `cost` is the USD cost of the call as priced by the daemon; `output`
-    /// is the completion-token count for the same call.
+    /// is the completion-token count for the same call; `gen_ms` is the
+    /// wall-clock duration the caller measured for the whole LLM call, when
+    /// known (the denominator for the footer's output tokens/s rate).
     Usage {
         tokens: u64,
         cached: Option<u64>,
         cost: f64,
         output: u64,
+        gen_ms: Option<u64>,
     },
     Plan(Plan),
 }

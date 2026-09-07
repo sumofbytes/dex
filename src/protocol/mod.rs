@@ -144,7 +144,9 @@ pub enum StreamEvent {
     /// or `DEX_COST_PER_1K` fallback), accumulated client-side so both
     /// processes always agree on spend; `output` is the completion-token
     /// count for the same call, accumulated for the status bar's output
-    /// figure.
+    /// figure; `gen_ms` is the wall-clock duration the daemon measured for
+    /// the call, the denominator for the footer's output tokens/s rate.
+    /// Older daemons omit `gen_ms`; the client then hides the rate.
     #[serde(rename = "usage")]
     Usage {
         tokens: u64,
@@ -154,6 +156,8 @@ pub enum StreamEvent {
         cost: f64,
         #[serde(default)]
         output: u64,
+        #[serde(default)]
+        gen_ms: Option<u64>,
     },
 
     /// A system message (e.g. compaction notice).
@@ -338,6 +342,7 @@ mod tests {
                 cached: Some(2),
                 cost: 0.0003,
                 output: 4,
+                gen_ms: Some(1234),
             },
             StreamEvent::SteeringAccepted {
                 content: "steer".into(),

@@ -605,6 +605,7 @@ fn shared_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .user_agent(crate::client::http::USER_AGENT)
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())

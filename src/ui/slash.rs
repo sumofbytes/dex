@@ -265,6 +265,7 @@ pub(super) fn reset_session_state(app: &mut App) {
     app.tool_state.total_usage = 0;
     app.tool_state.total_output = 0;
     app.tool_state.total_cost = 0.0;
+    app.tool_state.last_tok_s = None;
     app.tool_state.verify_dirty = false;
     app.plan = crate::core::types::Plan::default();
     app.transcript.clear();

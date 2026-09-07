@@ -885,6 +885,15 @@ async fn run_turn_inner(
     )
     .await
     .map_err(|e| format!("failed to build config: {e}"))?;
+    // Console Go routing requires `x-opencode-session` (pi sends the same
+    // pair). Auto-fill from the dex session id; explicit per-request headers
+    // below still win on collision.
+    crate::llm::config::apply_opencode_session_headers(
+        &mut config.extra_headers,
+        &config.provider,
+        &config.base_url,
+        session_id,
+    );
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
     // `insert_extra_header` drops empties + `authorization` and collapses
@@ -1055,11 +1064,13 @@ async fn run_turn_inner(
                         cached,
                         cost,
                         output,
+                        gen_ms,
                     } => StreamEvent::Usage {
                         tokens,
                         cached,
                         cost,
                         output,
+                        gen_ms,
                     },
                     SinkLine::Plan(plan) => StreamEvent::Plan {
                         goal: plan.goal,

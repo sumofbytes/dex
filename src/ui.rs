@@ -357,12 +357,11 @@ pub(crate) struct PendingApproval {
 }
 
 pub(crate) fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
+    match tokens {
+        // A trailing ".0" is wasted width in the status bar: 12.0k -> 12k.
+        t if t >= 1_000_000 => format!("{:.1}M", t as f64 / 1_000_000.0).replace(".0M", "M"),
+        t if t >= 1_000 => format!("{:.1}k", t as f64 / 1_000.0).replace(".0k", "k"),
+        t => t.to_string(),
     }
 }
 
