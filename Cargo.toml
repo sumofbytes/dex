@@ -1,0 +1,83 @@
+[package]
+name = "dex"
+version = "0.2.0"
+edition = "2021"
+description = "Terminal coding agent in Rust: OpenAI-compatible LLMs with tool use (read/bash/write/edit/grep), a ratatui TUI, client-daemon over HTTP+SSE, and JSONL sessions."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/arpitsr/dex"
+authors = ["Arpit Kumar <4772479+arpitsr@users.noreply.github.com>"]
+keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
+categories = ["command-line-utilities", "development-tools"]
+
+[features]
+network-tests = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+  reqwest = { version = "0.12", default-features = false, features = [
+      "json",
+      "stream",
+      "rustls-tls-native-roots",
+  ] }
+chrono = "0.4"
+ratatui = "0.29"
+crossterm = "0.28"
+ratatui-markdown = { version = "0.3.6", default-features = false, features = [
+    "markdown",
+    "highlight-lang-bash",
+    "highlight-lang-c",
+    "highlight-lang-cpp",
+    "highlight-lang-go",
+    "highlight-lang-java",
+    "highlight-lang-javascript",
+    "highlight-lang-json",
+    "highlight-lang-python",
+    "highlight-lang-rust",
+    "highlight-lang-typescript",
+    "highlight-lang-toml",
+    "highlight-lang-yaml",
+    "highlight-lang-c-sharp",
+    "highlight-lang-css",
+    "highlight-lang-dart",
+    # No highlight-lang-sql: tree-sitter-sequel 0.3.2 pins cc ~1.0.90,
+    # which conflicts with blake3's cc ^1.1.12 (single lockfile, no
+    # single cc satisfies both). sql stays on the generic lexer.
+    "highlight-lang-html",
+    # No highlight-lang-kotlin: ratatui-markdown 0.3.6's KOTLIN_HIGHLIGHTS
+    # query still references `(multiline_comment)`, renamed to
+    # `(block_comment)` in tree-sitter-kotlin-ng 1.1, so enabling the
+    # feature panics on any kotlin block. Re-add once upstream fixes it.
+    "highlight-lang-lua",
+    "highlight-lang-nix",
+    "highlight-lang-php",
+    "highlight-lang-ruby",
+    "highlight-lang-scala",
+    "highlight-lang-swift",
+    "highlight-lang-xml",
+] }
+unicode-width = "0.1"
+similar = "2"
+
+# Client-server architecture
+axum = "0.8"
+  tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util"] }
+futures-core = "0.3"
+uuid = { version = "1", features = ["v4"] }
+terminal-colorsaurus = "1.0.3"
+fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
+# MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
+base64 = "0.22"
+sha2 = "0.10"
+
+[dev-dependencies]
+http = "1"
+
+# Symbols for profilers (parca-agent / perf / heaptrack) without touching
+# release output: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

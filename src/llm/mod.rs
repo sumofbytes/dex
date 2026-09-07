@@ -1,0 +1,8 @@
+pub(crate) mod auth;
+pub(crate) mod client;
+pub(crate) mod config;
+pub(crate) mod prompt;
+pub(crate) mod protocol;
+pub(crate) mod provider;
+pub(crate) mod stream;
+pub(crate) mod streaming;

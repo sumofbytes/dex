@@ -1,0 +1,9 @@
+/target/
+parca-profiles/
+heaptrack.*.zst
+ak-tool-cache.json
+*.log
+.ak/sessions/
+.ak/skills/*/runtime/
+.env.local-ci
+*.env
