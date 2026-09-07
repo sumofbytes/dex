@@ -73,14 +73,14 @@ fn load_config_file() -> Option<serde_yaml::Value> {
         }
         Err(e) => {
             // A typo'd file must not silently disable every user setting.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!(
-                    "dex: ignoring invalid config {}: {e}\n     valid top-level keys: {}",
+            warn_once(
+                "config:invalid",
+                &format!(
+                    "ignoring invalid config {}: {e}\n     valid top-level keys: {}",
                     path.display(),
                     KNOWN_FILE_KEYS.join(", ")
-                )
-            });
+                ),
+            );
             None
         }
     };
@@ -225,21 +225,23 @@ fn known_providers(entries: &BTreeMap<String, ProviderEntry>) -> BTreeSet<String
 /// Split a model selection into `(provider, model)`. A leading
 /// `provider/` prefix — or the whole selection being a bare provider name —
 /// selects the provider; the remainder is the model id (a bare provider
-/// keeps the builtin default model). `None` provider means "selection names
+/// keeps the builtin default model). The provider is lowercased, matching
+/// `Provider::name()`. `None` provider means "selection names
 /// no known provider" (an endpoint prefix like `go/…` or a plain model id).
 fn split_selection(selection: &str, known: &BTreeSet<String>) -> (Option<String>, String) {
     match selection.split_once('/') {
         Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => (
-            Some(prefix.to_string()),
+            Some(prefix.trim().to_ascii_lowercase()),
             if rest.is_empty() {
                 DEFAULT_MODEL.to_string()
             } else {
                 rest.to_string()
             },
         ),
-        _ if Provider::parse_known(selection, known).is_some() => {
-            (Some(selection.to_string()), DEFAULT_MODEL.to_string())
-        }
+        _ if Provider::parse_known(selection, known).is_some() => (
+            Some(selection.trim().to_ascii_lowercase()),
+            DEFAULT_MODEL.to_string(),
+        ),
         _ => (None, selection.to_string()),
     }
 }
@@ -271,34 +273,64 @@ fn catalog_api(key: &str, catalog: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// A bare selection naming an unconfigured models.dev provider ("zai") rides
-/// the fallback provider as a plain model id and dies later with an opaque
-/// API error. Say so, once, with the fix. Returns whether it warned.
+/// Whether `model` names a known model id anywhere in the catalog (either
+/// shape). Guards the provider-like hint: native `org/model` ids share
+/// their prefix with a provider but are legit model ids.
+fn catalog_has_model(model: &str, catalog: &serde_json::Value) -> bool {
+    let needle = model.to_ascii_lowercase();
+    if let Some(providers) = catalog.as_object() {
+        for (_prov, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                if models.keys().any(|id| id.to_ascii_lowercase() == needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    catalog
+        .get("models")
+        .and_then(|m| m.as_object())
+        .is_some_and(|models| models.keys().any(|id| id.to_ascii_lowercase() == needle))
+}
+
+/// A selection naming an unconfigured models.dev provider — bare (`zai`)
+/// or qualified (`zai/glm-…`) — rides the fallback provider as an opaque
+/// id and dies later with an API error. Say so, once, with the fix.
+/// Returns whether it warned.
 fn warn_provider_like_selection(selection: &str, provider_name: &str, served: &[String]) -> bool {
-    // Prefixed/native ids ("zen/glm…", "moonshotai/kimi…") aren't bare
-    // provider names; the resolved provider itself and ids the gateway
-    // serves aren't mistakes either.
-    if selection.contains('/')
-        || selection == provider_name
-        || served.iter().any(|m| m.as_str() == selection)
-    {
+    // Ids the gateway serves and the resolved provider itself aren't mistakes.
+    if selection == provider_name || served.iter().any(|m| m.as_str() == selection) {
+        return false;
+    }
+    // For `prefix/rest` the mistake candidate is the prefix; the full id
+    // may still be legit (provider-native model ids like
+    // `moonshotai/kimi-k2.6`, endpoint routes like `go/…`).
+    let (candidate, qualified) = match selection.split_once('/') {
+        Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => (prefix, true),
+        Some(_) => return false,
+        None => (selection, false),
+    };
+    if candidate == provider_name {
         return false;
     }
     let Some(catalog) = load_dex_catalog() else {
         return false;
     };
-    if catalog_api(selection, &catalog).is_none() {
+    if catalog_api(candidate, &catalog).is_none() {
         return false;
     }
-    let key_env = catalog_env_vars(selection, &catalog)
+    if qualified && catalog_has_model(selection, &catalog) {
+        return false;
+    }
+    let key_env = catalog_env_vars(candidate, &catalog)
         .first()
         .cloned()
         .unwrap_or_else(|| "<key>".to_string());
     warn_once(
-        &format!("hint:provider:{selection}"),
+        &format!("hint:provider:{candidate}"),
         &format!(
-            "'{selection}' looks like a provider, not a model id — it's being sent to \
-'{provider_name}' as-is; to use it, add 'providers: {selection}: {{api_key: <key>}}' to config \
+            "'{selection}' looks like provider '{candidate}', not a model id — it's being sent to \
+'{provider_name}' as-is; to use it, add 'providers: {candidate}: {{api_key: <key>}}' to config \
 (key env: {key_env})"
         ),
     );
@@ -1932,10 +1964,25 @@ impl LlmConfig {
 /// `dex doctor`: print the resolved provider/model/endpoint/protocol/key
 /// configuration and where each value came from — `git config
 /// --show-origin` for the LLM wiring. Read-only, no network, no daemon;
-/// answers "why is dex using X?" without archaeology.
-pub(crate) fn doctor() -> String {
+/// answers "why is dex using X?" without archaeology. Takes the same
+/// overrides as `from_env` so flags (`--model`, `--base-url`,
+/// `--permission`, `--header`) are reflected, not silently dropped.
+pub(crate) fn doctor(
+    base_url_override: Option<String>,
+    model_override: Option<String>,
+    permission_override: Option<PermissionMode>,
+    header_overrides: &[String],
+) -> String {
     fn row(out: &mut String, key: &str, value: &str, source: &str) {
         out.push_str(&format!("{key:<11}{value:<46}{source}\n"));
+    }
+    fn permission_name(mode: PermissionMode) -> &'static str {
+        match mode {
+            PermissionMode::ReadOnly => "read-only",
+            PermissionMode::AskWrites => "ask-writes",
+            PermissionMode::AskShell => "ask-shell",
+            PermissionMode::Trusted => "trusted",
+        }
     }
     let mut out = String::new();
     out.push_str(&format!("dex {}\n\n", env!("CARGO_PKG_VERSION")));
@@ -1972,21 +2019,27 @@ pub(crate) fn doctor() -> String {
     let provider_entries = load_provider_entries(&file);
     let known = known_providers(&provider_entries);
 
-    // Selection + origin, mirroring `from_env` precedence.
+    // Selection + origin, mirroring `from_env` precedence:
+    // `--model` > `DEX_MODEL` > file `model:` > builtin default.
+    let flag_model = model_override.clone().filter(|m| !m.trim().is_empty());
+    let flag_base_url = base_url_override.clone().filter(|u| !u.trim().is_empty());
     let dex_model = env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty());
     let file_model = load_config_str(&file, "model");
-    let selection = dex_model
+    let selection = flag_model
         .clone()
+        .or(dex_model.clone())
         .or(file_model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let model_source = if dex_model.is_some() {
+    let selection_source = if flag_model.is_some() {
+        "--model"
+    } else if dex_model.is_some() {
         "DEX_MODEL"
     } else if file_model.is_some() {
         "config model:"
     } else {
         "built-in default"
     };
-    let (selection_provider, model) = split_selection(&selection, &known);
+    let (selection_provider, pre_model) = split_selection(&selection, &known);
     let file_provider = load_provider_name(&file);
     let env_provider = env::var("DEX_PROVIDER")
         .ok()
@@ -1996,15 +2049,21 @@ pub(crate) fn doctor() -> String {
         .or(env_provider.clone())
         .or(file_provider.clone())
         .unwrap_or_else(|| "opencode".to_string());
-    let provider_source = if selection_provider.is_some() {
-        "model selection prefix"
-    } else if env_provider.is_some() {
-        "DEX_PROVIDER (deprecated)"
-    } else if file_provider.is_some() {
-        "config active_provider: (deprecated)"
-    } else {
-        "built-in default"
+    let provider_source = match selection_provider {
+        Some(_) => format!("{selection_source} prefix"),
+        None if env_provider.is_some() => "DEX_PROVIDER (deprecated)".to_string(),
+        None if file_provider.is_some() => "config active_provider: (deprecated)".to_string(),
+        None => "built-in default".to_string(),
     };
+    // The real build, once: rows below take values from it so `doctor`
+    // agrees with runtime routing (catalog endpoint moves, prefix
+    // stripping, per-model/learned protocol). Origins stay informational.
+    let cfg_result = LlmConfig::from_env(
+        flag_base_url.clone(),
+        flag_model.clone(),
+        permission_override,
+        header_overrides,
+    );
     match Provider::parse_known(&provider_name, &known) {
         None => row(
             &mut out,
@@ -2013,26 +2072,44 @@ pub(crate) fn doctor() -> String {
             "UNSUPPORTED — use opencode, openai-codex or a providers: entry",
         ),
         Some(provider) => {
-            row(&mut out, "provider", provider.name(), provider_source);
-            row(&mut out, "model", &model, model_source);
+            // Values come from the live build when it succeeds; otherwise
+            // the derived values still explain the setup (e.g. missing key).
+            let live = cfg_result.as_ref().ok().filter(|c| c.provider == provider);
+            row(&mut out, "provider", provider.name(), &provider_source);
+            let model = live.map(|c| c.model.clone()).unwrap_or(pre_model.clone());
+            row(&mut out, "model", &model, selection_source);
 
             let resolved = resolve_provider(&provider, &provider_entries);
             let entry = provider_entries.get(provider.name());
             let file_base_url = load_config_str(&file, "base_url");
-            let base_url = file_base_url
+            let derived_base = flag_base_url
                 .clone()
+                .or(file_base_url.clone())
                 .or(resolved.landing.clone())
                 .unwrap_or_default();
-            let base_source = if file_base_url.is_some() {
-                "config base_url: (deprecated)"
+            let base_url = live.map(|c| c.base_url.clone()).unwrap_or(derived_base);
+            let base_source = if flag_base_url.is_some() {
+                "--base-url (pins endpoint)".to_string()
+            } else if file_base_url.is_some() {
+                "config base_url: (deprecated)".to_string()
+            } else if live.is_some() && resolved.landing.as_deref() != Some(base_url.as_str()) {
+                match live.and_then(|c| {
+                    c.endpoints
+                        .iter()
+                        .find(|(_, url)| *url == &base_url)
+                        .map(|(name, _)| name.clone())
+                }) {
+                    Some(name) => format!("endpoint {name} (models.dev routing)"),
+                    None => "models.dev catalog routing".to_string(),
+                }
             } else if entry.and_then(|e| e.base_url.clone()).is_some() {
-                "config providers.<name>.base_url"
+                "config providers.<name>.base_url".to_string()
             } else if matches!(provider, Provider::OpenCode | Provider::OpenAiCodex) {
-                "built-in default"
+                "built-in default".to_string()
             } else {
-                "models.dev catalog"
+                "models.dev catalog".to_string()
             };
-            row(&mut out, "base_url", &base_url, base_source);
+            row(&mut out, "base_url", &base_url, &base_source);
 
             // Credentials — name the deposit place, never the value.
             let key_source = if matches!(provider, Provider::OpenAiCodex) {
@@ -2075,9 +2152,10 @@ pub(crate) fn doctor() -> String {
             };
             row(&mut out, "api key", "(hidden)", &key_source);
 
-            // Wire protocol and its origin.
-            let model_api = model_api_from_env(&selection, &model);
-            let (api, api_source) = if let Some(api) = entry.and_then(|e| e.api) {
+            // Wire protocol and its origin. Lookup keys mirror `from_env`:
+            // the post-split remainder first, then the stripped model.
+            let model_api = model_api_from_env(&pre_model, &model);
+            let (chain_api, api_source) = if let Some(api) = entry.and_then(|e| e.api) {
                 (api.name().to_string(), "config providers.<name>.api")
             } else if let Some(name) = load_config_str(&file, "api") {
                 (
@@ -2096,8 +2174,9 @@ pub(crate) fn doctor() -> String {
                     "default (auto-fallback to completions)",
                 )
             };
+            let api = live.map(|c| c.api.name().to_string()).unwrap_or(chain_api);
             row(&mut out, "protocol", &api, api_source);
-            let (ctx, ctx_source) = if let Ok(v) = env::var("DEX_CONTEXT_WINDOW") {
+            let (chain_ctx, ctx_source) = if let Ok(v) = env::var("DEX_CONTEXT_WINDOW") {
                 (v, "DEX_CONTEXT_WINDOW".to_string())
             } else if let Some(ctx) = ctx_from_index(&model) {
                 (ctx.to_string(), "cached context index".to_string())
@@ -2110,26 +2189,52 @@ pub(crate) fn doctor() -> String {
                     ),
                 }
             };
+            let ctx = live
+                .map(|c| c.context_window.to_string())
+                .unwrap_or(chain_ctx);
             row(&mut out, "context", &format!("{ctx} tokens"), &ctx_source);
 
-            let (effort, effort_source) = if let Some(e) = stored_thinking_effort(&base_url, &model)
-            {
-                (e, "stored /thinking choice".to_string())
-            } else if let Ok(e) = env::var("DEX_THINKING_EFFORT") {
-                (e, "DEX_THINKING_EFFORT".to_string())
-            } else if let Some(e) = load_config_str(&file, "thinking_effort") {
-                (e, "config thinking_effort:".to_string())
-            } else {
-                ("(unset)".to_string(), "model default".to_string())
-            };
+            let (chain_effort, effort_source) =
+                if let Some(e) = stored_thinking_effort(&base_url, &model) {
+                    (e, "stored /thinking choice".to_string())
+                } else if let Some(e) = env::var("DEX_THINKING_EFFORT")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    (e, "DEX_THINKING_EFFORT".to_string())
+                } else if let Some(e) = load_config_str(&file, "thinking_effort") {
+                    (e, "config thinking_effort:".to_string())
+                } else {
+                    ("(unset)".to_string(), "model default".to_string())
+                };
+            let effort = live
+                .and_then(|c| c.thinking_effort.clone())
+                .unwrap_or(chain_effort);
             row(&mut out, "thinking", &effort, &effort_source);
 
-            let (perm, perm_source) = match env::var("DEX_PERMISSION")
-                .ok()
-                .filter(|v| PermissionMode::parse(v).is_ok())
-            {
-                Some(v) => (v, "DEX_PERMISSION".to_string()),
-                None => ("trusted".to_string(), "built-in default".to_string()),
+            let (perm, perm_source) = match live.map(|c| c.permission) {
+                Some(mode) => {
+                    let source = if permission_override.is_some() {
+                        "--permission"
+                    } else if env::var("DEX_PERMISSION")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .is_some()
+                    {
+                        "DEX_PERMISSION"
+                    } else {
+                        "built-in default"
+                    };
+                    (permission_name(mode).to_string(), source.to_string())
+                }
+                // The build failed (e.g. missing key): still show the origin.
+                None => match env::var("DEX_PERMISSION")
+                    .ok()
+                    .filter(|v| PermissionMode::parse(v).is_ok())
+                {
+                    Some(v) => (v, "DEX_PERMISSION".to_string()),
+                    None => ("trusted".to_string(), "built-in default".to_string()),
+                },
             };
             row(&mut out, "permission", &perm, &perm_source);
 
@@ -2140,11 +2245,18 @@ pub(crate) fn doctor() -> String {
             let file_headers = config_headers_map(&file, "headers");
             let entry_headers = entry.map(|e| e.headers.clone()).unwrap_or_default();
             let env_headers = custom_headers_from_env();
+            let mut cli_headers = BTreeMap::new();
+            for raw in header_overrides {
+                for (k, v) in parse_headers_str(raw) {
+                    insert_extra_header(&mut cli_headers, &k, &v);
+                }
+            }
             for (headers, source) in [
                 (&http_headers, "config http_headers: (deprecated)"),
                 (&file_headers, "config headers: (deprecated)"),
                 (&entry_headers, "config providers.<name>.headers"),
                 (&env_headers, "DEX_HEADERS"),
+                (&cli_headers, "--header"),
             ] {
                 header_count += headers.len();
                 if !headers.is_empty() {
@@ -2183,7 +2295,7 @@ pub(crate) fn doctor() -> String {
         }
     }
     out.push('\n');
-    match LlmConfig::from_env(None, None, None, &[]) {
+    match &cfg_result {
         Ok(_) => row(&mut out, "resolve", "OK", "config builds cleanly"),
         Err(e) => row(&mut out, "resolve", "ERROR", &e.to_string()),
     }
@@ -2245,7 +2357,14 @@ pub(crate) mod tests {
                 },
                 "opencode": {
                     "api": "https://zen.example/v1",
-                    "models": { "m-1": { "cost": { "input": 0.5 } } }
+                    "models": {
+                        "m-1": { "cost": { "input": 0.5 } },
+                        "moonshotai/kimi-k2": { "cost": { "input": 0.5 } }
+                    }
+                },
+                "moonshotai": {
+                    "api": "https://moonshot.example/v1",
+                    "models": { "kimi-k2": { "cost": { "input": 1.0 } } }
                 },
                 "opencode-go": {
                     "api": "https://go.example/v1",
@@ -2433,10 +2552,10 @@ pub(crate) mod tests {
 
     #[test]
     fn bare_unconfigured_catalog_provider_resolves_and_warns() {
-        // A bare selection naming an unconfigured catalog provider ("zai")
-        // rides the fallback provider as a plain model id: resolution
-        // succeeds and a one-time hint points at the fix. Prefixed and
-        // already-served ids are not mistakes.
+        // A selection naming an unconfigured catalog provider ("zai",
+        // bare or `zai/model`) rides the fallback provider as an opaque
+        // id: resolution succeeds and a one-time hint points at the fix.
+        // Already-served and known native ids are not mistakes.
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2462,9 +2581,23 @@ pub(crate) mod tests {
             "opencode",
             &["m-1".to_string()]
         ));
-        // Prefixed/native ids and the resolved provider itself: exempt.
+        // A qualified pick off an unconfigured provider warns too — it
+        // rides the fallback as an opaque id just like the bare name.
+        assert!(warn_provider_like_selection(
+            "aaa-reseller/m-2",
+            "opencode",
+            &[]
+        ));
+        // A known native `org/model` id sharing its prefix with a provider
+        // is legit — no warning. Unknown prefixes and the resolved
+        // provider itself are exempt too.
         assert!(!warn_provider_like_selection(
-            "aaa-reseller/m-1",
+            "moonshotai/kimi-k2",
+            "opencode",
+            &[]
+        ));
+        assert!(!warn_provider_like_selection(
+            "unknown/m-1",
             "opencode",
             &[]
         ));
@@ -4003,7 +4136,7 @@ pub(crate) mod tests {
             "DEX_CONFIG",
             std::env::temp_dir().join(format!("dex-missing-doctor-{}", std::process::id())),
         );
-        let out = doctor();
+        let out = doctor(None, None, None, &[]);
         assert!(out.contains("provider"), "{out}");
         assert!(out.contains("model"), "{out}");
         assert!(out.contains("OPENCODE_API_KEY"), "{out}");
