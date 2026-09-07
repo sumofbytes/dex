@@ -803,6 +803,32 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_item_writer_length_matches_materialized_json() {
+        // Pin the `ByteCounter` equivalence: `to_writer` on a `Value` emits
+        // the same compact bytes as `to_string`, so the writer-based length
+        // used by `message_char_len` must equal the materialized length
+        // exactly — a mismatch skews the compaction cut point.
+        let items = vec![
+            serde_json::json!({"type":"reasoning","id":"r1","encrypted_content":"blob1"}),
+            serde_json::json!({
+                "type":"reasoning","id":"r2",
+                "summary":[{"type":"summary_text","text":"visible"}],
+                "a":[1,2,3],"nested":{"k":"v"}
+            }),
+        ];
+        let mut with_items = ChatMessage::assistant("hello");
+        with_items.reasoning_items = Some(items.clone());
+        let base = ChatMessage::assistant("hello");
+        let item_chars: usize = items.iter().map(|i| i.to_string().len()).sum();
+        assert_eq!(
+            crate::agent::tokens::message_char_len(&with_items)
+                - crate::agent::tokens::message_char_len(&base),
+            item_chars,
+            "to_writer byte length must equal the to_string length"
+        );
+    }
+
+    #[test]
     fn cutoff_preserves_last_user_prompt() {
         // Pi-like: compaction inside a turn with many tool calls must not evict the prompt.
         let mut messages = vec![msg(Role::System, "sys")];

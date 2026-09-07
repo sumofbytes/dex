@@ -30,6 +30,9 @@ use input::InputField;
 const VERTICAL_GUTTER: u16 = 1;
 const HORIZONTAL_GUTTER: u16 = 1;
 const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
+// `render_user_prompt`'s borrowed pad span hardcodes the 1-wide gutter;
+// this equality is load-bearing, so trip at compile time if it changes.
+const _: () = assert!(HORIZONTAL_GUTTER == 1);
 const INPUT_BORDER_ROWS: u16 = 0;
 const INPUT_PAD_Y: u16 = 1;
 const STATUS_CONTENT_ROWS: u16 = 1;
