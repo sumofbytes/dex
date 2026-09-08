@@ -56,8 +56,11 @@ pub(super) fn input_content_width(width: u16) -> u16 {
     width.saturating_sub(super::HORIZONTAL_GUTTER * 2 + 1)
 }
 
+/// Footer chunk: one gutter above the status row, none below — the status
+/// line sits on the last screen row. The terminal adds its own dead space
+/// under the grid, and the dropped row read as a hole under the footer.
 pub(super) fn status_height() -> u16 {
-    super::STATUS_CONTENT_ROWS + super::VERTICAL_GUTTER * 2
+    super::STATUS_CONTENT_ROWS + super::VERTICAL_GUTTER
 }
 
 pub(super) fn minimum_view_height(activity_h: u16, approval_h: u16) -> u16 {
@@ -142,7 +145,12 @@ pub(super) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
                 i += 1;
             }
             i += 1;
-            blocks.push(MarkdownBlock::code_block(lang, body));
+            // The highlight hook path splits the body on `\n`, so the
+            // newline every fence body ends with (plus any blank lines the
+            // model leaves before the closing fence) rendered as trailing
+            // empty rows inside the box. Trailing blanks in a snippet are
+            // never worth a row of air.
+            blocks.push(MarkdownBlock::code_block(lang, body.trim_end_matches('\n')));
         } else if let Some(rest) = md::heading_text(t) {
             // H1-H3 map to their block; H4-H6 render as H3 (crate has no
             // H4+ variant — same as upstream parsers and glow/mdcat).
@@ -996,8 +1004,16 @@ impl FooterView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
         let line = footer_line(app, width);
+        // Status row sits on the last screen row: top gutter only. The
+        // terminal adds its own dead space below the grid, and the old
+        // bottom gutter row read as a hole under the footer.
         f.render_widget(
-            Paragraph::new(line).block(Block::default().padding(surface_padding())),
+            Paragraph::new(line).block(Block::default().padding(Padding {
+                left: super::HORIZONTAL_GUTTER,
+                right: super::HORIZONTAL_GUTTER,
+                top: super::VERTICAL_GUTTER,
+                bottom: 0,
+            })),
             area,
         );
     }
@@ -1806,13 +1822,13 @@ mod tests {
         assert_eq!(activity_height(0), 0);
         assert_eq!(activity_height(1), 3);
         assert_eq!(activity_height(3), 7);
-        assert_eq!(status_height(), 3);
+        assert_eq!(status_height(), 2);
     }
 
     #[test]
     fn minimum_view_height_accounts_for_all_gutters() {
-        assert_eq!(minimum_view_height(activity_height(1), 0), 10);
-        assert_eq!(minimum_view_height(activity_height(3), 0), 14);
+        assert_eq!(minimum_view_height(activity_height(1), 0), 9);
+        assert_eq!(minimum_view_height(activity_height(3), 0), 13);
     }
 
     #[test]
@@ -3145,6 +3161,29 @@ mod tests {
                 "{info}: {blocks:?}"
             );
         }
+    }
+
+    #[test]
+    fn markdown_fence_drops_trailing_blank_body_rows() {
+        // The highlight hook splits the body on `\n`: the newline every
+        // fence body ends with (and blank lines before the closing fence)
+        // used to render as empty `│` rows inside the box.
+        let render = |src: &str| -> Vec<String> {
+            markdown_lines(src)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let rows = render("```bash\nfoo \\\n  bar\n```");
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[0].starts_with('╭'), "{rows:?}");
+        assert_eq!(rows[1], "│ foo \\");
+        assert_eq!(rows[2], "│   bar");
+        assert!(rows[3].starts_with('╰'), "{rows:?}");
+        // Blank lines before the closing fence collapse away too.
+        let rows = render("```bash\nfoo\n\n\n```");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[1], "│ foo");
     }
 
     #[test]
