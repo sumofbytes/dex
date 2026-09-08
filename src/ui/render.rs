@@ -2896,7 +2896,7 @@ mod tests {
     fn ghost_key_facts_does_not_overflow_or_overlap_bottom() {
         // Repro for screenshot ghost: long assistant line with unbroken tokens
         // must wrap within width and never appear in input/footer area.
-        let ghost = "Key facts: Docs at /home/aks/Work/dex/HARNESS.md (489 lines), PLAN.md (92 lines, P0-P5 shipped, next 6-10: permission ceiling/audit, token auth/policy/redaction, transactional edits/journal, verification, versioned protocol seq/replay). Src layout: src/agent/{loop,state,compaction}, client/http, cli/config/core/daemon/llm/protocol/session/skills/tools/ui. Key symbols: Session::set_state/load_session_state (/resume), Plan{goal,steps}+/goal/plan add/done/clear+SinkLine::Plan→StreamEvent::Plan, WRAP_UP_THRESHOLD, DaemonState/PendingApproval/router/SSE, TurnLimits/deadline/within_budget, TurnComplete/TurnFailed/Usage, SessionHeader, FileConfig/LlmConfig/Provider, system_prompt/project_context, CONFIGURED_OUTPUT_LIMIT/execute_outcome. Unresolved: complete section-by-section audit and rewrite HARNESS.md with code citations and re-scoring per active runtime.1126 lines), daemon mod/server (axum router, SSE, approvals), llm/config/prompt, disposition, versioned protocol seq/replay).";
+        let ghost = "Key facts: Docs at /tmp/dex/HARNESS.md (489 lines), PLAN.md (92 lines, P0-P5 shipped, next 6-10: permission ceiling/audit, token auth/policy/redaction, transactional edits/journal, verification, versioned protocol seq/replay). Src layout: src/agent/{loop,state,compaction}, client/http, cli/config/core/daemon/llm/protocol/session/skills/tools/ui. Key symbols: Session::set_state/load_session_state (/resume), Plan{goal,steps}+/goal/plan add/done/clear+SinkLine::Plan→StreamEvent::Plan, WRAP_UP_THRESHOLD, DaemonState/PendingApproval/router/SSE, TurnLimits/deadline/within_budget, TurnComplete/TurnFailed/Usage, SessionHeader, FileConfig/LlmConfig/Provider, system_prompt/project_context, CONFIGURED_OUTPUT_LIMIT/execute_outcome. Unresolved: complete section-by-section audit and rewrite HARNESS.md with code citations and re-scoring per active runtime.1126 lines), daemon mod/server (axum router, SSE, approvals), llm/config/prompt, disposition, versioned protocol seq/replay).";
         for (w, h) in [
             (80, 24),
             (100, 24),
@@ -2919,9 +2919,7 @@ mod tests {
             ] {
                 super::super::append_sink_line(
                     &mut app,
-                    crate::core::types::SinkLine::ToolInput(format!(
-                        "read /home/aks/Work/dex/src/ui/{name}"
-                    )),
+                    crate::core::types::SinkLine::ToolInput(format!("read /tmp/dex/src/ui/{name}")),
                 );
                 super::super::append_sink_line(
                     &mut app,
@@ -3072,10 +3070,10 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = test_app();
         super::super::push_info(
-        &mut app,
-        "connected to http://127.0.0.1:35487 - workspace /home/aks/Work/dex - model deepseek-v4-flash"
-            .into(),
-    );
+            &mut app,
+            "connected to http://127.0.0.1:35487 - workspace /tmp/dex - model deepseek-v4-flash"
+                .into(),
+        );
         super::super::render_user_prompt(&mut app, "can you check pillar 1 form harness.md");
         super::super::append_sink_line(
             &mut app,
