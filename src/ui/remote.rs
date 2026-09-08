@@ -541,7 +541,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             let busy = remote.app.busy;
             // Cheap when unchanged (outside Herdr it is a no-op).
             herdr.sync(
-                remote.app.busy,
+                busy,
                 remote
                     .app
                     .pending_approval
@@ -602,11 +602,13 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                 break;
             }
         }
-        herdr.release();
         Ok(())
     };
 
     let res = run();
+    // Always release, even if the loop returned early via `?` (draw/poll
+    // error) — otherwise a stale agent row lingers in the Herdr sidebar.
+    herdr.release();
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
     let _ = execute!(

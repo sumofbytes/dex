@@ -87,7 +87,11 @@ impl Reporter {
             State::Idle
         };
         let message = approval.map(|tool| format!("awaiting {tool} approval"));
-        if self.last.as_ref() == Some(&(state, message.clone())) {
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|(last, last_message)| *last == state && *last_message == message)
+        {
             return;
         }
         self.last = Some((state, message.clone()));
@@ -222,6 +226,11 @@ mod tests {
             .expect("seq in report line")
     }
 
+    /// Best-effort cleanup: shim dir and log don't need to outlive the test.
+    fn cleanup(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn noop_outside_herdr() {
         let _lock = TEST_SESSIONS_ENV_LOCK
@@ -236,6 +245,7 @@ mod tests {
         reporter.release();
         reporter.wait_all();
         assert!(reported_lines(&dir.join("reports.log")).is_empty());
+        cleanup(&dir);
     }
 
     #[test]
@@ -305,5 +315,6 @@ mod tests {
             assert!(seq > &prev, "seq must increase: {line}");
             prev = *seq;
         }
+        cleanup(&dir);
     }
 }
