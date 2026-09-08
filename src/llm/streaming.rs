@@ -81,6 +81,13 @@ pub(crate) async fn complete(
             crate::llm::client::call_chat_completions(config, messages, with_tools, sink, cancel)
                 .await
         }
+        // Native Messages endpoint: no empirical fallback — the endpoint
+        // speaks one wire, and a pin (or the provider default) already
+        // decided it.
+        ApiProtocol::Anthropic => {
+            crate::llm::client::call_anthropic_messages(config, messages, with_tools, sink, cancel)
+                .await
+        }
         ApiProtocol::Responses => {
             match crate::llm::client::call_responses(
                 config,

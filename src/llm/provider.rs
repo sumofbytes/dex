@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::core::types::Provider;
+use crate::core::types::{ApiProtocol, Provider};
 
 /// Model used when `--model` and config file `model:` are both unset.
 pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
@@ -26,7 +26,31 @@ impl Provider {
         match self {
             Self::OpenCode => Some("https://opencode.ai/zen/v1"),
             Self::OpenAiCodex => Some("https://chatgpt.com/backend-api/codex"),
+            // Native Messages API landing; the request path appends
+            // `/v1/messages` (see `anthropic::messages_url`).
+            Self::Anthropic => Some("https://api.anthropic.com"),
             Self::Generic(_) => None,
+        }
+    }
+
+    /// Model used for a bare provider pick (`--model anthropic` with no
+    /// model id). Defaults to [`DEFAULT_MODEL`] for OpenAI-compatible
+    /// providers; native providers need one of their own family.
+    pub(crate) fn default_model(&self) -> &'static str {
+        match self {
+            Self::Anthropic => "claude-sonnet-4-5",
+            _ => DEFAULT_MODEL,
+        }
+    }
+
+    /// Wire protocol default when neither the provider entry's `api:` pin
+    /// nor the config file pins one. OpenAI-compatible providers share the
+    /// responses default (with the empirical completions fallback); native
+    /// providers pin their own wire.
+    pub(crate) fn default_api(&self) -> Option<ApiProtocol> {
+        match self {
+            Self::Anthropic => Some(ApiProtocol::Anthropic),
+            _ => None,
         }
     }
 
@@ -62,6 +86,7 @@ impl Provider {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            Self::Anthropic => ["anthropic"].iter().map(|s| s.to_string()).collect(),
             // The catalog entry of the same key prices a generic provider.
             Self::Generic(name) => vec![name.clone()],
         }
@@ -70,7 +95,7 @@ impl Provider {
     /// Does the endpoint also speak chat-completions, so a rejected
     /// `/responses` call may be retried there? (Empirical protocol fallback.)
     pub(crate) fn has_protocol_fallback(&self) -> bool {
-        !matches!(self, Self::OpenAiCodex)
+        !matches!(self, Self::OpenAiCodex | Self::Anthropic)
     }
 
     /// Can a 401 be recovered by re-reading credentials from their source?
@@ -87,6 +112,7 @@ impl Provider {
     pub(crate) fn auth_scheme(&self) -> AuthScheme {
         match self {
             Self::OpenAiCodex => AuthScheme::Codex,
+            Self::Anthropic => AuthScheme::Anthropic,
             _ => AuthScheme::Bearer,
         }
     }
@@ -97,11 +123,14 @@ impl Provider {
 /// (`client::authenticated_request`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AuthScheme {
-    /// `Authorization: Bearer <key>` — every provider except codex.
+    /// `Authorization: Bearer <key>` — every provider except codex/anthropic.
     Bearer,
     /// Bearer key plus the codex backend-api originator marker and
     /// account id.
     Codex,
+    /// Anthropic Messages auth: `x-api-key` plus the pinned
+    /// `anthropic-version` header — no `Authorization` header at all.
+    Anthropic,
 }
 
 impl AuthScheme {
@@ -111,11 +140,16 @@ impl AuthScheme {
         api_key: &str,
         account_id: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let request = request.bearer_auth(api_key);
         match self {
-            Self::Bearer => request,
+            Self::Bearer => request.bearer_auth(api_key),
+            Self::Anthropic => request.header("x-api-key", api_key).header(
+                "anthropic-version",
+                crate::llm::anthropic::ANTHROPIC_VERSION,
+            ),
             Self::Codex => {
-                let mut request = request.header("originator", "codex_cli_rs");
+                let mut request = request
+                    .bearer_auth(api_key)
+                    .header("originator", "codex_cli_rs");
                 if let Some(account_id) = account_id {
                     request = request.header("ChatGPT-Account-ID", account_id);
                 }
@@ -149,11 +183,16 @@ mod tests {
             AuthScheme::Codex
         ));
         assert!(matches!(
+            Provider::Anthropic.auth_scheme(),
+            AuthScheme::Anthropic
+        ));
+        assert!(matches!(
             Provider::Generic("zai".into()).auth_scheme(),
             AuthScheme::Bearer
         ));
         // The scheme is the single application point: bearer sets the key,
-        // codex adds its originator marker and account id.
+        // codex adds its originator marker and account id, anthropic uses
+        // x-api-key + the protocol version and no Authorization at all.
         let req = Provider::OpenAiCodex
             .auth_scheme()
             .apply(
@@ -179,6 +218,26 @@ mod tests {
                 .map(|v| v.to_str().unwrap()),
             Some("acct")
         );
+        let req = Provider::Anthropic
+            .auth_scheme()
+            .apply(
+                reqwest::Client::new().get("http://localhost/v1"),
+                "tok",
+                None,
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("x-api-key").map(|v| v.to_str().unwrap()),
+            Some("tok")
+        );
+        assert_eq!(
+            req.headers()
+                .get("anthropic-version")
+                .map(|v| v.to_str().unwrap()),
+            Some(crate::llm::anthropic::ANTHROPIC_VERSION)
+        );
+        assert!(req.headers().get("authorization").is_none());
         assert_eq!(
             Provider::OpenCode.default_base_url(),
             Some("https://opencode.ai/zen/v1")
@@ -187,11 +246,30 @@ mod tests {
             Provider::OpenAiCodex.default_base_url(),
             Some("https://chatgpt.com/backend-api/codex")
         );
+        assert_eq!(
+            Provider::Anthropic.default_base_url(),
+            Some("https://api.anthropic.com")
+        );
         assert_eq!(Provider::Generic("zai".into()).default_base_url(), None);
+        // Bare provider picks get a model of their own family.
+        assert_eq!(Provider::Anthropic.default_model(), "claude-sonnet-4-5");
+        assert_eq!(Provider::OpenCode.default_model(), DEFAULT_MODEL);
+        // Native providers pin their own wire; OpenAI-compatible ones keep
+        // the responses default + completions fallback.
+        assert_eq!(
+            Provider::Anthropic.default_api(),
+            Some(ApiProtocol::Anthropic)
+        );
+        assert_eq!(Provider::OpenCode.default_api(), None);
+        assert!(!Provider::Anthropic.has_protocol_fallback());
         // Pricing: a generic provider prices via its own catalog entry.
         assert_eq!(
             Provider::Generic("zai".into()).catalog_keys(),
             vec!["zai".to_string()]
+        );
+        assert_eq!(
+            Provider::Anthropic.catalog_keys(),
+            vec!["anthropic".to_string()]
         );
     }
 }
