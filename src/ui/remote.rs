@@ -7,7 +7,8 @@ use tokio::sync::mpsc;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-    KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -461,7 +462,15 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         // crossterm delivers them as one `Event::Paste`. Without it a paste is
         // typed through as individual keys and every embedded newline arrives
         // as a real Enter — submitting the first line of a multi-line paste.
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        // Kitty keyboard protocol (disambiguate only): supporting terminals
+        // then report Shift+Enter as `Enter + SHIFT` (`CSI 13;2 u`) instead of
+        // the same bare `\r` as Enter, so the composer can tell "newline"
+        // from "submit" (see `handle_key`: Enter without SHIFT submits,
+        // everything else falls through to the composer). Terminals without
+        // support ignore the sequence; Ctrl+J (`InputField::handle_key`)
+        // stays the universal fallback. Popped by `TerminalCleanup`.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -584,12 +593,16 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // error) — otherwise a stale agent row lingers in the Herdr sidebar.
     herdr.release();
     // Always restore the terminal, even if the loop returned early via `?`.
+    // The Kitty disambiguate pop is intentionally left to `TerminalCleanup`'s
+    // Drop: enhancement flags are a push/pop stack, so popping here *and* in
+    // Drop would pop twice and unbalance a terminal we don't own (e.g. when
+    // nested in another Kitty-aware app). Drop runs on every path.
     disable_raw_mode().ok();
     let _ = execute!(
         io::stdout(),
+        LeaveAlternateScreen,
         DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
+        DisableMouseCapture
     );
     res
 }
@@ -1818,7 +1831,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
+                "keys: Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
             push_info(
