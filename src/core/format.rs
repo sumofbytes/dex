@@ -72,10 +72,12 @@ pub(crate) fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> S
 /// Headless `[tool input]`/`[tool output]` body: same per-line standard as
 /// the transcript rows — [`PREVIEW_LINE_COLS`] display columns with `…` on
 /// every cut and ANSI escapes stripped — under the head/tail line fold.
+/// ANSI is stripped *before* the byte budget so escapes are not counted and
+/// a cut landing inside an escape sequence cannot swallow the `…` marker.
 pub(crate) fn terminal_preview(text: &str) -> String {
-    clamp_lines(text, 100, 10 * 1024)
+    clamp_lines(&strip_ansi(text), 100, 10 * 1024)
         .lines()
-        .map(|line| truncate_cols(&strip_ansi(line), PREVIEW_LINE_COLS))
+        .map(|line| truncate_cols(line, PREVIEW_LINE_COLS))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -121,9 +123,12 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
         "bash" => get("command").map(str::to_string),
         _ => None,
     };
-    let s = primary
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| input.to_string());
+    let s = primary.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        // Unknown tool or unparseable input: collapse whitespace so a
+        // pretty-printed JSON blob previews as one compact row instead of
+        // just its first line (`{`).
+        input.split_whitespace().collect::<Vec<_>>().join(" ")
+    });
     let s = s.lines().next().unwrap_or(&s).trim();
     let s = strip_ansi(s);
     truncate_cols(&s, PREVIEW_LINE_COLS)
@@ -1026,17 +1031,27 @@ pub(crate) async fn git_context_async(cwd: &str) -> (Option<String>, bool) {
 mod tests {
     use super::*;
 
+    /// Display columns of a string (wide chars count 2) — the unit of the
+    /// shared [`PREVIEW_LINE_COLS`] budget.
+    fn display_cols(s: &str) -> usize {
+        UnicodeWidthStr::width(s)
+    }
+
+    /// The budget's canonical cut of `l`-filler: budget-1 columns of content
+    /// plus the 1-column `…` marker — what any 400+-column line must clip to.
+    fn clipped_at_budget() -> String {
+        format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1))
+    }
+
     #[test]
     fn tool_rows_share_one_display_column_budget() {
         // The standard: every transcript tool row — the input preview
         // (`short_arg`), the output summary (`one_line_summary`), and every
         // preview flavor — is bounded by the same budget, measured in
         // display columns (wide chars count 2), with every cut marked `…`.
-        let cols = |s: &str| UnicodeWidthStr::width(s);
         let long = "l".repeat(400); // 400 display columns
-                                    // 319 columns of content + the 1-column ellipsis = the budget.
-        let clipped = format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1));
-        assert_eq!(cols(&clipped), PREVIEW_LINE_COLS);
+        let clipped = clipped_at_budget();
+        assert_eq!(display_cols(&clipped), PREVIEW_LINE_COLS);
         assert!(clipped.ends_with('…'), "cut must be marked");
 
         // Input row and output rows obey the same budget, byte-for-byte.
@@ -1076,9 +1091,8 @@ mod tests {
         // stderr) must adhere to the same per-line standard as the
         // transcript rows: [`PREVIEW_LINE_COLS`] display columns, wide chars
         // count 2, every cut marked `…`, ANSI escapes stripped.
-        let cols = |s: &str| UnicodeWidthStr::width(s);
         let long = "l".repeat(400); // 400 display columns
-        let clipped = format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1));
+        let clipped = clipped_at_budget();
 
         assert_eq!(terminal_preview(&long), clipped, "output body");
         // Every line obeys the budget independently.
@@ -1093,7 +1107,19 @@ mod tests {
         // Wide chars spend 2 columns each: 200 CJK chars (400 columns) clip.
         let wide = "界".repeat(200);
         let wc = terminal_preview(&wide);
-        assert!(cols(wc.as_str()) <= PREVIEW_LINE_COLS && wc.ends_with('…'));
+        assert!(display_cols(&wc) <= PREVIEW_LINE_COLS && wc.ends_with('…'));
+
+        // A [`MAX_LINE_CHARS`] cut landing mid-escape-sequence must not
+        // swallow the `…` marker: escapes are stripped before the budget is
+        // applied, so this 5000-column line still previews as the budgeted
+        // cut instead of an empty row.
+        let giant = format!("\x1b[{}m", "1".repeat(MAX_LINE_CHARS - 2));
+        let raw = format!("{giant}{}", "l".repeat(5_000));
+        assert_eq!(
+            terminal_preview(&raw),
+            clipped,
+            "escape cut keeps the marker"
+        );
 
         // The dispatch wrapper and the input row agree with the same budget.
         assert_eq!(tool_preview_body("bash", true, None, &long), clipped);
@@ -1102,6 +1128,20 @@ mod tests {
             clipped,
             "headless input row uses the same short_arg preview as the TUI"
         );
+    }
+
+    #[test]
+    fn short_arg_fallback_collapses_whitespace() {
+        // Unknown tool or unparseable input: the raw fallback is
+        // whitespace-collapsed so a pretty-printed JSON blob previews as one
+        // compact row instead of just its first line (`{`).
+        let pretty = "{\n  \"weird\": \"value\"\n}";
+        assert_eq!(
+            short_arg("unknown_tool", pretty),
+            "{ \"weird\": \"value\" }"
+        );
+        // Plain multi-line fallback is compacted the same way.
+        assert_eq!(short_arg("unknown_tool", "a\n  b\n  c"), "a b c");
     }
 
     #[test]
