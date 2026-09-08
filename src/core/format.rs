@@ -69,8 +69,15 @@ pub(crate) fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> S
     clamp_lines(text, max_lines, max_bytes)
 }
 
+/// Headless `[tool input]`/`[tool output]` body: same per-line standard as
+/// the transcript rows — [`PREVIEW_LINE_COLS`] display columns with `…` on
+/// every cut and ANSI escapes stripped — under the head/tail line fold.
 pub(crate) fn terminal_preview(text: &str) -> String {
-    truncate_text(text, 10 * 1024, 100)
+    clamp_lines(text, 100, 10 * 1024)
+        .lines()
+        .map(|line| truncate_cols(&strip_ansi(line), PREVIEW_LINE_COLS))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Rows of informational snippet under a tool outcome line in the REPL
@@ -119,13 +126,16 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
         .unwrap_or_else(|| input.to_string());
     let s = s.lines().next().unwrap_or(&s).trim();
     let s = strip_ansi(s);
-    truncate_cols(&s, ARG_PREVIEW_COLS)
+    truncate_cols(&s, PREVIEW_LINE_COLS)
 }
 
-/// Display-column budget for the transcript's tool-input preview row. Long
-/// bash commands wrap across rows in the transcript (the TUI word-wraps);
-/// this cap only bounds the damage for pathological inputs.
-const ARG_PREVIEW_COLS: usize = 320;
+/// Display-column budget shared by every transcript tool row: the input
+/// `▸` preview (`short_arg`), the output summary (`one_line_summary`), and
+/// every preview flavor (`tool_result_preview`, `read_preview_lines`,
+/// `diff_preview_lines`). The TUI word-wraps rows, so one generous cap just
+/// bounds the damage for pathological lines; `truncate_cols` measures real
+/// display columns (wide chars count 2) and marks every cut with `…`.
+const PREVIEW_LINE_COLS: usize = 320;
 
 /// Truncate to `max_cols` display columns, appending `…` when clipped.
 fn truncate_cols(s: &str, max_cols: usize) -> String {
@@ -176,21 +186,16 @@ fn read_short_arg(obj: Option<&serde_json::Map<String, Value>>) -> Option<String
     }
 }
 
-/// First non-empty, trimmed line of a tool result, truncated — a one-line
-/// confirmation for the REPL transcript instead of the full output.
+/// First non-empty, trimmed line of a tool result, truncated to the shared
+/// [`PREVIEW_LINE_COLS`] display-column budget with a visible `…` on cut —
+/// the same standard as the tool-input preview row.
 pub(crate) fn one_line_summary(text: &str) -> String {
     let stripped = strip_ansi(text);
     let line = stripped
         .lines()
         .find(|l| !l.trim().is_empty())
         .unwrap_or("");
-    let line = line.trim();
-    let limit = line
-        .char_indices()
-        .nth(120)
-        .map(|(i, _)| i)
-        .unwrap_or(line.len());
-    line[..limit].to_string()
+    truncate_cols(line.trim(), PREVIEW_LINE_COLS)
 }
 
 /// Drop ANSI escape sequences (colors, cursor movement) and carriage
@@ -224,9 +229,9 @@ fn strip_ansi(text: &str) -> String {
 /// one-line summary: enough to see *what* happened without flooding the
 /// transcript. Lines are trimmed on the right only, so indentation (tree
 /// output, indented code, nested listings) survives; blank lines and ANSI
-/// escapes are removed, long lines clipped at 120 chars, and overflow folds
-/// into a `… +N more lines` tail. `skip_first` lets callers omit the line
-/// the one-line summary already shows.
+/// escapes are removed, long lines clipped to [`PREVIEW_LINE_COLS`] display
+/// columns, and overflow folds into a `… +N more lines` tail. `skip_first`
+/// lets callers omit the line the one-line summary already shows.
 pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool) -> Vec<String> {
     let mut lines = text
         .lines()
@@ -238,18 +243,7 @@ pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool
     }
     let mut preview: Vec<String> = lines
         .by_ref()
-        .map(|line| {
-            let limit = line
-                .char_indices()
-                .nth(120)
-                .map(|(i, _)| i)
-                .unwrap_or(line.len());
-            let mut clipped = line[..limit].to_string();
-            if limit < line.len() {
-                clipped.push('…');
-            }
-            clipped
-        })
+        .map(|line| truncate_cols(&line, PREVIEW_LINE_COLS))
         .take(max_lines)
         .collect();
     let remaining = lines.count();
@@ -284,17 +278,7 @@ pub(crate) fn read_preview_lines(text: &str, max: usize) -> Vec<String> {
             continue;
         }
         if preview.len() < max {
-            let clipped = stripped.trim_end();
-            let limit = clipped
-                .char_indices()
-                .nth(120)
-                .map(|(i, _)| i)
-                .unwrap_or(clipped.len());
-            if limit < clipped.len() {
-                preview.push(format!("{}…", &clipped[..limit]));
-            } else {
-                preview.push(clipped.to_string());
-            }
+            preview.push(truncate_cols(stripped.trim_end(), PREVIEW_LINE_COLS));
         } else {
             elided += 1;
         }
@@ -340,18 +324,7 @@ pub(crate) fn diff_preview_lines(diff: &str, max: usize) -> Vec<String> {
     }
     let mut clipped: Vec<String> = lines
         .into_iter()
-        .map(|line| {
-            let limit = line
-                .char_indices()
-                .nth(120)
-                .map(|(i, _)| i)
-                .unwrap_or(line.len());
-            if limit < line.len() {
-                format!("{}…", &line[..limit])
-            } else {
-                line
-            }
-        })
+        .map(|line| truncate_cols(&line, PREVIEW_LINE_COLS))
         .collect();
     if clipped.len() > max {
         let rest = clipped.len() - max;
@@ -384,7 +357,8 @@ pub(crate) fn tool_preview(
 }
 
 /// Headless one-shot body for the same dispatch: GitHub-style diff snippet
-/// for write/edit, terminal-clamped output otherwise.
+/// for write/edit, per-line [`PREVIEW_LINE_COLS`]-clamped output otherwise
+/// (via [`terminal_preview`], same standard as the transcript rows).
 pub(crate) fn tool_preview_body(name: &str, ok: bool, diff: Option<&str>, result: &str) -> String {
     if let Some(diff) = diff {
         if matches!(name, "write" | "edit") && ok {
@@ -1053,6 +1027,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_rows_share_one_display_column_budget() {
+        // The standard: every transcript tool row — the input preview
+        // (`short_arg`), the output summary (`one_line_summary`), and every
+        // preview flavor — is bounded by the same budget, measured in
+        // display columns (wide chars count 2), with every cut marked `…`.
+        let cols = |s: &str| UnicodeWidthStr::width(s);
+        let long = "l".repeat(400); // 400 display columns
+                                    // 319 columns of content + the 1-column ellipsis = the budget.
+        let clipped = format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1));
+        assert_eq!(cols(&clipped), PREVIEW_LINE_COLS);
+        assert!(clipped.ends_with('…'), "cut must be marked");
+
+        // Input row and output rows obey the same budget, byte-for-byte.
+        assert_eq!(
+            short_arg("bash", &format!(r#"{{"command":"{long}"}}"#)),
+            clipped,
+            "input row"
+        );
+        assert_eq!(one_line_summary(&long), clipped, "summary row");
+        assert_eq!(
+            tool_result_preview(&long, TRANSCRIPT_PREVIEW_LINES, false)[0],
+            clipped,
+            "generic preview"
+        );
+        // Prefixes (diff marker, read gutter) count against the same budget.
+        let budgeted = |prefix: &str| {
+            format!(
+                "{prefix}{}…",
+                "l".repeat(PREVIEW_LINE_COLS - 1 - prefix.chars().count())
+            )
+        };
+        assert_eq!(
+            diff_preview_lines(&format!("-{long}"), 6)[0],
+            budgeted("-"),
+            "diff preview keeps its marker prefix"
+        );
+        assert_eq!(
+            read_preview_lines(&format!("   1  {long}"), 6)[0],
+            budgeted("   1  "),
+            "read preview keeps its gutter"
+        );
+    }
+
+    #[test]
+    fn headless_rows_share_one_display_column_budget() {
+        // The headless one-shot path (`[tool input]` / `[tool output]` on
+        // stderr) must adhere to the same per-line standard as the
+        // transcript rows: [`PREVIEW_LINE_COLS`] display columns, wide chars
+        // count 2, every cut marked `…`, ANSI escapes stripped.
+        let cols = |s: &str| UnicodeWidthStr::width(s);
+        let long = "l".repeat(400); // 400 display columns
+        let clipped = format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1));
+
+        assert_eq!(terminal_preview(&long), clipped, "output body");
+        // Every line obeys the budget independently.
+        assert_eq!(
+            terminal_preview(&format!("{long}\n{long}")),
+            format!("{clipped}\n{clipped}"),
+            "per line"
+        );
+        // ANSI bytes are stripped, not counted and not leaked to the terminal.
+        let ansi = format!("\x1b[31m{long}\x1b[0m");
+        assert_eq!(terminal_preview(&ansi), clipped);
+        // Wide chars spend 2 columns each: 200 CJK chars (400 columns) clip.
+        let wide = "界".repeat(200);
+        let wc = terminal_preview(&wide);
+        assert!(cols(wc.as_str()) <= PREVIEW_LINE_COLS && wc.ends_with('…'));
+
+        // The dispatch wrapper and the input row agree with the same budget.
+        assert_eq!(tool_preview_body("bash", true, None, &long), clipped);
+        assert_eq!(
+            short_arg("bash", &format!(r#"{{"command":"{long}"}}"#)),
+            clipped,
+            "headless input row uses the same short_arg preview as the TUI"
+        );
+    }
+
+    #[test]
+    fn preview_budget_counts_display_columns_not_chars() {
+        // Wide chars spend 2 columns each: 160 CJK chars are 320 columns and
+        // must fit the 320-column budget untouched (the old char-count clip
+        // at 120 "chars" cut them and left 240+ column rows).
+        let fits = "界".repeat(160);
+        assert_eq!(UnicodeWidthStr::width(fits.as_str()), PREVIEW_LINE_COLS);
+        assert_eq!(
+            one_line_summary(&fits),
+            fits,
+            "no cut at exactly the budget"
+        );
+        assert_eq!(
+            tool_result_preview(&fits, 6, false),
+            vec![fits],
+            "preview agrees with the summary row"
+        );
+        // 200 CJK chars (400 columns) clip to the budget with a marker.
+        let wide = "界".repeat(200);
+        let clipped = one_line_summary(&wide);
+        assert!(clipped.ends_with('…'));
+        assert!(UnicodeWidthStr::width(clipped.as_str()) <= PREVIEW_LINE_COLS);
+        assert_eq!(clipped.chars().count(), 160, "159 wide chars + ellipsis");
+    }
+
+    #[test]
     fn summary_is_outcome_first_without_ok_prefix() {
         // A successful read whose content happens to contain the shell
         // failure marker must not be reported as failed.
@@ -1172,12 +1249,14 @@ mod tests {
 
     #[test]
     fn preview_strips_ansi_and_clips_long_lines() {
-        let text = format!("\x1b[1;32m{}\x1b[0m", "x".repeat(200));
+        let text = format!("\x1b[1;32m{}\x1b[0m", "x".repeat(400));
         let preview = tool_result_preview(&text, 1, false);
         assert_eq!(preview.len(), 1);
         assert!(preview[0].starts_with("xxx"));
         assert!(preview[0].ends_with('…'));
-        assert!(preview[0].chars().count() <= 121);
+        // The shared transcript budget, in display columns like every other
+        // tool row (see tool_rows_share_one_display_column_budget).
+        assert!(UnicodeWidthStr::width(preview[0].as_str()) <= PREVIEW_LINE_COLS);
         assert!(!preview[0].contains('\x1b'));
     }
 
@@ -1226,13 +1305,13 @@ mod tests {
 
     #[test]
     fn diff_preview_clips_long_lines_and_caps_the_tail() {
-        let long = format!("+{}", "x".repeat(200));
+        let long = format!("+{}", "x".repeat(400));
         let diff = format!("--- a/f\n+++ b/f\n@@ -1 +1 @@\n{long}\n+two\n+three\n");
         let preview = diff_preview_lines(&diff, 2);
         assert_eq!(preview.len(), 3);
         assert!(preview[0].starts_with("@@"));
         assert!(preview[1].ends_with('…'));
-        assert!(preview[1].chars().count() <= 121);
+        assert!(UnicodeWidthStr::width(preview[1].as_str()) <= PREVIEW_LINE_COLS);
         assert_eq!(preview[2], "… +2 more diff lines");
     }
 
