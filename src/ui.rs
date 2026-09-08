@@ -8,6 +8,7 @@ use crossterm::Command;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::state::ToolState;
 use crate::core::types::{Role, SinkLine};
@@ -538,55 +539,113 @@ pub(crate) fn mouse_display_cell(
     Some((row, (m.column - area.x) as usize))
 }
 
+/// Column range of a leading fenced-code border prefix on a rendered
+/// transcript row: `(start, end)`, or `(0, 0)` when the row carries none.
+/// The border arrives as its own `│ ` span (code boxes and blockquotes,
+/// right after the whitespace indent); table rows use a bare `│` span and
+/// never match, so their pipes survive copies.
+fn leading_border_range(line: &Line<'static>) -> (usize, usize) {
+    let mut start = 0usize;
+    for span in &line.spans {
+        let text: &str = span.content.as_ref();
+        if !text.is_empty() && text.chars().all(char::is_whitespace) {
+            start += UnicodeWidthStr::width(text);
+            continue;
+        }
+        return if text == "│ " {
+            (start, start + UnicodeWidthStr::width(text))
+        } else {
+            (0, 0)
+        };
+    }
+    (0, 0)
+}
+
+/// Row text for copies: the `│ ` border span is display furniture, not
+/// content, so multi-line copies of a snippet come out without the bar.
+fn copy_text(line: &Line<'static>) -> String {
+    let (start, end) = leading_border_range(line);
+    if start == end {
+        return line.spans.iter().map(|s| s.content.as_ref()).collect();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if col < start || col >= end {
+                out.push(ch);
+            }
+            col += w;
+        }
+    }
+    out
+}
+
+/// Map a display column through a stripped leading border: columns before
+/// it keep their index, columns inside clamp to its start, columns after it
+/// shift left by its width. Monotonic, so `(shift(c0), shift(c1))` stays a
+/// valid range.
+fn border_shift(col: usize, (start, end): (usize, usize)) -> usize {
+    if col <= start {
+        col
+    } else if col >= end {
+        col - (end - start)
+    } else {
+        start
+    }
+}
+
 /// Plain text of a normalized selection: full rows join with newlines, the
 /// anchor/end rows are sliced to the selected columns — both endpoint cells
 /// inclusive, so releasing on a char selects it. Copies what's on
 /// screen (pre-wrapped), matching what native terminal selection would hand
-/// over.
+/// over, minus border furniture.
 pub(crate) fn selection_text(
     rows: &[Line<'static>],
     (r0, c0): (usize, usize),
     (r1, c1): (usize, usize),
 ) -> String {
-    let text =
-        |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
     if r0 == r1 {
         return rows
             .get(r0)
             .map(|l| {
-                text(l)
-                    .chars()
-                    .skip(c0)
-                    .take((c1 + 1).saturating_sub(c0))
+                let range = leading_border_range(l);
+                let text = copy_text(l);
+                let from = border_shift(c0, range);
+                // `c1` is the release cell (inclusive); `border_shift`
+                // speaks the old exclusive dialect, so hand it `c1 + 1`.
+                let to = border_shift(c1 + 1, range);
+                text.chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
                     .collect()
             })
             .unwrap_or_default();
     }
     let mut out: Vec<String> = Vec::new();
     if let Some(l) = rows.get(r0) {
-        out.push(text(l).chars().skip(c0).collect());
+        let from = border_shift(c0, leading_border_range(l));
+        out.push(copy_text(l).chars().skip(from).collect());
     }
     for line in rows.get(r0 + 1..).into_iter().flatten().take(r1 - r0 - 1) {
-        out.push(text(line));
+        out.push(copy_text(line));
     }
     if let Some(l) = rows.get(r1) {
-        out.push(text(l).chars().take(c1 + 1).collect());
+        let to = border_shift(c1 + 1, leading_border_range(l));
+        out.push(copy_text(l).chars().take(to).collect());
     }
     out.join("\n")
 }
 
 /// Copy text for whole-line (triple-click) selections: every row from
-/// `r0..=r1` in full, joined by newlines — no column clipping, so all
-/// covered lines are copied whole regardless of length.
+/// `r0..=r1` in full (border furniture stripped), joined by newlines — no
+/// column clipping, so all covered lines are copied whole regardless of
+/// length.
 pub(crate) fn line_selection_text(rows: &[Line<'static>], r0: usize, r1: usize) -> String {
     (r0..=r1.min(rows.len().saturating_sub(1)))
         .filter_map(|r| rows.get(r))
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-        })
+        .map(copy_text)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1448,6 +1507,48 @@ mod tests {
         assert_eq!(selection_text(&rows, (0, 6), (1, 3)), "world\nseco");
         // End in the blank margin still takes the row's tail.
         assert_eq!(selection_text(&rows, (0, 6), (0, 40)), "world");
+    }
+
+    #[test]
+    fn line_selection_text_strips_code_border_prefix() {
+        let border = Style::default().fg(Color::DarkGray);
+        let code_row = |t: &str| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled("│ ", border),
+                Span::styled(t.to_string(), Color::Cyan),
+            ])
+        };
+        // Fenced-code rows: the `│ ` prefix is display furniture.
+        let rows = vec![code_row("dex-eval run"), code_row("  --out ~/x")];
+        assert_eq!(
+            line_selection_text(&rows, 0, 1),
+            " dex-eval run\n   --out ~/x"
+        );
+        // Table rows use a bare `│` span — their pipes survive.
+        let table = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("│", border),
+            Span::raw(" A "),
+            Span::styled("│", border),
+        ]);
+        assert_eq!(line_selection_text(&[table], 0, 0), " │ A │");
+    }
+
+    #[test]
+    fn selection_text_slices_after_border_strip() {
+        let row = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+            Span::from("dex-eval run"),
+        ]);
+        let rows = vec![row];
+        // Columns refer to the displayed row (` │ dex-eval run`); the copy
+        // drops the two border cells and shifts with them, release cell
+        // inclusive (display cols 3..=6 → `dex-`).
+        assert_eq!(selection_text(&rows, (0, 3), (0, 6)), "dex-");
+        // A selection ending on a border cell copies only the indent.
+        assert_eq!(selection_text(&rows, (0, 0), (0, 2)), " ");
     }
 
     #[test]
