@@ -294,7 +294,7 @@ fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolE
 }
 
 fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
-    // Industry harnesses buffer audit async; dex does sync open+write per
+    // Audit writes are sync open+write per
     // tool call which blocks the loop thread on fs. Gate behind DEX_AUDIT=1
     // for strict auditing, otherwise skip (session.jsonl already journals).
     if std::env::var("DEX_AUDIT").as_deref() != Ok("1") {
@@ -961,7 +961,7 @@ fn apply_edit(
     }
 
     // Exact match failed: retry with a whitespace-insensitive line-window
-    // comparison (Codex-style fuzzy fallback). Handles the common case of
+    // comparison (fuzzy fallback). Handles the common case of
     // the model reproducing content with different indentation or trailing
     // whitespace. Whole lines are replaced, so the match must cover them.
     let old_lines: Vec<&str> = old.lines().collect();
@@ -1052,7 +1052,7 @@ async fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
     if entries.is_empty() {
         return Ok("(empty)".to_string());
     }
-    // Clamp to avoid flooding context; pi truncates similarly.
+    // Clamp to avoid flooding context.
     let limited = clamp_lines(&entries.join("\n"), 500, 32 * 1024);
     Ok(limited)
 }

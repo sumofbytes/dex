@@ -820,7 +820,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 // Blank inside the current assistant message (e.g. streaming
                 // blank line between paragraphs). Keep it inside the tail
                 // Assistant block so the inter-block gutter remains canonical.
-                // Blank runs collapse to one air row (CommonMark/pi/codex):
+                // Blank runs collapse to one air row (CommonMark):
                 // the model often emits several, and each used to push its
                 // own `Line::default()`.
                 if app.assistant_open {
@@ -945,8 +945,8 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             let output = indent_transcript_line(Line::from(spans));
             // write/edit previews are a git diff: color like git does. read
             // previews keep the numbered gutter dim and highlight the code
-            // by extension (opencode/Claude Code style, one tree-sitter
-            // pass per file section); anything unhighlightable stays dim.
+            // by extension (one tree-sitter pass per file section);
+            // anything unhighlightable stays dim.
             let preview_lines: Vec<Line<'static>> = if matches!(name.as_str(), "write" | "edit") {
                 preview
                     .iter()
@@ -1777,7 +1777,7 @@ mod tests {
     #[test]
     fn assistant_blank_runs_collapse_to_one_air_row() {
         // Streaming blank lines between paragraphs collapse to a single air
-        // row (CommonMark/pi/codex); each used to push its own blank `Line`.
+        // row (CommonMark); each used to push its own blank `Line`.
         let mut app = test_app();
         let due = || Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         for line in ["para one", "", "", "", "para two"] {
@@ -2078,8 +2078,8 @@ mod tests {
 
     #[test]
     fn read_preview_highlights_code_and_keeps_gutter_dim() {
-        // Industry standard (opencode/Claude Code): read snippets highlight
-        // by extension; the `{:>4}  ` gutter stays dim for alignment.
+        // Read snippets highlight by extension; the `{:>4}  ` gutter
+        // stays dim for alignment.
         let mut app = test_app();
         append_sink_line(
             &mut app,

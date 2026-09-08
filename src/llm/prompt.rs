@@ -28,7 +28,7 @@ pub(crate) fn project_context() -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-/// Base system prompt, pi-style: identity plus imperative working rules.
+/// Base system prompt: identity plus imperative working rules.
 /// Tool-behavior detail lives in the tool descriptions (src/llm/protocol.rs),
 /// where the model sees it at each tool decision — never duplicated here.
 pub(crate) fn system_prompt(skills: &[Skill]) -> String {

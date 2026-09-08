@@ -16,20 +16,21 @@ Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX
 ## Structure
 
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
-- `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Update`)
+- `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Doctor`/`Update`/`Mcp`/`Help`/`Version`)
 - `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
 - `src/agent/` — `loop.rs` turn loop, `state.rs`, `compaction.rs`
 - `src/llm/` — provider clients, streaming parsers, `config.rs` (provider/model/endpoint resolution, `/model` write-back, `dex doctor`), `prompt.rs` (system prompt)
 - `src/tools/` — workspace-confined tools (`mod.rs`, `fff.rs` for fff engine)
+- `src/mcp.rs` + `src/mcp/` — MCP client (stdio/HTTP/SSE, OAuth, `mcp_servers:` config)
 - `src/session.rs` — append-only JSONL (`$XDG_DATA_HOME/dex/sessions/<slug>/*.jsonl`)
-- `src/skills.rs` / `src/ui/` / `src/core/` — skills discovery, TUI, formatting
+- `src/skills.rs` / `src/ui.rs` + `src/ui/` / `src/core/` — skills discovery, TUI, formatting
 - This file + `CLAUDE.md` (if present, nearest parent wins) is auto-appended to the system prompt via `src/llm/prompt.rs:project_context()`.
 
 ## Config surface
 
 All of this lives in `src/llm/config.rs` — don't add a second way to express any of it:
 
-- One selection knob: `model: <provider|endpoint>/<model>` (file `model:`, env `DEX_MODEL`, flag `--model`; bare provider name switches provider and keeps the model). `/model`/`/provider` write back that single key and drop the deprecated ones — never write back `active_provider:`/top-level `base_url:`.
+- One selection knob: `model: <provider|endpoint>/<model>` (file `model:`, env `DEX_MODEL`, flag `--model`; bare provider name switches provider and keeps the model). `/model`/`/provider` write back that single key and drop the deprecated ones — never write back `active_provider:`/`provider:`/top-level `base_url:`.
 - Endpoints, model lists, pricing, context windows come from the models.dev catalog (cache via `dex update --models`); wire protocol is learned per endpoint+model (`learned-apis.json`), with `providers.<name>.api:` as the pin.
 - Per-provider keys live in `providers.<name>.api_key` or the provider's own catalog env var (opencode: `OPENCODE_API_KEY`). Never add per-provider default key env vars.
 - Extra headers precedence: file (provider-scoped `headers:` > global, per-key) < env (`ANTHROPIC_CUSTOM_HEADERS` < `OPENAI_HEADERS` < `DEX_HEADERS`) < `--header`; `authorization` can't be overridden.
