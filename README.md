@@ -296,7 +296,7 @@ One reconnect per turn, then an honest error.
 The TUI behaves exactly like the local one: assistant text streams live,
 tool calls and results appear as they happen, tool approvals pop up as an
 overlay (the daemon parks the turn until you decide), and Ctrl+C/Esc cancels
-the in-flight turn. API keys, the model, and the permission mode are
+the in-flight turn (a third Ctrl+C force-quits a stuck turn). API keys, the model, and the permission mode are
 resolved by the daemon's own environment; client flags like
 `--model` and `--permission` are forwarded as per-request overrides.
 
@@ -361,7 +361,7 @@ Any other arguments are treated as a one-shot prompt.
 - **Shift+Enter** — insert a newline (multi-line input).
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.
-- **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages.
+- **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages (a third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt clears it first, and **Ctrl+D** on an empty line quits.
 - **Ctrl+T** — expand/collapse the full thinking block.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the transcript.
 - **Paste** — pasted text is inserted at the cursor.
