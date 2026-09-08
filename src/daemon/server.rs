@@ -1320,12 +1320,14 @@ async fn cancel(
 ) -> Json<serde_json::Value> {
     // Ask the in-flight turn to unwind: the LLM stream reader and the agent
     // loop poll this token between steps. A missing entry means no turn is
-    // running for the session, so there is nothing to cancel.
+    // running for the session, so there is nothing to cancel. Cloned under
+    // the lock, cancelled outside it — never hold the mutex across the call.
     if let Some(token) = state
         .cancel_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&session_id)
+        .cloned()
     {
         token.cancel();
     }
@@ -1337,6 +1339,7 @@ async fn cancel(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&session_id)
+        .cloned()
     {
         token.cancel();
     }
@@ -1662,16 +1665,19 @@ async fn session_shell(
     };
     let duration = started.elapsed().as_secs_f64();
     let cancelled = shell_cancel.is_cancelled();
-    // Free the slot before the (blocking) journal write so a slow disk
-    // never serializes back-to-back `!` runs.
-    drop(_guard);
+    // The slot guard stays alive through the journal write below: freeing it
+    // before persisting would let a second `!` start while the first is still
+    // appending, interleaving the two runs' message + event writes and
+    // letting a concurrent turn's seq land inside this run's call/result
+    // pair. A slow disk serializing back-to-back `!` runs is the cheaper
+    // failure mode.
     let persist = if req.exclude_from_context {
         ChatMessage::user_named(
-            bash_context_text(&command, &output, success, code, cancelled),
+            crate::core::format::bash_context_text(&command, &output, success, code, cancelled),
             crate::core::types::BASH_EXCLUDED_NAME,
         )
     } else {
-        ChatMessage::user(bash_context_text(
+        ChatMessage::user(crate::core::format::bash_context_text(
             &command, &output, success, code, cancelled,
         ))
     };
@@ -1682,8 +1688,7 @@ async fn session_shell(
     let short = crate::core::format::short_arg("bash", &input_json);
     let summary = crate::core::format::tool_result_summary("bash", &input_json, &output, success);
     let preview = crate::core::format::tool_preview("bash", success, None, &output, true);
-    let call_seq = state.next_seq(&session_id);
-    let result_seq = state.next_seq(&session_id);
+    let (call_seq, result_seq) = state.next_seq_pair(&session_id);
     let call_event = serde_json::to_string(&StreamEvent::ToolCall {
         name: "bash".to_string(),
         args: serde_json::Value::String(short),
@@ -1712,38 +1717,6 @@ async fn session_shell(
         success,
         code,
     }))
-}
-
-/// Model-facing text for a `!`/`!!` run (pi's `bashExecutionToText`): the
-/// persisted message the next turn reads. The output is already clamped
-/// for the context window by the bash tool.
-fn bash_context_text(
-    command: &str,
-    output: &str,
-    success: bool,
-    code: Option<i32>,
-    cancelled: bool,
-) -> String {
-    let mut text = format!("Ran `{command}`\n");
-    if output.trim().is_empty() {
-        text.push_str("(no output)");
-    } else {
-        text.push_str("```\n");
-        text.push_str(output);
-        if !output.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str("```");
-    }
-    if cancelled {
-        text.push_str("\n\n(command cancelled)");
-    } else if !success {
-        match code {
-            Some(code) => text.push_str(&format!("\n\nCommand exited with code {code}")),
-            None => text.push_str("\n\nCommand failed"),
-        }
-    }
-    text
 }
 
 /// `POST /api/sessions/{id}/name` with `{"name": ...}` — rename a session

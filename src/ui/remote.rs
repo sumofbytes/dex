@@ -559,7 +559,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                 }
             }
 
-            let busy = remote.app.busy;
+            // A `!` shell run animates like a turn even with no agent turn in
+            // flight (otherwise a long shell looks frozen).
+            let busy = remote.app.busy || remote.shell_running;
             // Cheap when unchanged (outside Herdr it is a no-op).
             herdr.sync(
                 busy,

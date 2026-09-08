@@ -264,6 +264,17 @@ impl DaemonState {
         seq
     }
 
+    /// Allocate a consecutive call/result seq pair under one lock hold so no
+    /// concurrent turn can land between the two (shell tool-block replay
+    /// stays adjacent).
+    fn next_seq_pair(&self, session_id: &str) -> (u64, u64) {
+        let mut map = self.event_seqs.lock().unwrap_or_else(|e| e.into_inner());
+        let next = map.entry(session_id.to_string()).or_insert(0);
+        let first = *next;
+        *next += 2;
+        (first, first + 1)
+    }
+
     /// Seed `event_seqs` for a session from its persisted journal: the next
     /// allocation continues after the highest journaled seq (0 when the
     /// journal holds no seq yet — `None`, not a journal holding seq 0).
