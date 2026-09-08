@@ -263,20 +263,26 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) reasoning_effort: &'a Option<String>,
 }
 
+/// Wire protocol spoken by the active endpoint. pi names are canonical
+/// (`openai-completions`, `openai-responses`, `anthropic-messages`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ApiProtocol {
     ChatCompletions,
     Responses,
+    /// Anthropic Messages API: `POST /v1/messages` with block-shaped
+    /// content, `x-api-key` auth, and its own SSE event vocabulary.
+    Anthropic,
 }
 
 impl ApiProtocol {
-    /// Parse pi's `api` names (`openai-completions` / `openai-responses`
-    /// plus pi's short aliases). None for anything else — including pi APIs
-    /// outside dex's OpenAI-compatible subset (`anthropic-messages`, …).
+    /// Parse pi's `api` names (`openai-completions` / `openai-responses` /
+    /// `anthropic-messages` plus pi's short aliases). None for anything
+    /// else.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "responses" | "openai-responses" => Some(Self::Responses),
             "chat" | "chat-completions" | "openai-completions" => Some(Self::ChatCompletions),
+            "anthropic" | "anthropic-messages" => Some(Self::Anthropic),
             _ => None,
         }
     }
@@ -285,6 +291,7 @@ impl ApiProtocol {
         match self {
             Self::Responses => "openai-responses",
             Self::ChatCompletions => "openai-completions",
+            Self::Anthropic => "anthropic-messages",
         }
     }
 }
@@ -293,6 +300,12 @@ impl ApiProtocol {
 pub(crate) enum Provider {
     OpenCode,
     OpenAiCodex,
+    /// Native Anthropic Messages provider (`anthropic/<model>`): speaks
+    /// `anthropic-messages`, authenticates with `x-api-key` +
+    /// `anthropic-version`, lands on api.anthropic.com. Pricing, models and
+    /// the key env var (`ANTHROPIC_API_KEY`) come from the models.dev
+    /// catalog entry of the same key.
+    Anthropic,
     /// Any configured OpenAI-compatible provider (`providers:` map in
     /// config.yaml); the string is the catalog/config key ("zai",
     /// "openrouter", …). Auth is a bearer key; endpoint, models, pricing and
@@ -314,6 +327,7 @@ impl Provider {
         match lowered.as_str() {
             "opencode" => Some(Self::OpenCode),
             "openai-codex" | "codex" => Some(Self::OpenAiCodex),
+            "anthropic" => Some(Self::Anthropic),
             _ => known
                 .iter()
                 .any(|k| k.eq_ignore_ascii_case(&lowered))
@@ -332,6 +346,7 @@ impl Provider {
         match self {
             Self::OpenCode => "opencode",
             Self::OpenAiCodex => "openai-codex",
+            Self::Anthropic => "anthropic",
             Self::Generic(name) => name,
         }
     }
