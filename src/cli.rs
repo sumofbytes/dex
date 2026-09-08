@@ -42,7 +42,7 @@ pub(crate) enum Mode {
     RunTool { name: String, args: Vec<String> },
     /// Print the resolved provider/model config and each value's origin.
     Doctor,
-    /// Refresh model catalog (`dex update --models`) — like `pi update --models`.
+    /// Refresh the model catalog (`dex update --models`).
     Update { models: bool },
     /// Print usage (`dex --help`/`-h`) without touching config, network, or LLM.
     Help,

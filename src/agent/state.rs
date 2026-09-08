@@ -85,7 +85,7 @@ pub(crate) struct ToolState {
     /// Session-cumulative completion (output) tokens across every LLM call,
     /// fed by the same `Usage` events as `total_usage`. In-memory only.
     pub(crate) total_output: u64,
-    /// Session-cumulative cost in USD, mirroring pi's `usageTotals.cost`.
+    /// Session-cumulative cost in USD.
     /// Accumulated per `Usage` event from provider pricing (catalog) or
     /// `DEX_COST_PER_1K` fallback. In-memory only, like `total_usage`.
     pub(crate) total_cost: f64,
