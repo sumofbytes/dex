@@ -138,6 +138,8 @@ impl CancellationSource for CancellationToken {
 
 pub(crate) const RESET: &str = "\x1b[0m";
 
+pub(crate) const DIM: &str = "\x1b[2m";
+
 pub(crate) const TOOL_INPUT_COLOR: &str = "\x1b[1;33m";
 
 pub(crate) const TOOL_OUTPUT_COLOR: &str = "\x1b[0;34m";

@@ -266,6 +266,15 @@ fn stream_err(message: &str, output_flowed: bool) -> Box<dyn std::error::Error +
     }
 }
 
+/// Terminal stream failure from a driver that owns a thinking line: close
+/// the headless stderr thinking line first (a mid-stream error must never
+/// leave the user's terminal stuck in DIM), then apply the usual
+/// output-flowed retryability rule.
+fn driver_err(driver: &mut SseDriver, message: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    driver.end_thinking();
+    stream_err(message, driver.output_flowed)
+}
+
 /// Mid-stream events a parser emits per SSE line; the driver owns what
 /// happens to them (printing, accumulation, usage threading, lifecycle).
 enum StreamEvent {
@@ -319,6 +328,8 @@ struct SseDriver {
     usage: Option<Usage>,
     stop_reason: Option<StopReason>,
     output_flowed: bool,
+    /// Headless stderr thinking line is open (dim, no closing newline yet).
+    thinking_open: bool,
 }
 
 impl SseDriver {
@@ -330,11 +341,35 @@ impl SseDriver {
             usage: None,
             stop_reason: None,
             output_flowed: false,
+            thinking_open: false,
         }
     }
 
     fn sink(&self) -> Option<&mpsc::Sender<SinkLine>> {
         self.printer.sink.as_ref()
+    }
+
+    /// Headless (no sink) thinking: the TUI renders reasoning live on the
+    /// transcript, so pipe users get it dimmed on stderr instead — stdout
+    /// stays model-prose-only. Fragments are deltas: write without a newline
+    /// and close the line when a non-thinking event or turn end arrives.
+    fn print_thinking(&mut self, thought: &str) {
+        if thought.is_empty() {
+            return;
+        }
+        if !self.thinking_open {
+            self.thinking_open = true;
+            let _ = io::stderr().write_all(crate::core::console::DIM.as_bytes());
+        }
+        let _ = io::stderr().write_all(thought.as_bytes());
+    }
+
+    fn end_thinking(&mut self) {
+        if self.thinking_open {
+            self.thinking_open = false;
+            let _ = io::stderr().write_all(b"\x1b[0m\n");
+            let _ = io::stderr().flush();
+        }
     }
 
     /// Feed one raw SSE line; returns true when the parser signalled Done.
@@ -346,6 +381,9 @@ impl SseDriver {
     fn feed_raw(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
         let mut done = false;
         for event in parser.feed(line) {
+            if !matches!(event, StreamEvent::Thinking(_)) {
+                self.end_thinking();
+            }
             match event {
                 StreamEvent::Thinking(thought) => {
                     // Reasoning counts as flowed output: it renders live on the
@@ -355,6 +393,8 @@ impl SseDriver {
                     self.output_flowed = true;
                     if let Some(sink) = self.sink() {
                         let _ = sink.try_send(SinkLine::Thinking(thought));
+                    } else {
+                        self.print_thinking(&thought);
                     }
                 }
                 StreamEvent::Text(text) => {
@@ -390,6 +430,9 @@ impl SseDriver {
     async fn feed_raw_async(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
         let mut done = false;
         for event in parser.feed(line) {
+            if !matches!(event, StreamEvent::Thinking(_)) {
+                self.end_thinking();
+            }
             match event {
                 StreamEvent::Thinking(thought) => {
                     // Same output_flowed contract as `feed_raw`: reasoning
@@ -397,6 +440,8 @@ impl SseDriver {
                     self.output_flowed = true;
                     if let Some(sink) = self.sink() {
                         let _ = sink.send(SinkLine::Thinking(thought)).await;
+                    } else {
+                        self.print_thinking(&thought);
                     }
                 }
                 StreamEvent::Text(text) => {
@@ -458,10 +503,11 @@ impl SseDriver {
     }
 
     fn finish_turn_tail(
-        self,
+        mut self,
         parser: impl StreamParser,
         sink_is_some: bool,
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        self.end_thinking();
         let _ = io::stdout().flush();
         if !self.content.is_empty() {
             with_console(sink_is_some, || println!());
@@ -538,7 +584,7 @@ async fn run_sse<P: StreamParser>(
             _ = &mut cancel_fut => {
                 with_console(sink_is_some, || println!());
                 let _ = io::stdout().flush();
-                return Err(stream_err("cancelled", driver.output_flowed));
+                return Err(driver_err(&mut driver, "cancelled"));
             }
             // Idle watchdog: every chunk (including keep-alives) resets this
             // timer, so it only fires when the provider truly stopped
@@ -557,15 +603,15 @@ async fn run_sse<P: StreamParser>(
                 match chunk_res {
                     Err(None) => {
                         let secs = idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
-                        return Err(stream_err(
+                        return Err(driver_err(
+                            &mut driver,
                             &format!(
                                 "stream idle for over {secs}s; the provider stalled or the connection dropped (tune with DEX_STREAM_IDLE_TIMEOUT_SECS)"
                             ),
-                            driver.output_flowed,
                         ));
                     }
                     Err(Some(msg)) => {
-                        return Err(stream_err(&msg, driver.output_flowed));
+                        return Err(driver_err(&mut driver, &msg));
                     }
                     Ok(None) => break,
                       Ok(Some(bytes)) => {
@@ -591,7 +637,7 @@ async fn run_sse<P: StreamParser>(
         if cancel.is_cancelled() {
             with_console(sink_is_some, || println!());
             let _ = io::stdout().flush();
-            return Err(stream_err("cancelled", driver.output_flowed));
+            return Err(driver_err(&mut driver, "cancelled"));
         }
     }
     // EOF: flush trailing partial line (responses API ends at EOF).
@@ -638,7 +684,7 @@ fn run_sse_lines<P: StreamParser>(
     let mut driver = SseDriver::new(sink.clone());
     for line in lines {
         if cancel.is_cancelled() {
-            return Err(stream_err("cancelled", driver.output_flowed));
+            return Err(driver_err(&mut driver, "cancelled"));
         }
         // Re-add newline: `feed` expects raw SSE lines.
         let owned = format!("{line}\n");
@@ -935,8 +981,8 @@ impl StreamParser for ResponsesParser {
 #[cfg(test)]
 mod tests {
     use super::{
-        delta_thought, read_stream, stream_err, stream_idle_timeout, SinkLine, StreamDelta,
-        StreamPrinter, Usage,
+        delta_thought, driver_err, read_stream, stream_err, stream_idle_timeout, SinkLine,
+        SseDriver, StreamDelta, StreamPrinter, Usage,
     };
     use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
@@ -1334,6 +1380,26 @@ mod tests {
         assert!(!is_mid_stream(&*stream_err("boom", false)));
         assert!(is_mid_stream(&*stream_err("boom", true)));
         assert_eq!(stream_err("cancelled", true).to_string(), "cancelled");
+    }
+
+    /// A mid-stream failure on a headless run must close the open thinking
+    /// line (the terminal would otherwise stay dimmed); double-close is a
+    /// no-op, and retryability still follows output flow.
+    #[test]
+    fn driver_err_closes_open_thinking_line() {
+        let mut driver = SseDriver::new(None);
+        driver.thinking_open = true;
+        driver.output_flowed = true;
+        let err = driver_err(&mut driver, "boom");
+        assert!(!driver.thinking_open);
+        assert!(is_mid_stream(&*err));
+        // Idempotent: ending an already-closed line writes nothing.
+        driver.end_thinking();
+        assert!(!driver.thinking_open);
+        // Before any output, the same failure stays retryable.
+        let mut fresh = SseDriver::new(None);
+        fresh.thinking_open = true;
+        assert!(!is_mid_stream(&*driver_err(&mut fresh, "boom")));
     }
 
     /// The async SSE driver must yield complete lines to the parser even
