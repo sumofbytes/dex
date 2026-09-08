@@ -560,6 +560,39 @@ pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
 }
 
+/// Model-facing text for a `!`/`!!` shell run (pi's `bashExecutionToText`):
+/// the persisted message the next turn reads. The output is already clamped
+/// for the context window by the bash tool. Single owner for the daemon
+/// (`POST /shell`) and local one-shot paths so the two can't diverge.
+pub(crate) fn bash_context_text(
+    command: &str,
+    output: &str,
+    success: bool,
+    code: Option<i32>,
+    cancelled: bool,
+) -> String {
+    let mut text = format!("Ran `{command}`\n");
+    if output.trim().is_empty() {
+        text.push_str("(no output)");
+    } else {
+        text.push_str("```\n");
+        text.push_str(output);
+        if !output.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("```");
+    }
+    if cancelled {
+        text.push_str("\n\n(command cancelled)");
+    } else if !success {
+        match code {
+            Some(code) => text.push_str(&format!("\n\nCommand exited with code {code}")),
+            None => text.push_str("\n\nCommand failed"),
+        }
+    }
+    text
+}
+
 /// Human-readable approval helpers — keep tool JSON out of the user's face.
 /// `approval_title` / `approval_summary` / `approval_details` turn raw
 /// `{"path":…}` / `{"command":…}` payloads into the short, scannable
