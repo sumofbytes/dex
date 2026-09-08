@@ -148,6 +148,11 @@ pub(crate) struct DaemonState {
     /// signals the token so this turn unwinds without touching other
     /// sessions; the entry is removed when the turn finishes.
     pub cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// Per-session cancellation tokens for in-flight `!` shell runs (pi:
+    /// Esc cancels a running bash). POST /cancel signals these too; the
+    /// entry is removed when the run finishes. At most one run per session
+    /// (a second `POST /shell` while one is registered is 409).
+    pub shell_tokens: Mutex<HashMap<String, CancellationToken>>,
     /// Per-session steering queue: `POST /steer` pushes into the turn's
     /// `steering_rx` (consumed inside `process_turn` between iterations).
     pub steering_txs: Mutex<HashMap<String, mpsc::Sender<String>>>,
@@ -188,6 +193,7 @@ impl DaemonState {
             pending_approvals: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashSet::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
+            shell_tokens: Mutex::new(HashMap::new()),
             steering_txs: Mutex::new(HashMap::new()),
             followup_txs: Mutex::new(HashMap::new()),
             event_seqs: Mutex::new(HashMap::new()),
@@ -256,6 +262,17 @@ impl DaemonState {
         let seq = *next;
         *next += 1;
         seq
+    }
+
+    /// Allocate a consecutive call/result seq pair under one lock hold so no
+    /// concurrent turn can land between the two (shell tool-block replay
+    /// stays adjacent).
+    fn next_seq_pair(&self, session_id: &str) -> (u64, u64) {
+        let mut map = self.event_seqs.lock().unwrap_or_else(|e| e.into_inner());
+        let next = map.entry(session_id.to_string()).or_insert(0);
+        let first = *next;
+        *next += 2;
+        (first, first + 1)
     }
 
     /// Seed `event_seqs` for a session from its persisted journal: the next

@@ -354,6 +354,26 @@ Any other arguments are treated as a one-shot prompt.
 | `/provider <name>` | Switch provider for the rest of the session.          |
 | `/help` (unknown)   | Unknown commands print a hint.                        |
 
+### Shell escape
+
+Prefix any TUI input with `!` to run it as a shell command directly, without
+involving the agent (like pi):
+
+```
+> !ls -la
+> !!cargo test -- --nocapture
+```
+
+The command runs in the daemon workspace via the `bash` tool and renders as
+a tool block. It needs no approval — the `!` itself is the approval, even in
+`read-only` mode (that mode constrains the model, not your own typing) — and
+the run is saved to session history: `!` output feeds the model's context on
+the next turn, while `!!` stays visible in the transcript but is never sent
+to the model. A shell run may overlap an agent turn (like pi); only one `!`
+runs at a time per session — a second is refused until the first finishes,
+and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
+`dex connect <url> "!<command>"` do the same without the TUI.
+
 ### Keyboard controls
 
 - **Enter** — submit the current input.
