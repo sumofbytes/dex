@@ -107,22 +107,13 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
                 Ok(mut session) => {
                     // Same shape the daemon persists (pi's `bashExecution`
                     // text); `!!` is tagged out of the model-bound history.
-                    let mut text = format!("Ran `{command}`\n");
-                    if output.trim().is_empty() {
-                        text.push_str("(no output)");
-                    } else {
-                        text.push_str("```\n");
-                        text.push_str(output.trim_end());
-                        text.push_str("\n```");
-                    }
-                    if !success {
-                        match code {
-                            Some(code) => {
-                                text.push_str(&format!("\n\nCommand exited with code {code}"));
-                            }
-                            None => text.push_str("\n\nCommand failed"),
-                        }
-                    }
+                    let text = crate::core::format::bash_context_text(
+                        &command,
+                        &output,
+                        success,
+                        code,
+                        crate::core::console::is_interrupted(),
+                    );
                     let msg = if excluded {
                         ChatMessage::user_named(text, crate::core::types::BASH_EXCLUDED_NAME)
                     } else {
