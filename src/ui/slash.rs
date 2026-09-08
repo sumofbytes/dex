@@ -577,7 +577,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
+                "keys: Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
             push_info(
