@@ -171,6 +171,12 @@ impl Role {
     }
 }
 
+/// `name` tag for `!!` shell runs: persisted in the session and shown in
+/// the transcript, but filtered out of the model-bound history (pi: `!!`
+/// runs without sending output to the LLM). The single spelling lives
+/// here; `ChatMessage::is_context_excluded` is the only check.
+pub(crate) const BASH_EXCLUDED_NAME: &str = "bash-excluded";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct ChatMessage {
     pub(crate) role: Role,
@@ -245,6 +251,12 @@ impl ChatMessage {
     /// Message text, empty when the wire shape omitted `content`.
     pub(crate) fn content_str(&self) -> &str {
         self.content.as_deref().unwrap_or_default()
+    }
+
+    /// True for `!!` shell runs, which the transcript shows but the model
+    /// must never see (see [`BASH_EXCLUDED_NAME`]).
+    pub(crate) fn is_context_excluded(&self) -> bool {
+        self.name.as_deref() == Some(BASH_EXCLUDED_NAME)
     }
 }
 

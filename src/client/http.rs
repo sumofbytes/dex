@@ -779,11 +779,14 @@ impl DaemonClient {
         block_on(self.rename_session_async(session_id, name))
     }
 
-    /// Run a shell command directly on the daemon (`!` prefix in the TUI).
+    /// Run a shell command directly on the daemon (`!`/`!!` prefix in the
+    /// TUI). `exclude_from_context` is pi's `!!`: saved to history and
+    /// shown, but never sent to the LLM.
     pub async fn shell_async(
         &self,
         session_id: &str,
         command: &str,
+        exclude_from_context: bool,
     ) -> Result<ShellResponse, Box<dyn std::error::Error + Send + Sync>> {
         let resp = self
             .http
@@ -794,6 +797,7 @@ impl DaemonClient {
             .headers(self.api_headers())
             .json(&ShellRequest {
                 command: command.to_string(),
+                exclude_from_context,
             })
             .send()
             .await?
@@ -807,8 +811,10 @@ impl DaemonClient {
         &self,
         session_id: &str,
         command: &str,
+        exclude_from_context: bool,
     ) -> Result<ShellResponse, Box<dyn std::error::Error>> {
-        block_on(self.shell_async(session_id, command)).map_err(|e| e.to_string().into())
+        block_on(self.shell_async(session_id, command, exclude_from_context))
+            .map_err(|e| e.to_string().into())
     }
 
     /// Enqueue a steering message into an active turn (mid-turn injection).

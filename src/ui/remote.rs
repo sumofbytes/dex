@@ -62,21 +62,16 @@ enum WorkerMessage {
     Finished(Option<String>),
     /// Background git poll result (off UI thread, every 2s).
     Git(crate::protocol::GitInfo),
-    /// A direct shell run (`!` prefix) finished on the daemon. Rendered as a
-    /// `bash` tool block; display-only, never sent to the model.
+    /// A direct shell run (`!`/`!!` prefix) finished on the daemon. Rendered
+    /// as a `bash` tool block; the daemon saved it to session history (`!`
+    /// feeds the next turn, `!!` stays out of the model context).
     Shell {
         command: String,
         output: String,
         success: bool,
         duration: f64,
+        excluded: bool,
     },
-}
-
-/// Split a `!` shell escape (like pi) into its command. Returns `None` when
-/// the line isn't a shell escape; `Some("")` for a bare `!` (usage, not a
-/// run). Everything after the first `!` is the command, newlines included.
-fn parse_shell_command(line: &str) -> Option<String> {
-    line.strip_prefix('!').map(|cmd| cmd.trim().to_string())
 }
 
 /// Client-server TUI: renders the exact same `App` view as the local engine,
@@ -88,6 +83,13 @@ struct RemoteApp {
     options: ChatOptions,
     worker_tx: mpsc::Sender<WorkerMessage>,
     worker_rx: mpsc::Receiver<WorkerMessage>,
+    /// A `!`/`!!` shell run is in flight on the worker (pi: one bash at a
+    /// time — a second is refused until this one finishes). Independent of
+    /// `app.busy`: a shell may overlap an agent turn like pi.
+    shell_running: bool,
+    /// A cancel for the in-flight shell was already requested (second
+    /// Ctrl+C force-quits instead of re-sending, mirroring the turn path).
+    shell_cancel_requested: bool,
     /// Paired with the current turn's worker; approval overlays resolve
     /// through it.
     decision_tx: mpsc::Sender<CoreApprovalDecision>,
@@ -396,6 +398,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         decision_tx,
         cancel_flag,
         last_click: None,
+        shell_running: false,
+        shell_cancel_requested: false,
     };
     // Background git poll off the UI thread (Phase 5): task polls every 2s,
     // pushes into the worker channel; UI loop only applies. Daemon 5s cache
@@ -537,9 +541,19 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                         output,
                         success,
                         duration,
+                        excluded,
                     }) => {
                         streamed = true;
-                        finish_shell_command(&mut remote, &command, &output, success, duration);
+                        remote.shell_running = false;
+                        remote.shell_cancel_requested = false;
+                        finish_shell_command(
+                            &mut remote,
+                            &command,
+                            &output,
+                            success,
+                            duration,
+                            excluded,
+                        );
                     }
                     Err(_) => break,
                 }
@@ -1225,6 +1239,10 @@ fn is_osc_prefix(body: &str) -> bool {
 }
 
 fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
+    // Copied before the `app` borrow: a `!` shell run is independent of
+    // `busy` but cancels the same way (pi: Esc cancels a running bash).
+    let shell_running = remote.shell_running;
+    let shell_cancel_requested = remote.shell_cancel_requested;
     let app = &mut remote.app;
 
     // Approval overlay takes precedence: the worker is blocked until a
@@ -1283,8 +1301,8 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.busy {
-                if app.cancel_requested {
+            if app.busy || shell_running {
+                if app.cancel_requested || shell_cancel_requested {
                     // Second Ctrl+C while a cancel is already in flight: the
                     // daemon is stuck, force-quit rather than stay trapped.
                     app.quit = true;
@@ -1306,7 +1324,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 }
             }
         }
-        KeyCode::Esc if app.busy => {
+        KeyCode::Esc if app.busy || shell_running => {
             request_cancel(remote);
         }
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
@@ -1412,35 +1430,46 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
 }
 
 fn request_cancel(remote: &mut RemoteApp) {
-    let app = &mut remote.app;
-    if !app.busy {
+    let turn_running = remote.app.busy;
+    if !turn_running && !remote.shell_running {
         return;
     }
-    app.cancel_requested = true;
-    remote.cancel_flag.store(true, Ordering::SeqCst);
-    // If an approval is blocking the turn, deny it first so the agent thread
-    // can unwind.
-    if app.pending_approval.take().is_some() {
-        let _ = remote.decision_tx.try_send(CoreApprovalDecision::Deny);
+    if turn_running {
+        remote.app.cancel_requested = true;
+        remote.cancel_flag.store(true, Ordering::SeqCst);
+        // If an approval is blocking the turn, deny it first so the agent thread
+        // can unwind.
+        if remote.app.pending_approval.take().is_some() {
+            let _ = remote.decision_tx.try_send(CoreApprovalDecision::Deny);
+        }
     }
+    if remote.shell_running {
+        remote.shell_cancel_requested = true;
+    }
+    // One Esc cancels whatever is running: the daemon signals the turn
+    // token and the shell token alike (a turn and a shell overlap only
+    // when the user explicitly started both, like pi).
     match remote.client.cancel(&remote.session_id) {
-        Ok(()) => push_info(app, "cancelling...".to_string()),
-        Err(e) => push_info(app, format!("cancel failed: {e}")),
+        Ok(()) => push_info(&mut remote.app, "cancelling...".to_string()),
+        Err(e) => push_info(&mut remote.app, format!("cancel failed: {e}")),
     }
 }
 
-/// Run a `!` shell escape on the daemon (like pi): no agent turn, no
-/// approval — the `!` itself is the approval. Renders the `!cmd` prompt now;
-/// the `bash` tool block lands when the worker answers. Display-only: the
-/// session is untouched, so the next turn starts clean.
-fn run_shell_command(remote: &mut RemoteApp, command: String) {
-    render_user_prompt(&mut remote.app, &format!("!{command}"));
+/// Run a `!`/`!!` shell escape on the daemon (like pi): no agent turn, no
+/// approval — the `!` itself is the approval. Renders the typed line now;
+/// the `bash` tool block lands when the worker answers. The daemon saves
+/// the run to session history: `!` feeds the next turn, `!!` stays out of
+/// the model context.
+fn run_shell_command(remote: &mut RemoteApp, line: String, command: String, excluded: bool) {
+    render_user_prompt(&mut remote.app, &line);
+    remote.shell_running = true;
+    remote.shell_cancel_requested = false;
     let client = remote.client.clone();
     let sid = remote.session_id.clone();
     let tx = remote.worker_tx.clone();
     crate::client::http::spawn_task(async move {
         let start = Instant::now();
-        match client.shell_async(&sid, &command).await {
+        match client.shell_async(&sid, &command, excluded).await {
             Ok(resp) => {
                 let _ = tx
                     .send(WorkerMessage::Shell {
@@ -1448,6 +1477,7 @@ fn run_shell_command(remote: &mut RemoteApp, command: String) {
                         output: resp.output,
                         success: resp.success,
                         duration: start.elapsed().as_secs_f64(),
+                        excluded,
                     })
                     .await;
             }
@@ -1458,6 +1488,7 @@ fn run_shell_command(remote: &mut RemoteApp, command: String) {
                         output: format!("Error: {error}"),
                         success: false,
                         duration: start.elapsed().as_secs_f64(),
+                        excluded,
                     })
                     .await;
             }
@@ -1465,15 +1496,16 @@ fn run_shell_command(remote: &mut RemoteApp, command: String) {
     });
 }
 
-/// Render a finished `!` shell run as one self-contained `bash` tool block.
-/// Pushed back-to-back (input then output) so no open block lingers while
-/// the command runs and concurrent turns can't steal either half.
+/// Render a finished `!`/`!!` shell run as one self-contained `bash` tool
+/// block. Pushed back-to-back (input then output) so no open block lingers
+/// while the command runs and concurrent turns can't steal either half.
 fn finish_shell_command(
     remote: &mut RemoteApp,
     command: &str,
     output: &str,
     success: bool,
     duration: f64,
+    excluded: bool,
 ) {
     let input = serde_json::json!({"command": command}).to_string();
     let short = crate::core::format::short_arg("bash", &input);
@@ -1481,7 +1513,10 @@ fn finish_shell_command(
         &mut remote.app,
         SinkLine::ToolInput(format!("bash {short}")),
     );
-    let summary = crate::core::format::tool_result_summary("bash", &input, output, success);
+    let mut summary = crate::core::format::tool_result_summary("bash", &input, output, success);
+    if excluded {
+        summary.push_str(" · excluded from context");
+    }
     let preview = crate::core::format::tool_preview("bash", success, None, output, true);
     append_sink_line(
         &mut remote.app,
@@ -1502,25 +1537,20 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     if line.is_empty() {
         return;
     }
-    // `!` shell escape first (before the busy queue): it never touches the
-    // agent loop, so there is no turn to steer — and running it alongside
-    // one would race the agent's own workspace mutations.
-    if let Some(command) = parse_shell_command(&line) {
-        remote.app.history_push(line);
+    // `!`/`!!` shell escape first (before the busy queue): it never touches
+    // the agent loop, so there is no turn to steer — and like pi it may run
+    // alongside one (only one shell at a time per session; Esc cancels it).
+    // A bare `!`/`!!` falls through to the agent like pi.
+    if let Some((command, excluded)) = crate::protocol::parse_shell_escape(&line) {
+        remote.app.history_push(line.clone());
         remote.app.input.reset();
-        if command.is_empty() {
+        if remote.shell_running {
             push_info(
                 &mut remote.app,
-                "usage: !<command> — run a shell command directly, no agent involved (like pi)."
-                    .to_string(),
-            );
-        } else if remote.app.busy {
-            push_info(
-                &mut remote.app,
-                "cannot run shell while a turn is running — wait for it to finish.".to_string(),
+                "A bash command is already running. Press Esc to cancel it first.".to_string(),
             );
         } else {
-            run_shell_command(remote, command);
+            run_shell_command(remote, line, command, excluded);
         }
         return;
     }
@@ -1945,8 +1975,12 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "prefix: !<command> runs a shell command directly, no agent involved (like pi)."
+                "prefix: !<command> runs shell directly, output feeds the next turn (like pi)."
                     .to_string(),
+            );
+            push_info(
+                &mut remote.app,
+                "prefix: !!<command> keeps the output out of model context.".to_string(),
             );
             push_info(
                 &mut remote.app,
@@ -2281,27 +2315,6 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shell_escape_splits_command() {
-        assert_eq!(parse_shell_command("!ls -la"), Some("ls -la".to_string()));
-        assert_eq!(
-            parse_shell_command("!  echo hi  "),
-            Some("echo hi".to_string())
-        );
-        // Bare `!` is usage, not a run.
-        assert_eq!(parse_shell_command("!"), Some(String::new()));
-        assert_eq!(parse_shell_command("!   "), Some(String::new()));
-        // Multiline scripts run whole.
-        assert_eq!(
-            parse_shell_command("!echo a\necho b"),
-            Some("echo a\necho b".to_string())
-        );
-        // Ordinary prompts and slash commands are not shell escapes.
-        assert_eq!(parse_shell_command("hello"), None);
-        assert_eq!(parse_shell_command("/model foo"), None);
-        assert_eq!(parse_shell_command(""), None);
-    }
 
     #[test]
     fn output_rate_needs_output_and_timing() {
