@@ -33,10 +33,11 @@ use super::slash::{
     slash_suggestions, EXPAND_ON_ENTER,
 };
 use super::{
-    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
-    line_width, mouse_display_cell, push_banner, push_info, push_info_line, render_user_prompt,
-    resolve_approval, scroll_transcript, selection_text, settle_activity, start_activity, view,
-    word_bounds, App, EnableMouseScroll, PendingApproval, Selection, TerminalCleanup,
+    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, last_col,
+    line_selection_text, mouse_display_cell, push_banner, push_info, push_info_line,
+    render_user_prompt, resolve_approval, scroll_transcript, selection_text, settle_activity,
+    start_activity, view, word_bounds, App, EnableMouseScroll, PendingApproval, Selection,
+    TerminalCleanup,
 };
 
 /// Process start for the `ready in …` session-start line. Marked at `main()`
@@ -633,7 +634,7 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     }),
                 Some((row, _)) if clicks == 3 => Some(Selection {
                     anchor: (row, 0),
-                    end: (row, line_width(&remote.app.display_cache[row])),
+                    end: (row, last_col(&remote.app.display_cache[row])),
                     sticky: true,
                     whole_line: true,
                 }),
@@ -658,7 +659,7 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     if sel.whole_line {
                         // Line selects extend by whole rows; the anchor row
                         // (the press point) stays put, xterm-style.
-                        sel.end = (cell.0, line_width(&remote.app.display_cache[cell.0]));
+                        sel.end = (cell.0, last_col(&remote.app.display_cache[cell.0]));
                     } else {
                         sel.end = cell;
                     }
@@ -670,8 +671,15 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
             // picks) stay highlighted after release until the next press;
             // drag selections clear.
             let sticky = remote.app.selection.is_some_and(|s| s.sticky);
+            // A released drag breaks the multi-click chain: the next press
+            // starts a fresh count instead of compounding into word/line
+            // picks from where the drag happened to begin.
+            let dragged = remote
+                .app
+                .selection
+                .is_some_and(|s| !s.sticky && !s.is_empty());
             if let Some(sel) = remote.app.selection {
-                if !sel.is_empty() {
+                if sel.sticky || !sel.is_empty() {
                     let text = if sel.whole_line {
                         let r0 = sel.anchor.0.min(sel.end.0);
                         let r1 = sel.anchor.0.max(sel.end.0);
@@ -685,6 +693,9 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
             }
             if !sticky {
                 remote.app.selection = None;
+            }
+            if dragged {
+                remote.last_click = None;
             }
         }
         _ => {}

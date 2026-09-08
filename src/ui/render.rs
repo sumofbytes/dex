@@ -814,8 +814,9 @@ const SEL_BG: Color = Color::Indexed(24);
 
 /// Paint the mouse selection onto the visible window rows. Fully covered
 /// rows become a solid bar (style patch + padding to the area width); the
-/// anchor/end rows highlight only the selected cell range. Whole-line
-/// (triple-click) selections paint every covered row as a solid bar.
+/// anchor/end rows highlight only the selected cell range, end cell
+/// inclusive. Whole-line (triple-click) selections paint every covered row
+/// as a solid bar.
 fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, width: u16) {
     let ((r0, c0), (r1, c1)) = sel.norm();
     let hl = Style::default().bg(SEL_BG);
@@ -832,11 +833,11 @@ fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, 
             continue;
         }
         let (from, to) = if row == r0 && row == r1 {
-            (c0, c1)
+            (c0, c1 + 1)
         } else if row == r0 {
             (c0, usize::MAX)
         } else {
-            (0, c1)
+            (0, c1 + 1)
         };
         style_row_range(line, from, to, hl);
         if to == usize::MAX || to >= line.width() {
@@ -1683,6 +1684,41 @@ mod tests {
     use crate::core::types::{ApiProtocol, PermissionMode, Provider};
     use ratatui::backend::TestBackend;
     use std::time::Instant;
+
+    #[test]
+    fn apply_selection_highlights_end_cell_inclusively() {
+        // Releasing on a char selects it: the last char's cell must get the
+        // selection background, not stop one short of it.
+        let mut window = vec![Line::from("hello world")];
+        apply_selection(
+            &mut window,
+            0,
+            Selection {
+                anchor: (0, 6),
+                end: (0, 10),
+                sticky: false,
+                whole_line: false,
+            },
+            20,
+        );
+        let highlighted: String = window[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(SEL_BG))
+            .map(|s| s.content.as_ref())
+            .collect();
+        // "world" highlighted; the bar pads out to the area width because
+        // the selection reaches the row's last char.
+        assert_eq!(highlighted.trim_end(), "world");
+        // Untouched prefix stays plain.
+        let plain: String = window[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg.is_none())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(plain, "hello ");
+    }
 
     fn test_app() -> super::super::App {
         let cwd = "/tmp/dex-ui-test".to_string();
