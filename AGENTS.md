@@ -16,13 +16,14 @@ Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX
 ## Structure
 
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
-- `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Update`)
+- `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Doctor`/`Update`/`Mcp`/`Help`/`Version`)
 - `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
 - `src/agent/` — `loop.rs` turn loop, `state.rs`, `compaction.rs`
 - `src/llm/` — provider clients, streaming parsers, `config.rs` (provider/model/endpoint resolution, `/model` write-back, `dex doctor`), `prompt.rs` (system prompt)
 - `src/tools/` — workspace-confined tools (`mod.rs`, `fff.rs` for fff engine)
+- `src/mcp.rs` + `src/mcp/` — MCP client (stdio/HTTP/SSE, OAuth, `mcp_servers:` config)
 - `src/session.rs` — append-only JSONL (`$XDG_DATA_HOME/dex/sessions/<slug>/*.jsonl`)
-- `src/skills.rs` / `src/ui/` / `src/core/` — skills discovery, TUI, formatting
+- `src/skills.rs` / `src/ui.rs` + `src/ui/` / `src/core/` — skills discovery, TUI, formatting
 - This file + `CLAUDE.md` (if present, nearest parent wins) is auto-appended to the system prompt via `src/llm/prompt.rs:project_context()`.
 
 ## Config surface
