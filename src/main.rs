@@ -27,6 +27,53 @@ use serde_json::{json, Map, Value};
 use std::env;
 use std::io::{self, Write};
 
+/// Cost below this is noise on the one-shot summary line; also guards
+/// float equality when pricing data is missing (cost rounds to 0.0).
+const COST_SUMMARY_MIN_USD: f64 = 5e-4;
+
+/// One-shot stderr spend summary (`None` when nothing was reported): total
+/// prompt/output tokens, plus USD once it clears [`COST_SUMMARY_MIN_USD`].
+/// Output-only usage still summarizes — some providers omit prompt tokens.
+fn spend_summary(usage: u64, output: u64, cost: f64) -> Option<String> {
+    if usage == 0 && output == 0 {
+        return None;
+    }
+    let mut summary = format!("[dex] {usage} prompt / {output} output tokens");
+    if cost > COST_SUMMARY_MIN_USD {
+        summary.push_str(&format!(" · ${cost:.3}"));
+    }
+    Some(summary)
+}
+
+/// Per-request overrides built from CLI flags — shared by the TUI's remote
+/// client and the `dex connect <url> "prompt"` one-shot, so daemon-backed
+/// runs keep flag parity with in-process mode.
+pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
+    client::http::ChatOptions {
+        skill_dirs: args
+            .skill_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        base_url: args.base_url.clone(),
+        model: args.model.clone(),
+        permission: args.permission.map(|mode| mode.as_str().to_string()),
+        headers: if args.headers.is_empty() {
+            None
+        } else {
+            let mut merged = std::collections::BTreeMap::new();
+            for raw in &args.headers {
+                for (k, v) in crate::llm::config::parse_headers_str(raw) {
+                    crate::llm::config::insert_extra_header(&mut merged, &k, &v);
+                }
+            }
+            Some(merged)
+        },
+        plan: None,
+        idempotency_key: None,
+    }
+}
+
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // MCP bootstrap (background connect; schema merges whatever is cached).
     // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
@@ -41,10 +88,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     if let Some(warning) = config.thinking_mismatch_warning() {
         eprintln!("dex: {warning}");
     }
-    // Verification opt-in only — see daemon/server.rs.
-    if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
-        config.verify_command = crate::llm::config::detect_verify_command();
-    }
+    // Verification opt-in only — see llm/config.rs.
+    crate::llm::config::apply_verify_optin(&mut config);
     let mut skill_dirs = skill_dirs();
     skill_dirs.extend(args.skill_dirs.iter().cloned());
     let skills = discover_skills(&skill_dirs);
@@ -114,7 +159,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             "turn_failed"
         });
     }
-    println!();
+    // Spend summary for scripts — stderr only, so stdout stays model prose.
+    if let Some(summary) = spend_summary(state.total_usage, state.total_output, state.total_cost) {
+        eprintln!("{summary}");
+    }
     result
         .map(|_| ())
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
@@ -273,7 +321,12 @@ fn main() {
             let result = match prompt {
                 Some(prompt) => client::http::DaemonClient::new(&url).and_then(|client| {
                     client.wait_until_ready(std::time::Duration::from_secs(10))?;
-                    client::repl::one_shot(&client, &prompt)
+                    client::repl::one_shot(
+                        &client,
+                        &prompt,
+                        &chat_options_from_args(&args),
+                        args.session_name.as_deref(),
+                    )
                 }),
                 None => ui::run_ratatui_repl_with_remote(&args, &url).map_err(Into::into),
             };
@@ -387,5 +440,26 @@ fn main() {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spend_summary_gates_and_formats() {
+        assert_eq!(spend_summary(0, 0, 0.0), None);
+        // Output-only usage still summarizes (prompt may be unreported).
+        assert_eq!(
+            spend_summary(0, 12, 0.0).as_deref(),
+            Some("[dex] 0 prompt / 12 output tokens")
+        );
+        // Sub-threshold cost is hidden; above it, three decimals.
+        assert!(!spend_summary(10, 2, 0.0001).unwrap().contains('$'));
+        assert_eq!(
+            spend_summary(10, 2, 0.0123).as_deref(),
+            Some("[dex] 10 prompt / 2 output tokens · $0.012")
+        );
     }
 }

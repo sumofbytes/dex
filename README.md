@@ -26,6 +26,9 @@ sessions and can be resumed.
 - **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
+- **Herdr-aware** — running inside a [Herdr](https://herdr.dev) pane
+  (`HERDR_ENV=1`), dex reports `working`/`blocked`/`idle` to the Herdr sidebar
+  via `pane report-agent`; no-op everywhere else.
 - **No telemetry** — dex makes network calls only to the LLM providers you
   configure (plus `models.dev` for the model catalog). Nothing else.
 

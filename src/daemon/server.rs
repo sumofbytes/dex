@@ -918,9 +918,7 @@ async fn run_turn_inner(
     // `cargo test` after every edit is the biggest loop tax.
     // Set DEX_VERIFY or config verify_command, or DEX_VERIFY=1 with a manifest,
     // to re-enable: `DEX_VERIFY=1` or explicit `verify_command` in config.
-    if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
-        config.verify_command = crate::llm::config::detect_verify_command();
-    }
+    crate::llm::config::apply_verify_optin(&mut config);
 
     // Skills are resolved on the daemon (its filesystem is the workspace).
     // Async dir scans + concurrent reads (Phase 6).
