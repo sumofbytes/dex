@@ -45,6 +45,7 @@ impl InputField {
 
     pub(super) fn insert_char(&mut self, c: char) {
         if c == '\n' {
+            self.clamp_col();
             let line = std::mem::take(&mut self.lines[self.row]);
             let (left, right) = line.split_at(self.col);
             self.lines.insert(self.row + 1, right.to_string());
@@ -53,9 +54,7 @@ impl InputField {
             self.col = 0;
             return;
         }
-        if self.col > self.lines[self.row].len() {
-            self.col = self.lines[self.row].len();
-        }
+        self.clamp_col();
         self.lines[self.row].insert(self.col, c);
         self.col += c.len_utf8();
     }
@@ -168,9 +167,18 @@ impl InputField {
         }
     }
 
+    /// Clamp `col` to a char boundary on the current row. A byte offset that
+    /// is a boundary on one row can land inside a multi-byte char on another
+    /// (arrow-key row moves through pasted multi-line text); `String::insert`
+    /// / `split_at` panic on such an offset — which exits the whole TUI — so
+    /// the cursor snaps left to the char start instead.
     fn clamp_col(&mut self) {
-        let max = self.lines[self.row].len();
-        self.col = self.col.min(max);
+        let line = &self.lines[self.row];
+        let mut col = self.col.min(line.len());
+        while col > 0 && !line.is_char_boundary(col) {
+            col -= 1;
+        }
+        self.col = col;
     }
 }
 
@@ -212,6 +220,30 @@ mod tests {
             f.text().contains("10;rgb:"),
             "plain is inserted when it reaches input"
         );
+    }
+
+    #[test]
+    fn row_move_into_multibyte_line_snaps_cursor() {
+        // Regression: clamp_col clamped to byte length only, so a byte offset
+        // that was a boundary on the previous row landed inside a multi-byte
+        // char after Up/Down; the next keystroke panicked `String::insert`
+        // and exited the TUI. Paste multi-line text with a wide char, arrow
+        // across rows, then type.
+        let mut f = InputField::from_text("abcd\nab\u{7AC7}def"); // 界 = bytes 2..5
+        assert_eq!(f.row, 1);
+        f.handle_key(key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(f.row, 0);
+        assert_eq!(f.col, 4);
+        f.handle_key(key(KeyCode::Down, KeyModifiers::empty()));
+        // Byte 4 sits inside 界 on this row: cursor snaps to the char start.
+        assert_eq!(f.row, 1);
+        assert_eq!(f.col, 2);
+        f.handle_key(key(KeyCode::Char('i'), KeyModifiers::empty()));
+        assert_eq!(f.lines[1], "abi\u{7AC7}def");
+        // Enter at a snapped col must not panic either.
+        f.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(f.lines[1], "abi");
+        assert_eq!(f.lines[2], "\u{7AC7}def");
     }
 
     #[test]

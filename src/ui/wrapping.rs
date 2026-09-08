@@ -9,7 +9,13 @@ const TAB_WIDTH: usize = 8;
 
 pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u16, u16) {
     let width = width.max(1);
-    let col = col.min(line.len());
+    // Clamp to a char boundary too: a byte col valid on one row can sit
+    // inside a multi-byte char on this one (cross-row cursor moves), and
+    // `line[start..col]` below would panic mid-render.
+    let mut col = col.min(line.len());
+    while col > 0 && !line.is_char_boundary(col) {
+        col -= 1;
+    }
     let mut segments = Vec::new();
     let mut start = 0;
     let mut row_width = 0;
@@ -130,6 +136,16 @@ mod tests {
         assert_eq!(lines, vec!["ab", "界d"]);
         assert_eq!((row, column), (1, 2));
         assert_eq!(UnicodeWidthStr::width(lines[1].as_str()), 3);
+    }
+
+    #[test]
+    fn cursor_col_inside_multibyte_char_snaps_back() {
+        // A byte col landing inside a wide char (stale cross-row offset from
+        // the editor) must not slice mid-char; the cursor snaps to the
+        // char's left boundary instead of panicking the frame.
+        let (lines, row, column) = wrap_line("ab\u{7AC7}def", 80, 4);
+        assert_eq!(lines, vec!["ab\u{7AC7}def"]);
+        assert_eq!((row, column), (0, 2));
     }
 
     #[test]
