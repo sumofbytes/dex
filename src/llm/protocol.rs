@@ -30,7 +30,7 @@ pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamTo
 }
 
 pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
-    // Industry harnesses (pi, claude) ship 4-6 tools. `chain` and `git`
+    // Six default tools. `chain` and `git`
     // cost ~800 prompt tokens per request and are rarely used — `read`
     // fan-out + parallel calls cover the same, and `git` is reachable via
     // `bash "git ..."`. Gate them behind DEX_EXTRA_TOOLS=1 for compat.
@@ -355,7 +355,7 @@ mod tests {
     fn tools_schema_contains_all_tools() {
         let schema = tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
-        // Default is 6 tools (pi parity); DEX_EXTRA_TOOLS=1 adds git+chain
+        // Default is 6 tools; DEX_EXTRA_TOOLS=1 adds git+chain
         if std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1") {
             assert_eq!(
                 names,

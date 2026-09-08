@@ -83,9 +83,9 @@ struct RemoteApp {
     options: ChatOptions,
     worker_tx: mpsc::Sender<WorkerMessage>,
     worker_rx: mpsc::Receiver<WorkerMessage>,
-    /// A `!`/`!!` shell run is in flight on the worker (pi: one bash at a
+    /// A `!`/`!!` shell run is in flight on the worker (one bash at a
     /// time — a second is refused until this one finishes). Independent of
-    /// `app.busy`: a shell may overlap an agent turn like pi.
+    /// `app.busy`: a shell may overlap an agent turn.
     shell_running: bool,
     /// A cancel for the in-flight shell was already requested (second
     /// Ctrl+C force-quits instead of re-sending, mirroring the turn path).
@@ -1245,7 +1245,7 @@ fn is_osc_prefix(body: &str) -> bool {
 
 fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     // Copied before the `app` borrow: a `!` shell run is independent of
-    // `busy` but cancels the same way (pi: Esc cancels a running bash).
+    // `busy` but cancels the same way (Esc cancels it).
     let shell_running = remote.shell_running;
     let shell_cancel_requested = remote.shell_cancel_requested;
     let app = &mut remote.app;
@@ -1326,7 +1326,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 }
             } else if !app.input.text().is_empty() {
                 // First press with a drafted prompt just clears the composer
-                // (claudecode/pi parity); quitting needs an empty line.
+                // quitting needs an empty line.
                 app.input.reset();
                 app.slash_selected = 0;
                 app.last_ctrl_c = None;
@@ -1351,7 +1351,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 && !shell_running
                 && app.input.text().trim().is_empty() =>
         {
-            // EOF-quit on an empty composer (pi parity); a draft or a live
+            // EOF-quit on an empty composer; a draft or a live
             // turn/shell falls through to the composer below.
             app.quit = true;
         }
@@ -1486,14 +1486,14 @@ fn request_cancel(remote: &mut RemoteApp) {
     }
     // One Esc cancels whatever is running: the daemon signals the turn
     // token and the shell token alike (a turn and a shell overlap only
-    // when the user explicitly started both, like pi).
+    // when the user explicitly started both).
     match remote.client.cancel(&remote.session_id) {
         Ok(()) => push_info(&mut remote.app, "cancelling...".to_string()),
         Err(e) => push_info(&mut remote.app, format!("cancel failed: {e}")),
     }
 }
 
-/// Run a `!`/`!!` shell escape on the daemon (like pi): no agent turn, no
+/// Run a `!`/`!!` shell escape on the daemon: no agent turn, no
 /// approval — the `!` itself is the approval. Renders the typed line now;
 /// the `bash` tool block lands when the worker answers. The daemon saves
 /// the run to session history: `!` feeds the next turn, `!!` stays out of
@@ -1577,9 +1577,9 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
         return;
     }
     // `!`/`!!` shell escape first (before the busy queue): it never touches
-    // the agent loop, so there is no turn to steer — and like pi it may run
+    // the agent loop, so there is no turn to steer — and it may run
     // alongside one (only one shell at a time per session; Esc cancels it).
-    // A bare `!`/`!!` falls through to the agent like pi.
+    // A bare `!`/`!!` falls through to the agent.
     if let Some((command, excluded)) = crate::protocol::parse_shell_escape(&line) {
         remote.app.history_push(line.clone());
         remote.app.input.reset();
@@ -2015,8 +2015,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "prefix: !<command> runs shell directly, output feeds the next turn (like pi)."
-                    .to_string(),
+                "prefix: !<command> runs shell directly, output feeds the next turn.".to_string(),
             );
             push_info(
                 &mut remote.app,

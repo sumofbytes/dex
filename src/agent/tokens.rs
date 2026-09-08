@@ -41,7 +41,7 @@ impl std::io::Write for ByteCounter {
 
 /// Byte length of a message's replayed payload (content, tool calls,
 /// reasoning, framing) — the shared body of the token estimator, used by
-/// `estimate_tokens` and the pi-style cut-point walk.
+/// `estimate_tokens` and the cut-point walk.
 pub(crate) fn message_char_len(message: &ChatMessage) -> usize {
     let mut len = message.content.as_deref().map_or(0, str::len)
         + message.tool_calls.as_ref().map_or(0, |calls| {

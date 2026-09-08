@@ -780,8 +780,8 @@ impl DaemonClient {
     }
 
     /// Run a shell command directly on the daemon (`!`/`!!` prefix in the
-    /// TUI). `exclude_from_context` is pi's `!!`: saved to history and
-    /// shown, but never sent to the LLM.
+    /// TUI). `exclude_from_context` (`!!`): saved to history and shown,
+    /// but never sent to the LLM.
     pub async fn shell_async(
         &self,
         session_id: &str,

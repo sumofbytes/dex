@@ -888,8 +888,8 @@ async fn run_turn_inner(
     )
     .await
     .map_err(|e| format!("failed to build config: {e}"))?;
-    // Console Go routing requires `x-opencode-session` (pi sends the same
-    // pair). Auto-fill from the dex session id; explicit per-request headers
+    // Console Go routing requires `x-opencode-session`.
+    // Auto-fill from the dex session id; explicit per-request headers
     // below still win on collision.
     crate::llm::config::apply_opencode_session_headers(
         &mut config.extra_headers,
@@ -915,7 +915,7 @@ async fn run_turn_inner(
         }
     }
     // Verification is opt-in (DEX_VERIFY / config verify_command). No
-    // auto-detect by default — pi has no verify hook and auto-running
+    // auto-detect by default — auto-running
     // `cargo test` after every edit is the biggest loop tax.
     // Set DEX_VERIFY or config verify_command, or DEX_VERIFY=1 with a manifest,
     // to re-enable: `DEX_VERIFY=1` or explicit `verify_command` in config.
@@ -1331,7 +1331,7 @@ async fn cancel(
     {
         token.cancel();
     }
-    // Same for an in-flight `!` shell run (pi: Esc cancels a running bash).
+    // Same for an in-flight `!` shell run (Esc cancels it).
     // One Esc cancels whatever is running; a turn and a shell overlap only
     // when the user explicitly started both.
     if let Some(token) = state
@@ -1594,16 +1594,16 @@ async fn session_waive(
 }
 
 /// `POST /api/sessions/{id}/shell` with `{"command": ...}` — run a shell
-/// command directly in the daemon workspace (`!`/`!!` prefix in the TUI,
-/// like pi). Bypasses the agent loop and approvals: the explicit `!` is
+/// command directly in the daemon workspace (`!`/`!!` prefix in the TUI).
+/// Bypasses the agent loop and approvals: the explicit `!` is
 /// the approval (even in `read-only`, which constrains the model, not your
-/// own typing). Like pi the run is saved to session history: `!` feeds the
+/// own typing). The run is saved to session history: `!` feeds the
 /// next turn as a user message, `!!` (`exclude_from_context`) is saved too
 /// but filtered out of the model-bound history at load. Empty commands are
 /// a 400, unknown sessions a 404, and a second run while one is in flight
 /// for the session is a 409 (the TUI refuses it first; this guards direct
-/// API callers). A concurrent agent turn is allowed — pi runs `!` alongside
-/// a turn and folds the result into context afterwards; both append to the
+/// API callers). A concurrent agent turn is allowed — `!` may run alongside
+/// a turn and the result folds into context afterwards; both append to the
 /// append-only journal, ordered by completion.
 async fn session_shell(
     State(state): State<Arc<DaemonState>>,
@@ -1818,7 +1818,7 @@ mod handler_tests {
           )
           .unwrap();
         let (state, id) = state_with_session(&path);
-        // A registered in-flight run makes a second one 409 (pi: one bash
+        // A registered in-flight run makes a second one 409 (one bash
         // at a time; Esc cancels the first).
         state
             .shell_tokens
@@ -1854,7 +1854,7 @@ mod handler_tests {
         let body = r.expect("shell run").0;
         assert!(!body.success);
         assert!(body.output.contains("[exit 3]"));
-        // pi: runs persist to history and feed the next turn.
+        // Runs persist to history and feed the next turn.
         let loaded = crate::session::load_messages_from_session(&path).unwrap();
         assert!(
             loaded
@@ -1883,7 +1883,7 @@ mod handler_tests {
             .iter()
             .any(|m| m.content_str().contains("Ran `echo hi`")));
         assert!(!llm.iter().any(|m| m.content_str().contains("secret")));
-        // /cancel signals an in-flight shell run too (pi: Esc cancels bash).
+        // /cancel signals an in-flight shell run too (Esc cancels it).
         let token = crate::core::console::CancellationToken::new();
         state
             .shell_tokens
@@ -2499,7 +2499,7 @@ mod e2e_tests {
         .unwrap();
         chat_result.unwrap();
 
-        // Pi has no permission popups — default is trusted, so write succeeds without approval.
+        // Default is trusted, so write succeeds without approval.
         let approvals: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
