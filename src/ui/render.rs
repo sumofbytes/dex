@@ -1915,6 +1915,7 @@ mod tests {
             pending_steering: Vec::new(),
             pending_followups: Vec::new(),
             cancel_requested: false,
+            cancel_presses: 0,
             approval_rx: None,
             pending_approval: None,
             busy: false,

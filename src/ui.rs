@@ -212,6 +212,9 @@ pub(crate) struct App {
     pub(crate) pending_steering: Vec<String>,
     pub(crate) pending_followups: Vec<String>,
     pub(crate) cancel_requested: bool,
+    /// Busy Ctrl+C presses since the current cancel started; the third press
+    /// force-quits (stuck daemon). Reset wherever `cancel_requested` resets.
+    pub(crate) cancel_presses: u8,
     pub(crate) approval_rx: Option<mpsc::Receiver<crate::core::types::ApprovalRequest>>,
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) busy: bool,
@@ -1366,6 +1369,7 @@ mod tests {
             pending_steering: Vec::new(),
             pending_followups: Vec::new(),
             cancel_requested: false,
+            cancel_presses: 0,
             approval_rx: None,
             pending_approval: None,
             busy: false,
