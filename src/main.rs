@@ -75,9 +75,9 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
 }
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // `!`/`!!` shell escape (like pi): run directly, no agent turn, no
+    // `!`/`!!` shell escape: run directly, no agent turn, no
     // approval — the `!` itself is the approval. A bare `!`/`!!` falls
-    // through to the agent like pi. The run is saved to the session so a
+    // through to the agent. The run is saved to the session so a
     // later turn sees it (`!` in context, `!!` excluded); `--no-session`
     // keeps it ephemeral.
     if let Some((command, excluded)) = crate::protocol::parse_shell_escape(prompt.trim()) {
@@ -105,8 +105,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             };
             match opened {
                 Ok(mut session) => {
-                    // Same shape the daemon persists (pi's `bashExecution`
-                    // text); `!!` is tagged out of the model-bound history.
+                    // Same text the daemon persists for shell runs;
+                    // `!!` is tagged out of the model-bound history.
                     let text = crate::core::format::bash_context_text(
                         &command,
                         &output,
@@ -191,7 +191,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         let _ = session.append_message(&user);
     }
     messages.push(user);
-    // Console Go routing requires `x-opencode-session` (same pair pi sends);
+    // Console Go routing requires `x-opencode-session`;
     // explicit `--header` flags already baked into `extra_headers` still win.
     if let Some(session) = session.as_ref() {
         crate::llm::config::apply_opencode_session_headers(
@@ -415,7 +415,7 @@ fn main() {
                     std::process::exit(1);
                 }
             } else {
-                eprintln!("usage: dex update --models  (like pi update --models)");
+                eprintln!("usage: dex update --models");
                 std::process::exit(1);
             }
         }

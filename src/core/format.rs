@@ -161,8 +161,8 @@ fn truncate_cols(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// Compact read target for the transcript input line, in editor goto style
-/// like opencode/pi: bare `path` for a whole-file read, `path:from-to` when
+/// Compact read target for the transcript input line, in editor goto style:
+/// bare `path` for a whole-file read, `path:from-to` when
 /// paginating, `path:from+` for an open-ended offset, `N files` for fan-out
 /// (so `paths:[...]` never dumps raw JSON), or the glob. Raw JSON is never
 /// shown.
@@ -261,7 +261,7 @@ pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool
     preview
 }
 
-/// Read snippet à la opencode/pi: the `{:>4}  content` numbered gutter is
+/// Read snippet: the `{:>4}  content` numbered gutter is
 /// kept verbatim (trimmed on the right only, so gutter alignment and code
 /// indent survive — unlike the generic preview, which trims both sides),
 /// `==> file <==` fan-out headers stay as landmarks, and `[... N more
@@ -375,7 +375,7 @@ pub(crate) fn tool_preview_body(name: &str, ok: bool, diff: Option<&str>, result
 
 /// Outcome-first, human-sized result for the TUI transcript: the ✓/✗ glyph
 /// and its color already carry success/failure, so the summary leads with
-/// Read outcome in opencode/pi style: `lines A-B · M lines (+N more)` for a
+/// Read outcome: `lines A-B · M lines (+N more)` for a
 /// paginated or truncated read, `F files · M lines` for fan-out, and the plain
 /// `M lines` count otherwise. The range comes from the numbered gutter
 /// actually shown (truthful under clamping); `[... N more lines …]`
@@ -560,7 +560,7 @@ pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
 }
 
-/// Model-facing text for a `!`/`!!` shell run (pi's `bashExecutionToText`):
+/// Model-facing text for a `!`/`!!` shell run:
 /// the persisted message the next turn reads. The output is already clamped
 /// for the context window by the bash tool. Single owner for the daemon
 /// (`POST /shell`) and local one-shot paths so the two can't diverge.
@@ -903,7 +903,7 @@ pub(crate) fn mcp_status_line(statuses: &[crate::mcp::ServerStatus]) -> Option<S
     Some(format!("MCP servers: {}", parts.join(", ")))
 }
 
-/// Multi-line `/mcp` panel in Claude Code style: one header with totals,
+/// Multi-line `/mcp` panel: one header with totals,
 /// then per server a `✓ name — N tools` line (with each tool + its one-line
 /// description indented beneath) or a `✗ name — down: <reason>` line.
 /// `tools` is the cached schema slice; only `mcp__<server>__*` entries

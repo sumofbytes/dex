@@ -98,7 +98,7 @@ fn context_style(app: &App, tokens: u64) -> Style {
     }
 }
 
-/// Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
+/// Session cost: `$X.XXX`, catalog-priced when possible
 /// else `DEX_COST_PER_1K` fallback. `Some` once any prompt has been billed.
 /// Shared by the full and narrowed status lines so spend stays visible when
 /// the full line no longer fits beside the connection badge. Styled in the
@@ -254,7 +254,7 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
             pieces.push(quiet(format!("{rate:.0} tok/s")));
         }
     }
-    // Session cost like pi's footer: `$X.XXX`, catalog-priced when possible
+    // Session cost: `$X.XXX`, catalog-priced when possible
     // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
     push_cost(&mut pieces, app);
     pieces

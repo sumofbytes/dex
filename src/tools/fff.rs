@@ -1,5 +1,5 @@
 //! fff-powered search: `grep` (content) and `find` (paths) — aliases `ffgrep`/`fffind` kept for compat, backed by the
-//! fff-search crate (the engine behind pi's fff extension and fff.nvim).
+//! fff-search crate (also the engine behind fff.nvim).
 //! One shared picker per process; fff spawns its own background scan and
 //! filesystem watcher, so results stay fresh without rescans.
 

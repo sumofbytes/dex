@@ -10,14 +10,14 @@ use crate::llm::streaming::complete as call_llm;
 
 pub(crate) use super::tokens::{effective_tokens, estimate_tokens};
 
-/// Pi-like settings — direct port of `pi`'s `DEFAULT_COMPACTION_SETTINGS`.
+/// Compaction settings — token-based keep-recent with a message-count fallback.
 /// `keepRecentTokens=20000` (token-based); dex keeps 12 messages as
 /// fallback when total tokens < keep_recent (dex compat for many short msgs).
 pub(crate) const KEEP_RECENT_MESSAGES: usize = 12;
 pub(crate) const MIN_MESSAGES_TO_SUMMARIZE: usize = 8;
 
 // ---------------------------------------------------------------------------
-// Pi-like helpers: cut points, turn starts, file ops, serialization
+// Helpers: cut points, turn starts, file ops, serialization
 // ---------------------------------------------------------------------------
 
 fn is_cut_point_message(msg: &ChatMessage) -> bool {
@@ -25,8 +25,7 @@ fn is_cut_point_message(msg: &ChatMessage) -> bool {
 }
 
 fn is_turn_start_message(msg: &ChatMessage) -> bool {
-    // In pi: user, bashExecution, custom, branchSummary, compactionSummary are turn starts.
-    // In dex: only user starts a turn.
+    // Only user messages start a turn.
     msg.role == Role::User
 }
 
@@ -53,7 +52,7 @@ struct CutPoint {
     is_split_turn: bool,
 }
 
-/// Pi's `findCutPoint` — walk backwards until `keepRecentTokens`, cut at
+/// Find the cut point — walk backwards until `keepRecentTokens`, cut at
 /// next valid user/assistant boundary, handle split turns.
 /// `start` is boundaryStart (after previous compaction), `end` is messages.len().
 /// `min_keep_messages` is the fallback recent-window size (12 normally,
@@ -73,7 +72,7 @@ fn find_cut_point(
     let mut cut_index = cut_points[0];
     let mut hit_budget = false;
     for i in (start..end).rev() {
-        // pi estimates per message via chars/4; dex adds overhead — keep dex estimator for parity
+        // Estimate per message via chars/4 plus per-message overhead.
         let len = message_char_len(&messages[i]);
         let est = (len as u64) / 4 + PER_MESSAGE_OVERHEAD;
         if est == 0 {
@@ -93,7 +92,7 @@ fn find_cut_point(
         }
     }
     if !hit_budget {
-        // pi returns undefined when nothing to summarize; dex keeps fallback window
+        // Nothing token-worthy to summarize — keep a fallback window
         // so many short messages still compact (dex compat).
         if end - start <= 1 + min_keep_messages {
             return None;
@@ -164,7 +163,7 @@ fn find_cut_point(
     })
 }
 
-// File tracking — pi's `createFileOps` / `extractFileOpsFromMessage` / `computeFileLists`
+// File tracking — read/written/edited sets extracted from tool calls
 #[derive(Default)]
 struct FileOps {
     read: HashSet<String>,
@@ -239,8 +238,8 @@ fn format_file_operations(read_files: &[String], modified_files: &[String]) -> S
     }
 }
 
-/// Pi's `serializeConversation` — prevents the summarizer from continuing the conversation.
-/// Tool results truncated to 2000 chars (pi's `TOOL_RESULT_MAX_CHARS`).
+/// Serialize the conversation for the summarizer — prevents it from continuing the conversation.
+/// Tool results truncated to 2000 chars.
 fn serialize_conversation(messages: &[ChatMessage]) -> String {
     const TOOL_RESULT_MAX: usize = 2000;
     let mut parts = Vec::new();
@@ -305,7 +304,7 @@ pub(crate) async fn summarize_old_messages(
     old: &[ChatMessage],
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<(String, Option<Usage>), Box<dyn std::error::Error + Send + Sync>> {
-    // Pi-like: serialize via `serialize_conversation` (via convertToLlm -> serialize),
+    // Serialize via `serialize_conversation`,
     // handle previousSummary iterative, file ops via prompt, and custom instructions.
     // Preserve orientation anchors verbatim so compaction never erases the task.
     let has_plan = old.iter().any(|m| m.name.as_deref() == Some("plan"));
@@ -372,7 +371,7 @@ fn merge_usage(acc: &mut Option<Usage>, u: Option<Usage>) {
 }
 
 /// Deterministic fallback when the LLM summarizer fails or is cancelled.
-/// Pi-structured: Goal, Constraints, Progress, Key Decisions, Next Steps, Critical Context,
+/// Structured summary: Goal, Constraints, Progress, Key Decisions, Next Steps, Critical Context,
 /// plus <read-files>/<modified-files>. Keeps file ops and verification failures.
 fn deterministic_summary(
     old: &[ChatMessage],
@@ -449,7 +448,7 @@ fn deterministic_summary(
     let (read_files, modified_files) = compute_file_lists(file_ops);
     let file_section = format_file_operations(&read_files, &modified_files);
 
-    // Build pi-structured summary
+    // Build the structured summary
     let mut out = String::new();
     out.push_str("## Goal\n");
     out.push_str(&goal);
@@ -506,7 +505,7 @@ fn deterministic_summary(
 /// after the cutoff is kept whole, so an assistant-with-tool_calls at the
 /// cutoff is fine (its results follow it). Returns None if there is nothing
 /// large enough to summarize.
-/// Pi: walk back until keepRecentTokens (20000) is reached; dex falls back
+/// Walk back until keepRecentTokens (20000) is reached; fall back
 /// to KEEP_RECENT_MESSAGES (12) when total tokens < keep_recent.
 #[cfg(test)]
 pub(crate) fn find_cutoff_by_tokens(
@@ -517,8 +516,8 @@ pub(crate) fn find_cutoff_by_tokens(
     if total <= 1 {
         return None;
     }
-    // Pi-like: find valid cut points and walk backwards
-    // Check for previous summary to set boundaryStart pi-like
+    // Find valid cut points and walk backwards
+    // Check for a previous summary to set the boundary start
     let boundary_start = messages
         .iter()
         .rposition(|m| m.name.as_deref() == Some("summary"))
@@ -597,7 +596,7 @@ pub(crate) async fn compact_history(
         return Ok((false, None));
     }
 
-    // Pi's prepareCompaction: messagesToSummarize = boundary_start..historyEnd, turnPrefix = turnStart..firstKept if split
+    // messages_to_summarize = boundary_start..history_end; turn_prefix = turn_start..first_kept if split
     let history_end = if cp.is_split_turn {
         cp.turn_start_index.unwrap_or(first_kept)
     } else {
@@ -614,7 +613,7 @@ pub(crate) async fn compact_history(
         return Ok((false, None));
     }
 
-    // File ops cumulative — pi extracts from previous compaction + messages
+    // File ops are cumulative — extracted from the previous compaction + messages
     let previous_summary = messages
         .iter()
         .find(|m| m.name.as_deref() == Some("summary"))
@@ -630,7 +629,7 @@ pub(crate) async fn compact_history(
         extract_file_ops_from_message(msg, &mut file_ops);
     }
 
-    // Generate summary — pi's `compact()` merges two summaries for split turns
+    // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
     let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
         // Use LLM path: if split, generate history + turn prefix separately then merge
@@ -689,7 +688,7 @@ pub(crate) async fn compact_history(
                         deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
                     }
                 };
-            // Merge pi-like: history + "---" + turn context
+            // Merge: history + "---" + turn context
             let (read_files, modified_files) = compute_file_lists(&file_ops);
             let file_section = format_file_operations(&read_files, &modified_files);
             format!(
@@ -716,7 +715,7 @@ pub(crate) async fn compact_history(
         )
     };
 
-    // Pi's `firstKeptEntryId` is the kept boundary; dex splices from
+    // The kept boundary; dex splices from
     // boundary_start..first_kept. Repeated compactions previously spliced
     // from index 1, which left BOTH the old and the new summary in the
     // transcript — the model then re-read a stale checkpoint (and the old
@@ -887,7 +886,7 @@ mod tests {
 
     #[test]
     fn cutoff_preserves_last_user_prompt() {
-        // Pi-like: compaction inside a turn with many tool calls must not evict the prompt.
+        // Compaction inside a turn with many tool calls must not evict the prompt.
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "first goal: build foo"));
         for i in 0..5 {
@@ -919,7 +918,7 @@ mod tests {
             .unwrap();
         assert!(
             cutoff <= last_user,
-            "cutoff {} evicted last_user {} (pi bug)",
+            "cutoff {} evicted last_user {} (must not happen)",
             cutoff,
             last_user
         );
@@ -927,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_summary_is_pi_structured() {
+    fn deterministic_summary_is_structured() {
         let mut old = vec![
             msg(Role::User, "Goal: fix compaction"),
             msg(Role::Assistant, "did read src/foo.rs"),
@@ -950,10 +949,13 @@ mod tests {
             extract_file_ops_from_message(m, &mut ops);
         }
         let summary = deterministic_summary(&old, &[], None, &ops);
-        assert!(summary.contains("## Goal"), "pi structure missing Goal");
+        assert!(
+            summary.contains("## Goal"),
+            "summary structure missing Goal"
+        );
         assert!(
             summary.contains("## Progress"),
-            "pi structure missing Progress"
+            "summary structure missing Progress"
         );
         assert!(summary.contains("<read-files>"), "file ops missing");
         assert!(summary.contains("src/foo.rs"));

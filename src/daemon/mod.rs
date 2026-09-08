@@ -148,8 +148,8 @@ pub(crate) struct DaemonState {
     /// signals the token so this turn unwinds without touching other
     /// sessions; the entry is removed when the turn finishes.
     pub cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
-    /// Per-session cancellation tokens for in-flight `!` shell runs (pi:
-    /// Esc cancels a running bash). POST /cancel signals these too; the
+    /// Per-session cancellation tokens for in-flight `!` shell runs (Esc
+    /// cancels a running bash). POST /cancel signals these too; the
     /// entry is removed when the run finishes. At most one run per session
     /// (a second `POST /shell` while one is registered is 409).
     pub shell_tokens: Mutex<HashMap<String, CancellationToken>>,

@@ -3113,8 +3113,8 @@ mod tests {
 
     #[test]
     fn blank_runs_render_one_air_row() {
-        // Double/triple blank lines collapse to one air row (CommonMark and
-        // pi/codex/opencode all render a single separator for a blank run).
+        // Double/triple blank lines collapse to one air row (CommonMark renders
+        // a single separator for a blank run).
         let src = crate::core::markdown::normalize_gaps(
             "",
             "para one\n\n\n\npara two\n\n\n- a\n- b\n\n\ntail",

@@ -31,7 +31,7 @@ pub struct SessionInfo {
 /// Request to run a shell command directly (`!`/`!!` prefix in the TUI),
 /// bypassing the agent loop. Runs the daemon's `bash` tool in the session
 /// workspace with no approval step — the `!` itself is the approval.
-/// `exclude_from_context` is pi's `!!`: the run is still saved to session
+/// `exclude_from_context` (`!!`): the run is still saved to session
 /// history and shown in the transcript, but never sent to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellRequest {
@@ -50,10 +50,10 @@ pub struct ShellResponse {
     pub code: Option<i32>,
 }
 
-/// Split a `!`/`!!` shell escape (pi) into `(command, exclude_from_context)`.
+/// Split a `!`/`!!` shell escape into `(command, exclude_from_context)`.
 /// `!cmd` feeds the next turn; `!!cmd` stays out of the LLM context. Returns
 /// `None` when the line isn't a shell escape — including a bare `!`/`!!`,
-/// which falls through to the agent like pi instead of erroring. Everything
+/// which falls through to the agent instead of erroring. Everything
 /// after the prefix is the command, newlines included.
 pub fn parse_shell_escape(line: &str) -> Option<(String, bool)> {
     let (rest, excluded) = match line.strip_prefix("!!") {
@@ -398,7 +398,7 @@ mod tests {
             parse_shell_escape("!echo a\necho b"),
             Some(("echo a\necho b".to_string(), false))
         );
-        // Bare `!`/`!!` fall through to the agent like pi (usage, not a run).
+        // Bare `!`/`!!` fall through to the agent (usage, not a run).
         assert_eq!(parse_shell_escape("!"), None);
         assert_eq!(parse_shell_escape("!   "), None);
         assert_eq!(parse_shell_escape("!!"), None);

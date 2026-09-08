@@ -6,18 +6,21 @@ Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`
 one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
 sessions and can be resumed.
 
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how
+to build, test, and submit changes. Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md), and file bugs or ideas in
+[GitHub issues](https://github.com/arpitsr/dex/issues).
+
 ## Features
 
 - **OpenAI-compatible backend** — supports Chat Completions and Responses
   endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, etc.). Streaming responses,
   automatic retries with exponential backoff, and configurable reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
-  and edit files, search the filesystem. Extra tools (`git`, `chain`) behind `DEX_EXTRA_TOOLS=1`. Tool output caching disabled by default; set `DEX_TOOL_CACHE=1` to opt in. Pi-fast defaults: minimal prompt, parallel `write`/`edit` on distinct files, deterministic compaction, no per-turn `git`/`verify` tax.
-- **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript
-  (via `ratatui-markdown`), a custom multi-line input editor with an inline
-  block cursor and soft-wrapping (no `tui-textarea` underline / horizontal
-  overflow), a solid-bordered input box, autoscroll, a status bar, and a
-  visible steering/follow-up queue while the agent is working.
+  and edit files, search the filesystem. Extra tools (`git`, `chain`) behind `DEX_EXTRA_TOOLS=1`. Tool output caching is off by default; set `DEX_TOOL_CACHE=1` to opt in.
+- **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript,
+  multi-line input, autoscroll, a status bar, and a visible
+  steering/follow-up queue while the agent is working.
 - **Session persistence** — each conversation is saved as a JSONL log. A fresh
   session starts by default; use `--session` to explicitly continue one.
 - **Skills** — lightweight, discoverable agent skills (directories with a
@@ -46,8 +49,6 @@ curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh
 - Custom directory: `DEX_INSTALL_DIR=/usr/local/bin curl -fsSL .../install.sh | sh`
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/arpitsr/dex/releases).
-
-Or build from source:
 
 ## Building
 
@@ -129,7 +130,7 @@ to the canonical spots:
 
 | Deprecated                | Replacement                                        |
 | ------------------------- | -------------------------------------------------- |
-| `active_provider:`        | put the provider in `model:` as `provider/model`   |
+| `active_provider:` / `provider:` | put the provider in `model:` as `provider/model` |
 | top-level `base_url:`     | `base_url:` under the provider's entry in `providers:` |
 | top-level `api:`          | `api:` under the provider's entry in `providers:`  |
 | top-level `headers:` / `http_headers:` | `headers:` under the provider's entry (provider-scoped) or `DEX_HEADERS` (global) |
@@ -254,7 +255,7 @@ done
 ### Model catalog
 
 `dex update --models` refreshes the cached model catalog (context windows
-and `/model` autocomplete; like `pi update --models`).
+and `/model` autocomplete).
 
 ```sh
 dex update --models
@@ -331,7 +332,10 @@ In the interactive TUI, actions requiring approval open a dedicated overlay.
 Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
 or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
-Any other arguments are treated as a one-shot prompt.
+Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
+`connect`, `run`, `update --models`, `mcp`, `doctor`) are covered under
+Usage / Model catalog above; `--help`/`-h` and `--version`/`-V` print help
+and version without touching config or network.
 
 ## TUI slash commands
 
@@ -348,6 +352,7 @@ Any other arguments are treated as a one-shot prompt.
 | `/skill:<name>`     | Load a skill's full content into the conversation.    |
 | `/model`           | Show the current model and wire protocol.            |
 | `/model <name>`     | Switch the model for the rest of the session.         |
+| `/thinking [<level>\|clear]` | Show or set reasoning effort.           |
 | `/waive <reason>`   | Waive verification with a reason.                    |
 | `/undo`             | Undo the last recorded file change.                  |
 | `/provider`        | Show the current and available providers.             |
@@ -357,7 +362,7 @@ Any other arguments are treated as a one-shot prompt.
 ### Shell escape
 
 Prefix any TUI input with `!` to run it as a shell command directly, without
-involving the agent (like pi):
+involving the agent:
 
 ```
 > !ls -la
@@ -369,7 +374,7 @@ a tool block. It needs no approval — the `!` itself is the approval, even in
 `read-only` mode (that mode constrains the model, not your own typing) — and
 the run is saved to session history: `!` output feeds the model's context on
 the next turn, while `!!` stays visible in the transcript but is never sent
-to the model. A shell run may overlap an agent turn (like pi); only one `!`
+to the model. A shell run may overlap an agent turn; only one `!`
 runs at a time per session — a second is refused until the first finishes,
 and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
 `dex connect <url> "!<command>"` do the same without the TUI.
@@ -448,8 +453,8 @@ schema):
 | `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
 | `chain`* | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`. |
 
-`*` behind `DEX_EXTRA_TOOLS=1` — pi parity is 6 tools. Tool results are truncated before being sent back to the model, and a result
-cache (`dex-tool-cache.json`) is kept across runs to reduce redundant work. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
+`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
+cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
 
 ### MCP servers
 
@@ -501,7 +506,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
 | `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`). |
-| `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
+| `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default. |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
@@ -510,9 +515,12 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_MCP` / `DEX_NO_MCP` | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers. |
 | `DEX_MCP_MAX_TOOLS` | Cap on merged MCP schema tools (default 200; head kept sorted by name). |
 | `DEX_COST_PER_1K` | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`). |
-| `DEX_CONTEXT_WINDOW` | Override model context window (pi: per-model from catalog, e.g. gpt-5.6 1050000, claude 200k, muse 1048576). |
-| `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384, pi: `compaction.reserveTokens`). |
-| `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000, pi: `compaction.keepRecentTokens`). |
+| `DEX_CONTEXT_WINDOW` | Override model context window (per-model from catalog when unset). |
+| `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384). |
+| `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000). |
+| `DEX_TOOL_CACHE` | `1` to cache tool results across runs (`dex-tool-cache.json`; default off). |
+| `DEX_CONFIG` | Override the config file path (default `$XDG_CONFIG_HOME/dex/config.yaml`). |
+| `CODEX_HOME` | Directory holding Codex `auth.json` (default `~/.codex`). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |
 
@@ -539,15 +547,16 @@ dex/
     ├── llm/              # provider clients, streaming parsers, auth, config
     ├── session.rs        # JSONL session persistence
     ├── tools/            # builtin tools: read, bash, write, edit, ffgrep, fffind (fff engine)
+    ├── mcp.rs + mcp/     # MCP client: stdio/HTTP/SSE servers, OAuth login
     ├── skills.rs         # skill discovery
-    └── ui/               # ratatui TUI (local event loop + remote client UI)
+    └── ui.rs + ui/       # ratatui TUI (local event loop + remote client UI)
 ```
 
 ## How it works
 
 A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
-model with tools enabled, executes any requested tool calls in parallel ( `write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
-results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (pi: `reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
+model with tools enabled, executes any requested tool calls in parallel (`write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
+results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (`reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default. Progress is reported through a `Console` (streamed lines + approval
 requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and
@@ -556,6 +565,38 @@ translates console output into `StreamEvent`s over SSE
 from a worker thread and renders them live; approvals and cancellation are
 round-tripped over `POST .../approve` and `POST .../cancel`. The local TUI
 (`src/ui/event.rs`) runs the same loop in-process with direct channels.
+
+## Acknowledgments
+
+`dex` interoperates with conventions from across the terminal-agent
+ecosystem: `CLAUDE.md` project instructions and `ANTHROPIC_CUSTOM_HEADERS`
+(Claude Code), session headers and response-first wire negotiation on the
+`opencode` gateway (OpenCode), OAuth via `codex --login` (Codex),
+token-based compaction settings (`pi-mono`), and `fff-search` file search
+(`fff.nvim`). Model metadata comes from the models.dev catalog.
+
+## Support
+
+- Bugs: open an [issue](https://github.com/arpitsr/dex/issues/new?template=bug_report.md)
+  with `dex --version`, redacted config, and steps to reproduce.
+- Ideas: open a [feature request](https://github.com/arpitsr/dex/issues/new?template=feature_request.md).
+- Security: do not open a public issue — see [SECURITY.md](SECURITY.md).
+- There is no chat or discussion forum; GitHub issues are the contact channel.
+
+## Contributing
+
+Contributions are welcome. There is no formal roadmap — open or pick up an
+issue labeled [`good first issue` or `help wanted`](https://github.com/arpitsr/dex/issues).
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) first and follow the
+[Code of Conduct](CODE_OF_CONDUCT.md). By contributing you agree your work
+is dual-licensed MIT/Apache-2.0 like the rest of the project.
+
+Status: pre-`1.0` (`0.x`) — usable daily but expect breaking changes until a
+`1.0` release.
+
+Note: the name `dex` collides with an unrelated `dex` crate on crates.io, so
+`dex` is distributed via [GitHub releases](https://github.com/arpitsr/dex/releases)
+and `scripts/install.sh`, not `cargo install`.
 
 ## License
 
