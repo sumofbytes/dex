@@ -892,55 +892,55 @@ fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
     Some(value)
 }
 
-fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
+/// models.dev catalog `limit.<key>` for `model` (`context` = window,
+/// `output` = generation cap). Matches either cache shape — api.json
+/// (per-provider models) or catalog.json (flat models map) — case-
+/// insensitively.
+fn catalog_limit(model: &str, catalog: &serde_json::Value, key: &str) -> Option<u64> {
     let needle = model.to_ascii_lowercase();
     // catalog is api.json (providers) or catalog.json (models+providers) — try both shapes
     if let Some(providers) = catalog.as_object() {
-        // api.json shape: { "opencode": { models: { "id": { limit:{context} } } } }
-        for (_prov, entry) in providers {
-            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                if let Some(m) = models.get(needle.as_str()).or_else(|| {
+        let lookup = |models: &serde_json::Map<String, serde_json::Value>| {
+            models
+                .get(needle.as_str())
+                .or_else(|| {
                     // fallback case-insensitive scan
                     models
                         .iter()
                         .find(|(k, _)| k.to_ascii_lowercase() == needle)
                         .map(|(_, v)| v)
-                }) {
-                    if let Some(ctx) = m
-                        .get("limit")
-                        .and_then(|l| l.get("context"))
-                        .and_then(|c| c.as_u64())
-                    {
-                        return Some(ctx);
-                    }
+                })
+                .and_then(|m| m.get("limit"))
+                .and_then(|l| l.get(key))
+                .and_then(|c| c.as_u64())
+        };
+        // api.json shape: { "opencode": { models: { "id": { limit:{context} } } } }
+        for (_prov, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                if let Some(v) = lookup(models) {
+                    return Some(v);
                 }
             }
         }
         // catalog.json shape: { models: { "id": { limit } }, providers: { } }
         if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
-            if let Some(m) = models.get(needle.as_str()) {
-                if let Some(ctx) = m
-                    .get("limit")
-                    .and_then(|l| l.get("context"))
-                    .and_then(|c| c.as_u64())
-                {
-                    return Some(ctx);
-                }
-            }
-            for (k, m) in models {
-                if k.to_ascii_lowercase() == needle {
-                    if let Some(ctx) = m
-                        .get("limit")
-                        .and_then(|l| l.get("context"))
-                        .and_then(|c| c.as_u64())
-                    {
-                        return Some(ctx);
-                    }
-                }
+            if let Some(v) = lookup(models) {
+                return Some(v);
             }
         }
     }
     None
+}
+
+fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
+    catalog_limit(model, catalog, "context")
+}
+
+/// models.dev `limit.output` for the model — the generation cap wires that
+/// must declare one up front (Anthropic `max_tokens`) clamp against. Reads
+/// the cached catalog parse, so safe on hot paths.
+pub(crate) fn catalog_output_limit_for(model: &str) -> Option<u64> {
+    load_dex_catalog().and_then(|c| catalog_limit(model, &c, "output"))
 }
 
 /// Endpoint URL serving `model` per the models.dev catalog, for bare model

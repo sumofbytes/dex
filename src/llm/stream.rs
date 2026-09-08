@@ -1014,6 +1014,9 @@ fn stop_reason_from_anthropic(stop: &str) -> Option<StopReason> {
         "max_tokens" | "model_context_window" => Some(StopReason::Length),
         "tool_use" => Some(StopReason::ToolUse),
         "refusal" => Some(StopReason::ContentFilter),
+        // `pause_turn` suspends a server-tool turn for continuation; dex
+        // drives its own turns, so a paused stream is just a finished one.
+        "pause_turn" => Some(StopReason::Stop),
         // Unrecognized provider reason — leave unset rather than guess.
         _ => None,
     }
@@ -1029,7 +1032,7 @@ struct AnthropicBlock {
     name: String,
     /// `input_json_delta` fragments for tool_use blocks.
     json: String,
-    /// text_delta / thinking_delta accumulation.
+    /// thinking_delta accumulation (replayed for signed thinking blocks).
     text: String,
     /// signature_delta accumulation (required to replay thinking).
     signature: String,
@@ -1166,11 +1169,11 @@ impl StreamParser for AnthropicParser {
                     .unwrap_or_default()
                 {
                     "text_delta" => {
+                        // Text flows to the caller via StreamEvent::Text;
+                        // blocks only accumulate state that gets replayed
+                        // (thinking), so nothing to keep here.
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             events.push(StreamEvent::Text(text.to_string()));
-                            if let Some(block) = self.block(&event) {
-                                block.text.push_str(text);
-                            }
                         }
                     }
                     "thinking_delta" => {
@@ -1464,6 +1467,7 @@ mod tests {
             ("model_context_window", StopReason::Length),
             ("tool_use", StopReason::ToolUse),
             ("refusal", StopReason::ContentFilter),
+            ("pause_turn", StopReason::Stop),
         ] {
             let (tx, _rx) = mpsc::channel(32);
             let lines: &[&str] = &[&format!(
