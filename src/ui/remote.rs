@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
     KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
-    PushKeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -593,12 +593,16 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // error) — otherwise a stale agent row lingers in the Herdr sidebar.
     herdr.release();
     // Always restore the terminal, even if the loop returned early via `?`.
+    // Mirrors `TerminalCleanup::drop` (Pop undoes the Kitty disambiguate
+    // push above; harmless where unsupported). Drop still runs after this
+    // as the backstop for `?` early-returns that skip this block.
     disable_raw_mode().ok();
     let _ = execute!(
         io::stdout(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
         DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
+        DisableMouseCapture
     );
     res
 }

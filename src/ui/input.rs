@@ -93,12 +93,17 @@ impl InputField {
                     self.insert_char(c);
                 }
             }
-            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+            KeyCode::Char('j')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 // Ctrl+J (LF, 0x0A) is the universal newline fallback:
                 // legacy terminals report Shift+Enter as bare `\r`, identical
-                // to Enter, until the Kitty protocol is negotiated (remote.rs).
+                // to Enter, until the Kitty disambiguate flag is pushed (remote.rs).
                 // Ctrl+J arrives as a distinct byte everywhere — same
                 // convention as Codex/opencode — so it always means newline.
+                // SHIFT is tolerated (Ctrl+Shift+J still newlines); ALT is
+                // excluded so Alt-chorded bindings stay reserved.
                 self.insert_char('\n');
             }
             KeyCode::Char(_) => {}
@@ -238,9 +243,21 @@ mod tests {
         let mut f = InputField::from_text("ab");
         f.handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(f.text(), "ab\n", "Ctrl+J must insert a newline");
+        // Ctrl+Shift+J still newlines (SHIFT tolerated).
+        f.handle_key(key(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(f.text(), "ab\n\n", "Ctrl+Shift+J must insert a newline");
+        // Alt-chorded Ctrl+J stays reserved (dropped).
+        f.handle_key(key(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(f.text(), "ab\n\n", "Ctrl+Alt+J must stay dropped");
         // Other Ctrl-modified chars are still dropped (OSC-report guard).
         f.handle_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        assert_eq!(f.text(), "ab\n", "Ctrl+G must stay dropped");
+        assert_eq!(f.text(), "ab\n\n", "Ctrl+G must stay dropped");
     }
 
     #[test]
