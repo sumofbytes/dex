@@ -85,10 +85,46 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
     None
 }
 
+/// One-shot mode: `!<command>` runs a shell command directly on the daemon
+/// (like pi); anything else sends a single prompt and prints the response.
+/// `options` carries the CLI flag overrides (`--model`, `-H`, `--skill`, …)
+/// so `dex connect <url> "prompt"` keeps flag parity with the TUI.
+pub(crate) fn one_shot(
+    client: &DaemonClient,
+    prompt: &str,
+    options: &ChatOptions,
+    session_name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `!` shell escape (like pi): run directly on the daemon, no agent turn.
+    if let Some(command) = prompt.trim().strip_prefix('!').map(str::trim) {
+        if command.is_empty() {
+            return Err(
+                "usage: !<command> — run a shell command directly, no agent involved.".into(),
+            );
+        }
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let session = client.create_session(&cwd, session_name)?;
+        let resp = client.shell(&session.session_id, command)?;
+        if resp.success {
+            print!("{}", resp.output);
+            if !resp.output.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        } else {
+            Err(resp.output.into())
+        }
+    } else {
+        one_shot_chat(client, prompt, options, session_name)
+    }
+}
+
 /// One-shot mode: send a single prompt and print the response. `options`
 /// carries the CLI flag overrides (`--model`, `-H`, `--skill`, …) so
 /// `dex connect <url> "prompt"` keeps flag parity with the TUI.
-pub(crate) fn one_shot(
+fn one_shot_chat(
     client: &DaemonClient,
     prompt: &str,
     options: &ChatOptions,
@@ -167,6 +203,28 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
             } else {
                 println!("cancel sent");
             }
+            continue;
+        }
+        // `!` shell escape (like pi): run directly, no agent turn.
+        if let Some(command) = input.strip_prefix('!').map(str::trim) {
+            if command.is_empty() {
+                eprintln!("usage: !<command> — run a shell command directly");
+            } else {
+                match client.shell(&session.session_id, command) {
+                    Ok(resp) => {
+                        if resp.success {
+                            print!("{}", resp.output);
+                            if !resp.output.ends_with('\n') {
+                                println!();
+                            }
+                        } else {
+                            eprintln!("{}", resp.output);
+                        }
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            println!();
             continue;
         }
 

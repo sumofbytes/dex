@@ -354,6 +354,23 @@ Any other arguments are treated as a one-shot prompt.
 | `/provider <name>` | Switch provider for the rest of the session.          |
 | `/help` (unknown)   | Unknown commands print a hint.                        |
 
+### Shell escape
+
+Prefix any TUI input with `!` to run it as a shell command directly, without
+involving the agent (like pi):
+
+```
+> !ls -la
+> !cargo test -- --nocapture
+```
+
+The command runs in the daemon workspace via the `bash` tool and renders as
+a tool block. It needs no approval — the `!` itself is the approval, even in
+`read-only` mode — and it never touches the conversation: no session write,
+so the next turn starts clean. While a turn is running `!` is refused (it
+would race the agent's own workspace mutations). `dex "!<command>"` and
+`dex connect <url> "!<command>"` do the same without the TUI.
+
 ### Keyboard controls
 
 - **Enter** — submit the current input.

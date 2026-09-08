@@ -28,6 +28,24 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+/// Request to run a shell command directly (`!` prefix in the TUI),
+/// bypassing the agent loop. Runs the daemon's `bash` tool in the session
+/// workspace with no approval step — the `!` itself is the approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellRequest {
+    pub command: String,
+}
+
+/// Response from running a shell command directly. `output` is the combined
+/// stdout/stderr (already clamped for display); `code` is the process exit
+/// code (`None` when killed or timed out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellResponse {
+    pub output: String,
+    pub success: bool,
+    pub code: Option<i32>,
+}
+
 /// Request to enqueue a steering message into an active turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerRequest {
@@ -309,6 +327,25 @@ mod tests {
         .unwrap();
         assert!(back.thinking_effort.is_none());
         assert!(back.thinking_warning.is_none());
+    }
+
+    #[test]
+    fn shell_request_response_round_trip() {
+        let req = ShellRequest {
+            command: "ls -la".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ShellRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.command, "ls -la");
+        let resp = ShellResponse {
+            output: "ok".into(),
+            success: true,
+            code: Some(0),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: ShellResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.success);
+        assert_eq!(back.code, Some(0));
     }
 
     #[test]

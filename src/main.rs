@@ -75,8 +75,25 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
 }
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // MCP bootstrap (background connect; schema merges whatever is cached).
-    // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
+    // `!` shell escape (like pi): run directly, no agent turn, no session.
+    if let Some(command) = prompt.trim().strip_prefix('!').map(str::trim) {
+        if command.is_empty() {
+            return Err(
+                "usage: dex \"!<command>\" — run a shell command directly, no agent involved."
+                    .into(),
+            );
+        }
+        let mut map = Map::new();
+        map.insert("command".to_string(), Value::String(command.to_string()));
+        return match execute("bash", &map, &GlobalCancellation) {
+            Ok(out) => {
+                print!("{out}");
+                Ok(())
+            }
+            Err(error) => Err(format!("Error: {error}").into()),
+        };
+    } // MCP bootstrap (background connect; schema merges whatever is cached).
+      // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
     crate::mcp::global_manager();
     let mut config = LlmConfig::from_env(
         args.base_url.clone(),

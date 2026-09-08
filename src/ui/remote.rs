@@ -62,6 +62,21 @@ enum WorkerMessage {
     Finished(Option<String>),
     /// Background git poll result (off UI thread, every 2s).
     Git(crate::protocol::GitInfo),
+    /// A direct shell run (`!` prefix) finished on the daemon. Rendered as a
+    /// `bash` tool block; display-only, never sent to the model.
+    Shell {
+        command: String,
+        output: String,
+        success: bool,
+        duration: f64,
+    },
+}
+
+/// Split a `!` shell escape (like pi) into its command. Returns `None` when
+/// the line isn't a shell escape; `Some("")` for a bare `!` (usage, not a
+/// run). Everything after the first `!` is the command, newlines included.
+fn parse_shell_command(line: &str) -> Option<String> {
+    line.strip_prefix('!').map(|cmd| cmd.trim().to_string())
 }
 
 /// Client-server TUI: renders the exact same `App` view as the local engine,
@@ -516,6 +531,15 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                     Ok(WorkerMessage::Finished(error)) => {
                         streamed = true;
                         finish_turn(&mut remote, error);
+                    }
+                    Ok(WorkerMessage::Shell {
+                        command,
+                        output,
+                        success,
+                        duration,
+                    }) => {
+                        streamed = true;
+                        finish_shell_command(&mut remote, &command, &output, success, duration);
                     }
                     Err(_) => break,
                 }
@@ -1405,9 +1429,99 @@ fn request_cancel(remote: &mut RemoteApp) {
     }
 }
 
+/// Run a `!` shell escape on the daemon (like pi): no agent turn, no
+/// approval — the `!` itself is the approval. Renders the `!cmd` prompt now;
+/// the `bash` tool block lands when the worker answers. Display-only: the
+/// session is untouched, so the next turn starts clean.
+fn run_shell_command(remote: &mut RemoteApp, command: String) {
+    render_user_prompt(&mut remote.app, &format!("!{command}"));
+    let client = remote.client.clone();
+    let sid = remote.session_id.clone();
+    let tx = remote.worker_tx.clone();
+    crate::client::http::spawn_task(async move {
+        let start = Instant::now();
+        match client.shell_async(&sid, &command).await {
+            Ok(resp) => {
+                let _ = tx
+                    .send(WorkerMessage::Shell {
+                        command,
+                        output: resp.output,
+                        success: resp.success,
+                        duration: start.elapsed().as_secs_f64(),
+                    })
+                    .await;
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(WorkerMessage::Shell {
+                        command,
+                        output: format!("Error: {error}"),
+                        success: false,
+                        duration: start.elapsed().as_secs_f64(),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+/// Render a finished `!` shell run as one self-contained `bash` tool block.
+/// Pushed back-to-back (input then output) so no open block lingers while
+/// the command runs and concurrent turns can't steal either half.
+fn finish_shell_command(
+    remote: &mut RemoteApp,
+    command: &str,
+    output: &str,
+    success: bool,
+    duration: f64,
+) {
+    let input = serde_json::json!({"command": command}).to_string();
+    let short = crate::core::format::short_arg("bash", &input);
+    append_sink_line(
+        &mut remote.app,
+        SinkLine::ToolInput(format!("bash {short}")),
+    );
+    let summary = crate::core::format::tool_result_summary("bash", &input, output, success);
+    let preview = crate::core::format::tool_preview("bash", success, None, output, true);
+    append_sink_line(
+        &mut remote.app,
+        SinkLine::ToolOutput {
+            name: "bash".into(),
+            summary,
+            success,
+            preview,
+            duration,
+        },
+    );
+    // The command may have switched branches or dirtied the tree.
+    refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
+}
+
 fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let line = remote.app.input.text().trim().to_string();
     if line.is_empty() {
+        return;
+    }
+    // `!` shell escape first (before the busy queue): it never touches the
+    // agent loop, so there is no turn to steer — and running it alongside
+    // one would race the agent's own workspace mutations.
+    if let Some(command) = parse_shell_command(&line) {
+        remote.app.history_push(line);
+        remote.app.input.reset();
+        if command.is_empty() {
+            push_info(
+                &mut remote.app,
+                "usage: !<command> — run a shell command directly, no agent involved (like pi)."
+                    .to_string(),
+            );
+        } else if remote.app.busy {
+            push_info(
+                &mut remote.app,
+                "cannot run shell while a turn is running — wait for it to finish.".to_string(),
+            );
+        } else {
+            run_shell_command(remote, command);
+        }
         return;
     }
     // While busy, queue steering (mid-turn) or follow-up (chained turn) to
@@ -1831,6 +1945,11 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
+                "prefix: !<command> runs a shell command directly, no agent involved (like pi)."
+                    .to_string(),
+            );
+            push_info(
+                &mut remote.app,
                 "keys: Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
@@ -2162,6 +2281,27 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_escape_splits_command() {
+        assert_eq!(parse_shell_command("!ls -la"), Some("ls -la".to_string()));
+        assert_eq!(
+            parse_shell_command("!  echo hi  "),
+            Some("echo hi".to_string())
+        );
+        // Bare `!` is usage, not a run.
+        assert_eq!(parse_shell_command("!"), Some(String::new()));
+        assert_eq!(parse_shell_command("!   "), Some(String::new()));
+        // Multiline scripts run whole.
+        assert_eq!(
+            parse_shell_command("!echo a\necho b"),
+            Some("echo a\necho b".to_string())
+        );
+        // Ordinary prompts and slash commands are not shell escapes.
+        assert_eq!(parse_shell_command("hello"), None);
+        assert_eq!(parse_shell_command("/model foo"), None);
+        assert_eq!(parse_shell_command(""), None);
+    }
 
     #[test]
     fn output_rate_needs_output_and_timing() {

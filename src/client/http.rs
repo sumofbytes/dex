@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use crate::protocol::{
     ApprovalDecision, ApprovalResponse, ChatRequest, CreateSessionRequest, CreateSessionResponse,
     DaemonInfo, EventsResponse, FollowupRequest, GitInfo, LoadSkillRequest, LoadSkillResponse,
-    ReattachResponse, SessionInfo, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
+    ReattachResponse, SessionInfo, ShellRequest, ShellResponse, SkillInfo, SteerRequest,
+    StreamEnvelope, StreamEvent,
 };
 
 /// Per-request overrides forwarded to the daemon with a chat turn.
@@ -776,6 +777,38 @@ impl DaemonClient {
         name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         block_on(self.rename_session_async(session_id, name))
+    }
+
+    /// Run a shell command directly on the daemon (`!` prefix in the TUI).
+    pub async fn shell_async(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<ShellResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/api/sessions/{}/shell",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .json(&ShellRequest {
+                command: command.to_string(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ShellResponse>()
+            .await?;
+        Ok(resp)
+    }
+
+    pub fn shell(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<ShellResponse, Box<dyn std::error::Error>> {
+        block_on(self.shell_async(session_id, command)).map_err(|e| e.to_string().into())
     }
 
     /// Enqueue a steering message into an active turn (mid-turn injection).
