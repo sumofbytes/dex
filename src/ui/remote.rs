@@ -33,10 +33,11 @@ use super::slash::{
     slash_suggestions, EXPAND_ON_ENTER,
 };
 use super::{
-    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, line_selection_text,
-    line_width, mouse_display_cell, push_banner, push_info, push_info_line, render_user_prompt,
-    resolve_approval, scroll_transcript, selection_text, settle_activity, start_activity, view,
-    word_bounds, App, EnableMouseScroll, PendingApproval, Selection, TerminalCleanup,
+    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, last_col,
+    line_selection_text, mouse_display_cell, push_banner, push_info, push_info_line,
+    render_user_prompt, resolve_approval, scroll_transcript, selection_text, settle_activity,
+    start_activity, view, word_bounds, App, EnableMouseScroll, PendingApproval, Selection,
+    TerminalCleanup,
 };
 
 /// Process start for the `ready in …` session-start line. Marked at `main()`
@@ -633,10 +634,7 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     }),
                 Some((row, _)) if clicks == 3 => Some(Selection {
                     anchor: (row, 0),
-                    end: (
-                        row,
-                        line_width(&remote.app.display_cache[row]).saturating_sub(1),
-                    ),
+                    end: (row, last_col(&remote.app.display_cache[row])),
                     sticky: true,
                     whole_line: true,
                 }),
@@ -661,10 +659,7 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     if sel.whole_line {
                         // Line selects extend by whole rows; the anchor row
                         // (the press point) stays put, xterm-style.
-                        sel.end = (
-                            cell.0,
-                            line_width(&remote.app.display_cache[cell.0]).saturating_sub(1),
-                        );
+                        sel.end = (cell.0, last_col(&remote.app.display_cache[cell.0]));
                     } else {
                         sel.end = cell;
                     }

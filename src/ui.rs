@@ -460,10 +460,17 @@ pub(crate) fn word_bounds(line: &Line<'static>, col: usize) -> Option<(usize, us
     Some((start, end))
 }
 
-/// Char count of a display line; `line_width - 1` (saturating) is the last
-/// covered cell of a whole-line (triple-click) pick on that row.
+/// Char count of a display line; see [`last_col`] for the last covered cell
+/// of a whole-line (triple-click) pick on that row.
 pub(crate) fn line_width(line: &Line<'static>) -> usize {
     line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Inclusive cell index of a line's final char; `(row, last_col(row))` is the
+/// end coordinate of a whole-line (triple-click) pick on that row. Empty lines
+/// pick cell 0.
+pub(crate) fn last_col(line: &Line<'static>) -> usize {
+    line_width(line).saturating_sub(1)
 }
 
 /// OSC 52 clipboard set: `ESC ] 52 ; c ; <base64> ST`. Honored by xterm,
