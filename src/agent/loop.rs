@@ -112,6 +112,10 @@ async fn record_usage(
 ) {
     state.last_usage = Some(u.prompt_tokens);
     state.last_cached = u.cached_tokens;
+    // Session-cumulative totals feed the one-shot stderr summary; the TUI
+    // accumulates the same Usage sink lines client-side (separate state).
+    state.total_usage = state.total_usage.saturating_add(u.prompt_tokens);
+    state.total_output = state.total_output.saturating_add(u.completion_tokens);
     let cost =
         crate::llm::config::usage_cost(&config.model, &config.provider, &config.base_url, &u)
             .unwrap_or_else(|| {
@@ -577,11 +581,9 @@ pub(crate) async fn process_turn(
                 let note = format!(
                     "turn budget exhausted after {tool_iterations} tool rounds; partial progress preserved — send another prompt to continue"
                 );
-                if console.sink().is_some() {
-                    console.emit_async(SinkLine::System(note.clone())).await;
-                } else {
-                    with_console(false, || eprintln!("[dex] {note}"));
-                }
+                // No sink line here: the Err below surfaces the note exactly
+                // once on every surface (`agent error:` headless, TurnFailed
+                // in the daemon transcript and events journal).
                 // Leave a transcript marker so the resume shows why the
                 // turn stopped (User-role + name tag, like steering/summary).
                 messages.push(ChatMessage::user_named(note.clone(), "budget"));
