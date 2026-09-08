@@ -77,6 +77,19 @@ pub(crate) fn retryable_status(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
 }
 
+/// Provider wording for "you hit a rate limit, retry after a brief wait".
+/// Matched on lowercase against error bodies/messages (HTTP error JSON like
+/// `{"error":{"code":"rate_limit_exceeded",...}}` as well as stream-phase
+/// `Fail` messages like `rate_limit_error: ...`). Gateways don't always use
+/// a 429 status for these, so the body — not just the status — decides.
+pub(crate) fn is_rate_limited(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("rate_limit")
+        || message.contains("rate limit")
+        || message.contains("too many requests")
+        || message.contains("overloaded")
+}
+
 /// `Retry-After` header value → duration. Seconds form plus the HTTP-date
 /// form (IMF-fixdate `... GMT`, parsed via a `+0000` rewrite); capped so a
 /// hostile header cannot park the turn for hours. `None` when absent or
@@ -208,7 +221,7 @@ async fn post_with_retry(
                     continue;
                 }
             }
-            let retryable = retryable_status(status);
+            let retryable = retryable_status(status) || is_rate_limited(&body_text);
             if retryable && attempt < MAX_RETRIES {
                 let delay = backoff_delay(attempt, retry_after);
                 with_console(sink.is_some(), || {
@@ -331,16 +344,38 @@ pub(crate) async fn call_anthropic_messages(
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let body = crate::llm::anthropic::messages_body(config, messages, with_tools);
-    let resp = post_with_retry(
-        config,
-        &crate::llm::anthropic::messages_url(&config.base_url),
-        &body,
-        sink.as_ref(),
-    )
-    .await?;
-    // Same output-flowed marker semantics as the OpenAI protocols: a drop
-    // before the first delta stays retryable, after it fails the turn.
-    crate::llm::stream::read_anthropic_stream(resp, sink, cancel).await
+    const MAX_RETRIES: u32 = 3;
+    for attempt in 0..=MAX_RETRIES {
+        let resp = post_with_retry(
+            config,
+            &crate::llm::anthropic::messages_url(&config.base_url),
+            &body,
+            sink.as_ref(),
+        )
+        .await?;
+        // Same output-flowed marker semantics as the OpenAI protocols: a drop
+        // before the first delta stays retryable, after it fails the turn.
+        // Anthropic can also report rate limits as a terminal `error` event
+        // on a 200 body (no HTTP status to trigger `post_with_retry`), so a
+        // pre-output rate-limit failure re-issues the whole request here.
+        match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel).await {
+            Ok(turn) => return Ok(turn),
+            Err(e)
+                if attempt < MAX_RETRIES
+                    && !crate::llm::streaming::is_mid_stream(&*e)
+                    && is_rate_limited(&e.to_string()) =>
+            {
+                let delay = backoff_delay(attempt, None);
+                with_console(sink.is_some(), || {
+                    eprintln!("[llm] rate limited: retrying in {:?}", delay)
+                });
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    unreachable!()
 }
 
 #[cfg(test)]
@@ -411,6 +446,25 @@ mod tests {
         // A tiny Retry-After (≤ base/2) is ignored in favor of the base.
         let delay = backoff_delay(0, Some(Duration::from_millis(100)));
         assert!(delay.as_millis() >= 375);
+    }
+
+    #[test]
+    fn rate_limit_matches_provider_phrasings() {
+        // The reported gateway shape: OpenAI-style JSON body proxied with a
+        // non-429 status, so the status alone never triggered a retry.
+        let body = r#"{"model":"muse-spark-1.3-contributor","error":{"param":null,"code":"rate_limit_exceeded","type":"rate_limit_error","message":"Error from provider (Console Go): Upstream request failed: [rate_limit_exceeded] Rate limit exceeded. Please retry after a brief wait."}}"#;
+        assert!(is_rate_limited(body));
+        assert!(is_rate_limited("rate_limit_error: Overloaded"));
+        assert!(is_rate_limited("overloaded_error: Overloaded"));
+        assert!(is_rate_limited("429 Too Many Requests"));
+        assert!(is_rate_limited("API error: Too many requests, slow down"));
+        // Real failures that must NOT retry as rate limits.
+        assert!(!is_rate_limited("API error: invalid api key"));
+        assert!(!is_rate_limited(
+            "API error: This model's maximum context length is 8192 tokens"
+        ));
+        assert!(!is_rate_limited("cancelled"));
+        assert!(!is_rate_limited(""));
     }
 
     #[test]
