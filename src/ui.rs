@@ -585,7 +585,8 @@ fn copy_text(line: &Line<'static>) -> String {
 /// Map a display column through a stripped leading border: columns before
 /// it keep their index, columns inside clamp to its start, columns after it
 /// shift left by its width. Monotonic, so `(shift(c0), shift(c1))` stays a
-/// valid range.
+/// valid range — callers pass the start cell and the *exclusive* end bound
+/// (for an inclusive release cell `c1`, that's `c1 + 1`).
 fn border_shift(col: usize, (start, end): (usize, usize)) -> usize {
     if col <= start {
         col
