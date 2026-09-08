@@ -12,7 +12,7 @@ mod tools;
 mod ui;
 
 use crate::cli::{Args, Mode};
-use crate::session::{load_messages_from_session, Session};
+use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::execute_sync as execute;
 
 use crate::agent::r#loop::process_turn;
@@ -75,8 +75,69 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
 }
 
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // MCP bootstrap (background connect; schema merges whatever is cached).
-    // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
+    // `!`/`!!` shell escape (like pi): run directly, no agent turn, no
+    // approval — the `!` itself is the approval. A bare `!`/`!!` falls
+    // through to the agent like pi. The run is saved to the session so a
+    // later turn sees it (`!` in context, `!!` excluded); `--no-session`
+    // keeps it ephemeral.
+    if let Some((command, excluded)) = crate::protocol::parse_shell_escape(prompt.trim()) {
+        let mut map = Map::new();
+        map.insert("command".to_string(), Value::String(command.clone()));
+        let result = execute("bash", &map, &GlobalCancellation);
+        let (output, success, code) = match &result {
+            Ok(out) => (out.clone(), true, Some(0)),
+            Err(error) => {
+                let code = match error {
+                    crate::tools::ToolError::Shell { code, .. } => *code,
+                    _ => None,
+                };
+                (format!("Error: {error}"), false, code)
+            }
+        };
+        if !args.no_session {
+            let cwd = env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let opened = if args.new_session {
+                Session::new(cwd, args.session_name.clone())
+            } else {
+                Session::open_or_continue(cwd, args.session_path.as_deref(), false)
+            };
+            match opened {
+                Ok(mut session) => {
+                    // Same shape the daemon persists (pi's `bashExecution`
+                    // text); `!!` is tagged out of the model-bound history.
+                    let text = crate::core::format::bash_context_text(
+                        &command,
+                        &output,
+                        success,
+                        code,
+                        crate::core::console::is_interrupted(),
+                    );
+                    let msg = if excluded {
+                        ChatMessage::user_named(text, crate::core::types::BASH_EXCLUDED_NAME)
+                    } else {
+                        ChatMessage::user(text)
+                    };
+                    if let Err(error) = session.append_message(&msg) {
+                        eprintln!("[session] could not persist shell run ({error})");
+                    }
+                }
+                Err(error) => eprintln!(
+                    "[session] could not open session ({}); continuing without persistence",
+                    error
+                ),
+            }
+        }
+        return match result {
+            Ok(out) => {
+                print!("{out}");
+                Ok(())
+            }
+            Err(error) => Err(format!("Error: {error}").into()),
+        };
+    } // MCP bootstrap (background connect; schema merges whatever is cached).
+      // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
     crate::mcp::global_manager();
     let mut config = LlmConfig::from_env(
         args.base_url.clone(),
@@ -121,7 +182,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     };
     let mut messages = vec![ChatMessage::system(system_prompt(&skills))];
     if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
-        messages.extend(load_messages_from_session(existing).unwrap_or_default());
+        // Model-bound load: `!!` shell runs stay out of the LLM context.
+        messages.extend(load_llm_messages_from_session(existing).unwrap_or_default());
     }
     let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {

@@ -784,6 +784,17 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
     Ok(messages)
 }
 
+/// Model-bound history: the full journal minus `!!` shell runs (pi: saved
+/// to history and shown in the TUI, but never sent to the LLM). Transcript
+/// rebuilds keep the unfiltered [`load_messages_from_session`] so `!!`
+/// stays visible there.
+pub(crate) fn load_llm_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
+    Ok(load_messages_from_session(path)?
+        .into_iter()
+        .filter(|m| !m.is_context_excluded())
+        .collect())
+}
+
 /// Repair a transcript that ends mid-batch: an assistant tool call whose
 /// result never landed (a crash between the assistant message and the tool
 /// result, or a truncated journal line). Providers reject a `tool_calls`
@@ -1165,6 +1176,34 @@ mod tests {
             "blob1"
         );
         assert_eq!(loaded[0].reasoning_content.as_deref(), Some("step 1"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn llm_history_drops_excluded_shell_runs_but_transcript_keeps_them() {
+        // pi's `!!`: saved to history and shown in the TUI, never sent to
+        // the LLM. The transcript rebuild uses the full load; the
+        // model-bound load filters.
+        use crate::core::types::BASH_EXCLUDED_NAME;
+        let path = unique_path("dex-session-shell-exclude");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut session = Session::from_path(&path).unwrap();
+        session
+            .append_message(&ChatMessage::user("Ran `echo hi`\n```\nhi\n```"))
+            .unwrap();
+        session
+            .append_message(&ChatMessage::user_named(
+                "Ran `echo secret`\n```\nsecret\n```",
+                BASH_EXCLUDED_NAME,
+            ))
+            .unwrap();
+        drop(session);
+        let full = load_messages_from_session(&path).unwrap();
+        assert_eq!(full.len(), 2);
+        let llm = load_llm_messages_from_session(&path).unwrap();
+        assert_eq!(llm.len(), 1);
+        assert!(llm[0].content_str().contains("echo hi"));
         let _ = fs::remove_file(path);
     }
 
