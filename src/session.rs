@@ -520,8 +520,8 @@ impl Session {
         let line = serde_json::to_string(entry).map_err(io::Error::other)?;
         let file = self.journal.as_mut().expect("journal handle set above");
         writeln!(file, "{line}")?;
-        // Industry harnesses (pi, claude) don't fsync every line — they
-        // rely on OS buffer + periodic flush. Sync only when
+        // Don't fsync every line — rely on the OS buffer + periodic flush.
+        // Sync only when
         // durability matters (turn boundaries / effect journal) or when
         // DEX_DURABLE=1 is set for strict recovery testing.
         let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
@@ -784,7 +784,7 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
     Ok(messages)
 }
 
-/// Model-bound history: the full journal minus `!!` shell runs (pi: saved
+/// Model-bound history: the full journal minus `!!` shell runs (saved
 /// to history and shown in the TUI, but never sent to the LLM). Transcript
 /// rebuilds keep the unfiltered [`load_messages_from_session`] so `!!`
 /// stays visible there.
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn llm_history_drops_excluded_shell_runs_but_transcript_keeps_them() {
-        // pi's `!!`: saved to history and shown in the TUI, never sent to
+        // `!!`: saved to history and shown in the TUI, never sent to
         // the LLM. The transcript rebuild uses the full load; the
         // model-bound load filters.
         use crate::core::types::BASH_EXCLUDED_NAME;

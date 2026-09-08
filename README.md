@@ -6,6 +6,11 @@ Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`
 one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
 sessions and can be resumed.
 
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how
+to build, test, and submit changes. Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md), and file bugs or ideas in
+[GitHub issues](https://github.com/arpitsr/dex/issues).
+
 ## Features
 
 - **OpenAI-compatible backend** — supports Chat Completions and Responses
@@ -249,8 +254,8 @@ done
 
 ### Model catalog
 
-`dex update --models` refreshes the cached model catalog (context windows
-and `/model` autocomplete; like `pi update --models`).
+  `dex update --models` refreshes the cached model catalog (context windows
+  and `/model` autocomplete).
 
 ```sh
 dex update --models
@@ -356,8 +361,8 @@ or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 ### Shell escape
 
-Prefix any TUI input with `!` to run it as a shell command directly, without
-involving the agent (like pi):
+  Prefix any TUI input with `!` to run it as a shell command directly, without
+  involving the agent:
 
 ```
 > !ls -la
@@ -369,7 +374,7 @@ a tool block. It needs no approval — the `!` itself is the approval, even in
 `read-only` mode (that mode constrains the model, not your own typing) — and
 the run is saved to session history: `!` output feeds the model's context on
 the next turn, while `!!` stays visible in the transcript but is never sent
-to the model. A shell run may overlap an agent turn (like pi); only one `!`
+  to the model. A shell run may overlap an agent turn; only one `!`
 runs at a time per session — a second is refused until the first finishes,
 and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
 `dex connect <url> "!<command>"` do the same without the TUI.
@@ -448,8 +453,8 @@ schema):
 | `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
 | `chain`* | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`. |
 
-`*` behind `DEX_EXTRA_TOOLS=1` — pi parity is 6 tools. Tool results are truncated before being sent back to the model, and a result
-cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
+  `*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
+  cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
 
 ### MCP servers
 
@@ -501,7 +506,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
 | `DEX_THINKING_EFFORT` | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback). |
 | `DEX_PERMISSION` | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`). |
-| `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default (pi has no verify). |
+| `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default. |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
@@ -510,9 +515,9 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_MCP` / `DEX_NO_MCP` | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers. |
 | `DEX_MCP_MAX_TOOLS` | Cap on merged MCP schema tools (default 200; head kept sorted by name). |
 | `DEX_COST_PER_1K` | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`). |
-| `DEX_CONTEXT_WINDOW` | Override model context window (pi: per-model from catalog, e.g. gpt-5.6 1050000, claude 200k, muse 1048576). |
-| `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384, pi: `compaction.reserveTokens`). |
-| `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000, pi: `compaction.keepRecentTokens`). |
+| `DEX_CONTEXT_WINDOW` | Override model context window (per-model from catalog when unset). |
+| `DEX_RESERVE_TOKENS` | Tokens reserved for reply (default 16384). |
+| `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000). |
 | `DEX_TOOL_CACHE` | `1` to cache tool results across runs (`dex-tool-cache.json`; default off). |
 | `DEX_CONFIG` | Override the config file path (default `$XDG_CONFIG_HOME/dex/config.yaml`). |
 | `CODEX_HOME` | Directory holding Codex `auth.json` (default `~/.codex`). |
@@ -551,7 +556,7 @@ dex/
 
 A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
 model with tools enabled, executes any requested tool calls in parallel ( `write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
-results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (pi: `reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default for pi-fast latency. Progress is reported through a `Console` (streamed lines + approval
+  results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (`reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default. Progress is reported through a `Console` (streamed lines + approval
 requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and

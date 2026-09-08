@@ -100,8 +100,8 @@ impl InputField {
                 // Ctrl+J (LF, 0x0A) is the universal newline fallback:
                 // legacy terminals report Shift+Enter as bare `\r`, identical
                 // to Enter, until the Kitty disambiguate flag is pushed (remote.rs).
-                // Ctrl+J arrives as a distinct byte everywhere — same
-                // convention as Codex/opencode — so it always means newline.
+                // Ctrl+J arrives as a distinct byte everywhere,
+                // so it always means newline.
                 // SHIFT is tolerated (Ctrl+Shift+J still newlines); ALT is
                 // excluded so Alt-chorded bindings stay reserved.
                 self.insert_char('\n');

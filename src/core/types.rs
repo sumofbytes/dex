@@ -172,8 +172,8 @@ impl Role {
 }
 
 /// `name` tag for `!!` shell runs: persisted in the session and shown in
-/// the transcript, but filtered out of the model-bound history (pi: `!!`
-/// runs without sending output to the LLM). The single spelling lives
+/// the transcript, but filtered out of the model-bound history (`!!`
+/// runs are saved and shown without sending output to the LLM). The single spelling lives
 /// here; `ChatMessage::is_context_excluded` is the only check.
 pub(crate) const BASH_EXCLUDED_NAME: &str = "bash-excluded";
 
@@ -287,7 +287,7 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) reasoning_effort: &'a Option<String>,
 }
 
-/// Wire protocol spoken by the active endpoint. pi names are canonical
+/// Wire protocol spoken by the active endpoint. Canonical names
 /// (`openai-completions`, `openai-responses`, `anthropic-messages`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ApiProtocol {
@@ -299,8 +299,8 @@ pub(crate) enum ApiProtocol {
 }
 
 impl ApiProtocol {
-    /// Parse pi's `api` names (`openai-completions` / `openai-responses` /
-    /// `anthropic-messages` plus pi's short aliases). None for anything
+    /// Parse `api` names (`openai-completions` / `openai-responses` /
+    /// `anthropic-messages` plus short aliases). None for anything
     /// else.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {

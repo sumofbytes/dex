@@ -86,9 +86,9 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
 }
 
 /// One-shot mode: `!<command>` runs a shell command directly on the daemon
-/// (like pi: `!` feeds the next turn, `!!` stays out of model context);
+/// (`!` feeds the next turn, `!!` stays out of model context);
 /// anything else sends a single prompt and prints the response. A bare
-/// `!`/`!!` falls through to the agent like pi. `options` carries the CLI
+/// `!`/`!!` falls through to the agent. `options` carries the CLI
 /// flag overrides (`--model`, `-H`, `--skill`, …) so
 /// `dex connect <url> "prompt"` keeps flag parity with the TUI.
 pub(crate) fn one_shot(
@@ -97,7 +97,7 @@ pub(crate) fn one_shot(
     options: &ChatOptions,
     session_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // `!`/`!!` shell escape (like pi): run directly on the daemon, no agent
+    // `!`/`!!` shell escape: run directly on the daemon, no agent
     // turn. The daemon saves the run to the new session's history.
     if let Some((command, excluded)) = crate::protocol::parse_shell_escape(prompt.trim()) {
         let cwd = std::env::current_dir()
@@ -205,7 +205,7 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
             }
             continue;
         }
-        // `!`/`!!` shell escape (like pi): run directly, no agent turn. A
+        // `!`/`!!` shell escape: run directly, no agent turn. A
         // bare `!`/`!!` falls through to the agent.
         if let Some((command, excluded)) = crate::protocol::parse_shell_escape(input) {
             match client.shell(&session.session_id, &command, excluded) {

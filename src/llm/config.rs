@@ -1112,7 +1112,7 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
     None
 }
 
-/// Refresh dex models cache — like `pi update --models`, now via models.dev.
+/// Refresh the dex models cache via models.dev.
 /// Fetches https://models.dev/api.json (no auth) and caches to
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
 /// and autocomplete without network. Falls back to opencode /models if needed.
@@ -1225,9 +1225,9 @@ pub(crate) fn permission_from_env() -> Result<PermissionMode, Box<dyn std::error
 
 /// Parse one custom-header value into `name -> value` pairs.
 ///
-/// Accepts a JSON object (`{"X-Foo":"bar"}` — pi's `headers` map / codex
+/// Accepts a JSON object (`{"X-Foo":"bar"}` — `headers` map /
 /// `http_headers` shape) or `Name: Value` / `Name=Value` pairs separated by
-/// commas or newlines (Claude Code's `ANTHROPIC_CUSTOM_HEADERS` shape).
+/// commas or newlines (the `ANTHROPIC_CUSTOM_HEADERS` shape).
 /// Entries without a name, without a separator, or with an empty value are
 /// skipped; later entries win on duplicate names (case-insensitive, last
 /// casing wins). `authorization` is dropped (the api key owns it) and a
@@ -1334,8 +1334,7 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
 }
 
 /// Console Go routing affinity: the zen/go endpoint rejects requests without
-/// `x-opencode-session` (`MissingSessionID`). Same pair pi sends (its
-/// `getSessionHeaders`): gated to the opencode provider or an opencode.ai
+/// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
 /// base URL, filled from the dex session id. Keys already present (any
 /// casing) are left alone, so explicit user headers always win regardless
 /// of call order.
@@ -1376,8 +1375,8 @@ fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml
     }
 }
 
-/// Custom headers from one config file key. Accepts a mapping (pi/codex
-/// style), a text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as
+/// Custom headers from one config file key. Accepts a mapping,
+/// a text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as
 /// the env vars / `--header`), or a list mixing both. Later entries win.
 fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<String, String> {
     let Some(value) = file.as_ref().and_then(|f| f.get(key)) else {
@@ -1404,8 +1403,8 @@ fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<S
     out
 }
 
-/// Custom headers from the config file. `headers:` (pi) wins per-key over
-/// `http_headers:` (codex) when both set the same name. Both keys are
+/// Custom headers from the config file. `headers:` wins per-key over
+/// `http_headers:` when both set the same name. Both keys are
 /// deprecated top-level mirrors of provider state — still global, with a
 /// one-time pointer at the canonical spots.
 fn load_config_headers(file: &Option<serde_yaml::Value>) -> BTreeMap<String, String> {
@@ -1640,7 +1639,7 @@ impl LlmConfig {
                 })
             })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        // Pi: reserve 16384, keep 20000 tokens recent (not 12 messages)
+        // Reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1675,7 +1674,7 @@ impl LlmConfig {
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
-        // Dex own cache (no pi dependency) — bootstraps with just current model if missing.
+        // Dex own cache — bootstraps with just current model if missing.
         if available_models.is_empty() {
             if let Some(cached) = load_dex_models_cache() {
                 available_models = cached;
@@ -1894,7 +1893,7 @@ impl LlmConfig {
     }
 
     /// Trigger compaction when prompt exceeds this many tokens.
-    /// Pi: contextWindow - reserveTokens (16384) leaves room for reply.
+    /// contextWindow - reserveTokens (16384) leaves room for reply.
     pub(crate) fn compaction_threshold(&self) -> u64 {
         self.context_window.saturating_sub(self.reserve_tokens)
     }
@@ -2850,13 +2849,13 @@ pub(crate) mod tests {
             "OPENAI_HEADERS",
             "ANTHROPIC_CUSTOM_HEADERS",
         ]);
-        // Config file: `headers:` (pi) wins per-key over `http_headers:` (codex).
+        // Config file: `headers:` wins per-key over `http_headers:`.
         let dir = std::env::temp_dir().join(format!("dex-headers-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = dir.join("config.yaml");
         std::fs::write(
             &cfg_path,
-            "active_provider: opencode\nmodel: m-h\nhttp_headers:\n  X-File: file\n  X-Shared: codex\nheaders:\n  X-Shared: pi\n",
+            "active_provider: opencode\nmodel: m-h\nhttp_headers:\n  X-File: file\n  X-Shared: http\nheaders:\n  X-Shared: file\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &cfg_path);
@@ -2864,7 +2863,7 @@ pub(crate) mod tests {
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_HEADERS", "X-Env: env");
         std::env::set_var("OPENAI_HEADERS", "X-Env2: openai");
-        std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "X-Env3: claude");
+        std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", "X-Env3: env3");
         let cfg = LlmConfig::from_env(
             None,
             None,
@@ -2887,7 +2886,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             cfg.extra_headers.get("X-Env3").map(String::as_str),
-            Some("claude")
+            Some("env3")
         );
         assert_eq!(
             cfg.extra_headers.get("X-Cli").map(String::as_str),
@@ -3997,12 +3996,12 @@ pub(crate) mod tests {
                 "nodoc": {},
             } },
             "models": {
-                "Claude-X": { "limit": { "context": 200000 } },
+                "Custom-X": { "limit": { "context": 200000 } },
             },
         });
         let map = build_ctx_map(&catalog);
         assert_eq!(map.get("gpt-5"), Some(&128000));
-        assert_eq!(map.get("claude-x"), Some(&200000));
+        assert_eq!(map.get("custom-x"), Some(&200000));
         assert!(!map.contains_key("zero"));
         assert!(!map.contains_key("nodoc"));
     }

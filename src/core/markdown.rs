@@ -10,7 +10,7 @@
 //! Rule basis: CommonMark + markdownlint MD022 (blanks around headings),
 //! MD031 (blanks around fences), MD032 (blanks around lists), MD035
 //! (hr style) and MD058 (blanks around tables) — the same rule
-//! glow/mdcat/opencode/Claude Code follow: exactly one blank line before
+//! glow/mdcat follow: exactly one blank line before
 //! AND after each heading, fence, list block, table, rule and quote; tight
 //! inside lists, tables and quotes; single blanks between paragraphs.
 //!
@@ -311,8 +311,8 @@ impl GapState {
                 out.push('\n');
                 continue;
             } else {
-                // Blank runs collapse to one air row (CommonMark/pi/codex
-                // render a single separator): `prev` is empty at stream start
+                // Blank runs collapse to one air row (CommonMark
+                // renders a single separator): `prev` is empty at stream start
                 // and right after a blank, and that earlier blank already
                 // separates, so skipping loses nothing. Fenced blanks take
                 // the branch above and pass through untouched.
@@ -407,7 +407,7 @@ mod tests {
             normalize_gaps("", "## H\n\n- a\n\ntail"),
             "## H\n\n- a\n\ntail\n"
         );
-        // Blank runs collapse to one air row (CommonMark/pi/codex); leading
+        // Blank runs collapse to one air row (CommonMark); leading
         // blanks are dropped, fenced blanks pass through untouched.
         assert_eq!(normalize_gaps("", "a\n\n\n\nb\n"), "a\n\nb\n");
         assert_eq!(normalize_gaps("", "\n\n## H\n"), "## H\n");

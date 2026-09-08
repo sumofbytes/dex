@@ -578,8 +578,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "prefix: !<command> runs shell directly, output feeds the next turn (like pi)."
-                    .to_string(),
+                "prefix: !<command> runs shell directly, output feeds the next turn.".to_string(),
             );
             push_info(
                 app,
