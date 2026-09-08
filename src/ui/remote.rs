@@ -633,7 +633,10 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     }),
                 Some((row, _)) if clicks == 3 => Some(Selection {
                     anchor: (row, 0),
-                    end: (row, line_width(&remote.app.display_cache[row])),
+                    end: (
+                        row,
+                        line_width(&remote.app.display_cache[row]).saturating_sub(1),
+                    ),
                     sticky: true,
                     whole_line: true,
                 }),
@@ -658,7 +661,10 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                     if sel.whole_line {
                         // Line selects extend by whole rows; the anchor row
                         // (the press point) stays put, xterm-style.
-                        sel.end = (cell.0, line_width(&remote.app.display_cache[cell.0]));
+                        sel.end = (
+                            cell.0,
+                            line_width(&remote.app.display_cache[cell.0]).saturating_sub(1),
+                        );
                     } else {
                         sel.end = cell;
                     }
@@ -670,8 +676,15 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
             // picks) stay highlighted after release until the next press;
             // drag selections clear.
             let sticky = remote.app.selection.is_some_and(|s| s.sticky);
+            // A released drag breaks the multi-click chain: the next press
+            // starts a fresh count instead of compounding into word/line
+            // picks from where the drag happened to begin.
+            let dragged = remote
+                .app
+                .selection
+                .is_some_and(|s| !s.sticky && !s.is_empty());
             if let Some(sel) = remote.app.selection {
-                if !sel.is_empty() {
+                if sel.sticky || !sel.is_empty() {
                     let text = if sel.whole_line {
                         let r0 = sel.anchor.0.min(sel.end.0);
                         let r1 = sel.anchor.0.max(sel.end.0);
@@ -685,6 +698,9 @@ fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
             }
             if !sticky {
                 remote.app.selection = None;
+            }
+            if dragged {
+                remote.last_click = None;
             }
         }
         _ => {}

@@ -406,8 +406,10 @@ impl Command for EnableMouseScroll {
 pub(crate) const NOTICE_LIFETIME: Duration = Duration::from_secs(2);
 
 /// Mouse drag selection over the transcript, in `display_cache` (row, col)
-/// cell space. `anchor`/`end` are the raw press/release points; `norm()`
-/// orders them for highlight and copy. `sticky` selections (double-click
+/// cell space. `anchor`/`end` are the raw press/release points and BOTH
+/// cells they land on are covered (native terminal convention: releasing
+/// on a char selects it); `norm()` orders them for highlight and copy.
+/// `sticky` selections (double-click
 /// word picks, triple-click line picks) survive mouse-up so the highlight
 /// stays visible until the next click. `whole_line` selections cover full
 /// rows: `anchor` is the press point and `end` (moved by dragging) only
@@ -430,15 +432,18 @@ impl Selection {
         }
     }
 
-    /// True when the press never moved: a click clears, it doesn't copy.
+    /// True when the press never moved (anchor == end): a plain click
+    /// clears instead of copying. Sticky picks may still cover a single
+    /// cell (one-char word, one-char line) and must copy.
     pub(crate) fn is_empty(&self) -> bool {
         self.anchor == self.end
     }
 }
 
 /// Expand a click at char index `col` on a display line to the enclosing
-/// word: the maximal run of non-whitespace chars. `None` past the line's
-/// text or when the click lands on whitespace.
+/// word: the maximal run of non-whitespace chars, as inclusive char
+/// indices. `None` past the line's text or when the click lands on
+/// whitespace.
 pub(crate) fn word_bounds(line: &Line<'static>, col: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
     if col >= chars.len() || chars[col].is_whitespace() {
@@ -448,15 +453,15 @@ pub(crate) fn word_bounds(line: &Line<'static>, col: usize) -> Option<(usize, us
     while start > 0 && !chars[start - 1].is_whitespace() {
         start -= 1;
     }
-    let mut end = col + 1;
-    while end < chars.len() && !chars[end].is_whitespace() {
+    let mut end = col;
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
         end += 1;
     }
     Some((start, end))
 }
 
-/// Char count of a display line: the extent a whole-line (triple-click)
-/// selection covers on that row.
+/// Char count of a display line; `line_width - 1` (saturating) is the last
+/// covered cell of a whole-line (triple-click) pick on that row.
 pub(crate) fn line_width(line: &Line<'static>) -> usize {
     line.spans.iter().map(|s| s.content.chars().count()).sum()
 }
@@ -527,7 +532,8 @@ pub(crate) fn mouse_display_cell(
 }
 
 /// Plain text of a normalized selection: full rows join with newlines, the
-/// anchor/end rows are sliced to the selected columns. Copies what's on
+/// anchor/end rows are sliced to the selected columns — both endpoint cells
+/// inclusive, so releasing on a char selects it. Copies what's on
 /// screen (pre-wrapped), matching what native terminal selection would hand
 /// over.
 pub(crate) fn selection_text(
@@ -544,7 +550,7 @@ pub(crate) fn selection_text(
                 text(l)
                     .chars()
                     .skip(c0)
-                    .take(c1.saturating_sub(c0))
+                    .take((c1 + 1).saturating_sub(c0))
                     .collect()
             })
             .unwrap_or_default();
@@ -557,7 +563,7 @@ pub(crate) fn selection_text(
         out.push(text(line));
     }
     if let Some(l) = rows.get(r1) {
-        out.push(text(l).chars().take(c1).collect());
+        out.push(text(l).chars().take(c1 + 1).collect());
     }
     out.join("\n")
 }
@@ -1382,19 +1388,19 @@ mod tests {
     #[test]
     fn word_bounds_selects_enclosing_word() {
         let line = Line::from("run cargo test --all-targets");
-        // Click inside "cargo" → whole word.
-        assert_eq!(word_bounds(&line, 5), Some((4, 9)));
-        assert_eq!(word_bounds(&line, 4), Some((4, 9)));
-        assert_eq!(word_bounds(&line, 8), Some((4, 9)));
-        // Word at line start/end ("--all-targets" spans 15..28).
-        assert_eq!(word_bounds(&line, 1), Some((0, 3)));
-        assert_eq!(word_bounds(&line, 27), Some((15, 28)));
+        // Click inside "cargo" → whole word (inclusive bounds).
+        assert_eq!(word_bounds(&line, 5), Some((4, 8)));
+        assert_eq!(word_bounds(&line, 4), Some((4, 8)));
+        assert_eq!(word_bounds(&line, 8), Some((4, 8)));
+        // Word at line start/end ("--all-targets" spans 15..=27).
+        assert_eq!(word_bounds(&line, 1), Some((0, 2)));
+        assert_eq!(word_bounds(&line, 27), Some((15, 27)));
         // Whitespace click or past end → no selection.
         assert_eq!(word_bounds(&line, 3), None);
         assert_eq!(word_bounds(&line, 28), None);
         // Spans are joined before scanning.
         let spans = Line::from(vec![Span::from("run "), Span::from("cargo")]);
-        assert_eq!(word_bounds(&spans, 6), Some((4, 9)));
+        assert_eq!(word_bounds(&spans, 6), Some((4, 8)));
     }
 
     #[test]
@@ -1404,12 +1410,37 @@ mod tests {
             Line::default(),
             Line::from(Span::styled("beta", Style::default().fg(Color::Cyan))),
         ];
-        // Across rows, through the blank separator.
-        assert_eq!(selection_text(&rows, (0, 1), (2, 2)), "lpha\n\nbe");
+        // Across rows, through the blank separator; end cell inclusive.
+        assert_eq!(selection_text(&rows, (0, 1), (2, 2)), "lpha\n\nbet");
         // Single row, single range.
-        assert_eq!(selection_text(&rows, (2, 1), (2, 3)), "et");
+        assert_eq!(selection_text(&rows, (2, 1), (2, 3)), "eta");
         // Anchor past the end of the line yields nothing.
         assert_eq!(selection_text(&rows, (0, 90), (0, 95)), "");
+    }
+
+    #[test]
+    fn selection_text_covers_both_endpoint_cells() {
+        // Native terminal convention: releasing on a char selects it.
+        // Dragging onto a line's last char must include that char rather
+        // than forcing an overshoot into the blank margin, which rounds up
+        // to the whole rest of the line.
+        let rows = vec![Line::from("hello world"), Line::from("second row")];
+        // Forward drag releasing on the last char ('d', col 10).
+        assert_eq!(selection_text(&rows, (0, 6), (0, 10)), "world");
+        // Backward drag pressed on the last char: both ends covered (the
+        // handler copies through `norm()`, as here).
+        let sel = Selection {
+            anchor: (0, 10),
+            end: (0, 6),
+            sticky: false,
+            whole_line: false,
+        };
+        let ((r0, c0), (r1, c1)) = sel.norm();
+        assert_eq!(selection_text(&rows, (r0, c0), (r1, c1)), "world");
+        // Multi-row: the release cell on the last row is included.
+        assert_eq!(selection_text(&rows, (0, 6), (1, 3)), "world\nseco");
+        // End in the blank margin still takes the row's tail.
+        assert_eq!(selection_text(&rows, (0, 6), (0, 40)), "world");
     }
 
     #[test]
