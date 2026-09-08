@@ -1,7 +1,7 @@
 #!/bin/sh
 # dex installer — detects your platform and installs the latest release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/develop/install.sh | sh
 #
 # Supported: linux (musl, static) and macOS, x86_64 + aarch64.
 # Windows: download the .zip from https://github.com/arpitsr/dex/releases/latest
