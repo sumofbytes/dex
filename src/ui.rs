@@ -14,6 +14,7 @@ use crate::core::types::{Role, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
 
+mod herdr;
 mod input;
 mod remote;
 mod render;
