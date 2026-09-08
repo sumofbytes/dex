@@ -254,8 +254,8 @@ done
 
 ### Model catalog
 
-  `dex update --models` refreshes the cached model catalog (context windows
-  and `/model` autocomplete).
+`dex update --models` refreshes the cached model catalog (context windows
+and `/model` autocomplete).
 
 ```sh
 dex update --models
@@ -332,10 +332,10 @@ In the interactive TUI, actions requiring approval open a dedicated overlay.
 Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
 or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
-  Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
-  `connect`, `run`, `update --models`, `mcp`, `doctor`) are covered under
-  Usage / Model catalog above; `--help`/`-h` and `--version`/`-V` print help
-  and version without touching config or network.
+Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
+`connect`, `run`, `update --models`, `mcp`, `doctor`) are covered under
+Usage / Model catalog above; `--help`/`-h` and `--version`/`-V` print help
+and version without touching config or network.
 
 ## TUI slash commands
 
@@ -361,8 +361,8 @@ or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 ### Shell escape
 
-  Prefix any TUI input with `!` to run it as a shell command directly, without
-  involving the agent:
+Prefix any TUI input with `!` to run it as a shell command directly, without
+involving the agent:
 
 ```
 > !ls -la
@@ -374,7 +374,7 @@ a tool block. It needs no approval — the `!` itself is the approval, even in
 `read-only` mode (that mode constrains the model, not your own typing) — and
 the run is saved to session history: `!` output feeds the model's context on
 the next turn, while `!!` stays visible in the transcript but is never sent
-  to the model. A shell run may overlap an agent turn; only one `!`
+to the model. A shell run may overlap an agent turn; only one `!`
 runs at a time per session — a second is refused until the first finishes,
 and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
 `dex connect <url> "!<command>"` do the same without the TUI.
@@ -453,8 +453,8 @@ schema):
 | `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
 | `chain`* | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`. |
 
-  `*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
-  cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
+`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
+cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
 
 ### MCP servers
 
@@ -545,18 +545,18 @@ dex/
     ├── agent/            # turn loop, steering, compaction, tool state
     ├── core/             # console sinks, formatting, highlighting, types
     ├── llm/              # provider clients, streaming parsers, auth, config
-  ├── session.rs        # JSONL session persistence
-  ├── tools/            # builtin tools: read, bash, write, edit, ffgrep, fffind (fff engine)
-  ├── mcp.rs + mcp/     # MCP client: stdio/HTTP/SSE servers, OAuth login
-  ├── skills.rs         # skill discovery
-  └── ui.rs + ui/       # ratatui TUI (local event loop + remote client UI)
+    ├── session.rs        # JSONL session persistence
+    ├── tools/            # builtin tools: read, bash, write, edit, ffgrep, fffind (fff engine)
+    ├── mcp.rs + mcp/     # MCP client: stdio/HTTP/SSE servers, OAuth login
+    ├── skills.rs         # skill discovery
+    └── ui.rs + ui/       # ratatui TUI (local event loop + remote client UI)
 ```
 
 ## How it works
 
 A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
-model with tools enabled, executes any requested tool calls in parallel ( `write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
-  results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (`reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default. Progress is reported through a `Console` (streamed lines + approval
+model with tools enabled, executes any requested tool calls in parallel (`write`/`edit` on distinct files in parallel; `bash` or same `path` serializes), feeds
+results back, and compacts history deterministically once `tokens > contextWindow - reserveTokens` (`reserve=16384`, `keepRecent=20000` tokens, per-model `contextWindow` from catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default. Progress is reported through a `Console` (streamed lines + approval
 requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and
