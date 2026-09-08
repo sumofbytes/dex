@@ -83,11 +83,27 @@ pub(crate) fn retryable_status(status: reqwest::StatusCode) -> bool {
 /// `Fail` messages like `rate_limit_error: ...`). Gateways don't always use
 /// a 429 status for these, so the body — not just the status — decides.
 pub(crate) fn is_rate_limited(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("rate_limit")
-        || message.contains("rate limit")
-        || message.contains("too many requests")
-        || message.contains("overloaded")
+    let lower = message.to_ascii_lowercase();
+    // `-`/`_` spellings (`rate_limit`, `rate-limit`) collapse to one phrase.
+    let normalized = lower.replace(['-', '_'], " ");
+    normalized.contains("rate limit")
+        || normalized.contains("too many requests")
+        || normalized.contains("overload")
+        || contains_status_code(&lower, "429")
+        || contains_status_code(&lower, "529")
+}
+
+/// Bare `{"code":429}` proxied with a non-429 status still counts — but only
+/// as a standalone number, so `14290 tokens` or `429496` can't false-positive.
+fn contains_status_code(haystack: &str, code: &str) -> bool {
+    haystack.match_indices(code).any(|(i, _)| {
+        let prev_ok = i == 0 || !haystack.as_bytes()[i - 1].is_ascii_digit();
+        let next_ok = haystack[i + code.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit());
+        prev_ok && next_ok
+    })
 }
 
 /// `Retry-After` header value → duration. Seconds form plus the HTTP-date
@@ -176,9 +192,9 @@ async fn post_with_retry(
     body: &impl serde::Serialize,
     sink: Option<&mpsc::Sender<SinkLine>>,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
-    const MAX_RETRIES: u32 = 3;
+    const MAX_HTTP_RETRIES: u32 = 3;
     let mut active_config = config.clone();
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..=MAX_HTTP_RETRIES {
         let request = config.client.post(url);
         let resp = match authenticated_request(request, &active_config)
             .json(body)
@@ -186,7 +202,7 @@ async fn post_with_retry(
             .await
         {
             Ok(resp) => resp,
-            Err(e) if attempt < MAX_RETRIES => {
+            Err(e) if attempt < MAX_HTTP_RETRIES => {
                 let delay = backoff_delay(attempt, None);
                 with_console(sink.is_some(), || {
                     eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay)
@@ -210,7 +226,7 @@ async fn post_with_retry(
             let body_text = resp.text().await.map_err(Box::new)?;
             if status == reqwest::StatusCode::UNAUTHORIZED
                 && active_config.provider.credentials_refreshable()
-                && attempt < MAX_RETRIES
+                && attempt < MAX_HTTP_RETRIES
             {
                 if let Ok((token, account)) = crate::llm::config::resolve_credentials(
                     &active_config.provider,
@@ -222,7 +238,7 @@ async fn post_with_retry(
                 }
             }
             let retryable = retryable_status(status) || is_rate_limited(&body_text);
-            if retryable && attempt < MAX_RETRIES {
+            if retryable && attempt < MAX_HTTP_RETRIES {
                 let delay = backoff_delay(attempt, retry_after);
                 with_console(sink.is_some(), || {
                     eprintln!(
@@ -344,8 +360,14 @@ pub(crate) async fn call_anthropic_messages(
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let body = crate::llm::anthropic::messages_body(config, messages, with_tools);
-    const MAX_RETRIES: u32 = 3;
-    for attempt in 0..=MAX_RETRIES {
+    // Stream-phase budget only: each attempt re-issues the whole request via
+    // `post_with_retry` (its own HTTP-phase budget), so the worst case is
+    // (`MAX_STREAM_RETRIES` + 1) × (`MAX_HTTP_RETRIES` + 1) POSTs. In
+    // practice this loop only runs after the inner one already returned a
+    // 200, and a 200 body carries no `Retry-After` — hence
+    // `backoff_delay(attempt, None)`, with the attempt index restarting here.
+    const MAX_STREAM_RETRIES: u32 = 3;
+    for attempt in 0..=MAX_STREAM_RETRIES {
         let resp = post_with_retry(
             config,
             &crate::llm::anthropic::messages_url(&config.base_url),
@@ -360,11 +382,7 @@ pub(crate) async fn call_anthropic_messages(
         // pre-output rate-limit failure re-issues the whole request here.
         match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel).await {
             Ok(turn) => return Ok(turn),
-            Err(e)
-                if attempt < MAX_RETRIES
-                    && !crate::llm::streaming::is_mid_stream(&*e)
-                    && is_rate_limited(&e.to_string()) =>
-            {
+            Err(e) if should_retry_stream_error(&*e, attempt, MAX_STREAM_RETRIES) => {
                 let delay = backoff_delay(attempt, None);
                 with_console(sink.is_some(), || {
                     eprintln!("[llm] rate limited: retrying in {:?}", delay)
@@ -376,6 +394,20 @@ pub(crate) async fn call_anthropic_messages(
     }
 
     unreachable!()
+}
+
+/// Stream-phase retry gate for a terminal `error` event on a 200 body: only
+/// a pre-output rate limit within budget. Mid-stream failures may have
+/// already put partial text on the transcript, and anything else says
+/// nothing transient about capacity.
+fn should_retry_stream_error(
+    err: &(dyn std::error::Error + 'static),
+    attempt: u32,
+    max_retries: u32,
+) -> bool {
+    attempt < max_retries
+        && !crate::llm::streaming::is_mid_stream(err)
+        && is_rate_limited(&err.to_string())
 }
 
 #[cfg(test)]
@@ -456,15 +488,43 @@ mod tests {
         assert!(is_rate_limited(body));
         assert!(is_rate_limited("rate_limit_error: Overloaded"));
         assert!(is_rate_limited("overloaded_error: Overloaded"));
+        assert!(is_rate_limited("overloading is temporary"));
+        assert!(is_rate_limited("rate-limit exceeded, retry soon"));
         assert!(is_rate_limited("429 Too Many Requests"));
         assert!(is_rate_limited("API error: Too many requests, slow down"));
+        // Bare numeric code proxied with a non-429 status.
+        assert!(is_rate_limited(r#"{"code":429,"message":"slow down"}"#));
+        assert!(is_rate_limited("error 529: overloaded"));
         // Real failures that must NOT retry as rate limits.
         assert!(!is_rate_limited("API error: invalid api key"));
         assert!(!is_rate_limited(
             "API error: This model's maximum context length is 8192 tokens"
         ));
+        // Standalone-code matching is digit-boundaried: token counts and
+        // large numbers containing the digits must not false-positive.
+        assert!(!is_rate_limited("API error: 14290 tokens used"));
+        assert!(!is_rate_limited("maximum context length 429496 tokens"));
         assert!(!is_rate_limited("cancelled"));
         assert!(!is_rate_limited(""));
+    }
+
+    #[test]
+    fn stream_error_retry_gate() {
+        // Pre-output rate limit within budget retries.
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            "rate_limit_error: Rate limit exceeded".into();
+        assert!(should_retry_stream_error(&*err, 0, 3));
+        // Budget exhausted stops retrying.
+        assert!(!should_retry_stream_error(&*err, 3, 3));
+        // Mid-stream rate limits never retry — partial text is already on
+        // the transcript and a re-issued call would duplicate it.
+        let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            crate::llm::stream::MidStreamError("rate_limit_error: Overloaded".into()),
+        );
+        assert!(!should_retry_stream_error(&*mid, 0, 3));
+        // Non-rate-limit failures never retry through this gate.
+        let other: Box<dyn std::error::Error + Send + Sync> = "API error: invalid api key".into();
+        assert!(!should_retry_stream_error(&*other, 0, 3));
     }
 
     #[test]
