@@ -973,6 +973,11 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 let path = arg_path.split_whitespace().next().unwrap_or("");
                 let path = path.split(':').next().unwrap_or(path);
                 render::render_read_preview(&preview, crate::core::lang::lang_from_path(path))
+            } else if success && matches!(name.as_str(), "grep" | "ffgrep") {
+                // Content-mode hits are `path:line:code` rows: keep the
+                // gutter dim, highlight the code by path extension (same
+                // engine and dim fallback as read previews).
+                render::render_search_preview(&preview)
             } else {
                 preview
                     .iter()
@@ -1286,6 +1291,12 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 let mut lines = content.lines();
                 let summary = lines.next().unwrap_or("").to_string();
                 let preview: Vec<String> = lines.take(6).map(|s| s.to_string()).collect();
+                // Replay has no ToolInput (args live in the assistant call,
+                // not the tool message); emit a bare one so the output
+                // attaches to a real tool block instead of the synthesized
+                // `▸ tool` fallback. Search previews highlight from the
+                // inline `path:line:` gutters, so they work without an arg.
+                append_sink_line(app, crate::core::types::SinkLine::ToolInput(name.clone()));
                 append_sink_line(
                     app,
                     crate::core::types::SinkLine::ToolOutput {

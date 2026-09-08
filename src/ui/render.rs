@@ -530,6 +530,141 @@ pub(super) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
     out
 }
 
+/// Split a search hit's structural gutter: `path:line:` (match) or
+/// `path:line-` (context row); the first `:` + digits + `:`/`-` run wins.
+/// Byte-safe: `:` and ASCII digits never occur inside a multi-byte UTF-8
+/// sequence, so slicing at these offsets lands on char boundaries.
+fn split_search_gutter(line: &str) -> Option<(&str, &str, char, &str)> {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b':' {
+            continue;
+        }
+        let ds = i + 1;
+        let mut de = ds;
+        while de < bytes.len() && bytes[de].is_ascii_digit() {
+            de += 1;
+        }
+        if de == ds || de >= bytes.len() {
+            continue;
+        }
+        let sep = bytes[de];
+        if sep == b':' || sep == b'-' {
+            return Some((&line[..i], &line[ds..de], sep as char, &line[de + 1..]));
+        }
+    }
+    None
+}
+
+/// Flush one same-language run of search rows: ONE highlight pass over the
+/// joined code (same scheme as `render_read_preview`), gutter dim, per-row
+/// dim fallback when the language has no highlighter.
+fn push_search_run(out: &mut Vec<Line<'static>>, run: &[(String, &str)], lang: &str, dim: Style) {
+    let joined = run
+        .iter()
+        .map(|(_, code)| *code)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let highlighted = highlight_code_block(lang, &joined);
+    for (i, (gutter, code)) in run.iter().enumerate() {
+        let spans = highlighted
+            .as_ref()
+            .and_then(|h| h.get(i))
+            .filter(|spans| !spans.is_empty());
+        match spans {
+            Some(spans) => {
+                let mut all = vec![Span::styled(gutter.clone(), dim)];
+                all.extend(spans.iter().cloned());
+                out.push(super::indent_transcript_line(Line::from(all)));
+            }
+            None => out.push(super::indent_transcript_line(Line::from(Span::styled(
+                format!("{gutter}{code}"),
+                dim,
+            )))),
+        }
+    }
+}
+
+/// Whole `grep`/`ffgrep` content-mode preview rows: hits are
+/// `path:line:code` (context rows `path:line-code`), so the gutter is
+/// structural — keep it dim and highlight the code by path extension.
+/// Contiguous same-language hits share one highlight pass; bare path
+/// headers (files mode, fff's fuzzy-fallback grouping with `  N: code`
+/// rows) and prose stay dim.
+pub(super) fn render_search_preview(preview: &[String]) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme::tool_preview_fg());
+    enum Row<'a> {
+        Meta(&'a str),
+        Code {
+            gutter: String,
+            code: &'a str,
+            lang: String,
+        },
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut header_lang = String::new();
+    for line in preview {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("[...") {
+            rows.push(Row::Meta(line.as_str()));
+            continue;
+        }
+        if let Some((path, num, sep, code)) = split_search_gutter(line) {
+            rows.push(Row::Code {
+                gutter: format!("  {path}:{num}{sep}"),
+                code,
+                lang: crate::core::lang::lang_from_path(path).to_string(),
+            });
+            continue;
+        }
+        let lang = crate::core::lang::lang_from_path(trimmed);
+        if !trimmed.chars().any(char::is_whitespace) && !lang.is_empty() {
+            // Bare path (files-mode list, fuzzy grouping): dim landmark
+            // re-targeting the language for following grouped rows.
+            header_lang = lang.to_string();
+        }
+        if !header_lang.is_empty() {
+            let digits = trimmed.len()
+                - trimmed
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .len();
+            if digits > 0 && trimmed[digits..].starts_with(": ") {
+                rows.push(Row::Code {
+                    gutter: format!("  {}: ", &trimmed[..digits]),
+                    code: &trimmed[digits + 2..],
+                    lang: header_lang.clone(),
+                });
+                continue;
+            }
+        }
+        rows.push(Row::Meta(line.as_str()));
+    }
+
+    let mut out = Vec::with_capacity(preview.len());
+    let mut runs: Vec<(String, Vec<(String, &str)>)> = Vec::new();
+    for row in rows {
+        match row {
+            Row::Meta(text) => {
+                for (lang, run) in runs.drain(..) {
+                    push_search_run(&mut out, &run, &lang, dim);
+                }
+                out.push(super::indent_transcript_line(Line::from(Span::styled(
+                    format!("  {text}"),
+                    dim,
+                ))));
+            }
+            Row::Code { gutter, code, lang } => match runs.iter().position(|(l, _)| *l == lang) {
+                Some(i) => runs[i].1.push((gutter, code)),
+                None => runs.push((lang, vec![(gutter, code)])),
+            },
+        }
+    }
+    for (lang, run) in runs {
+        push_search_run(&mut out, &run, &lang, dim);
+    }
+    out
+}
+
 /// Render a streamed thinking block: collapsed = a single dim indicator
 /// that animates "◌ Thinking .." while the block streams and settles at
 /// "Thought for 4s" (or "◌ Thinking ..." when no span was measured) once it
@@ -3139,6 +3274,60 @@ mod tests {
         assert!(lines[0].spans[1..]
             .iter()
             .all(|s| s.style.fg == Some(crate::ui::theme::tool_preview_fg())));
+    }
+
+    #[test]
+    fn search_preview_highlights_hits_and_keeps_gutter_dim() {
+        // grep/ffgrep content mode: `path:line:code` hits (and `:N-` context
+        // rows) keep the structural gutter dim while the code highlights by
+        // path extension — contiguous same-language hits share one pass.
+        let preview = vec![
+            String::new(),
+            "src/a.rs:2:fn hits() {}".to_string(),
+            "src/a.rs:1-// context".to_string(),
+            "src/b.rs:5:let other = 1;".to_string(),
+        ];
+        let lines = render_search_preview(&preview);
+        assert_eq!(lines.len(), 4);
+        let text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        assert!(
+            text(&lines[1]).contains("  src/a.rs:2:"),
+            "{}",
+            text(&lines[1])
+        );
+        assert!(
+            text(&lines[1]).contains("fn hits() {}"),
+            "{}",
+            text(&lines[1])
+        );
+        // Gutter (spans[1] after the transcript indent) stays dim...
+        let dim = crate::ui::theme::tool_preview_fg();
+        assert_eq!(lines[1].spans[1].style.fg, Some(dim));
+        // ...and the code is tree-sitter highlighted, not one dim blob.
+        assert!(lines[1].spans.len() > 2, "{:?}", lines[1]);
+        assert!(lines[2].spans.len() > 2, "{:?}", lines[2]);
+        assert!(lines[3].spans.len() > 2, "{:?}", lines[3]);
+    }
+
+    #[test]
+    fn search_preview_keeps_prose_and_path_lists_dim() {
+        // files-mode path lists and fuzzy-fallback prose stay dim exactly
+        // like the generic renderer; the fuzzy grouping's `  N: code` rows
+        // highlight via the bare path header's language.
+        let preview = vec![
+            "0 exact matches for 'x'. 2 approximate:".to_string(),
+            "src/main.rs".to_string(),
+            "  10: fn main() {}".to_string(),
+        ];
+        let lines = render_search_preview(&preview);
+        assert_eq!(lines.len(), 3);
+        let dim = crate::ui::theme::tool_preview_fg();
+        let dim_after_indent =
+            |l: &Line<'static>| l.spans[1..].iter().all(|s| s.style.fg == Some(dim));
+        assert!(dim_after_indent(&lines[0]), "{:?}", lines[0]);
+        assert!(dim_after_indent(&lines[1]), "{:?}", lines[1]);
+        assert!(lines[2].spans.len() > 2, "{:?}", lines[2]);
     }
 
     #[test]
