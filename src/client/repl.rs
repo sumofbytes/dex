@@ -86,27 +86,26 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
 }
 
 /// One-shot mode: `!<command>` runs a shell command directly on the daemon
-/// (like pi); anything else sends a single prompt and prints the response.
-/// `options` carries the CLI flag overrides (`--model`, `-H`, `--skill`, …)
-/// so `dex connect <url> "prompt"` keeps flag parity with the TUI.
+/// (like pi: `!` feeds the next turn, `!!` stays out of model context);
+/// anything else sends a single prompt and prints the response. A bare
+/// `!`/`!!` falls through to the agent like pi. `options` carries the CLI
+/// flag overrides (`--model`, `-H`, `--skill`, …) so
+/// `dex connect <url> "prompt"` keeps flag parity with the TUI.
 pub(crate) fn one_shot(
     client: &DaemonClient,
     prompt: &str,
     options: &ChatOptions,
     session_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // `!` shell escape (like pi): run directly on the daemon, no agent turn.
-    if let Some(command) = prompt.trim().strip_prefix('!').map(str::trim) {
-        if command.is_empty() {
-            return Err(
-                "usage: !<command> — run a shell command directly, no agent involved.".into(),
-            );
-        }
+    // `!`/`!!` shell escape (like pi): run directly on the daemon, no agent
+    // turn. The daemon saves the run to the new session's history.
+    if let Some((command, excluded)) = crate::protocol::parse_shell_escape(prompt.trim()) {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let session = client.create_session(&cwd, session_name)?;
-        let resp = client.shell(&session.session_id, command)?;
+        eprintln!("session: {}", session.session_id);
+        let resp = client.shell(&session.session_id, &command, excluded)?;
         if resp.success {
             print!("{}", resp.output);
             if !resp.output.ends_with('\n') {
@@ -156,7 +155,8 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
     let session = client.create_session(&cwd, None)?;
 
     println!("Connected to daemon. Session: {}", session.session_id);
-    println!("Type your prompt and press Enter. Ctrl+C to quit.\n");
+    println!("Type your prompt and press Enter. Ctrl+C to quit.");
+    println!("Prefix with ! to run shell directly (!! keeps it out of model context).\n");
 
     let stdin = io::stdin();
 
@@ -205,24 +205,21 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
             }
             continue;
         }
-        // `!` shell escape (like pi): run directly, no agent turn.
-        if let Some(command) = input.strip_prefix('!').map(str::trim) {
-            if command.is_empty() {
-                eprintln!("usage: !<command> — run a shell command directly");
-            } else {
-                match client.shell(&session.session_id, command) {
-                    Ok(resp) => {
-                        if resp.success {
-                            print!("{}", resp.output);
-                            if !resp.output.ends_with('\n') {
-                                println!();
-                            }
-                        } else {
-                            eprintln!("{}", resp.output);
+        // `!`/`!!` shell escape (like pi): run directly, no agent turn. A
+        // bare `!`/`!!` falls through to the agent.
+        if let Some((command, excluded)) = crate::protocol::parse_shell_escape(input) {
+            match client.shell(&session.session_id, &command, excluded) {
+                Ok(resp) => {
+                    if resp.success {
+                        print!("{}", resp.output);
+                        if !resp.output.ends_with('\n') {
+                            println!();
                         }
+                    } else {
+                        eprintln!("{}", resp.output);
                     }
-                    Err(e) => eprintln!("error: {e}"),
                 }
+                Err(e) => eprintln!("error: {e}"),
             }
             println!();
             continue;

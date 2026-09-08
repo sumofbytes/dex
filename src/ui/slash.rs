@@ -577,8 +577,12 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "prefix: !<command> runs a shell command directly, no agent involved (like pi)."
+                "prefix: !<command> runs shell directly, output feeds the next turn (like pi)."
                     .to_string(),
+            );
+            push_info(
+                app,
+                "prefix: !!<command> keeps the output out of model context.".to_string(),
             );
             push_info(
                 app,

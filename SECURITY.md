@@ -33,7 +33,10 @@ In scope:
 - Escaping the workspace sandbox (`resolve_workspace_path`) via symlinks or
   path tricks from any builtin tool
 - Bypassing or confusing the permission/approval model (e.g. a tool or model
-  response that mutates state without the configured approval)
+  response that mutates state without the configured approval). User-typed
+  `!` shell runs are not a bypass: they execute only on your explicit
+  per-command action (like typing into your own terminal), while the
+  permission mode constrains model-directed tools.
 - Session file handling: crafted JSONL session records that cause unintended
   tool execution on resume
 - Skill loading: `SKILL.md` frontmatter or skill bodies that bypass tool
