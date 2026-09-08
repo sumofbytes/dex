@@ -56,6 +56,9 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
 /// May we infer the protocol by retrying a failed `/responses` call as
 /// chat-completions? Only when nothing explicitly pinned the protocol, the
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
+/// A rate limit is transient capacity, not a protocol mismatch: falling back
+/// would double load on the provider and could permanently learn the wrong
+/// protocol for the model via `remember_learned_api`.
 fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if config.api_pinned {
         return false; // user pinned one protocol for everything
@@ -65,6 +68,9 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     }
     if !config.provider.has_protocol_fallback() {
         return false; // codex backend-api has no /chat/completions
+    }
+    if crate::llm::client::is_rate_limited(err) {
+        return false; // transient capacity — retry the same protocol instead
     }
     !err.contains("cancelled")
 }
@@ -203,6 +209,16 @@ mod tests {
             assert!(try_responses_fallback(&cfg, "500 Internal server error"));
             // Never on cancellation.
             assert!(!try_responses_fallback(&cfg, "cancelled"));
+            // Never on rate limits: transient capacity, not a protocol
+            // mismatch — and falling back would double provider load.
+            assert!(!try_responses_fallback(
+                &cfg,
+                r#"API error: {"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"Rate limit exceeded. Please retry after a brief wait."}}"#
+            ));
+            assert!(!try_responses_fallback(
+                &cfg,
+                "overloaded_error: Overloaded"
+            ));
             // Explicit DEX_MODEL_APIS entry — user already decided.
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");
             assert!(!try_responses_fallback(&cfg, "500 boom"));
