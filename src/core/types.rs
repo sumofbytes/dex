@@ -43,6 +43,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn permission_mode_wire_spelling_round_trips() {
+        for mode in [
+            PermissionMode::ReadOnly,
+            PermissionMode::AskWrites,
+            PermissionMode::AskShell,
+            PermissionMode::Trusted,
+        ] {
+            assert_eq!(PermissionMode::parse(mode.as_str()), Ok(mode));
+        }
+    }
+
+    #[test]
     fn plan_round_trip_keeps_contract() {
         let plan = Plan {
             goal: Some("g".into()),
@@ -475,6 +487,17 @@ impl PermissionMode {
             Self::AskWrites => 1,
             Self::AskShell => 2,
             Self::Trusted => 3,
+        }
+    }
+    /// Canonical wire spelling (CLI `--permission`, daemon request field):
+    /// round-trips through [`Self::parse`]. Single source so call sites
+    /// never drift from the accepted spellings.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::AskWrites => "ask-writes",
+            Self::AskShell => "ask-shell",
+            Self::Trusted => "trusted",
         }
     }
 }

@@ -27,6 +27,24 @@ use serde_json::{json, Map, Value};
 use std::env;
 use std::io::{self, Write};
 
+/// Cost below this is noise on the one-shot summary line; also guards
+/// float equality when pricing data is missing (cost rounds to 0.0).
+const COST_SUMMARY_MIN_USD: f64 = 5e-4;
+
+/// One-shot stderr spend summary (`None` when nothing was reported): total
+/// prompt/output tokens, plus USD once it clears [`COST_SUMMARY_MIN_USD`].
+/// Output-only usage still summarizes — some providers omit prompt tokens.
+fn spend_summary(usage: u64, output: u64, cost: f64) -> Option<String> {
+    if usage == 0 && output == 0 {
+        return None;
+    }
+    let mut summary = format!("[dex] {usage} prompt / {output} output tokens");
+    if cost > COST_SUMMARY_MIN_USD {
+        summary.push_str(&format!(" · ${cost:.3}"));
+    }
+    Some(summary)
+}
+
 /// Per-request overrides built from CLI flags — shared by the TUI's remote
 /// client and the `dex connect <url> "prompt"` one-shot, so daemon-backed
 /// runs keep flag parity with in-process mode.
@@ -39,12 +57,7 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
             .collect(),
         base_url: args.base_url.clone(),
         model: args.model.clone(),
-        permission: args.permission.map(|mode| match mode {
-            crate::core::types::PermissionMode::ReadOnly => "read-only".to_string(),
-            crate::core::types::PermissionMode::AskWrites => "ask-writes".to_string(),
-            crate::core::types::PermissionMode::AskShell => "ask-shell".to_string(),
-            crate::core::types::PermissionMode::Trusted => "trusted".to_string(),
-        }),
+        permission: args.permission.map(|mode| mode.as_str().to_string()),
         headers: if args.headers.is_empty() {
             None
         } else {
@@ -147,14 +160,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         });
     }
     // Spend summary for scripts — stderr only, so stdout stays model prose.
-    if state.total_usage > 0 {
-        let mut summary = format!(
-            "[dex] {} prompt / {} output tokens",
-            state.total_usage, state.total_output
-        );
-        if state.total_cost > 0.0005 {
-            summary.push_str(&format!(" · ${:.3}", state.total_cost));
-        }
+    if let Some(summary) = spend_summary(state.total_usage, state.total_output, state.total_cost) {
         eprintln!("{summary}");
     }
     result
@@ -434,5 +440,26 @@ fn main() {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spend_summary_gates_and_formats() {
+        assert_eq!(spend_summary(0, 0, 0.0), None);
+        // Output-only usage still summarizes (prompt may be unreported).
+        assert_eq!(
+            spend_summary(0, 12, 0.0).as_deref(),
+            Some("[dex] 0 prompt / 12 output tokens")
+        );
+        // Sub-threshold cost is hidden; above it, three decimals.
+        assert!(!spend_summary(10, 2, 0.0001).unwrap().contains('$'));
+        assert_eq!(
+            spend_summary(10, 2, 0.0123).as_deref(),
+            Some("[dex] 10 prompt / 2 output tokens · $0.012")
+        );
     }
 }

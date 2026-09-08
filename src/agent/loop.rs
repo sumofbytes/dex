@@ -725,6 +725,42 @@ mod tests {
         }
     }
 
+    /// Session-cumulative totals accumulate across calls with saturating
+    /// adds; zero-prompt usage still counts its output tokens (the one-shot
+    /// spend summary gates on both totals).
+    #[tokio::test]
+    async fn record_usage_accumulates_session_totals() {
+        let config = test_config();
+        let mut state = ToolState::default();
+        record_usage(
+            &config,
+            &mut state,
+            &Console::none(),
+            Usage {
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                cached_tokens: None,
+            },
+            None,
+        )
+        .await;
+        record_usage(
+            &config,
+            &mut state,
+            &Console::none(),
+            Usage {
+                prompt_tokens: 0,
+                completion_tokens: 7,
+                cached_tokens: None,
+            },
+            None,
+        )
+        .await;
+        assert_eq!(state.total_usage, 10);
+        assert_eq!(state.total_output, 11);
+        assert_eq!(state.last_usage, Some(0));
+    }
+
     #[tokio::test]
     async fn process_turn_completes_with_injected_client() {
         let _lock = TEST_TURN_ENV_LOCK.lock().await;
