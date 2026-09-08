@@ -318,34 +318,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .collect();
 
     // Per-request overrides so client flags keep working in remote mode.
-    let options = ChatOptions {
-        skill_dirs: args
-            .skill_dirs
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        base_url: args.base_url.clone(),
-        model: args.model.clone(),
-        permission: args.permission.map(|mode| match mode {
-            PermissionMode::ReadOnly => "read-only".to_string(),
-            PermissionMode::AskWrites => "ask-writes".to_string(),
-            PermissionMode::AskShell => "ask-shell".to_string(),
-            PermissionMode::Trusted => "trusted".to_string(),
-        }),
-        headers: if args.headers.is_empty() {
-            None
-        } else {
-            let mut merged = std::collections::BTreeMap::new();
-            for raw in &args.headers {
-                for (k, v) in crate::llm::config::parse_headers_str(raw) {
-                    crate::llm::config::insert_extra_header(&mut merged, &k, &v);
-                }
-            }
-            Some(merged)
-        },
-        plan: None,
-        idempotency_key: None,
-    };
+    let options = crate::chat_options_from_args(args);
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(256);
     let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>(16);

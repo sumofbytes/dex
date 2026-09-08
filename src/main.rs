@@ -27,6 +27,40 @@ use serde_json::{json, Map, Value};
 use std::env;
 use std::io::{self, Write};
 
+/// Per-request overrides built from CLI flags — shared by the TUI's remote
+/// client and the `dex connect <url> "prompt"` one-shot, so daemon-backed
+/// runs keep flag parity with in-process mode.
+pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
+    client::http::ChatOptions {
+        skill_dirs: args
+            .skill_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        base_url: args.base_url.clone(),
+        model: args.model.clone(),
+        permission: args.permission.map(|mode| match mode {
+            crate::core::types::PermissionMode::ReadOnly => "read-only".to_string(),
+            crate::core::types::PermissionMode::AskWrites => "ask-writes".to_string(),
+            crate::core::types::PermissionMode::AskShell => "ask-shell".to_string(),
+            crate::core::types::PermissionMode::Trusted => "trusted".to_string(),
+        }),
+        headers: if args.headers.is_empty() {
+            None
+        } else {
+            let mut merged = std::collections::BTreeMap::new();
+            for raw in &args.headers {
+                for (k, v) in crate::llm::config::parse_headers_str(raw) {
+                    crate::llm::config::insert_extra_header(&mut merged, &k, &v);
+                }
+            }
+            Some(merged)
+        },
+        plan: None,
+        idempotency_key: None,
+    }
+}
+
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // MCP bootstrap (background connect; schema merges whatever is cached).
     // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
@@ -41,10 +75,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     if let Some(warning) = config.thinking_mismatch_warning() {
         eprintln!("dex: {warning}");
     }
-    // Verification opt-in only — see daemon/server.rs.
-    if config.verify_command.is_none() && std::env::var("DEX_VERIFY").as_deref() == Ok("1") {
-        config.verify_command = crate::llm::config::detect_verify_command();
-    }
+    // Verification opt-in only — see llm/config.rs.
+    crate::llm::config::apply_verify_optin(&mut config);
     let mut skill_dirs = skill_dirs();
     skill_dirs.extend(args.skill_dirs.iter().cloned());
     let skills = discover_skills(&skill_dirs);
@@ -114,7 +146,17 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             "turn_failed"
         });
     }
-    println!();
+    // Spend summary for scripts — stderr only, so stdout stays model prose.
+    if state.total_usage > 0 {
+        let mut summary = format!(
+            "[dex] {} prompt / {} output tokens",
+            state.total_usage, state.total_output
+        );
+        if state.total_cost > 0.0005 {
+            summary.push_str(&format!(" · ${:.3}", state.total_cost));
+        }
+        eprintln!("{summary}");
+    }
     result
         .map(|_| ())
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
@@ -273,7 +315,12 @@ fn main() {
             let result = match prompt {
                 Some(prompt) => client::http::DaemonClient::new(&url).and_then(|client| {
                     client.wait_until_ready(std::time::Duration::from_secs(10))?;
-                    client::repl::one_shot(&client, &prompt)
+                    client::repl::one_shot(
+                        &client,
+                        &prompt,
+                        &chat_options_from_args(&args),
+                        args.session_name.as_deref(),
+                    )
                 }),
                 None => ui::run_ratatui_repl_with_remote(&args, &url).map_err(Into::into),
             };

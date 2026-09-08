@@ -1149,6 +1149,17 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
 /// Called at the daemon/one-shot boundary (NOT inside the shared agent loop),
 /// so a test harness with a real workspace CWD cannot accidentally re-run the
 /// project's own test suite mid-turn.
+/// Verification opt-in shared by the daemon bootstrap and the one-shot CLI:
+/// an explicit `verify_command` always wins; `DEX_VERIFY=1` auto-detects
+/// from project manifests. Lives here (not in the agent loop) so a test
+/// harness with a real workspace CWD cannot accidentally re-run the
+/// project's own test suite mid-turn.
+pub(crate) fn apply_verify_optin(config: &mut LlmConfig) {
+    if config.verify_command.is_none() && env::var("DEX_VERIFY").as_deref() == Ok("1") {
+        config.verify_command = detect_verify_command();
+    }
+}
+
 pub(crate) fn detect_verify_command() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     if cwd.join("Cargo.toml").exists() {
