@@ -492,6 +492,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Report lifecycle state to the enclosing Herdr pane, if any.
+    let mut herdr = super::herdr::Reporter::new();
     let mut run = || -> std::io::Result<()> {
         // Events consumed by the OSC-report lookahead, replayed on the next
         // iterations of the loop.
@@ -537,6 +539,15 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             }
 
             let busy = remote.app.busy;
+            // Cheap when unchanged (outside Herdr it is a no-op).
+            herdr.sync(
+                remote.app.busy,
+                remote
+                    .app
+                    .pending_approval
+                    .as_ref()
+                    .map(|a| a.name.as_str()),
+            );
             // An expired status notice needs one more frame to disappear.
             if remote.app.tick_notice() {
                 dirty = true;
@@ -591,6 +602,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                 break;
             }
         }
+        herdr.release();
         Ok(())
     };
 
