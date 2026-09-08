@@ -358,7 +358,7 @@ Any other arguments are treated as a one-shot prompt.
 
 - **Enter** — submit the current input.
 - **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓** navigate suggestions; **Esc** — discard the draft and close the popup.
-- **Shift+Enter** — insert a newline (multi-line input).
+- **Shift+Enter** — insert a newline (multi-line input). Needs a terminal with Kitty keyboard-protocol support (Ghostty, Kitty, WezTerm, foot, iTerm2, VS Code, Windows Terminal, Alacritty); otherwise use **Ctrl+J**, which works everywhere.
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.
 - **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages.
