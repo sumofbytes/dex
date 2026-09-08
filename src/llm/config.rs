@@ -1144,11 +1144,21 @@ pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     crate::client::http::block_on(refresh_models_cache_async())
 }
 
-/// Auto-detect a verification command (P9) when none is configured: a
-/// recognized manifest in the workspace selects the standard test command.
-/// Called at the daemon/one-shot boundary (NOT inside the shared agent loop),
-/// so a test harness with a real workspace CWD cannot accidentally re-run the
-/// project's own test suite mid-turn.
+/// Verification opt-in shared by the daemon bootstrap and the one-shot CLI:
+/// an explicit `verify_command` always wins; `DEX_VERIFY=1` auto-detects a
+/// standard test command from project manifests via
+/// [`detect_verify_command`]. Called at the daemon/one-shot boundary (NOT
+/// inside the shared agent loop), so a test harness with a real workspace
+/// CWD cannot accidentally re-run the project's own test suite mid-turn.
+pub(crate) fn apply_verify_optin(config: &mut LlmConfig) {
+    if config.verify_command.is_none() && env::var("DEX_VERIFY").as_deref() == Ok("1") {
+        config.verify_command = detect_verify_command();
+    }
+}
+
+/// Auto-detect a verification command from workspace manifests: the first
+/// recognized one (Cargo.toml, go.mod, package.json) selects the standard
+/// test command.
 pub(crate) fn detect_verify_command() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
     if cwd.join("Cargo.toml").exists() {
@@ -2305,11 +2315,11 @@ pub(crate) fn doctor(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        build_ctx_map, detect_verify_command, doctor, load_config_file, load_dex_models_cache,
-        load_provider_entries, model_api_from_env, persist_selection, reasoning_options_for,
-        remember_learned_api, remember_thinking_effort, stored_thinking_effort, usage_cost,
-        validate_thinking_effort, warn_provider_like_selection, ApiProtocol, LlmConfig,
-        PermissionMode, Provider, ProviderEntry,
+        apply_verify_optin, build_ctx_map, detect_verify_command, doctor, load_config_file,
+        load_dex_models_cache, load_provider_entries, model_api_from_env, persist_selection,
+        reasoning_options_for, remember_learned_api, remember_thinking_effort,
+        stored_thinking_effort, usage_cost, validate_thinking_effort, warn_provider_like_selection,
+        ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
@@ -2966,6 +2976,24 @@ pub(crate) mod tests {
         assert!(
             PermissionMode::ReadOnly.permissiveness() < PermissionMode::Trusted.permissiveness()
         );
+    }
+
+    /// An explicit `verify_command` is never overwritten — even with the
+    /// opt-in env set. The auto-detect branch itself is cwd-dependent and
+    /// covered by `detect_verify_command_selects_by_manifest`.
+    #[test]
+    fn apply_verify_optin_explicit_command_wins() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut config = test_cfg();
+        config.verify_command = Some("make check".into());
+        apply_verify_optin(&mut config);
+        assert_eq!(config.verify_command.as_deref(), Some("make check"));
+        let _env = EnvRestore::take(&["DEX_VERIFY"]);
+        std::env::set_var("DEX_VERIFY", "1");
+        apply_verify_optin(&mut config);
+        assert_eq!(config.verify_command.as_deref(), Some("make check"));
     }
 
     #[test]
