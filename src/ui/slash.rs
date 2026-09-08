@@ -252,6 +252,7 @@ pub(super) fn reset_session_state(app: &mut App) {
     app.pending_steering.clear();
     app.pending_followups.clear();
     app.cancel_requested = false;
+    app.cancel_presses = 0;
     if let Some(approval) = app.pending_approval.take() {
         let _ = approval
             .response

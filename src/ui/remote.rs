@@ -361,6 +361,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         pending_steering: Vec::new(),
         pending_followups: Vec::new(),
         cancel_requested: false,
+        cancel_presses: 0,
         approval_rx: None,
         pending_approval: None,
         busy: false,
@@ -546,6 +547,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                         streamed = true;
                         remote.shell_running = false;
                         remote.shell_cancel_requested = false;
+                        remote.app.cancel_presses = 0;
                         finish_shell_command(
                             &mut remote,
                             &command,
@@ -1014,6 +1016,7 @@ fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     }
     app.busy = false;
     app.cancel_requested = false;
+    app.cancel_presses = 0;
     // A turn can end right after thinking (cancel, failure before any text);
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
@@ -1305,12 +1308,28 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.busy || shell_running {
                 if app.cancel_requested || shell_cancel_requested {
-                    // Second Ctrl+C while a cancel is already in flight: the
-                    // daemon is stuck, force-quit rather than stay trapped.
-                    app.quit = true;
+                    // Cancel already in flight: stay idempotent. Only the
+                    // third press force-quits (stuck daemon/shell) — a slow
+                    // turn must never die to an impatient double-tap.
+                    app.cancel_presses = app.cancel_presses.saturating_add(1);
+                    if app.cancel_presses >= 3 {
+                        app.quit = true;
+                    } else {
+                        push_info(
+                            app,
+                            "still cancelling... (Ctrl+C again to force quit)".to_string(),
+                        );
+                    }
                 } else {
                     request_cancel(remote);
+                    remote.app.cancel_presses = 1;
                 }
+            } else if !app.input.text().is_empty() {
+                // First press with a drafted prompt just clears the composer
+                // (claudecode/pi parity); quitting needs an empty line.
+                app.input.reset();
+                app.slash_selected = 0;
+                app.last_ctrl_c = None;
             } else {
                 // Double Ctrl+C to exit when idle (avoid accidental quit).
                 const DOUBLE_WINDOW: Duration = Duration::from_secs(2);
@@ -1325,6 +1344,16 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                     push_info(app, "Press Ctrl+C again to exit".to_string());
                 }
             }
+        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !app.busy
+                && !shell_running
+                && app.input.text().trim().is_empty() =>
+        {
+            // EOF-quit on an empty composer (pi parity); a draft or a live
+            // turn/shell falls through to the composer below.
+            app.quit = true;
         }
         KeyCode::Esc if app.busy || shell_running => {
             request_cancel(remote);
@@ -1436,7 +1465,14 @@ fn request_cancel(remote: &mut RemoteApp) {
     if !turn_running && !remote.shell_running {
         return;
     }
-    if turn_running {
+    // A cancel is already unwinding everything running (double Esc / overlay
+    // re-press): don't re-POST or spam the transcript.
+    let turn_done = !turn_running || remote.app.cancel_requested;
+    let shell_done = !remote.shell_running || remote.shell_cancel_requested;
+    if turn_done && shell_done {
+        return;
+    }
+    if turn_running && !remote.app.cancel_requested {
         remote.app.cancel_requested = true;
         remote.cancel_flag.store(true, Ordering::SeqCst);
         // If an approval is blocking the turn, deny it first so the agent thread
@@ -1445,7 +1481,7 @@ fn request_cancel(remote: &mut RemoteApp) {
             let _ = remote.decision_tx.try_send(CoreApprovalDecision::Deny);
         }
     }
-    if remote.shell_running {
+    if remote.shell_running && !remote.shell_cancel_requested {
         remote.shell_cancel_requested = true;
     }
     // One Esc cancels whatever is running: the daemon signals the turn
@@ -1466,6 +1502,7 @@ fn run_shell_command(remote: &mut RemoteApp, line: String, command: String, excl
     render_user_prompt(&mut remote.app, &line);
     remote.shell_running = true;
     remote.shell_cancel_requested = false;
+    remote.app.cancel_presses = 0;
     let client = remote.client.clone();
     let sid = remote.session_id.clone();
     let tx = remote.worker_tx.clone();
@@ -1628,6 +1665,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let app = &mut remote.app;
     app.busy = true;
     app.cancel_requested = false;
+    app.cancel_presses = 0;
     // Live "● Working" indicator inside the transcript; settled to the
     // "Worked for …" summary by `finish_turn`.
     start_activity(app);
@@ -2551,5 +2589,188 @@ mod tests {
         .await
         .expect("closed channel must resolve, not hang");
         assert!(matches!(decision, ProtocolApprovalDecision::Deny));
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> crossterm::event::KeyEvent {
+        use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn ctrl_c() -> crossterm::event::KeyEvent {
+        key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    fn ctrl_d() -> crossterm::event::KeyEvent {
+        key(KeyCode::Char('d'), KeyModifiers::CONTROL)
+    }
+
+    fn esc_key() -> crossterm::event::KeyEvent {
+        key(KeyCode::Esc, KeyModifiers::empty())
+    }
+
+    /// Minimal `RemoteApp` for `handle_key` tests. The client points at a
+    /// dead port so `request_cancel`'s POST fails fast (connection refused)
+    /// instead of hanging.
+    fn test_remote() -> RemoteApp {
+        let app = App {
+            transcript: Vec::new(),
+            input: crate::ui::input::InputField::new(),
+            config: crate::llm::config::LlmConfig {
+                provider: Provider::OpenCode,
+                api_key: String::new(),
+                base_url: String::new(),
+                model: "test".into(),
+                available_models: vec!["test".into()],
+                endpoints: Default::default(),
+                api: ApiProtocol::Responses,
+                account_id: None,
+                thinking_effort: None,
+                context_window: 128_000,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 20_000,
+                permission: PermissionMode::Trusted,
+                verify_command: None,
+                extra_headers: Default::default(),
+                provider_entries: Default::default(),
+                provider_headers: Default::default(),
+                api_pinned: false,
+                client: reqwest::Client::new(),
+            },
+            messages: Vec::new(),
+            tool_state: crate::agent::state::ToolState::default(),
+            session: Session::in_memory("/tmp".into()),
+            skills: Vec::new(),
+            turn_start: 0,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            git_dirty: false,
+            steering_rx: None,
+            followup_rx: None,
+            pending_steering: Vec::new(),
+            pending_followups: Vec::new(),
+            cancel_requested: false,
+            cancel_presses: 0,
+            approval_rx: None,
+            pending_approval: None,
+            busy: false,
+            autoscroll: true,
+            scroll: 0,
+            tick: 0,
+            quit: false,
+            last_ctrl_c: None,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            slash_selected: 0,
+            connection: None,
+            assistant_open: false,
+            show_thinking: false,
+            thinking_open: false,
+            plan: crate::core::types::Plan::default(),
+            assistant_pending: String::new(),
+            assistant_gap: crate::core::markdown::GapState::new(),
+            stream_last_flush: Instant::now(),
+            wrapped_cache: Vec::new(),
+            wrapped_width: 0,
+            display_cache: Vec::new(),
+            transcript_area: None,
+            selection: None,
+            notice: None,
+        };
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(16);
+        let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>(16);
+        RemoteApp {
+            app,
+            client: DaemonClient::new("http://127.0.0.1:9").expect("test client builds"),
+            session_id: "test".to_string(),
+            options: ChatOptions::default(),
+            worker_tx,
+            worker_rx,
+            decision_tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            last_click: None,
+            shell_running: false,
+            shell_cancel_requested: false,
+        }
+    }
+
+    #[test]
+    fn ctrl_c_clears_draft_before_armed_quit() {
+        let mut remote = test_remote();
+        remote.app.input.insert_paste("hello");
+        handle_key(&mut remote, ctrl_c());
+        assert!(!remote.app.quit, "draft Ctrl+C must not quit");
+        assert!(
+            remote.app.input.text().is_empty(),
+            "first press clears the draft"
+        );
+        assert!(
+            remote.app.last_ctrl_c.is_none(),
+            "clearing disarms the pending quit"
+        );
+        // Empty composer now arms; the second press quits.
+        handle_key(&mut remote, ctrl_c());
+        assert!(!remote.app.quit);
+        assert!(remote.app.last_ctrl_c.is_some());
+        handle_key(&mut remote, ctrl_c());
+        assert!(remote.app.quit);
+    }
+
+    #[test]
+    fn ctrl_c_clears_whitespace_only_draft() {
+        let mut remote = test_remote();
+        remote.app.input.insert_paste("   ");
+        handle_key(&mut remote, ctrl_c());
+        assert!(!remote.app.quit);
+        assert!(remote.app.input.text().is_empty());
+    }
+
+    #[test]
+    fn busy_ctrl_c_needs_three_presses_to_force_quit() {
+        let mut remote = test_remote();
+        remote.app.busy = true;
+        handle_key(&mut remote, ctrl_c());
+        assert!(remote.app.cancel_requested, "first press cancels");
+        assert!(!remote.app.quit);
+        handle_key(&mut remote, ctrl_c());
+        assert!(
+            !remote.app.quit,
+            "second press must not force-quit a slow turn"
+        );
+        handle_key(&mut remote, ctrl_c());
+        assert!(remote.app.quit, "third press force-quits a stuck turn");
+    }
+
+    #[test]
+    fn esc_repress_while_cancelling_stays_put() {
+        let mut remote = test_remote();
+        remote.app.busy = true;
+        remote.app.cancel_requested = true;
+        handle_key(&mut remote, esc_key());
+        assert!(!remote.app.quit);
+        assert!(remote.app.cancel_requested);
+    }
+
+    #[test]
+    fn ctrl_d_quits_only_on_empty_idle_composer() {
+        let mut remote = test_remote();
+        handle_key(&mut remote, ctrl_d());
+        assert!(remote.app.quit, "empty idle Ctrl+D quits");
+
+        let mut remote = test_remote();
+        remote.app.input.insert_paste("draft");
+        handle_key(&mut remote, ctrl_d());
+        assert!(!remote.app.quit, "draft Ctrl+D must not quit");
+        assert_eq!(remote.app.input.text(), "draft");
+
+        let mut remote = test_remote();
+        remote.app.busy = true;
+        handle_key(&mut remote, ctrl_d());
+        assert!(!remote.app.quit, "busy Ctrl+D must not quit the turn");
     }
 }
