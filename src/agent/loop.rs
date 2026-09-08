@@ -9,8 +9,7 @@ use crate::core::console::{
     TOOL_OUTPUT_COLOR,
 };
 use crate::core::format::{
-    model_tool_result, short_arg, terminal_preview, tool_preview, tool_preview_body,
-    tool_result_summary,
+    model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
 };
 use crate::core::types::{ChatMessage, LlmToolCall, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
@@ -504,7 +503,7 @@ pub(crate) async fn process_turn(
                             "{}[tool input] {} {}{}",
                             TOOL_INPUT_COLOR,
                             call.function.name,
-                            terminal_preview(&input),
+                            short_arg(&name, &input),
                             RESET
                         );
                     });
