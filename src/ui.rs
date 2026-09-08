@@ -374,9 +374,14 @@ struct TerminalCleanup;
 
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        use crossterm::event::{DisableBracketedPaste, DisableMouseCapture};
+        use crossterm::event::{
+            DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
+        };
         let _ = crossterm::execute!(
             std::io::stdout(),
+            // Undoes the Kitty disambiguate push from the TUI setup; harmless
+            // on terminals that never supported it.
+            PopKeyboardEnhancementFlags,
             crossterm::terminal::LeaveAlternateScreen,
             DisableBracketedPaste,
             DisableMouseCapture

@@ -354,11 +354,31 @@ Any other arguments are treated as a one-shot prompt.
 | `/provider <name>` | Switch provider for the rest of the session.          |
 | `/help` (unknown)   | Unknown commands print a hint.                        |
 
+### Shell escape
+
+Prefix any TUI input with `!` to run it as a shell command directly, without
+involving the agent (like pi):
+
+```
+> !ls -la
+> !!cargo test -- --nocapture
+```
+
+The command runs in the daemon workspace via the `bash` tool and renders as
+a tool block. It needs no approval — the `!` itself is the approval, even in
+`read-only` mode (that mode constrains the model, not your own typing) — and
+the run is saved to session history: `!` output feeds the model's context on
+the next turn, while `!!` stays visible in the transcript but is never sent
+to the model. A shell run may overlap an agent turn (like pi); only one `!`
+runs at a time per session — a second is refused until the first finishes,
+and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
+`dex connect <url> "!<command>"` do the same without the TUI.
+
 ### Keyboard controls
 
 - **Enter** — submit the current input.
 - **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓** navigate suggestions; **Esc** — discard the draft and close the popup.
-- **Shift+Enter** — insert a newline (multi-line input).
+- **Shift+Enter** — insert a newline (multi-line input). Needs a terminal with Kitty keyboard-protocol support (e.g. Ghostty, Kitty, WezTerm, foot); otherwise use **Ctrl+J**, which works everywhere.
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.
 - **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages (a third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt clears it first, and **Ctrl+D** on an empty line quits.

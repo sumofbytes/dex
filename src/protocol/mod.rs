@@ -28,6 +28,46 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
+/// Request to run a shell command directly (`!`/`!!` prefix in the TUI),
+/// bypassing the agent loop. Runs the daemon's `bash` tool in the session
+/// workspace with no approval step — the `!` itself is the approval.
+/// `exclude_from_context` is pi's `!!`: the run is still saved to session
+/// history and shown in the transcript, but never sent to the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellRequest {
+    pub command: String,
+    #[serde(default)]
+    pub exclude_from_context: bool,
+}
+
+/// Response from running a shell command directly. `output` is the combined
+/// stdout/stderr (already clamped for display); `code` is the process exit
+/// code (`None` when killed or timed out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellResponse {
+    pub output: String,
+    pub success: bool,
+    pub code: Option<i32>,
+}
+
+/// Split a `!`/`!!` shell escape (pi) into `(command, exclude_from_context)`.
+/// `!cmd` feeds the next turn; `!!cmd` stays out of the LLM context. Returns
+/// `None` when the line isn't a shell escape — including a bare `!`/`!!`,
+/// which falls through to the agent like pi instead of erroring. Everything
+/// after the prefix is the command, newlines included.
+pub fn parse_shell_escape(line: &str) -> Option<(String, bool)> {
+    let (rest, excluded) = match line.strip_prefix("!!") {
+        Some(rest) => (rest, true),
+        None => (line.strip_prefix('!')?, false),
+    };
+    let command = rest.trim().to_string();
+    if command.is_empty() {
+        None
+    } else {
+        Some((command, excluded))
+    }
+}
+
 /// Request to enqueue a steering message into an active turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerRequest {
@@ -309,6 +349,63 @@ mod tests {
         .unwrap();
         assert!(back.thinking_effort.is_none());
         assert!(back.thinking_warning.is_none());
+    }
+
+    #[test]
+    fn shell_request_response_round_trip() {
+        let req = ShellRequest {
+            command: "ls -la".into(),
+            exclude_from_context: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ShellRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.command, "ls -la");
+        assert!(!back.exclude_from_context);
+        // Old clients omit the flag; it defaults to feeding the next turn.
+        let back: ShellRequest = serde_json::from_str(r#"{"command":"x"}"#).unwrap();
+        assert!(!back.exclude_from_context);
+        let resp = ShellResponse {
+            output: "ok".into(),
+            success: true,
+            code: Some(0),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: ShellResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.success);
+        assert_eq!(back.code, Some(0));
+    }
+
+    #[test]
+    fn shell_escape_splits_command() {
+        assert_eq!(
+            parse_shell_escape("!ls -la"),
+            Some(("ls -la".to_string(), false))
+        );
+        assert_eq!(
+            parse_shell_escape("!  echo hi  "),
+            Some(("echo hi".to_string(), false))
+        );
+        assert_eq!(
+            parse_shell_escape("!!cargo test"),
+            Some(("cargo test".to_string(), true))
+        );
+        assert_eq!(
+            parse_shell_escape("!!  echo hi  "),
+            Some(("echo hi".to_string(), true))
+        );
+        // Multiline scripts run whole.
+        assert_eq!(
+            parse_shell_escape("!echo a\necho b"),
+            Some(("echo a\necho b".to_string(), false))
+        );
+        // Bare `!`/`!!` fall through to the agent like pi (usage, not a run).
+        assert_eq!(parse_shell_escape("!"), None);
+        assert_eq!(parse_shell_escape("!   "), None);
+        assert_eq!(parse_shell_escape("!!"), None);
+        // Ordinary prompts and slash commands are not shell escapes.
+        assert_eq!(parse_shell_escape("hello"), None);
+        assert_eq!(parse_shell_escape("/model foo"), None);
+        assert_eq!(parse_shell_escape(""), None);
     }
 
     #[test]

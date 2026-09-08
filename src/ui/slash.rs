@@ -578,7 +578,16 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "keys: Enter send · Shift+Enter newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
+                "prefix: !<command> runs shell directly, output feeds the next turn (like pi)."
+                    .to_string(),
+            );
+            push_info(
+                app,
+                "prefix: !!<command> keeps the output out of model context.".to_string(),
+            );
+            push_info(
+                app,
+                "keys: Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
                     .to_string(),
             );
             push_info(

@@ -7,3 +7,4 @@ ak-tool-cache.json
 .ak/skills/*/runtime/
 .env.local-ci
 *.env
+.worktrees/
