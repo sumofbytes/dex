@@ -92,7 +92,7 @@ mcp_servers:
     deny: ["delete_*"]
   postgres:
     type: http          # stdio is default when `command` present
-    url: https://mcp.internal/mcp
+      url: https://mcp.internal/mcp # example placeholder, not a real host
     headers: { Authorization: "Bearer ${MCP_TOKEN}" }
 ```
 
