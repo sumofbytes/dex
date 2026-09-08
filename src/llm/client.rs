@@ -323,6 +323,26 @@ pub(crate) async fn call_responses(
     read_responses_stream(resp, sink, cancel).await
 }
 
+pub(crate) async fn call_anthropic_messages(
+    config: &LlmConfig,
+    messages: &[ChatMessage],
+    with_tools: bool,
+    sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+    let body = crate::llm::anthropic::messages_body(config, messages, with_tools);
+    let resp = post_with_retry(
+        config,
+        &crate::llm::anthropic::messages_url(&config.base_url),
+        &body,
+        sink.as_ref(),
+    )
+    .await?;
+    // Same output-flowed marker semantics as the OpenAI protocols: a drop
+    // before the first delta stays retryable, after it fails the turn.
+    crate::llm::stream::read_anthropic_stream(resp, sink, cancel).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

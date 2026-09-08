@@ -4,7 +4,7 @@
 //! (tool-call merging, reasoning replay) stays parser-local, so the driver
 //! is written once and a new protocol plugs in as another [`StreamParser`].
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -286,9 +286,15 @@ enum StreamEvent {
     Usage(Usage),
     /// Terminal condition reported by the provider.
     Stop(StopReason),
-    /// Protocol-level end of stream (chat-completions `[DONE]`); the driver
-    /// stops reading. The responses API ends at EOF instead.
+    /// Protocol-level end of stream (chat-completions `[DONE]`, the
+    /// Anthropic `message_stop`); the driver stops reading. Protocols that
+    /// end at EOF (responses API) never emit it.
     Done,
+    /// Provider-reported failure (e.g. Anthropic's terminal `error` event
+    /// on a 200 body). Honors the same output-flowed rule as transport
+    /// failures: before any output it stays retryable, after it becomes a
+    /// [`MidStreamError`].
+    Fail(String),
 }
 
 /// Parser-owned parts of the final assistant message; the driver owns
@@ -372,13 +378,18 @@ impl SseDriver {
         }
     }
 
-    /// Feed one raw SSE line; returns true when the parser signalled Done.
-    /// Sync variant for the in-memory test driver (channel never fills).
-    /// Live network paths use [`SseDriver::feed_raw_async`], which
+    /// Feed one raw SSE line; `Ok(true)` when the parser signalled Done.
+    /// A parser `Fail` becomes `Err` honoring the output-flowed rule. Sync
+    /// variant for the in-memory test driver (channel never fills). Live
+    /// network paths use [`SseDriver::feed_raw_async`], which
     /// back-pressures with `send().await` instead of dropping on a full
     /// channel.
     #[cfg(test)]
-    fn feed_raw(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
+    fn feed_raw(
+        &mut self,
+        line: &str,
+        parser: &mut impl StreamParser,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut done = false;
         for event in parser.feed(line) {
             if !matches!(event, StreamEvent::Thinking(_)) {
@@ -419,15 +430,22 @@ impl SseDriver {
                 StreamEvent::Usage(u) => self.usage = Some(u),
                 StreamEvent::Stop(reason) => self.stop_reason = Some(reason),
                 StreamEvent::Done => done = true,
+                StreamEvent::Fail(message) => {
+                    return Err(stream_err(&message, self.output_flowed));
+                }
             }
         }
-        done
+        Ok(done)
     }
 
     /// Async variant for live network paths: sink sends back-pressure with
     /// `send().await` so transcript lines are never dropped on a full
-    /// channel.
-    async fn feed_raw_async(&mut self, line: &str, parser: &mut impl StreamParser) -> bool {
+    /// channel. Same `Fail` → `Err` contract as [`SseDriver::feed_raw`].
+    async fn feed_raw_async(
+        &mut self,
+        line: &str,
+        parser: &mut impl StreamParser,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut done = false;
         for event in parser.feed(line) {
             if !matches!(event, StreamEvent::Thinking(_)) {
@@ -466,9 +484,12 @@ impl SseDriver {
                 StreamEvent::Usage(u) => self.usage = Some(u),
                 StreamEvent::Stop(reason) => self.stop_reason = Some(reason),
                 StreamEvent::Done => done = true,
+                StreamEvent::Fail(message) => {
+                    return Err(stream_err(&message, self.output_flowed));
+                }
             }
         }
-        done
+        Ok(done)
     }
 
     #[cfg(test)]
@@ -617,17 +638,18 @@ async fn run_sse<P: StreamParser>(
                       Ok(Some(bytes)) => {
                           buf.extend_from_slice(&bytes);
                           // Extract complete lines; keep partial tail buffered.
-                          while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                              // Borrow the line before draining: skips a
-                              // throwaway byte Vec per SSE line.
-                              let line = String::from_utf8_lossy(&buf[..=pos]).into_owned();
-                              buf.drain(..=pos);
-                              if driver.feed_raw_async(&line, &mut parser).await {
-                                  // Chat-completions [DONE]: stop reading.
-                                  let sink_is_some = sink.is_some();
-                                  return driver.finish_turn_async(parser, sink_is_some).await;
-                              }
-                          }
+                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                // Borrow the line before draining: skips a
+                                // throwaway byte Vec per SSE line.
+                                let line = String::from_utf8_lossy(&buf[..=pos]).into_owned();
+                                buf.drain(..=pos);
+                                if driver.feed_raw_async(&line, &mut parser).await? {
+                                    // Chat-completions [DONE] / Anthropic
+                                    // message_stop: stop reading.
+                                    let sink_is_some = sink.is_some();
+                                    return driver.finish_turn_async(parser, sink_is_some).await;
+                                }
+                            }
                       }
                 }
             }
@@ -644,8 +666,7 @@ async fn run_sse<P: StreamParser>(
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf).into_owned();
         // Feed as one final line even without trailing newline.
-        let done = driver.feed_raw_async(&line, &mut parser).await;
-        let _ = done;
+        driver.feed_raw_async(&line, &mut parser).await?;
     }
     let sink_is_some = sink.is_some();
     driver.finish_turn_async(parser, sink_is_some).await
@@ -688,7 +709,7 @@ fn run_sse_lines<P: StreamParser>(
         }
         // Re-add newline: `feed` expects raw SSE lines.
         let owned = format!("{line}\n");
-        if driver.feed_raw(&owned, &mut parser) {
+        if driver.feed_raw(&owned, &mut parser)? {
             break;
         }
     }
@@ -711,6 +732,15 @@ pub(crate) async fn read_responses_stream(
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     run_sse(response, sink, cancel, ResponsesParser::default()).await
+}
+
+/// Read an Anthropic Messages SSE body into a turn.
+pub(crate) async fn read_anthropic_stream(
+    response: reqwest::Response,
+    sink: Option<mpsc::Sender<SinkLine>>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+    run_sse(response, sink, cancel, AnthropicParser::default()).await
 }
 
 fn stop_reason_from_finish(finish: &str) -> Option<StopReason> {
@@ -978,6 +1008,273 @@ impl StreamParser for ResponsesParser {
     }
 }
 
+fn stop_reason_from_anthropic(stop: &str) -> Option<StopReason> {
+    match stop {
+        "end_turn" | "stop_sequence" => Some(StopReason::Stop),
+        "max_tokens" | "model_context_window" => Some(StopReason::Length),
+        "tool_use" => Some(StopReason::ToolUse),
+        "refusal" => Some(StopReason::ContentFilter),
+        // `pause_turn` suspends a server-tool turn for continuation; dex
+        // drives its own turns, so a paused stream is just a finished one.
+        "pause_turn" => Some(StopReason::Stop),
+        // Unrecognized provider reason — leave unset rather than guess.
+        _ => None,
+    }
+}
+
+/// One indexed content block under construction (text / thinking /
+/// tool_use). Anthropic streams per-block deltas keyed by `index`, so each
+/// block accumulates its own state until `content_block_stop`.
+#[derive(Default)]
+struct AnthropicBlock {
+    kind: String,
+    id: String,
+    name: String,
+    /// `input_json_delta` fragments for tool_use blocks.
+    json: String,
+    /// thinking_delta accumulation (replayed for signed thinking blocks).
+    text: String,
+    /// signature_delta accumulation (required to replay thinking).
+    signature: String,
+    /// Complete block captured at start for types with no deltas
+    /// (`redacted_thinking` arrives whole).
+    raw: Option<Value>,
+}
+
+/// `POST /v1/messages` stream (Anthropic Messages wire): typed events under
+/// `data:`, body ends with `message_stop` (or EOF). Usage arrives split —
+/// prompt-side counts on `message_start`, cumulative output tokens on
+/// `message_delta` — so the parser accumulates and emits one complete
+/// [`Usage`] per update instead of letting the last event clobber the rest.
+#[derive(Default)]
+struct AnthropicParser {
+    blocks: HashMap<u64, AnthropicBlock>,
+    tool_calls: Vec<LlmToolCall>,
+    /// Signature-carrying thinking blocks (+ whole redacted_thinking
+    /// blocks) for stateless replay on the next request.
+    reasoning_items: Vec<Value>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: Option<u64>,
+    cache_creation: u64,
+}
+
+impl AnthropicParser {
+    fn block(&mut self, event: &Value) -> Option<&mut AnthropicBlock> {
+        let index = event.get("index").and_then(Value::as_u64)?;
+        self.blocks.get_mut(&index)
+    }
+
+    /// Merge one usage object (`message_start` / `message_delta` shape):
+    /// every field is optional and only updates when present.
+    fn absorb_usage(&mut self, usage: &Value) {
+        if let Some(v) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.input_tokens = v;
+        }
+        if let Some(v) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = v;
+        }
+        if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.cache_read = Some(v);
+        }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cache_creation = v;
+        }
+    }
+
+    /// Prompt side counts every token that occupies context: uncached
+    /// input, cache reads, and cache writes; cache reads are surfaced
+    /// separately for cost discounting.
+    fn current_usage(&self) -> Usage {
+        Usage {
+            prompt_tokens: self.input_tokens + self.cache_read.unwrap_or(0) + self.cache_creation,
+            completion_tokens: self.output_tokens,
+            cached_tokens: self.cache_read,
+        }
+    }
+}
+
+impl StreamParser for AnthropicParser {
+    fn feed(&mut self, line: &str) -> Vec<StreamEvent> {
+        let Some(data) = line.strip_prefix("data:") else {
+            return Vec::new();
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            return Vec::new();
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Vec::new();
+        };
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut events = Vec::new();
+        match event_type {
+            // Terminal failure on a 200 body (overloaded_error, …): the
+            // driver turns this into a real error, retryable only before
+            // any output flowed.
+            "error" => {
+                let kind = event
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("api_error");
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown provider error");
+                events.push(StreamEvent::Fail(format!("{kind}: {message}")));
+            }
+            "message_start" => {
+                if let Some(usage) = event.pointer("/message/usage") {
+                    self.absorb_usage(usage);
+                }
+            }
+            "content_block_start" => {
+                let block = event.get("content_block").cloned().unwrap_or(Value::Null);
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let kind = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.blocks.insert(
+                    index,
+                    AnthropicBlock {
+                        id: block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        raw: (kind == "redacted_thinking").then_some(block),
+                        kind,
+                        ..Default::default()
+                    },
+                );
+            }
+            "content_block_delta" => {
+                let delta = event.get("delta").cloned().unwrap_or(Value::Null);
+                match delta
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "text_delta" => {
+                        // Text flows to the caller via StreamEvent::Text;
+                        // blocks only accumulate state that gets replayed
+                        // (thinking), so nothing to keep here.
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            events.push(StreamEvent::Text(text.to_string()));
+                        }
+                    }
+                    "thinking_delta" => {
+                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            events.push(StreamEvent::Thinking(text.to_string()));
+                            if let Some(block) = self.block(&event) {
+                                block.text.push_str(text);
+                            }
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
+                            if let Some(block) = self.block(&event) {
+                                block.signature.push_str(sig);
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) {
+                            if let Some(block) = self.block(&event) {
+                                block.json.push_str(fragment);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(block) = self.blocks.remove(&index) {
+                    match block.kind.as_str() {
+                        "tool_use" => {
+                            // Completed calls without an id/name must be
+                            // dropped, not executed (responses-parser rule).
+                            if !block.id.is_empty() && !block.name.is_empty() {
+                                self.tool_calls.push(LlmToolCall {
+                                    id: block.id,
+                                    call_type: "function".to_string(),
+                                    function: crate::core::types::FunctionCall {
+                                        name: block.name,
+                                        arguments: if block.json.is_empty() {
+                                            "{}".to_string()
+                                        } else {
+                                            block.json
+                                        },
+                                    },
+                                });
+                            }
+                        }
+                        // Only signature-carrying thinking blocks replay;
+                        // unsigned ones would corrupt the thread.
+                        "thinking" => {
+                            if !block.signature.is_empty() {
+                                self.reasoning_items.push(json!({
+                                    "type": "thinking",
+                                    "thinking": block.text,
+                                    "signature": block.signature,
+                                }));
+                            }
+                        }
+                        "redacted_thinking" => {
+                            if let Some(raw) = block.raw {
+                                self.reasoning_items.push(raw);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = event.get("usage") {
+                    self.absorb_usage(usage);
+                    events.push(StreamEvent::Usage(self.current_usage()));
+                }
+                if let Some(stop) = event
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .and_then(stop_reason_from_anthropic)
+                {
+                    events.push(StreamEvent::Stop(stop));
+                }
+            }
+            "message_stop" => events.push(StreamEvent::Done),
+            // `ping` keep-alives and anything unrecognized are noise.
+            _ => {}
+        }
+        events
+    }
+
+    fn finish(self) -> ParsedMessage {
+        // Completed calls without an id must be dropped, not executed.
+        let mut tool_calls = self.tool_calls;
+        tool_calls.retain(|call| !call.id.is_empty() && !call.function.name.is_empty());
+        ParsedMessage {
+            tool_calls,
+            reasoning_items: (!self.reasoning_items.is_empty()).then_some(self.reasoning_items),
+            reasoning_content: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1071,6 +1368,177 @@ mod tests {
         cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
         super::run_sse_lines(lines, sink, cancel, super::ResponsesParser::default())
+    }
+
+    fn read_anthropic_lines(
+        lines: &[&str],
+        sink: Option<tokio::sync::mpsc::Sender<SinkLine>>,
+        cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
+        super::run_sse_lines(lines, sink, cancel, super::AnthropicParser::default())
+    }
+
+    /// Anthropic Messages: text and tool_use blocks reassemble per index,
+    /// usage merges message_start (prompt side) with message_delta
+    /// (cumulative output), and `message_stop` terminates the stream.
+    #[test]
+    fn anthropic_stream_reassembles_blocks_and_terminates_on_message_stop() {
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":25,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"th\":\"a.rs\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            r#"data: {"type":"ping"}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}"#,
+            r#"data: {"type":"message_stop"}"#,
+            // Server keeps the connection open after message_stop — Done
+            // must stop reading before this arrives.
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":99}}"#,
+        ];
+        let turn = read_anthropic_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(turn.message.content.as_deref(), Some("hello "));
+        let calls = turn.message.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(turn.stop_reason, Some(StopReason::ToolUse));
+        // Prompt side counts cache reads/writes too; output is the
+        // message_delta cumulative value, not the trailing one.
+        assert_eq!(
+            turn.usage,
+            Some(Usage {
+                prompt_tokens: 32,
+                completion_tokens: 9,
+                cached_tokens: Some(5)
+            })
+        );
+    }
+
+    /// Thinking deltas land as Thinking sink lines; signed thinking blocks
+    /// are captured for replay, unsigned ones are not.
+    #[test]
+    fn anthropic_stream_captures_replayable_thinking() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step "}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig1"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"one"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"unsigned"}}"#,
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"encrypted-blob"}}"#,
+            r#"data: {"type":"content_block_stop","index":2}"#,
+        ];
+        let turn = read_anthropic_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
+        let items = turn.message.reasoning_items.unwrap();
+        assert_eq!(items.len(), 2, "unsigned thinking must not replay");
+        assert_eq!(items[0]["type"], "thinking");
+        assert_eq!(items[0]["thinking"], "step one");
+        assert_eq!(items[0]["signature"], "sig1");
+        assert_eq!(items[1]["type"], "redacted_thinking");
+        assert_eq!(items[1]["data"], "encrypted-blob");
+        let lines: Vec<SinkLine> = {
+            let mut out = Vec::new();
+            while let Ok(v) = rx.try_recv() {
+                out.push(v);
+            }
+            out
+        };
+        assert!(matches!(&lines[0], SinkLine::Thinking(s) if s == "step "));
+        assert!(matches!(&lines[1], SinkLine::Thinking(s) if s == "one"));
+    }
+
+    /// Anthropic stop reasons map onto the normalized set; unknown reasons
+    /// stay unset.
+    #[test]
+    fn anthropic_stream_maps_stop_reasons() {
+        for (reason, expected) in [
+            ("end_turn", StopReason::Stop),
+            ("stop_sequence", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("model_context_window", StopReason::Length),
+            ("tool_use", StopReason::ToolUse),
+            ("refusal", StopReason::ContentFilter),
+            ("pause_turn", StopReason::Stop),
+        ] {
+            let (tx, _rx) = mpsc::channel(32);
+            let lines: &[&str] = &[&format!(
+                r#"data: {{"type":"message_delta","delta":{{"stop_reason":"{reason}"}}}}"#
+            )];
+            let turn = read_anthropic_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
+            assert_eq!(turn.stop_reason, Some(expected), "stop_reason={reason}");
+        }
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[r#"data: {"type":"message_delta","delta":{"stop_reason":"junk"}}"#];
+        assert_eq!(
+            read_anthropic_lines(lines, Some(tx), &CancellationToken::new())
+                .unwrap()
+                .stop_reason,
+            None
+        );
+    }
+
+    /// A terminal `error` event on a 200 body is a real failure: retryable
+    /// before any output flowed, a mid-stream marker after it.
+    #[test]
+    fn anthropic_error_event_fails_turn_by_output_flow() {
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        ];
+        let err = read_anthropic_lines(lines, Some(tx), &CancellationToken::new())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "overloaded_error: Overloaded");
+        assert!(!is_mid_stream(
+            &*read_anthropic_lines(lines, None, &CancellationToken::new()).unwrap_err()
+        ));
+
+        // After text has streamed, the failure must carry the marker so a
+        // retry cannot duplicate the partial transcript.
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        ];
+        let err = read_anthropic_lines(lines, Some(tx), &CancellationToken::new()).unwrap_err();
+        assert!(is_mid_stream(&*err));
+        assert_eq!(err.to_string(), "overloaded_error: Overloaded");
+    }
+
+    /// Garbage, empty, and keep-alive lines are skipped; a stream with no
+    /// output yields an empty assistant message (no spurious tool calls).
+    #[test]
+    fn anthropic_stream_tolerates_garbage() {
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            "data: not json at all",
+            "data: ",
+            r#"data: {"type":"ping"}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ];
+        let turn = read_anthropic_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
+        assert_eq!(turn.message.content, None);
+        assert!(turn.message.tool_calls.is_none());
+        assert_eq!(turn.usage, None);
+        // Ghost tool blocks (no id) are dropped at finish, like responses.
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"ghost","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ];
+        let turn = read_anthropic_lines(lines, Some(tx), &CancellationToken::new()).unwrap();
+        assert!(turn.message.tool_calls.is_none());
     }
 
     /// A reasoning output item with encrypted_content is captured onto the

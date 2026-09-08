@@ -156,6 +156,21 @@ providers:
     # headers: {X-Custom: ...} # optional; sent only to this provider
 ```
 
+Anthropic is built in as its own provider — `model: anthropic/claude-sonnet-4-5`
+(or `--model anthropic`) with `ANTHROPIC_API_KEY`. It speaks the native
+Messages wire (`anthropic-messages`: `x-api-key` auth, `anthropic-version`
+header, block-shaped tool calls and thinking blocks replayed with their
+signatures). Any other provider entry can also pin that wire with
+`api: anthropic-messages` when its endpoint speaks the Messages API:
+
+```yaml
+providers:
+  gateway:
+    api_key: ...
+    base_url: https://gateway.example/v1
+    api: anthropic-messages
+```
+
 `/provider zai` and `/model zai/<id>` switch to it (the completion list shows
 `zai/<id>` once configured). The endpoint, model list, pricing, context
 windows and reasoning options come from the cached models.dev catalog — run
@@ -449,6 +464,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | Variable             | Description                                              |
 | -------------------- | -------------------------------------------------------- |
 | `OPENCODE_API_KEY`   | API key for the opencode gateway (required for `opencode`; export it in your shell profile). |
+| `ANTHROPIC_API_KEY`  | API key for the built-in `anthropic` provider (`model: anthropic/<model>`); resolves cache-less. |
 | `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. `OPENAI_HEADERS`/`ANTHROPIC_CUSTOM_HEADERS` are deprecated aliases — use `DEX_HEADERS`. |
 | `DEX_MODEL` | Model selection, `provider/model` (`endpoint/model` or a bare provider name work too) — the same knob as the file's `model:` key. |
 | `DEX_PROVIDER` | Deprecated provider selection — use `DEX_MODEL=<provider>/<model>` (still honored with a one-time warning). |

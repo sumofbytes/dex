@@ -478,7 +478,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             );
             push_info(
                 app,
-                "available providers: opencode, openai-codex".to_string(),
+                "available providers: opencode, openai-codex, anthropic".to_string(),
             );
         }
         "/thinking" => {
