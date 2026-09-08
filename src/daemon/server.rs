@@ -90,6 +90,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/undo", post(session_undo))
         .route("/api/sessions/{id}/waive", post(session_waive))
         .route("/api/sessions/{id}/name", post(session_name))
+        .route("/api/sessions/{id}/shell", post(session_shell))
         .with_state(state)
         .layer(axum::middleware::from_fn(require_bearer))
 }
@@ -928,11 +929,13 @@ async fn run_turn_inner(
 
     // Rebuild the conversation: system prompt + persisted history + prompt.
     // History load via `spawn_blocking` (full-history scan, fast) — Phase 4/6.
+    // The model-bound load drops `!!` shell runs (saved + shown, never sent
+    // to the LLM); the transcript rebuild keeps them.
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt(&skills)));
     if let Some(path) = session.path().map(|p| p.to_path_buf()) {
         let loaded = tokio::task::spawn_blocking(move || {
-            session::load_messages_from_session(&path).unwrap_or_default()
+            session::load_llm_messages_from_session(&path).unwrap_or_default()
         })
         .await
         .unwrap_or_default();
@@ -1317,12 +1320,26 @@ async fn cancel(
 ) -> Json<serde_json::Value> {
     // Ask the in-flight turn to unwind: the LLM stream reader and the agent
     // loop poll this token between steps. A missing entry means no turn is
-    // running for the session, so there is nothing to cancel.
+    // running for the session, so there is nothing to cancel. Cloned under
+    // the lock, cancelled outside it — never hold the mutex across the call.
     if let Some(token) = state
         .cancel_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&session_id)
+        .cloned()
+    {
+        token.cancel();
+    }
+    // Same for an in-flight `!` shell run (pi: Esc cancels a running bash).
+    // One Esc cancels whatever is running; a turn and a shell overlap only
+    // when the user explicitly started both.
+    if let Some(token) = state
+        .shell_tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session_id)
+        .cloned()
     {
         token.cancel();
     }
@@ -1576,6 +1593,132 @@ async fn session_waive(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+/// `POST /api/sessions/{id}/shell` with `{"command": ...}` — run a shell
+/// command directly in the daemon workspace (`!`/`!!` prefix in the TUI,
+/// like pi). Bypasses the agent loop and approvals: the explicit `!` is
+/// the approval (even in `read-only`, which constrains the model, not your
+/// own typing). Like pi the run is saved to session history: `!` feeds the
+/// next turn as a user message, `!!` (`exclude_from_context`) is saved too
+/// but filtered out of the model-bound history at load. Empty commands are
+/// a 400, unknown sessions a 404, and a second run while one is in flight
+/// for the session is a 409 (the TUI refuses it first; this guards direct
+/// API callers). A concurrent agent turn is allowed — pi runs `!` alongside
+/// a turn and folds the result into context afterwards; both append to the
+/// append-only journal, ordered by completion.
+async fn session_shell(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<crate::protocol::ShellRequest>,
+) -> Result<Json<crate::protocol::ShellResponse>, StatusCode> {
+    let command = req.command.trim().to_string();
+    if command.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Session must exist — the workspace is resolved from the daemon cwd,
+    // but the lookup guards against typos/stale ids like every other route.
+    let session_file = session_path(&state, &session_id)?;
+    let shell_cancel = CancellationToken::new();
+    {
+        let mut running = state.shell_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if running.contains_key(&session_id) {
+            return Err(StatusCode::CONFLICT);
+        }
+        running.insert(session_id.clone(), shell_cancel.clone());
+    }
+    // Frees the per-session slot even when the run panics, so one bad run
+    // can't wedge `!` for the session until a daemon restart.
+    struct ShellGuard {
+        state: Arc<DaemonState>,
+        session_id: String,
+    }
+    impl Drop for ShellGuard {
+        fn drop(&mut self) {
+            self.state
+                .shell_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
+        }
+    }
+    let _guard = ShellGuard {
+        state: state.clone(),
+        session_id: session_id.clone(),
+    };
+    let started = Instant::now();
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "command".to_string(),
+        serde_json::Value::String(command.clone()),
+    );
+    let (output, success, code) = match crate::tools::execute("bash", &args, &shell_cancel).await {
+        Ok(output) => (output, true, Some(0)),
+        Err(error) => {
+            // Same `Error: …` shape `execute_outcome` gives the agent loop
+            // (Display appends `[exit N]` for non-zero exits), plus the raw
+            // code for the client.
+            let code = match &error {
+                crate::tools::ToolError::Shell { code, .. } => *code,
+                _ => None,
+            };
+            (format!("Error: {error}"), false, code)
+        }
+    };
+    let duration = started.elapsed().as_secs_f64();
+    let cancelled = shell_cancel.is_cancelled();
+    // The slot guard stays alive through the journal write below: freeing it
+    // before persisting would let a second `!` start while the first is still
+    // appending, interleaving the two runs' message + event writes and
+    // letting a concurrent turn's seq land inside this run's call/result
+    // pair. A slow disk serializing back-to-back `!` runs is the cheaper
+    // failure mode.
+    let persist = if req.exclude_from_context {
+        ChatMessage::user_named(
+            crate::core::format::bash_context_text(&command, &output, success, code, cancelled),
+            crate::core::types::BASH_EXCLUDED_NAME,
+        )
+    } else {
+        ChatMessage::user(crate::core::format::bash_context_text(
+            &command, &output, success, code, cancelled,
+        ))
+    };
+    // ToolCall/ToolResult pair mirroring the live TUI block, so a
+    // true-remote reattach (events-journal replay) renders the same block
+    // the co-located transcript rebuild draws from the message above.
+    let input_json = serde_json::json!({"command": command}).to_string();
+    let short = crate::core::format::short_arg("bash", &input_json);
+    let summary = crate::core::format::tool_result_summary("bash", &input_json, &output, success);
+    let preview = crate::core::format::tool_preview("bash", success, None, &output, true);
+    let (call_seq, result_seq) = state.next_seq_pair(&session_id);
+    let call_event = serde_json::to_string(&StreamEvent::ToolCall {
+        name: "bash".to_string(),
+        args: serde_json::Value::String(short),
+    })
+    .unwrap_or_default();
+    let result_event = serde_json::to_string(&StreamEvent::ToolResult {
+        name: "bash".to_string(),
+        summary,
+        success,
+        preview,
+        duration,
+    })
+    .unwrap_or_default();
+    // Best-effort history: a failed journal write must not fail a run whose
+    // output is already in hand (the TUI renders the response regardless).
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut session) = Session::from_path(&session_file) {
+            let _ = session.append_message(&persist);
+            let _ = session.append_event(call_seq, &call_event);
+            let _ = session.append_event(result_seq, &result_event);
+        }
+    })
+    .await;
+    Ok(Json(crate::protocol::ShellResponse {
+        output,
+        success,
+        code,
+    }))
+}
+
 /// `POST /api/sessions/{id}/name` with `{"name": ...}` — rename a session
 /// (remote counterpart of local `/name`).
 async fn session_name(
@@ -1633,6 +1776,123 @@ mod handler_tests {
             },
         );
         (state, id)
+    }
+
+    #[tokio::test]
+    async fn shell_validates_runs_and_persists() {
+        use crate::protocol::ShellRequest;
+        let shell = |command: &str, excluded: bool| ShellRequest {
+            command: command.into(),
+            exclude_from_context: excluded,
+        };
+        let state = Arc::new(DaemonState::new());
+        // Unknown session -> 404 (with a real command).
+        let r = session_shell(
+            State(state.clone()),
+            Path("nope".into()),
+            Json(shell("echo hi", false)),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+        // Empty command -> 400 before the session lookup.
+        let r = session_shell(
+            State(state.clone()),
+            Path("nope".into()),
+            Json(shell("   ", false)),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        // Hermetic session file: unique temp path, so parallel runs never
+        // collide (no fixed name under target/).
+        let path = std::env::temp_dir().join(format!(
+            "dex-shell-test-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(
+              &path,
+              "{\"type\":\"session\",\"version\":1,\"id\":\"test-shell-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp/dex-test-cwd\"}\n",
+          )
+          .unwrap();
+        let (state, id) = state_with_session(&path);
+        // A registered in-flight run makes a second one 409 (pi: one bash
+        // at a time; Esc cancels the first).
+        state
+            .shell_tokens
+            .lock()
+            .unwrap()
+            .insert(id.clone(), crate::core::console::CancellationToken::new());
+        let r = session_shell(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(shell("echo hi", false)),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::CONFLICT)));
+        state.shell_tokens.lock().unwrap().remove(&id);
+        let r = session_shell(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(shell("echo hi", false)),
+        )
+        .await;
+        let body = r.expect("shell run").0;
+        assert!(body.success);
+        assert!(body.output.contains("hi"));
+        // The slot frees when the run finishes (back-to-back `!` works).
+        assert!(!state.shell_tokens.lock().unwrap().contains_key(&id));
+        // A failing command reports success=false with the exit marker.
+        let r = session_shell(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(shell("exit 3", false)),
+        )
+        .await;
+        let body = r.expect("shell run").0;
+        assert!(!body.success);
+        assert!(body.output.contains("[exit 3]"));
+        // pi: runs persist to history and feed the next turn.
+        let loaded = crate::session::load_messages_from_session(&path).unwrap();
+        assert!(
+            loaded
+                .iter()
+                .any(|m| m.content_str().contains("Ran `echo hi`")),
+            "shell run persisted: {:?}",
+            loaded
+                .iter()
+                .map(|m| m.content_str().to_string())
+                .collect::<Vec<_>>(),
+        );
+        // `!!` persists too but stays out of the model-bound history.
+        let r = session_shell(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(shell("echo secret", true)),
+        )
+        .await;
+        assert!(r.expect("shell run").0.success);
+        let loaded = crate::session::load_messages_from_session(&path).unwrap();
+        assert!(loaded
+            .iter()
+            .any(|m| m.is_context_excluded() && m.content_str().contains("secret")),);
+        let llm = crate::session::load_llm_messages_from_session(&path).unwrap();
+        assert!(llm
+            .iter()
+            .any(|m| m.content_str().contains("Ran `echo hi`")));
+        assert!(!llm.iter().any(|m| m.content_str().contains("secret")));
+        // /cancel signals an in-flight shell run too (pi: Esc cancels bash).
+        let token = crate::core::console::CancellationToken::new();
+        state
+            .shell_tokens
+            .lock()
+            .unwrap()
+            .insert(id.clone(), token.clone());
+        let _ = cancel(State(state.clone()), Path(id)).await;
+        assert!(token.is_cancelled());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
