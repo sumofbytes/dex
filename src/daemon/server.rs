@@ -90,6 +90,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/undo", post(session_undo))
         .route("/api/sessions/{id}/waive", post(session_waive))
         .route("/api/sessions/{id}/name", post(session_name))
+        .route("/api/sessions/{id}/shell", post(session_shell))
         .with_state(state)
         .layer(axum::middleware::from_fn(require_bearer))
 }
@@ -1576,6 +1577,53 @@ async fn session_waive(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+/// `POST /api/sessions/{id}/shell` with `{"command": ...}` — run a shell
+/// command directly in the daemon workspace (`!` prefix in the TUI, like pi).
+/// Bypasses the agent loop and approvals: the explicit `!` is the approval.
+/// Display-only: nothing is appended to the session, so the next turn starts
+/// clean. Empty commands are a 400; unknown sessions a 404.
+async fn session_shell(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<crate::protocol::ShellRequest>,
+) -> Result<Json<crate::protocol::ShellResponse>, StatusCode> {
+    if req.command.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Session must exist — the workspace is resolved from the daemon cwd,
+    // but the lookup guards against typos/stale ids like every other route.
+    session_path(&state, &session_id)?;
+    let mut args = serde_json::Map::new();
+    args.insert(
+        "command".to_string(),
+        serde_json::Value::String(req.command),
+    );
+    let (output, success, code) = match crate::tools::execute(
+        "bash",
+        &args,
+        &crate::agent::state::GlobalCancellation,
+    )
+    .await
+    {
+        Ok(output) => (output, true, Some(0)),
+        Err(error) => {
+            // Same `Error: …` shape `execute_outcome` gives the agent loop
+            // (Display appends `[exit N]` for non-zero exits), plus the raw
+            // code for the client.
+            let code = match &error {
+                crate::tools::ToolError::Shell { code, .. } => *code,
+                _ => None,
+            };
+            (format!("Error: {error}"), false, code)
+        }
+    };
+    Ok(Json(crate::protocol::ShellResponse {
+        output,
+        success,
+        code,
+    }))
+}
+
 /// `POST /api/sessions/{id}/name` with `{"name": ...}` — rename a session
 /// (remote counterpart of local `/name`).
 async fn session_name(
@@ -1633,6 +1681,67 @@ mod handler_tests {
             },
         );
         (state, id)
+    }
+
+    #[tokio::test]
+    async fn shell_validates_and_runs() {
+        use crate::protocol::ShellRequest;
+        let state = Arc::new(DaemonState::new());
+        // Unknown session -> 404 (with a real command).
+        let r = session_shell(
+            State(state.clone()),
+            Path("nope".into()),
+            Json(ShellRequest {
+                command: "echo hi".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+        // Empty command -> 400 before the session lookup.
+        let r = session_shell(
+            State(state.clone()),
+            Path("nope".into()),
+            Json(ShellRequest {
+                command: "   ".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        // Real runs need a registered session file (existence only; the
+        // session itself is untouched — `!` is display-only).
+        let dir = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dex-shell-test.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"session","version":1,"id":"test-shell-1","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp/dex-test-cwd"}"#,
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+        let r = session_shell(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(ShellRequest {
+                command: "echo hi".into(),
+            }),
+        )
+        .await;
+        let body = r.expect("shell run").0;
+        assert!(body.success);
+        assert!(body.output.contains("hi"));
+        // A failing command reports success=false with the exit marker.
+        let r = session_shell(
+            State(state),
+            Path(id),
+            Json(ShellRequest {
+                command: "exit 3".into(),
+            }),
+        )
+        .await;
+        let body = r.expect("shell run").0;
+        assert!(!body.success);
+        assert!(body.output.contains("[exit 3]"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
