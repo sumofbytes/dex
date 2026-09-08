@@ -318,34 +318,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         .collect();
 
     // Per-request overrides so client flags keep working in remote mode.
-    let options = ChatOptions {
-        skill_dirs: args
-            .skill_dirs
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        base_url: args.base_url.clone(),
-        model: args.model.clone(),
-        permission: args.permission.map(|mode| match mode {
-            PermissionMode::ReadOnly => "read-only".to_string(),
-            PermissionMode::AskWrites => "ask-writes".to_string(),
-            PermissionMode::AskShell => "ask-shell".to_string(),
-            PermissionMode::Trusted => "trusted".to_string(),
-        }),
-        headers: if args.headers.is_empty() {
-            None
-        } else {
-            let mut merged = std::collections::BTreeMap::new();
-            for raw in &args.headers {
-                for (k, v) in crate::llm::config::parse_headers_str(raw) {
-                    crate::llm::config::insert_extra_header(&mut merged, &k, &v);
-                }
-            }
-            Some(merged)
-        },
-        plan: None,
-        idempotency_key: None,
-    };
+    let options = crate::chat_options_from_args(args);
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(256);
     let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>(16);
@@ -492,6 +465,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Report lifecycle state to the enclosing Herdr pane, if any.
+    let mut herdr = super::herdr::Reporter::new();
     let mut run = || -> std::io::Result<()> {
         // Events consumed by the OSC-report lookahead, replayed on the next
         // iterations of the loop.
@@ -537,6 +512,15 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             }
 
             let busy = remote.app.busy;
+            // Cheap when unchanged (outside Herdr it is a no-op).
+            herdr.sync(
+                busy,
+                remote
+                    .app
+                    .pending_approval
+                    .as_ref()
+                    .map(|a| a.name.as_str()),
+            );
             // An expired status notice needs one more frame to disappear.
             if remote.app.tick_notice() {
                 dirty = true;
@@ -595,6 +579,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     };
 
     let res = run();
+    // Always release, even if the loop returned early via `?` (draw/poll
+    // error) — otherwise a stale agent row lingers in the Herdr sidebar.
+    herdr.release();
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
     let _ = execute!(

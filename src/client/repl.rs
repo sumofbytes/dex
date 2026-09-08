@@ -85,22 +85,26 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
     None
 }
 
-/// One-shot mode: send a single prompt and print the response.
+/// One-shot mode: send a single prompt and print the response. `options`
+/// carries the CLI flag overrides (`--model`, `-H`, `--skill`, …) so
+/// `dex connect <url> "prompt"` keeps flag parity with the TUI.
 pub(crate) fn one_shot(
     client: &DaemonClient,
     prompt: &str,
+    options: &ChatOptions,
+    session_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let session = client.create_session(&cwd, None)?;
+    let session = client.create_session(&cwd, session_name)?;
 
     eprintln!("session: {}", session.session_id);
 
     client.chat(
         &session.session_id,
         prompt,
-        ChatOptions::default(),
+        options.clone(),
         &mut handle_event,
     )?;
 
