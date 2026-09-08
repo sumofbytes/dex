@@ -229,18 +229,26 @@ fn known_providers(entries: &BTreeMap<String, ProviderEntry>) -> BTreeSet<String
 /// `Provider::name()`. `None` provider means "selection names
 /// no known provider" (an endpoint prefix like `go/…` or a plain model id).
 fn split_selection(selection: &str, known: &BTreeSet<String>) -> (Option<String>, String) {
+    // A bare provider pick gets that provider's own default model
+    // (`anthropic` → a claude model; OpenAI-compatible providers share the
+    // builtin default).
+    let default_model = |name: &str| {
+        Provider::parse_known(name, known)
+            .map(|provider| provider.default_model().to_string())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    };
     match selection.split_once('/') {
         Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => (
             Some(prefix.trim().to_ascii_lowercase()),
             if rest.is_empty() {
-                DEFAULT_MODEL.to_string()
+                default_model(prefix)
             } else {
                 rest.to_string()
             },
         ),
         _ if Provider::parse_known(selection, known).is_some() => (
             Some(selection.trim().to_ascii_lowercase()),
-            DEFAULT_MODEL.to_string(),
+            default_model(selection),
         ),
         _ => (None, selection.to_string()),
     }
@@ -358,6 +366,18 @@ fn catalog_env_vars(key: &str, catalog: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Builtin providers whose canonical key env var is pinned in dex rather
+/// than catalog-discovered, so key resolution works cache-less on a fresh
+/// install (no `dex update --models` needed first). Mirrored in `doctor`'s
+/// key-origin row.
+fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
+    match provider {
+        Provider::OpenCode => Some("OPENCODE_API_KEY"),
+        Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    }
+}
+
 /// Landing base URL when nothing explicit is set: the builtin default, or
 /// for a generic provider its config entry override > catalog `api` URL.
 fn landing_base_url_for(
@@ -447,15 +467,16 @@ pub(crate) fn resolve_credentials(
     {
         return Ok((key, None));
     }
-    // The provider's own documented env vars; for opencode the canonical
-    // name is hardcoded too so it works cache-less (the catalog is just
-    // the source for every other provider).
+    // The provider's own documented env vars; pinned builtin vars (see
+    // `pinned_key_env`) work cache-less — the catalog is the source for
+    // every other provider.
     let mut env_names: Vec<String> = load_dex_catalog()
         .map(|c| catalog_env_vars(name, &c))
         .unwrap_or_default();
-    if matches!(provider, Provider::OpenCode) && !env_names.iter().any(|v| v == "OPENCODE_API_KEY")
-    {
-        env_names.insert(0, "OPENCODE_API_KEY".to_string());
+    if let Some(pinned) = pinned_key_env(provider) {
+        if !env_names.iter().any(|v| v == pinned) {
+            env_names.insert(0, pinned.to_string());
+        }
     }
     for var in &env_names {
         if let Ok(key) = env::var(var) {
@@ -871,55 +892,55 @@ fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
     Some(value)
 }
 
-fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
+/// models.dev catalog `limit.<key>` for `model` (`context` = window,
+/// `output` = generation cap). Matches either cache shape — api.json
+/// (per-provider models) or catalog.json (flat models map) — case-
+/// insensitively.
+fn catalog_limit(model: &str, catalog: &serde_json::Value, key: &str) -> Option<u64> {
     let needle = model.to_ascii_lowercase();
     // catalog is api.json (providers) or catalog.json (models+providers) — try both shapes
     if let Some(providers) = catalog.as_object() {
-        // api.json shape: { "opencode": { models: { "id": { limit:{context} } } } }
-        for (_prov, entry) in providers {
-            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                if let Some(m) = models.get(needle.as_str()).or_else(|| {
+        let lookup = |models: &serde_json::Map<String, serde_json::Value>| {
+            models
+                .get(needle.as_str())
+                .or_else(|| {
                     // fallback case-insensitive scan
                     models
                         .iter()
                         .find(|(k, _)| k.to_ascii_lowercase() == needle)
                         .map(|(_, v)| v)
-                }) {
-                    if let Some(ctx) = m
-                        .get("limit")
-                        .and_then(|l| l.get("context"))
-                        .and_then(|c| c.as_u64())
-                    {
-                        return Some(ctx);
-                    }
+                })
+                .and_then(|m| m.get("limit"))
+                .and_then(|l| l.get(key))
+                .and_then(|c| c.as_u64())
+        };
+        // api.json shape: { "opencode": { models: { "id": { limit:{context} } } } }
+        for (_prov, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
+                if let Some(v) = lookup(models) {
+                    return Some(v);
                 }
             }
         }
         // catalog.json shape: { models: { "id": { limit } }, providers: { } }
         if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
-            if let Some(m) = models.get(needle.as_str()) {
-                if let Some(ctx) = m
-                    .get("limit")
-                    .and_then(|l| l.get("context"))
-                    .and_then(|c| c.as_u64())
-                {
-                    return Some(ctx);
-                }
-            }
-            for (k, m) in models {
-                if k.to_ascii_lowercase() == needle {
-                    if let Some(ctx) = m
-                        .get("limit")
-                        .and_then(|l| l.get("context"))
-                        .and_then(|c| c.as_u64())
-                    {
-                        return Some(ctx);
-                    }
-                }
+            if let Some(v) = lookup(models) {
+                return Some(v);
             }
         }
     }
     None
+}
+
+fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
+    catalog_limit(model, catalog, "context")
+}
+
+/// models.dev `limit.output` for the model — the generation cap wires that
+/// must declare one up front (Anthropic `max_tokens`) clamp against. Reads
+/// the cached catalog parse, so safe on hot paths.
+pub(crate) fn catalog_output_limit_for(model: &str) -> Option<u64> {
+    load_dex_catalog().and_then(|c| catalog_limit(model, &c, "output"))
 }
 
 /// Endpoint URL serving `model` per the models.dev catalog, for bare model
@@ -1475,14 +1496,19 @@ pub(crate) struct LlmConfig {
 /// Base wire protocol + baked pin from the provider entry's `api:` pin and
 /// the global file `api:`. Single derivation shared by `from_env` and every
 /// provider switch; per-model overrides (`DEX_MODEL_APIS`, learned) apply
-/// on top via `resolve_model_api`.
+/// on top via `resolve_model_api`. Native providers carry a built-in
+/// default (`anthropic` → anthropic-messages); OpenAI-compatible ones
+/// fall back to the responses default with the empirical completions
+/// fallback.
 fn base_protocol(
+    provider: &Provider,
     api_pin: Option<ApiProtocol>,
     file: &Option<serde_yaml::Value>,
 ) -> (ApiProtocol, bool) {
     let file_pin = load_config_str(file, "api");
     let api = api_pin
         .or(file_pin.as_deref().and_then(ApiProtocol::parse))
+        .or_else(|| provider.default_api())
         .unwrap_or(ApiProtocol::Responses);
     (api, file_pin.is_some() || api_pin.is_some())
 }
@@ -1526,16 +1552,23 @@ impl LlmConfig {
             .or_else(|| env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty()))
             .or_else(|| load_config_str(&file, "model"))
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        let (selection_provider, model) = split_selection(&selection, &known);
-        let provider_name = match selection_provider {
-            Some(name) => name,
+        let (selection_provider, mut model) = split_selection(&selection, &known);
+        let provider_name = match selection_provider.as_deref() {
+            Some(name) => name.to_string(),
             None => env_provider_fallback(&file),
         };
         let provider = Provider::parse_known(&provider_name, &known).ok_or_else(|| {
             format!(
-                "unsupported provider '{provider_name}'; use opencode, openai-codex or a providers: entry"
+                "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic or a providers: entry"
             )
         })?;
+        // A provider from the deprecated fallback (`DEX_PROVIDER` /
+        // `active_provider:`) with the untouched builtin default model gets
+        // one of its own family — `active_provider: anthropic` must not send
+        // `gpt-5.6-luna` to the Messages API.
+        if selection_provider.is_none() && model == DEFAULT_MODEL {
+            model = provider.default_model().to_string();
+        }
         let mut available_models = env::var("DEX_MODELS")
             .ok()
             .map(|value| {
@@ -1583,12 +1616,12 @@ impl LlmConfig {
                 "top-level config key 'api:' is deprecated — set 'api:' under the provider's entry in 'providers:'",
             );
             ApiProtocol::parse(&name).ok_or_else(|| {
-                format!("unsupported api '{name}'; use openai-completions or openai-responses")
+                format!("unsupported api '{name}'; use openai-completions, openai-responses or anthropic-messages")
             })?;
         }
         // Baked once: hot paths read the fields instead of re-reading the
         // file on every request.
-        let (api, api_pinned) = base_protocol(resolved.api_pin, &file);
+        let (api, api_pinned) = base_protocol(&provider, resolved.api_pin, &file);
         // The model carries its own wire protocol; the global `api` above is
         // only the default. Otherwise the `apply_model` call below resolves
         // (full `endpoint/id` key, then bare id, then learned fallback).
@@ -1908,7 +1941,7 @@ impl LlmConfig {
     /// Base wire protocol + baked pin from an entry pin, re-reading the
     /// global file `api:` (cached). Per-model overrides apply on top.
     fn refresh_protocol(&mut self, api_pin: Option<ApiProtocol>) {
-        let (api, pinned) = base_protocol(api_pin, &load_config_file());
+        let (api, pinned) = base_protocol(&self.provider, api_pin, &load_config_file());
         self.api = api;
         self.api_pinned = pinned;
     }
@@ -2079,7 +2112,7 @@ pub(crate) fn doctor(
             &mut out,
             "provider",
             &provider_name,
-            "UNSUPPORTED — use opencode, openai-codex or a providers: entry",
+            "UNSUPPORTED — use opencode, openai-codex, anthropic or a providers: entry",
         ),
         Some(provider) => {
             // Values come from the live build when it succeeds; otherwise
@@ -2114,7 +2147,10 @@ pub(crate) fn doctor(
                 }
             } else if entry.and_then(|e| e.base_url.clone()).is_some() {
                 "config providers.<name>.base_url".to_string()
-            } else if matches!(provider, Provider::OpenCode | Provider::OpenAiCodex) {
+            } else if matches!(
+                provider,
+                Provider::OpenCode | Provider::OpenAiCodex | Provider::Anthropic
+            ) {
                 "built-in default".to_string()
             } else {
                 "models.dev catalog".to_string()
@@ -2144,12 +2180,12 @@ pub(crate) fn doctor(
                 let mut names = load_dex_catalog()
                     .map(|c| catalog_env_vars(provider.name(), &c))
                     .unwrap_or_default();
-                // Mirror `resolve_credentials`: opencode's canonical var is a
-                // dex convention, not a catalog `env` entry.
-                if matches!(provider, Provider::OpenCode)
-                    && !names.iter().any(|v| v == "OPENCODE_API_KEY")
-                {
-                    names.insert(0, "OPENCODE_API_KEY".to_string());
+                // Mirror `resolve_credentials`: pinned builtin vars resolve
+                // cache-less, ahead of any catalog `env` discovery.
+                if let Some(pinned) = pinned_key_env(&provider) {
+                    if !names.iter().any(|v| v == pinned) {
+                        names.insert(0, pinned.to_string());
+                    }
                 }
                 match names
                     .iter()
@@ -2178,6 +2214,8 @@ pub(crate) fn doctor(
                 (api.name().to_string(), "DEX_MODEL_APIS")
             } else if let Some(api) = learned_api(&base_url, &model) {
                 (api.name().to_string(), "learned (learned-apis.json)")
+            } else if let Some(api) = provider.default_api() {
+                (api.name().to_string(), "built-in provider default")
             } else {
                 (
                     "openai-responses".to_string(),
@@ -3068,6 +3106,66 @@ pub(crate) mod tests {
         };
         assert!(err.contains("providers.opencode.api_key"), "{err}");
         assert!(err.contains("OPENCODE_API_KEY"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anthropic_key_resolves_cacheless_via_pinned_env_var() {
+        // The catalog cache is empty (`{}`) — ANTHROPIC_API_KEY must still
+        // resolve because builtin native providers pin their canonical var
+        // (see `pinned_key_env`). Deposit order matches opencode:
+        // providers.anthropic.api_key > ANTHROPIC_API_KEY.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "ANTHROPIC_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-akey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::fs::write(dir.join("config.yaml"), "active_provider: anthropic\n").unwrap();
+        // Cache-less: the pinned var is the shell path; the bare provider
+        // pick gets a model of its own family and the native wire.
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant");
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.api_key, "sk-ant");
+        assert_eq!(cfg.model, "claude-sonnet-4-5");
+        assert_eq!(cfg.api, ApiProtocol::Anthropic);
+        // The scoped deposit place wins over the env var.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: anthropic\nproviders:\n  anthropic:\n    api_key: deposited\n",
+        )
+        .unwrap();
+        assert_eq!(
+            LlmConfig::from_env(None, None, None, &[]).unwrap().api_key,
+            "deposited"
+        );
+        // The primary knob (`model: anthropic`) picks the family default too.
+        std::fs::write(dir.join("config.yaml"), "model: anthropic\n").unwrap();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant");
+        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
+        assert_eq!(cfg.model, "claude-sonnet-4-5");
+        assert_eq!(cfg.api, ApiProtocol::Anthropic);
+        // Missing everywhere: the error points at the canonical names.
+        std::fs::write(dir.join("config.yaml"), "active_provider: anthropic\n").unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected missing-key error"),
+        };
+        assert!(err.contains("providers.anthropic.api_key"), "{err}");
+        assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
