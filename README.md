@@ -50,6 +50,11 @@ curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/arpitsr/dex/releases).
 
+No further setup: dex runs with no config (defaults build cleanly), and the
+daemon fetches the models.dev catalog in the background on first start
+(`dex update --models` for a manual refresh). `dex doctor` prints every
+resolved value with its origin.
+
 ## Building
 
 Requires a Rust toolchain (edition 2021):
