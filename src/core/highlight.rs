@@ -48,40 +48,14 @@ pub(crate) fn code_colors() -> CodeColors {
 }
 
 /// The single tree-sitter parser for the process, shared by the TUI spans
-/// adapter (`ui::render::highlight_code_block`), the markdown fence renderer
-/// below, and the headless ANSI adapter — one palette, one grammar set, no
-/// drift.
+/// adapter (`ui::render::highlight_code_block`, which also serves the
+/// markdown fence renderer) and the headless ANSI adapter — one palette,
+/// one grammar set, no drift.
 pub(crate) fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
     static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
     HIGHLIGHTER
         .get_or_init(|| Arc::new(TreeSitterHighlighter::new().with_code_colors(code_colors())))
         .clone()
-}
-
-/// Tree-sitter + generic-lexer fallback as one [`CodeHighlighter`], so TUI
-/// fenced code blocks (`ui::render::markdown_lines`) highlight exactly like
-/// [`highlight_code_block`] and headless [`print_code_block`]: tree-sitter
-/// first, the generic lexer on a miss, dim when neither colors anything.
-/// Without this, fences for sql/dockerfile/kotlin/groovy rendered dim in
-/// the TUI while previews and headless output colored them.
-pub(crate) fn shared_markdown_highlighter() -> Arc<CombinedHighlighter> {
-    Arc::new(CombinedHighlighter {
-        tree: shared_highlighter(),
-    })
-}
-
-pub(crate) struct CombinedHighlighter {
-    tree: Arc<TreeSitterHighlighter>,
-}
-
-impl CodeHighlighter for CombinedHighlighter {
-    fn highlight(&self, lang: &str, code: &str) -> Vec<StyleSegment> {
-        let segs = self.tree.highlight(lang, code);
-        if !segs.is_empty() {
-            return segs;
-        }
-        fallback_segments(lang, code)
-    }
 }
 
 /// Highlight a snippet to an ANSI-escaped string in ONE tree-sitter pass.
@@ -1240,17 +1214,15 @@ mod tests {
     }
 
     #[test]
-    fn combined_highlighter_falls_back_for_dockerfile() {
-        use ratatui_markdown::highlight::CodeHighlighter;
-        let h = shared_markdown_highlighter();
-        // Tree-sitter hit passes through.
-        assert!(!h.highlight("rust", "fn main() {}\n").is_empty());
-        // Tree-sitter miss falls back to the generic lexer.
-        assert!(!h.highlight("dockerfile", "FROM rust:1\n").is_empty());
-        // Truly unknown stays empty (dim).
-        assert!(h
-            .highlight("definitely-not-a-lang", "def x = 42\n")
-            .is_empty());
-        assert!(h.highlight("text", "select 1\n").is_empty());
+    fn highlight_pipeline_falls_back_for_dockerfile() {
+        // The two-stage wiring `ui::render::highlight_code_block`
+        // implements: a tree-sitter hit passes through, a miss (dockerfile
+        // has no usable grammar) falls back to the generic lexer, and truly
+        // unknown tags stay empty (dim).
+        assert!(highlight_ansi("rust", "fn main() {}\n").is_some());
+        assert!(highlight_ansi("dockerfile", "FROM rust:1\n").is_none());
+        assert!(fallback_code_block("dockerfile", "FROM rust:1\n").is_some());
+        assert!(fallback_code_block("definitely-not-a-lang", "def x = 42\n").is_none());
+        assert!(fallback_code_block("text", "select 1\n").is_none());
     }
 }
