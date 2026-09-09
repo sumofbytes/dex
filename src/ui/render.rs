@@ -2376,14 +2376,17 @@ mod tests {
         app.tool_state.last_usage = Some(12_000);
         let text = ui_status(&app);
         assert!(text.contains("ctx 12k/128k 9%"), "{text}");
-        // Cached-token subset appears once a provider reports it, and stays
-        // hidden when it is absent or zero. The old hit % is gone on
-        // purpose: it is the cached count over the ctx count, derivable by
-        // eye from the two adjacent numbers.
+        // Cached-token subset appears once a provider reports it, collapsed
+        // to a % of the last call's prompt (the glanceable cache-health
+        // readout; the absolute count is the ctx number times this %). It
+        // stays hidden when absent or zero, and the absolute is the
+        // fallback when the prompt size is unknown.
         assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
         app.tool_state.last_cached = Some(8_000);
         let text = ui_status(&app);
-        assert!(text.contains("8k cached"), "{text}");
+        assert!(text.contains("66% cached"), "{text}");
+        app.tool_state.last_usage = None;
+        assert!(ui_status(&app).contains("8k cached"), "{}", ui_status(&app));
         app.tool_state.last_cached = Some(0);
         assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
         // The last call's output rate appears once a timed call lands and
