@@ -813,10 +813,25 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
     map
 }
 
+/// Unique tmp path for an atomic write: PID plus a per-call counter, so
+/// concurrent writers (daemon fetch vs `dex update --models`, or two
+/// in-process rebuilds) never share a tmp file — a shared name lets one
+/// writer's rename publish another writer's half-written bytes, which is
+/// exactly the torn state the rename was meant to prevent. Readers ignore
+/// tmp files, so a crashed write just litters one stale file.
+fn unique_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
 /// Best-effort index write; failures just mean the next launch re-parses.
-/// Atomic (tmp file + rename) so a concurrent `refresh` never leaves a torn
-/// `models.ctx.json` for a reader mid-turn; a stale reader just falls back to
-/// the full catalog parse on JSON error.
+/// Atomic (unique tmp file + rename) so a concurrent `refresh` never leaves
+/// a torn `models.ctx.json` for a reader mid-turn; a stale reader just falls
+/// back to the full catalog parse on JSON error.
 fn write_ctx_index(map: &BTreeMap<String, u64>) {
     let Some(path) = dex_ctx_index_path() else {
         return;
@@ -828,7 +843,7 @@ fn write_ctx_index(map: &BTreeMap<String, u64>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string(map) {
-        let tmp = path.with_extension("json.tmp");
+        let tmp = unique_tmp_path(&path);
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -1157,9 +1172,11 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
             if let Some(parent) = path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            // tmp + rename: a reader in another process (or a concurrent
-            // daemon/update fetch) must never observe a torn catalog.
-            let tmp = path.with_extension("json.tmp");
+            // tmp + rename with a per-call unique tmp name (see
+            // `unique_tmp_path`): a reader in another process, or a
+            // concurrent daemon/update fetch, must never observe a torn
+            // catalog.
+            let tmp = unique_tmp_path(&path);
             tokio::fs::write(&tmp, text)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -2385,8 +2402,9 @@ pub(crate) mod tests {
         apply_verify_optin, build_ctx_map, catalog_cache_missing, detect_verify_command, doctor,
         load_config_file, load_dex_models_cache, load_provider_entries, model_api_from_env,
         persist_selection, reasoning_options_for, remember_learned_api, remember_thinking_effort,
-        stored_thinking_effort, usage_cost, validate_thinking_effort, warn_provider_like_selection,
-        ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
+        stored_thinking_effort, unique_tmp_path, usage_cost, validate_thinking_effort,
+        warn_provider_like_selection, write_ctx_index, ApiProtocol, LlmConfig, PermissionMode,
+        Provider, ProviderEntry,
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
@@ -3105,6 +3123,48 @@ pub(crate) mod tests {
         // Any non-empty catalog counts as present.
         std::fs::write(&path, "{}").unwrap();
         assert!(!catalog_cache_missing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_ctx_index_writes_leave_no_torn_file() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        // tmp paths are unique per call even within one process — a shared
+        // name lets one writer rename another's half-written tmp file.
+        let base = std::path::PathBuf::from("/tmp/dex");
+        assert_ne!(unique_tmp_path(&base), unique_tmp_path(&base));
+        let dir = std::env::temp_dir().join(format!("dex-ctx-index-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        // Four concurrent writers on one destination. Maps are large enough
+        // that a write spans syscalls, so a shared tmp name could publish
+        // another writer's half-written bytes.
+        let mk_map = |ctx: u64| -> std::collections::BTreeMap<String, u64> {
+            (0..20_000u32)
+                .map(|i| (format!("model-{i}"), ctx))
+                .collect()
+        };
+        for _ in 0..4 {
+            std::thread::scope(|s| {
+                for ctx in [1000u64, 2000, 3000, 4000] {
+                    let map = mk_map(ctx);
+                    s.spawn(move || write_ctx_index(&map));
+                }
+            });
+            let path = dir.join("dex/models.ctx.json");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let parsed: std::collections::BTreeMap<String, u64> =
+                serde_json::from_str(&text).expect("index must always parse");
+            assert_eq!(parsed.len(), 20_000);
+            assert!(
+                [1000, 2000, 3000, 4000].contains(parsed.values().next().unwrap()),
+                "torn or foreign index contents"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
