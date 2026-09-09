@@ -1170,13 +1170,14 @@ impl SlashSuggestionsView {
         const MAX_VISIBLE: usize = 10;
         let mut visible = suggestions.len().min(MAX_VISIBLE);
         // Full-width sheet above the composer: a top border line, one dim
-        // header row, then items. No background fills and no selected-row
-        // highlight — the `> ` marker is the only selection indicator.
-        let height = (visible as u16 + 2).min(area.y);
-        if height < 3 {
+        // header row, a blank spacer row, then items. No background fills
+        // and no selected-row highlight — the `> ` marker is the only
+        // selection indicator.
+        let height = (visible as u16 + 3).min(area.y);
+        if height < 4 {
             return;
         }
-        visible = visible.min(height.saturating_sub(2) as usize);
+        visible = visible.min(height.saturating_sub(3) as usize);
         if visible == 0 {
             return;
         }
@@ -1258,12 +1259,14 @@ impl SlashSuggestionsView {
         };
         let header_text = if suggestions.len() > visible {
             format!(
-                " {base} {}/{}   ↑↓ navigate · Enter select · Tab complete ",
+                // Two-space lead matches the `> `/`  ` marker gutter so the
+                // header text starts at the same column as the item labels.
+                "  {base} {}/{}   ↑↓ navigate · Enter select · Tab complete ",
                 app.slash_selected + 1,
                 suggestions.len()
             )
         } else {
-            format!(" {base}   ↑↓ navigate · Enter select · Tab complete ")
+            format!("  {base}   ↑↓ navigate · Enter select · Tab complete ")
         };
         let header_text = truncate_display(&header_text, width);
         let border = "─".repeat(width as usize);
@@ -1296,7 +1299,7 @@ impl SlashSuggestionsView {
             List::new(items),
             Rect {
                 x: popup.x,
-                y: popup.y + 2,
+                y: popup.y + 3,
                 width: popup.width,
                 height: visible as u16,
             },
