@@ -165,10 +165,10 @@ fn branch_pieces(app: &App) -> Vec<Piece> {
 ///
 /// Width discipline: the full line must fit an ~110-column terminal or it
 /// falls to the next tier and every live number vanishes, so each item is
-/// written as tight as it stays readable — `ctx 12k/128k 9%`, `8k cached`,
+/// written as tight as it stays readable — `ctx 12k/128k 9%`, `66% cached`,
 /// `↑42k ↓1.2k` (cumulative in/out), `123 tok/s`. Redundant detail is
-/// dropped, never information: the cached % is the adjacent pair divided by
-/// eye, and a trailing `.0` on scaled tokens says nothing.
+/// dropped, never information: the cached absolute is the ctx number times
+/// its %, and a trailing `.0` on scaled tokens says nothing.
 pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     // Transient notice (copy confirmation) takes over the line until it
     // expires: unmissable feedback beats the quiet facts for two seconds.
@@ -218,13 +218,27 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     };
     pieces.push((ctx_text, context_style(app, tokens)));
     // Provider-reported cache-hit subset of the last call's prompt (billed
-    // at a fraction of full input price); omitted until a provider reports
-    // it. The hit % is derivable from this and the ctx number, so only the
-    // absolute is shown.
+    // at a fraction of full input price), collapsed to a % of that prompt —
+    // the glanceable "is caching working" readout; the absolute count is
+    // the ctx number times this %. The subset is clamped to the prompt
+    // (some third-party OpenAI-compatible endpoints report nonconforming
+    // usage) and, once a provider reports it, omitted only at zero. The
+    // absolute is the fallback when the prompt size is unknown or the hit
+    // is below one percent.
     if let Some(cached) = app.tool_state.last_cached {
         if cached > 0 {
             pieces.push(sep());
-            pieces.push(quiet(format!("{} cached", format_tokens(cached))));
+            let cached_text = match app.tool_state.last_usage {
+                Some(prompt) if prompt > 0 => {
+                    let cached = cached.min(prompt);
+                    match cached.saturating_mul(100) / prompt {
+                        0 => format!("{} cached", format_tokens(cached)),
+                        pct => format!("{pct}% cached"),
+                    }
+                }
+                _ => format!("{} cached", format_tokens(cached)),
+            };
+            pieces.push(quiet(cached_text));
         }
     }
     // Cumulative prompt (↑) and completion (↓) tokens across all LLM calls
