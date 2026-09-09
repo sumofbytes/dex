@@ -57,7 +57,9 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
             // before it and skip it, so the next row never starts with a
             // stray space. Otherwise wrap at the last whitespace inside the
             // row and consume it; only hard-break when no break point exists.
-            if ch.is_whitespace() && end > begin && last_space == Some((begin, end)) {
+            // (`last_space` was just set from this char above, so an
+            // overflowing whitespace char is always the recorded break.)
+            if ch.is_whitespace() {
                 segments.push((start, begin));
                 start = end;
                 row_width = 0;
@@ -67,7 +69,11 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
             if let Some((space_begin, space_end)) =
                 last_space.filter(|(_, e)| *e > start && *e <= begin)
             {
-                segments.push((start, space_begin));
+                // A break at the row start would emit an empty row (run of
+                // whitespace split across rows): consume it without pushing.
+                if space_begin > start {
+                    segments.push((start, space_begin));
+                }
                 start = space_end;
                 row_width = {
                     let mut w = 0;
@@ -118,17 +124,20 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
     for (index, &(start, end)) in segments.iter().enumerate() {
         let is_last = index + 1 == segments.len();
         // Segments no longer tile the line: the consumed break whitespace
-        // leaves a gap (`prev_end` .. `next_start`). A cursor before the gap
-        // belongs at the end of the previous row; a cursor after it matches
-        // the next row's start. Contiguous boundaries belong to the next row.
+        // leaves a gap (`prev_end` .. `next_start`). A cursor anywhere in the
+        // gap belongs at the end of the previous row; the next row's start
+        // belongs to the next row. Contiguous boundaries belong to the next
+        // row.
         let inside = col >= start && col < end;
-        let at_gap_end = col == end && !is_last && segments[index + 1].0 > col;
+        let at_gap_end = !is_last && col >= end && col < segments[index + 1].0;
         if !(inside || (col == end && is_last) || at_gap_end) {
             continue;
         }
         cursor_segment = index as u16;
         let mut w = 0;
-        for c in line[start..col].chars() {
+        // A cursor inside a consumed gap measures to the row end, not past
+        // it: the gap whitespace renders on neither row.
+        for c in line[start..col.min(end)].chars() {
             if c == '\t' {
                 w += TAB_WIDTH - (w % TAB_WIDTH);
             } else if !c.is_control() {
@@ -207,6 +216,24 @@ mod tests {
         // containing a single leading space.
         let (lines, row, column) = wrap_line("ab ", 2, "ab ".len());
         assert_eq!(lines, vec!["ab", ""]);
+        assert_eq!((row, column), (1, 0));
+    }
+
+    #[test]
+    fn double_space_at_wrap_edge_collapses_without_empty_row() {
+        // A whitespace run split across rows must not emit an empty
+        // intermediate row: the break consumes the run boundary.
+        let (lines, row, column) = wrap_line("ab  cd", 2, "ab  cd".len());
+        assert_eq!(lines, vec!["ab", "cd"]);
+        assert_eq!((row, column), (1, 2));
+        // Cursor before the gap: end of the previous row.
+        let (_, row, column) = wrap_line("ab  cd", 2, 2);
+        assert_eq!((row, column), (0, 2));
+        // Cursor inside the consumed run: still end of the previous row.
+        let (_, row, column) = wrap_line("ab  cd", 2, 3);
+        assert_eq!((row, column), (0, 2));
+        // Cursor after the run: start of the next row.
+        let (_, row, column) = wrap_line("ab  cd", 2, 4);
         assert_eq!((row, column), (1, 0));
     }
 }
