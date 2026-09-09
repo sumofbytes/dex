@@ -19,7 +19,12 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
     let mut segments = Vec::new();
     let mut start = 0;
     let mut row_width = 0;
-    let mut last_space_end = None;
+    // Byte range of the last whitespace char that can serve as a wrap
+    // point. The break whitespace itself is consumed (standard word-wrap):
+    // it renders on neither row, so a trailing space never wraps into a
+    // leading space on the next visual line — matching the submitted
+    // prompt, which drops the break space when wrapping.
+    let mut last_space: Option<(usize, usize)> = None;
 
     // Walk char-boundary pairs directly; no materialized bounds vector.
     let mut chars = line.char_indices().peekable();
@@ -33,9 +38,6 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
             ch.width().unwrap_or(0).max(1)
         };
 
-        if ch.is_whitespace() {
-            last_space_end = Some(end);
-        }
         if ch.is_control() && ch != '\t' {
             // Drop other C0 controls entirely (\r, BEL, etc.) — they would
             // otherwise desync the model vs terminal. Tabs are kept with
@@ -47,12 +49,31 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
             }
             continue;
         }
+        if ch.is_whitespace() {
+            last_space = Some((begin, end));
+        }
         if row_width + char_width > width && begin > start {
-            // Wrap at the last whitespace inside the current row, if any; a
-            // space at the wrap point itself (`end > begin`) belongs to the
-            // next row, so fall through to the hard break then.
-            if let Some(space_end) = last_space_end.filter(|end| *end > start && *end <= begin) {
-                segments.push((start, space_end));
+            // A whitespace char that itself overflows is collapsed: break
+            // before it and skip it, so the next row never starts with a
+            // stray space. Otherwise wrap at the last whitespace inside the
+            // row and consume it; only hard-break when no break point exists.
+            // (`last_space` was just set from this char above, so an
+            // overflowing whitespace char is always the recorded break.)
+            if ch.is_whitespace() {
+                segments.push((start, begin));
+                start = end;
+                row_width = 0;
+                last_space = None;
+                continue;
+            }
+            if let Some((space_begin, space_end)) =
+                last_space.filter(|(_, e)| *e > start && *e <= begin)
+            {
+                // A break at the row start would emit an empty row (run of
+                // whitespace split across rows): consume it without pushing.
+                if space_begin > start {
+                    segments.push((start, space_begin));
+                }
                 start = space_end;
                 row_width = {
                     let mut w = 0;
@@ -70,7 +91,7 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
                 start = begin;
                 row_width = 0;
             }
-            last_space_end = None;
+            last_space = None;
         }
         row_width += char_width;
     }
@@ -101,19 +122,30 @@ pub(super) fn wrap_line(line: &str, width: usize, col: usize) -> (Vec<String>, u
     let mut cursor_segment = segments.len().saturating_sub(1) as u16;
     let mut cursor_x = 0;
     for (index, &(start, end)) in segments.iter().enumerate() {
-        if col >= start && col < end || (col == end && index == segments.len() - 1) {
-            cursor_segment = index as u16;
-            let mut w = 0;
-            for c in line[start..col].chars() {
-                if c == '\t' {
-                    w += TAB_WIDTH - (w % TAB_WIDTH);
-                } else if !c.is_control() {
-                    w += c.width().unwrap_or(0).max(1);
-                }
-            }
-            cursor_x = w as u16;
-            break;
+        let is_last = index + 1 == segments.len();
+        // Segments no longer tile the line: the consumed break whitespace
+        // leaves a gap (`prev_end` .. `next_start`). A cursor anywhere in the
+        // gap belongs at the end of the previous row; the next row's start
+        // belongs to the next row. Contiguous boundaries belong to the next
+        // row.
+        let inside = col >= start && col < end;
+        let at_gap_end = !is_last && col >= end && col < segments[index + 1].0;
+        if !(inside || (col == end && is_last) || at_gap_end) {
+            continue;
         }
+        cursor_segment = index as u16;
+        let mut w = 0;
+        // A cursor inside a consumed gap measures to the row end, not past
+        // it: the gap whitespace renders on neither row.
+        for c in line[start..col.min(end)].chars() {
+            if c == '\t' {
+                w += TAB_WIDTH - (w % TAB_WIDTH);
+            } else if !c.is_control() {
+                w += c.width().unwrap_or(0).max(1);
+            }
+        }
+        cursor_x = w as u16;
+        break;
     }
     (strings, cursor_segment, cursor_x)
 }
@@ -126,7 +158,7 @@ mod tests {
     #[test]
     fn wraps_at_whitespace_and_tracks_cursor() {
         let (lines, row, column) = wrap_line("one two", 5, "one two".len());
-        assert_eq!(lines, vec!["one ", "two"]);
+        assert_eq!(lines, vec!["one", "two"]);
         assert_eq!((row, column), (1, 3));
     }
 
@@ -157,8 +189,51 @@ mod tests {
     #[test]
     fn wrap_point_on_whitespace_does_not_invert_range() {
         // Width boundary lands exactly on a space: previously this produced
-        // line[3..2] and panicked. Greedy wrapping keeps making progress.
+        // line[3..2] and panicked. Greedy wrapping keeps making progress,
+        // and the break space is consumed so no row starts with a space.
         let (lines, _, _) = wrap_line("In one", 2, 0);
-        assert_eq!(lines, vec!["In", " o", "ne"]);
+        assert_eq!(lines, vec!["In", "on", "e"]);
+    }
+
+    #[test]
+    fn overflowing_space_collapses_instead_of_leading_next_row() {
+        // Typing a space at the end of a full row must not indent the next
+        // visual line: the space is consumed, matching the submitted prompt.
+        let (lines, row, column) = wrap_line("ab cd", 2, "ab ".len());
+        assert_eq!(lines, vec!["ab", "cd"]);
+        // Cursor sat right after the consumed space: start of the next row.
+        assert_eq!((row, column), (1, 0));
+        // Cursor right before the consumed space: end of the previous row.
+        let (lines, row, column) = wrap_line("ab cd", 2, 2);
+        assert_eq!(lines, vec!["ab", "cd"]);
+        assert_eq!((row, column), (0, 2));
+    }
+
+    #[test]
+    fn trailing_space_at_wrap_edge_produces_empty_not_spaced_row() {
+        // Full row + trailing space: the space collapses into an empty
+        // continuation row (cursor on the next line at x=0), not a row
+        // containing a single leading space.
+        let (lines, row, column) = wrap_line("ab ", 2, "ab ".len());
+        assert_eq!(lines, vec!["ab", ""]);
+        assert_eq!((row, column), (1, 0));
+    }
+
+    #[test]
+    fn double_space_at_wrap_edge_collapses_without_empty_row() {
+        // A whitespace run split across rows must not emit an empty
+        // intermediate row: the break consumes the run boundary.
+        let (lines, row, column) = wrap_line("ab  cd", 2, "ab  cd".len());
+        assert_eq!(lines, vec!["ab", "cd"]);
+        assert_eq!((row, column), (1, 2));
+        // Cursor before the gap: end of the previous row.
+        let (_, row, column) = wrap_line("ab  cd", 2, 2);
+        assert_eq!((row, column), (0, 2));
+        // Cursor inside the consumed run: still end of the previous row.
+        let (_, row, column) = wrap_line("ab  cd", 2, 3);
+        assert_eq!((row, column), (0, 2));
+        // Cursor after the run: start of the next row.
+        let (_, row, column) = wrap_line("ab  cd", 2, 4);
+        assert_eq!((row, column), (1, 0));
     }
 }
