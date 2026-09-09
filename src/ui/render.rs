@@ -267,10 +267,13 @@ fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
 }
 
 /// Copy-safe code-block hooks: no box-drawing (`╭─`/`│ `/`╰─`) so native
-/// terminal copies come out as runnable commands. Grouping comes from a dim
-/// language label plus a two-space indent and syntax colors — no per-line
-/// prefix to strip. Highlighting reuses the combined tree-sitter + fallback
-/// highlighter so TUI snippets match read previews and headless output.
+/// terminal copies of the body rows come out as runnable commands — no
+/// per-line prefix to strip. Grouping comes from a dim language label plus
+/// a two-space indent and syntax colors. The label row is metadata, not
+/// code: skip it when copying, as with any header. Highlighting reuses
+/// `highlight_code_block` (one tree-sitter pass with sorted segments plus
+/// the generic-lexer fallback) so TUI snippets match read previews and
+/// headless output with no second highlighting path to drift.
 struct CopySafeCodeHooks;
 
 impl RenderHooks for CopySafeCodeHooks {
@@ -280,14 +283,9 @@ impl RenderHooks for CopySafeCodeHooks {
         if !lang.is_empty() {
             lines.push(Line::from(Span::styled(format!("  {lang}"), dim)));
         }
-        let highlighted = {
-            let segs = highlight::shared_markdown_highlighter().highlight(lang, content);
-            if segs.is_empty() {
-                None
-            } else {
-                highlight::code_block_spans(content, &segs)
-            }
-        };
+        // One shared helper (sorted segments, byte-safe split): the same
+        // rows `render_tool_input` highlights and headless output prints.
+        let highlighted = highlight_code_block(lang, content);
         match highlighted {
             Some(rows) => {
                 for spans in rows {
@@ -318,7 +316,8 @@ pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
     // Borderless code blocks (see `CopySafeCodeHooks`): the `│ ` gutter and
     // `╭─`/`╰─` rules copy as text in native terminal selections and force
     // edits before pasted commands run. Indent + highlight distinguishes
-    // code without any glyph that pollutes copies.
+    // code without any glyph that pollutes copies (the dim language label
+    // is metadata, not code — copy the body rows).
     let blocks = split_markdown(s);
     let renderer = MarkdownRenderer::new(0)
         .with_render_hooks(Box::new(CopySafeCodeHooks) as Box<dyn RenderHooks>);
@@ -1217,10 +1216,11 @@ impl SlashSuggestionsView {
         const MAX_VISIBLE: usize = 10;
         let mut visible = suggestions.len().min(MAX_VISIBLE);
         // Borderless floating sheet above the composer: no box-drawing
-        // (`╭─`/`│ `/`───`) so native terminal copies come out as plain
-        // commands. Separation comes from the popup background, not glyphs;
-        // the `> ` marker plus a selected-row background is the only
-        // selection indicator.
+        // (`╭─`/`│ `/`───`) so native terminal copies carry no border
+        // glyphs to strip. Separation comes from the popup background, not
+        // glyphs; the `> ` marker plus a selected-row background is the
+        // only selection indicator (skip the 2-wide marker gutter when
+        // copying a command, as with any picker affordance).
         let height = (visible as u16 + 2).min(area.y);
         if height < 3 {
             return;
@@ -1257,7 +1257,8 @@ impl SlashSuggestionsView {
         };
         // Marker gutter (2) + command + gap (2); the rest is description.
         // Backgrounds (not glyphs) separate the sheet: they never survive a
-        // native terminal copy, so pasted commands run without edits.
+        // native terminal copy, so rows paste without border-glyph edits
+        // (only the `> ` marker gutter needs skipping).
         let inner_w = width as usize;
         let desc_w = inner_w.saturating_sub(cmd_col + 4) as u16;
         let popup_bg = theme::popup_bg();
@@ -1337,12 +1338,17 @@ impl SlashSuggestionsView {
         let header_text = truncate_display(&header_text, width);
         // No `─` rule: a border row copies as `────` in native selections.
         // The sheet background already separates the popup from the
-        // transcript, and blank padding copies as nothing.
+        // transcript (air plus a bold header when the background is
+        // unknown/Reset), and blank padding copies as nothing.
+        // Without theme info (`Background::Unknown`) every popup background
+        // is `Reset`, so bold the header: it is the only sheet separator
+        // left, and modifiers never survive a native copy.
+        let mut header_style = Style::default().fg(theme::muted_fg()).bg(popup_bg);
+        if popup_bg == Color::Reset {
+            header_style = header_style.add_modifier(Modifier::BOLD);
+        }
         let header_w = UnicodeWidthStr::width(header_text.as_str());
-        let mut header_line = Line::from(Span::styled(
-            header_text,
-            Style::default().fg(theme::muted_fg()).bg(popup_bg),
-        ));
+        let mut header_line = Line::from(Span::styled(header_text, header_style));
         if header_w < inner_w {
             header_line.spans.push(Span::styled(
                 " ".repeat(inner_w - header_w),
@@ -2599,6 +2605,36 @@ mod tests {
         assert!(symbols.contains("> alpha-model"), "{symbols}");
         assert!(symbols.contains("  beta-model"), "{symbols}");
         assert!(!symbols.contains("/model"), "{symbols}");
+    }
+
+    #[test]
+    fn slash_popup_renders_no_box_drawing() {
+        // Copy-safe sheet: no `╭─`/`│ `/`───` glyphs anywhere in the popup
+        // cells, so a native terminal selection pastes plain commands.
+        let mut app = test_app();
+        app.input = InputField::from_text("/");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                SlashSuggestionsView::render(frame, Rect::new(0, 21, 80, 3), &mut app);
+            })
+            .expect("render should succeed");
+        let symbols: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(symbols.contains("> "), "{symbols}");
+        assert!(
+            !symbols.contains('╭')
+                && !symbols.contains('╰')
+                && !symbols.contains('│')
+                && !symbols.contains('─'),
+            "box-drawing must not survive in the popup: {symbols}"
+        );
     }
 
     #[test]
