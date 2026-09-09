@@ -92,3 +92,6 @@ esac
 
 echo "Installed: $("$INSTALL_DIR/dex" --version)"
 echo "Location:  $INSTALL_DIR/dex"
+echo
+echo "Next: run \`dex doctor\` to see what's resolved, then set a provider key"
+echo "(e.g. export ANTHROPIC_API_KEY=...) or edit \$XDG_CONFIG_HOME/dex/config.yaml."
