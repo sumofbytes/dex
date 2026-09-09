@@ -2380,11 +2380,19 @@ mod tests {
         // to a % of the last call's prompt (the glanceable cache-health
         // readout; the absolute count is the ctx number times this %). It
         // stays hidden when absent or zero, and the absolute is the
-        // fallback when the prompt size is unknown.
+        // fallback when the prompt size is unknown or the hit is below
+        // one percent; the % clamps at 100 for nonconforming endpoints.
         assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
         app.tool_state.last_cached = Some(8_000);
         let text = ui_status(&app);
         assert!(text.contains("66% cached"), "{text}");
+        app.tool_state.last_cached = Some(15_000);
+        let text = ui_status(&app);
+        assert!(text.contains("100% cached"), "{text}");
+        app.tool_state.last_cached = Some(60);
+        let text = ui_status(&app);
+        assert!(text.contains("60 cached"), "{text}");
+        app.tool_state.last_cached = Some(8_000);
         app.tool_state.last_usage = None;
         assert!(ui_status(&app).contains("8k cached"), "{}", ui_status(&app));
         app.tool_state.last_cached = Some(0);

@@ -220,14 +220,21 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     // Provider-reported cache-hit subset of the last call's prompt (billed
     // at a fraction of full input price), collapsed to a % of that prompt —
     // the glanceable "is caching working" readout; the absolute count is
-    // the ctx number times this %. Omitted until a provider reports it;
-    // the absolute is the fallback when the prompt size is unknown.
+    // the ctx number times this %. The subset is clamped to the prompt
+    // (some third-party OpenAI-compatible endpoints report nonconforming
+    // usage) and, once a provider reports it, omitted only at zero. The
+    // absolute is the fallback when the prompt size is unknown or the hit
+    // is below one percent.
     if let Some(cached) = app.tool_state.last_cached {
         if cached > 0 {
             pieces.push(sep());
             let cached_text = match app.tool_state.last_usage {
                 Some(prompt) if prompt > 0 => {
-                    format!("{}% cached", cached.saturating_mul(100) / prompt)
+                    let cached = cached.min(prompt);
+                    match cached.saturating_mul(100) / prompt {
+                        0 => format!("{} cached", format_tokens(cached)),
+                        pct => format!("{pct}% cached"),
+                    }
                 }
                 _ => format!("{} cached", format_tokens(cached)),
             };
