@@ -1169,12 +1169,15 @@ impl SlashSuggestionsView {
         // instead of a full-transcript wall, and scroll it with the selection.
         const MAX_VISIBLE: usize = 10;
         let mut visible = suggestions.len().min(MAX_VISIBLE);
-        // Borderless floating sheet: one dim header row + items, no box.
-        let height = (visible as u16 + 1).min(area.y);
-        if height < 2 {
+        // Full-width sheet above the composer: a top border line, one dim
+        // header row, a blank spacer row, then items. No background fills
+        // and no selected-row highlight — the `> ` marker is the only
+        // selection indicator.
+        let height = (visible as u16 + 3).min(area.y);
+        if height < 4 {
             return;
         }
-        visible = visible.min(height.saturating_sub(1) as usize);
+        visible = visible.min(height.saturating_sub(3) as usize);
         if visible == 0 {
             return;
         }
@@ -1184,7 +1187,7 @@ impl SlashSuggestionsView {
             .saturating_sub(visible.saturating_sub(1))
             .min(max_start);
         let window = &suggestions[start..start + visible];
-        // Size the popup to its content: the label column fits the longest
+        // Full width of the composer; the label column fits the longest
         // visible item with a two-space gap before the description. Inside a
         // picker (`/model `, `/provider `, `/resume …`) rows show just the
         // item (`> gpt-5`), not the repeated command (`/model gpt-5`) — the
@@ -1197,14 +1200,7 @@ impl SlashSuggestionsView {
             .unwrap_or(0)
             .min(48)
             .min(avail.max(1));
-        let desc_col = window
-            .iter()
-            .map(|(_, description)| UnicodeWidthStr::width(description.as_str()))
-            .max()
-            .unwrap_or(0);
-        // Content + one cell of side padding on each side; no border chrome.
-        let width = (cmd_col + 2 + desc_col + 2) as u16 + 2;
-        let width = width.clamp(24, 72).min(area.width);
+        let width = area.width;
         let popup = Rect {
             x: area.x,
             y: area.y - height,
@@ -1212,41 +1208,33 @@ impl SlashSuggestionsView {
             height,
         };
         // Marker gutter (2) + command + gap (2); the rest is description.
-        let inner_w = width.saturating_sub(2) as usize;
+        let inner_w = width as usize;
         let desc_w = inner_w.saturating_sub(cmd_col + 4) as u16;
         let items = window
             .iter()
             .enumerate()
             .map(|(offset, (command, description))| {
                 let selected = start + offset == app.slash_selected;
-                let row_bg = if selected {
-                    theme::popup_select_bg()
-                } else {
-                    theme::popup_bg()
-                };
                 let marker_style = if selected {
                     Style::default()
                         .fg(Color::Cyan)
-                        .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::muted_fg()).bg(row_bg)
+                    Style::default().fg(theme::muted_fg())
                 };
                 let command_style = if selected {
                     Style::default()
                         .fg(theme::surface_fg())
-                        .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                         .fg(Color::Cyan)
-                        .bg(row_bg)
                         .add_modifier(Modifier::BOLD)
                 };
                 let description_style = if selected {
-                    Style::default().fg(theme::surface_fg()).bg(row_bg)
+                    Style::default().fg(theme::surface_fg())
                 } else {
-                    Style::default().fg(theme::secondary_fg()).bg(row_bg)
+                    Style::default().fg(theme::secondary_fg())
                 };
                 let label = slash::suggestion_label(&input, command);
                 let cell = truncate_display(label, cmd_col as u16);
@@ -1254,15 +1242,10 @@ impl SlashSuggestionsView {
                 let mut cell = cell;
                 cell.push_str(&" ".repeat(pad + 2));
                 let desc = truncate_display(description, desc_w);
-                let used = 2
-                    + UnicodeWidthStr::width(cell.as_str())
-                    + UnicodeWidthStr::width(desc.as_str());
-                let tail = " ".repeat(inner_w.saturating_sub(used));
                 ListItem::new(Line::from(vec![
                     Span::styled(if selected { "> " } else { "  " }, marker_style),
                     Span::styled(cell, command_style),
                     Span::styled(desc, description_style),
-                    Span::styled(tail, Style::default().bg(row_bg)),
                 ]))
             });
         let base = if input.starts_with("/model ") {
@@ -1276,26 +1259,22 @@ impl SlashSuggestionsView {
         };
         let header_text = if suggestions.len() > visible {
             format!(
-                " {base} {}/{}   ↑↓ navigate · Enter select · Tab complete ",
+                // Two-space lead matches the `> `/`  ` marker gutter so the
+                // header text starts at the same column as the item labels.
+                "  {base} {}/{}   ↑↓ navigate · Enter select · Tab complete ",
                 app.slash_selected + 1,
                 suggestions.len()
             )
         } else {
-            format!(" {base}   ↑↓ navigate · Enter select · Tab complete ")
+            format!("  {base}   ↑↓ navigate · Enter select · Tab complete ")
         };
         let header_text = truncate_display(&header_text, width);
-        let header_w = UnicodeWidthStr::width(header_text.as_str());
-        let mut header_text = header_text;
-        header_text.push_str(&" ".repeat((width as usize).saturating_sub(header_w)));
+        let border = "─".repeat(width as usize);
         f.render_widget(Clear, popup);
         f.render_widget(
-            Block::default().style(Style::default().bg(theme::popup_bg())),
-            popup,
-        );
-        f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                header_text,
-                Style::default().fg(theme::muted_fg()).bg(theme::popup_bg()),
+                border,
+                Style::default().fg(theme::muted_fg()),
             ))),
             Rect {
                 x: popup.x,
@@ -1305,10 +1284,22 @@ impl SlashSuggestionsView {
             },
         );
         f.render_widget(
-            List::new(items),
+            Paragraph::new(Line::from(Span::styled(
+                header_text,
+                Style::default().fg(theme::muted_fg()),
+            ))),
             Rect {
                 x: popup.x,
                 y: popup.y + 1,
+                width: popup.width,
+                height: 1,
+            },
+        );
+        f.render_widget(
+            List::new(items),
+            Rect {
+                x: popup.x,
+                y: popup.y + 3,
                 width: popup.width,
                 height: visible as u16,
             },
