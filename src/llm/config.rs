@@ -748,6 +748,15 @@ fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.dev.json"))
 }
 
+/// True when no cached models.dev catalog exists yet (fresh install). The
+/// daemon fetches it in the background on first start so context windows and
+/// `/model` autocomplete work without a manual `dex update --models`.
+pub(crate) fn catalog_cache_missing() -> bool {
+    dex_catalog_cache_path()
+        .map(|p| std::fs::metadata(&p).map(|m| m.len() == 0).unwrap_or(true))
+        .unwrap_or(true)
+}
+
 /// Slim cross-process context index (`models.ctx.json`): `lowercased model
 /// id → context window`. The full catalog is 4+ MB, so every fresh process
 /// paid a full read + parse (~180ms) just to look up one model. The index is
@@ -1119,33 +1128,54 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
 pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .user_agent(crate::client::http::USER_AGENT)
-        .timeout(Duration::from_secs(10))
+        // 30s total: api.json is a ~4MB body; the old 10s cap failed on
+        // normal slow links while curl (no timeout) succeeded.
+        .timeout(Duration::from_secs(30))
         .build()?;
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
     let mut fetched = false;
+    let mut last_err = String::from("no fetch attempted");
     for url in [
         "https://models.dev/api.json",
         "https://models.dev/catalog.json",
     ] {
-        if let Ok(resp) = client
-            .get(url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            if let Ok(text) = resp.text().await {
-                if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
-                    if let Some(path) = dex_catalog_cache_path() {
-                        if let Some(parent) = path.parent() {
-                            let _ = tokio::fs::create_dir_all(parent).await;
-                        }
-                        tokio::fs::write(&path, &text).await?;
-                        println!("cached models.dev {} to {}", url, path.display());
-                        fetched = true;
-                        break;
-                    }
-                }
+        let outcome = async {
+            let resp = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+            let text = resp.text().await.map_err(|e| e.to_string())?;
+            if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+                return Err("response is not valid JSON".to_string());
             }
+            let Some(path) = dex_catalog_cache_path() else {
+                return Err("no cache dir (set HOME or XDG_CACHE_HOME)".to_string());
+            };
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            // tmp + rename: a reader in another process (or a concurrent
+            // daemon/update fetch) must never observe a torn catalog.
+            let tmp = path.with_extension("json.tmp");
+            tokio::fs::write(&tmp, text)
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::fs::rename(&tmp, &path)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("cached models.dev {} to {}", url, path.display());
+            Ok(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                fetched = true;
+                break;
+            }
+            Err(e) => last_err = format!("{url}: {e}"),
         }
     }
     if fetched {
@@ -1156,7 +1186,7 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
         }
         return Ok(());
     }
-    Err("could not fetch models.dev catalog — check network".into())
+    Err(format!("could not fetch models.dev catalog: {last_err}").into())
 }
 
 /// Sync wrapper for CLI paths that stay sync (`dex update --models`):
@@ -2352,9 +2382,9 @@ pub(crate) fn doctor(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        apply_verify_optin, build_ctx_map, detect_verify_command, doctor, load_config_file,
-        load_dex_models_cache, load_provider_entries, model_api_from_env, persist_selection,
-        reasoning_options_for, remember_learned_api, remember_thinking_effort,
+        apply_verify_optin, build_ctx_map, catalog_cache_missing, detect_verify_command, doctor,
+        load_config_file, load_dex_models_cache, load_provider_entries, model_api_from_env,
+        persist_selection, reasoning_options_for, remember_learned_api, remember_thinking_effort,
         stored_thinking_effort, usage_cost, validate_thinking_effort, warn_provider_like_selection,
         ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
     };
@@ -3055,6 +3085,27 @@ pub(crate) mod tests {
         // `current_dir()` return None for them.
         std::env::set_current_dir(prev).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn catalog_cache_missing_reports_fresh_installs() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        let dir = std::env::temp_dir().join(format!("dex-catalog-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let path = dir.join("dex/models.dev.json");
+        // No file (fresh install) or a zero-length file (torn write): missing.
+        assert!(catalog_cache_missing());
+        std::fs::write(&path, "").unwrap();
+        assert!(catalog_cache_missing());
+        // Any non-empty catalog counts as present.
+        std::fs::write(&path, "{}").unwrap();
+        assert!(!catalog_cache_missing());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
