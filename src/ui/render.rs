@@ -2,8 +2,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{block::Padding, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui_markdown::highlight::{CodeHighlighter, HighlightHooks};
-use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
+use ratatui_markdown::highlight::CodeHighlighter;
+use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer, RenderHooks};
 use ratatui_markdown::ThemeConfig;
 use std::time::Duration;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -266,15 +266,61 @@ fn build_table_block(buf: &[String]) -> Option<MarkdownBlock> {
     Some(MarkdownBlock::Table { headers, rows })
 }
 
+/// Copy-safe code-block hooks: no box-drawing (`╭─`/`│ `/`╰─`) so native
+/// terminal copies of the body rows come out as runnable commands — no
+/// per-line prefix to strip. Grouping comes from a dim language label plus
+/// a two-space indent and syntax colors. The label row is metadata, not
+/// code: skip it when copying, as with any header. Highlighting reuses
+/// `highlight_code_block` (one tree-sitter pass with sorted segments plus
+/// the generic-lexer fallback) so TUI snippets match read previews and
+/// headless output with no second highlighting path to drift.
+struct CopySafeCodeHooks;
+
+impl RenderHooks for CopySafeCodeHooks {
+    fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
+        let dim = Style::default().fg(theme::muted_fg());
+        let mut lines = Vec::new();
+        if !lang.is_empty() {
+            lines.push(Line::from(Span::styled(format!("  {lang}"), dim)));
+        }
+        // One shared helper (sorted segments, byte-safe split): the same
+        // rows `render_tool_input` highlights and headless output prints.
+        let highlighted = highlight_code_block(lang, content);
+        match highlighted {
+            Some(rows) => {
+                for spans in rows {
+                    if spans.is_empty() {
+                        lines.push(Line::from(String::new()));
+                    } else {
+                        let mut line = Line::from(Span::raw("  ".to_string()));
+                        line.spans.extend(spans);
+                        lines.push(line);
+                    }
+                }
+            }
+            None => {
+                for row in content.lines() {
+                    if row.trim().is_empty() {
+                        lines.push(Line::from(String::new()));
+                    } else {
+                        lines.push(Line::from(Span::styled(format!("  {row}"), dim)));
+                    }
+                }
+            }
+        }
+        Some(lines)
+    }
+}
+
 pub(super) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
-    // Combined tree-sitter + generic-lexer highlighter, so fenced blocks
-    // highlight exactly like read previews and headless output (dockerfile /
-    // kotlin / groovy fall back instead of going dim in the TUI only).
-    let highlighter = highlight::shared_markdown_highlighter();
+    // Borderless code blocks (see `CopySafeCodeHooks`): the `│ ` gutter and
+    // `╭─`/`╰─` rules copy as text in native terminal selections and force
+    // edits before pasted commands run. Indent + highlight distinguishes
+    // code without any glyph that pollutes copies (the dim language label
+    // is metadata, not code — copy the body rows).
     let blocks = split_markdown(s);
-    let renderer = MarkdownRenderer::new(0).with_render_hooks(Box::new(
-        HighlightHooks::new(highlighter, usize::MAX).with_border_color(theme::muted_fg()),
-    ));
+    let renderer = MarkdownRenderer::new(0)
+        .with_render_hooks(Box::new(CopySafeCodeHooks) as Box<dyn RenderHooks>);
     renderer.render(&blocks, &markdown_theme())
 }
 
@@ -1169,15 +1215,17 @@ impl SlashSuggestionsView {
         // instead of a full-transcript wall, and scroll it with the selection.
         const MAX_VISIBLE: usize = 10;
         let mut visible = suggestions.len().min(MAX_VISIBLE);
-        // Full-width sheet above the composer: a top border line, one dim
-        // header row, a blank spacer row, then items. No background fills
-        // and no selected-row highlight — the `> ` marker is the only
-        // selection indicator.
-        let height = (visible as u16 + 3).min(area.y);
-        if height < 4 {
+        // Borderless floating sheet above the composer: no box-drawing
+        // (`╭─`/`│ `/`───`) so native terminal copies carry no border
+        // glyphs to strip. Separation comes from the popup background, not
+        // glyphs; the `> ` marker plus a selected-row background is the
+        // only selection indicator (skip the 2-wide marker gutter when
+        // copying a command, as with any picker affordance).
+        let height = (visible as u16 + 2).min(area.y);
+        if height < 3 {
             return;
         }
-        visible = visible.min(height.saturating_sub(3) as usize);
+        visible = visible.min(height.saturating_sub(2) as usize);
         if visible == 0 {
             return;
         }
@@ -1208,33 +1256,42 @@ impl SlashSuggestionsView {
             height,
         };
         // Marker gutter (2) + command + gap (2); the rest is description.
+        // Backgrounds (not glyphs) separate the sheet: they never survive a
+        // native terminal copy, so rows paste without border-glyph edits
+        // (only the `> ` marker gutter needs skipping).
         let inner_w = width as usize;
         let desc_w = inner_w.saturating_sub(cmd_col + 4) as u16;
+        let popup_bg = theme::popup_bg();
+        let select_bg = theme::popup_select_bg();
         let items = window
             .iter()
             .enumerate()
             .map(|(offset, (command, description))| {
                 let selected = start + offset == app.slash_selected;
+                let bg = if selected { select_bg } else { popup_bg };
                 let marker_style = if selected {
                     Style::default()
                         .fg(Color::Cyan)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::muted_fg())
+                    Style::default().fg(theme::muted_fg()).bg(bg)
                 };
                 let command_style = if selected {
                     Style::default()
                         .fg(theme::surface_fg())
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                         .fg(Color::Cyan)
+                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 };
                 let description_style = if selected {
-                    Style::default().fg(theme::surface_fg())
+                    Style::default().fg(theme::surface_fg()).bg(bg)
                 } else {
-                    Style::default().fg(theme::secondary_fg())
+                    Style::default().fg(theme::secondary_fg()).bg(bg)
                 };
                 let label = slash::suggestion_label(&input, command);
                 let cell = truncate_display(label, cmd_col as u16);
@@ -1242,11 +1299,21 @@ impl SlashSuggestionsView {
                 let mut cell = cell;
                 cell.push_str(&" ".repeat(pad + 2));
                 let desc = truncate_display(description, desc_w);
-                ListItem::new(Line::from(vec![
+                let mut line = Line::from(vec![
                     Span::styled(if selected { "> " } else { "  " }, marker_style),
                     Span::styled(cell, command_style),
                     Span::styled(desc, description_style),
-                ]))
+                ]);
+                // Extend the background to the right edge so the sheet reads
+                // as one surface; trailing spaces copy as nothing to strip.
+                let line_w = line.width();
+                if line_w < inner_w {
+                    line.spans.push(Span::styled(
+                        " ".repeat(inner_w - line_w),
+                        Style::default().bg(bg),
+                    ));
+                }
+                ListItem::new(line).style(Style::default().bg(bg))
             });
         let base = if input.starts_with("/model ") {
             "Models"
@@ -1269,13 +1336,28 @@ impl SlashSuggestionsView {
             format!("  {base}   ↑↓ navigate · Enter select · Tab complete ")
         };
         let header_text = truncate_display(&header_text, width);
-        let border = "─".repeat(width as usize);
+        // No `─` rule: a border row copies as `────` in native selections.
+        // The sheet background already separates the popup from the
+        // transcript (air plus a bold header when the background is
+        // unknown/Reset), and blank padding copies as nothing.
+        // Without theme info (`Background::Unknown`) every popup background
+        // is `Reset`, so bold the header: it is the only sheet separator
+        // left, and modifiers never survive a native copy.
+        let mut header_style = Style::default().fg(theme::muted_fg()).bg(popup_bg);
+        if popup_bg == Color::Reset {
+            header_style = header_style.add_modifier(Modifier::BOLD);
+        }
+        let header_w = UnicodeWidthStr::width(header_text.as_str());
+        let mut header_line = Line::from(Span::styled(header_text, header_style));
+        if header_w < inner_w {
+            header_line.spans.push(Span::styled(
+                " ".repeat(inner_w - header_w),
+                Style::default().bg(popup_bg),
+            ));
+        }
         f.render_widget(Clear, popup);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                border,
-                Style::default().fg(theme::muted_fg()),
-            ))),
+            Paragraph::new(header_line).style(Style::default().bg(popup_bg)),
             Rect {
                 x: popup.x,
                 y: popup.y,
@@ -1285,9 +1367,10 @@ impl SlashSuggestionsView {
         );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                header_text,
-                Style::default().fg(theme::muted_fg()),
-            ))),
+                " ".repeat(inner_w),
+                Style::default().bg(popup_bg),
+            )))
+            .style(Style::default().bg(popup_bg)),
             Rect {
                 x: popup.x,
                 y: popup.y + 1,
@@ -1296,10 +1379,10 @@ impl SlashSuggestionsView {
             },
         );
         f.render_widget(
-            List::new(items),
+            List::new(items).style(Style::default().bg(popup_bg)),
             Rect {
                 x: popup.x,
-                y: popup.y + 3,
+                y: popup.y + 2,
                 width: popup.width,
                 height: visible as u16,
             },
@@ -2525,6 +2608,36 @@ mod tests {
     }
 
     #[test]
+    fn slash_popup_renders_no_box_drawing() {
+        // Copy-safe sheet: no `╭─`/`│ `/`───` glyphs anywhere in the popup
+        // cells, so a native terminal selection pastes plain commands.
+        let mut app = test_app();
+        app.input = InputField::from_text("/");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                SlashSuggestionsView::render(frame, Rect::new(0, 21, 80, 3), &mut app);
+            })
+            .expect("render should succeed");
+        let symbols: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(symbols.contains("> "), "{symbols}");
+        assert!(
+            !symbols.contains('╭')
+                && !symbols.contains('╰')
+                && !symbols.contains('│')
+                && !symbols.contains('─'),
+            "box-drawing must not survive in the popup: {symbols}"
+        );
+    }
+
+    #[test]
     fn virtual_terminal_renders_at_normal_and_narrow_sizes() {
         for (width, height) in [(80, 24), (24, 12), (24, 8)] {
             let backend = TestBackend::new(width, height);
@@ -3344,9 +3457,9 @@ mod tests {
 
     #[test]
     fn markdown_fence_drops_trailing_blank_body_rows() {
-        // The highlight hook splits the body on `\n`: the newline every
-        // fence body ends with (and blank lines before the closing fence)
-        // used to render as empty `│` rows inside the box.
+        // Borderless code blocks: no `╭─`/`│ `/`╰─` glyphs, so native
+        // terminal copies come out as runnable commands. Trailing blanks in
+        // a snippet still collapse away (no empty tail rows).
         let render = |src: &str| -> Vec<String> {
             markdown_lines(src)
                 .iter()
@@ -3354,15 +3467,20 @@ mod tests {
                 .collect()
         };
         let rows = render("```bash\nfoo \\\n  bar\n```");
-        assert_eq!(rows.len(), 4, "{rows:?}");
-        assert!(rows[0].starts_with('╭'), "{rows:?}");
-        assert_eq!(rows[1], "│ foo \\");
-        assert_eq!(rows[2], "│   bar");
-        assert!(rows[3].starts_with('╰'), "{rows:?}");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[0].contains("bash"), "{rows:?}");
+        assert!(!rows[0].contains('╭') && !rows[0].contains('─'), "{rows:?}");
+        assert_eq!(rows[1], "  foo \\");
+        assert_eq!(rows[2], "    bar");
+        assert!(
+            rows.iter()
+                .all(|r| !r.contains('╭') && !r.contains('╰') && !r.contains('│')),
+            "no box-drawing may survive: {rows:?}"
+        );
         // Blank lines before the closing fence collapse away too.
         let rows = render("```bash\nfoo\n\n\n```");
-        assert_eq!(rows.len(), 3, "{rows:?}");
-        assert_eq!(rows[1], "│ foo");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1], "  foo");
     }
 
     #[test]
