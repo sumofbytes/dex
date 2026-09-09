@@ -389,6 +389,33 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
         warm.rebuild_async().await;
     });
 
+    // Fresh installs have no models.dev catalog until `dex update --models`
+    // runs, which silently degrades context windows and `/model` autocomplete.
+    // Best-effort background fetch on first start; never blocks or fails the
+    // daemon. One retry after 5 minutes covers a laptop waking offline, since
+    // a daemon can outlive the outage; `dex update --models` always works too.
+    if crate::llm::config::catalog_cache_missing() {
+        tokio::spawn(async {
+            // The error type is Box<dyn Error>, which is not Send: report it
+            // and drop it before any further await so the future stays Send.
+            let failed = match crate::llm::config::refresh_models_cache_async().await {
+                Ok(()) => false,
+                Err(e) => {
+                    eprintln!("note: models.dev catalog fetch failed ({e}); retrying in 5 minutes");
+                    true
+                }
+            };
+            if failed {
+                tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+                if let Err(e) = crate::llm::config::refresh_models_cache_async().await {
+                    eprintln!(
+                        "note: models.dev catalog still missing ({e}); run `dex update --models`"
+                    );
+                }
+            }
+        });
+    }
+
     let app = server::router(state.clone());
 
     let addr = listener
