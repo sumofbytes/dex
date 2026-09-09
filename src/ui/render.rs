@@ -1257,18 +1257,19 @@ impl SlashSuggestionsView {
         } else {
             "Slash commands"
         };
+        // `> ` marker matches the selected-row marker so the header reads
+        // as part of the list; the text after it starts at the same column
+        // as the item labels.
         let header_text = if suggestions.len() > visible {
             format!(
-                // Two-space lead matches the `> `/`  ` marker gutter so the
-                // header text starts at the same column as the item labels.
-                "  {base} {}/{}   ↑↓ navigate · Enter select · Tab complete ",
+                "{base} {}/{}   ↑↓ navigate · Enter select · Tab complete ",
                 app.slash_selected + 1,
                 suggestions.len()
             )
         } else {
-            format!("  {base}   ↑↓ navigate · Enter select · Tab complete ")
+            format!("{base}   ↑↓ navigate · Enter select · Tab complete ")
         };
-        let header_text = truncate_display(&header_text, width);
+        let header_text = truncate_display(&header_text, width.saturating_sub(2));
         let border = "─".repeat(width as usize);
         f.render_widget(Clear, popup);
         f.render_widget(
@@ -1284,10 +1285,15 @@ impl SlashSuggestionsView {
             },
         );
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                header_text,
-                Style::default().fg(theme::muted_fg()),
-            ))),
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "> ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(header_text, Style::default().fg(theme::muted_fg())),
+            ])),
             Rect {
                 x: popup.x,
                 y: popup.y + 1,
