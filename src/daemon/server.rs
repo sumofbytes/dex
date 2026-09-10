@@ -789,6 +789,13 @@ async fn run_agent_turn(
     // Own receivers mutably for the async turn (tokio try_recv needs &mut).
     let mut steering_rx = steering_rx;
     let mut followup_rx = followup_rx;
+    // Drain signals for the sink/approval bridges: both run concurrently
+    // with this task and may still hold lines they received before the
+    // console dropped. The terminal event must be the last one on the wire
+    // (and the highest seq in the journal), or clients settle the turn
+    // while straggler AssistantText/ToolResult events still arrive.
+    let (sink_done_tx, sink_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let (approval_done_tx, approval_done_rx) = tokio::sync::oneshot::channel::<()>();
     let result: Result<(String, Option<u64>, Option<u64>), String> = match CatchUnwind::new(
         Box::pin(run_turn_inner(
             &state,
@@ -800,6 +807,8 @@ async fn run_agent_turn(
             Some(&steering_accepted_tx),
             Some(&mut followup_rx),
             Some(&followup_accepted_tx),
+            sink_done_tx,
+            approval_done_tx,
         )),
         "turn panicked",
     )
@@ -811,6 +820,8 @@ async fn run_agent_turn(
     // Drop the guard now before sending the terminal event so a new turn can
     // be accepted promptly; drop ordering handles pending approvals/active turns.
     drop(_guard);
+    let _ = sink_done_rx.await;
+    let _ = approval_done_rx.await;
 
     let terminal = match result {
         Ok((response, usage, cached)) => StreamEvent::TurnComplete {
@@ -864,6 +875,8 @@ async fn run_turn_inner(
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
     followup_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
     followup_accepted_tx: Option<&mpsc::Sender<String>>,
+    sink_done: tokio::sync::oneshot::Sender<()>,
+    approval_done: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -1180,6 +1193,9 @@ async fn run_turn_inner(
                 }
                 let _ = stream_tx.send(StreamEnvelope { seq, event }).await;
             }
+            // Drained (or cancelled): run_agent_turn may now emit the
+            // terminal event — it must stay the last one on the wire.
+            let _ = sink_done.send(());
         });
     }
 
@@ -1232,6 +1248,8 @@ async fn run_turn_inner(
                     })
                     .await;
             }
+            // Channel closed: run_agent_turn may now emit the terminal event.
+            let _ = approval_done.send(());
         });
     }
 
@@ -2910,6 +2928,8 @@ mod permission_gate_tests {
             None,
             None,
             None,
+            tokio::sync::oneshot::channel::<()>().0,
+            tokio::sync::oneshot::channel::<()>().0,
         )
         .await
         .unwrap_err();
@@ -2933,6 +2953,8 @@ mod permission_gate_tests {
             None,
             None,
             None,
+            tokio::sync::oneshot::channel::<()>().0,
+            tokio::sync::oneshot::channel::<()>().0,
         )
         .await
         .unwrap_err();
@@ -2952,6 +2974,8 @@ mod permission_gate_tests {
             None,
             None,
             None,
+            tokio::sync::oneshot::channel::<()>().0,
+            tokio::sync::oneshot::channel::<()>().0,
         )
         .await
         .unwrap_err();
