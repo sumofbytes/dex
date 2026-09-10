@@ -3,6 +3,8 @@ use std::env;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
 use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
@@ -2112,7 +2114,31 @@ pub(crate) fn doctor(
     header_overrides: &[String],
 ) -> String {
     fn row(out: &mut String, key: &str, value: &str, source: &str) {
-        out.push_str(&format!("{key:<11}{value:<46}{source}\n"));
+        // Three fixed columns — key (11), value (46), origin. Widths count
+        // display columns (CJK chars render 2 wide), so padded values still
+        // line up. A value that overflows its column wraps: the value
+        // prints in full on its own line and the origin hangs at the origin
+        // column, so long paths never run into the origin text.
+        const VALUE_COLS: usize = 46;
+        let origin_indent = " ".repeat(11 + VALUE_COLS);
+        let fits = UnicodeWidthStr::width(value) <= VALUE_COLS;
+        let mut origin_lines = source.split('\n');
+        let inline = if fits {
+            origin_lines.next().unwrap_or_default()
+        } else {
+            ""
+        };
+        if inline.is_empty() {
+            out.push_str(&format!("{key:<11}{value}\n"));
+        } else {
+            let pad = VALUE_COLS - UnicodeWidthStr::width(value);
+            out.push_str(&format!("{key:<11}{value}{:pad$}{inline}\n", ""));
+        }
+        for line in origin_lines {
+            if !line.is_empty() {
+                out.push_str(&format!("{origin_indent}{line}\n"));
+            }
+        }
     }
     fn permission_name(mode: PermissionMode) -> &'static str {
         match mode {
@@ -2457,6 +2483,7 @@ pub(crate) mod tests {
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn apply_model_routes_prefixed_selection_to_endpoint() {
@@ -4476,5 +4503,73 @@ pub(crate) mod tests {
         assert!(out.contains("OPENCODE_API_KEY"), "{out}");
         assert!(out.contains("built-in default"), "{out}");
         assert!(out.contains("resolve"), "{out}");
+    }
+
+    /// Rows whose value overflows the value column wrap instead of
+    /// colliding with the origin text; the origin hangs at the origin
+    /// column (display columns 11+46 = 57).
+    #[test]
+    fn doctor_wraps_overlong_value_and_hangs_origin() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_CONFIG"]);
+        // Missing file, so the config row prints the path + a source note.
+        std::env::set_var(
+            "DEX_CONFIG",
+            format!(
+                "{}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.yaml",
+                std::env::temp_dir().display()
+            ),
+        );
+        let out = doctor(None, None, None, &[]);
+        let mut lines = out.lines().peekable();
+        while let Some(line) = lines.next() {
+            if !line.starts_with("config ") {
+                continue;
+            }
+            // The whole path is the only text on its own line.
+            assert!(
+                line.trim_end().ends_with("config.yaml"),
+                "value keeps its line: {line:?}"
+            );
+            // The origin starts at the origin column on the next line.
+            let origin = lines.next().expect("origin line");
+            assert_eq!(
+                origin.find("missing or invalid"),
+                Some(11 + 46),
+                "origin hangs at the origin column: {origin:?}"
+            );
+            return;
+        }
+        panic!("no config row in:\n{out}");
+    }
+
+    /// Padding counts display columns: a CJK path is 31 chars but only 45
+    /// columns wide, so the origin still lands on column 57.
+    #[test]
+    fn doctor_pads_by_display_width() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_CONFIG"]);
+        // "/tmp/" (5 cols) + 14 CJK chars (28 cols) + "/config.yaml" (12 cols) = 45.
+        std::env::set_var(
+            "DEX_CONFIG",
+            format!("/tmp/{}/config.yaml", "配置文件配置文件配置文件配置"),
+        );
+        let out = doctor(None, None, None, &[]);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("config "))
+            .expect("config row");
+        let at = line
+            .find("missing or invalid")
+            .expect("origin inline on the value line");
+        assert_eq!(
+            UnicodeWidthStr::width(&line[..at]),
+            11 + 46,
+            "origin starts at display column 57: {line:?}"
+        );
     }
 }
