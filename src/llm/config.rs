@@ -445,6 +445,27 @@ fn resolve_provider(
     }
 }
 
+/// Neutral first-run hint when nothing selects a provider (no `--model`,
+/// `DEX_MODEL`, file `model:`, `DEX_PROVIDER`/`active_provider:`) and the
+/// builtin default has no key. Names no favorite — the user picks.
+fn setup_guide_error() -> String {
+    let path = config_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/dex/config.yaml".to_string());
+    // Model ids ride the providers' own defaults so the catalog can move
+    // without this text rotting; the gateway shape mirrors the README.
+    let anthropic_model = Provider::Anthropic.default_model();
+    let opencode_model = Provider::OpenCode.default_model();
+    format!(
+        "no provider configured — pick one, then run `dex doctor`:\n\
+         \u{20}\u{20}anthropic: model: anthropic/{anthropic_model} + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
+         \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
+         \u{20}\u{20}opencode: model: zen/{opencode_model} + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
+         \u{20}\u{20}codex: model: openai-codex + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
+         config: {path}"
+    )
+}
+
 /// Per-provider credentials — the uniform deposit order for every provider
 /// except codex (which reads its own credential file):
 /// 1. `providers.<name>.api_key` in config.yaml,
@@ -1592,6 +1613,24 @@ impl LlmConfig {
         }
         let provider_entries = load_provider_entries(&file);
         let known = known_providers(&provider_entries);
+        // Untouched builtin default (no flag/env/file pointer anywhere):
+        // a missing key then means "nothing configured", not "opencode
+        // is broken" — the error guides setup instead of endorsing one
+        // provider.
+        let using_builtin_default = model_override
+            .as_ref()
+            .map(|m| m.trim().is_empty())
+            .unwrap_or(true)
+            && env::var("DEX_MODEL")
+                .ok()
+                .filter(|m| !m.trim().is_empty())
+                .is_none()
+            && load_config_str(&file, "model").is_none()
+            && env::var("DEX_PROVIDER")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_none()
+            && load_provider_name(&file).is_none();
         // One selection knob names provider *and* model: `provider/model`
         // (`endpoint/model` or a bare provider name work too). Precedence:
         // `--model` > `DEX_MODEL` > file `model:` > builtin default. When
@@ -1674,7 +1713,14 @@ impl LlmConfig {
         // The model carries its own wire protocol; the global `api` above is
         // only the default. Otherwise the `apply_model` call below resolves
         // (full `endpoint/id` key, then bare id, then learned fallback).
-        let (api_key, account_id) = resolve_credentials(&provider, &provider_entries)?;
+        let (api_key, account_id) =
+            resolve_credentials(&provider, &provider_entries).map_err(|e| {
+                if using_builtin_default {
+                    setup_guide_error().into()
+                } else {
+                    e
+                }
+            })?;
         let context_window = env::var("DEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3168,6 +3214,55 @@ pub(crate) mod tests {
                 "torn or foreign index contents"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_default_missing_key_suggests_setup() {
+        // Nothing selects a provider (no flag/env/file pointer): the
+        // missing-key error must guide setup, not endorse opencode.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "DEX_MODEL_APIS",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        // Point at a path that does not exist: no file `model:`.
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        for key in [
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected setup-guide error"),
+        };
+        assert!(err.contains("no provider configured"), "{err}");
+        assert!(err.contains("anthropic"), "{err}");
+        assert!(err.contains("gateway"), "{err}");
+        assert!(err.contains("openai-codex"), "{err}");
+        assert!(err.contains(crate::llm::provider::DEFAULT_MODEL), "{err}");
+        assert!(!err.contains("no API key for provider"), "{err}");
+        // The same guide surfaces in `dex doctor`'s resolve row.
+        let report = doctor(None, None, None, &[]);
+        assert!(report.contains("no provider configured"), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
