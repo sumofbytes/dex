@@ -178,7 +178,13 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
                     out.push_str(&format!("\n{file}"));
                     last_file = file;
                 }
-                out.push_str(&format!("  {}: {}", m.line_number, m.line_content));
+                // Files mode lists paths only: detail rows would pollute
+                // the path list (and the files-matched summary). Each
+                // detail gets its own line so content rows stay `N: code`
+                // shaped for the summary counter and search preview.
+                if !files_mode {
+                    out.push_str(&format!("\n  {}: {}", m.line_number, m.line_content));
+                }
             }
             return Ok(out);
         }

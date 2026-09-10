@@ -1899,6 +1899,9 @@ mod tests {
             "{}",
             outcome.text
         );
+        // Detail rows get their own lines, not glued to the path
+        // (`thing.rs  1: …` would break the summary counter and preview).
+        assert!(!outcome.text.contains("thing.rs  "), "{}", outcome.text);
 
         let _ = fs::remove_dir_all(root);
     }
