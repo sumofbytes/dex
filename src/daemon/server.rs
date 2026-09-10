@@ -70,10 +70,17 @@ async fn require_bearer(
 
 /// Per-request log line for `DEX_LOG=info dex serve`:
 /// `method path -> status (ms)`. Outermost layer, so rejected requests log too.
+/// One info line per handled request. The capture allocates (method + path),
+/// so it is skipped entirely when `DEX_LOG` would drop the line. On streaming
+/// routes (SSE) the duration is time to response *headers* — the body keeps
+/// streaming after this line is written.
 async fn log_requests(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if !crate::core::logging::enabled(crate::core::logging::Level::Info) {
+        return next.run(request).await;
+    }
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let started = Instant::now();
