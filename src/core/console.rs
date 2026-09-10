@@ -163,7 +163,12 @@ pub(crate) static SPINNER_DRAWN: AtomicBool = AtomicBool::new(false);
 pub(crate) struct Console {
     sink: Option<mpsc::Sender<SinkLine>>,
     approval: Option<mpsc::Sender<ApprovalRequest>>,
-    session_approvals: Mutex<Option<HashSet<String>>>,
+    /// Shared across clones: every copy made for a turn (fan-out tasks, the
+    /// turn policy) reads and records the same live set, so an
+    /// allow-for-session verdict mid-turn covers the rest of the turn. The
+    /// daemon seeds a fresh console per turn from its persisted map, so
+    /// nothing leaks across turns or sessions.
+    session_approvals: Arc<Mutex<Option<HashSet<String>>>>,
     /// When true, the daemon handles approvals remotely via SSE instead of
     /// prompting on stdin. The approval channel is still used to send requests;
     /// a separate mechanism resolves them when the client POSTs back.
@@ -227,12 +232,9 @@ impl Clone for Console {
         Self {
             sink: self.sink.clone(),
             approval: self.approval.clone(),
-            session_approvals: Mutex::new(
-                self.session_approvals
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-            ),
+            // Shared, not snapshotted: clones are concurrent workers of one
+            // turn and must agree on session approvals (see field docs).
+            session_approvals: self.session_approvals.clone(),
             remote_approval: self.remote_approval,
             trace: self.trace.clone(),
         }
@@ -248,7 +250,7 @@ impl Console {
         Self {
             sink: Some(sink),
             approval: Some(approval),
-            session_approvals: Mutex::new(None),
+            session_approvals: Arc::new(Mutex::new(None)),
             remote_approval: false,
             trace: None,
         }
@@ -260,7 +262,7 @@ impl Console {
         Self {
             sink: None,
             approval: None,
-            session_approvals: Mutex::new(None),
+            session_approvals: Arc::new(Mutex::new(None)),
             remote_approval: false,
             trace: None,
         }
@@ -274,7 +276,7 @@ impl Console {
         Self {
             sink: Some(sink),
             approval: Some(approval),
-            session_approvals: Mutex::new(None),
+            session_approvals: Arc::new(Mutex::new(None)),
             remote_approval: true,
             trace: None,
         }
