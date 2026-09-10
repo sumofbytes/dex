@@ -390,6 +390,7 @@ impl SseDriver {
         line: &str,
         parser: &mut impl StreamParser,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        crate::log!(Trace, "sse {}", line.trim_end());
         let mut done = false;
         for event in parser.feed(line) {
             if !matches!(event, StreamEvent::Thinking(_)) {
@@ -446,6 +447,7 @@ impl SseDriver {
         line: &str,
         parser: &mut impl StreamParser,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        crate::log!(Trace, "sse {}", line.trim_end());
         let mut done = false;
         for event in parser.feed(line) {
             if !matches!(event, StreamEvent::Thinking(_)) {
