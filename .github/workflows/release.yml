@@ -12,10 +12,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Creating the tag is the only manual step. This job bumps Cargo.toml +
-  # Cargo.lock on the default branch to the tag's version (bot commit) and
-  # hands that exact commit to the build jobs, so released binaries report
-  # the released version.
+  # The tag must point at a commit whose Cargo.toml already carries the
+  # tag's version (the bump lands via a normal PR — develop is protected,
+  # so no bot push). This job just resolves that commit for the build
+  # jobs, so released binaries report the released version.
   bump:
     runs-on: ubuntu-latest
     outputs:
@@ -31,23 +31,10 @@ jobs:
             exit 1
           fi
           cur="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
-          if [ "$ver" != "$cur" ] &&
-            [ "$(printf '%s\n%s\n' "$cur" "$ver" | sort -V | head -n1)" = "$ver" ]; then
-            echo "error: tag v$ver is older than the current Cargo.toml version $cur" >&2
+          if [ "$ver" != "$cur" ]; then
+            echo "error: tag v$ver does not match Cargo.toml $cur." >&2
+            echo "develop is protected: land the version bump via PR, then tag its tip." >&2
             exit 1
-          fi
-          if [ "$ver" = "$cur" ]; then
-            echo "Cargo.toml already at $cur — no bump needed"
-          else
-            awk -v v="$ver" '!done && /^version = /{print "version = \"" v "\""; done = 1; next} {print}' \
-              Cargo.toml > Cargo.toml.new
-            mv Cargo.toml.new Cargo.toml
-            cargo update -p dex >/dev/null
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.toml Cargo.lock
-            git commit -q -m "chore(release): v$ver"
-            git push origin "HEAD:${{ github.event.repository.default_branch }}"
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
