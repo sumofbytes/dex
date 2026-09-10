@@ -58,7 +58,9 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
 /// A rate limit is transient capacity, not a protocol mismatch: falling back
 /// would double load on the provider and could permanently learn the wrong
-/// protocol for the model via `remember_learned_api`.
+/// protocol for the model via `remember_learned_api`. A stalled stream is the
+/// same (transient transport, retried same-protocol by the caller) — it must
+/// never trigger or learn a fallback either.
 fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if config.api_pinned {
         return false; // user pinned one protocol for everything
@@ -71,6 +73,9 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     }
     if crate::llm::client::is_rate_limited(err) {
         return false; // transient capacity — retry the same protocol instead
+    }
+    if crate::llm::stream::is_stream_idle_error(err) {
+        return false; // transient stall — retried same-protocol, not a mismatch
     }
     !err.contains("cancelled")
 }
@@ -218,6 +223,13 @@ mod tests {
             assert!(!try_responses_fallback(
                 &cfg,
                 "overloaded_error: Overloaded"
+            ));
+            // Never on a stalled stream either: transient transport retried
+            // same-protocol, not a protocol mismatch — and falling back
+            // would learn the wrong protocol for the model.
+            assert!(!try_responses_fallback(
+                &cfg,
+                "stream idle for over 300s; the provider stalled"
             ));
             // Explicit DEX_MODEL_APIS entry — user already decided.
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");
