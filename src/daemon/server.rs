@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
+use crate::agent::subagent::{status_word, AgentTurnContext, WaitOutcome};
 use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
 use crate::core::unwind::CatchUnwind;
@@ -917,6 +918,24 @@ async fn run_turn_inner(
     // to re-enable: `DEX_VERIFY=1` or explicit `verify_command` in config.
     crate::llm::config::apply_verify_optin(&mut config);
 
+    // The delegation context (Phase 5): built once per parent turn — the
+    // manager handle, the parent session path/cwd, and the resolved config
+    // the child inherits (cloning its own per definition, §13).
+    let agent_ctx = Arc::new(AgentTurnContext {
+        session_id: session_id.to_string(),
+        session_path: entry.path.clone(),
+        cwd: entry.cwd.clone(),
+        config: Arc::new(config.clone()),
+        manager: state.manager_for(session_id),
+        session_approvals: state
+            .session_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default(),
+    });
+
     // Skills are resolved on the daemon (its filesystem is the workspace).
     // Async dir scans + concurrent reads (Phase 6).
     let mut dirs = skill_dirs();
@@ -938,6 +957,10 @@ async fn run_turn_inner(
         messages.extend(loaded);
     }
     let user_message = ChatMessage::user(req.prompt.clone());
+    // §10b V1a: completion notices queued while no turn was live drain at
+    // the next real turn boundary — the start of this one. They ride the
+    // LLM context as a user-role message, never the steering channel.
+    drain_agent_notices(state, session_id, &mut session, &mut messages).await?;
     // Durable journal (P8): a turn only exists once turn_start is recorded,
     // and an io::Error here fails the turn instead of being swallowed.
     session
@@ -1164,8 +1187,11 @@ async fn run_turn_inner(
             client: &config,
             cancel,
             console: &console,
-            // Main agent: unfiltered (children pass Some via the manager).
+            // Main agent: unfiltered (children pass Some via the manager);
+            // the delegation context is live, so `delegate` can spawn.
             filter: None,
+            agent_ctx: Some(agent_ctx.clone()),
+            tool_budget: None,
         })
         .await;
         match result {
@@ -1173,6 +1199,12 @@ async fn run_turn_inner(
                 final_response = resp;
                 final_usage = tool_state.last_usage;
                 final_cached = tool_state.last_cached;
+                // Mid-turn completions drain at this boundary too — the
+                // same seam follow-ups chain through (§10b V1a). With no
+                // follow-up to chain, the persisted notice message still
+                // reaches the model: the next turn reloads it from the
+                // session history.
+                drain_agent_notices(state, session_id, &mut session, &mut messages).await?;
                 // Drain follow-ups queued while this turn ran.
                 let followups: Vec<String> = match followup_opt.as_mut() {
                     Some(rx) => {
@@ -1228,6 +1260,60 @@ async fn run_turn_inner(
     turn_result
         .map_err(|e| e.to_string())
         .map(|response| (response, usage, cached))
+}
+
+/// Drain queued child completion notices into ONE user-role message
+/// ("agent-notifications") prepended to the next turn's context (§10b V1a:
+/// results land only at real turn boundaries — never mid-turn, never via
+/// the steering channel). The retained [`AgentResult`](crate::agent::subagent::AgentResult)
+/// is the source of truth: the child's final text is what the parent
+/// consumes.
+async fn drain_agent_notices(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<bool, String> {
+    let manager = state.manager_for(session_id);
+    let notices = manager.drain_notices();
+    let overflow = manager.take_overflow();
+    if notices.is_empty() && overflow == 0 {
+        return Ok(false);
+    }
+    let mut text = String::new();
+    for notice in notices {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!(
+            "[agent {}:{}] finished {}",
+            notice.name,
+            notice.agent_id,
+            status_word(notice.status)
+        ));
+        if let WaitOutcome::Finished(result) = manager.wait(&notice.agent_id, Duration::ZERO).await
+        {
+            if !result.summary.trim().is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&result.summary);
+            }
+            if let Some(error) = result.error {
+                text.push_str(&format!("\nError: {error}"));
+            }
+        }
+    }
+    if overflow > 0 {
+        text.push_str(&format!(
+            "\n\n{overflow} more children finished earlier than this notice could \
+             carry; their results are retained — use delegate_output with their ids."
+        ));
+    }
+    let message = ChatMessage::user_named(text, "agent-notifications");
+    session
+        .append_message(&message)
+        .map_err(|e| format!("failed to persist agent notice: {e}"))?;
+    messages.push(message);
+    Ok(true)
 }
 
 async fn approve(
@@ -2565,6 +2651,275 @@ mod e2e_tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file("evil.txt");
+    }
+
+    /// Full delegation loop over real HTTP: the parent's model calls
+    /// `delegate`, the child runs its OWN turn (own session, own history,
+    /// same fake provider — requests are dispatched on the persona in the
+    /// system prompt, so response order never races), and the child's
+    /// completion notice drains into the NEXT user chat's turn context
+    /// (§10b V1a). The child JSONL lands under `agents/` (§16).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
+    async fn delegate_runs_child_and_notice_drains_next_turn() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        const DELEGATE_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"delegate","arguments":"{\"agent\":\"explorer\",\"task\":\"find where the gate lives\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        const PARENT_DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"delegated\"}}]}\n\ndata: [DONE]\n\n";
+        const CHILD_DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the gate lives in src/tools\"}}]}\n\ndata: [DONE]\n\n";
+
+        // Provider calls: parent requests count up (first = delegate call);
+        // child requests are recognized by the persona in their system
+        // prompt. Every request body is captured for the drain assertion.
+        let parent_calls = Arc::new(AtomicUsize::new(0));
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let fake_llm = Router::new().route(
+            "/chat/completions",
+            post(
+                move |AxumState(state): AxumState<Arc<AtomicUsize>>, body: String| {
+                    let seen = seen.clone();
+                    async move {
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        seen.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(parsed.clone());
+                        let system = parsed["messages"][0]["content"]
+                            .as_str()
+                            .unwrap_or_default();
+                        let sse = if system.contains("You are an explorer") {
+                            CHILD_DONE_SSE
+                        } else {
+                            let n = state.fetch_add(1, Ordering::SeqCst);
+                            if n == 0 {
+                                DELEGATE_SSE
+                            } else {
+                                PARENT_DONE_SSE
+                            }
+                        };
+                        axum::http::Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(sse))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        // Axum requires typed state; attach the counter (already Arc'd).
+        let fake_llm = fake_llm.with_state(parent_calls.clone());
+        let llm_base = spawn_app(fake_llm).await;
+        let daemon_state = Arc::new(DaemonState::new());
+        let daemon_base = spawn_app(router(daemon_state.clone())).await;
+
+        // Deterministic daemon environment: LLM pointed at the fake provider.
+        let data_dir = std::env::temp_dir().join(format!("dex-deleg-{}", std::process::id()));
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME",
+            "DEX_CONFIG",
+            "DEX_PERMISSION",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+            "DEX_VERIFY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        let _env = crate::session::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
+        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_VERIFY", "true");
+        for v in [
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ] {
+            std::env::remove_var(v);
+        }
+
+        // Chat 1: the parent delegates and finishes its own turn.
+        let base1 = daemon_base.clone();
+        let (session_id, events, chat_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&base1).unwrap();
+            client.wait_until_ready(Duration::from_secs(10)).unwrap();
+            let session_id = client
+                .create_session("/tmp/dex-deleg-cwd", Some("deleg"))
+                .unwrap()
+                .session_id;
+            let mut events: Vec<crate::protocol::StreamEvent> = Vec::new();
+            let r = client
+                .chat(
+                    &session_id,
+                    "go explore",
+                    ChatOptions::default(),
+                    &mut |event| {
+                        events.push(event);
+                        None
+                    },
+                )
+                .map_err(|e| e.to_string());
+            (session_id, events, r)
+        })
+        .await
+        .unwrap();
+        chat_result.unwrap();
+
+        // The parent's turn saw the spawn and finished.
+        assert!(
+            events.iter().any(|e| matches!(e,
+                crate::protocol::StreamEvent::System(text) if text.starts_with("[agent explorer:"))),
+            "started line must be journaled: {events:?}"
+        );
+        match events.iter().find_map(|e| match e {
+            crate::protocol::StreamEvent::TurnComplete { response, .. } => Some(response.clone()),
+            _ => None,
+        }) {
+            Some(response) => assert_eq!(response, "delegated"),
+            None => panic!("expected TurnComplete in {events:?}"),
+        }
+        // The child id comes from the started line.
+        let agent_id = events
+            .iter()
+            .find_map(|e| match e {
+                crate::protocol::StreamEvent::System(text)
+                    if text.starts_with("[agent explorer:") =>
+                {
+                    Some(
+                        text.trim_start_matches("[agent explorer:")
+                            .trim_end_matches("] started")
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            })
+            .expect("started line");
+
+        // Wait for the child to reach its terminal state (deterministic:
+        // the notice must be queued before the next chat drains it).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if daemon_state
+                .manager_for(&session_id)
+                .status(&crate::agent::subagent::AgentId(agent_id.clone()))
+                == Some(crate::agent::subagent::AgentState::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(Instant::now() < deadline, "child never completed");
+        }
+
+        // Chat 2: the notice drains into this turn's LLM context.
+        let (second_events, second_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&daemon_base).unwrap();
+            let mut events: Vec<crate::protocol::StreamEvent> = Vec::new();
+            let r = client
+                .chat(
+                    &session_id,
+                    "did it finish?",
+                    ChatOptions::default(),
+                    &mut |event| {
+                        events.push(event);
+                        None
+                    },
+                )
+                .map_err(|e| e.to_string());
+            (events, r)
+        })
+        .await
+        .unwrap();
+        second_result.unwrap();
+        match second_events.iter().find_map(|e| match e {
+            crate::protocol::StreamEvent::TurnComplete { response, .. } => Some(response.clone()),
+            _ => None,
+        }) {
+            Some(response) => assert_eq!(response, "delegated"),
+            None => panic!("expected TurnComplete in {second_events:?}"),
+        }
+
+        // The second chat's LLM request carried the notice: the status line
+        // plus the child's summary (what the parent consumes, §6).
+        let bodies = requests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let last = bodies.last().unwrap();
+        let notice_messages: Vec<&serde_json::Value> = last["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("finished completed"))
+            })
+            .collect();
+        assert_eq!(notice_messages.len(), 1, "{last:?}");
+        let notice = notice_messages[0]["content"].as_str().unwrap();
+        assert!(
+            notice.contains("[agent explorer:"),
+            "status line prefix: {notice}"
+        );
+        assert!(
+            notice.contains("the gate lives in src/tools"),
+            "child summary delivered: {notice}"
+        );
+
+        // §16: the child's own JSONL beside the parent's, with markers.
+        let sessions_base = data_dir.join("dex/sessions");
+        let mut child_files = Vec::new();
+        let mut stack = vec![sessions_base];
+        while let Some(dir) = stack.pop() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with("-explorer.jsonl"))
+                    {
+                        child_files.push(path);
+                    }
+                }
+            }
+        }
+        assert_eq!(child_files.len(), 1, "one child JSONL under agents/");
+        let child_text = std::fs::read_to_string(&child_files[0]).unwrap();
+        assert!(
+            child_text.contains("\"type\":\"turn_start\""),
+            "{child_text}"
+        );
+        assert!(
+            child_text.contains("\"type\":\"turn_complete\""),
+            "{child_text}"
+        );
+        assert!(
+            child_text.contains("find where the gate lives"),
+            "child transcript carries the task: {child_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
 
