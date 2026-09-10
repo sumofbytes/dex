@@ -150,6 +150,18 @@ pub(crate) struct ApprovalRequest {
     pub response: tokio::sync::mpsc::Sender<ApprovalDecision>,
 }
 
+/// One message on a per-turn steering or follow-up queue. `Content` enqueues a
+/// not-yet-delivered item; `Recall` cancels a queued item (matched by content)
+/// so the client can pull it back into the composer and edit it. The consumer
+/// applies recalls in arrival order, so a recall only cancels an item that has
+/// not yet been injected into the conversation — an already-injected item is
+/// part of the transcript and cannot be pulled back.
+#[derive(Debug)]
+pub enum QueueMsg {
+    Content(String),
+    Recall(String),
+}
+
 /// Width of a string as displayed, ignoring ANSI escape sequences.
 /// dividers, truncated to fit the terminal width.
 /// Message role on the wire. Serialized lowercase; only these four exist —

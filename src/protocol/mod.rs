@@ -89,6 +89,16 @@ pub struct FollowupRequest {
     pub content: String,
 }
 
+/// Request to recall a queued steering/follow-up message that the daemon has
+/// not injected yet (client-side "edit a waiting message").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallRequest {
+    pub content: String,
+    /// `true` recalls a queued follow-up; `false` (default) a queued steer.
+    #[serde(default)]
+    pub followup: bool,
+}
+
 /// Request to submit a chat prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::protocol::{
     ApprovalDecision, ApprovalResponse, ChatRequest, CreateSessionRequest, CreateSessionResponse,
     DaemonInfo, EventsResponse, FollowupRequest, GitInfo, LoadSkillRequest, LoadSkillResponse,
-    ReattachResponse, SessionInfo, ShellRequest, ShellResponse, SkillInfo, SteerRequest,
-    StreamEnvelope, StreamEvent,
+    ReattachResponse, RecallRequest, SessionInfo, ShellRequest, ShellResponse, SkillInfo,
+    SteerRequest, StreamEnvelope, StreamEvent,
 };
 
 /// Per-request overrides forwarded to the daemon with a chat turn.
@@ -885,6 +885,39 @@ impl DaemonClient {
         content: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         block_on(self.followup_async(session_id, content))
+    }
+
+    /// Recall a queued steering/follow-up message the daemon has not injected
+    /// yet, so the caller can edit and resubmit it (Alt+Up in the TUI).
+    pub async fn recall_async(
+        &self,
+        session_id: &str,
+        content: &str,
+        followup: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.http
+            .post(format!(
+                "{}/api/sessions/{}/recall",
+                self.base_url, session_id
+            ))
+            .headers(self.api_headers())
+            .json(&RecallRequest {
+                content: content.to_string(),
+                followup,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub fn recall(
+        &self,
+        session_id: &str,
+        content: &str,
+        followup: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        block_on(self.recall_async(session_id, content, followup))
     }
 }
 
