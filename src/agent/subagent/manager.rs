@@ -149,15 +149,26 @@ pub(crate) struct ProgressReporter {
 
 impl ProgressReporter {
     /// Record the tool the child is currently running (e.g. `"bash"`).
+    /// Fires the lifecycle hook (§15 V1b) when the tool actually changes,
+    /// so one tool call's set/clear pair emits at most one progress event.
     pub(crate) fn set(&self, tool: &str) {
-        if let Some(child) = self
-            .manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .running
-            .get_mut(&self.id)
-        {
-            child.instance.progress = Some(tool.to_string());
+        let mut inner = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fire = false;
+        if let Some(child) = inner.running.get_mut(&self.id) {
+            if child.instance.progress.as_deref() != Some(tool) {
+                child.instance.progress = Some(tool.to_string());
+                fire = true;
+            }
+        }
+        let hook = inner.events.clone();
+        drop(inner);
+        if fire {
+            if let Some(hook) = hook {
+                hook(AgentEvent::Progress {
+                    agent_id: self.id.clone(),
+                    current_tool: Some(tool.to_string()),
+                });
+            }
         }
     }
 
@@ -183,8 +194,25 @@ pub(crate) struct AgentManager {
     inner: Arc<Mutex<Inner>>,
 }
 
-/// The daemon-supplied terminal-path hook: one completion notice per call.
-type JournalHook = Arc<dyn Fn(&AgentNotice) + Send + Sync>;
+/// V1b typed child-agent lifecycle event (plan §15): fired through the
+/// daemon's event hook at spawn, on every progress change, and on every
+/// terminal path — the same single choke points the V1a `System` lines use,
+/// so no lifecycle transition can bypass either encoding.
+pub(crate) enum AgentEvent {
+    Spawned {
+        agent_id: AgentId,
+        name: String,
+    },
+    Progress {
+        agent_id: AgentId,
+        current_tool: Option<String>,
+    },
+    Completed(AgentNotice),
+}
+
+/// The daemon-supplied lifecycle hook: typed events (§15 V1b) journaled and
+/// broadcast beside the V1a `System` lines.
+type EventHook = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
 struct Inner {
     session: String,
@@ -193,12 +221,12 @@ struct Inner {
     /// clone (e.g. held by an in-flight tool call) cannot then orphan a
     /// child into a registry nobody will ever join (plan §14).
     closed: bool,
-    /// Set by the daemon (`AgentManager::with_journal`): invoked on every
+    /// Set by the daemon (`AgentManager::with_events`): invoked on every
     /// terminal path with the completion notice, so child lifecycle lines
     /// (§15 V1a `[agent <name>:<id>] finished <status>`) are journaled at
     /// completion time even while no turn is live. `None` for test-built
     /// managers.
-    journal: Option<JournalHook>,
+    events: Option<EventHook>,
     running: HashMap<AgentId, RunningChild>,
     results: HashMap<AgentId, AgentResult>,
     /// Insertion order of `results`, for oldest-first eviction.
@@ -221,7 +249,7 @@ impl AgentManager {
                 session: session.to_string(),
                 next_counter: 0,
                 closed: false,
-                journal: None,
+                events: None,
                 running: HashMap::new(),
                 results: HashMap::new(),
                 result_order: VecDeque::new(),
@@ -231,11 +259,22 @@ impl AgentManager {
         }
     }
 
-    /// Attach the terminal-path journal hook (§15 V1a). The daemon builds
-    /// managers with it; test-built managers leave it `None`.
-    pub(crate) fn with_journal(self, hook: Arc<dyn Fn(&AgentNotice) + Send + Sync>) -> Self {
-        self.lock().journal = Some(hook);
+    /// Attach the lifecycle event hook (§15 V1a `System` lines + §15 V1b
+    /// typed variants). The daemon builds managers with it; test-built
+    /// managers leave it `None`.
+    pub(crate) fn with_events(self, hook: EventHook) -> Self {
+        self.lock().events = Some(hook);
         self
+    }
+
+    /// The definition name behind a live child id (§12 V1b approval
+    /// labels). `None` for unknown ids and finished children — approvals
+    /// only ever arrive from a running child.
+    pub(crate) fn definition_name(&self, id: &AgentId) -> Option<String> {
+        self.lock()
+            .running
+            .get(id)
+            .map(|child| child.instance.definition.name.clone())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -313,6 +352,7 @@ impl AgentManager {
 
         let manager = self.clone();
         let name = def.name.clone();
+        let spawn_name = name.clone();
         let task_id = id.clone();
         let handle = tokio::spawn(async move {
             // Cancel wins over a body that ignores its token, and the body
@@ -364,6 +404,15 @@ impl AgentManager {
         if let Some(child) = self.lock().running.get_mut(&id) {
             child.handle = Some(handle);
         }
+        // §15 V1b: the typed spawn event fires after registration, so the
+        // journal order can never reference an unregistered id.
+        let hook = self.lock().events.clone();
+        if let Some(hook) = hook {
+            hook(AgentEvent::Spawned {
+                agent_id: id.clone(),
+                name: spawn_name,
+            });
+        }
         Ok(id)
     }
 
@@ -397,10 +446,10 @@ impl AgentManager {
         inner.running.remove(id);
         // Outside the lock: the hook journals through the daemon's own seq
         // mutex, and its file IO must never block registry access.
-        let hook = inner.journal.clone();
+        let hook = inner.events.clone();
         drop(inner);
         if let Some(hook) = hook {
-            hook(&notice);
+            hook(AgentEvent::Completed(notice));
         }
     }
 
@@ -472,6 +521,12 @@ impl AgentManager {
     /// finished — ask for specifics".
     pub(crate) fn take_overflow(&self) -> usize {
         std::mem::take(&mut self.lock().overflowed)
+    }
+
+    /// Any queued completion notices (the idle wake's fire condition,
+    /// §10b V1b — a peek, not a drain).
+    pub(crate) fn has_notices(&self) -> bool {
+        !self.lock().notices.is_empty()
     }
 
     /// Live children. The daemon shutdown path (§17) joins until this
@@ -571,13 +626,23 @@ mod tests {
     async fn journal_hook_fires_on_every_terminal_path() {
         // §15 V1a: the daemon's hook observes every terminal path — the
         // single choke point means cancel and panic are journaled too.
-        let seen: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        // §15 V1b: the same hook now carries the typed events; spawn and
+        // terminal completions must both fire through it.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let capture = seen.clone();
-        let mgr = AgentManager::new("sess").with_journal(Arc::new(move |notice| {
-            capture.lock().unwrap_or_else(|e| e.into_inner()).push((
-                notice.agent_id.to_string(),
-                super::super::status_word(notice.status),
-            ));
+        let mgr = AgentManager::new("sess").with_events(Arc::new(move |event| {
+            let text = match event {
+                AgentEvent::Spawned { agent_id, .. } => format!("spawned {agent_id}"),
+                AgentEvent::Progress { agent_id, .. } => format!("progress {agent_id}"),
+                AgentEvent::Completed(notice) => {
+                    format!(
+                        "{} {}",
+                        notice.agent_id,
+                        super::super::status_word(notice.status)
+                    )
+                }
+            };
+            capture.lock().unwrap_or_else(|e| e.into_inner()).push(text);
         }));
         let completed = mgr
             .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
@@ -600,10 +665,16 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                ("sess-0".to_string(), "completed"),
-                ("sess-1".to_string(), "cancelled"),
+                "spawned sess-0".to_string(),
+                "spawned sess-1".to_string(),
+                "sess-0 completed".to_string(),
+                "sess-1 cancelled".to_string(),
             ]
         );
+        // Finished children leave the live registry (§12 V1b): approvals
+        // only ever arrive from a running child, so the label lookup is
+        // `None` for a terminal id.
+        assert_eq!(mgr.definition_name(&cancelled_id), None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -625,6 +696,10 @@ mod tests {
         assert_eq!(second.to_string(), "sess-1");
         assert_eq!(mgr.status(&first), Some(AgentState::Running));
         assert_eq!(mgr.active_count(), 2);
+        // The §12 V1b approval label resolves from the live registry: a
+        // running child's definition name is available the moment a parked
+        // approval needs it.
+        assert_eq!(mgr.definition_name(&first), Some("explorer".to_string()));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -105,6 +105,16 @@ pub(crate) struct AgentTurnContext {
     /// spawned them, so the set they inherit is seeded at spawn (§12; the
     /// live-consulted variant is V1b).
     pub(crate) session_approvals: HashSet<String>,
+    /// §12 V1b: the per-parent-turn channel that routes a child's
+    /// [`ApprovalRequest`] into the daemon's `pending_approvals` as a
+    /// labeled prompt (the parent turn's own tools use their own channel).
+    /// `None` outside the daemon: the child console then carries a closed
+    /// channel and `enforce_policy` fails closed (V1a detached auto-deny).
+    pub(crate) child_approvals: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
+    /// §12 V1b: live "allow for session" lookup against the daemon's map,
+    /// so a decision granted after a child spawned still applies to it.
+    /// `None` outside the daemon.
+    pub(crate) live_approvals: Option<crate::core::console::LiveApprovalCheck>,
 }
 
 /// Dispatch the delegation tools from [`crate::tools::execute`]. The
@@ -386,15 +396,28 @@ async fn child_run(
     let mut messages = vec![ChatMessage::system(child_system_prompt(&def)), user_message];
 
     // Child console: a child-local sink that captures the last assistant
-    // text (the §6 synthesized partial summary) and NO live approval
-    // channel — background children cannot prompt for approval (§12 V1a
-    // detached auto-deny: the denial is recorded as a failed tool result).
-    // "Allow for session" approvals granted in the parent session carry
-    // over, so a user-approved exact command still runs.
+    // text (the §6 synthesized partial summary) and, under the daemon, a
+    // live approval channel routed through the parent turn's child-approval
+    // bridge (§12 V1b labeled prompts: the request parks in the session's
+    // pending_approvals with the child's name, and a 5-minute timeout
+    // denies it if nobody answers). "Allow for session" approvals granted
+    // in the parent session carry over — seeded from the spawn-time
+    // snapshot and consulted live, so a decision granted after the spawn
+    // still applies. Outside the daemon the channel stays closed and
+    // `enforce_policy` fails closed (V1a detached auto-deny: the denial is
+    // recorded as a failed tool result).
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkLine>(256);
-    let (approval_tx, _dropped) = mpsc::channel::<ApprovalRequest>(1);
-    drop(_dropped);
-    let console = Console::new(sink_tx, approval_tx);
+    let approval_tx = match &ctx.child_approvals {
+        Some(bridge) => bridge.clone(),
+        None => {
+            let (approval_tx, _dropped) = mpsc::channel::<ApprovalRequest>(1);
+            drop(_dropped);
+            approval_tx
+        }
+    };
+    let console = Console::new(sink_tx, approval_tx)
+        .with_live_approvals(ctx.live_approvals.clone())
+        .with_agent(id.0.clone(), def.name.clone());
     console.seed_session_approvals(ctx.session_approvals.clone());
     let last_assistant = Arc::new(Mutex::new(None::<String>));
     let usage = Arc::new(Mutex::new(AgentUsage::default()));
@@ -612,6 +635,8 @@ mod tests {
             config: Arc::new(crate::llm::config::tests::test_cfg()),
             manager: manager.clone(),
             session_approvals: HashSet::new(),
+            child_approvals: None,
+            live_approvals: None,
         });
         let id = manager
             .spawn(

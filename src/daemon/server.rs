@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,11 +16,11 @@ use tokio::sync::mpsc;
 
 use crate::agent::r#loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
-use crate::agent::subagent::{AgentTurnContext, WaitOutcome};
+use crate::agent::subagent::{AgentId, AgentManager, AgentTurnContext, WaitOutcome};
 use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::core::unwind::CatchUnwind;
-use crate::llm::config::LlmConfig;
+use crate::llm::config::{agent_wake_enabled, LlmConfig};
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
@@ -530,12 +531,10 @@ async fn chat(
     let mut followup_rx_opt: Option<mpsc::Receiver<QueueMsg>> = None;
     let mut cancel_for_turn: Option<CancellationToken> = None;
     if replay_envelope.is_none() {
-        {
-            let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
-            if active.contains(&session_id) {
-                return Err(StatusCode::CONFLICT);
-            }
-            active.insert(session_id.clone());
+        // Chat wins over an idle wake (§10b V1b): steal the wake, then take
+        // the turn slot. Without a wake, a second chat 409s immediately.
+        if !steal_wake_and_claim(&state, &session_id).await {
+            return Err(StatusCode::CONFLICT);
         }
 
         // Register a fresh per-turn cancellation token before spawning so a
@@ -653,6 +652,8 @@ async fn run_agent_turn(
     struct TurnGuard {
         state: Arc<DaemonState>,
         session_id: String,
+        cancel: CancellationToken,
+        stream_tx: mpsc::Sender<StreamEnvelope>,
     }
     impl Drop for TurnGuard {
         fn drop(&mut self) {
@@ -663,32 +664,48 @@ async fn run_agent_turn(
             for sender in self.state.take_session_pendings(&self.session_id) {
                 let _ = sender.try_send(ApprovalDecision::Deny);
             }
-            self.state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
-            self.state
-                .cancel_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
-            self.state
-                .steering_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
-            self.state
-                .followup_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
+            // Tear down only the entries THIS turn registered: an idle wake
+            // stolen by a user chat POST must not remove the user turn's
+            // fresh registration (identity-checked via the cancel token).
+            let owned = {
+                let mut tokens = self
+                    .state
+                    .cancel_tokens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let owned = tokens
+                    .get(&self.session_id)
+                    .is_some_and(|token| token.same_token(&self.cancel));
+                if owned {
+                    tokens.remove(&self.session_id);
+                }
+                owned
+            };
+            if owned {
+                self.state
+                    .active_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.session_id);
+                for map in [&self.state.steering_txs, &self.state.followup_txs] {
+                    map.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&self.session_id);
+                }
+                self.state
+                    .unregister_stream(&self.session_id, &self.stream_tx);
+            }
         }
     }
     let _guard = TurnGuard {
         state: state.clone(),
         session_id: session_id.clone(),
+        cancel: cancel.clone(),
+        stream_tx: tx.clone(),
     };
+    // Journaled agent events (child lifecycle, labeled approvals, wake
+    // turns) also ride this turn's live stream while it lasts (V1b).
+    state.register_stream(&session_id, &tx);
     // Steering / follow-up channels for this turn (mirrors the old in-memory
     // `event.rs` submit path). `POST /steer` and `POST /followup` push into
     // these; the agent loop consumes them between iterations / chained turns.
@@ -942,6 +959,36 @@ async fn run_turn_inner(
     // to re-enable: `DEX_VERIFY=1` or explicit `verify_command` in config.
     crate::llm::config::apply_verify_optin(&mut config);
 
+    // §12 V1b: the child-approval bridge consumes a child's requests,
+    // parks them labeled in the session's pending_approvals, and denies
+    // them after a five-minute silence. The live-approvals closure keeps
+    // children in sync with "allow for session" decisions granted after
+    // they spawned.
+    let (child_approval_tx, child_approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        let manager = state.manager_for(&session_id);
+        tokio::spawn(child_approval_bridge(
+            state,
+            session_id.clone(),
+            manager,
+            child_approval_rx,
+        ));
+    }
+    let live_approvals = {
+        let state = state.clone();
+        let sid = session_id.to_string();
+        Arc::new(move |key: &str| {
+            state
+                .session_approvals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&sid)
+                .is_some_and(|approved| approved.contains(key))
+        })
+    };
+
     // The delegation context (Phase 5): built once per parent turn — the
     // manager handle, the parent session path/cwd, and the resolved config
     // the child inherits (cloning its own per definition, §13).
@@ -958,6 +1005,8 @@ async fn run_turn_inner(
             .get(session_id)
             .cloned()
             .unwrap_or_default(),
+        child_approvals: Some(child_approval_tx),
+        live_approvals: Some(live_approvals),
     });
 
     // Skills are resolved on the daemon (its filesystem is the workspace).
@@ -1152,14 +1201,14 @@ async fn run_turn_inner(
                     continue;
                 }
                 let request_id = uuid::Uuid::new_v4().to_string();
-                let name_clone = request.name.clone();
-                let input_clone = request.input.clone();
+                let agent = request.agent.clone();
                 let parked = PendingApproval {
                     session_id: session_id.clone(),
                     response: request.response,
-                    name: name_clone,
-                    input: input_clone,
+                    name: request.name.clone(),
+                    input: request.input.clone(),
                     agent_id: request.agent_id,
+                    agent: agent.clone(),
                 };
                 let replaced = state
                     .pending_approvals
@@ -1178,6 +1227,7 @@ async fn run_turn_inner(
                             request_id,
                             name: request.name,
                             input: request.input,
+                            agent,
                         },
                     })
                     .await;
@@ -1336,6 +1386,298 @@ async fn drain_agent_notices(
     Ok(true)
 }
 
+/// Five-minute silence denies a parked child-agent approval (§12 V1b): a
+/// prompt nobody answers must never strand a child forever, and the denial
+/// is recorded in the child's transcript like any other refusal.
+const CHILD_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Wake scheduling (§10b V1b): debounce bursts, retry around a live user
+/// turn a bounded number of times, and gate on recent client presence.
+const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
+const WAKE_RETRY: Duration = Duration::from_secs(5);
+const WAKE_RETRIES: usize = 12;
+/// A client reading the journal within this window counts as an audience.
+const WAKE_PRESENCE_WINDOW: Duration = Duration::from_secs(30);
+
+/// The idle wake turn's prompt: the drained notices themselves ride the
+/// agent-notifications user message (the same seam a user turn uses), so
+/// the wake only needs to point the main agent at them.
+const WAKE_PROMPT: &str = "A background agent finished while this session was idle. Review the agent-notifications below and continue the work they point at; if nothing needs doing, reply with one short line and stop.";
+
+/// §12 V1b: consume a child's approval requests. Each one parks in the
+/// session's `pending_approvals` under the child's id, is journaled and
+/// broadcast as a labeled `ApprovalRequired` (so the TUI renders "explorer
+/// wants to run bash: …" and stays answerable after the parent turn ends),
+/// and arms a five-minute deny timer.
+async fn child_approval_bridge(
+    state: Arc<DaemonState>,
+    session_id: String,
+    manager: AgentManager,
+    mut rx: mpsc::Receiver<ApprovalRequest>,
+) {
+    while let Some(request) = rx.recv().await {
+        // The session's manager was dropped (deleted/reset): deny so the
+        // child's blocked tool call unwinds instead of parking forever.
+        if !state
+            .agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&session_id)
+        {
+            let _ = request.response.try_send(ApprovalDecision::Deny);
+            continue;
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        // The label prefers the console-stamped name; fall back to the
+        // manager registry (same definition, single source).
+        let agent = request
+            .agent
+            .clone()
+            .or_else(|| manager.definition_name(&AgentId(request.agent_id.clone()?)));
+        let parked = PendingApproval {
+            session_id: session_id.clone(),
+            response: request.response,
+            name: request.name.clone(),
+            input: request.input.clone(),
+            agent_id: request.agent_id.clone(),
+            agent: agent.clone(),
+        };
+        let replaced = state
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.clone(), parked);
+        if let Some(stale) = replaced {
+            let _ = stale.response.try_send(ApprovalDecision::Deny);
+        }
+        // Journal + broadcast: with no turn streaming, the client's event
+        // poll is the delivery path (§15: child events ride ?since=).
+        let env = StreamEnvelope {
+            seq: state.next_seq(&session_id),
+            event: StreamEvent::ApprovalRequired {
+                request_id: request_id.clone(),
+                name: request.name.clone(),
+                input: request.input.clone(),
+                agent: agent.clone(),
+            },
+        };
+        if let Some(path) = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session_id)
+            .map(|e| e.path.clone())
+        {
+            if let Ok(mut journal) = Session::from_path(&path) {
+                let _ = journal.append_event(
+                    env.seq,
+                    &serde_json::to_string(&env.event).unwrap_or_default(),
+                );
+            }
+        }
+        state.broadcast_event(&session_id, &env);
+        // The five-minute denial timer. Resolution removes the entry first,
+        // so an answered prompt never double-denies.
+        let timer_state = state.clone();
+        let timer_sid = session_id.clone();
+        let timer_id = request_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CHILD_APPROVAL_TIMEOUT).await;
+            let pending = {
+                let mut pending = timeout_pending(&timer_state);
+                pending.remove(&timer_id)
+            };
+            let Some(pending) = pending else {
+                return;
+            };
+            if pending.session_id != timer_sid {
+                // Restore: cross-session entries belong to their session.
+                timeout_pending(&timer_state).insert(timer_id, pending);
+                return;
+            }
+            write_approval_audit(
+                &timer_sid,
+                &timer_id,
+                &pending.name,
+                &pending.input,
+                "deny",
+                "timeout",
+                pending.agent.as_deref(),
+            );
+            let _ = pending.response.send(ApprovalDecision::Deny).await;
+        });
+    }
+}
+
+/// Locked peek/remove helper for the timeout timer (keeps the borrow out of
+/// the async block).
+fn timeout_pending(
+    state: &Arc<DaemonState>,
+) -> std::sync::MutexGuard<'_, HashMap<String, PendingApproval>> {
+    state
+        .pending_approvals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// One audit row for an approval resolution (the same shape `approve`
+/// writes; `actor` distinguishes the remote client from the timer).
+fn write_approval_audit(
+    session_id: &str,
+    request_id: &str,
+    tool: &str,
+    input: &str,
+    decision: &str,
+    actor: &str,
+    agent: Option<&str>,
+) {
+    let Some(base) = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
+    else {
+        return;
+    };
+    let path = base.join("dex/audit.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&input, &mut hasher);
+    let input_hash = std::hash::Hasher::finish(&hasher);
+    let mut record = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "session_id": session_id,
+        "request_id": request_id,
+        "tool": tool,
+        "input_hash": format!("{:016x}", input_hash),
+        "decision": decision,
+        "actor": actor,
+    });
+    if let Some(agent) = agent {
+        record["agent"] = serde_json::json!(agent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
+/// §10b V1b: idle wake. Fired when a completion notice is queued while no
+/// turn is live and a client is plausibly listening (presence = a recent
+/// `GET /events` read). Runs the notice drain as a REAL journaled turn —
+/// same pipeline, guard rails, and teardown as a user turn — so the main
+/// agent acts on background completions without waiting for the user.
+/// Chat wins: the chat handler steals the wake before registering, so no
+/// user-visible 409 ever loses a race with a background notice.
+pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
+    tokio::spawn(async move {
+        // Debounce: children finishing in a burst wake once, not per child.
+        tokio::time::sleep(WAKE_DEBOUNCE).await;
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            if attempts > WAKE_RETRIES || !agent_wake_enabled() {
+                return;
+            }
+            // Presence gate: no client reading the journal → no audience.
+            // The notices wait in the queue for the next real turn.
+            if !state.client_seen_fresh(&session_id, WAKE_PRESENCE_WINDOW) {
+                return;
+            }
+            if state
+                .active_turns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&session_id)
+            {
+                // A user turn is live: it drains at its boundary. Re-check
+                // after it ends so a notice landing mid-turn still wakes.
+                tokio::time::sleep(WAKE_RETRY).await;
+                continue;
+            }
+            let manager = state.manager_for(&session_id);
+            if !manager.has_notices() {
+                return;
+            }
+            let Some(wake_cancel) = state.claim_wake(&session_id) else {
+                return; // one wake at a time per session
+            };
+            // Re-check idle after claiming (the claim raced a user turn).
+            if state
+                .active_turns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&session_id)
+            {
+                state.cancel_wake(&session_id);
+                continue;
+            }
+            // The wake holds the session's turn slot, so the append-only log
+            // stays serialized; the user chat POST steals instead of 409ing.
+            state
+                .active_turns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone());
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.clone(), wake_cancel.clone());
+            // Same model the session's last turn used (stored per session);
+            // permission resolves from the daemon's own ceiling.
+            let model = state
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&session_id)
+                .and_then(|entry| {
+                    crate::session::load_session_state(&entry.path)
+                        .ok()
+                        .and_then(|map| map.get("model").cloned())
+                })
+                .filter(|model| !model.trim().is_empty());
+            let request = ChatRequest {
+                prompt: WAKE_PROMPT.to_string(),
+                skill_dirs: Vec::new(),
+                base_url: None,
+                model,
+                permission: None,
+                headers: None,
+                plan: None,
+            };
+            // The wake's stream has no attached client; the journal is the
+            // delivery path and the terminal event's send is best effort.
+            let (wake_tx, _wake_rx) = mpsc::channel::<StreamEnvelope>(256);
+            run_agent_turn(
+                state.clone(),
+                session_id.clone(),
+                request,
+                wake_cancel,
+                wake_tx,
+                None,
+                0,
+                None,
+                None,
+            )
+            .await;
+            // More completions may have landed while the wake ran; re-arm
+            // (bounded) instead of dropping them.
+            if !state.manager_for(&session_id).has_notices() {
+                return;
+            }
+            tokio::time::sleep(WAKE_DEBOUNCE).await;
+        }
+    });
+}
+
 async fn approve(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
@@ -1358,50 +1700,23 @@ async fn approve(
                 }
                 crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
             };
-            // Audit: best-effort, redacted input hash, actor, request_id
-            {
-                let Some(base) = std::env::var_os("XDG_DATA_HOME")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| {
-                        std::env::var_os("HOME")
-                            .map(|h| std::path::PathBuf::from(h).join(".local/share"))
-                    })
-                else {
-                    let _ = pending.response.try_send(decision);
-                    return Ok(Json(json!({ "status": "ok" })));
-                };
-                let path = base.join("dex/audit.jsonl");
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                std::hash::Hash::hash(&pending.input, &mut hasher);
-                use std::hash::Hasher;
-                let input_hash = format!("{:016x}", hasher.finish());
-                let decision_str = match decision {
-                    ApprovalDecision::Once => "once",
-                    ApprovalDecision::Session => "session",
-                    ApprovalDecision::Deny => "deny",
-                };
-                let record = serde_json::json!({
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "session_id": session_id,
-                    "request_id": req.request_id,
-                    "tool": pending.name,
-                    "input_hash": input_hash,
-                    "decision": decision_str,
-                    "actor": "remote",
-                });
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    let mut line = record.to_string();
-                    line.push('\n');
-                    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
-                }
-            }
+            let decision_str = match decision {
+                ApprovalDecision::Once => "once",
+                ApprovalDecision::Session => "session",
+                ApprovalDecision::Deny => "deny",
+            };
+            // Audit: best-effort, redacted input hash, actor, request_id.
+            // A child-agent prompt records its label so the trail names the
+            // requester (§12 V1b).
+            write_approval_audit(
+                &session_id,
+                &req.request_id,
+                &pending.name,
+                &pending.input,
+                decision_str,
+                "remote",
+                pending.agent.as_deref(),
+            );
             let _ = pending.response.send(decision).await;
             Ok(Json(json!({ "status": "ok" })))
         }
@@ -1584,28 +1899,70 @@ fn session_path(
 
 /// `GET /api/sessions/{id}/events?since=<seq>` — replay journaled stream
 /// events after a cursor (P10). Missing journal file replays nothing.
+async fn steal_wake_and_claim(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    let had_wake = state.cancel_wake(session_id).is_some();
+    for _ in 0..250 {
+        // The guard dies inside this block, before the poll sleep below —
+        // a std::sync guard must never span an await.
+        let claimed = {
+            let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+            if active.contains(session_id) {
+                false
+            } else {
+                active.insert(session_id.to_string());
+                true
+            }
+        };
+        if claimed {
+            return true;
+        }
+        if !had_wake {
+            return false;
+        }
+        // The wake holds the slot only while it unwinds; poll instead of
+        // blocking the handler on a condvar.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// `POST /api/sessions/{id}/events` handler.
 async fn session_events(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<EventsResponse>, StatusCode> {
     let path = session_path(&state, &session_id)?;
+    // Presence heartbeat (§10b V1b): every journal read counts as a client
+    // listening; the idle wake fires only while this stays fresh.
+    state.touch_client_seen(&session_id);
     let since = params
         .get("since")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let events = tokio::task::spawn_blocking(move || {
         let mut events = Vec::new();
+        let mut last_raw = since;
         for (seq, payload) in Session::load_events(&path, since).unwrap_or_default() {
+            last_raw = last_raw.max(seq);
+            // Unknown event types are skipped for the payload (the client's
+            // fallback rule) but still advance the cursor — otherwise a
+            // poller would re-fetch the same range forever.
             if let Ok(event) = serde_json::from_str::<StreamEvent>(&payload) {
                 events.push(StreamEnvelope { seq, event });
             }
         }
-        let next_seq = events
-            .last()
-            .map(|e| e.seq.saturating_add(1))
-            .unwrap_or(since);
-        (events, next_seq)
+        // next_seq follows the raw journal rows (even unknown types), so the
+        // client cursor keeps moving; with no rows past `since` the cursor
+        // stays put so a later row can never be skipped.
+        (
+            events,
+            if last_raw > since {
+                last_raw + 1
+            } else {
+                since
+            },
+        )
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2202,6 +2559,46 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn steal_wake_and_claim_wins_over_a_live_wake() {
+        // Chat-wins rule (§10b V1b): a user POST steals the idle wake — the
+        // wake's token is cancelled and the slot lands on the user turn.
+        let state = Arc::new(DaemonState::new());
+        state.claim_wake("s-a").expect("seed a live wake");
+        assert!(steal_wake_and_claim(&state, "s-a").await);
+        assert!(
+            state.cancel_wake("s-a").is_none(),
+            "the stolen wake is gone"
+        );
+        assert!(
+            state.active_turns.lock().unwrap().contains("s-a"),
+            "the user turn holds the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn steal_wake_and_claim_yields_to_a_live_turn() {
+        // No wake to steal and a turn holds the slot: the chat POST must
+        // lose here too — it retries, it never force-breaks a live turn.
+        let state = Arc::new(DaemonState::new());
+        state.active_turns.lock().unwrap().insert("s-a".to_string());
+        assert!(!steal_wake_and_claim(&state, "s-a").await);
+        assert!(
+            state.active_turns.lock().unwrap().contains("s-a"),
+            "the live turn keeps the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn steal_wake_and_claim_claims_a_free_slot() {
+        let state = Arc::new(DaemonState::new());
+        assert!(steal_wake_and_claim(&state, "s-a").await);
+        assert!(
+            state.active_turns.lock().unwrap().contains("s-a"),
+            "the slot is claimed"
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
     async fn approve_unknown_request_is_404_and_cross_session_is_restored() {
         let state = Arc::new(DaemonState::new());
@@ -2227,6 +2624,7 @@ mod handler_tests {
                 name: "bash".into(),
                 input: "{}".into(),
                 agent_id: None,
+                agent: None,
             },
         );
         let r = approve(
@@ -2284,6 +2682,7 @@ mod handler_tests {
                     name: "write".into(),
                     input: "{}".into(),
                     agent_id: None,
+                    agent: None,
                 },
             );
             pending.insert(
@@ -2294,6 +2693,7 @@ mod handler_tests {
                     name: "write".into(),
                     input: "{}".into(),
                     agent_id: None,
+                    agent: None,
                 },
             );
         }
@@ -2319,6 +2719,7 @@ mod handler_tests {
                 name: "write".into(),
                 input: "{}".into(),
                 agent_id: Some("s-a-0".into()),
+                agent: Some("explorer".into()),
             },
         );
 

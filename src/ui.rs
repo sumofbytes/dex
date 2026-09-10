@@ -216,7 +216,13 @@ pub(crate) struct App {
     /// force-quits (stuck daemon). Reset wherever `cancel_requested` resets.
     pub(crate) cancel_presses: u8,
     pub(crate) approval_rx: Option<mpsc::Receiver<crate::core::types::ApprovalRequest>>,
-    pub(crate) pending_approval: Option<PendingApproval>,
+    /// Waiting approval prompts, oldest first (V1b): child agents can park
+    /// several at once and they outlive the parent turn, so the old
+    /// single-slot overwrite-deny invariant is a queue now. The overlay
+    /// renders the front; a decision pops it and reveals the next.
+    pub(crate) pending_approvals: Vec<PendingApproval>,
+    /// Live child agents (V1b typed events, §15).
+    pub(crate) agents: Vec<AgentChip>,
     pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
@@ -359,6 +365,23 @@ pub(crate) struct PendingApproval {
     pub(crate) input: String,
     pub(crate) response: tokio::sync::mpsc::Sender<crate::core::types::ApprovalDecision>,
     pub(crate) selected: usize,
+    /// Wire request id (V1b): the POST /approve target. Parent-turn
+    /// approvals carried it implicitly (one per turn); child approvals can
+    /// queue, so each entry names its own.
+    pub(crate) request_id: String,
+    /// The child agent's definition name (V1b, §12): the prompt renders
+    /// labeled ("explorer wants to run bash: …").
+    pub(crate) agent: Option<String>,
+}
+
+/// One live child agent, from the V1b typed lifecycle events (§15): the
+/// status-bar chip. Entries arrive at `AgentSpawned`, update on
+/// `AgentProgress`, and drop at `AgentCompleted`.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentChip {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) tool: Option<String>,
 }
 
 pub(crate) fn format_tokens(tokens: u64) -> String {
@@ -1216,10 +1239,22 @@ fn dim_intermediate_assistant_block(app: &mut App) {
     }
 }
 
-/// Send the user's approval decision for the pending tool execution.
+/// Send the user's approval decision for the front pending approval, then
+/// reveal the next queued one (V1b: child agents can park several).
 pub(super) fn resolve_approval(app: &mut App, decision: crate::core::types::ApprovalDecision) {
-    if let Some(approval) = app.pending_approval.take() {
+    if !app.pending_approvals.is_empty() {
+        let approval = app.pending_approvals.remove(0);
         let _ = approval.response.try_send(decision);
+    }
+}
+
+/// Deny every queued approval (cancel/quit path): the agent threads unwind
+/// instead of waiting on prompts nobody will answer.
+pub(super) fn deny_all_approvals(app: &mut App) {
+    for approval in app.pending_approvals.drain(..) {
+        let _ = approval
+            .response
+            .try_send(crate::core::types::ApprovalDecision::Deny);
     }
 }
 
@@ -1371,7 +1406,8 @@ mod tests {
             cancel_requested: false,
             cancel_presses: 0,
             approval_rx: None,
-            pending_approval: None,
+            pending_approvals: Vec::new(),
+            agents: Vec::new(),
             busy: false,
             autoscroll: true,
             scroll: 0,

@@ -1346,11 +1346,18 @@ async fn enforce_policy(
         )));
     };
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
+    // §12 V1b: a child console stamps its identity, so the daemon parks the
+    // request under the child's id and labels the prompt with its name.
+    let (agent_id, agent) = match console.agent.as_ref() {
+        Some((id, label)) => (Some(id.clone()), Some(label.clone())),
+        None => (None, None),
+    };
     sender
         .send(ApprovalRequest {
             name: name.to_string(),
             input: input.clone(),
-            agent_id: None,
+            agent_id,
+            agent,
             response: response_tx,
         })
         .await

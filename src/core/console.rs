@@ -13,6 +13,11 @@ use crate::agent::state::CancellationSource;
 
 use crate::core::types::{ApprovalRequest, SinkLine};
 
+/// Live "allow for session" lookup (V1b): the daemon hands children a
+/// closure over its approval map so decisions granted after a child
+/// spawned still apply. Keyed like [`Console::approval_key`].
+pub(crate) type LiveApprovalCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: i32) {
@@ -107,6 +112,13 @@ impl CancellationToken {
         self.cancelled.swap(false, Ordering::SeqCst)
     }
 
+    /// Identity check for turn teardown: two tokens are the same only when
+    /// they were created together (same allocation). Guards against a wake
+    /// turn's teardown removing a user turn's fresh registration.
+    pub(crate) fn same_token(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
     /// Async wait for cancellation: resolves immediately when already
     /// cancelled, otherwise when `cancel()` fires. Powers
     /// `tokio::select!` in async LLM/SSE/tool/daemon paths (instant cancel
@@ -173,6 +185,14 @@ pub(crate) struct Console {
     /// prompting on stdin. The approval channel is still used to send requests;
     /// a separate mechanism resolves them when the client POSTs back.
     pub(crate) remote_approval: bool,
+    /// Live "allow for session" lookup consulted before the local set (V1b):
+    /// children outlive the turn that seeded their snapshot, so a decision
+    /// granted afterwards must still apply. Keyed like `approval_key`.
+    live_approvals: Option<LiveApprovalCheck>,
+    /// The requesting child agent (V1b, §12): `(agent_id, definition name)`.
+    /// Stamped onto its `ApprovalRequest`s so the daemon parks and labels
+    /// them as the child's; `None` for the parent turn's own tools.
+    pub(crate) agent: Option<(String, String)>,
     /// Redacted per-turn observability journal (P9). Optional; the daemon
     /// opens one per turn (`<session>.trace.jsonl`, `0600`), local paths skip it.
     trace: Option<TraceWriter>,
@@ -236,6 +256,8 @@ impl Clone for Console {
             // turn and must agree on session approvals (see field docs).
             session_approvals: self.session_approvals.clone(),
             remote_approval: self.remote_approval,
+            live_approvals: self.live_approvals.clone(),
+            agent: self.agent.clone(),
             trace: self.trace.clone(),
         }
     }
@@ -252,6 +274,8 @@ impl Console {
             approval: Some(approval),
             session_approvals: Arc::new(Mutex::new(None)),
             remote_approval: false,
+            live_approvals: None,
+            agent: None,
             trace: None,
         }
     }
@@ -264,6 +288,8 @@ impl Console {
             approval: None,
             session_approvals: Arc::new(Mutex::new(None)),
             remote_approval: false,
+            live_approvals: None,
+            agent: None,
             trace: None,
         }
     }
@@ -278,8 +304,25 @@ impl Console {
             approval: Some(approval),
             session_approvals: Arc::new(Mutex::new(None)),
             remote_approval: true,
+            live_approvals: None,
+            agent: None,
             trace: None,
         }
+    }
+
+    /// Attach the live "allow for session" lookup (V1b). The daemon hands a
+    /// child a closure over its own approval map so decisions granted after
+    /// the child spawned still apply.
+    pub(crate) fn with_live_approvals(mut self, live: Option<LiveApprovalCheck>) -> Self {
+        self.live_approvals = live;
+        self
+    }
+
+    /// Label this console as a child agent's (V1b): its approval requests
+    /// carry the agent id the daemon parks them under.
+    pub(crate) fn with_agent(mut self, agent_id: String, name: String) -> Self {
+        self.agent = Some((agent_id, name));
+        self
     }
 
     /// Attach a trace journal (P9). Returns a clone (the same file).
@@ -366,6 +409,11 @@ impl Console {
 
     pub(crate) fn session_approved(&self, name: &str, input: &str) -> bool {
         let key = Self::approval_key(name, input);
+        // Live first (V1b): the daemon's map reflects decisions granted
+        // after this console's snapshot was taken.
+        if self.live_approvals.as_ref().is_some_and(|live| live(&key)) {
+            return true;
+        }
         self.session_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
