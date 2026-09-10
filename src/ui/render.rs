@@ -42,13 +42,14 @@ pub(super) fn input_outer_height(content_rows: u16) -> u16 {
     content_rows + super::INPUT_BORDER_ROWS + super::INPUT_PAD_Y * 2
 }
 
-pub(super) fn activity_height(item_count: u16) -> u16 {
+pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
     if item_count == 0 {
         return 0;
     }
-    item_count
-        .saturating_mul(2)
-        .saturating_sub(1)
+    // One content row per line (a multiline queued item spans several rows),
+    // one blank separator between items, gutters above and below.
+    line_count
+        .saturating_add(item_count.saturating_sub(1))
         .saturating_add(super::VERTICAL_GUTTER * 2)
 }
 
@@ -84,9 +85,10 @@ pub(super) fn compute_layout(
     area: Rect,
     input_rows: u16,
     activity_items: u16,
+    activity_rows: u16,
     approval_pending: bool,
 ) -> Option<UiLayout> {
-    let activity_h = activity_height(activity_items);
+    let activity_h = activity_height(activity_items, activity_rows);
     let approval_h = if approval_pending {
         super::APPROVAL_HEIGHT
     } else {
@@ -1077,6 +1079,32 @@ fn pad_row(line: &mut Line<'static>, width: u16, hl: Style) {
 
 struct ActivityView;
 
+/// Items and content rows the pending queue renders, mirroring
+/// `ActivityView::render` (3 visible items, `+N more` tail, one row per
+/// source line — long lines truncate, they never wrap). Sizing must agree
+/// with the render or multiline submissions clip.
+fn pending_queue_metrics(app: &App) -> (u16, u16) {
+    let total = app.pending_steering.len() + app.pending_followups.len();
+    if total == 0 {
+        return (0, 0);
+    }
+    let visible = total.min(3);
+    let mut items = visible as u16;
+    let rows: usize = app
+        .pending_steering
+        .iter()
+        .chain(app.pending_followups.iter())
+        .take(visible)
+        .map(|p| p.lines().count().max(1))
+        .sum();
+    let mut rows = rows as u16;
+    if total > visible {
+        items += 1;
+        rows += 1;
+    }
+    (items, rows)
+}
+
 impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         // Always clear the rect first: ratatui only repaints cells the
@@ -1091,43 +1119,57 @@ impl ActivityView {
             return;
         }
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
-        let mut activity_lines = Vec::new();
-        let mut shown = 0;
-        for pending in app.pending_steering.iter().take(3) {
-            activity_lines.push(Line::from(Span::styled(
-                truncate_display(&format!("steer · {pending}"), content_width),
-                Style::default().fg(Color::Yellow),
-            )));
-            shown += 1;
-        }
-        for pending in app
-            .pending_followups
+        // One group per queued item: the badge row plus one row per
+        // continuation line. Multiline submissions keep their line breaks
+        // (`truncate_display`/`cell_safe` strip control chars, so feeding the
+        // whole text to one badge row would flatten it into a raw line).
+        let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut shown = 0usize;
+        for (is_steer, pending) in app
+            .pending_steering
             .iter()
-            .take(3usize.saturating_sub(shown))
+            .map(|p| (true, p))
+            .chain(app.pending_followups.iter().map(|p| (false, p)))
         {
-            activity_lines.push(Line::from(Span::styled(
-                truncate_display(&format!("follow-up · {pending}"), content_width),
-                Style::default().fg(Color::Yellow),
-            )));
+            if shown >= 3 {
+                break;
+            }
+            let style = Style::default().fg(Color::Yellow);
+            let label = if is_steer { "steer" } else { "follow-up" };
+            let mut lines = pending.lines();
+            let mut group = vec![Line::from(Span::styled(
+                truncate_display(
+                    &format!("{label} · {}", lines.next().unwrap_or_default()),
+                    content_width,
+                ),
+                style,
+            ))];
+            group.extend(lines.map(|rest| {
+                Line::from(Span::styled(truncate_display(rest, content_width), style))
+            }));
+            groups.push(group);
             shown += 1;
         }
         let pending_total = app.pending_steering.len() + app.pending_followups.len();
         if pending_total > shown {
-            activity_lines.push(Line::from(Span::styled(
+            groups.push(vec![Line::from(Span::styled(
                 truncate_display(
                     &format!("+{} more queued", pending_total - shown),
                     content_width,
                 ),
                 Style::default().fg(Color::Yellow),
-            )));
+            ))]);
         }
 
-        let mut spaced = Vec::with_capacity(activity_lines.len() * 2 - 1);
-        for (index, line) in activity_lines.into_iter().enumerate() {
+        // Blank separator between items only — a group's continuation rows
+        // sit directly under their badge.
+        let total_rows: usize = groups.iter().map(|g| g.len()).sum();
+        let mut spaced = Vec::with_capacity(total_rows + groups.len() - 1);
+        for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
                 spaced.push(Line::from(String::new()));
             }
-            spaced.push(line);
+            spaced.extend(group);
         }
         f.render_widget(
             Paragraph::new(spaced).block(Block::default().padding(surface_padding())),
@@ -1580,17 +1622,14 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // render it, so don't pay `render_input` twice per frame.
     let (input_lines, input_cursor) = render_input(&app.input, input_content_width(area.width));
     let input_rows = input_lines.len() as u16;
-    let pending_total = app.pending_steering.len() + app.pending_followups.len();
-    let visible_pending = pending_total.min(3) as u16;
-    let extra_queue_line = u16::from(pending_total > 3);
     // The busy "● Working" status lives in the transcript (turn-activity
     // block); this strip only sizes for the pending queue.
-    let activity_items = visible_pending + extra_queue_line;
+    let (activity_items, activity_rows) = pending_queue_metrics(app);
     // Approval is a centered modal, not a bottom-pane split — don't reserve
     // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
     // no reason and push the composer up.
-    let layout =
-        compute_layout(area, input_rows, activity_items, false).expect("layout always exists");
+    let layout = compute_layout(area, input_rows, activity_items, activity_rows, false)
+        .expect("layout always exists");
 
     TranscriptView::render(f, layout.transcript, app);
     BottomPane::render(f, &layout, app, input_lines, input_cursor);
@@ -2029,16 +2068,68 @@ mod tests {
             input_block().inner(Rect::new(0, 0, 80, 24)).width
         );
         // Guard keeps the queue-only strip collapsed at zero items.
-        assert_eq!(activity_height(0), 0);
-        assert_eq!(activity_height(1), 3);
-        assert_eq!(activity_height(3), 7);
+        assert_eq!(activity_height(0, 0), 0);
+        assert_eq!(activity_height(1, 1), 3);
+        assert_eq!(activity_height(3, 3), 7);
         assert_eq!(status_height(), 2);
     }
 
     #[test]
     fn minimum_view_height_accounts_for_all_gutters() {
-        assert_eq!(minimum_view_height(activity_height(1), 0), 9);
-        assert_eq!(minimum_view_height(activity_height(3), 0), 13);
+        assert_eq!(minimum_view_height(activity_height(1, 1), 0), 9);
+        assert_eq!(minimum_view_height(activity_height(3, 3), 0), 13);
+    }
+
+    #[test]
+    fn multiline_pending_steer_renders_each_source_line() {
+        // A multiline submission queued while busy must keep its line breaks
+        // above the composer: `truncate_display`/`cell_safe` strip control
+        // chars, so feeding the whole text to one badge row used to flatten
+        // it into a single raw line.
+        let mut app = test_app();
+        app.busy = true;
+        app.pending_steering
+            .push("first steer line\nsecond steer line".into());
+        app.pending_followups.push("follow one\ntwo".into());
+
+        let (items, rows) = pending_queue_metrics(&app);
+        assert_eq!(items, 2);
+        assert_eq!(rows, 4);
+        assert_eq!(activity_height(items, rows), 4 + 1 + 2);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let buffer = terminal.backend().buffer();
+        let rendered: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        for expected in [
+            "steer · first steer line",
+            "second steer line",
+            "follow-up · follow one",
+            "two",
+        ] {
+            assert!(
+                rendered.iter().any(|row| row == expected),
+                "missing row {expected:?} in {rendered:?}"
+            );
+        }
+        // The pre-fix failure mode: newlines dropped, lines concatenated.
+        assert!(
+            !rendered
+                .iter()
+                .any(|row| row.contains("first steer linesecond steer line")),
+            "steer lines were flattened: {rendered:?}"
+        );
     }
 
     #[test]
@@ -2056,7 +2147,7 @@ mod tests {
     #[test]
     fn layout_reserves_bottom_pane_before_transcript() {
         let area = Rect::new(0, 0, 80, 24);
-        let layout = compute_layout(area, 1, 1, false).expect("terminal should fit layout");
+        let layout = compute_layout(area, 1, 1, 1, false).expect("terminal should fit layout");
         assert_eq!(layout.transcript.y, 0);
         assert!(layout.transcript.height > 0);
         assert_eq!(
@@ -2675,7 +2766,7 @@ mod tests {
         terminal
             .draw(|frame| view(frame, &mut app))
             .expect("render should succeed");
-        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, 1, false).unwrap();
+        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, 1, 1, false).unwrap();
         assert!(layout.transcript.bottom() <= layout.activity.top());
         assert!(layout.activity.bottom() <= layout.input.top());
         assert!(layout.input.bottom() <= layout.footer.top());
@@ -2861,7 +2952,7 @@ mod tests {
         let input_rows = render_input(&app.input, input_content_width(area.width))
             .0
             .len() as u16;
-        let layout = compute_layout(area, input_rows, 1, false).unwrap();
+        let layout = compute_layout(area, input_rows, 1, 1, false).unwrap();
         let inner = input_block().inner(layout.input);
         let (_, cursor) = render_input(&app.input, inner.width);
         terminal
@@ -3071,11 +3162,9 @@ mod tests {
             let input_rows = render_input(&app.input, input_content_width(area.width))
                 .0
                 .len() as u16;
-            let pending_total = app.pending_steering.len() + app.pending_followups.len();
-            let visible_pending = pending_total.min(3) as u16;
-            let extra = u16::from(pending_total > 3);
-            let activity_items = visible_pending + extra;
-            let layout = compute_layout(area, input_rows, activity_items, false).unwrap();
+            let (activity_items, activity_rows) = pending_queue_metrics(&app);
+            let layout =
+                compute_layout(area, input_rows, activity_items, activity_rows, false).unwrap();
             // Check every cell in input and footer does not contain ghost fragments
             // Ghost contains distinctive substrings that should never leak into chrome
             let forbidden = [
