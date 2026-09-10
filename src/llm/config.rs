@@ -2114,13 +2114,14 @@ pub(crate) fn doctor(
     header_overrides: &[String],
 ) -> String {
     fn row(out: &mut String, key: &str, value: &str, source: &str) {
-        // Three fixed columns — key (11), value (46), origin. Widths count
+        // Three fixed columns — key (KEY_COLS), value (VALUE_COLS), origin. Widths count
         // display columns (CJK chars render 2 wide), so padded values still
         // line up. A value that overflows its column wraps: the value
         // prints in full on its own line and the origin hangs at the origin
         // column, so long paths never run into the origin text.
+        const KEY_COLS: usize = 11;
         const VALUE_COLS: usize = 46;
-        let origin_indent = " ".repeat(11 + VALUE_COLS);
+        let origin_indent = " ".repeat(KEY_COLS + VALUE_COLS);
         let fits = UnicodeWidthStr::width(value) <= VALUE_COLS;
         let mut origin_lines = source.split('\n');
         let inline = if fits {
@@ -2129,10 +2130,10 @@ pub(crate) fn doctor(
             ""
         };
         if inline.is_empty() {
-            out.push_str(&format!("{key:<11}{value}\n"));
+            out.push_str(&format!("{key:<KEY_COLS$}{value}\n"));
         } else {
-            let pad = VALUE_COLS - UnicodeWidthStr::width(value);
-            out.push_str(&format!("{key:<11}{value}{:pad$}{inline}\n", ""));
+            let pad = " ".repeat(VALUE_COLS - UnicodeWidthStr::width(value));
+            out.push_str(&format!("{key:<KEY_COLS$}{value}{pad}{inline}\n"));
         }
         for line in origin_lines {
             if !line.is_empty() {
@@ -4513,7 +4514,12 @@ pub(crate) mod tests {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_CONFIG"]);
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "OPENCODE_API_KEY",
+        ]);
         // Missing file, so the config row prints the path + a source note.
         std::env::set_var(
             "DEX_CONFIG",
@@ -4523,7 +4529,7 @@ pub(crate) mod tests {
             ),
         );
         let out = doctor(None, None, None, &[]);
-        let mut lines = out.lines().peekable();
+        let mut lines = out.lines();
         while let Some(line) = lines.next() {
             if !line.starts_with("config ") {
                 continue;
@@ -4552,7 +4558,12 @@ pub(crate) mod tests {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_CONFIG"]);
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "OPENCODE_API_KEY",
+        ]);
         // "/tmp/" (5 cols) + 14 CJK chars (28 cols) + "/config.yaml" (12 cols) = 45.
         std::env::set_var(
             "DEX_CONFIG",
