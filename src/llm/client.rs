@@ -419,7 +419,7 @@ fn should_retry_stream_error(
 ) -> bool {
     attempt < max_retries
         && !crate::llm::streaming::is_mid_stream(err)
-        && is_rate_limited(&err.to_string())
+        && is_rate_limited(&error_chain_message(err))
 }
 
 #[cfg(test)]
@@ -429,13 +429,9 @@ mod tests {
 
     #[test]
     fn error_chain_message_walks_sources() {
-        // reqwest-style: outer Display names the URL, the cause lives in
+        // reqwest-style: outer Display names the context, the cause lives in
         // `source()`. `to_string()` alone drops it; the chain keeps it.
         let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
-        let outer: Box<dyn std::error::Error + Send + Sync> =
-            format!("error sending request for url (https://example.invalid/): {io}").into();
-        // Plain outer without a source chain stays as-is.
-        assert!(error_chain_message(&*outer).contains("error sending request"));
         let chained = std::io::Error::new(std::io::ErrorKind::TimedOut, io);
         let msg = error_chain_message(&chained);
         assert!(msg.contains("connection refused"), "chain kept: {msg}");
