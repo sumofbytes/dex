@@ -95,6 +95,13 @@ pub(crate) fn enabled(level: Level) -> bool {
 
 /// One line per event: `<timestamp> <LEVEL> <module>: <message>`.
 pub(crate) fn log(level: Level, target: &str, args: fmt::Arguments<'_>) {
+    // Raw identifiers (`dex::agent::r#loop`) read better without the sigil;
+    // only allocates for the rare target that has one.
+    let target = if target.contains("r#") {
+        std::borrow::Cow::Owned(target.replace("r#", ""))
+    } else {
+        std::borrow::Cow::Borrowed(target)
+    };
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
     let line = format!("{ts} {} {target}: {args}\n", level.as_str());
     let Ok(mut sink) = SINK.get_or_init(|| Mutex::new(Sink::Stderr)).lock() else {
@@ -108,10 +115,12 @@ pub(crate) fn log(level: Level, target: &str, args: fmt::Arguments<'_>) {
 }
 
 fn set_sink(sink: Sink) {
-    *SINK
-        .get_or_init(|| Mutex::new(Sink::Stderr))
-        .lock()
-        .unwrap() = sink;
+    // Same poison tolerance as `log`: a logger must not panic the process.
+    let mut guard = match SINK.get_or_init(|| Mutex::new(Sink::Stderr)).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = sink;
 }
 
 /// Install the file sink for `path` (created as needed), or fall back to a
@@ -143,6 +152,11 @@ fn install_file_sink(path: PathBuf) -> Option<String> {
 /// events). Returns a notice for the caller to print while the terminal is
 /// still the normal screen.
 pub(crate) fn redirect_to_file() -> Option<String> {
+    // `DEX_LOG=off` gates every line anyway — don't create the log file.
+    if !enabled(Level::Error) {
+        set_sink(Sink::Null);
+        return None;
+    }
     match log_file() {
         Some(path) => install_file_sink(path),
         None => {
@@ -182,6 +196,11 @@ macro_rules! log {
 mod tests {
     use super::*;
 
+    /// The stateful tests below mutate `MAX_LEVEL`, `SINK`, and (for the
+    /// redirect test) the environment; the suite runs on parallel threads,
+    /// so they serialize here.
+    static STATE_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn parses_named_levels_case_insensitively() {
         assert_eq!(Level::parse("trace"), Some(Level::Trace));
@@ -209,6 +228,7 @@ mod tests {
 
     #[test]
     fn redirected_sink_receives_formatted_lines() {
+        let _state = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_level(Level::Trace);
         let path = std::env::temp_dir().join(format!("dex-log-test-{}", std::process::id()));
         let _ = fs::remove_file(&path);
@@ -217,8 +237,11 @@ mod tests {
             "open should succeed"
         );
         log(Level::Debug, "t", format_args!("hello {}", 7));
+        // Raw-identifier sigils are trimmed from targets.
+        log(Level::Debug, "dex::agent::r#loop", format_args!("x"));
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.ends_with("DEBUG t: hello 7\n"), "{text}");
+        assert!(text.contains("DEBUG t: hello 7\n"), "{text}");
+        assert!(text.ends_with("DEBUG dex::agent::loop: x\n"), "{text}");
         let _ = fs::remove_file(&path);
         // Restore global state for the rest of the suite.
         set_level(Level::Warn);
@@ -227,6 +250,7 @@ mod tests {
 
     #[test]
     fn unwritable_log_target_falls_back_to_null() {
+        let _state = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A regular file used as a directory: create_dir_all and the open both
         // fail, so the sink must drop lines instead of writing to stderr.
         set_level(Level::Debug);
@@ -239,6 +263,28 @@ mod tests {
         );
         let _ = fs::remove_file(&blocker);
         // Restore global state for the rest of the suite.
+        set_level(Level::Warn);
+        set_sink(Sink::Stderr);
+    }
+
+    #[test]
+    fn redirect_with_off_ceiling_creates_no_log_file() {
+        let _state = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("dex-log-off-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        std::env::set_var("XDG_DATA_HOME", &base);
+        set_level(Level::Off);
+        assert!(redirect_to_file().is_none());
+        assert!(
+            !base.join("dex/dex.log").exists(),
+            "DEX_LOG=off must not create the log file"
+        );
+        // Restore global state for the rest of the suite.
+        std::env::remove_var("XDG_DATA_HOME");
+        let _ = fs::remove_dir_all(&base);
         set_level(Level::Warn);
         set_sink(Sink::Stderr);
     }
