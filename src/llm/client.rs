@@ -451,6 +451,10 @@ pub(crate) async fn call_anthropic_messages(
         &config.model,
         config.thinking_effort.is_some(),
     );
+    // Stall/drop recovery draws from its own `stall_retries` budget, not the
+    // rate-limit `attempt` index: a rate-limited attempt must neither starve
+    // nor be starved by stall recovery when failures mix within one turn.
+    let mut stall_retries = 0u32;
     for attempt in 0..=MAX_STREAM_RETRIES {
         let resp = post_with_retry(
             config,
@@ -466,7 +470,9 @@ pub(crate) async fn call_anthropic_messages(
         // pre-output rate-limit failure re-issues the whole request here.
         // A stalled stream retries same-protocol too (mid-stream included,
         // with an explicit notice) instead of failing the turn for a manual
-        // `continue`.
+        // `continue`. Stall/drop recovery draws from the separate
+        // `stall_retries` budget above, so mixed failure sequences don't
+        // couple the two budgets.
         match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel, idle_timeout)
             .await
         {
@@ -480,11 +486,13 @@ pub(crate) async fn call_anthropic_messages(
             }
             Err(e) => {
                 let msg = error_chain_message(&*e);
-                if (should_retry_idle(&msg, attempt) || should_retry_dropped(&*e, attempt))
+                if (should_retry_idle(&msg, stall_retries)
+                    || should_retry_dropped(&*e, stall_retries))
                     && !cancel.is_cancelled()
                 {
-                    note_idle_retry(&sink, attempt, &msg).await;
-                    tokio::time::sleep(backoff_delay(attempt, None)).await;
+                    note_idle_retry(&sink, stall_retries, &msg).await;
+                    tokio::time::sleep(backoff_delay(stall_retries, None)).await;
+                    stall_retries += 1;
                     continue;
                 }
                 return Err(e);
@@ -510,16 +518,17 @@ fn should_retry_idle(message: &str, attempt: u32) -> bool {
 }
 
 /// Same-protocol retry for a dead socket: keepalives surface a dropped
-/// connection as a transport error from `chunk()`. Pre-output it is a pure
+/// connection as a transport error from `chunk()`, which `run_sse` marks
+/// with [`StreamTransportError`] pre-output. A marked failure is a pure
 /// re-issue — nothing flowed, nothing to duplicate — so unlike mid-stream
-/// failures it stays retryable. Shares the idle-retry budget. Never retries
-/// cancellations.
+/// failures it stays retryable. Detection is provenance, not wording: no
+/// message, provider error text included, can match this gate. Shares the
+/// idle-retry budget, not the rate-limit one. Never retries cancellations.
 fn should_retry_dropped(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
-    let message = error_chain_message(err);
     attempt < MAX_IDLE_STREAM_RETRIES
         && !crate::llm::streaming::is_mid_stream(err)
-        && crate::llm::stream::is_dropped_connection(&message)
-        && !message.contains("cancelled")
+        && crate::llm::stream::is_transport_error(err)
+        && !error_chain_message(err).contains("cancelled")
 }
 
 /// Visible retry notice: headless logs to stderr, TUI gets a transcript
@@ -716,9 +725,11 @@ mod tests {
 
     #[test]
     fn dropped_connection_retries_pre_output_only() {
-        // A dead socket before any output is a pure re-issue within budget.
+        use crate::llm::stream::StreamTransportError;
+        // A marked transport failure before any output is a pure re-issue
+        // within budget — detection is provenance, not wording.
         let err: Box<dyn std::error::Error + Send + Sync> =
-            "error sending request: connection closed before message completed".into();
+            Box::new(StreamTransportError("connection reset by peer".into()));
         assert!(should_retry_dropped(&*err, 0));
         assert!(should_retry_dropped(&*err, 1));
         assert!(!should_retry_dropped(&*err, MAX_IDLE_STREAM_RETRIES));
@@ -728,11 +739,15 @@ mod tests {
             crate::llm::stream::MidStreamError("connection reset by peer".into()),
         );
         assert!(!should_retry_dropped(&*mid, 0));
-        // Anything else never retries through this gate.
+        // Anything else never retries through this gate — including the bare
+        // wording with no transport marker (provider error text is not a
+        // dead socket).
         let other: Box<dyn std::error::Error + Send + Sync> = "API error: invalid api key".into();
         assert!(!should_retry_dropped(&*other, 0));
+        let worded: Box<dyn std::error::Error + Send + Sync> = "connection reset by peer".into();
+        assert!(!should_retry_dropped(&*worded, 0));
         let cancelled: Box<dyn std::error::Error + Send + Sync> =
-            "connection reset; cancelled".into();
+            Box::new(StreamTransportError("connection reset; cancelled".into()));
         assert!(!should_retry_dropped(&*cancelled, 0));
     }
 
