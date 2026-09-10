@@ -8,6 +8,7 @@
 mod context;
 mod definition;
 mod instance;
+pub(crate) mod manager;
 mod result;
 
 pub(crate) use context::ContextSeed;
@@ -15,6 +16,7 @@ pub(crate) use definition::{
     AgentDefinition, PermissionInherit, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS,
 };
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
+pub(crate) use manager::{AgentManager, AgentNotice, SpawnError, WaitOutcome};
 pub(crate) use result::AgentResult;
 
 use definition::parse_definition;
