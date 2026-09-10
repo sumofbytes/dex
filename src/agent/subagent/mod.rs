@@ -1,9 +1,12 @@
 //! Sub-agent domain types (plan §4): definitions, instances, results.
 //!
-//! Phases 3–8 fill this module in sequence; until V1a ships the allow below
-//! keeps interim states warning-free, and Phase 9 removes it once the
-//! manager, tools, and drains are all wired (zero allows must remain).
-#![allow(dead_code, unused_imports)]
+//! Phases 3–8 fill this module in sequence. Nothing here has a non-test
+//! caller yet (Phase 5's delegate tools are the first), so the module is
+//! wholly dormant: one `dead_code` allow below covers that deliberately,
+//! and Phase 9 removes it once manager, tools, and drains are all wired
+//! (zero allows must remain). Unused imports, by contrast, are allowed
+//! per-item on the re-exports that need them.
+#![allow(dead_code)]
 
 mod context;
 mod definition;
@@ -11,12 +14,19 @@ mod instance;
 pub(crate) mod manager;
 mod result;
 
+#[allow(unused_imports)]
 pub(crate) use context::ContextSeed;
+#[allow(unused_imports)]
 pub(crate) use definition::{
     AgentDefinition, PermissionInherit, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS,
 };
+// Phase 5's delegate tool consumes the remaining types; until they are
+// wired these re-exports stay deliberately reachable (and allowed).
+#[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
-pub(crate) use manager::{AgentManager, AgentNotice, SpawnError, WaitOutcome};
+#[allow(unused_imports)]
+pub(crate) use manager::{AgentManager, AgentNotice, ProgressReporter, SpawnError, WaitOutcome};
+#[allow(unused_imports)]
 pub(crate) use result::AgentResult;
 
 use definition::parse_definition;

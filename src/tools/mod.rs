@@ -1341,6 +1341,7 @@ async fn enforce_policy(
         .send(ApprovalRequest {
             name: name.to_string(),
             input: input.clone(),
+            agent_id: None,
             response: response_tx,
         })
         .await
