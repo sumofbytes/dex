@@ -1287,10 +1287,11 @@ impl SlashSuggestionsView {
         // instead of a full-transcript wall, and scroll it with the selection.
         const MAX_VISIBLE: usize = 10;
         let mut visible = suggestions.len().min(MAX_VISIBLE);
-        // Borderless floating sheet above the composer: no box-drawing
-        // (`╭─`/`│ `/`───`) so native terminal copies carry no border
-        // glyphs to strip. Separation comes from the popup background, not
-        // glyphs; the `> ` marker plus a selected-row background is the
+        // Copy-safe sheet above the composer: only a `─` rule on top for
+        // separation, no box-drawing elsewhere (`╭`/`│ `/`───` per row) so a
+        // native terminal selection pastes plain commands (at worst one
+        // leading `────` line to drop). No background either: rows carry no
+        // fill, so nothing extra to strip. The `> ` marker plus bold is the
         // only selection indicator (skip the 2-wide marker gutter when
         // copying a command, as with any picker affordance).
         let height = (visible as u16 + 2).min(area.y);
@@ -1328,42 +1329,36 @@ impl SlashSuggestionsView {
             height,
         };
         // Marker gutter (2) + command + gap (2); the rest is description.
-        // Backgrounds (not glyphs) separate the sheet: they never survive a
-        // native terminal copy, so rows paste without border-glyph edits
-        // (only the `> ` marker gutter needs skipping).
+        // No fills: `Clear` already blanked the sheet, and the top rule is
+        // the only border, so rows copy as plain text (at most the leading
+        // `────` line, plus the `> ` marker gutter to skip).
         let inner_w = width as usize;
         let desc_w = inner_w.saturating_sub(cmd_col + 4) as u16;
-        let popup_bg = theme::popup_bg();
-        let select_bg = theme::popup_select_bg();
         let items = window
             .iter()
             .enumerate()
             .map(|(offset, (command, description))| {
                 let selected = start + offset == app.slash_selected;
-                let bg = if selected { select_bg } else { popup_bg };
                 let marker_style = if selected {
                     Style::default()
                         .fg(Color::Cyan)
-                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(theme::muted_fg()).bg(bg)
+                    Style::default().fg(theme::muted_fg())
                 };
                 let command_style = if selected {
                     Style::default()
                         .fg(theme::surface_fg())
-                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                         .fg(Color::Cyan)
-                        .bg(bg)
                         .add_modifier(Modifier::BOLD)
                 };
                 let description_style = if selected {
-                    Style::default().fg(theme::surface_fg()).bg(bg)
+                    Style::default().fg(theme::surface_fg())
                 } else {
-                    Style::default().fg(theme::secondary_fg()).bg(bg)
+                    Style::default().fg(theme::secondary_fg())
                 };
                 let label = slash::suggestion_label(&input, command);
                 let cell = truncate_display(label, cmd_col as u16);
@@ -1371,21 +1366,11 @@ impl SlashSuggestionsView {
                 let mut cell = cell;
                 cell.push_str(&" ".repeat(pad + 2));
                 let desc = truncate_display(description, desc_w);
-                let mut line = Line::from(vec![
+                Line::from(vec![
                     Span::styled(if selected { "> " } else { "  " }, marker_style),
                     Span::styled(cell, command_style),
                     Span::styled(desc, description_style),
-                ]);
-                // Extend the background to the right edge so the sheet reads
-                // as one surface; trailing spaces copy as nothing to strip.
-                let line_w = line.width();
-                if line_w < inner_w {
-                    line.spans.push(Span::styled(
-                        " ".repeat(inner_w - line_w),
-                        Style::default().bg(bg),
-                    ));
-                }
-                ListItem::new(line).style(Style::default().bg(bg))
+                ])
             });
         let base = if input.starts_with("/model ") {
             "Models"
@@ -1408,28 +1393,15 @@ impl SlashSuggestionsView {
             format!("  {base}   ↑↓ navigate · Enter select · Tab complete ")
         };
         let header_text = truncate_display(&header_text, width);
-        // No `─` rule: a border row copies as `────` in native selections.
-        // The sheet background already separates the popup from the
-        // transcript (air plus a bold header when the background is
-        // unknown/Reset), and blank padding copies as nothing.
-        // Without theme info (`Background::Unknown`) every popup background
-        // is `Reset`, so bold the header: it is the only sheet separator
-        // left, and modifiers never survive a native copy.
-        let mut header_style = Style::default().fg(theme::muted_fg()).bg(popup_bg);
-        if popup_bg == Color::Reset {
-            header_style = header_style.add_modifier(Modifier::BOLD);
-        }
-        let header_w = UnicodeWidthStr::width(header_text.as_str());
-        let mut header_line = Line::from(Span::styled(header_text, header_style));
-        if header_w < inner_w {
-            header_line.spans.push(Span::styled(
-                " ".repeat(inner_w - header_w),
-                Style::default().bg(popup_bg),
-            ));
-        }
+        // Single `─` rule across the top is the sheet's only border: it
+        // separates the popup from the transcript without side/corner
+        // glyphs, and a stray leading `────` line is the only copy artifact.
         f.render_widget(Clear, popup);
         f.render_widget(
-            Paragraph::new(header_line).style(Style::default().bg(popup_bg)),
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(inner_w),
+                Style::default().fg(theme::muted_fg()),
+            ))),
             Rect {
                 x: popup.x,
                 y: popup.y,
@@ -1439,10 +1411,9 @@ impl SlashSuggestionsView {
         );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " ".repeat(inner_w),
-                Style::default().bg(popup_bg),
-            )))
-            .style(Style::default().bg(popup_bg)),
+                header_text,
+                Style::default().fg(theme::muted_fg()),
+            ))),
             Rect {
                 x: popup.x,
                 y: popup.y + 1,
@@ -1451,7 +1422,7 @@ impl SlashSuggestionsView {
             },
         );
         f.render_widget(
-            List::new(items).style(Style::default().bg(popup_bg)),
+            List::new(items),
             Rect {
                 x: popup.x,
                 y: popup.y + 2,
@@ -2850,9 +2821,11 @@ mod tests {
     }
 
     #[test]
-    fn slash_popup_renders_no_box_drawing() {
-        // Copy-safe sheet: no `╭─`/`│ `/`───` glyphs anywhere in the popup
-        // cells, so a native terminal selection pastes plain commands.
+    fn slash_popup_has_only_a_top_rule() {
+        // Copy-safe sheet: a single `─` rule across the top for separation;
+        // no side/corner glyphs (`╭`/`│ `/`╰`) anywhere, and no `─` outside
+        // the top row, so a native terminal selection pastes plain commands
+        // (at worst one leading `────` line to drop).
         let mut app = test_app();
         app.input = InputField::from_text("/");
         let backend = TestBackend::new(80, 24);
@@ -2862,21 +2835,36 @@ mod tests {
                 SlashSuggestionsView::render(frame, Rect::new(0, 21, 80, 3), &mut app);
             })
             .expect("render should succeed");
-        let symbols: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect();
-        assert!(symbols.contains("> "), "{symbols}");
-        assert!(
-            !symbols.contains('╭')
-                && !symbols.contains('╰')
-                && !symbols.contains('│')
-                && !symbols.contains('─'),
-            "box-drawing must not survive in the popup: {symbols}"
-        );
+        // Exactly one rule row, spanning only `─`/spaces; nothing box-drawn
+        // anywhere else.
+        let rule_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains('─'))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(rule_rows.len(), 1, "exactly one top rule: {rows:?}");
+        for (y, row) in rows.iter().enumerate() {
+            if y == rule_rows[0] {
+                assert!(
+                    row.chars().all(|c| c == '─' || c == ' '),
+                    "top row must be a clean rule: {row}"
+                );
+            } else {
+                assert!(
+                    !row.contains('─')
+                        && !row.contains('│')
+                        && !row.contains('╭')
+                        && !row.contains('╰'),
+                    "box-drawing must not survive outside the top rule: {row}"
+                );
+            }
+        }
+        assert!(rows.iter().any(|r| r.contains("> ")), "{rows:?}");
     }
 
     #[test]
