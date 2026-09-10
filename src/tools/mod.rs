@@ -1793,6 +1793,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ffgrep_truncation_trailer_counts_shown_and_how_to_continue() {
+        // Truncation must read like read's trailer: what was shown, that more
+        // was left unscanned, and the exact next-page argument.
+        let pid = std::process::id();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("dex-fff-page-{pid}"));
+        fs::create_dir_all(&root).unwrap();
+        let needle = format!("PAGETOKEN_{pid}");
+        for f in 0..6 {
+            let body: String = (0..20).map(|_| format!("{needle}\n")).collect();
+            fs::write(root.join(format!("f{f}.rs")), body).unwrap();
+        }
+        super::fff::rescan();
+
+        // Files mode: 3 of 6 files shown, next page starts at file_offset 3.
+        let mut args = Map::new();
+        args.insert("pattern".into(), Value::String(needle.clone()));
+        args.insert("head_limit".into(), Value::Number(3.into()));
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
+        assert!(outcome.ok, "{}", outcome.text);
+        assert!(outcome.text.contains("3 files shown"), "{}", outcome.text);
+        assert!(
+            outcome
+                .text
+                .contains("continue with file_offset 3 or raise head_limit"),
+            "{}",
+            outcome.text
+        );
+
+        // Content mode resumes from that offset: pages 4 and 5, each capped
+        // at 10 matches per file, under the default head_limit of 50.
+        let mut args = Map::new();
+        args.insert("pattern".into(), Value::String(needle.clone()));
+        args.insert("output_mode".into(), Value::String("content".into()));
+        args.insert("file_offset".into(), Value::Number(4.into()));
+        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
+        assert!(outcome.ok, "{}", outcome.text);
+        assert!(
+            outcome.text.contains("every file hit the 10-match cap"),
+            "{}",
+            outcome.text
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn ffgrep_context_returns_surrounding_lines() {
         // Fixture at the workspace root (not target/): fff respects
         // .gitignore, so ignored fixture dirs are invisible to it.
