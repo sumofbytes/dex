@@ -331,14 +331,39 @@ pub(crate) async fn call_chat_completions(
         },
         reasoning_effort: &config.thinking_effort,
     };
-    let resp = post_with_retry(
-        config,
-        &format!("{}/chat/completions", config.base_url),
-        &req,
-        sink.as_ref(),
-    )
-    .await?;
-    read_stream(resp, sink, cancel).await
+    // Same-protocol retry for a stalled or dropped stream before output:
+    // the watchdog fired without a chunk (or the socket died pre-output),
+    // so re-issuing the request resumes the turn instead of failing it back
+    // to the user for a manual `continue`. Bounded (`MAX` + 1 attempts); a
+    // persistently silent provider still surfaces its error. Stream-phase
+    // budget only: each attempt re-issues the whole request via
+    // `post_with_retry` (its own HTTP-phase budget).
+    let idle_timeout = idle_timeout(config);
+    for attempt in 0..=MAX_IDLE_STREAM_RETRIES {
+        let resp = post_with_retry(
+            config,
+            &format!("{}/chat/completions", config.base_url),
+            &req,
+            sink.as_ref(),
+        )
+        .await?;
+        match read_stream(resp, sink.clone(), cancel, idle_timeout).await {
+            Ok(turn) => return Ok(turn),
+            Err(e) => {
+                let msg = error_chain_message(&*e);
+                if (should_retry_idle(&*e, attempt) || should_retry_dropped(&*e, attempt))
+                    && !cancel.is_cancelled()
+                {
+                    note_idle_retry(&sink, attempt, &msg).await;
+                    tokio::time::sleep(backoff_delay(attempt, None)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    unreachable!("stream retry loop exited without returning")
 }
 
 pub(crate) async fn call_responses(
@@ -368,18 +393,37 @@ pub(crate) async fn call_responses(
     if let Some(effort) = &config.thinking_effort {
         body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
-    let resp = post_with_retry(
-        config,
-        &format!("{}/responses", config.base_url),
-        &body,
-        sink.as_ref(),
-    )
-    .await?;
-    // Mid-stream failures (output already flowed) are marked by the stream
-    // driver itself, so the protocol-fallback gate won't re-run a turn whose
-    // partial text is already on the transcript — while a drop before the
-    // first delta stays retryable.
-    read_responses_stream(resp, sink, cancel).await
+    let idle_timeout = idle_timeout(config);
+    for attempt in 0..=MAX_IDLE_STREAM_RETRIES {
+        // Mid-stream failures (output already flowed) are marked by the stream
+        // driver itself, so the protocol-fallback gate won't re-run a turn whose
+        // partial text is already on the transcript — while a stall or drop
+        // before the first delta stays retryable same-protocol here
+        // (explicit notice, no fallback).
+        let resp = post_with_retry(
+            config,
+            &format!("{}/responses", config.base_url),
+            &body,
+            sink.as_ref(),
+        )
+        .await?;
+        match read_responses_stream(resp, sink.clone(), cancel, idle_timeout).await {
+            Ok(turn) => return Ok(turn),
+            Err(e) => {
+                let msg = error_chain_message(&*e);
+                if (should_retry_idle(&*e, attempt) || should_retry_dropped(&*e, attempt))
+                    && !cancel.is_cancelled()
+                {
+                    note_idle_retry(&sink, attempt, &msg).await;
+                    tokio::time::sleep(backoff_delay(attempt, None)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    unreachable!("stream retry loop exited without returning")
 }
 
 pub(crate) async fn call_anthropic_messages(
@@ -391,13 +435,19 @@ pub(crate) async fn call_anthropic_messages(
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let body = crate::llm::anthropic::messages_body(config, messages, with_tools);
     // Stream-phase budget only: each attempt re-issues the whole request via
-    // `post_with_retry` (its own HTTP-phase budget), so the worst case is
-    // (`MAX_STREAM_RETRIES` + 1) × (`MAX_HTTP_RETRIES` + 1) POSTs. In
-    // practice this loop only runs after the inner one already returned a
-    // 200, and a 200 body carries no `Retry-After` — hence
-    // `backoff_delay(attempt, None)`, with the attempt index restarting here.
+    // `post_with_retry` (its own HTTP-phase budget). In practice this loop
+    // only runs after the inner one already returned a 200, and a 200 body
+    // carries no `Retry-After` — hence `backoff_delay(_, None)`.
     const MAX_STREAM_RETRIES: u32 = 3;
-    for attempt in 0..=MAX_STREAM_RETRIES {
+    let idle_timeout = idle_timeout(config);
+    // Stall/drop recovery draws from its own `stall_retries` budget, not the
+    // rate-limit `rate_attempt` index: a rate-limited attempt must neither
+    // starve nor be starved by stall recovery when failures mix within one
+    // turn. Two independent counters in one `loop` (no `for` index), so a
+    // stall `continue` never consumes rate-limit budget and vice versa.
+    let mut rate_attempt = 0u32;
+    let mut stall_retries = 0u32;
+    loop {
         let resp = post_with_retry(
             config,
             &crate::llm::anthropic::messages_url(&config.base_url),
@@ -405,25 +455,101 @@ pub(crate) async fn call_anthropic_messages(
             sink.as_ref(),
         )
         .await?;
-        // Same output-flowed marker semantics as the OpenAI protocols: a drop
-        // before the first delta stays retryable, after it fails the turn.
-        // Anthropic can also report rate limits as a terminal `error` event
-        // on a 200 body (no HTTP status to trigger `post_with_retry`), so a
-        // pre-output rate-limit failure re-issues the whole request here.
-        match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel).await {
+        // Same output-flowed marker semantics as the OpenAI protocols: a stall
+        // or drop before the first delta stays retryable same-protocol (with
+        // an explicit notice), after it fails the turn. Anthropic can also
+        // report rate limits as a terminal `error` event on a 200 body (no
+        // HTTP status to trigger `post_with_retry`), so a pre-output
+        // rate-limit failure re-issues the whole request here.
+        match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel, idle_timeout)
+            .await
+        {
             Ok(turn) => return Ok(turn),
-            Err(e) if should_retry_stream_error(&*e, attempt, MAX_STREAM_RETRIES) => {
-                let delay = backoff_delay(attempt, None);
+            Err(e) if should_retry_stream_error(&*e, rate_attempt, MAX_STREAM_RETRIES) => {
+                let delay = backoff_delay(rate_attempt, None);
                 with_console(sink.is_some(), || {
                     eprintln!("[llm] rate limited: retrying in {:?}", delay)
                 });
+                rate_attempt += 1;
                 tokio::time::sleep(delay).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let msg = error_chain_message(&*e);
+                if (should_retry_idle(&*e, stall_retries)
+                    || should_retry_dropped(&*e, stall_retries))
+                    && !cancel.is_cancelled()
+                {
+                    note_idle_retry(&sink, stall_retries, &msg).await;
+                    tokio::time::sleep(backoff_delay(stall_retries, None)).await;
+                    stall_retries += 1;
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
+}
 
-    unreachable!()
+/// Bounded same-protocol retries for a stalled or dropped stream before any
+/// output flowed (`stream idle for over …` / transport marker). A stall is
+/// transient transport, not a verdict on the request — re-issuing resumes
+/// the turn where a failure would force a manual `continue`. Only pre-output
+/// failures retry: once output has flowed the partial text is already on the
+/// transcript and a re-issue would duplicate it, so mid-stream failures fail
+/// the turn for a manual `continue`. Never retries cancellations.
+const MAX_IDLE_STREAM_RETRIES: u32 = 2;
+
+/// Idle budget for this turn, computed once per call: the explicit env
+/// override wins, otherwise reasoning-capable models get the patient budget
+/// (see `stream_idle_timeout_for`). One helper so the three protocol entry
+/// points share the catalog lookup instead of repeating it.
+fn idle_timeout(config: &LlmConfig) -> Option<Duration> {
+    crate::llm::stream::stream_idle_timeout_for(&config.model, config.thinking_effort.is_some())
+}
+
+fn should_retry_idle(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
+    attempt < MAX_IDLE_STREAM_RETRIES
+        && !crate::llm::streaming::is_mid_stream(err)
+        && crate::llm::stream::is_stream_idle_error(&error_chain_message(err))
+        && !error_chain_message(err).contains("cancelled")
+}
+
+/// Same-protocol retry for a dead socket: keepalives surface a dropped
+/// connection as a transport error from `chunk()`, which `run_sse` marks
+/// with [`StreamTransportError`] pre-output. A marked failure is a pure
+/// re-issue — nothing flowed, nothing to duplicate — so unlike mid-stream
+/// failures it stays retryable. Detection is provenance, not wording: no
+/// message wording is matched, so provider error text can never trip this
+/// gate. Shares the idle-retry budget, not the rate-limit one. Never retries
+/// cancellations.
+fn should_retry_dropped(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
+    attempt < MAX_IDLE_STREAM_RETRIES
+        && !crate::llm::streaming::is_mid_stream(err)
+        && crate::llm::stream::is_transport_error(err)
+        && !error_chain_message(err).contains("cancelled")
+}
+
+/// Visible retry notice: headless logs to stderr, TUI gets a transcript
+/// `System` line (console IO is suppressed under a sink).
+async fn note_idle_retry(sink: &Option<mpsc::Sender<SinkLine>>, attempt: u32, message: &str) {
+    let delay = backoff_delay(attempt, None);
+    with_console(sink.is_some(), || {
+        eprintln!(
+            "[llm] stream interrupted ({message}): retrying in {:?} (attempt {}/{})",
+            delay,
+            attempt + 2,
+            MAX_IDLE_STREAM_RETRIES + 1,
+        )
+    });
+    if let Some(sink) = sink {
+        let _ = sink
+            .send(SinkLine::System(format!(
+                "stream interrupted ({message}); retrying automatically (attempt {}/{})",
+                attempt + 2,
+                MAX_IDLE_STREAM_RETRIES + 1,
+            )))
+            .await;
+    }
 }
 
 /// Stream-phase retry gate for a terminal `error` event on a 200 body: only
@@ -565,6 +691,63 @@ mod tests {
         // Non-rate-limit failures never retry through this gate.
         let other: Box<dyn std::error::Error + Send + Sync> = "API error: invalid api key".into();
         assert!(!should_retry_stream_error(&*other, 0, 3));
+    }
+
+    #[test]
+    fn idle_stall_retries_same_protocol_within_budget() {
+        // Pre-output stalls retry (explicit notice, no fallback); mid-stream
+        // stalls fail the turn — partial text is already on the transcript
+        // and a re-issue would duplicate it. Anything else never retries
+        // through this gate.
+        let stall: Box<dyn std::error::Error + Send + Sync> =
+            "stream idle for over 300s; the provider stalled".into();
+        assert!(should_retry_idle(&*stall, 0));
+        assert!(should_retry_idle(&*stall, 1));
+        assert!(!should_retry_idle(&*stall, MAX_IDLE_STREAM_RETRIES));
+        let other: Box<dyn std::error::Error + Send + Sync> = "API error: invalid api key".into();
+        assert!(!should_retry_idle(&*other, 0));
+        let cancelled: Box<dyn std::error::Error + Send + Sync> = "cancelled".into();
+        assert!(!should_retry_idle(&*cancelled, 0));
+        let idle_cancelled: Box<dyn std::error::Error + Send + Sync> =
+            "stream idle for over 300s; cancelled".into();
+        assert!(!should_retry_idle(&*idle_cancelled, 0));
+        // Mid-stream stall: output already flowed, so no retry.
+        let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            crate::llm::stream::MidStreamError("stream idle for over 300s; stalled".into()),
+        );
+        assert!(!should_retry_idle(&*mid, 0));
+        assert!(crate::llm::stream::is_stream_idle_error(
+            "stream idle for over 300s; x"
+        ));
+        assert!(!crate::llm::stream::is_stream_idle_error("API error: boom"));
+    }
+
+    #[test]
+    fn dropped_connection_retries_pre_output_only() {
+        use crate::llm::stream::StreamTransportError;
+        // A marked transport failure before any output is a pure re-issue
+        // within budget — detection is provenance, not wording.
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(StreamTransportError("connection reset by peer".into()));
+        assert!(should_retry_dropped(&*err, 0));
+        assert!(should_retry_dropped(&*err, 1));
+        assert!(!should_retry_dropped(&*err, MAX_IDLE_STREAM_RETRIES));
+        // Mid-stream drops never retry here — partial output may already be
+        // on the transcript and a re-issued call would duplicate it.
+        let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            crate::llm::stream::MidStreamError("connection reset by peer".into()),
+        );
+        assert!(!should_retry_dropped(&*mid, 0));
+        // Anything else never retries through this gate — including the bare
+        // wording with no transport marker (provider error text is not a
+        // dead socket).
+        let other: Box<dyn std::error::Error + Send + Sync> = "API error: invalid api key".into();
+        assert!(!should_retry_dropped(&*other, 0));
+        let worded: Box<dyn std::error::Error + Send + Sync> = "connection reset by peer".into();
+        assert!(!should_retry_dropped(&*worded, 0));
+        let cancelled: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(StreamTransportError("connection reset; cancelled".into()));
+        assert!(!should_retry_dropped(&*cancelled, 0));
     }
 
     #[test]

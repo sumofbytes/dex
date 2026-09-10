@@ -505,7 +505,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_HTTP_REQUEST_TIMEOUT_SECS` | Total request bound, applied only when explicitly set — streaming LLM/chat paths default to no total timeout so long turns aren't killed. |
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
-| `DEX_STREAM_IDLE_TIMEOUT_SECS` | SSE idle watchdog: fail the stream when no chunk (or keep-alive) arrives for this long (default 90; `0` disables). Slow reasoning models that buffer longer than this trip it while healthy — raise it (e.g. 300). |
+| `DEX_STREAM_IDLE_TIMEOUT_SECS` | SSE idle watchdog: no chunk (or keep-alive) for this long counts as a stall (default 90, 300 for reasoning-capable models; `0` disables). Pre-output stalls and dropped connections retry automatically same-protocol (2 retries) before failing the turn. |
 | `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap on tool rounds — one round per assistant batch with calls, not per call (default 200). A looping model is stopped with partial progress preserved and a transcript marker. |
 | `DEX_DAEMON_TOKEN` | Bearer token for the daemon API. Required by clients when `dex serve` binds a non-loopback address (auto-generated and written to `$XDG_DATA_HOME/dex/daemon.token`, 0600) or when the operator sets one. Loopback-only daemons need no token. |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
