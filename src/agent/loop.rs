@@ -12,7 +12,7 @@ use crate::core::console::{
 use crate::core::format::{
     model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
 };
-use crate::core::types::{ChatMessage, LlmToolCall, Role, SinkLine, StopReason, Usage};
+use crate::core::types::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::stream::Turn;
@@ -233,7 +233,7 @@ pub(crate) struct AgentRuntime<'a, C, X> {
     pub(crate) config: &'a LlmConfig,
     pub(crate) messages: &'a mut Vec<ChatMessage>,
     pub(crate) state: &'a mut ToolState,
-    pub(crate) steering_rx: Option<&'a mut mpsc::Receiver<String>>,
+    pub(crate) steering_rx: Option<&'a mut mpsc::Receiver<QueueMsg>>,
     pub(crate) steering_accepted_tx: Option<&'a mpsc::Sender<String>>,
     pub(crate) session: Option<&'a mut Session>,
     pub(crate) client: &'a C,
@@ -247,6 +247,21 @@ pub(crate) struct AgentRuntime<'a, C, X> {
     /// Turn budget override (plan §4: a definition's `max_tool_iterations`
     /// feeds the existing budget knob; `None` = the default/env value).
     pub(crate) tool_budget: Option<usize>,
+}
+
+/// Apply one drained queue message to the not-yet-injected `pending` list:
+/// `Content` appends, `Recall` removes the newest matching item. Recalls are
+/// applied in arrival order, so a recall can only cancel an item that has not
+/// been injected yet — one already sent is part of the transcript.
+pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
+    match msg {
+        QueueMsg::Content(text) => pending.push(text),
+        QueueMsg::Recall(text) => {
+            if let Some(pos) = pending.iter().rposition(|item| item == &text) {
+                pending.remove(pos);
+            }
+        }
+    }
 }
 
 pub(crate) async fn process_turn<C, X>(
@@ -299,8 +314,8 @@ where
         }
         if let Some(rx) = steering_rx.as_mut() {
             let mut drained: Vec<String> = Vec::new();
-            while let Ok(steering) = rx.try_recv() {
-                drained.push(steering);
+            while let Ok(msg) = rx.try_recv() {
+                apply_queue_msg(&mut drained, msg);
             }
             for steering in drained {
                 if let Some(accepted) = &steering_accepted_tx {
@@ -694,8 +709,8 @@ where
             });
             if let Some(rx) = steering_rx.as_mut() {
                 let mut steering: Vec<String> = Vec::new();
-                while let Ok(s) = rx.try_recv() {
-                    steering.push(s);
+                while let Ok(msg) = rx.try_recv() {
+                    apply_queue_msg(&mut steering, msg);
                 }
                 if !steering.is_empty() {
                     for content in steering {
@@ -997,6 +1012,23 @@ mod tests {
         // Generic length validation without a context anchor must not
         // trigger a wasteful emergency compaction.
         assert!(!is_context_overflow("reduce the length of your filename"));
+    }
+
+    #[test]
+    fn queue_recall_removes_newest_match_only() {
+        let mut pending = Vec::new();
+        apply_queue_msg(&mut pending, QueueMsg::Content("a".into()));
+        apply_queue_msg(&mut pending, QueueMsg::Content("a".into()));
+        apply_queue_msg(&mut pending, QueueMsg::Content("b".into()));
+        // Newest matching item goes first; the older duplicate stays.
+        apply_queue_msg(&mut pending, QueueMsg::Recall("a".into()));
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
+        // A recall with no queued match is a no-op (already injected).
+        apply_queue_msg(&mut pending, QueueMsg::Recall("zzz".into()));
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
+        // A recall that arrives after its item (separate drain) still works.
+        apply_queue_msg(&mut pending, QueueMsg::Recall("a".into()));
+        assert_eq!(pending, vec!["b".to_string()]);
     }
 
     /// A model that stalls in a tool-call loop is cut off by the per-turn
