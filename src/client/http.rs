@@ -125,6 +125,13 @@ pub(crate) fn shared_streaming_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
+                // Socket-level keepalives: a silently dropped connection
+                // (dead middlebox, hung peer) fails fast at the TCP layer
+                // instead of parking until the app-level idle watchdog.
+                // Healthy-but-slow providers are unaffected — keepalive ACKs
+                // carry no body bytes, so the SSE idle timer still governs
+                // application silence.
+                .tcp_keepalive(Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         })
