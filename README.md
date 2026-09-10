@@ -413,6 +413,7 @@ and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
 - **Shift+Enter** — insert a newline (multi-line input). Needs a terminal with Kitty keyboard-protocol support (e.g. Ghostty, Kitty, WezTerm, foot); otherwise use **Ctrl+J**, which works everywhere.
 - **Enter while working** — queue a steering message for the next model boundary.
 - **Alt+Enter while working** — queue a follow-up for after the current task.
+- **Alt+Up while working** — recall the newest queued steer (or follow-up) back into the composer to edit it before it is delivered; press again for the next one.
 - **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages (a third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt clears it first, and **Ctrl+D** on an empty line quits.
 - **Ctrl+T** — expand/collapse the full thinking block.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the transcript.
@@ -425,7 +426,10 @@ While `dex` is working, the input remains available. Submitted steering and
 follow-up messages stay visible in the queue directly above the input box until
 the worker accepts them. Steering is delivered before the next model call;
 follow-ups wait until the current task has finished. The queue is kept separate
-from the transcript so pending messages do not scroll away.
+from the transcript so pending messages do not scroll away. **Alt+Up** recalls
+the newest queued message back into the composer for editing (the daemon drops
+its queued copy); a message already accepted at a model boundary has been
+injected and can no longer be recalled.
 
 ## Sessions
 

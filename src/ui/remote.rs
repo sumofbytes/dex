@@ -812,31 +812,42 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             );
         }
         StreamEvent::SteeringAccepted { content } => {
-            if let Some(pos) = remote
-                .app
+            let app = &mut remote.app;
+            // Drop the accepted badge (exact match, then trim-insensitive so a
+            // whitespace echo difference doesn't strand it). Never pop an
+            // unrelated item: a recall may have already removed this one, and
+            // the accepted copy still renders below.
+            let trimmed = content.trim();
+            if let Some(pos) = app
                 .pending_steering
                 .iter()
                 .position(|c| c == &content)
+                .or_else(|| {
+                    app.pending_steering
+                        .iter()
+                        .position(|c| c.trim() == trimmed)
+                })
             {
-                remote.app.pending_steering.remove(pos);
-            } else if !remote.app.pending_steering.is_empty() {
-                // Fallback: content may have been trimmed differently; pop oldest.
-                remote.app.pending_steering.remove(0);
+                app.pending_steering.remove(pos);
             }
-            render_user_prompt(&mut remote.app, &content);
+            render_user_prompt(app, &content);
         }
         StreamEvent::FollowupAccepted { content } => {
-            if let Some(pos) = remote
-                .app
+            let app = &mut remote.app;
+            let trimmed = content.trim();
+            if let Some(pos) = app
                 .pending_followups
                 .iter()
                 .position(|c| c == &content)
+                .or_else(|| {
+                    app.pending_followups
+                        .iter()
+                        .position(|c| c.trim() == trimmed)
+                })
             {
-                remote.app.pending_followups.remove(pos);
-            } else if !remote.app.pending_followups.is_empty() {
-                remote.app.pending_followups.remove(0);
+                app.pending_followups.remove(pos);
             }
-            render_user_prompt(&mut remote.app, &content);
+            render_user_prompt(app, &content);
         }
         StreamEvent::ApprovalRequired { name, input, .. } => {
             // Invariant: the daemon parks at most one approval per turn
@@ -1436,6 +1447,16 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         KeyCode::PageDown => {
             scroll_transcript(app, 20);
         }
+        // Alt+Up while working: pull the newest queued message back into the
+        // composer to edit it. Best-effort — an item already accepted at a
+        // model boundary is gone from the queue and renders as a transcript
+        // block instead.
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (!app.pending_steering.is_empty() || !app.pending_followups.is_empty()) =>
+        {
+            recall_queued(remote);
+        }
         KeyCode::Up => {
             if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
                 scroll_transcript(app, -1);
@@ -1575,6 +1596,42 @@ fn finish_shell_command(
     );
     // The command may have switched branches or dirtied the tree.
     refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
+}
+
+/// Alt+Up while a turn is running: pull the newest queued steering message
+/// (falling back to a follow-up) back into the composer and tell the daemon to
+/// drop its queued copy, so the user can edit before it is injected.
+/// Best-effort: a message already accepted at a model boundary is gone from
+/// the queue and renders as a transcript block instead.
+fn recall_queued(remote: &mut RemoteApp) {
+    let (text, followup) = if let Some(text) = remote.app.pending_steering.pop() {
+        (text, false)
+    } else if let Some(text) = remote.app.pending_followups.pop() {
+        (text, true)
+    } else {
+        return;
+    };
+    // Append to any draft so typed text is never lost; one item per press.
+    let app = &mut remote.app;
+    let mut draft = app.input.text();
+    if !draft.trim().is_empty() {
+        draft.push('\n');
+    }
+    draft.push_str(&text);
+    app.input = crate::ui::input::InputField::from_text(&draft);
+    app.slash_selected = 0;
+    let client = remote.client.clone();
+    let sid = remote.session_id.clone();
+    match client.recall(&sid, &text, followup) {
+        Ok(()) => push_info(
+            app,
+            format!(
+                "recalled queued {} for editing (Alt+Up again for more)",
+                if followup { "follow-up" } else { "steer" }
+            ),
+        ),
+        Err(e) => push_info(app, format!("could not recall queued message: {e}")),
+    }
 }
 
 fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {

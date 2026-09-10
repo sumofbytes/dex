@@ -11,7 +11,7 @@ use crate::core::console::{
 use crate::core::format::{
     model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
 };
-use crate::core::types::{ChatMessage, LlmToolCall, Role, SinkLine, StopReason, Usage};
+use crate::core::types::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::stream::Turn;
@@ -219,12 +219,27 @@ async fn emergency_compact(
     Ok(compacted_any)
 }
 
+/// Apply one drained queue message to the not-yet-injected `pending` list:
+/// `Content` appends, `Recall` removes the newest matching item. Recalls are
+/// applied in arrival order, so a recall can only cancel an item that has not
+/// been injected yet — one already sent is part of the transcript.
+pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
+    match msg {
+        QueueMsg::Content(text) => pending.push(text),
+        QueueMsg::Recall(text) => {
+            if let Some(pos) = pending.iter().rposition(|item| item == &text) {
+                pending.remove(pos);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_turn(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
     state: &mut ToolState,
-    mut steering_rx: Option<&mut mpsc::Receiver<String>>,
+    mut steering_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
     mut session: Option<&mut Session>,
     client: &(impl ModelClient + 'static),
@@ -252,8 +267,8 @@ pub(crate) async fn process_turn(
         }
         if let Some(rx) = steering_rx.as_mut() {
             let mut drained: Vec<String> = Vec::new();
-            while let Ok(steering) = rx.try_recv() {
-                drained.push(steering);
+            while let Ok(msg) = rx.try_recv() {
+                apply_queue_msg(&mut drained, msg);
             }
             for steering in drained {
                 if let Some(accepted) = &steering_accepted_tx {
@@ -637,8 +652,8 @@ pub(crate) async fn process_turn(
             });
             if let Some(rx) = steering_rx.as_mut() {
                 let mut steering: Vec<String> = Vec::new();
-                while let Ok(s) = rx.try_recv() {
-                    steering.push(s);
+                while let Ok(msg) = rx.try_recv() {
+                    apply_queue_msg(&mut steering, msg);
                 }
                 if !steering.is_empty() {
                     for content in steering {
@@ -934,6 +949,23 @@ mod tests {
         // Generic length validation without a context anchor must not
         // trigger a wasteful emergency compaction.
         assert!(!is_context_overflow("reduce the length of your filename"));
+    }
+
+    #[test]
+    fn queue_recall_removes_newest_match_only() {
+        let mut pending = Vec::new();
+        apply_queue_msg(&mut pending, QueueMsg::Content("a".into()));
+        apply_queue_msg(&mut pending, QueueMsg::Content("a".into()));
+        apply_queue_msg(&mut pending, QueueMsg::Content("b".into()));
+        // Newest matching item goes first; the older duplicate stays.
+        apply_queue_msg(&mut pending, QueueMsg::Recall("a".into()));
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
+        // A recall with no queued match is a no-op (already injected).
+        apply_queue_msg(&mut pending, QueueMsg::Recall("zzz".into()));
+        assert_eq!(pending, vec!["a".to_string(), "b".to_string()]);
+        // A recall that arrives after its item (separate drain) still works.
+        apply_queue_msg(&mut pending, QueueMsg::Recall("a".into()));
+        assert_eq!(pending, vec!["b".to_string()]);
     }
 
     /// A model that stalls in a tool-call loop is cut off by the per-turn

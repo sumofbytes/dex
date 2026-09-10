@@ -13,16 +13,16 @@ use futures_core::Stream;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::agent::r#loop::process_turn;
+use crate::agent::r#loop::{apply_queue_msg, process_turn};
 use crate::agent::state::ToolState;
 use crate::core::console::{CancellationToken, Console, TraceWriter};
-use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
+use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
-    FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, SkillInfo, SteerRequest,
-    StreamEnvelope, StreamEvent,
+    FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, RecallRequest, SkillInfo,
+    SteerRequest, StreamEnvelope, StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
@@ -109,6 +109,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/steer", post(steer))
         .route("/api/sessions/{id}/followup", post(followup))
+        .route("/api/sessions/{id}/recall", post(recall))
         .route("/api/sessions/{id}/skill", post(load_skill))
         // P10: versioned reattach/replay, P9: trace, P8: undo.
         .route("/api/sessions/{id}/events", get(session_events))
@@ -500,8 +501,8 @@ async fn chat(
     // have a target as soon as the turn is registered (avoids a race where
     // the client sends steering in the gap between `active_turns` insert and
     // the `spawn_blocking` thread creating its channels).
-    let mut steering_rx_opt: Option<mpsc::Receiver<String>> = None;
-    let mut followup_rx_opt: Option<mpsc::Receiver<String>> = None;
+    let mut steering_rx_opt: Option<mpsc::Receiver<QueueMsg>> = None;
+    let mut followup_rx_opt: Option<mpsc::Receiver<QueueMsg>> = None;
     let mut cancel_for_turn: Option<CancellationToken> = None;
     if replay_envelope.is_none() {
         {
@@ -526,8 +527,8 @@ async fn chat(
         // Steering / follow-up queues for this turn (mirrors old local
         // `event.rs` channels). Insert now so the HTTP handlers can push
         // immediately.
-        let (steering_tx, steering_rx) = mpsc::channel::<String>(16);
-        let (followup_tx, followup_rx) = mpsc::channel::<String>(16);
+        let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
+        let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
         state
             .steering_txs
             .lock()
@@ -645,8 +646,8 @@ async fn run_agent_turn(
     tx: mpsc::Sender<StreamEnvelope>,
     idempotency_key: Option<String>,
     request_hash: u64,
-    steering_rx: Option<mpsc::Receiver<String>>,
-    followup_rx: Option<mpsc::Receiver<String>>,
+    steering_rx: Option<mpsc::Receiver<QueueMsg>>,
+    followup_rx: Option<mpsc::Receiver<QueueMsg>>,
 ) {
     // Use a guard so active_turns/cancel_tokens/pending approvals/steering
     // are cleaned even when run_turn_inner panics inside the spawned task
@@ -706,8 +707,8 @@ async fn run_agent_turn(
     let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
         (Some(sr), Some(fr)) => (sr, fr),
         _ => {
-            let (steering_tx, sr) = mpsc::channel::<String>(16);
-            let (followup_tx, fr) = mpsc::channel::<String>(16);
+            let (steering_tx, sr) = mpsc::channel::<QueueMsg>(16);
+            let (followup_tx, fr) = mpsc::channel::<QueueMsg>(16);
             state
                 .steering_txs
                 .lock()
@@ -850,9 +851,9 @@ async fn run_turn_inner(
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
-    steering_rx: Option<&mut mpsc::Receiver<String>>,
+    steering_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
     steering_accepted_tx: Option<&mpsc::Sender<String>>,
-    followup_rx: Option<&mut mpsc::Receiver<String>>,
+    followup_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
     followup_accepted_tx: Option<&mpsc::Sender<String>>,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
@@ -1202,12 +1203,13 @@ async fn run_turn_inner(
                 final_response = resp;
                 final_usage = tool_state.last_usage;
                 final_cached = tool_state.last_cached;
-                // Drain follow-ups queued while this turn ran.
+                // Drain follow-ups queued while this turn ran (`Recall`
+                // cancels one that has not been chained yet).
                 let followups: Vec<String> = match followup_opt.as_mut() {
                     Some(rx) => {
-                        let mut out = Vec::new();
-                        while let Ok(v) = rx.try_recv() {
-                            out.push(v);
+                        let mut out: Vec<String> = Vec::new();
+                        while let Ok(msg) = rx.try_recv() {
+                            apply_queue_msg(&mut out, msg);
                         }
                         out
                     }
@@ -1419,7 +1421,9 @@ async fn steer(
         map.get(&session_id).cloned()
     }
     .ok_or(StatusCode::CONFLICT)?;
-    tx.send(content).await.map_err(|_| StatusCode::CONFLICT)?;
+    tx.send(QueueMsg::Content(content))
+        .await
+        .map_err(|_| StatusCode::CONFLICT)?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -1441,7 +1445,41 @@ async fn followup(
         map.get(&session_id).cloned()
     }
     .ok_or(StatusCode::CONFLICT)?;
-    tx.send(content).await.map_err(|_| StatusCode::CONFLICT)?;
+    tx.send(QueueMsg::Content(content))
+        .await
+        .map_err(|_| StatusCode::CONFLICT)?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+/// `POST /api/sessions/{id}/recall` — cancel a queued steering/follow-up
+/// message the daemon has not injected yet, so the client can edit it. The
+/// recall rides the same per-turn queue as the item, so it is a no-op when the
+/// item was already accepted at a model boundary (it is then part of the
+/// transcript and re-rendered by `SteeringAccepted`/`FollowupAccepted`).
+async fn recall(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<RecallRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let content = req.content.trim().to_string();
+    if content.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if lookup_entry(&state, &session_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let tx = {
+        let map = if req.followup {
+            state.followup_txs.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            state.steering_txs.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        map.get(&session_id).cloned()
+    }
+    .ok_or(StatusCode::CONFLICT)?;
+    tx.send(QueueMsg::Recall(content))
+        .await
+        .map_err(|_| StatusCode::CONFLICT)?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -2030,7 +2068,7 @@ mod handler_tests {
         .await;
         assert!(matches!(r, Err(StatusCode::CONFLICT)));
         let r = followup(
-            State(state),
+            State(state.clone()),
             Path("s".into()),
             Json(FollowupRequest {
                 content: "x".into(),
@@ -2038,6 +2076,41 @@ mod handler_tests {
         )
         .await;
         assert!(matches!(r, Err(StatusCode::CONFLICT)));
+        // recall mirrors steer/followup: empty -> 400, no active queue -> 409.
+        let r = recall(
+            State(state.clone()),
+            Path("s".into()),
+            Json(RecallRequest {
+                content: "  ".into(),
+                followup: false,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        let r = recall(
+            State(state.clone()),
+            Path("s".into()),
+            Json(RecallRequest {
+                content: "x".into(),
+                followup: false,
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::CONFLICT)));
+        // With an active queue the recall lands as `Recall` on that channel.
+        let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
+        state.steering_txs.lock().unwrap().insert("s".into(), tx);
+        let r = recall(
+            State(state.clone()),
+            Path("s".into()),
+            Json(RecallRequest {
+                content: "typo".into(),
+                followup: false,
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(matches!(rx.try_recv(), Ok(QueueMsg::Recall(c)) if c == "typo"));
     }
 
     #[tokio::test]

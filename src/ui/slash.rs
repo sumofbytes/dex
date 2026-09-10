@@ -593,7 +593,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 app,
                 "mouse: drag selects + copies · wheel scrolls transcript".to_string(),
             );
-            push_info(app, "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input".to_string());
+            push_info(app, "while working: Enter queues steer · Alt+Enter queues follow-up · Alt+Up recalls the newest queued message for editing · Esc/Ctrl+C cancels and restores queued input".to_string());
         }
         _ if line.starts_with("/model ") => {
             let m = line["/model ".len()..].trim().to_string();
