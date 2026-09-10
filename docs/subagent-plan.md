@@ -762,8 +762,15 @@ $XDG_DATA_HOME/dex/sessions/<slug>/agents/<agent_id>-<name>.jsonl
   child's `process_turn` writes its own markers/messages into it, and the
   exclusion rule is already satisfied structurally — `list_all`/`list` read
   only direct `.jsonl` files in each session directory and the loaders take
-  explicit paths — with a regression test pinning it. Surfacing `agents/`
-  runs in session listings and §18 usage journaling remain Phase 8/9 work.
+  explicit paths — with a regression test pinning it. Phase 8 added the
+  remaining half: `Session::list_children` reads `agents/*.jsonl` with each
+  run's turn state (`interrupted` = unterminated `turn_start`), the
+  daemon's `GET /api/sessions` reports `child_agents`/`interrupted_children`,
+  and the TUI's `/resume` listing renders them — loaders still exclude the
+  directory. §18 usage journaling is done too: the child body tallies its
+  own `record_usage` emissions into `AgentResult.usage`, and the completion
+  notice carries them (`· 1.5k tok · $0.0030`), deduped by `seq` on replay
+  like every lifecycle line.
 - The parent's transcript records only the `delegate` call, any
   `delegate_output` result, and the completion notice — never the child
   transcript.
@@ -887,12 +894,10 @@ Each is a possible extension; none may complicate the V1a core.
 
 # 21. Implementation Sequence
 
-Status after the Phase 5/6/8 slice: **0–7 done** (gate, runtime, types,
+Status after the Phase 9 pass: **0–9 done** (gate, runtime, types,
 manager, delegate tools, boundary drains, policies incl. detached
-auto-deny), plus §8's child-JSONL half (explicit-path constructor, loader
-exclusion, marker discipline). Remaining for Phase 8: §18 child usage
-journaling and session listings surfacing `agents/` runs. Phase 9 is the
-final §22 pass; Phase 10 is V1b.
+auto-deny, child JSONL, §18 usage journaling + session listings surfacing
+`agents/` runs, full §22 V1a pass). Phase 10 is V1b.
 
 | Phase | Content | Exit condition |
 |---|---|---|
@@ -913,80 +918,80 @@ final §22 pass; Phase 10 is V1b.
 # 22. Acceptance Criteria
 
 ## A. Core architecture
-- [ ] Sub-agents use the same loop/runtime as the main agent; no duplicated LLM/tool loop.
-- [ ] Definition and execution state are separate types.
-- [ ] Sub-agent code sits behind one small module; removing/disabling it (`DEX_SUBAGENTS=0`) leaves the single-agent path materially unchanged.
-- [ ] No new dependency; existing abstractions reused.
+- [x] Sub-agents use the same loop/runtime as the main agent; no duplicated LLM/tool loop.
+- [x] Definition and execution state are separate types.
+- [x] Sub-agent code sits behind one small module; removing/disabling it (`DEX_SUBAGENTS=0`) leaves the single-agent path materially unchanged.
+- [x] No new dependency; existing abstractions reused.
 
 ## B. Context isolation
-- [ ] Independent context per child: task in, transcript never inherited.
-- [ ] File hints and parent summary pass only when explicitly provided.
-- [ ] Child working directory = parent workspace root; `resolve_workspace_path` confinement holds for every child call; parent/child resolve the same root.
-- [ ] Child tool calls/messages never appear in parent history; parent loader ignores `agents/*`.
+- [x] Independent context per child: task in, transcript never inherited.
+- [x] File hints and parent summary pass only when explicitly provided.
+- [x] Child working directory = parent workspace root; `resolve_workspace_path` confinement holds for every child call; parent/child resolve the same root.
+- [x] Child tool calls/messages never appear in parent history; parent loader ignores `agents/*`.
 
 ## C. Delegation (background) — V1a
-- [ ] `delegate(agent, task)` returns an `AgentId` immediately; the parent turn can end while the child runs.
-- [ ] `delegate_output(agent_id, wait_seconds?)` is bounded (≤120 s), polls with ~250 ms sleeps, returns early on completion/timeout/parent-cancel, and returns a structured `AgentResult`; steering is acted on within one sleep interval after the wait returns.
-- [ ] `delegate_stop(agent_id)` cancels and returns the `Cancelled` result.
-- [ ] Unknown names reject cleanly with the available-agent list.
-- [ ] `delegate` is unregistered in OneShot/no-daemon modes via a registration-time filter (not a prompt hack).
-- [ ] Multiple children spawnable from one parent turn; parallel via fan-out; cap enforced with clean rejection.
+- [x] `delegate(agent, task)` returns an `AgentId` immediately; the parent turn can end while the child runs.
+- [x] `delegate_output(agent_id, wait_seconds?)` is bounded (≤120 s), polls with ~250 ms sleeps, returns early on completion/timeout/parent-cancel, and returns a structured `AgentResult`; steering is acted on within one sleep interval after the wait returns.
+- [x] `delegate_stop(agent_id)` cancels and returns the `Cancelled` result.
+- [x] Unknown names reject cleanly with the available-agent list.
+- [x] `delegate` is unregistered in OneShot/no-daemon modes via a registration-time filter (not a prompt hack).
+- [x] Multiple children spawnable from one parent turn; parallel via fan-out; cap enforced with clean rejection.
 
 ## D. Turn boundaries (V1a) and wake (V1b)
-- [ ] V1a: completion notices drain only at real turn starts (chained follow-up, next user chat) — never mid-turn, never via the steering channel.
-- [ ] V1a: notice queue bounded at 32; overflow folds into a summary notice.
+- [x] V1a: completion notices drain only at real turn starts (chained follow-up, next user chat) — never mid-turn, never via the steering channel.
+- [x] V1a: notice queue bounded at 32; overflow folds into a summary notice.
 - [ ] V1b: wake fires only when the session is idle and a real presence signal confirms an audience; never steals a race with a user chat POST (chat wins, wake skips — no user-visible 409); reattach wakes at most once.
 
 ## E. Lifecycle
-- [ ] Well-defined states; `Completed`/`Failed`/`Cancelled`/`TimedOut` all reachable and tested; each queues its completion notice.
-- [ ] Registry cleaned up on every terminal state; no orphaned tasks after cancel, timeout, session deletion, or daemon shutdown; `DaemonState.agents` lifecycle tested incl. restart-empty.
-- [ ] TUI disconnect does not kill children; daemon restart marks them interrupted and state is recoverable from the session dir.
+- [x] Well-defined states; `Completed`/`Failed`/`Cancelled`/`TimedOut` all reachable and tested; each queues its completion notice.
+- [x] Registry cleaned up on every terminal state; no orphaned tasks after cancel, timeout, session deletion, or daemon shutdown; `DaemonState.agents` lifecycle tested incl. restart-empty.
+- [x] TUI disconnect does not kill children; daemon restart marks them interrupted and state is recoverable from the session dir.
 
 ## F. Tool and permission isolation
-- [ ] Phase 0: dispatch consults policy; mutating calls park + emit `ApprovalRequired` and block for the verdict.
-- [ ] Allowlist enforced at dispatch via the explicit `ToolFilter` parameter; denied calls error with the policy reason.
-- [ ] Child tools ⊆ parent tools; child permissions ⊆ parent policy on the Phase 0 gate; no escalation path.
-- [ ] `delegate`/`delegate_output`/`delegate_stop` never available to children (no recursion, depth 1).
-- [ ] `explorer` read-only; `reviewer` has no write/edit/bash.
-- [ ] V1a: detached children auto-deny mutating calls and record the denial.
+- [x] Phase 0: dispatch consults policy; mutating calls park + emit `ApprovalRequired` and block for the verdict.
+- [x] Allowlist enforced at dispatch via the explicit `ToolFilter` parameter; denied calls error with the policy reason.
+- [x] Child tools ⊆ parent tools; child permissions ⊆ parent policy on the Phase 0 gate; no escalation path.
+- [x] `delegate`/`delegate_output`/`delegate_stop` never available to children (no recursion, depth 1).
+- [x] `explorer` read-only; `reviewer` has no write/edit/bash.
+- [x] V1a: detached children auto-deny mutating calls and record the denial.
 - [ ] V1b: child approval prompts surface labeled in the parent session; `AllowSession` applies to children; 5-minute timeout; the parent-turn-end guard leaves child approvals parked.
 
 ## G. Model configuration
-- [ ] Per-definition model through the existing resolver; no provider-specific code in the sub-agent module.
-- [ ] Works with zero user configuration (built-ins inherit or name catalog models).
+- [x] Per-definition model through the existing resolver; no provider-specific code in the sub-agent module.
+- [x] Works with zero user configuration (built-ins inherit or name catalog models).
 
 ## H. Concurrency
-- [ ] Two+ children run concurrently; results map to correct ids; one failure doesn't terminate siblings; no shared-state corruption.
+- [x] Two+ children run concurrently; results map to correct ids; one failure doesn't terminate siblings; no shared-state corruption.
 
 ## I. Cancellation and timeout
-- [ ] Parent turn cancel stops the parent (and any `delegate_output` wait) without touching children; `delegate_stop` yields `Cancelled`; timeout yields `TimedOut`; daemon shutdown cancels all; no orphans in any path.
+- [x] Parent turn cancel stops the parent (and any `delegate_output` wait) without touching children; `delegate_stop` yields `Cancelled`; timeout yields `TimedOut`; daemon shutdown cancels all; no orphans in any path.
 
 ## J. Result quality
-- [ ] Every terminal state yields an `AgentResult`; `Completed` carries the child's final message; non-message endings synthesize `summary` + set actionable `error`.
-- [ ] Parent consumes results and continues; child transcripts never auto-injected.
+- [x] Every terminal state yields an `AgentResult`; `Completed` carries the child's final message; non-message endings synthesize `summary` + set actionable `error`.
+- [x] Parent consumes results and continues; child transcripts never auto-injected.
 
 ## K. Events and TUI
-- [ ] V1a: lifecycle lines are seq-journaled `System` envelopes; TUI matches the stable prefix via existing poll + replay, deduped by `seq`; zero wire change.
+- [x] V1a: lifecycle lines are seq-journaled `System` envelopes; TUI matches the stable prefix via existing poll + replay, deduped by `seq`; zero wire change.
 - [ ] V1b: typed variants ship as a declared wire bump with old-client fallback.
-- [ ] Core runtime runs with no TUI attached.
+- [x] Core runtime runs with no TUI attached.
 
 ## L. Built-ins
-- [ ] `explorer`/`reviewer`/`tester` exist with the tool sets in §19, all on the shared runtime; adding a definition requires no runtime change.
+- [x] `explorer`/`reviewer`/`tester` exist with the tool sets in §19, all on the shared runtime; adding a definition requires no runtime change.
 
 ## M. Testing
-- [ ] Unit: Phase 0 gate, definitions, isolation, tool policy, permissions (V1a auto-deny; V1b labels), lifecycle, cancel, timeout, notice drain at both real boundaries.
-- [ ] Concurrency + parent-cancellation + child-survival tests with the mock client.
-- [ ] Integration: main → delegate → child → tool → result → notice → main continues on its next turn.
-- [ ] Existing suite passes; single-agent behavior has no regressions.
+- [x] Unit: Phase 0 gate, definitions, isolation, tool policy, permissions (V1a auto-deny; V1b labels), lifecycle, cancel, timeout, notice drain at both real boundaries.
+- [x] Concurrency + parent-cancellation + child-survival tests with the mock client.
+- [x] Integration: main → delegate → child → tool → result → notice → main continues on its next turn.
+- [x] Existing suite passes; single-agent behavior has no regressions.
 
 ## N. Observability
-- [ ] Unique ids; parent/child linkage recorded; durations, turns, tool-call counts, tokens recorded via existing infra; failures identify the agent; no context dumps in logs.
-- [ ] Child transcripts inspectable from the session dir.
+- [x] Unique ids; parent/child linkage recorded; durations, turns, tool-call counts, tokens recorded via existing infra; failures identify the agent; no context dumps in logs.
+- [x] Child transcripts inspectable from the session dir.
 
 ## O. Simplicity
-- [ ] No second execution engine, tool framework, permission engine, or model resolver.
-- [ ] No mandatory external service, user configuration, agent-to-agent messaging, shared mutable state, DAG framework, idle wake, or wire bump in V1a.
-- [ ] No abstraction kept solely for hypothetical futures (manager is a struct; trait only if a second implementation appears).
+- [x] No second execution engine, tool framework, permission engine, or model resolver.
+- [x] No mandatory external service, user configuration, agent-to-agent messaging, shared mutable state, DAG framework, idle wake, or wire bump in V1a.
+- [x] No abstraction kept solely for hypothetical futures (manager is a struct; trait only if a second implementation appears).
 
 ---
 
