@@ -348,17 +348,24 @@ provider logic — children resolve their model through the existing config
 path.
 
 As built (Phase 4), `spawn` takes the child body as a third argument —
-`spawn(def, seed, run)` where `run` receives the child token plus a
-scoped `ProgressReporter` (`set`/`clear`, the §15 `progress <tool>` source)
-and resolves to the terminal `AgentResult`. The sketch above leaves the
-body implied; passing it in keeps model logic out of the manager while
-giving the caller (parent turn / delegate tool) ownership of the child
-future. Results are filed under the allocated id, so bodies cannot
-misattribute. The wrapper itself owns three more mechanics so no terminal
-path can orphan an entry (§14): body panics funnel a synthesized `Failed`
-through `finish`; a run outliving `def.timeout` is dropped and ended
-`TimedOut`; and after `shutdown` the manager is closed — `spawn` rejects,
-so a stale clone cannot respawn into a registry nobody will join.
+`spawn(def, seed, run)` where `run` receives the child token, a scoped
+`ProgressReporter` (`set`/`clear`, the §15 `progress <tool>` source), and the
+allocated `AgentId` (session paths and results need it), and resolves to the
+terminal `AgentResult`. The sketch above leaves the body implied; passing it
+in keeps model logic out of the manager while giving the caller (the
+`delegate` tool, Phase 5) ownership of the child future. Results are filed
+under the allocated id, so bodies cannot misattribute. The wrapper itself
+owns three more mechanics so no terminal path can orphan an entry (§14):
+body panics funnel a synthesized `Failed` through `finish`; a run outliving
+`def.timeout` is dropped and ended `TimedOut`; and after `shutdown` the
+manager is closed — `spawn` rejects, so a stale clone cannot respawn into a
+registry nobody will join. `finish` is the single terminal choke point: it
+files the result, queues the notice (bounded at 32, overflow folded into a
+counter), removes the registry entry, and invokes the daemon-supplied
+journal hook (§15's `finished <status>` lifecycle line — set via
+`with_journal`, which closes over the daemon state; the resulting
+state → manager → hook cycle is broken when the shutdown path takes the
+managers out of the map).
 
 Lifecycle (rev 5 — previously unspecified): the entry is created lazily on
 first `delegate` for a session and removed when the session is deleted/reset
@@ -456,11 +463,29 @@ delegate_stop(agent_id)                    -> AgentResult | { state }
 
 Registration: behind `DEX_SUBAGENTS=0` the three tools are unregistered and
 the module is dead code (§19). `delegate` is additionally unregistered in
-OneShot/no-daemon modes — rev 5 note: `tools_schema()` is global
-(`src/llm/protocol.rs:32`, consumed at `client.rs:324`,
-`anthropic.rs:249`) with no per-mode parameter today, so this needs a
-registration-time filter argument threaded from `Mode` to schema
-construction, not a prompt hack (§21, Phase 5).
+OneShot/no-daemon modes — implemented (Phase 5) as a registration-time
+static: `main` marks only daemon-backed modes (Serve/Default, which spawn a
+daemon) as daemon-linked, `tools_schema()` consults it plus the kill switch,
+and dispatch independently rejects the trio whenever the turn carries no
+daemon context (the enforcement, not the prompt, is the boundary).
+
+As built (Phase 5), the tools are thin clients of the manager exactly as
+specified: `delegate` resolves the definition (`find_definition`), builds the
+seed from the tool arguments, spawns through the session's manager, journals
+the `started` System line through the parent turn's sink, and returns
+`{agent_id, state: running}`; `delegate_output` polls the manager with
+`Duration::ZERO` probes between ~250 ms sleeps, checking the parent turn's
+cancel token between sleeps (early return on completion, deadline, or parent
+cancel; the child keeps running, §14); `delegate_stop` signals the token and
+returns the funneled `Cancelled` result (or `cancelling` for a body that
+ignores its token — it still ends via the wrapper's timeout). The child body
+(`child_body`) is one standard `process_turn` with an isolated bundle: own
+config clone (model override via `apply_model`, §13), own child JSONL (§16),
+own console, no steering, the definition's tool filter (delegation names
+stripped defensively, §11), and its own budget override. Depth 1 is
+enforced twice: the child filter never contains a delegation tool, and the
+child's bundle carries no daemon context, so its delegation calls are
+rejected at dispatch.
 
 Semantics:
 
@@ -513,9 +538,17 @@ place follow-ups chain the next `process_turn`
 `ChatMessage::user_named(text, "agent-notifications")` to the next
 iteration. No new turn is invented; the loop already exists. Notices for a
 parent whose turn has fully ended wait for its next user chat, where the
-same drain runs at turn start. Steering stays user-owned throughout: agent
-notices never use it mid-turn; they wait for the boundary — the
-convergence rule from §2, kept intact.
+same drain runs at turn start. As built (Phase 6), the drain is one helper
+(`drain_agent_notices`) called at BOTH sites — at the chained-iteration
+boundary after a successful turn, and at turn start before the new prompt is
+persisted — and each notice carries the child's retained summary verbatim
+(the §6 delivery), so the notice queue is the announcement and
+`delegate_output` remains the on-demand fetch. The mid-turn drain persists
+the notice message even when no follow-up chains the turn; the next turn
+picks it up from the session history, and the already-drained queue prevents
+double delivery. Steering stays user-owned throughout: agent notices never
+use it mid-turn; they wait for the boundary — the convergence rule from §2,
+kept intact.
 
 ## V1b (deferred): idle wake + presence gating
 
@@ -594,10 +627,18 @@ until resolved. Without Phase 0, the rest of this section is untestable.
 client is fresh, a child's mutating call **auto-denies immediately** and the
 denial is recorded in the child's result — a background child can never
 block silently on an absent user (CC's pre-2.1.186 fallback, and the only
-safe default). Attached-session child prompts in V1a resolve through the
-same path as the parent's own prompts; no child-specific labeling yet. Net
-effect on built-ins: `explorer`/`reviewer` never prompt (prompt-free tools);
-`tester`'s `bash` prompts when attached, auto-denies when detached.
+safe default). As built (Phase 5), the mechanism is deliberately simple: a
+child's console carries **no approval channel at all**, so under any `ask-*`
+mode `enforce_policy` fails closed at the no-channel branch and the denial
+is recorded in the child's transcript (under `trusted` parents children run
+unprompted, matching the subset rule). "Attached-session child prompts" and
+the labeled variant both wait for V1b, which owns presence detection — the
+Phase 4 guard plumbing (`agent_id` on approvals) is the pre-committed seam.
+Session-level approvals apply to children: the child console is seeded with
+the parent session's approval set at spawn, so an exact command the user
+already allowed still runs. Net effect on built-ins: `explorer`/`reviewer`
+never prompt (prompt-free tools); `tester`'s `bash` runs under `trusted`
+parents and auto-denies under `ask-*` in V1a.
 
 **V1b (deferred): labeled prompts.** A child's approval sender
 parks in the same `pending_approvals` map and emits `ApprovalRequired {
@@ -715,6 +756,14 @@ $XDG_DATA_HOME/dex/sessions/<slug>/agents/<agent_id>-<name>.jsonl
   attached runs (running, completed, interrupted-after-restart), and a
   hard rule that `load_llm_messages_from_session` (and resume path
   reconstruction) never ingests `agents/*` into the parent transcript.
+  As built (Phase 5): `Session::child` creates
+  `agents/<agent_id>-<name>.jsonl` beside the parent file (appending and
+  continuing the line counter on the daemon-restart id collision), the
+  child's `process_turn` writes its own markers/messages into it, and the
+  exclusion rule is already satisfied structurally — `list_all`/`list` read
+  only direct `.jsonl` files in each session directory and the loaders take
+  explicit paths — with a regression test pinning it. Surfacing `agents/`
+  runs in session listings and §18 usage journaling remain Phase 8/9 work.
 - The parent's transcript records only the `delegate` call, any
   `delegate_output` result, and the completion notice — never the child
   transcript.
@@ -837,6 +886,13 @@ Each is a possible extension; none may complicate the V1a core.
 ---
 
 # 21. Implementation Sequence
+
+Status after the Phase 5/6/8 slice: **0–7 done** (gate, runtime, types,
+manager, delegate tools, boundary drains, policies incl. detached
+auto-deny), plus §8's child-JSONL half (explicit-path constructor, loader
+exclusion, marker discipline). Remaining for Phase 8: §18 child usage
+journaling and session listings surfacing `agents/` runs. Phase 9 is the
+final §22 pass; Phase 10 is V1b.
 
 | Phase | Content | Exit condition |
 |---|---|---|

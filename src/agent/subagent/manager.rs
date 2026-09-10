@@ -155,6 +155,9 @@ pub(crate) struct AgentManager {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// The daemon-supplied terminal-path hook: one completion notice per call.
+type JournalHook = Arc<dyn Fn(&AgentNotice) + Send + Sync>;
+
 struct Inner {
     session: String,
     next_counter: u64,
@@ -162,6 +165,12 @@ struct Inner {
     /// clone (e.g. held by an in-flight tool call) cannot then orphan a
     /// child into a registry nobody will ever join (plan §14).
     closed: bool,
+    /// Set by the daemon (`AgentManager::with_journal`): invoked on every
+    /// terminal path with the completion notice, so child lifecycle lines
+    /// (§15 V1a `[agent <name>:<id>] finished <status>`) are journaled at
+    /// completion time even while no turn is live. `None` for test-built
+    /// managers.
+    journal: Option<JournalHook>,
     running: HashMap<AgentId, RunningChild>,
     results: HashMap<AgentId, AgentResult>,
     /// Insertion order of `results`, for oldest-first eviction.
@@ -184,6 +193,7 @@ impl AgentManager {
                 session: session.to_string(),
                 next_counter: 0,
                 closed: false,
+                journal: None,
                 running: HashMap::new(),
                 results: HashMap::new(),
                 result_order: VecDeque::new(),
@@ -193,18 +203,26 @@ impl AgentManager {
         }
     }
 
+    /// Attach the terminal-path journal hook (§15 V1a). The daemon builds
+    /// managers with it; test-built managers leave it `None`.
+    pub(crate) fn with_journal(self, hook: Arc<dyn Fn(&AgentNotice) + Send + Sync>) -> Self {
+        self.lock().journal = Some(hook);
+        self
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Spawn a child agent.
     ///
-    /// `run` receives the child's [`CancellationToken`] and a
-    /// [`ProgressReporter`] scoped to it, and produces its terminal
-    /// [`AgentResult`]; results are filed under the allocated id, so bodies
-    /// cannot misattribute. Every terminal path — completion, failure,
-    /// cancel, timeout, panic — funnels through result retention, the
-    /// notice queue, and registry removal.
+    /// `run` receives the child's [`CancellationToken`], a [`ProgressReporter`]
+    /// scoped to it, and its allocated [`AgentId`] (session paths and results
+    /// need it, plan §4), and produces the terminal [`AgentResult`]; results
+    /// are filed under the allocated id, so bodies cannot misattribute. Every
+    /// terminal path — completion, failure, cancel, timeout, panic — funnels
+    /// through result retention, the notice queue, the journal hook, and
+    /// registry removal.
     ///
     /// The wrapper enforces the definition's `timeout` (default
     /// [`DEFAULT_AGENT_TIMEOUT`]): a run that outlasts it is dropped and
@@ -225,7 +243,7 @@ impl AgentManager {
         run: F,
     ) -> Result<AgentId, SpawnError>
     where
-        F: FnOnce(CancellationToken, ProgressReporter) -> Fut + Send + 'static,
+        F: FnOnce(CancellationToken, ProgressReporter, AgentId) -> Fut + Send + 'static,
         Fut: Future<Output = AgentResult> + Send + 'static,
     {
         let (id, token, timeout) = {
@@ -277,10 +295,14 @@ impl AgentManager {
                 result = tokio::time::timeout(
                     timeout,
                     CatchUnwind::new(
-                        Box::pin(run(token.clone(), ProgressReporter {
-                            manager: manager.inner.clone(),
-                            id: task_id.clone(),
-                        })),
+                        Box::pin(run(
+                            token.clone(),
+                            ProgressReporter {
+                                manager: manager.inner.clone(),
+                                id: task_id.clone(),
+                            },
+                            task_id.clone(),
+                        )),
                         "child panicked",
                     ),
                 ) => match result {
@@ -314,9 +336,10 @@ impl AgentManager {
         Ok(id)
     }
 
-    /// Stamp one terminal result through retention, notices, and registry
-    /// removal. Single choke point: completion, failure, cancel (and later
-    /// timeout) all land here, so no terminal path can orphan an entry.
+    /// Stamp one terminal result through retention, notices, the journal
+    /// hook, and registry removal. Single choke point: completion, failure,
+    /// cancel, timeout, and panic all land here, so no terminal path can
+    /// orphan an entry or skip its lifecycle line.
     fn finish(&self, id: &AgentId, name: &str, result: AgentResult) {
         let mut inner = self.lock();
         if inner.results.len() >= MAX_RESULTS {
@@ -327,16 +350,24 @@ impl AgentManager {
         let status = result.status;
         inner.result_order.push_back(id.clone());
         inner.results.insert(id.clone(), result);
+        let notice = AgentNotice {
+            agent_id: id.clone(),
+            name: name.to_string(),
+            status,
+        };
         if inner.notices.len() >= MAX_NOTICES {
             inner.overflowed += 1;
         } else {
-            inner.notices.push_back(AgentNotice {
-                agent_id: id.clone(),
-                name: name.to_string(),
-                status,
-            });
+            inner.notices.push_back(notice.clone());
         }
         inner.running.remove(id);
+        // Outside the lock: the hook journals through the daemon's own seq
+        // mutex, and its file IO must never block registry access.
+        let hook = inner.journal.clone();
+        drop(inner);
+        if let Some(hook) = hook {
+            hook(&notice);
+        }
     }
 
     /// Bounded wait: the retained result if terminal, the last-seen state
@@ -486,7 +517,11 @@ mod tests {
 
     /// A body that only ends through its token — the shape Phase 7's real
     /// runner has. Lets tests hold children live without sleeps.
-    async fn token_body(token: CancellationToken, _progress: ProgressReporter) -> AgentResult {
+    async fn token_body(
+        token: CancellationToken,
+        _progress: ProgressReporter,
+        _id: AgentId,
+    ) -> AgentResult {
         token.cancelled().await;
         AgentResult {
             status: AgentState::Cancelled,
@@ -496,17 +531,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn journal_hook_fires_on_every_terminal_path() {
+        // §15 V1a: the daemon's hook observes every terminal path — the
+        // single choke point means cancel and panic are journaled too.
+        let seen: Arc<Mutex<Vec<(String, &'static str)>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let mgr = AgentManager::new("sess").with_journal(Arc::new(move |notice| {
+            capture.lock().unwrap_or_else(|e| e.into_inner()).push((
+                notice.agent_id.to_string(),
+                super::super::status_word(notice.status),
+            ));
+        }));
+        let completed = mgr
+            .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
+                completed("findings")
+            })
+            .unwrap();
+        let cancelled_id = mgr
+            .spawn(&test_def("tester"), test_seed(), token_body)
+            .unwrap();
+        assert!(matches!(
+            mgr.wait(&completed, Duration::from_secs(5)).await,
+            WaitOutcome::Finished(_)
+        ));
+        mgr.cancel(&cancelled_id);
+        assert!(matches!(
+            mgr.wait(&cancelled_id, Duration::from_secs(5)).await,
+            WaitOutcome::Finished(_)
+        ));
+        let entries = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            entries,
+            vec![
+                ("sess-0".to_string(), "completed"),
+                ("sess-1".to_string(), "cancelled"),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn spawn_assigns_session_scoped_ids_and_reports_running() {
         let mgr = AgentManager::new("sess");
         // `spawn` never yields before returning, so on a single-threaded
         // runtime the wrapper cannot have run yet: fully deterministic.
         let first = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
                 completed("findings")
             })
             .unwrap();
         let second = mgr
-            .spawn(&test_def("tester"), test_seed(), |_, _| async {
+            .spawn(&test_def("tester"), test_seed(), |_, _, _| async {
                 completed("pass")
             })
             .unwrap();
@@ -520,7 +594,7 @@ mod tests {
     async fn completing_child_files_result_and_notice() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
                 completed("findings")
             })
             .unwrap();
@@ -550,7 +624,7 @@ mod tests {
     async fn failed_result_preserved_with_error() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("tester"), test_seed(), |_, _| async {
+            .spawn(&test_def("tester"), test_seed(), |_, _, _| async {
                 failed("boom")
             })
             .unwrap();
@@ -570,7 +644,7 @@ mod tests {
     async fn wait_times_out_then_finishes() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 completed("late")
             })
@@ -667,7 +741,7 @@ mod tests {
         let mgr = AgentManager::new("sess");
         for _ in 0..(MAX_NOTICES + 3) {
             let id = mgr
-                .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+                .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
                     completed("done")
                 })
                 .unwrap();
@@ -688,7 +762,7 @@ mod tests {
     async fn results_survive_notice_drain() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
                 completed("durable")
             })
             .unwrap();
@@ -736,7 +810,7 @@ mod tests {
                 mgr.spawn(
                     &test_def(&format!("agent-{n}")),
                     test_seed(),
-                    |_, _| async move {
+                    |_, _, _| async move {
                         gate.wait().await;
                         completed("through the gate")
                     },
@@ -761,7 +835,7 @@ mod tests {
     async fn panicking_body_fails_without_orphaning_the_entry() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _, _| async {
                 panic!("body exploded")
             })
             .unwrap();
@@ -789,7 +863,7 @@ mod tests {
         let mut def = test_def("explorer");
         def.timeout = Duration::from_millis(50);
         let id = mgr
-            .spawn(&def, test_seed(), |_, _| async {
+            .spawn(&def, test_seed(), |_, _, _| async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 completed("never")
             })
@@ -832,7 +906,7 @@ mod tests {
         let mgr = AgentManager::new("sess");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), move |_, progress| {
+            .spawn(&test_def("explorer"), test_seed(), move |_, progress, _| {
                 async move {
                     progress.set("bash");
                     let _ = rx.await; // hold the "tool call" until observed

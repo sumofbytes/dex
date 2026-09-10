@@ -1,11 +1,13 @@
-//! Sub-agent domain types (plan §4): definitions, instances, results.
+//! Sub-agent domain types (plan §4): definitions, instances, results,
+//! manager, and the delegation tools.
 //!
-//! Phases 3–8 fill this module in sequence. Nothing here has a non-test
-//! caller yet (Phase 5's delegate tools are the first), so the module is
-//! wholly dormant: one `dead_code` allow below covers that deliberately,
-//! and Phase 9 removes it once manager, tools, and drains are all wired
-//! (zero allows must remain). Unused imports, by contrast, are allowed
-//! per-item on the re-exports that need them.
+//! Phases 0–8 are wired: manager, delegate tools, child body, and the
+//! Phase 6 turn-boundary drains all have non-test callers. What stays
+//! deliberately dormant under one `dead_code` allow is the post-V1 surface
+//! (`AgentInstance::parent_id`, `AgentState::Pending`) that Phase 9's final
+//! pass trims or keeps with the contract — zero *unintended* allows must
+//! remain. Unused imports, by contrast, are allowed per-item on the
+//! re-exports that need them.
 #![allow(dead_code)]
 
 mod context;
@@ -13,6 +15,7 @@ mod definition;
 mod instance;
 pub(crate) mod manager;
 mod result;
+pub(crate) mod tools;
 
 #[allow(unused_imports)]
 pub(crate) use context::ContextSeed;
@@ -20,14 +23,16 @@ pub(crate) use context::ContextSeed;
 pub(crate) use definition::{
     AgentDefinition, PermissionInherit, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS,
 };
-// Phase 5's delegate tool consumes the remaining types; until they are
-// wired these re-exports stay deliberately reachable (and allowed).
 #[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
 #[allow(unused_imports)]
 pub(crate) use manager::{AgentManager, AgentNotice, ProgressReporter, SpawnError, WaitOutcome};
 #[allow(unused_imports)]
 pub(crate) use result::AgentResult;
+pub(crate) use tools::{
+    delegation_enabled, execute_delegation, is_delegation, set_daemon_linked, status_word,
+    AgentTurnContext,
+};
 
 use definition::parse_definition;
 
@@ -43,7 +48,7 @@ const EXPLORER_MD: &str = "---\nname: explorer\ndescription: Understand code wit
 
 const REVIEWER_MD: &str = "---\nname: reviewer\ndescription: Review a diff or change for correctness and regressions. Give it what changed; it returns findings in prose. Read-only.\ntools: read, ffgrep, fffind, git\n---\nYou are a reviewer. Review the change for correctness, regressions, and missed edge cases; report findings in prose with file paths and line references. Never modify files or run shell commands outside your tools.\n";
 
-const TESTER_MD: &str = "---\nname: tester\ndescription: Investigate and run relevant tests. Give it what to verify; it reports pass/fail plus failures in prose. May run shell commands: prompts when a user is attached, auto-denies when detached.\ntools: read, ffgrep, fffind, bash\n---\nYou are a tester. Investigate the requested area and run the relevant tests with your shell; report pass/fail plus the failures in prose with file paths. Keep commands read-only in spirit (run tests, do not deploy or delete). If a command is denied, report that instead of working around it.\n";
+const TESTER_MD: &str = "---\nname: tester\ndescription: Investigate and run relevant tests. Give it what to verify; it reports pass/fail plus failures in prose. May run shell commands: they run under a trusted permission policy and are auto-denied otherwise.\ntools: read, ffgrep, fffind, bash\n---\nYou are a tester. Investigate the requested area and run the relevant tests with your shell; report pass/fail plus the failures in prose with file paths. Keep commands read-only in spirit (run tests, do not deploy or delete). If a command is denied, report that instead of working around it.\n";
 
 /// V1a ships three built-ins, zero required configuration (§19). Parsed
 /// through the same frontmatter parser user files will use, so the parser

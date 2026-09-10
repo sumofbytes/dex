@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::state::{wait_cancelled, CancellationSource};
@@ -1273,6 +1274,12 @@ fn extract_search_paths(
 pub(crate) struct Policy {
     pub(crate) mode: PermissionMode,
     pub(crate) console: Option<Console>,
+    /// The daemon-backed turn context (Phase 5): `Some` only for parent
+    /// turns inside the daemon. It is what makes the delegation tools
+    /// spawnable; children and every non-daemon path carry `None`, so a
+    /// `delegate` call from either is rejected at dispatch (§11, no
+    /// recursion — depth 1 in code, not in the prompt).
+    pub(crate) agent: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
 }
 
 impl Policy {
@@ -1280,6 +1287,7 @@ impl Policy {
         Self {
             mode: PermissionMode::Trusted,
             console: None,
+            agent: None,
         }
     }
 
@@ -1287,6 +1295,7 @@ impl Policy {
         Self {
             mode,
             console: Some(console.clone()),
+            agent: None,
         }
     }
 }
@@ -1390,9 +1399,10 @@ pub(crate) struct ToolFilter {
 }
 
 impl ToolFilter {
-    // Test-only until the Phase 4 manager builds child filters from
-    // definitions (same precedent as DaemonState::is_session_approved).
-    #[allow(dead_code)]
+    // Test-only constructor; the daemon builds child filters from
+    // definitions via struct literal (same precedent as
+    // DaemonState::is_session_approved).
+    #[cfg(test)]
     pub(crate) fn new(
         owner: impl Into<String>,
         allowed: impl IntoIterator<Item = impl Into<String>>,
@@ -1423,6 +1433,29 @@ pub(crate) async fn execute(
     policy: &Policy,
     filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
+    // Delegation tools route first (Phase 5): they are not workspace tools
+    // and have no static registry entry. The child allowlist never contains
+    // one, so the same availability gate rejects a child's call before any
+    // delegation logic runs (§11 — depth 1 at dispatch).
+    if crate::agent::subagent::is_delegation(name) {
+        if let Some(filter) = filter {
+            if !filter.allows(name) {
+                let error = ToolError::Denied(format!(
+                    "tool '{name}' is not in {}'s tool allowlist",
+                    filter.owner
+                ));
+                audit(name, args, &error.to_string());
+                return Err(error);
+            }
+        }
+        let result = crate::agent::subagent::execute_delegation(name, args, cancel, policy).await;
+        let outcome = match &result {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.to_string(),
+        };
+        audit(name, args, &outcome);
+        return result;
+    }
     let requirement = if name.starts_with("mcp__") {
         // MCP tools are external processes: most restrictive gate, same as
         // shell. Resolved here so the gate below covers them too.

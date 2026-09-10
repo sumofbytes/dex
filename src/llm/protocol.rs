@@ -145,6 +145,58 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             },
         },
     ];
+    // Sub-agent delegation (§10): background spawn + bounded wait + stop.
+    // Registered only in daemon-linked processes with the kill switch unset;
+    // OneShot/direct runs reject them at dispatch (no manager to spawn into).
+    // Descriptions carry the usage guidance (AGENTS.md: behavior detail
+    // lives at the tool decision, not in prompt.rs).
+    if crate::agent::subagent::delegation_enabled() {
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "delegate".to_string(),
+                description: "Delegate a task to a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "agent": { "type": "string", "description": "agent name: explorer | reviewer | tester" },
+                        "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation" },
+                        "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" }
+                    },
+                    "required": ["agent", "task"]
+                }),
+            },
+        });
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "delegate_output".to_string(),
+                description: "Fetch a delegated child's result. Returns the terminal result (status, summary, error) as soon as it is done; otherwise the current state plus what it is running now. wait_seconds (0-120, default 0) bounds the wait: 0 polls and returns immediately. The wait returns early if this turn is cancelled; steering sent while waiting is acted on right after it returns. Finished results stay fetchable after their announcement.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string", "description": "id returned by delegate" },
+                        "wait_seconds": { "type": "integer", "description": "how long to wait for completion (0-120, default 0)" }
+                    },
+                    "required": ["agent_id"]
+                }),
+            },
+        });
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "delegate_stop".to_string(),
+                description: "Cancel a running delegated child and return its terminal result (status cancelled). Safe on ids that already finished: it returns their recorded result instead.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string", "description": "id returned by delegate" }
+                    },
+                    "required": ["agent_id"]
+                }),
+            },
+        });
+    }
     if extra {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),

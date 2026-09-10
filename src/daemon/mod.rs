@@ -4,14 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::AgentManager;
+use crate::agent::subagent::{status_word, AgentManager, AgentNotice};
 use crate::core::console::CancellationToken;
 use crate::core::types::ApprovalDecision;
+use crate::protocol::StreamEvent;
 
 // ---------------------------------------------------------------------------
 // Daemon bearer token
@@ -241,15 +242,23 @@ impl DaemonState {
     }
 
     /// Lazily create (or return) the child-agent manager for a session.
-    /// Clones share one registry, so any handle sees every child.
+    /// Clones share one registry, so any handle sees every child. The
+    /// terminal-path journal hook (§15 V1a) closes over this state, making
+    /// a state → manager → hook cycle; `shutdown_agents` and
+    /// `remove_session_agents` take the managers out of the map, which
+    /// drops the hooks and breaks it — nothing leaks.
     /// Phase 5's delegate tool is the first caller.
-    #[allow(dead_code)]
-    pub(crate) fn manager_for(&self, session_id: &str) -> AgentManager {
-        self.agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn manager_for(self: &Arc<Self>, session_id: &str) -> AgentManager {
+        let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        agents
             .entry(session_id.to_string())
-            .or_insert_with(|| AgentManager::new(session_id))
+            .or_insert_with(|| {
+                let state = Arc::clone(self);
+                let sid = session_id.to_string();
+                AgentManager::new(session_id).with_journal(Arc::new(move |notice| {
+                    journal_agent_notice(&state, &sid, notice);
+                }))
+            })
             .clone()
     }
 
@@ -449,6 +458,34 @@ impl DaemonState {
     }
 }
 
+/// Journal one child lifecycle line (§15 V1a): a `System` event with the
+/// stable `[agent <name>:<id>]` prefix the TUI matches on. Called from the
+/// manager's terminal path — every ending (completed/failed/cancelled/
+/// timed out/panic) lands here at completion time, even while no turn is
+/// live, so a client's `?since=` poll picks it up without a turn.
+fn journal_agent_notice(state: &DaemonState, session_id: &str, notice: &AgentNotice) {
+    let text = format!(
+        "[agent {}:{}] finished {}",
+        notice.name,
+        notice.agent_id,
+        status_word(notice.status)
+    );
+    let seq = state.next_seq(session_id);
+    let path = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .map(|entry| entry.path.clone());
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut journal) = crate::session::Session::from_path(&path) {
+        let event = StreamEvent::System(text);
+        let _ = journal.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+    }
+}
+
 /// Start the daemon HTTP server on an already-bound listener.
 pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     // MCP bootstrap: connects servers in the background and merges their
@@ -550,7 +587,11 @@ mod tests {
         (def, seed)
     }
 
-    async fn done_body(_token: CancellationToken, _progress: ProgressReporter) -> AgentResult {
+    async fn done_body(
+        _token: CancellationToken,
+        _progress: ProgressReporter,
+        _id: crate::agent::subagent::AgentId,
+    ) -> AgentResult {
         AgentResult {
             status: AgentState::Completed,
             summary: "done".to_string(),
@@ -558,7 +599,11 @@ mod tests {
         }
     }
 
-    async fn cancel_body(token: CancellationToken, _progress: ProgressReporter) -> AgentResult {
+    async fn cancel_body(
+        token: CancellationToken,
+        _progress: ProgressReporter,
+        _id: crate::agent::subagent::AgentId,
+    ) -> AgentResult {
         token.cancelled().await;
         AgentResult {
             status: AgentState::Cancelled,
@@ -597,7 +642,7 @@ mod tests {
     #[test]
     fn fresh_state_has_no_agent_managers() {
         // Restart-empty: no child registries until first delegate.
-        let state = DaemonState::new();
+        let state = std::sync::Arc::new(DaemonState::new());
         assert!(state
             .agents
             .lock()
@@ -607,7 +652,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn manager_for_is_shared_per_session_and_isolated_across() {
-        let state = DaemonState::new();
+        let state = std::sync::Arc::new(DaemonState::new());
         let (def, seed) = agent_test_parts("explorer");
         // A child spawned through one handle is visible through another
         // handle for the same session: clones share one registry.
@@ -635,7 +680,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_session_agents_cancels_children_and_drops_manager() {
-        let state = DaemonState::new();
+        let state = std::sync::Arc::new(DaemonState::new());
         let manager = state.manager_for("s1");
         let (def, seed) = agent_test_parts("explorer");
         let id = manager.spawn(&def, seed, cancel_body).unwrap();
@@ -657,7 +702,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_agents_joins_every_session() {
-        let state = DaemonState::new();
+        let state = Arc::new(DaemonState::new());
         let first = state.manager_for("s1");
         let second = state.manager_for("s2");
         let (def1, seed1) = agent_test_parts("explorer");

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -239,6 +240,13 @@ pub(crate) struct AgentRuntime<'a, C, X> {
     pub(crate) cancel: &'a X,
     pub(crate) console: &'a Console,
     pub(crate) filter: Option<&'a ToolFilter>,
+    /// The daemon-backed turn context (Phase 5): `Some` only for parent
+    /// turns inside the daemon — it is what makes `delegate` spawnable.
+    /// Children and every non-daemon path pass `None` (no delegation, §11).
+    pub(crate) agent_ctx: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
+    /// Turn budget override (plan §4: a definition's `max_tool_iterations`
+    /// feeds the existing budget knob; `None` = the default/env value).
+    pub(crate) tool_budget: Option<usize>,
 }
 
 pub(crate) async fn process_turn<C, X>(
@@ -261,13 +269,15 @@ where
         cancel,
         console,
         filter,
+        agent_ctx,
+        tool_budget,
     } = rt;
     let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
     let cancellation = cancel;
     let mut persisted_cursor = messages.len();
-    let tool_budget = max_tool_iterations();
+    let tool_budget = tool_budget.unwrap_or_else(max_tool_iterations);
     let mut tool_iterations = 0usize;
     // One context-overflow retry per turn: after an emergency compaction the
     // model call is re-issued exactly once; a second overflow is a real
@@ -276,8 +286,10 @@ where
     let mut budget_warned = false;
     // Phase 0 gate context: every tool call this turn runs under the
     // turn's permission mode + approval channel. One policy for the whole
-    // turn so same-turn allow-for-session records are shared.
-    let policy = Policy::turn(config.permission, console);
+    // turn so same-turn allow-for-session records are shared. The daemon
+    // context (Phase 5) rides along for the delegation tools.
+    let mut policy = Policy::turn(config.permission, console);
+    policy.agent = agent_ctx;
 
     for _iteration in 0..1_000_000 {
         persist_pending(&mut session, messages, &mut persisted_cursor)?;
@@ -830,6 +842,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await;
         assert!(result.is_ok());
@@ -907,6 +921,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::daemon(sink_tx, approval_tx),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await;
         let mut events = Vec::new();
@@ -1039,6 +1055,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await
         .unwrap_err()
@@ -1121,6 +1139,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await;
         assert!(
@@ -1177,6 +1197,8 @@ mod tests {
             cancel: &cancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await
         .unwrap_err();
@@ -1255,6 +1277,8 @@ mod tests {
             cancel: &cancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await
         .unwrap_err();
@@ -1353,6 +1377,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await;
         let guard_hits = messages
@@ -1386,6 +1412,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::none(),
             filter: None,
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await;
         let guard_hits = messages
@@ -1489,6 +1517,8 @@ mod tests {
             cancel: &NeverCancel,
             console: &crate::core::console::Console::none(),
             filter: Some(&filter),
+            agent_ctx: None,
+            tool_budget: None,
         })
         .await;
         assert_eq!(result.unwrap(), "done");
