@@ -315,6 +315,68 @@ impl Session {
         })
     }
 
+    /// Child-agent JSONL (plan §16): `agents/<agent_id>-<name>.jsonl`
+    /// beside the parent session file, with the same header and marker
+    /// discipline (`turn_start`/`turn_complete`/`turn_failed` — a crash
+    /// loses at most the in-flight event). The file lives outside the
+    /// parent transcript: `list_all`/`list` read only direct `.jsonl`
+    /// files in each session directory and the loaders take explicit
+    /// paths, so `agents/*` is never ingested into the parent history.
+    pub(crate) fn child(
+        parent_path: &Path,
+        cwd: &str,
+        agent_id: &str,
+        name: &str,
+    ) -> io::Result<Self> {
+        let dir = parent_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("agents");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{agent_id}-{name}.jsonl"));
+        let header = SessionHeader {
+            entry_type: "session".to_string(),
+            version: SESSION_VERSION,
+            id: format!("{agent_id}-{name}"),
+            timestamp: Self::now_iso(),
+            cwd: cwd.to_string(),
+            name: Some(format!(
+                "{name} (child of {})",
+                parent_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("session")
+            )),
+        };
+        let line = serde_json::to_string(&header).map_err(io::Error::other)?;
+        // The agent id is session-scoped and the manager counter restarts
+        // after a daemon restart, so a resumed session can collide with a
+        // prior run's file: append (never truncate) keeps the interrupted
+        // run's record readable, and continuing the line counter keeps
+        // entry ids unique across the seam.
+        let mut counter = 0u64;
+        if path.exists() {
+            let mut reader = BufReader::new(File::open(&path)?);
+            let mut buf = Vec::new();
+            while reader.read_until(b'\n', &mut buf)? > 0 {
+                counter += 1;
+                buf.clear();
+            }
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", line)?;
+        Ok(Self {
+            header,
+            path: Some(path),
+            counter,
+            journal: None,
+            events_journal: None,
+        })
+    }
+
     pub(crate) fn in_memory(cwd: String) -> Self {
         Self {
             header: SessionHeader {
@@ -1539,5 +1601,70 @@ mod tests {
         assert_eq!(messages[2].role, crate::core::types::Role::Tool);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("mid-1"));
         assert_eq!(messages[3].content.as_deref(), Some("follow-up"));
+    }
+
+    #[test]
+    fn child_session_writes_its_own_file_with_markers() {
+        // §16: the child's JSONL lands in `agents/` beside the parent file
+        // with the same turn-marker discipline.
+        let parent = Session::new("/tmp/dex-child-parent".into(), None).unwrap();
+        let parent_path = parent.path().unwrap().to_path_buf();
+        let mut child =
+            Session::child(&parent_path, "/tmp/dex-child-parent", "p-0", "explorer").unwrap();
+        let child_path = child.path().unwrap().to_path_buf();
+        assert_eq!(
+            child_path.parent().unwrap(),
+            parent_path.parent().unwrap().join("agents")
+        );
+        assert_eq!(
+            child_path.file_name().and_then(|s| s.to_str()),
+            Some("p-0-explorer.jsonl")
+        );
+        child.turn_event("turn_start").unwrap();
+        child
+            .append_message(&ChatMessage::user("child task"))
+            .unwrap();
+        child.turn_event("turn_complete").unwrap();
+        // Marker discipline holds: a completed turn is not "interrupted".
+        assert_eq!(Session::last_turn_state(&child_path), "complete");
+        let messages = load_messages_from_session(&child_path).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_deref(), Some("child task"));
+        let _ = std::fs::remove_dir_all(parent_path.parent().unwrap());
+    }
+
+    #[test]
+    fn parent_listing_and_loader_ignore_child_sessions() {
+        // §16 hard rule: `agents/*` never enters the parent transcript or
+        // the session registry. Serialization: Session::new writes into the
+        // shared sessions dir.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let parent = Session::new("/tmp/dex-ignore-child".into(), None).unwrap();
+        let parent_path = parent.path().unwrap().to_path_buf();
+        let mut child =
+            Session::child(&parent_path, "/tmp/dex-ignore-child", "p-1", "tester").unwrap();
+        let child_path = child.path().unwrap().to_path_buf();
+        child
+            .append_message(&ChatMessage::user("child-only content"))
+            .unwrap();
+        // Listing reads only direct .jsonl files in each session directory.
+        let listed = Session::list_all().unwrap();
+        assert!(
+            listed.iter().all(|(path, _)| path != &child_path),
+            "child session must not be listed as a session"
+        );
+        assert!(
+            listed.iter().any(|(path, _)| path == &parent_path),
+            "the parent session itself stays listed"
+        );
+        // And the loaders take explicit paths: the parent's history has no
+        // child content.
+        let parent_messages = load_llm_messages_from_session(&parent_path).unwrap();
+        assert!(parent_messages
+            .iter()
+            .all(|m| m.content.as_deref() != Some("child-only content")));
+        let _ = std::fs::remove_dir_all(parent_path.parent().unwrap());
     }
 }

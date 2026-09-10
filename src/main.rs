@@ -214,6 +214,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         cancel: &crate::agent::state::GlobalCancellation,
         console: &console,
         filter: None,
+        agent_ctx: None,
+        tool_budget: None,
     }));
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {
@@ -333,6 +335,10 @@ fn main() {
     install_sigint_handler();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
+    // Delegation tools register only in daemon-backed processes (§10): a
+    // one-shot run has no manager to spawn into, so the tools stay out of
+    // its schema entirely. Dispatch rejects them there regardless (§11).
+    crate::agent::subagent::set_daemon_linked(matches!(mode, Mode::Serve { .. } | Mode::Default));
 
     match mode {
         Mode::Help => {
