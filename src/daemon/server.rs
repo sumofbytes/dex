@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
-use crate::agent::subagent::{status_word, AgentTurnContext, WaitOutcome};
+use crate::agent::subagent::{AgentTurnContext, WaitOutcome};
 use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
 use crate::core::unwind::CatchUnwind;
@@ -399,7 +399,26 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
                 .map(|m| m.len())
                 .unwrap_or(0);
             let turn_state = session::Session::last_turn_state(&path).to_string();
-            (path, header, message_count, turn_state)
+            // §16/Phase 8: child runs surface in the listing (the resume
+            // picker shows them); loaders keep excluding `agents/*`.
+            let (child_agents, interrupted_children) = session::Session::list_children(&path)
+                .map(|runs| {
+                    (
+                        runs.len(),
+                        runs.iter()
+                            .filter(|(.., state)| *state == "interrupted")
+                            .count(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            (
+                path,
+                header,
+                message_count,
+                turn_state,
+                child_agents,
+                interrupted_children,
+            )
         }));
     }
     let mut scanned = Vec::new();
@@ -409,7 +428,7 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
         }
     }
     scanned.sort_by(|a, b| b.1.timestamp().cmp(a.1.timestamp()));
-    for (path, header, message_count, turn_state) in scanned {
+    for (path, header, message_count, turn_state, child_agents, interrupted_children) in scanned {
         let name = header.name().map(|n| n.to_string());
         by_id.insert(
             header.id().to_string(),
@@ -421,6 +440,8 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
                 "created_at": header.timestamp(),
                 "message_count": message_count,
                 "turn_state": turn_state,
+                "child_agents": child_agents,
+                "interrupted_children": interrupted_children,
             }),
         );
     }
@@ -437,6 +458,8 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
                     "created_at": "",
                     "message_count": 0,
                     "turn_state": "unknown",
+                    "child_agents": 0,
+                    "interrupted_children": 0,
                 })
             });
         }
@@ -1285,12 +1308,7 @@ async fn drain_agent_notices(
         if !text.is_empty() {
             text.push_str("\n\n");
         }
-        text.push_str(&format!(
-            "[agent {}:{}] finished {}",
-            notice.name,
-            notice.agent_id,
-            status_word(notice.status)
-        ));
+        text.push_str(&notice.text());
         if let WaitOutcome::Finished(result) = manager.wait(&notice.agent_id, Duration::ZERO).await
         {
             if !result.summary.trim().is_empty() {
@@ -2672,8 +2690,14 @@ mod e2e_tests {
         );
         const PARENT_DONE_SSE: &str =
             "data: {\"choices\":[{\"delta\":{\"content\":\"delegated\"}}]}\n\ndata: [DONE]\n\n";
-        const CHILD_DONE_SSE: &str =
-            "data: {\"choices\":[{\"delta\":{\"content\":\"the gate lives in src/tools\"}}]}\n\ndata: [DONE]\n\n";
+        const CHILD_DONE_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"content":"the gate lives in src/tools"}}]}"#,
+            // §18: the child's own per-call usage — its record_usage prices
+            // it and the completion notice carries the tokens, so client-side
+            // spend accounting stays honest.
+            "\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":300}}",
+            "\n\ndata: [DONE]\n\n"
+        );
 
         // Provider calls: parent requests count up (first = delegate call);
         // child requests are recognized by the persona in their system
@@ -2878,6 +2902,12 @@ mod e2e_tests {
         assert!(
             notice.contains("[agent explorer:"),
             "status line prefix: {notice}"
+        );
+        // §18: the child's own spend rides the notice (deduped by seq on
+        // replay, like every lifecycle line).
+        assert!(
+            notice.contains("finished completed · 1.5k tok"),
+            "usage suffix: {notice}"
         );
         assert!(
             notice.contains("the gate lives in src/tools"),

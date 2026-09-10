@@ -2141,10 +2141,14 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     push_info(&mut remote.app, "sessions:".to_string());
                     for (i, s) in sessions.iter().enumerate() {
                         let name = s.name.as_deref().unwrap_or("(unnamed)");
-                        push_info(
-                            &mut remote.app,
-                            format!("  {}: {} ({})", i, name, s.session_id),
-                        );
+                        let mut row = format!("  {}: {} ({})", i, name, s.session_id);
+                        if s.child_agents > 0 {
+                            row.push_str(&format!(" · {} agent run(s)", s.child_agents));
+                        }
+                        if s.interrupted_children > 0 {
+                            row.push_str(&format!(" · {} interrupted", s.interrupted_children));
+                        }
+                        push_info(&mut remote.app, row);
                     }
                     push_info(
                         &mut remote.app,

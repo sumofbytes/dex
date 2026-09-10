@@ -35,7 +35,7 @@ use crate::core::unwind::CatchUnwind;
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
 use super::instance::{AgentId, AgentInstance, AgentState};
-use super::result::AgentResult;
+use super::result::{AgentResult, AgentUsage};
 
 /// Max live children per session (plan §7). The 5th concurrent spawn is
 /// rejected with the running list so the caller can wait on or cancel one
@@ -54,15 +54,43 @@ const WAIT_POLL: Duration = Duration::from_millis(25);
 /// Completion announcement queued for the Phase 6 drain site (parent turn
 /// end, which renders these into context). Notices are informational only —
 /// the retained [`AgentResult`] is the source of truth.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AgentNotice {
     pub(crate) agent_id: AgentId,
     pub(crate) name: String,
     pub(crate) status: AgentState,
+    /// Child token spend, when the body reported any (§18: the lifecycle
+    /// line carries it so client-side spend accounting stays honest).
+    pub(crate) usage: Option<AgentUsage>,
+}
+
+impl AgentNotice {
+    /// The §15 V1a lifecycle line: the stable `[agent <name>:<id>] finished
+    /// <status>` prefix the TUI matches on, plus the child's token spend
+    /// when reported. Cost is shown only when priced (an unpriced model
+    /// renders no `$0.0000` noise). Pure; unit-tested.
+    pub(crate) fn text(&self) -> String {
+        let mut text = format!(
+            "[agent {}:{}] finished {}",
+            self.name,
+            self.agent_id,
+            super::status_word(self.status)
+        );
+        if let Some(usage) = self.usage {
+            text.push_str(&format!(
+                " · {} tok",
+                crate::ui::format_tokens(usage.prompt_tokens + usage.output_tokens)
+            ));
+            if usage.cost_usd > 0.0 {
+                text.push_str(&format!(" · ${:.4}", usage.cost_usd));
+            }
+        }
+        text
+    }
 }
 
 /// Bounded-wait outcome for [`AgentManager::wait`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum WaitOutcome {
     /// Terminal result; also retained for later fetch after notice drain.
     Finished(AgentResult),
@@ -311,17 +339,20 @@ impl AgentManager {
                         status: AgentState::Failed,
                         summary: String::new(),
                         error: Some(panicked),
+                        usage: None,
                     },
                     Err(_elapsed) => AgentResult {
                         status: AgentState::TimedOut,
                         summary: String::new(),
                         error: Some(format!("timed out after {}s", timeout.as_secs())),
+                        usage: None,
                     },
                 },
                 () = token.cancelled() => AgentResult {
                     status: AgentState::Cancelled,
                     summary: String::new(),
                     error: Some("cancelled".to_string()),
+                    usage: None,
                 },
             };
             manager.finish(&task_id, &name, result.clone());
@@ -354,6 +385,9 @@ impl AgentManager {
             agent_id: id.clone(),
             name: name.to_string(),
             status,
+            // Copied from the retained result, so the notice can never
+            // disagree with the record the parent later fetches.
+            usage: inner.results.get(id).and_then(|result| result.usage),
         };
         if inner.notices.len() >= MAX_NOTICES {
             inner.overflowed += 1;
@@ -504,6 +538,7 @@ mod tests {
             status: AgentState::Completed,
             summary: summary.to_string(),
             error: None,
+            usage: None,
         }
     }
 
@@ -512,6 +547,7 @@ mod tests {
             status: AgentState::Failed,
             summary: String::new(),
             error: Some(error.to_string()),
+            usage: None,
         }
     }
 
@@ -527,6 +563,7 @@ mod tests {
             status: AgentState::Cancelled,
             summary: String::new(),
             error: Some("child saw cancel".to_string()),
+            usage: None,
         }
     }
 
@@ -615,6 +652,7 @@ mod tests {
                 agent_id: id,
                 name: "explorer".to_string(),
                 status: AgentState::Completed,
+                usage: None,
             }]
         );
         assert_eq!(mgr.take_overflow(), 0);
@@ -926,5 +964,86 @@ mod tests {
         }
         // Finished children carry no live progress.
         assert_eq!(mgr.progress(&id), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_child_failing_does_not_disturb_a_sibling() {
+        // §22-H: results map to their own ids and a sibling's run is
+        // independent of a failure — no shared-state corruption, no
+        // cascade.
+        let mgr = AgentManager::new("sess");
+        let doomed = mgr
+            .spawn(&test_def("doomed"), test_seed(), |_, _, _| async {
+                failed("boom")
+            })
+            .unwrap();
+        let sibling = mgr
+            .spawn(&test_def("sibling"), test_seed(), |_, _, _| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                completed("fine")
+            })
+            .unwrap();
+        match mgr.wait(&doomed, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Failed);
+                assert_eq!(result.error.as_deref(), Some("boom"));
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        match mgr.wait(&sibling, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Completed);
+                assert_eq!(result.summary, "fine");
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert_eq!(mgr.active_count(), 0);
+        let notices = mgr.drain_notices();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].status, AgentState::Failed);
+        assert_eq!(notices[1].status, AgentState::Completed);
+    }
+
+    #[test]
+    fn notice_text_carries_usage_and_hides_unpriced_cost() {
+        // §18: the lifecycle line carries the child's own spend, deduped
+        // by seq on replay like every other lifecycle line.
+        let notice = AgentNotice {
+            agent_id: AgentId("sess-3".to_string()),
+            name: "explorer".to_string(),
+            status: AgentState::Completed,
+            usage: Some(AgentUsage {
+                prompt_tokens: 1_200,
+                output_tokens: 300,
+                cost_usd: 0.0312,
+            }),
+        };
+        assert_eq!(
+            notice.text(),
+            "[agent explorer:sess-3] finished completed · 1.5k tok · $0.0312"
+        );
+        // Unpriced model: tokens yes, no `$0.0000` noise.
+        let unpriced = AgentNotice {
+            agent_id: AgentId("sess-3".to_string()),
+            name: "explorer".to_string(),
+            status: AgentState::Completed,
+            usage: Some(AgentUsage {
+                prompt_tokens: 1,
+                output_tokens: 2,
+                cost_usd: 0.0,
+            }),
+        };
+        assert_eq!(
+            unpriced.text(),
+            "[agent explorer:sess-3] finished completed · 3 tok"
+        );
+        // Wrapper-synthesized endings carry no usage row at all.
+        let bare = AgentNotice {
+            agent_id: AgentId("sess-3".to_string()),
+            name: "explorer".to_string(),
+            status: AgentState::Completed,
+            usage: None,
+        };
+        assert_eq!(bare.text(), "[agent explorer:sess-3] finished completed");
     }
 }

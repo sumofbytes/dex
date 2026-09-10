@@ -36,7 +36,7 @@ use super::context::ContextSeed;
 use super::definition::AgentDefinition;
 use super::instance::{AgentId, AgentState};
 use super::manager::{AgentManager, ProgressReporter, WaitOutcome};
-use super::result::AgentResult;
+use super::result::{AgentResult, AgentUsage};
 
 /// The three model-facing delegation tools (§10). Background is the only
 /// spawn mode — no `run_in_background` flag to forget.
@@ -361,6 +361,7 @@ async fn child_run(
                 status: AgentState::Failed,
                 summary: String::new(),
                 error: Some(format!("agent model '{model}' failed to resolve: {error}")),
+                usage: None,
             };
         }
     }
@@ -375,6 +376,7 @@ async fn child_run(
                 status: AgentState::Failed,
                 summary: String::new(),
                 error: Some(format!("child session could not be created: {error}")),
+                usage: None,
             };
         }
     };
@@ -395,11 +397,14 @@ async fn child_run(
     let console = Console::new(sink_tx, approval_tx);
     console.seed_session_approvals(ctx.session_approvals.clone());
     let last_assistant = Arc::new(Mutex::new(None::<String>));
+    let usage = Arc::new(Mutex::new(AgentUsage::default()));
     let capture = last_assistant.clone();
-    // The child's sink lines drive two things: the §6 partial-summary
-    // capture (last assistant text) and the §15 progress label (the tool
-    // the child is currently running, read by `delegate_output`).
-    tokio::spawn(async move {
+    let tally = usage.clone();
+    // The child's sink lines drive three things: the §6 partial-summary
+    // capture (last assistant text), the §15 progress label (the tool the
+    // child is currently running, read by `delegate_output`), and the §18
+    // usage tally (each `record_usage` emission folds into the result).
+    let consumer = tokio::spawn(async move {
         while let Some(line) = sink_rx.recv().await {
             match line {
                 SinkLine::Assistant(text) => {
@@ -411,6 +416,17 @@ async fn child_run(
                     progress.set(name);
                 }
                 SinkLine::ToolOutput { .. } => progress.clear(),
+                SinkLine::Usage {
+                    tokens,
+                    output,
+                    cost,
+                    ..
+                } => {
+                    tally
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .absorb(tokens, output, cost);
+                }
                 _ => {}
             }
         }
@@ -446,6 +462,13 @@ async fn child_run(
         tool_budget: def.max_tool_iterations.map(|n| n as usize),
     })
     .await;
+    // Dropping the console closes the child sink, so the consumer drains
+    // every buffered line and exits — awaiting it makes the captured
+    // summary and §18 usage deterministic instead of racing the last
+    // sends. (`SinkLine::Usage` is emitted per LLM call, after the final
+    // assistant text.)
+    drop(console);
+    let _ = consumer.await;
     let _ = session.turn_event(if result.is_ok() {
         "turn_complete"
     } else {
@@ -456,6 +479,7 @@ async fn child_run(
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default();
+    let usage = usage.lock().unwrap_or_else(|e| e.into_inner()).reported();
     match result {
         // Completed guarantees a non-empty summary (§6): an empty final
         // message is not a usable result.
@@ -463,16 +487,19 @@ async fn child_run(
             status: AgentState::Completed,
             summary: text,
             error: None,
+            usage,
         },
         Ok(_) => AgentResult {
             status: AgentState::Failed,
             summary: partial,
             error: Some("child ended without a final message".to_string()),
+            usage,
         },
         Err(error) => AgentResult {
             status: AgentState::Failed,
             summary: partial,
             error: Some(error.to_string()),
+            usage,
         },
     }
 }
@@ -569,5 +596,66 @@ mod tests {
         if crate::llm::prompt::project_context().is_some() {
             assert!(prompt.contains("--- Project instructions ---"), "{prompt}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parent_cancel_ends_delegate_output_without_touching_children() {
+        // §22-I: the parent's cancel token ends the `delegate_output` wait
+        // early (the deadline is minutes away, so an instant return proves
+        // the token drove it) — and the child keeps running untouched.
+        let manager = AgentManager::new("sess");
+        let ctx = Arc::new(AgentTurnContext {
+            session_id: "sess".to_string(),
+            // No real child body runs here, so the parent path is never touched.
+            session_path: PathBuf::new(),
+            cwd: String::new(),
+            config: Arc::new(crate::llm::config::tests::test_cfg()),
+            manager: manager.clone(),
+            session_approvals: HashSet::new(),
+        });
+        let id = manager
+            .spawn(
+                &super::super::builtin_definitions()
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ContextSeed {
+                    task: "do the thing".to_string(),
+                    file_hints: Vec::new(),
+                    parent_summary: None,
+                },
+                // Ends only through its own token: parent cancel must not
+                // reach it.
+                |token, _progress, _id| async move {
+                    token.cancelled().await;
+                    AgentResult {
+                        status: AgentState::Cancelled,
+                        summary: String::new(),
+                        error: Some("child saw cancel".to_string()),
+                        usage: None,
+                    }
+                },
+            )
+            .unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut args = Map::new();
+        args.insert("agent_id".into(), json!(id.to_string()));
+        let wait =
+            tokio::time::timeout(Duration::from_secs(5), delegate_output(&ctx, &args, &token))
+                .await;
+        match wait {
+            Ok(Ok(out)) => {
+                let value: Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(value["state"], "running");
+            }
+            other => panic!("expected a fast running report, got {other:?}"),
+        }
+        // Untouched: still live, still Running, still its own cancel token.
+        assert_eq!(manager.active_count(), 1);
+        assert_eq!(manager.status(&id), Some(AgentState::Running));
+        // Cleanup: cancel + join so no task outlives the test.
+        manager.shutdown().await;
+        assert_eq!(manager.active_count(), 0);
     }
 }

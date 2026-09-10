@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::{status_word, AgentManager, AgentNotice};
+use crate::agent::subagent::{AgentManager, AgentNotice};
 use crate::core::console::CancellationToken;
 use crate::core::types::ApprovalDecision;
 use crate::protocol::StreamEvent;
@@ -464,12 +464,6 @@ impl DaemonState {
 /// timed out/panic) lands here at completion time, even while no turn is
 /// live, so a client's `?since=` poll picks it up without a turn.
 fn journal_agent_notice(state: &DaemonState, session_id: &str, notice: &AgentNotice) {
-    let text = format!(
-        "[agent {}:{}] finished {}",
-        notice.name,
-        notice.agent_id,
-        status_word(notice.status)
-    );
     let seq = state.next_seq(session_id);
     let path = state
         .sessions
@@ -481,7 +475,7 @@ fn journal_agent_notice(state: &DaemonState, session_id: &str, notice: &AgentNot
         return;
     };
     if let Ok(mut journal) = crate::session::Session::from_path(&path) {
-        let event = StreamEvent::System(text);
+        let event = StreamEvent::System(notice.text());
         let _ = journal.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
     }
 }
@@ -596,6 +590,7 @@ mod tests {
             status: AgentState::Completed,
             summary: "done".to_string(),
             error: None,
+            usage: None,
         }
     }
 
@@ -609,6 +604,7 @@ mod tests {
             status: AgentState::Cancelled,
             summary: String::new(),
             error: Some("child saw cancel".to_string()),
+            usage: None,
         }
     }
 
