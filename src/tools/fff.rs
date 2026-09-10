@@ -109,11 +109,13 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
         .and_then(Value::as_u64)
         .map(|n| n.max(1) as usize)
         .unwrap_or(50);
+    let file_offset = args.get("file_offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let context = args
         .get("context")
         .and_then(Value::as_u64)
         .map(|n| n.min(10) as usize)
         .unwrap_or(0);
+    let matches_per_file = if files_mode { 1 } else { 10 };
 
     with_picker(|p| {
         let parser = QueryParser::new(::fff::AiGrepConfig);
@@ -124,7 +126,8 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
             GrepMode::PlainText
         };
         let options = GrepSearchOptions {
-            max_matches_per_file: if files_mode { 1 } else { 10 },
+            max_matches_per_file: matches_per_file,
+            file_offset,
             page_limit: head_limit,
             mode,
             time_budget_ms: GREP_TIME_BUDGET_MS,
@@ -136,6 +139,12 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
         };
         let result = p.grep(&parsed, &options);
         if result.matches.is_empty() {
+            // A paged continuation that finds nothing is an honest empty
+            // page (the remaining files don't match); fuzzy retry would
+            // resurface files from before the offset.
+            if file_offset > 0 {
+                return Ok("0 matches.".to_string());
+            }
             // Typo tolerance: retry the query as fuzzy before giving up.
             let fuzzy_query: String = parsed
                 .grep_text()
@@ -169,7 +178,13 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
                     out.push_str(&format!("\n{file}"));
                     last_file = file;
                 }
-                out.push_str(&format!("  {}: {}", m.line_number, m.line_content));
+                // Files mode lists paths only: detail rows would pollute
+                // the path list (and the files-matched summary). Each
+                // detail gets its own line so content rows stay `N: code`
+                // shaped for the summary counter and search preview.
+                if !files_mode {
+                    out.push_str(&format!("\n  {}: {}", m.line_number, m.line_content));
+                }
             }
             return Ok(out);
         }
@@ -207,10 +222,29 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
                 }
             }
         }
+        // Truncation summary, read's trailer standard: say what was shown,
+        // that more was left unscanned, and how to continue. Without
+        // pagination the model could only widen head_limit blindly.
         if result.next_file_offset != 0 {
-            out.push_str(
-                "\n[... more matching files exist; narrow the query or raise head_limit ...]",
-            );
+            let (kind, shown) = if files_mode {
+                ("files", result.files.len())
+            } else {
+                ("matches", result.matches.len())
+            };
+            out.push_str(&format!(
+                "\n[... {shown} {kind} shown, more files unscanned; continue with file_offset {} or raise head_limit ...]",
+                result.next_file_offset
+            ));
+        } else if !files_mode
+            && !result.files.is_empty()
+            && result.matches.len() == result.files.len() * matches_per_file
+        {
+            // No pagination but every file sat at the per-file cap: matches
+            // were likely dropped inside the files already shown. Say so
+            // instead of truncating silently.
+            out.push_str(&format!(
+                "\n[... every file hit the {matches_per_file}-match cap; matches may be missing — narrow the query ...]"
+            ));
         }
         Ok(out)
     })

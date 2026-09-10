@@ -109,6 +109,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                         "pattern": { "type": "string", "description": "text or regex to search; may include path prefixes ('src/') and excludes ('!tests/')" },
                         "output_mode": { "type": "string", "enum": ["files", "content"], "description": "files (default): paths only; content: path:line:text" },
                         "head_limit": { "type": "integer", "description": "maximum results (default 50)" },
+"file_offset": { "type": "integer", "description": "file index to resume from when a result ends with a '[... shown, more files unscanned; continue with file_offset ...]' trailer" },
                         "context": { "type": "integer", "description": "lines of context around each match in content mode (0-10, default 0)" }
                     },
                     "required": ["pattern"]
