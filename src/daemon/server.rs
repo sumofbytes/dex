@@ -1678,7 +1678,16 @@ async fn session_shell(
         "command".to_string(),
         serde_json::Value::String(command.clone()),
     );
-    let (output, success, code) = match crate::tools::execute("bash", &args, &shell_cancel).await {
+    // Explicit user `!` invocation: the `!` itself is the approval, so this
+    // runs trusted (same rationale as `execute_sync` for `dex run`).
+    let (output, success, code) = match crate::tools::execute(
+        "bash",
+        &args,
+        &shell_cancel,
+        &crate::tools::Policy::trusted(),
+    )
+    .await
+    {
         Ok(output) => (output, true, Some(0)),
         Err(error) => {
             // Same `Error: …` shape `execute_outcome` gives the agent loop
@@ -2527,7 +2536,9 @@ mod e2e_tests {
         .unwrap();
         chat_result.unwrap();
 
-        // Default is trusted, so write succeeds without approval.
+        // ask-writes is enforced at dispatch: exactly one prompt for the
+        // write (previously nothing ever sent on the approval channel, so
+        // the write ran unprompted despite DEX_PERMISSION=ask-writes).
         let approvals: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -2535,18 +2546,18 @@ mod e2e_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(approvals, Vec::<String>::new(), "{events:?}");
+        assert_eq!(approvals, vec!["write".to_string()], "{events:?}");
 
-        // The write tool should succeed and create the file.
+        // The client denied it: the tool fails closed and touches nothing.
         assert!(
             events.iter().any(|e| matches!(e,
                 crate::protocol::StreamEvent::ToolResult { name, success, .. }
-                if name == "write" && *success)),
-            "write must surface as successful ToolResult: {events:?}"
+                if name == "write" && !*success)),
+            "denied write must surface as failed ToolResult: {events:?}"
         );
         assert!(
-            std::path::Path::new("evil.txt").exists(),
-            "write must touch disk when trusted"
+            !std::path::Path::new("evil.txt").exists(),
+            "denied write must not touch disk"
         );
 
         // The turn completed with the model's final text.

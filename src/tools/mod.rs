@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::agent::state::{wait_cancelled, CancellationSource};
+use crate::core::console::Console;
 use crate::core::format::clamp_lines;
+use crate::core::types::{ApprovalDecision, ApprovalRequest, PermissionMode};
 use tokio::io::AsyncReadExt as _;
 
 #[cfg(unix)]
@@ -157,6 +159,11 @@ pub(crate) enum ToolError {
     /// An internal tool-engine failure (not a bad invocation, not a shell
     /// exit): e.g. the fff index failed to initialize.
     Internal(String),
+    /// The permission policy refused the call before it ran: a read-only
+    /// rejection, a user deny, an unanswered approval (approver gone), or
+    /// approval needed with no channel to ask on. Never inferred from tool
+    /// output — decided by the Phase 0 gate in `execute`.
+    Denied(String),
     Unknown(String),
 }
 
@@ -280,6 +287,7 @@ impl std::fmt::Display for ToolError {
                 None => write!(f, "{output}"),
             },
             Self::Internal(e) => write!(f, "{e}"),
+            Self::Denied(message) => write!(f, "permission denied: {message}"),
             Self::Unknown(t) => write!(f, "unknown tool '{}'", t),
         }
     }
@@ -1091,6 +1099,7 @@ const CHAIN_MAX_STEPS: usize = 4;
 async fn tool_chain(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
 ) -> Result<String, ToolError> {
     let steps = args
         .get("steps")
@@ -1110,7 +1119,7 @@ async fn tool_chain(
 
     let mut completed: Vec<(String, String)> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
-        match run_chain_step(step, index, &completed, cancel).await {
+        match run_chain_step(step, index, &completed, cancel, policy).await {
             Ok(pair) => completed.push(pair),
             Err(error) => {
                 let mut text = render_chain_steps(&completed);
@@ -1145,6 +1154,7 @@ async fn run_chain_step(
     index: usize,
     completed: &[(String, String)],
     cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
 ) -> Result<(String, String), ToolError> {
     let invalid = |message: String| ToolError::InvalidArgument(format!("step {index}: {message}"));
     let obj = step
@@ -1211,7 +1221,7 @@ async fn run_chain_step(
         );
     }
 
-    let output = Box::pin(execute(tool, &step_args, cancel)).await?;
+    let output = Box::pin(execute(tool, &step_args, cancel, policy)).await?;
     Ok((tool.to_string(), output))
 }
 
@@ -1246,12 +1256,144 @@ fn extract_search_paths(
     Ok(paths)
 }
 
+/// The permission context a tool call runs under (Phase 0 gate). `mode`
+/// is the turn's `PermissionMode` (from `LlmConfig::permission`);
+/// `console` carries the approval channel plus the live session-approval
+/// set. Owned (not borrowed) so concurrent fan-out tasks can each hold a
+/// copy; the console clone shares the turn's live session-approval set, so
+/// build one `Policy` per turn and reuse it for the whole turn — same-turn
+/// allow-for-session records are then visible to every later call.
+/// `Policy::trusted()` (no console) preserves the old behavior for explicit
+/// user-invoked paths (`dex run`, `--tool`, the `!` escape): the `!` itself
+/// is the approval there.
+#[derive(Clone)]
+pub(crate) struct Policy {
+    pub(crate) mode: PermissionMode,
+    pub(crate) console: Option<Console>,
+}
+
+impl Policy {
+    pub(crate) fn trusted() -> Self {
+        Self {
+            mode: PermissionMode::Trusted,
+            console: None,
+        }
+    }
+
+    pub(crate) fn turn(mode: PermissionMode, console: &Console) -> Self {
+        Self {
+            mode,
+            console: Some(console.clone()),
+        }
+    }
+}
+
+/// Phase 0 approval gate: dispatch consults the turn's policy before any
+/// tool runs. Reads always pass; `trusted` passes everything; `ask-shell`
+/// passes file mutations (only shell prompts); everything else mutating
+/// parks an `ApprovalRequest` on the console's approval channel and blocks
+/// for the verdict, with session approvals short-circuiting first.
+/// Denial, cancellation, and no-channel surface as `ToolError::Denied` —
+/// the loop records it as a failed tool result, and the post-fan-out
+/// cancellation check still unwinds a turn cancelled mid-prompt.
+async fn enforce_policy(
+    name: &str,
+    args: &Map<String, Value>,
+    requirement: PermissionRequirement,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
+) -> Result<(), ToolError> {
+    let needs_approval = match (requirement, policy.mode) {
+        (PermissionRequirement::Read, _) => false,
+        (_, PermissionMode::Trusted) => false,
+        // ask-shell permits reads and file mutations; only shell prompts.
+        (PermissionRequirement::Write, PermissionMode::AskShell) => false,
+        _ => true,
+    };
+    if !needs_approval {
+        return Ok(());
+    }
+    if policy.mode == PermissionMode::ReadOnly {
+        return Err(ToolError::Denied(format!(
+            "{name} is not allowed in read-only mode"
+        )));
+    }
+    let Some(console) = policy.console.as_ref() else {
+        return Err(ToolError::Denied(format!(
+            "{name} needs approval ({} mode) but no approval channel is attached",
+            policy.mode.as_str()
+        )));
+    };
+    let input = serde_json::Value::Object(args.clone()).to_string();
+    if console.session_approved(name, &input) {
+        return Ok(());
+    }
+    let Some(sender) = console.approval() else {
+        return Err(ToolError::Denied(format!(
+            "{name} needs approval but no approval channel is attached"
+        )));
+    };
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(ApprovalRequest {
+            name: name.to_string(),
+            input: input.clone(),
+            response: response_tx,
+        })
+        .await
+        .map_err(|_| {
+            ToolError::Denied(format!(
+                "{name} needs approval but the approval channel is closed"
+            ))
+        })?;
+    let decision = tokio::select! {
+        () = wait_cancelled(cancel) => {
+            return Err(ToolError::Denied(
+                "cancelled while awaiting approval".to_string(),
+            ));
+        }
+        verdict = response_rx.recv() => verdict,
+    };
+    match decision {
+        Some(ApprovalDecision::Once) => Ok(()),
+        Some(ApprovalDecision::Session) => {
+            // Same-turn repeats skip the prompt via the turn policy's
+            // console copy; the daemon's /approve handler persists to its
+            // session map for later turns (the console is per-turn).
+            console.record_session_approval(name, &input);
+            Ok(())
+        }
+        Some(ApprovalDecision::Deny) => {
+            Err(ToolError::Denied(format!("{name} denied by approver")))
+        }
+        None => Err(ToolError::Denied(format!(
+            "{name} approval went unanswered; treating as denied"
+        ))),
+    }
+}
+
 /// Execute a tool using paths confined to the current workspace.
 pub(crate) async fn execute(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
 ) -> Result<String, ToolError> {
+    let requirement = if name.starts_with("mcp__") {
+        // MCP tools are external processes: most restrictive gate, same as
+        // shell. Resolved here so the gate below covers them too.
+        PermissionRequirement::Shell
+    } else if let Some(meta) = metadata(name) {
+        meta.permission
+    } else {
+        let error = ToolError::Unknown(name.to_string());
+        audit(name, args, &error.to_string());
+        return Err(error);
+    };
+    if let Err(error) = enforce_policy(name, args, requirement, cancel, policy).await {
+        audit(name, args, &error.to_string());
+        return Err(error);
+    }
     if name.starts_with("mcp__") {
         let result = crate::mcp::call_global(name, args, cancel).await;
         let outcome = match &result {
@@ -1260,11 +1402,6 @@ pub(crate) async fn execute(
         };
         audit(name, args, &outcome);
         return result.map_err(ToolError::Internal);
-    }
-    if metadata(name).is_none() {
-        let error = ToolError::Unknown(name.to_string());
-        audit(name, args, &error.to_string());
-        return Err(error);
     }
     // fff owns its threads + lock; run inside spawn_blocking (10s grep budget stays).
     if matches!(name, "grep" | "ffgrep" | "find" | "fffind") {
@@ -1291,7 +1428,7 @@ pub(crate) async fn execute(
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
         "ls" => tool_ls(args).await,
         "git" => tool_git(args, cancel).await,
-        "chain" => tool_chain(args, cancel).await,
+        "chain" => tool_chain(args, cancel, policy).await,
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
     let outcome = match &result {
@@ -1309,6 +1446,7 @@ pub(crate) async fn execute_outcome(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
 ) -> ToolOutcome {
     // Capture the unified diff BEFORE `execute` mutates the file; the
     // before-image is gone afterwards. Display-only: it never reaches the
@@ -1318,7 +1456,7 @@ pub(crate) async fn execute_outcome(
     } else {
         None
     };
-    match execute(name, args, cancel).await {
+    match execute(name, args, cancel, policy).await {
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
@@ -1333,13 +1471,14 @@ pub(crate) async fn execute_outcome(
 }
 
 /// Sync wrappers for `dex run <tool>` / `dex --tool` raw paths (no async CLI
-/// plumbing needed per plan §5).
+/// plumbing needed per plan §5). Explicit user invocations run trusted —
+/// the command itself is the approval — so no policy parameter.
 pub(crate) fn execute_sync(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
-    crate::client::http::block_on(execute(name, args, cancel))
+    crate::client::http::block_on(execute(name, args, cancel, &Policy::trusted()))
 }
 
 #[cfg(test)]
@@ -1395,13 +1534,13 @@ mod tests {
     async fn tool_arguments_are_validated() {
         let args = Map::new();
         assert!(matches!(
-            execute("read", &args, &GlobalCancellation).await,
+            execute("read", &args, &GlobalCancellation, &Policy::trusted()).await,
             Err(ToolError::Missing("path"))
         ));
         let mut args = Map::new();
         args.insert("path".into(), Value::Bool(true));
         assert!(matches!(
-            execute("read", &args, &GlobalCancellation).await,
+            execute("read", &args, &GlobalCancellation, &Policy::trusted()).await,
             Err(ToolError::NotString("path"))
         ));
     }
@@ -1411,13 +1550,13 @@ mod tests {
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("*".into()));
         assert!(matches!(
-            execute("fffind", &args, &GlobalCancellation).await,
+            execute("fffind", &args, &GlobalCancellation, &Policy::trusted()).await,
             Err(ToolError::InvalidArgument(_))
         ));
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("".into()));
         assert!(matches!(
-            execute("ffgrep", &args, &GlobalCancellation).await,
+            execute("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await,
             Err(ToolError::InvalidArgument(_))
         ));
     }
@@ -1431,12 +1570,20 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("content".into(), Value::String("first\n".into()));
-        assert!(execute("write", &args, &GlobalCancellation).await.is_ok());
+        assert!(
+            execute("write", &args, &GlobalCancellation, &Policy::trusted())
+                .await
+                .is_ok()
+        );
         // Content round-trips and no `.dex-write-*` temp file survives.
         assert_eq!(fs::read_to_string(&full).unwrap(), "first\n");
         args.insert("oldText".into(), Value::String("first".into()));
         args.insert("newText".into(), Value::String("second".into()));
-        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
+        assert!(
+            execute("edit", &args, &GlobalCancellation, &Policy::trusted())
+                .await
+                .is_ok()
+        );
         assert_eq!(fs::read_to_string(&full).unwrap(), "second\n");
         let strays: Vec<_> = fs::read_dir(cwd.join("target"))
             .unwrap()
@@ -1465,11 +1612,19 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("content".into(), Value::String("#!/bin/sh\n".into()));
-        assert!(execute("write", &args, &GlobalCancellation).await.is_ok());
+        assert!(
+            execute("write", &args, &GlobalCancellation, &Policy::trusted())
+                .await
+                .is_ok()
+        );
         std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
         args.insert("oldText".into(), Value::String("#!/bin/sh".into()));
         args.insert("newText".into(), Value::String("#!/bin/sh\necho hi".into()));
-        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
+        assert!(
+            execute("edit", &args, &GlobalCancellation, &Policy::trusted())
+                .await
+                .is_ok()
+        );
         let mode = std::fs::metadata(&full).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "edit must not strip +x");
         let _ = fs::remove_file(&full);
@@ -1547,7 +1702,11 @@ mod tests {
         args.insert("oldText".into(), Value::String("v1".into()));
         args.insert("newText".into(), Value::String("v2".into()));
         args.insert("expected_hash".into(), Value::String(h.clone()));
-        assert!(execute("edit", &args, &GlobalCancellation).await.is_ok());
+        assert!(
+            execute("edit", &args, &GlobalCancellation, &Policy::trusted())
+                .await
+                .is_ok()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
 
         // Stale expected_hash: rejected, file untouched.
@@ -1557,7 +1716,7 @@ mod tests {
         stale.insert("newText".into(), Value::String("v3".into()));
         stale.insert("expected_hash".into(), Value::String("deadbeef".into()));
         assert!(matches!(
-            execute("edit", &stale, &GlobalCancellation).await,
+            execute("edit", &stale, &GlobalCancellation, &Policy::trusted()).await,
             Err(ToolError::StaleFile { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
@@ -1619,7 +1778,7 @@ mod tests {
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("oldText".into(), Value::String("b\n".into()));
         args.insert("newText".into(), Value::String("B\n".into()));
-        let outcome = execute_outcome("edit", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("edit", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         let diff = outcome.diff.expect("edit outcome carries a diff");
         assert!(diff.contains("-b"), "{diff}");
@@ -1721,7 +1880,7 @@ mod tests {
 
         let mut args = Map::new();
         args.insert("path".into(), Value::String(path.display().to_string()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         // Line numbers are now right-aligned with two spaces (no raw tab) and file
         // tabs are expanded per tab_width, so the separator is stable.
@@ -1732,11 +1891,11 @@ mod tests {
 
         args.insert("offset".into(), Value::Number(2.into()));
         args.insert("limit".into(), Value::Number(1.into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert_eq!(outcome.text, "   2  two");
 
         args.insert("offset".into(), Value::Number(9.into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(!outcome.ok, "offset past end must fail: {}", outcome.text);
 
         // Binary content is refused instead of dumped into the context.
@@ -1746,7 +1905,7 @@ mod tests {
             "path".into(),
             Value::String(root.join("blob.bin").display().to_string()),
         );
-        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("binary file"), "{}", outcome.text);
 
@@ -1774,7 +1933,7 @@ mod tests {
                 Value::String(root.join("b.txt").display().to_string()),
             ]),
         );
-        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("==> "), "{}", outcome.text);
         assert!(outcome.text.contains("   1  alpha"), "{}", outcome.text);
@@ -1784,7 +1943,7 @@ mod tests {
         // Glob fan-out, sorted, capped.
         let mut args = Map::new();
         args.insert("glob".into(), Value::String("*.txt".into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("a.txt"), "{}", outcome.text);
         assert!(outcome.text.contains("b.txt"), "{}", outcome.text);
@@ -1812,7 +1971,8 @@ mod tests {
         args.insert("pattern".into(), Value::String(needle.clone()));
         args.insert("output_mode".into(), Value::String("content".into()));
         args.insert("context".into(), Value::Number(1.into()));
-        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("before"), "{}", outcome.text);
         assert!(outcome.text.contains("after"), "{}", outcome.text);
@@ -1843,7 +2003,8 @@ mod tests {
             Value::String(format!("UserAccountControlel{}", "r")),
         );
         args.insert("output_mode".into(), Value::String("content".into()));
-        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("approximate"), "{}", outcome.text);
         assert!(
@@ -1877,7 +2038,8 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("--- step 0: ffgrep ---"),
@@ -1905,7 +2067,8 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("read-only"), "{}", outcome.text);
 
@@ -1919,7 +2082,8 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("earlier step"), "{}", outcome.text);
 
@@ -1933,7 +2097,8 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome = execute_outcome("chain", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("step 0: ffgrep") && outcome.text.contains("step 1 failed"),
@@ -1952,7 +2117,8 @@ mod tests {
         let needle = format!("zxq{}wvut", std::process::id());
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String(needle));
-        let outcome = execute_outcome("ffgrep", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(
             outcome.ok,
             "no matches (exact or fuzzy) must be ok: {}",
@@ -1970,7 +2136,8 @@ mod tests {
         super::fff::rescan();
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("tools mod".into()));
-        let outcome = execute_outcome("fffind", &args, &GlobalCancellation).await;
+        let outcome =
+            execute_outcome("fffind", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("src/tools/mod.rs"),
@@ -1983,7 +2150,7 @@ mod tests {
     async fn failed_shell_command_keeps_output_and_exit_marker() {
         let mut args = Map::new();
         args.insert("command".into(), Value::String("echo boom; exit 2".into()));
-        let outcome = execute_outcome("bash", &args, &GlobalCancellation).await;
+        let outcome = execute_outcome("bash", &args, &GlobalCancellation, &Policy::trusted()).await;
         assert!(!outcome.ok);
         assert!(outcome.text.contains("boom"));
         assert!(outcome.text.contains("[exit 2]"));
@@ -2015,7 +2182,9 @@ mod tests {
             ),
         );
         // Use workspace_path resolution via execute (paths confined).
-        let out = execute("read", &args, &GlobalCancellation).await.unwrap();
+        let out = execute("read", &args, &GlobalCancellation, &Policy::trusted())
+            .await
+            .unwrap();
         // All good files present, in input order (==> path <== sections sorted by input, not completion).
         let mut last_pos = 0;
         for i in 0..5 {
@@ -2086,7 +2255,7 @@ mod tests {
             "command".to_string(),
             serde_json::Value::String("sleep 30".to_string()),
         );
-        let outcome = execute_outcome("bash", &args, &cancel).await;
+        let outcome = execute_outcome("bash", &args, &cancel, &Policy::trusted()).await;
         assert!(!outcome.ok);
         assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
     }
@@ -2112,7 +2281,9 @@ mod tests {
             "command".into(),
             serde_json::Value::String("echo hi".into()),
         );
-        let ok = execute("bash", &args, &GlobalCancellation).await.unwrap();
+        let ok = execute("bash", &args, &GlobalCancellation, &Policy::trusted())
+            .await
+            .unwrap();
         assert!(ok.contains("hi"));
     }
 
@@ -2131,7 +2302,9 @@ mod tests {
         args.insert("path".into(), serde_json::Value::String(rel.into()));
         args.insert("offset".into(), serde_json::Value::from(3u64));
         args.insert("limit".into(), serde_json::Value::from(2u64));
-        let out = execute("read", &args, &GlobalCancellation).await.unwrap();
+        let out = execute("read", &args, &GlobalCancellation, &Policy::trusted())
+            .await
+            .unwrap();
         assert!(out.contains("3"), "{out}");
         assert!(out.contains("line3") && out.contains("line4"));
         assert!(!out.contains("line5"));
@@ -2142,7 +2315,7 @@ mod tests {
             .unwrap();
         let mut bargs = Map::new();
         bargs.insert("path".into(), serde_json::Value::String(bin_rel.into()));
-        let err = execute("read", &bargs, &GlobalCancellation)
+        let err = execute("read", &bargs, &GlobalCancellation, &Policy::trusted())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("binary"), "{err}");
@@ -2160,9 +2333,272 @@ mod tests {
                 serde_json::json!({"tool": "bash", "args": {"command": "echo hi"}}),
             ]),
         );
-        let err = execute("chain", &args, &GlobalCancellation)
+        let err = execute("chain", &args, &GlobalCancellation, &Policy::trusted())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    // Phase 0 gate tests: dispatch consults the turn policy, parks an
+    // approval prompt for mutating calls under ask modes, and blocks for
+    // the verdict. Files land under `target/` (unique per test) with
+    // best-effort cleanup, mirroring the existing tests in this module.
+    use crate::core::console::Console;
+    use crate::core::types::{ApprovalDecision, PermissionMode};
+
+    fn phase0_console() -> (
+        Console,
+        tokio::sync::mpsc::Receiver<crate::core::types::ApprovalRequest>,
+    ) {
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel::<crate::core::types::SinkLine>(16);
+        let (approval_tx, approval_rx) =
+            tokio::sync::mpsc::channel::<crate::core::types::ApprovalRequest>(16);
+        (Console::new(sink_tx, approval_tx), approval_rx)
+    }
+
+    fn phase0_write_args(path: &str) -> Map<String, Value> {
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(path.into()));
+        args.insert("content".into(), Value::String("phase0\n".into()));
+        args
+    }
+
+    #[tokio::test]
+    async fn ask_writes_parks_write_and_blocks_until_allowed() {
+        let rel = "target/phase0-allow.txt";
+        let _ = fs::remove_file(rel);
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::AskWrites, &console);
+        let args = phase0_write_args(rel);
+        let expected_input = Value::Object(args.clone()).to_string();
+        let mut handle = tokio::spawn(async move {
+            execute_outcome("write", &args, &GlobalCancellation, &policy).await
+        });
+        // The call blocks: no outcome before the verdict …
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "write must block for approval under ask-writes"
+        );
+        // … and exactly one prompt is parked.
+        let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .expect("approval prompt must arrive")
+            .expect("approval channel must stay open");
+        assert_eq!(request.name, "write");
+        assert_eq!(request.input, expected_input);
+        request
+            .response
+            .send(ApprovalDecision::Once)
+            .await
+            .expect("agent must still be waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("verdict must unblock the call")
+            .expect("worker panicked");
+        assert!(outcome.ok, "{}", outcome.text);
+        assert_eq!(fs::read_to_string(rel).unwrap(), "phase0\n");
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "exactly one prompt must be parked"
+        );
+        let _ = fs::remove_file(rel);
+    }
+
+    #[tokio::test]
+    async fn ask_writes_deny_blocks_the_write() {
+        let rel = "target/phase0-deny.txt";
+        let _ = fs::remove_file(rel);
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::AskWrites, &console);
+        let args = phase0_write_args(rel);
+        let handle = tokio::spawn(async move {
+            execute_outcome("write", &args, &GlobalCancellation, &policy).await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .expect("approval prompt must arrive")
+            .expect("approval channel must stay open");
+        request
+            .response
+            .send(ApprovalDecision::Deny)
+            .await
+            .expect("agent must still be waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("verdict must unblock the call")
+            .expect("worker panicked");
+        assert!(!outcome.ok);
+        assert!(outcome.text.contains("denied"), "{}", outcome.text);
+        assert!(!std::path::Path::new(rel).exists(), "deny must not write");
+    }
+
+    #[tokio::test]
+    async fn ask_writes_allow_session_skips_the_second_prompt() {
+        let rel = "target/phase0-session.txt";
+        let _ = fs::remove_file(rel);
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::AskWrites, &console);
+        // First identical call prompts; deny it to release the worker.
+        let args = phase0_write_args(rel);
+        let policy2 = policy.clone();
+        let first = tokio::spawn(async move {
+            execute_outcome("write", &args, &GlobalCancellation, &policy2).await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .expect("approval prompt must arrive")
+            .expect("approval channel must stay open");
+        request
+            .response
+            .send(ApprovalDecision::Deny)
+            .await
+            .expect("agent must still be waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("verdict must unblock the call")
+            .expect("worker panicked");
+        assert!(!outcome.ok);
+        assert!(!std::path::Path::new(rel).exists(), "deny must not write");
+        // Second identical call prompts again; allow for session.
+        let args2 = phase0_write_args(rel);
+        let policy3 = policy.clone();
+        let second = tokio::spawn(async move {
+            execute_outcome("write", &args2, &GlobalCancellation, &policy3).await
+        });
+        let request2 = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .expect("second prompt must arrive")
+            .expect("approval channel must stay open");
+        request2
+            .response
+            .send(ApprovalDecision::Session)
+            .await
+            .expect("agent must still be waiting");
+        let outcome2 = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("verdict must unblock the call")
+            .expect("worker panicked");
+        assert!(outcome2.ok, "{}", outcome2.text);
+        // Same-turn repeat: no new prompt, straight through.
+        let args3 = phase0_write_args(rel);
+        let outcome3 = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_outcome("write", &args3, &GlobalCancellation, &policy),
+        )
+        .await
+        .expect("session-approved call must not block");
+        assert!(outcome3.ok, "{}", outcome3.text);
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "no further prompt after allow-for-session"
+        );
+        let _ = fs::remove_file(rel);
+    }
+
+    #[tokio::test]
+    async fn read_only_rejects_write_without_prompt() {
+        let rel = "target/phase0-readonly.txt";
+        let _ = fs::remove_file(rel);
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::ReadOnly, &console);
+        let args = phase0_write_args(rel);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_outcome("write", &args, &GlobalCancellation, &policy),
+        )
+        .await
+        .expect("read-only rejection must not block");
+        assert!(!outcome.ok);
+        assert!(outcome.text.contains("read-only"), "{}", outcome.text);
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "read-only must reject, never prompt"
+        );
+        assert!(!std::path::Path::new(rel).exists());
+    }
+
+    #[tokio::test]
+    async fn trusted_runs_mutations_with_no_channel() {
+        let rel = "target/phase0-trusted.txt";
+        let _ = fs::remove_file(rel);
+        let args = phase0_write_args(rel);
+        let outcome =
+            execute_outcome("write", &args, &GlobalCancellation, &Policy::trusted()).await;
+        assert!(outcome.ok, "{}", outcome.text);
+        assert_eq!(fs::read_to_string(rel).unwrap(), "phase0\n");
+        let _ = fs::remove_file(rel);
+    }
+
+    #[tokio::test]
+    async fn ask_shell_permits_write_but_prompts_shell() {
+        // File mutations need no prompt under ask-shell …
+        let rel = "target/phase0-askshell.txt";
+        let _ = fs::remove_file(rel);
+        let policy = Policy::turn(PermissionMode::AskShell, &Console::none());
+        let args = phase0_write_args(rel);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_outcome("write", &args, &GlobalCancellation, &policy),
+        )
+        .await
+        .expect("ask-shell write must not block");
+        assert!(outcome.ok, "{}", outcome.text);
+        let _ = fs::remove_file(rel);
+        // … while shell still parks exactly one prompt.
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::AskShell, &console);
+        let mut args = Map::new();
+        args.insert("command".into(), Value::String("echo phase0".into()));
+        let handle = tokio::spawn(async move {
+            execute_outcome("bash", &args, &GlobalCancellation, &policy).await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .expect("shell prompt must arrive")
+            .expect("approval channel must stay open");
+        assert_eq!(request.name, "bash");
+        request
+            .response
+            .send(ApprovalDecision::Once)
+            .await
+            .expect("agent must still be waiting");
+        let outcome = tokio::time::timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("verdict must unblock the call")
+            .expect("worker panicked");
+        assert!(outcome.ok, "{}", outcome.text);
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "exactly one prompt must be parked"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_wait_unwinds_on_cancel() {
+        use crate::core::console::CancellationToken;
+        let rel = "target/phase0-cancel.txt";
+        let _ = fs::remove_file(rel);
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::AskWrites, &console);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        let args = phase0_write_args(rel);
+        let handle =
+            tokio::spawn(async move { execute_outcome("write", &args, &cancel2, &policy).await });
+        // Wait for the parked prompt, then cancel instead of answering.
+        let _request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+            .await
+            .expect("approval prompt must arrive")
+            .expect("approval channel must stay open");
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("cancel must unblock the parked call")
+            .expect("worker panicked");
+        assert!(!outcome.ok);
+        assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
+        assert!(!std::path::Path::new(rel).exists());
     }
 }
