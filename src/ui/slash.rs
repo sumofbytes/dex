@@ -253,7 +253,7 @@ pub(super) fn reset_session_state(app: &mut App) {
     app.pending_followups.clear();
     app.cancel_requested = false;
     app.cancel_presses = 0;
-    if let Some(approval) = app.pending_approval.take() {
+    for approval in app.pending_approvals.drain(..) {
         let _ = approval
             .response
             .try_send(crate::core::types::ApprovalDecision::Deny);

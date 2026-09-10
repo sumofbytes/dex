@@ -121,6 +121,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "providers",
     "thinking_effort",
     "mcp_servers",
+    "agent_wake",
     // Deprecated but still honored for old files:
     "active_provider",
     "provider",
@@ -145,6 +146,34 @@ fn warn_once(id: &str, message: &str) {
     {
         eprintln!("dex: {message}");
     }
+}
+
+/// The `agent_wake` knob (§10b V1b): when a completion notice is queued
+/// while the session is idle and a client is plausibly listening, the
+/// daemon runs one wake turn to deliver it. Config `agent_wake:` (default
+/// on) with a `DEX_AGENT_WAKE` kill switch — env beats file, per the
+/// standard precedence. Returns the value plus its origin for `doctor`.
+pub(crate) fn agent_wake_origin() -> (bool, &'static str) {
+    if let Ok(raw) = env::var("DEX_AGENT_WAKE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => return (false, "DEX_AGENT_WAKE"),
+            "1" | "true" | "on" | "yes" => return (true, "DEX_AGENT_WAKE"),
+            _ => {}
+        }
+    }
+    if let Some(enabled) = load_config_file()
+        .as_ref()
+        .and_then(|file| file.get("agent_wake"))
+        .and_then(|value| value.as_bool())
+    {
+        return (enabled, "config: agent_wake");
+    }
+    (true, "built-in default")
+}
+
+/// The wake gate read by the scheduler: `true` unless disabled.
+pub(crate) fn agent_wake_enabled() -> bool {
+    agent_wake_origin().0
 }
 
 /// Selection pointer fallback: `active_provider:` is deprecated — the
@@ -2409,6 +2438,13 @@ pub(crate) fn doctor(
                 },
             };
             row(&mut out, "permission", &perm, &perm_source);
+            let (wake, wake_source) = agent_wake_origin();
+            row(
+                &mut out,
+                "agent wake",
+                if wake { "on" } else { "off" },
+                wake_source,
+            );
 
             // Headers: count per layer, sources joined.
             let mut header_count = 0;

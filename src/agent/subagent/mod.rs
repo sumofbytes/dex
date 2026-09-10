@@ -26,7 +26,9 @@ pub(crate) use definition::{
 #[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
 #[allow(unused_imports)]
-pub(crate) use manager::{AgentManager, AgentNotice, ProgressReporter, SpawnError, WaitOutcome};
+pub(crate) use manager::{
+    AgentEvent, AgentManager, AgentNotice, ProgressReporter, SpawnError, WaitOutcome,
+};
 #[allow(unused_imports)]
 pub(crate) use result::AgentResult;
 pub(crate) use tools::{
