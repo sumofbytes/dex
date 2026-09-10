@@ -452,11 +452,16 @@ fn setup_guide_error() -> String {
     let path = config_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/dex/config.yaml".to_string());
+    // Model ids ride the providers' own defaults so the catalog can move
+    // without this text rotting; the gateway shape mirrors the README.
+    let anthropic_model = Provider::Anthropic.default_model();
+    let opencode_model = Provider::OpenCode.default_model();
     format!(
         "no provider configured — pick one, then run `dex doctor`:\n\
-         \u{20}\u{20}anthropic: model: anthropic/claude-sonnet-4-5 + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
-         \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<id> + providers.gateway: {{base_url, api_key, api: anthropic-messages}}\n\
-         \u{20}\u{20}opencode: model: zen/gpt-5.6-luna + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
+         \u{20}\u{20}anthropic: model: anthropic/{anthropic_model} + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
+         \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
+         \u{20}\u{20}opencode: model: zen/{opencode_model} + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
+         \u{20}\u{20}codex: model: openai-codex + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"
     )
 }
@@ -3252,7 +3257,12 @@ pub(crate) mod tests {
         assert!(err.contains("no provider configured"), "{err}");
         assert!(err.contains("anthropic"), "{err}");
         assert!(err.contains("gateway"), "{err}");
+        assert!(err.contains("openai-codex"), "{err}");
+        assert!(err.contains(crate::llm::provider::DEFAULT_MODEL), "{err}");
         assert!(!err.contains("no API key for provider"), "{err}");
+        // The same guide surfaces in `dex doctor`'s resolve row.
+        let report = doctor(None, None, None, &[]);
+        assert!(report.contains("no provider configured"), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
