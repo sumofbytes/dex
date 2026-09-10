@@ -14,6 +14,17 @@ use crate::llm::config::{insert_extra_header, LlmConfig};
 use crate::llm::protocol::{responses_input, responses_tools, tools_schema};
 use crate::llm::stream::{read_responses_stream, read_stream, Turn};
 
+pub(crate) fn error_chain_message(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        src = s.source();
+    }
+    msg
+}
+
 pub(crate) trait ModelClient: Clone + Send + Sync {
     async fn complete(
         &self,
@@ -34,10 +45,7 @@ impl ModelClient for LlmConfig {
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         crate::llm::streaming::complete(self, messages, with_tools, sink, cancel)
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                Box::<dyn std::error::Error + Send + Sync>::from(msg)
-            })
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(error_chain_message(&*e)))
     }
 }
 
@@ -205,13 +213,17 @@ async fn post_with_retry(
             Err(e) if attempt < MAX_HTTP_RETRIES => {
                 let delay = backoff_delay(attempt, None);
                 with_console(sink.is_some(), || {
-                    eprintln!("[llm] request failed: {}; retrying in {:?}", e, delay)
+                    eprintln!(
+                        "[llm] request failed: {}; retrying in {:?}",
+                        error_chain_message(&e),
+                        delay
+                    )
                 });
                 tokio::time::sleep(delay).await;
                 continue;
             }
             Err(e) => {
-                provider_log("request_failed", &e.to_string());
+                provider_log("request_failed", &error_chain_message(&e));
                 return Err(Box::new(e));
             }
         };
@@ -414,6 +426,20 @@ fn should_retry_stream_error(
 mod tests {
     use super::*;
     use crate::core::types::Usage;
+
+    #[test]
+    fn error_chain_message_walks_sources() {
+        // reqwest-style: outer Display names the URL, the cause lives in
+        // `source()`. `to_string()` alone drops it; the chain keeps it.
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let outer: Box<dyn std::error::Error + Send + Sync> =
+            format!("error sending request for url (https://example.invalid/): {io}").into();
+        // Plain outer without a source chain stays as-is.
+        assert!(error_chain_message(&*outer).contains("error sending request"));
+        let chained = std::io::Error::new(std::io::ErrorKind::TimedOut, io);
+        let msg = error_chain_message(&chained);
+        assert!(msg.contains("connection refused"), "chain kept: {msg}");
+    }
 
     #[derive(Clone)]
     struct MockModel;
