@@ -706,26 +706,28 @@ async fn run_sse<P: StreamParser>(
             // sending. Without it a stalled stream parks the turn forever.
             // Disabled (`None`) arms no timer at all — no overflow-prone
             // infinite deadline.
-              // Transport errors keep their type *and* provenance: a `chunk()`
-              // failure is marked with `StreamTransportError` pre-output, so
-              // the retry gate matches the marker instead of message wording
-              // or `reqwest::Error` kind (both shift across reqwest
-              // versions). Only the watchdog timeout — which has no source
-              // error — travels as a plain message.
-              chunk_res = async {
-                  match idle_timeout {
-                      Some(t) => match tokio::time::timeout(t, response.chunk()).await {
-                          Err(_) => Err(None),
-                          Ok(r) => r.map_err(|e| {
-                              Some(Box::new(e)
-                                  as Box<dyn std::error::Error + Send + Sync>)
-                          }),
-                      },
-                      None => response.chunk().await.map_err(|e| {
-                          Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                      }),
-                  }
-              } => {
+            // Transport errors keep their type *and* provenance: a `chunk()`
+            // failure is marked with `StreamTransportError` pre-output, so
+            // the retry gate matches the marker instead of message wording
+            // or `reqwest::Error` kind (both shift across reqwest
+            // versions). Only the watchdog timeout — which has no source
+            // error — travels as a plain message.
+            chunk_res = async {
+                match idle_timeout {
+                    Some(t) => match tokio::time::timeout(t, response.chunk()).await {
+                        Err(_) => Err(None),
+                        Ok(r) => r.map_err(|e| {
+                            Some(
+                                Box::new(e)
+                                    as Box<dyn std::error::Error + Send + Sync>,
+                            )
+                        }),
+                    },
+                    None => response.chunk().await.map_err(|e| {
+                        Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                    }),
+                }
+            } => {
                 match chunk_res {
                     Err(None) => {
                         let secs = idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
@@ -736,26 +738,26 @@ async fn run_sse<P: StreamParser>(
                             ),
                         ));
                     }
-                      Err(Some(err)) => {
-                          return Err(driver_err_transport(&mut driver, err));
-                      }
+                    Err(Some(err)) => {
+                        return Err(driver_err_transport(&mut driver, err));
+                    }
                     Ok(None) => break,
-                      Ok(Some(bytes)) => {
-                          buf.extend_from_slice(&bytes);
-                          // Extract complete lines; keep partial tail buffered.
-                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                                // Borrow the line before draining: skips a
-                                // throwaway byte Vec per SSE line.
-                                let line = String::from_utf8_lossy(&buf[..=pos]).into_owned();
-                                buf.drain(..=pos);
-                                if driver.feed_raw_async(&line, &mut parser).await? {
-                                    // Chat-completions [DONE] / Anthropic
-                                    // message_stop: stop reading.
-                                    let sink_is_some = sink.is_some();
-                                    return driver.finish_turn_async(parser, sink_is_some).await;
-                                }
+                    Ok(Some(bytes)) => {
+                        buf.extend_from_slice(&bytes);
+                        // Extract complete lines; keep partial tail buffered.
+                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                            // Borrow the line before draining: skips a
+                            // throwaway byte Vec per SSE line.
+                            let line = String::from_utf8_lossy(&buf[..=pos]).into_owned();
+                            buf.drain(..=pos);
+                            if driver.feed_raw_async(&line, &mut parser).await? {
+                                // Chat-completions [DONE] / Anthropic
+                                // message_stop: stop reading.
+                                let sink_is_some = sink.is_some();
+                                return driver.finish_turn_async(parser, sink_is_some).await;
                             }
-                      }
+                        }
+                    }
                 }
             }
         }

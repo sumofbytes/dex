@@ -1768,7 +1768,7 @@ impl LlmConfig {
                 .connect_timeout(Duration::from_secs(connect_secs))
                 .timeout(Duration::from_secs(request_secs))
                 // Same dead-socket detection as the shared streaming client.
-                .tcp_keepalive(Duration::from_secs(60))
+                .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
                 .build()?
         };
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
