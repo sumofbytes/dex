@@ -68,6 +68,26 @@ async fn require_bearer(
     next.run(request).await
 }
 
+/// Per-request log line for `DEX_LOG=info dex serve`:
+/// `method path -> status (ms)`. Outermost layer, so rejected requests log too.
+async fn log_requests(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    crate::log!(
+        Info,
+        "{} {path} -> {} ({:?})",
+        method,
+        response.status(),
+        started.elapsed()
+    );
+    response
+}
+
 pub(crate) fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -93,6 +113,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions/{id}/shell", post(session_shell))
         .with_state(state)
         .layer(axum::middleware::from_fn(require_bearer))
+        .layer(axum::middleware::from_fn(log_requests))
 }
 
 async fn health(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {

@@ -274,6 +274,12 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
         ));
     }
+    // The TUI owns the terminal from here on: move runtime logs to the file
+    // sink so DEX_LOG output can't garble the alt screen. The notice (if any)
+    // prints while the terminal is still the normal screen.
+    if let Some(notice) = crate::core::logging::redirect_to_file() {
+        eprintln!("{notice}");
+    }
     let launch_start = *LAUNCH_START.get_or_init(Instant::now);
     OSC_START.get_or_init(Instant::now);
 

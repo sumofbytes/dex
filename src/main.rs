@@ -327,6 +327,7 @@ fn print_help() {
 }
 
 fn main() {
+    crate::core::logging::init();
     crate::ui::mark_launch_start();
     install_sigint_handler();
     let args = cli::parse_args();

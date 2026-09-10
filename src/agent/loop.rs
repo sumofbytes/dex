@@ -172,7 +172,15 @@ async fn execute_tool_call(
         );
     };
     let input = serde_json::to_string(args).unwrap_or_default();
+    crate::log!(Debug, "tool {name} {input}");
+    let started = Instant::now();
     let outcome = execute_outcome(&name, args, cancel).await;
+    crate::log!(
+        Debug,
+        "tool {name} ok={} in {:?}",
+        outcome.ok,
+        started.elapsed()
+    );
     (name, input, outcome)
 }
 
