@@ -11,7 +11,9 @@ use crate::agent::state::CancellationSource;
 use crate::core::console::with_console;
 use crate::core::types::{ChatMessage, ChatRequest, SinkLine, StreamOptions};
 use crate::llm::config::{insert_extra_header, LlmConfig};
-use crate::llm::protocol::{responses_input, responses_tools, tools_schema};
+use crate::llm::protocol::{
+    chat_completions_messages, responses_input, responses_tools, tools_schema,
+};
 use crate::llm::stream::{read_responses_stream, read_stream, Turn};
 
 pub(crate) fn error_chain_message(e: &(dyn std::error::Error + 'static)) -> String {
@@ -319,7 +321,7 @@ pub(crate) async fn call_chat_completions(
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let req = ChatRequest {
         model: &config.model,
-        messages,
+        messages: chat_completions_messages(messages),
         tools: if with_tools {
             tools_schema()
         } else {
