@@ -56,7 +56,7 @@ All of this lives in `src/llm/config.rs` — don't add a second way to express a
 
 ## Release
 
-- `scripts/release.sh [major|minor|patch|X.Y.Z]` — cuts a release; the only manual step is this tag+push. Never bump `Cargo.toml` yourself: CI does the version bump on the default branch after the tag lands. Working tree must be clean and the default branch up to date.
+- `scripts/release.sh [major|minor|patch|X.Y.Z]` — tags the release commit. `develop` is protected (no pushes, not even CI), so bump `version` in `Cargo.toml` + `cargo update -p dex` via a normal PR first, merge, pull, then tag its tip. Working tree must be clean and the default branch up to date.
 
 ## Before submitting
 
