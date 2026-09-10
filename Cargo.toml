@@ -1,6 +1,6 @@
 [package]
 name = "dex"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 description = "Terminal coding agent in Rust: OpenAI-compatible LLMs with tool use (read/bash/write/edit/grep), a ratatui TUI, client-daemon over HTTP+SSE, and JSONL sessions."
 license = "MIT OR Apache-2.0"
