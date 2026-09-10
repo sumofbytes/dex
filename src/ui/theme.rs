@@ -35,7 +35,8 @@ fn raised(amount: f32) -> Color {
     }
 }
 
-/// BG for the composer, submitted prompts, and overlays: a "raised" surface.
+/// BG for submitted prompts and overlays (the composer is a plain prompt
+/// line now): a "raised" surface.
 pub(crate) fn surface_bg() -> Color {
     match background() {
         Background::Dark => raised(0.10),
