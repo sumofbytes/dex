@@ -293,12 +293,13 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
-/// Serialized straight onto the wire; borrows the request history instead of
-/// cloning it per call (`messages` can hold the whole compacted session).
+/// Serialized straight onto the wire; `messages` arrive wire-shaped (see
+/// [`crate::llm::protocol::chat_completions_messages`]) so dex-internal
+/// `ChatMessage` fields never reach a strict OpenAI-compatible endpoint.
 #[derive(Serialize)]
 pub(crate) struct ChatRequest<'a> {
     pub(crate) model: &'a str,
-    pub(crate) messages: &'a [ChatMessage],
+    pub(crate) messages: Vec<Value>,
     pub(crate) tools: Vec<ToolDefinition>,
     pub(crate) stream: bool,
     pub(crate) stream_options: StreamOptions,
