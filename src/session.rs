@@ -463,6 +463,38 @@ impl Session {
         Ok(sessions)
     }
 
+    /// List one session's child runs (§16): every JSONL under the session's
+    /// `agents/` directory, each with its header and last turn state —
+    /// `"interrupted"` is a `turn_start` with no terminal marker (a crashed
+    /// or daemon-restart-killed child). Deliberately separate from
+    /// `list`/`list_all`, whose loaders must keep excluding `agents/*`.
+    /// Sorted by header timestamp, newest first, like the other listings.
+    pub(crate) fn list_children(
+        parent_path: &Path,
+    ) -> io::Result<Vec<(PathBuf, SessionHeader, &'static str)>> {
+        let dir = parent_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("agents");
+        let mut children = Vec::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    if let Some(first) = read_first_line(&path) {
+                        if let Ok(header) = serde_json::from_str::<SessionHeader>(first.trim_end())
+                        {
+                            let turn_state = Self::last_turn_state(&path);
+                            children.push((path, header, turn_state));
+                        }
+                    }
+                }
+            }
+        }
+        children.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        Ok(children)
+    }
+
     pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Self> {
         let sessions = Self::list(cwd)?;
         let path = if let Ok(index) = selector.parse::<usize>() {
@@ -1630,6 +1662,44 @@ mod tests {
         let messages = load_messages_from_session(&child_path).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content.as_deref(), Some("child task"));
+        let _ = std::fs::remove_dir_all(parent_path.parent().unwrap());
+    }
+
+    #[test]
+    fn list_children_reports_runs_and_interrupted_state() {
+        // Phase 8 exit: resume shows children and interrupted runs — every
+        // run under `agents/` with its last turn state, `"interrupted"`
+        // being a `turn_start` with no terminal marker (crashed or
+        // daemon-restart-killed child). Loaders still ignore the directory.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let parent = Session::new("/tmp/dex-children-list".into(), None).unwrap();
+        let parent_path = parent.path().unwrap().to_path_buf();
+        drop(parent);
+        let mut done =
+            Session::child(&parent_path, "/tmp/dex-children-list", "c-0", "explorer").unwrap();
+        done.turn_event("turn_start").unwrap();
+        done.turn_event("turn_complete").unwrap();
+        let mut hung =
+            Session::child(&parent_path, "/tmp/dex-children-list", "c-1", "tester").unwrap();
+        hung.turn_event("turn_start").unwrap();
+        // A crash before a terminal marker leaves the run interrupted.
+        drop(done);
+        drop(hung);
+        let runs = Session::list_children(&parent_path).unwrap();
+        assert_eq!(runs.len(), 2);
+        let state_of = |prefix: &str| {
+            runs.iter()
+                .find(|(_, header, _)| header.id().starts_with(prefix))
+                .map(|(.., state)| *state)
+        };
+        assert_eq!(state_of("c-0"), Some("complete"));
+        assert_eq!(state_of("c-1"), Some("interrupted"));
+        // Headers keep the parent linkage (§22-N: parent/child recorded).
+        assert!(runs
+            .iter()
+            .all(|(_, header, _)| header.name().is_some_and(|n| n.contains("(child of "))));
         let _ = std::fs::remove_dir_all(parent_path.parent().unwrap());
     }
 

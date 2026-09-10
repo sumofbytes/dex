@@ -26,6 +26,14 @@ pub struct SessionInfo {
     pub created_at: String,
     #[serde(default)]
     pub message_count: usize,
+    /// Child-agent runs recorded under this session (§16); `0` from older
+    /// daemons that don't report them.
+    #[serde(default)]
+    pub child_agents: usize,
+    /// Child runs whose last turn marker is an unterminated `turn_start`
+    /// (crashed or daemon-restart-killed children).
+    #[serde(default)]
+    pub interrupted_children: usize,
 }
 
 /// Request to run a shell command directly (`!`/`!!` prefix in the TUI),
