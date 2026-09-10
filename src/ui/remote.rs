@@ -812,31 +812,42 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             );
         }
         StreamEvent::SteeringAccepted { content } => {
-            if let Some(pos) = remote
-                .app
+            let app = &mut remote.app;
+            // Drop the accepted badge (exact match, then trim-insensitive so a
+            // whitespace echo difference doesn't strand it). Never pop an
+            // unrelated item: a recall may have already removed this one, and
+            // the accepted copy still renders below.
+            let trimmed = content.trim();
+            if let Some(pos) = app
                 .pending_steering
                 .iter()
                 .position(|c| c == &content)
+                .or_else(|| {
+                    app.pending_steering
+                        .iter()
+                        .position(|c| c.trim() == trimmed)
+                })
             {
-                remote.app.pending_steering.remove(pos);
-            } else if !remote.app.pending_steering.is_empty() {
-                // Fallback: content may have been trimmed differently; pop oldest.
-                remote.app.pending_steering.remove(0);
+                app.pending_steering.remove(pos);
             }
-            render_user_prompt(&mut remote.app, &content);
+            render_user_prompt(app, &content);
         }
         StreamEvent::FollowupAccepted { content } => {
-            if let Some(pos) = remote
-                .app
+            let app = &mut remote.app;
+            let trimmed = content.trim();
+            if let Some(pos) = app
                 .pending_followups
                 .iter()
                 .position(|c| c == &content)
+                .or_else(|| {
+                    app.pending_followups
+                        .iter()
+                        .position(|c| c.trim() == trimmed)
+                })
             {
-                remote.app.pending_followups.remove(pos);
-            } else if !remote.app.pending_followups.is_empty() {
-                remote.app.pending_followups.remove(0);
+                app.pending_followups.remove(pos);
             }
-            render_user_prompt(&mut remote.app, &content);
+            render_user_prompt(app, &content);
         }
         StreamEvent::ApprovalRequired { name, input, .. } => {
             // Invariant: the daemon parks at most one approval per turn
@@ -1436,6 +1447,16 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         KeyCode::PageDown => {
             scroll_transcript(app, 20);
         }
+        // Alt+Up while working: pull the newest queued message back into the
+        // composer to edit it. Best-effort — an item already accepted at a
+        // model boundary is gone from the queue and renders as a transcript
+        // block instead.
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (!app.pending_steering.is_empty() || !app.pending_followups.is_empty()) =>
+        {
+            recall_queued(remote);
+        }
         KeyCode::Up => {
             if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
                 scroll_transcript(app, -1);
@@ -1575,6 +1596,61 @@ fn finish_shell_command(
     );
     // The command may have switched branches or dirtied the tree.
     refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
+}
+
+/// Alt+Up while a turn is running: pull the newest queued steering message
+/// (falling back to a follow-up) back into the composer and tell the daemon to
+/// drop its queued copy, so the user can edit before it is injected.
+/// Best-effort: a message already accepted at a model boundary is gone from
+/// the queue and renders as a transcript block instead. The local queue is
+/// only touched after the daemon accepts the recall, so a failed call leaves
+/// badges and draft untouched.
+fn recall_queued(remote: &mut RemoteApp) {
+    let Some((text, followup)) = recall_candidate(&remote.app) else {
+        return;
+    };
+    let client = remote.client.clone();
+    let sid = remote.session_id.clone();
+    if let Err(e) = client.recall(&sid, &text, followup) {
+        push_info(
+            &mut remote.app,
+            format!("could not recall queued message: {e}"),
+        );
+        return;
+    }
+    if followup {
+        remote.app.pending_followups.pop();
+    } else {
+        remote.app.pending_steering.pop();
+    }
+    // Append to any draft so typed text is never lost; one item per press.
+    let app = &mut remote.app;
+    let mut draft = app.input.text();
+    if !draft.trim().is_empty() {
+        draft.push('\n');
+    }
+    draft.push_str(&text);
+    app.input = crate::ui::input::InputField::from_text(&draft);
+    app.slash_selected = 0;
+    push_info(
+        app,
+        format!(
+            "recalled queued {} for editing (Alt+Up again for more)",
+            if followup { "follow-up" } else { "steer" }
+        ),
+    );
+}
+
+/// Newest queued message to recall: steers first, then follow-ups (matching
+/// the badge order). Peeks instead of popping so a failed recall can leave
+/// the queue intact.
+fn recall_candidate(app: &App) -> Option<(String, bool)> {
+    if let Some(text) = app.pending_steering.last() {
+        return Some((text.clone(), false));
+    }
+    app.pending_followups
+        .last()
+        .map(|text| (text.clone(), true))
 }
 
 fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
@@ -2038,7 +2114,7 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             );
             push_info(
                 &mut remote.app,
-                "while working: Enter queues steer · Alt+Enter queues follow-up · Esc/Ctrl+C cancels and restores queued input"
+                "while working: Enter queues steer · Alt+Enter queues follow-up · Alt+Up recalls the newest queued message for editing · Esc/Ctrl+C cancels and restores queued input"
                     .to_string(),
             );
         }
@@ -2753,6 +2829,36 @@ mod tests {
         );
         handle_key(&mut remote, ctrl_c());
         assert!(remote.app.quit, "third press force-quits a stuck turn");
+    }
+
+    #[test]
+    fn recall_candidate_prefers_newest_steer_then_followup() {
+        let mut remote = test_remote();
+        assert!(recall_candidate(&remote.app).is_none(), "empty queue");
+        remote.app.pending_followups.push("follow".into());
+        remote.app.pending_steering.push("steer".into());
+        // Steers are recalled before follow-ups regardless of queue order.
+        let (text, followup) = recall_candidate(&remote.app).expect("candidate");
+        assert_eq!(text, "steer");
+        assert!(!followup);
+        remote.app.pending_steering.pop();
+        let (text, followup) = recall_candidate(&remote.app).expect("candidate");
+        assert_eq!(text, "follow");
+        assert!(followup);
+    }
+
+    #[test]
+    fn recall_queued_failure_keeps_queue_and_draft() {
+        let mut remote = test_remote();
+        remote.app.busy = true;
+        remote.app.pending_steering.push("queued msg".into());
+        remote.app.input = crate::ui::input::InputField::from_text("draft text");
+        // The fixture's client points at a dead port: the POST fails, so the
+        // badge must stay queued and the draft must be untouched.
+        recall_queued(&mut remote);
+        assert_eq!(remote.app.pending_steering, vec!["queued msg".to_string()]);
+        assert_eq!(remote.app.input.text(), "draft text");
+        assert!(!remote.app.transcript.is_empty(), "failure is reported");
     }
 
     #[test]
