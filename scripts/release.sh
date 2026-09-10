@@ -1,12 +1,17 @@
 #!/bin/sh
-# Cut a release: the only manual step. Tags the current commit and pushes the
-# tag; .github/workflows/release.yml then bumps Cargo.toml/Cargo.lock on the
-# default branch (develop) to the tag's version (bot commit), builds every
-# target from that commit, and publishes the GitHub release that
-# scripts/install.sh installs from.
+# Cut a release: tag the current commit and push the tag;
+# .github/workflows/release.yml then builds every target from it and
+# publishes the GitHub release that scripts/install.sh installs from.
+#
+# develop is protected (PR reviews + checks, no direct pushes — not even
+# for CI), so the version bump must land via a normal PR first: bump
+# `version` in Cargo.toml, run `cargo update -p dex`, merge, then tag
+# its tip here.
 #
 # usage: scripts/release.sh [major|minor|patch|X.Y.Z]
-#         The next version is computed from the version in Cargo.toml.
+#         The target version is computed from Cargo.toml and must already
+#         match it — otherwise the script aborts and tells you which bump
+#         PR to land first.
 
 set -eu
 cd "$(dirname "$0")/.."
@@ -53,6 +58,14 @@ major | minor | patch)
 *) NEW="${1#v}" ;;
 esac
 
+if [ "$NEW" != "$CUR" ]; then
+    echo "error: Cargo.toml says $CUR but the release would be v$NEW." >&2
+    echo "develop is protected: land the bump via PR first" >&2
+    echo "(version = \"$NEW\" in Cargo.toml + cargo update -p dex), merge it," >&2
+    echo "pull, then re-run this script." >&2
+    exit 1
+fi
+
 if git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; then
     echo "error: tag v$NEW already exists" >&2
     exit 1
@@ -61,6 +74,6 @@ fi
 git tag "v$NEW"
 git push origin "v$NEW"
 
-echo "tagged v$NEW (Cargo.toml still says $CUR locally — CI bumps it on $base)."
+echo "tagged v$NEW."
 echo "follow the build: https://github.com/arpitsr/dex/actions"
 echo "after it finishes: git pull"
