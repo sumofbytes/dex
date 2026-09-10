@@ -474,23 +474,33 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
     match name {
         "read" => read_summary(obj.as_ref(), text),
         "grep" | "ffgrep" => {
-            // Files mode (the default) lists paths, not matches.
+            // Files mode (the default) lists paths, not matches; content
+            // mode prints `path:123:text` hits alongside `path:123-context`
+            // context rows, so only match-shaped rows count — and the
+            // `[... more exist ...]` truncation trailer is never a hit.
             let files_mode = obj
                 .as_ref()
                 .and_then(|o| o.get("output_mode"))
                 .and_then(Value::as_str)
                 .unwrap_or("files")
                 == "files";
+            let hits = if files_mode {
+                text.lines()
+                    .filter(|line| {
+                        !line.trim().is_empty() && !line.trim_start().starts_with("[...")
+                    })
+                    .count()
+            } else {
+                text.lines()
+                    .filter(|line| grep_match_line(line.trim_start()))
+                    .count()
+            };
             if files_mode {
-                format!(
-                    "{} file{} matched",
-                    lines,
-                    if lines == 1 { "" } else { "s" }
-                )
-            } else if lines == 1 {
+                format!("{} file{} matched", hits, if hits == 1 { "" } else { "s" })
+            } else if hits == 1 {
                 "1 match".to_string()
             } else {
-                format!("{lines} matches")
+                format!("{hits} matches")
             }
         }
         "find" | "fffind" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
@@ -536,6 +546,29 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// A grep content-mode row is a match when shaped `path:123:text`; context
+/// rows print `path:123-text`, and fff's fuzzy fallback prints `  12: code`
+/// under a bare path header (matches too). Trailers start `[...`.
+fn grep_match_line(line: &str) -> bool {
+    if line.starts_with("[...") {
+        return false;
+    }
+    // Fuzzy fallback row: leading `12: code`.
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && line[digits..].starts_with(": ") {
+        return true;
+    }
+    // Exact hit: `path:123:text` (context is `path:123-text`).
+    let Some((_, after_path)) = line.split_once(':') else {
+        return false;
+    };
+    let d = after_path
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    d > 0 && after_path[d..].starts_with(':')
 }
 
 /// Compact wall-clock label for a tool result: millis below 1s,
@@ -1233,6 +1266,35 @@ mod tests {
                 true
             ),
             "1 match"
+        );
+        // Context rows and the truncation trailer are not matches; fuzzy
+        // fallback rows (`12: code` under a path header) are.
+        assert_eq!(
+            tool_result_summary(
+                "grep",
+                r#"{"output_mode":"content"}"#,
+                "src/a.rs:2:hit\nsrc/a.rs:1-before\nsrc/a.rs:3-after\n[... 1 match shown, more files unscanned; continue with file_offset 2 ...]",
+                true
+            ),
+            "1 match"
+        );
+        assert_eq!(
+            tool_result_summary(
+                "grep",
+                r#"{"output_mode":"content"}"#,
+                "0 exact matches for 'q'. 2 approximate:\nsrc/a.rs\n  12: first\n  30: second",
+                true
+            ),
+            "2 matches"
+        );
+        assert_eq!(
+            tool_result_summary(
+                "grep",
+                "{}",
+                "a.rs\nb.rs\nc.rs\n[... 3 files shown, more files unscanned; continue with file_offset 3 ...]",
+                true
+            ),
+            "3 files matched"
         );
         // Empty successful output says so instead of a bare "ok".
         assert_eq!(tool_result_summary("bash", "{}", "", true), "(no output)");
