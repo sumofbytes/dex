@@ -16,7 +16,7 @@ use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::stream::Turn;
 use crate::session::Session;
-use crate::tools::{execute_outcome, ToolOutcome};
+use crate::tools::{execute_outcome, Policy, ToolOutcome};
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
     let mut paths = std::collections::HashSet::new();
@@ -143,6 +143,7 @@ async fn record_usage(
 async fn execute_tool_call(
     call: &LlmToolCall,
     cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
 ) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
@@ -174,7 +175,7 @@ async fn execute_tool_call(
     let input = serde_json::to_string(args).unwrap_or_default();
     crate::log!(Debug, "tool {name} {input}");
     let started = Instant::now();
-    let outcome = execute_outcome(&name, args, cancel).await;
+    let outcome = execute_outcome(&name, args, cancel, policy).await;
     crate::log!(
         Debug,
         "tool {name} ok={} in {:?}",
@@ -243,6 +244,10 @@ pub(crate) async fn process_turn(
     // failure (single message too large), not something more slicing fixes.
     let mut overflow_retried = false;
     let mut budget_warned = false;
+    // Phase 0 gate context: every tool call this turn runs under the
+    // turn's permission mode + approval channel. One policy for the whole
+    // turn so same-turn allow-for-session records are shared.
+    let policy = Policy::turn(config.permission, console);
 
     for _iteration in 0..1_000_000 {
         persist_pending(&mut session, messages, &mut persisted_cursor)?;
@@ -413,9 +418,12 @@ pub(crate) async fn process_turn(
                 let mut out = Vec::new();
                 for call in &calls {
                     let started = Instant::now();
-                    let (name, input, outcome) =
-                        execute_tool_call(call, cancel as &(dyn CancellationSource + Send + Sync))
-                            .await;
+                    let (name, input, outcome) = execute_tool_call(
+                        call,
+                        cancel as &(dyn CancellationSource + Send + Sync),
+                        &policy,
+                    )
+                    .await;
                     out.push((name, input, outcome, started.elapsed()));
                 }
                 out
@@ -426,9 +434,11 @@ pub(crate) async fn process_turn(
                 for (idx, call) in calls.iter().enumerate() {
                     let call = call.clone();
                     let cancel = cancel.clone();
+                    let policy = policy.clone();
                     set.spawn(async move {
                         let started = Instant::now();
-                        let (name, input, outcome) = execute_tool_call(&call, &cancel).await;
+                        let (name, input, outcome) =
+                            execute_tool_call(&call, &cancel, &policy).await;
                         (idx, name, input, outcome, started.elapsed())
                     });
                 }
