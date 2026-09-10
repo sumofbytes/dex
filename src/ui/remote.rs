@@ -1740,7 +1740,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                         {
                             crate::llm::client::provider_log(
                                 "approval_delivery_failed",
-                                &e.to_string(),
+                                &crate::llm::client::error_chain_message(&*e),
                             );
                         }
                     }
