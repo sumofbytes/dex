@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crossterm::Command;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -32,9 +32,6 @@ use input::InputField;
 const VERTICAL_GUTTER: u16 = 1;
 const HORIZONTAL_GUTTER: u16 = 1;
 const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
-// `render_user_prompt`'s borrowed pad span hardcodes the 1-wide gutter;
-// this equality is load-bearing, so trip at compile time if it changes.
-const _: () = assert!(HORIZONTAL_GUTTER == 1);
 const INPUT_BORDER_ROWS: u16 = 0;
 const INPUT_PAD_Y: u16 = 1;
 const STATUS_CONTENT_ROWS: u16 = 1;
@@ -1236,23 +1233,28 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
-    let user_bg = Style::default()
-        .fg(theme::surface_fg())
-        .bg(theme::surface_bg());
-    // The left pad is the same one-space gutter as `edge_pad`
-    // (`TRANSCRIPT_INDENT == HORIZONTAL_GUTTER == 1`), so reuse the
-    // borrowed span instead of re-allocating the string per line.
-    let edge_pad = Span::styled(" ", user_bg);
+    // Same head glyph as the live composer (`render_input`), on the same
+    // left margin: the transcript indent puts `▶` at the column the
+    // composer's glyph occupies, so submitted and typed prompts (and the
+    // rest of the grid) share one left edge. No background.
     let mut block_lines = Vec::new();
-    block_lines.push(Line::from(edge_pad.clone()));
-    for sub in line.split('\n') {
-        block_lines.push(Line::from(vec![
-            edge_pad.clone(),
-            Span::styled(sub.to_string(), user_bg),
-            edge_pad.clone(),
-        ]));
+    for (i, sub) in line.split('\n').enumerate() {
+        let row = if i == 0 {
+            Line::from(vec![
+                Span::styled(
+                    render::COMPOSER_PROMPT,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::raw(sub.to_string()),
+            ])
+        } else {
+            Line::from(Span::raw(sub.to_string()))
+        };
+        block_lines.push(indent_transcript_line(row));
     }
-    block_lines.push(Line::from(edge_pad));
     app.transcript.push(TranscriptBlock::User {
         stamp: 0,
         lines: block_lines,

@@ -28,14 +28,17 @@ pub(super) fn surface_padding() -> Padding {
 }
 
 pub(super) fn input_block() -> Block<'static> {
-    Block::default()
-        .padding(Padding {
-            left: super::HORIZONTAL_GUTTER + 1,
-            right: super::HORIZONTAL_GUTTER,
-            top: super::INPUT_PAD_Y,
-            bottom: super::INPUT_PAD_Y,
-        })
-        .style(Style::default().bg(theme::surface_bg()))
+    // No background: the composer reads as a plain prompt line. Its only
+    // ornament is the `▶` prompt glyph `render_input` puts at the shared
+    // transcript margin (same column the submitted prompt's glyph lands on),
+    // so typing and history align on one left edge; the right pad just keeps
+    // the cursor off the last cell.
+    Block::default().padding(Padding {
+        left: super::HORIZONTAL_GUTTER,
+        right: super::HORIZONTAL_GUTTER,
+        top: super::INPUT_PAD_Y,
+        bottom: super::INPUT_PAD_Y,
+    })
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {
@@ -54,7 +57,7 @@ pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
 }
 
 pub(super) fn input_content_width(width: u16) -> u16 {
-    width.saturating_sub(super::HORIZONTAL_GUTTER * 2 + 1)
+    width.saturating_sub(super::HORIZONTAL_GUTTER * 2)
 }
 
 /// Footer chunk: one gutter above the status row, none below — the status
@@ -998,8 +1001,7 @@ impl TranscriptView {
         // No `.wrap(Wrap)` here: the display cache is already pre-wrapped to
         // `area.width` by `wrap_line_display`, and ratatui 0.29's WordWrapper
         // emits a phantom empty row before any all-whitespace line that is
-        // exactly `area.width` wide — the submitted-prompt box's edge rows are
-        // exactly that, so Wrap rendered dark holes inside the box.
+        // exactly `area.width` wide, shifting every row below it down by one.
         // ponytail: clone only the visible window; a full-transcript clone
         // per frame was the remaining O(N) term once wrapping was cached.
         let mut window: Vec<Line<'static>> = app
@@ -1221,14 +1223,13 @@ impl ComposerView {
         cursor: (u16, u16, u16),
     ) {
         f.render_widget(Clear, area);
+        // No raised surface: the composer is a plain prompt line on the
+        // terminal background; the `▶` prompt glyph marks it (busy state dims
+        // text and glyph together).
         let input_style = if app.busy || app.pending_approval.is_some() {
-            Style::default()
-                .fg(theme::muted_fg())
-                .bg(theme::surface_bg())
+            Style::default().fg(theme::muted_fg())
         } else {
-            Style::default()
-                .fg(theme::surface_fg())
-                .bg(theme::surface_bg())
+            Style::default().fg(theme::surface_fg())
         };
         let block = input_block();
         let inner = block.inner(area);
@@ -1308,12 +1309,13 @@ impl SlashSuggestionsView {
             .saturating_sub(visible.saturating_sub(1))
             .min(max_start);
         let window = &suggestions[start..start + visible];
-        // Full width of the composer; the label column fits the longest
-        // visible item with a two-space gap before the description. Inside a
-        // picker (`/model `, `/provider `, `/resume …`) rows show just the
-        // item (`> gpt-5`), not the repeated command (`/model gpt-5`) — the
-        // header already names the picker.
-        let avail = area.width.saturating_sub(2) as usize;
+        // Sheet width matches the composer minus its left gutter: the labels
+        // share the composer's text column (glyph + gap to the left). Inside
+        // a picker (`/model `, `/provider `, `/resume …`) rows show just
+        // the item (`> gpt-5`), not the repeated command (`/model <item>`)
+        // — the header already names the picker.
+        let width = area.width.saturating_sub(super::HORIZONTAL_GUTTER);
+        let avail = width.saturating_sub(2) as usize;
         let cmd_col = window
             .iter()
             .map(|(command, _)| UnicodeWidthStr::width(slash::suggestion_label(&input, command)))
@@ -1321,9 +1323,8 @@ impl SlashSuggestionsView {
             .unwrap_or(0)
             .min(48)
             .min(avail.max(1));
-        let width = area.width;
         let popup = Rect {
-            x: area.x,
+            x: area.x + super::HORIZONTAL_GUTTER,
             y: area.y - height,
             width,
             height,
@@ -1620,7 +1621,11 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(Clear, area);
     // ponytail: wrap the composer once — the rows size the layout and
     // render it, so don't pay `render_input` twice per frame.
-    let (input_lines, input_cursor) = render_input(&app.input, input_content_width(area.width));
+    let (input_lines, input_cursor) = render_input(
+        &app.input,
+        input_content_width(area.width),
+        app.busy || app.pending_approval.is_some(),
+    );
     let input_rows = input_lines.len() as u16;
     // The busy "● Working" status lives in the transcript (turn-activity
     // block); this strip only sizes for the pending queue.
@@ -1640,152 +1645,6 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
 
 pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
     let w = width.max(1) as usize;
-    // User prompt lines carry a raised-surface background (pad + content + edge).
-    // Wrapping the whole line (pad+content+edge) to `w` would make continuation
-    // rows start at col 0 without the left pad, and the total length
-    // pad+content+edge would be considered one logical line, causing the
-    // continuation to be shifted and, for very long single-line prompts,
-    // the word-wrap's `last_space` would be inside the content rather than
-    // at the pad boundary. To keep the surface visually solid and to avoid
-    // any overflow, unwrap the inner content, wrap it to `w-2`, and re-add
-    // the pads to every row.
-    let has_bg = line.spans.iter().any(|s| s.style.bg.is_some());
-    if has_bg {
-        // Edge line: single space with bg (top/bottom border of user block)
-        if line.spans.len() == 1 && line.spans[0].content == " " {
-            let bg = line.spans[0].style.bg.unwrap();
-            return vec![Line::from(Span::styled(
-                " ".repeat(w),
-                Style::default().bg(bg),
-            ))];
-        }
-        // Content line: pad (1) + content + edge (1) — all with same bg
-        if line.spans.len() == 3
-            && line.spans[0].content == " "
-            && line.spans[2].content == " "
-            && line.spans[0].style.bg.is_some()
-            && line.spans[2].style.bg.is_some()
-        {
-            let content = line.spans[1].content.clone();
-            let content_style = line.spans[1].style;
-            let pad_style = line.spans[0].style;
-            let content_width = w.saturating_sub(2).max(1);
-            // Wrap the inner content only, without pads, using the same
-            // word-wrap logic but without indent and without bg handling.
-            let inner_line = Line::from(Span::styled(content.to_string(), content_style));
-            // Reuse the non-bg wrapping path for the inner content by
-            // constructing raw units for the inner line and wrapping to
-            // content_width. This avoids infinite recursion.
-            let mut raw: Vec<(String, Style, bool)> = Vec::new();
-            for sg in inner_line.styled_graphemes(Style::default()) {
-                if sg.symbol == "\t" {
-                    raw.push(("\t".to_string(), sg.style, true));
-                } else if sg.symbol.chars().all(|c| c.is_control()) {
-                    continue;
-                } else if sg.symbol.chars().any(|c| c.is_control()) {
-                    let filtered: String = sg.symbol.chars().filter(|c| !c.is_control()).collect();
-                    if filtered.is_empty() {
-                        continue;
-                    }
-                    raw.push((filtered, sg.style, false));
-                } else {
-                    raw.push((sg.symbol.to_string(), sg.style, false));
-                }
-            }
-            #[derive(Clone)]
-            struct Unit2 {
-                text: String,
-                style: Style,
-                width: usize,
-                whitespace: bool,
-            }
-            let mut rows2: Vec<Vec<Unit2>> = Vec::new();
-            let mut row2: Vec<Unit2> = Vec::new();
-            let mut row_width2: usize = 0;
-            let mut last_space2: Option<usize> = None;
-            for (symbol, style, is_tab) in raw {
-                let mut text2 = symbol.clone();
-                let mut width2 = if is_tab {
-                    TAB_WIDTH - (row_width2 % TAB_WIDTH)
-                } else {
-                    symbol
-                        .chars()
-                        .map(|c| c.width().unwrap_or(0))
-                        .sum::<usize>()
-                        .max(1)
-                };
-                let mut whitespace2 = is_tab || symbol.chars().all(char::is_whitespace);
-                if is_tab {
-                    text2 = " ".repeat(width2);
-                }
-                if row_width2 + width2 > content_width && !row2.is_empty() {
-                    if let Some(space) = last_space2 {
-                        let remainder = row2.split_off(space + 1);
-                        row2.truncate(space);
-                        rows2.push(row2);
-                        row2 = remainder;
-                    } else {
-                        rows2.push(row2);
-                        row2 = Vec::new();
-                    }
-                    row_width2 = row2.iter().map(|u: &Unit2| u.width).sum::<usize>();
-                    last_space2 = None;
-                    if is_tab {
-                        width2 = TAB_WIDTH - (row_width2 % TAB_WIDTH);
-                        text2 = " ".repeat(width2);
-                        whitespace2 = true;
-                    }
-                }
-                if whitespace2 {
-                    last_space2 = Some(row2.len());
-                }
-                row_width2 += width2;
-                row2.push(Unit2 {
-                    text: text2,
-                    style,
-                    width: width2,
-                    whitespace: whitespace2,
-                });
-            }
-            if !row2.is_empty() || rows2.is_empty() {
-                rows2.push(row2);
-            }
-            let mut out: Vec<Line<'static>> = Vec::new();
-            for row_units in rows2 {
-                let mut spans = Vec::new();
-                spans.push(Span::styled(" ".to_string(), pad_style));
-                spans.extend(row_units.into_iter().map(|u| Span::styled(u.text, u.style)));
-                spans.push(Span::styled(" ".to_string(), pad_style));
-                let mut line = Line::from(spans);
-                let row_width: usize = line
-                    .spans
-                    .iter()
-                    .map(|s| {
-                        s.content
-                            .chars()
-                            .map(|c| c.width().unwrap_or(0))
-                            .sum::<usize>()
-                    })
-                    .sum();
-                if row_width < w {
-                    let bg = pad_style.bg.unwrap();
-                    line.spans.push(Span::styled(
-                        " ".repeat(w - row_width),
-                        Style::default().bg(bg),
-                    ));
-                }
-                out.push(line);
-            }
-            if out.is_empty() {
-                let bg = pad_style.bg.unwrap();
-                out.push(Line::from(Span::styled(
-                    " ".repeat(w),
-                    Style::default().bg(bg),
-                )));
-            }
-            return out;
-        }
-    }
     let output_indent = line.spans.first().is_some_and(|span| {
         span.content.as_ref() == transcript_indent() && span.style.bg.is_none()
     });
@@ -1878,7 +1737,7 @@ pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
         rows.push(row);
     }
 
-    let mut out: Vec<Line<'static>> = rows
+    let out: Vec<Line<'static>> = rows
         .into_iter()
         .map(|row| {
             let mut spans = Vec::new();
@@ -1889,53 +1748,70 @@ pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
             Line::from(spans)
         })
         .collect();
-
-    for row in &mut out {
-        let Some(background) = row.spans.iter().find_map(|span| span.style.bg) else {
-            continue;
-        };
-        let row_width: usize = row
-            .spans
-            .iter()
-            .map(|span| {
-                span.content
-                    .chars()
-                    .map(|c| c.width().unwrap_or(0))
-                    .sum::<usize>()
-            })
-            .sum();
-        if row_width < w {
-            row.spans.push(Span::styled(
-                " ".repeat(w - row_width),
-                Style::default().bg(background),
-            ));
-        }
-    }
     out
 }
+
+/// Prompt glyph at the head of the composer: with the background block gone
+/// this is the visual cue that the row below the transcript is where you type.
+/// A right-pointing triangle doubles as a solid "D" for Dex (shell-prompt
+/// idiom). Two cells wide (`▶` + gap), bold so it reads as an affordance
+/// rather than content. Like `❯`/`▶` ornaments generally, some fonts draw it
+/// off the text baseline — if it ever misaligns in practice, plain `>` is the
+/// guaranteed-aligned fallback.
+pub(super) const COMPOSER_PROMPT: &str = "▶";
+const PROMPT_COLS: usize = 2;
 
 pub(super) fn render_input(
     input: &InputField,
     width: u16,
+    dim: bool,
 ) -> (Vec<Line<'static>>, (u16, u16, u16)) {
     let w = width.max(1) as usize;
+    // The glyph occupies the head of the first visual row only, so that row
+    // wraps narrower; every later row gets the full width and starts at the
+    // inner left edge (the shared transcript margin).
+    let (first_w, has_prompt) = if w > PROMPT_COLS + 1 {
+        (w - PROMPT_COLS, true)
+    } else {
+        (w, false)
+    };
+    let prompt_line = |seg: String| -> Line<'static> {
+        let fg = if dim { theme::muted_fg() } else { Color::Cyan };
+        Line::from(vec![
+            Span::styled(
+                COMPOSER_PROMPT,
+                Style::default().fg(fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(seg),
+        ])
+    };
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cur_row: u16 = 0;
     let mut cur_x: u16 = 0;
     for (li, line) in input.lines.iter().enumerate() {
-        let (segs, seg_idx, x) = wrap_line(line, w, input.col);
-        for seg in segs {
-            lines.push(Line::from(Span::raw(seg)));
+        let wrap_w = if li == 0 && has_prompt { first_w } else { w };
+        let (segs, seg_idx, x) = wrap_line(line, wrap_w, input.col);
+        for (si, seg) in segs.into_iter().enumerate() {
+            if li == 0 && si == 0 && has_prompt {
+                lines.push(prompt_line(seg));
+            } else {
+                lines.push(Line::from(Span::raw(seg)));
+            }
         }
         if li == input.row {
             cur_row += seg_idx;
-            cur_x = x;
+            cur_x = x + if li == 0 && seg_idx == 0 && has_prompt {
+                PROMPT_COLS as u16
+            } else {
+                0
+            };
         } else if li < input.row {
-            cur_row += wrap_line(line, w, line.len()).0.len() as u16;
+            cur_row += wrap_line(line, wrap_w, line.len()).0.len() as u16;
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from(String::new()));
+        lines.push(prompt_line(String::new()));
     }
     (lines, (cur_row, cur_x, cur_row))
 }
@@ -2059,9 +1935,9 @@ mod tests {
 
     #[test]
     fn shared_surface_dimensions_are_consistent() {
-        assert_eq!(input_content_width(80), 77);
+        assert_eq!(input_content_width(80), 78);
         assert_eq!(input_content_width(1), 0);
-        assert_eq!(input_content_width(3), 0);
+        assert_eq!(input_content_width(3), 1);
         assert_eq!(
             input_content_width(80),
             input_block().inner(Rect::new(0, 0, 80, 24)).width
@@ -2994,10 +2870,10 @@ mod tests {
         );
         let mut app = test_app();
         app.input = InputField::from_text(&"x".repeat(200));
-        let measured = render_input(&app.input, input_content_width(area.width))
+        let measured = render_input(&app.input, input_content_width(area.width), false)
             .0
             .len();
-        let rendered = render_input(&app.input, input_block().inner(area).width)
+        let rendered = render_input(&app.input, input_block().inner(area).width, false)
             .0
             .len();
         assert_eq!(measured, rendered, "wrapped row counts must agree");
@@ -3082,13 +2958,13 @@ mod tests {
         app.busy = true;
         app.input = InputField::from_text("steer left");
         terminal.draw(|f| view(f, &mut app)).expect("frame");
-        let input_rows = render_input(&app.input, input_content_width(area.width))
+        let input_rows = render_input(&app.input, input_content_width(area.width), false)
             .0
             .len() as u16;
         let layout =
             compute_layout(area, input_rows, QueueMetrics { items: 1, rows: 1 }, false).unwrap();
         let inner = input_block().inner(layout.input);
-        let (_, cursor) = render_input(&app.input, inner.width);
+        let (_, cursor) = render_input(&app.input, inner.width, false);
         terminal
             .backend_mut()
             .assert_cursor_position((inner.x + cursor.1, inner.y + cursor.2));
@@ -3200,7 +3076,7 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_wrapping_is_width_bounded_and_fills_background() {
+    fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         let long = "Current: Directive: P0-P5 shipped per PLAN.md.P10 with HARNESS re-score each phase. Gates: P6 permission ceiling+scoped audit, P7 token auth/policy/redaction, P8 tx edits/journal/rebuild, P9 verification/trace/cost, P10 versioned protocol/seq/replay. Primitive beats intent. Principles: Session::set_state/load_session_state JSONL, injection via system at WRAP_UP_THRESHOLD, state in daemon, ceiling not flag, Protocol: src/llm/protocol.rs, src/protocol/mod.rs; Git commits 770d5d1 P5 hardening, 8d0ccb, e2d5c97, prior unstaged 655+/102- across 3 files (fmt'd). Unresolved: P6 ceiling+audit validation pending, P7 remote security (token auth/policy/redaction) in-progress, then P8-10; HARNESS re-score required per phase. ns: treat diff as P5 compaction hardening (token math+deterministic fallback+ephemeral injection); validate format/math/ordering + tests/clippy before commit; sequential execution. Actions: audited token/config wiring; cargo test 68 passed + clippy 0 + build, committed 770d5d1 (3 files); then started P7 audit - hit No such file io error, inspected DaemonState/Client, re-read ns:Mutex<HashMap<String,SessionEntry>>, PendingApproval{}, server::router, TcpListener non-blocking->tokio; DaemonClient blocking request, Outcomes: P5 hardening complete - token accounting hardened, session consistency maintained.";
         for w in [80, 90, 100, 120, 70, 50, 40] {
             let mut app = test_app();
@@ -3217,11 +3093,18 @@ mod tests {
                         "user line overflow at w {w}: width {width} > {w} line {:?}",
                         s
                     );
-                    // User lines should fill exactly w with bg (except maybe last? but our code fills)
-                    // Check that at least one span has bg
+                    // Composer-matched style: no raised background, every row
+                    // on the shared transcript margin (exactly one gutter of
+                    // leading space — the same column the composer's glyph
+                    // occupies).
                     assert!(
-                        wl.spans.iter().any(|sp| sp.style.bg.is_some()),
-                        "user line should have bg"
+                        wl.spans.iter().all(|sp| sp.style.bg.is_none()),
+                        "user line must not carry a background at w {w}: {s:?}"
+                    );
+                    assert_eq!(
+                        wl.spans.first().map(|sp| sp.content.as_ref()),
+                        Some(super::super::transcript_indent().as_str()),
+                        "user row must carry the grid-margin indent span at w {w}: {s:?}"
                     );
                 }
             }
@@ -3293,7 +3176,7 @@ mod tests {
             let buffer = terminal.backend().buffer();
             let area = buffer.area;
             // Compute layout like view does
-            let input_rows = render_input(&app.input, input_content_width(area.width))
+            let input_rows = render_input(&app.input, input_content_width(area.width), false)
                 .0
                 .len() as u16;
             let queue = pending_queue_metrics(&app);
@@ -3396,14 +3279,14 @@ mod tests {
             "streamed assistant chunks must stay flush inside one block"
         );
     }
-    /// Regression: the submitted-prompt box (raised surface) must render as
-    /// exactly three consecutive rows — top edge, content, bottom edge. The
-    /// transcript Paragraph must NOT enable `Wrap`: the display cache is already
-    /// pre-wrapped, and ratatui 0.29's WordWrapper emits a phantom empty row
-    /// before any all-whitespace line exactly `area.width` wide (the box edge
-    /// rows), punching dark holes inside the box.
+    /// Regression: the submitted prompt must render as one flush-left row
+    /// headed by the composer glyph, followed by exactly one blank gap row
+    /// before the next block. The transcript Paragraph must NOT enable `Wrap`:
+    /// the display cache is already pre-wrapped, and ratatui 0.29's WordWrapper
+    /// emits a phantom empty row before any all-whitespace line exactly
+    /// `area.width` wide, which would shift the tool block down.
     #[test]
-    fn submitted_prompt_box_is_three_solid_rows() {
+    fn submitted_prompt_is_one_row_above_tool_block() {
         let backend = TestBackend::new(126, 25);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = test_app();
@@ -3440,11 +3323,20 @@ mod tests {
         };
         let text_row = row_of("can you check pillar").expect("prompt text rendered");
         let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
-        // Box = edge, content(text), edge; then one gap line; then the tool block.
+        // One content row, then the inter-block gap row, then the tool block.
         assert_eq!(
             tool_row,
-            text_row + 3,
-            "box must occupy exactly text_row-1..text_row+1; a phantom row from Paragraph::wrap shifts the tool block down"
+            text_row + 2,
+            "a phantom row from Paragraph::wrap shifts the tool block down"
+        );
+        // On the shared transcript margin with the composer glyph head — the
+        // prompt row starts one gutter in, then `▶ ` + text (no background).
+        let prompt_row: String = (0..area.width)
+            .map(|x| buffer.cell((x, text_row)).unwrap().symbol())
+            .collect();
+        assert!(
+            prompt_row.starts_with(" ▶ can you check pillar"),
+            "prompt row must sit on the composer's glyph margin: {prompt_row:?}"
         );
     }
 
@@ -3887,6 +3779,35 @@ mod tests {
                 .flat_map(|l| l.spans.iter())
                 .any(|s| s.style.fg.is_some()),
             "dockerfile fence should fallback-highlight: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn composer_prompt_glyph_heads_the_first_row() {
+        // The `▶` glyph is the composer's visual cue: exactly one of them,
+        // on the shared transcript margin (one gutter in), same row as the
+        // first line of input.
+        let (w, h) = (60u16, 16u16);
+        let mut app = test_app();
+        app.input = InputField::from_text("hello composer");
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| view(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let prompt_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains(COMPOSER_PROMPT))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(prompt_rows.len(), 1, "one prompt row: {rows:?}");
+        let row = rows[prompt_rows[0]].trim_end();
+        let margin = " ".repeat(TRANSCRIPT_INDENT);
+        assert!(
+            row.starts_with(&format!("{margin}{COMPOSER_PROMPT} hello composer")),
+            "glyph on the transcript margin, gap + text after it: {row:?}"
         );
     }
 }
