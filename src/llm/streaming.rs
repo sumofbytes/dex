@@ -77,6 +77,9 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if crate::llm::stream::is_stream_idle_error(err) {
         return false; // transient stall — retried same-protocol, not a mismatch
     }
+    if crate::llm::stream::is_dropped_connection(err) {
+        return false; // dead socket — retried same-protocol, not a mismatch
+    }
     !err.contains("cancelled")
 }
 
@@ -230,6 +233,12 @@ mod tests {
             assert!(!try_responses_fallback(
                 &cfg,
                 "stream idle for over 300s; the provider stalled"
+            ));
+            // Never on a dropped socket either: transient transport retried
+            // same-protocol — falling back would learn the wrong protocol.
+            assert!(!try_responses_fallback(
+                &cfg,
+                "error sending request: connection closed before message completed"
             ));
             // Explicit DEX_MODEL_APIS entry — user already decided.
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");

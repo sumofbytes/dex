@@ -559,21 +559,52 @@ impl SseDriver {
 /// timer. `DEX_STREAM_IDLE_TIMEOUT_SECS` overrides; `0` disables the
 /// watchdog entirely (no timer armed).
 ///
-/// The default (300s) covers slow reasoning models that buffer for minutes
-/// without emitting a chunk; a stall past it is retried automatically by the
-/// caller (same protocol, bounded) before it ever fails the turn.
-pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+/// The default is per-model ([`stream_idle_timeout_for`]): reasoning-capable
+/// models buffer for minutes without emitting a chunk (300s), fast models
+/// fail fast (90s) so a real stall surfaces instead of hanging. A stall past
+/// the budget is retried automatically by the caller (same protocol,
+/// bounded) before it ever fails the turn.
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+pub(crate) const REASONING_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
 pub(crate) fn is_stream_idle_error(message: &str) -> bool {
     message.contains("stream idle for over")
 }
 
-fn stream_idle_timeout() -> Option<Duration> {
+/// Transport deaths that say nothing about the request: a middlebox or dead
+/// peer dropped the socket mid-body (surfaced by `chunk()` once TCP
+/// keepalives stop being ACKed). Pre-output these are pure re-issues —
+/// nothing flowed, nothing to duplicate — and the protocol-fallback gate
+/// excludes them too, so a dead socket is never learned as a mismatch.
+pub(crate) fn is_dropped_connection(message: &str) -> bool {
+    [
+        "connection closed before message completed",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|s| message.contains(s))
+}
+
+/// Idle budget for one stream: the explicit env override wins, `0`
+/// disables; otherwise reasoning-capable models (thinking enabled for this
+/// call, or the models.dev catalog advertises effort options for the model)
+/// get the patient budget and fast models fail fast.
+pub(crate) fn stream_idle_timeout_for(model: &str, thinking: bool) -> Option<Duration> {
     match env_secs("DEX_STREAM_IDLE_TIMEOUT_SECS") {
         Some(0) => None,
         Some(secs) => Some(Duration::from_secs(secs)),
-        None => Some(Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)),
+        None => Some(Duration::from_secs(if model_reasons(model, thinking) {
+            REASONING_STREAM_IDLE_TIMEOUT_SECS
+        } else {
+            DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+        })),
     }
+}
+
+fn model_reasons(model: &str, thinking: bool) -> bool {
+    thinking || crate::llm::config::reasoning_options_for(model).is_some()
 }
 
 fn env_secs(name: &str) -> Option<u64> {
@@ -586,11 +617,14 @@ fn env_secs(name: &str) -> Option<u64> {
 /// split on `\n`, feed the existing `StreamParser`s unchanged (pure
 /// functions over `&str`). Cancel via `select!(cancelled(),
 /// chunk = response.chunk())` — a stalled chunk no longer stalls cancel.
-/// Preserves `MidStreamError` semantics exactly.
+/// The idle budget is caller-computed per model
+/// ([`stream_idle_timeout_for`]); `None` arms no timer. Preserves
+/// `MidStreamError` semantics exactly.
 async fn run_sse<P: StreamParser>(
     mut response: reqwest::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    idle_timeout: Option<Duration>,
     mut parser: P,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     let sink_is_some = sink.is_some();
@@ -601,7 +635,6 @@ async fn run_sse<P: StreamParser>(
         let _ = io::stdout().flush();
         return Err(stream_err("cancelled", false));
     }
-    let idle_timeout = stream_idle_timeout();
     let mut driver = SseDriver::new(sink.clone());
     let mut buf: Vec<u8> = Vec::new();
     // Pin the cancel future once; `cancelled()` loops until set, so a
@@ -729,8 +762,16 @@ pub(crate) async fn read_stream(
     response: reqwest::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    idle_timeout: Option<Duration>,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    run_sse(response, sink, cancel, ChatCompletionsParser::default()).await
+    run_sse(
+        response,
+        sink,
+        cancel,
+        idle_timeout,
+        ChatCompletionsParser::default(),
+    )
+    .await
 }
 
 /// Read a responses-API SSE body into a turn.
@@ -738,8 +779,16 @@ pub(crate) async fn read_responses_stream(
     response: reqwest::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    idle_timeout: Option<Duration>,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    run_sse(response, sink, cancel, ResponsesParser::default()).await
+    run_sse(
+        response,
+        sink,
+        cancel,
+        idle_timeout,
+        ResponsesParser::default(),
+    )
+    .await
 }
 
 /// Read an Anthropic Messages SSE body into a turn.
@@ -747,8 +796,16 @@ pub(crate) async fn read_anthropic_stream(
     response: reqwest::Response,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    idle_timeout: Option<Duration>,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    run_sse(response, sink, cancel, AnthropicParser::default()).await
+    run_sse(
+        response,
+        sink,
+        cancel,
+        idle_timeout,
+        AnthropicParser::default(),
+    )
+    .await
 }
 
 fn stop_reason_from_finish(finish: &str) -> Option<StopReason> {
@@ -1286,8 +1343,8 @@ impl StreamParser for AnthropicParser {
 #[cfg(test)]
 mod tests {
     use super::{
-        delta_thought, driver_err, read_stream, stream_err, stream_idle_timeout, SinkLine,
-        SseDriver, StreamDelta, StreamPrinter, Usage,
+        delta_thought, driver_err, is_dropped_connection, read_stream, stream_err,
+        stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta, StreamPrinter, Usage,
     };
     use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
@@ -1936,32 +1993,88 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
             .send()
             .await
             .unwrap();
-        let turn = super::read_responses_stream(response, None, &CancellationToken::new())
-            .await
-            .unwrap();
+        let turn = super::read_responses_stream(
+            response,
+            None,
+            &CancellationToken::new(),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hello world!"));
     }
 
     #[test]
     fn idle_timeout_env_parses() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "7");
-        assert_eq!(stream_idle_timeout(), Some(Duration::from_secs(7)));
+        assert_eq!(
+            stream_idle_timeout_for("dex-test-no-such-model", false),
+            Some(Duration::from_secs(7))
+        );
         // 0 disables the watchdog entirely (no timer armed, not an
         // immediate timeout and not an infinite deadline).
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "0");
-        assert_eq!(stream_idle_timeout(), None);
+        assert_eq!(
+            stream_idle_timeout_for("dex-test-no-such-model", false),
+            None
+        );
         // Garbage falls back to the default.
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "junk");
         assert_eq!(
-            stream_idle_timeout(),
+            stream_idle_timeout_for("dex-test-no-such-model", false),
             Some(Duration::from_secs(super::DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
         );
         match prev {
             Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
             None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),
         }
+    }
+
+    #[test]
+    fn idle_timeout_default_is_per_model() {
+        // No env override (lock held so a parallel env-mutating test can't
+        // leak in); an unknown model is never reasoning-capable, so the
+        // default must not depend on whatever catalog cache the machine has.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
+        std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS");
+        assert_eq!(
+            stream_idle_timeout_for("dex-test-no-such-model", false),
+            Some(Duration::from_secs(super::DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
+        );
+        // Thinking enabled for the call earns the patient budget without any
+        // catalog entry.
+        assert_eq!(
+            stream_idle_timeout_for("dex-test-no-such-model", true),
+            Some(Duration::from_secs(
+                super::REASONING_STREAM_IDLE_TIMEOUT_SECS
+            ))
+        );
+        match prev {
+            Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),
+        }
+    }
+
+    #[test]
+    fn dropped_connection_matching() {
+        assert!(is_dropped_connection(
+            "error sending request: connection closed before message completed"
+        ));
+        assert!(is_dropped_connection(
+            "connection reset by peer (os error 104)"
+        ));
+        assert!(!is_dropped_connection("API error: boom"));
+        assert!(!is_dropped_connection(
+            "stream idle for over 90s; the provider stalled"
+        ));
     }
 
     /// A provider that sends response headers and then never sends a byte
@@ -1987,13 +2100,16 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
             .send()
             .await
             .unwrap();
-        let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
-        std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "1");
-        let result = read_stream(response, None, &CancellationToken::new()).await;
-        match prev {
-            Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
-            None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),
-        }
+        let result = read_stream(
+            response,
+            None,
+            &CancellationToken::new(),
+            // Explicit budget, not the env var: this test holds no env lock
+            // (a guard can't span `.await`) and must not race env-mutating
+            // tests. Env parsing is covered by `idle_timeout_env_parses`.
+            Some(Duration::from_secs(1)),
+        )
+        .await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("stream idle"),

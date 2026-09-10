@@ -331,10 +331,15 @@ pub(crate) async fn call_chat_completions(
         },
         reasoning_effort: &config.thinking_effort,
     };
-    // Same-protocol retry for a stalled stream: the watchdog fired without a
-    // chunk, so re-issuing the request resumes the turn instead of failing it
-    // back to the user for a manual `continue`. Bounded (`MAX` + 1 attempts);
-    // a persistently silent provider still surfaces its error.
+    // Same-protocol retry for a stalled or dropped stream: the watchdog
+    // fired without a chunk (or the socket died pre-output), so re-issuing
+    // the request resumes the turn instead of failing it back to the user
+    // for a manual `continue`. Bounded (`MAX` + 1 attempts); a persistently
+    // silent provider still surfaces its error.
+    let idle_timeout = crate::llm::stream::stream_idle_timeout_for(
+        &config.model,
+        config.thinking_effort.is_some(),
+    );
     for attempt in 0..=MAX_IDLE_STREAM_RETRIES {
         let resp = post_with_retry(
             config,
@@ -343,11 +348,13 @@ pub(crate) async fn call_chat_completions(
             sink.as_ref(),
         )
         .await?;
-        match read_stream(resp, sink.clone(), cancel).await {
+        match read_stream(resp, sink.clone(), cancel, idle_timeout).await {
             Ok(turn) => return Ok(turn),
             Err(e) => {
                 let msg = error_chain_message(&*e);
-                if should_retry_idle(&msg, attempt) && !cancel.is_cancelled() {
+                if (should_retry_idle(&msg, attempt) || should_retry_dropped(&*e, attempt))
+                    && !cancel.is_cancelled()
+                {
                     note_idle_retry(&sink, attempt, &msg).await;
                     tokio::time::sleep(backoff_delay(attempt, None)).await;
                     continue;
@@ -387,6 +394,10 @@ pub(crate) async fn call_responses(
     if let Some(effort) = &config.thinking_effort {
         body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
+    let idle_timeout = crate::llm::stream::stream_idle_timeout_for(
+        &config.model,
+        config.thinking_effort.is_some(),
+    );
     for attempt in 0..=MAX_IDLE_STREAM_RETRIES {
         // Mid-stream failures (output already flowed) are marked by the stream
         // driver itself, so the protocol-fallback gate won't re-run a turn whose
@@ -402,11 +413,13 @@ pub(crate) async fn call_responses(
             sink.as_ref(),
         )
         .await?;
-        match read_responses_stream(resp, sink.clone(), cancel).await {
+        match read_responses_stream(resp, sink.clone(), cancel, idle_timeout).await {
             Ok(turn) => return Ok(turn),
             Err(e) => {
                 let msg = error_chain_message(&*e);
-                if should_retry_idle(&msg, attempt) && !cancel.is_cancelled() {
+                if (should_retry_idle(&msg, attempt) || should_retry_dropped(&*e, attempt))
+                    && !cancel.is_cancelled()
+                {
                     note_idle_retry(&sink, attempt, &msg).await;
                     tokio::time::sleep(backoff_delay(attempt, None)).await;
                     continue;
@@ -434,6 +447,10 @@ pub(crate) async fn call_anthropic_messages(
     // 200, and a 200 body carries no `Retry-After` — hence
     // `backoff_delay(attempt, None)`, with the attempt index restarting here.
     const MAX_STREAM_RETRIES: u32 = 3;
+    let idle_timeout = crate::llm::stream::stream_idle_timeout_for(
+        &config.model,
+        config.thinking_effort.is_some(),
+    );
     for attempt in 0..=MAX_STREAM_RETRIES {
         let resp = post_with_retry(
             config,
@@ -450,7 +467,9 @@ pub(crate) async fn call_anthropic_messages(
         // A stalled stream retries same-protocol too (mid-stream included,
         // with an explicit notice) instead of failing the turn for a manual
         // `continue`.
-        match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel).await {
+        match crate::llm::stream::read_anthropic_stream(resp, sink.clone(), cancel, idle_timeout)
+            .await
+        {
             Ok(turn) => return Ok(turn),
             Err(e) if should_retry_stream_error(&*e, attempt, MAX_STREAM_RETRIES) => {
                 let delay = backoff_delay(attempt, None);
@@ -461,7 +480,9 @@ pub(crate) async fn call_anthropic_messages(
             }
             Err(e) => {
                 let msg = error_chain_message(&*e);
-                if should_retry_idle(&msg, attempt) && !cancel.is_cancelled() {
+                if (should_retry_idle(&msg, attempt) || should_retry_dropped(&*e, attempt))
+                    && !cancel.is_cancelled()
+                {
                     note_idle_retry(&sink, attempt, &msg).await;
                     tokio::time::sleep(backoff_delay(attempt, None)).await;
                     continue;
@@ -488,13 +509,26 @@ fn should_retry_idle(message: &str, attempt: u32) -> bool {
         && !message.contains("cancelled")
 }
 
+/// Same-protocol retry for a dead socket: keepalives surface a dropped
+/// connection as a transport error from `chunk()`. Pre-output it is a pure
+/// re-issue — nothing flowed, nothing to duplicate — so unlike mid-stream
+/// failures it stays retryable. Shares the idle-retry budget. Never retries
+/// cancellations.
+fn should_retry_dropped(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
+    let message = error_chain_message(err);
+    attempt < MAX_IDLE_STREAM_RETRIES
+        && !crate::llm::streaming::is_mid_stream(err)
+        && crate::llm::stream::is_dropped_connection(&message)
+        && !message.contains("cancelled")
+}
+
 /// Visible retry notice: headless logs to stderr, TUI gets a transcript
 /// `System` line (console IO is suppressed under a sink).
 async fn note_idle_retry(sink: &Option<mpsc::Sender<SinkLine>>, attempt: u32, message: &str) {
     let delay = backoff_delay(attempt, None);
     with_console(sink.is_some(), || {
         eprintln!(
-            "[llm] stream stalled ({message}): retrying in {:?} (attempt {}/{})",
+            "[llm] stream interrupted ({message}): retrying in {:?} (attempt {}/{})",
             delay,
             attempt + 2,
             MAX_IDLE_STREAM_RETRIES + 1,
@@ -503,7 +537,7 @@ async fn note_idle_retry(sink: &Option<mpsc::Sender<SinkLine>>, attempt: u32, me
     if let Some(sink) = sink {
         let _ = sink
             .send(SinkLine::System(format!(
-                "stream stalled ({message}); retrying automatically (attempt {}/{})",
+                "stream interrupted ({message}); retrying automatically (attempt {}/{})",
                 attempt + 2,
                 MAX_IDLE_STREAM_RETRIES + 1,
             )))
@@ -678,6 +712,28 @@ mod tests {
             "stream idle for over 300s; x"
         ));
         assert!(!crate::llm::stream::is_stream_idle_error("API error: boom"));
+    }
+
+    #[test]
+    fn dropped_connection_retries_pre_output_only() {
+        // A dead socket before any output is a pure re-issue within budget.
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            "error sending request: connection closed before message completed".into();
+        assert!(should_retry_dropped(&*err, 0));
+        assert!(should_retry_dropped(&*err, 1));
+        assert!(!should_retry_dropped(&*err, MAX_IDLE_STREAM_RETRIES));
+        // Mid-stream drops never retry here — partial output may already be
+        // on the transcript and a re-issued call would duplicate it.
+        let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            crate::llm::stream::MidStreamError("connection reset by peer".into()),
+        );
+        assert!(!should_retry_dropped(&*mid, 0));
+        // Anything else never retries through this gate.
+        let other: Box<dyn std::error::Error + Send + Sync> = "API error: invalid api key".into();
+        assert!(!should_retry_dropped(&*other, 0));
+        let cancelled: Box<dyn std::error::Error + Send + Sync> =
+            "connection reset; cancelled".into();
+        assert!(!should_retry_dropped(&*cancelled, 0));
     }
 
     #[test]
