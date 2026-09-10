@@ -1433,12 +1433,9 @@ pub(crate) async fn execute(
         audit(name, args, &error.to_string());
         return Err(error);
     };
-    if let Err(error) = enforce_policy(name, args, requirement, cancel, policy).await {
-        audit(name, args, &error.to_string());
-        return Err(error);
-    }
     // Availability before approval: a sharper, cheaper rejection naming the
     // agent's allowlist (plan §11 — the model self-corrects, never executes).
+    // Checked before `enforce_policy` so a denied tool never prompts.
     if let Some(filter) = filter {
         if !filter.allows(name) {
             let error = ToolError::Denied(format!(
@@ -1448,6 +1445,10 @@ pub(crate) async fn execute(
             audit(name, args, &error.to_string());
             return Err(error);
         }
+    }
+    if let Err(error) = enforce_policy(name, args, requirement, cancel, policy).await {
+        audit(name, args, &error.to_string());
+        return Err(error);
     }
     if name.starts_with("mcp__") {
         let result = crate::mcp::call_global(name, args, cancel).await;
@@ -2807,6 +2808,29 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("dex"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn filtered_out_tool_rejects_before_approval_without_prompt() {
+        // Filter runs before policy: a denied tool must fail closed with an
+        // allowlist error and never park an approval prompt.
+        let (console, mut approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::AskWrites, &console);
+        let filter = ToolFilter::new("explorer", ["read"]);
+        let args = phase0_write_args("target/phase0-filter-no-prompt.txt");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_outcome("write", &args, &GlobalCancellation, &policy, Some(&filter)),
+        )
+        .await
+        .expect("filtered-out rejection must not block");
+        assert!(!outcome.ok);
+        assert!(outcome.text.contains("allowlist"), "{}", outcome.text);
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "filtered-out tool must reject, never prompt"
+        );
+        assert!(!std::path::Path::new("target/phase0-filter-no-prompt.txt").exists());
     }
 
     #[tokio::test]
