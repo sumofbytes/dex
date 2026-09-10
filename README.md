@@ -479,7 +479,7 @@ schema):
 | `bash`  | Run a shell command via `sh -c` (`command`).                     |
 | `write` | Write/overwrite a file (`path`, `content`).                      |
 | `edit`  | Replace exactly one occurrence of text (`path`, `oldText`, `newText`). |
-| `ffgrep` | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`). |
+| `ffgrep` | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
 | `fffind` | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`). |
 | `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
 | `chain`* | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`. |
