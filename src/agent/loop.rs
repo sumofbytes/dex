@@ -16,7 +16,7 @@ use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::stream::Turn;
 use crate::session::Session;
-use crate::tools::{execute_outcome, Policy, ToolOutcome};
+use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
     let mut paths = std::collections::HashSet::new();
@@ -144,6 +144,7 @@ async fn execute_tool_call(
     call: &LlmToolCall,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
@@ -175,7 +176,7 @@ async fn execute_tool_call(
     let input = serde_json::to_string(args).unwrap_or_default();
     crate::log!(Debug, "tool {name} {input}");
     let started = Instant::now();
-    let outcome = execute_outcome(&name, args, cancel, policy).await;
+    let outcome = execute_outcome(&name, args, cancel, policy, filter).await;
     crate::log!(
         Debug,
         "tool {name} ok={} in {:?}",
@@ -220,18 +221,47 @@ async fn emergency_compact(
     Ok(compacted_any)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn process_turn(
-    config: &LlmConfig,
-    messages: &mut Vec<ChatMessage>,
-    state: &mut ToolState,
-    mut steering_rx: Option<&mut mpsc::Receiver<String>>,
-    steering_accepted_tx: Option<&mpsc::Sender<String>>,
-    mut session: Option<&mut Session>,
-    client: &(impl ModelClient + 'static),
-    cancel: &(impl CancellationSource + Clone + 'static),
-    console: &Console,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// The per-agent capability bundle for [`process_turn`] (Phase 2 runtime
+/// extraction; plan §8). One loop serves main agent and children — the
+/// bundle decides what each run gets: the main agent passes its steering
+/// channels, session, and `filter: None`; a child passes `steering_rx:
+/// None`, its own seed messages, its own JSONL session, its own console,
+/// and `filter: Some` (allowlist enforced at dispatch). Children never
+/// inherit the parent's transcript, steering, session, or cancel token.
+pub(crate) struct AgentRuntime<'a, C, X> {
+    pub(crate) config: &'a LlmConfig,
+    pub(crate) messages: &'a mut Vec<ChatMessage>,
+    pub(crate) state: &'a mut ToolState,
+    pub(crate) steering_rx: Option<&'a mut mpsc::Receiver<String>>,
+    pub(crate) steering_accepted_tx: Option<&'a mpsc::Sender<String>>,
+    pub(crate) session: Option<&'a mut Session>,
+    pub(crate) client: &'a C,
+    pub(crate) cancel: &'a X,
+    pub(crate) console: &'a Console,
+    pub(crate) filter: Option<&'a ToolFilter>,
+}
+
+pub(crate) async fn process_turn<C, X>(
+    rt: AgentRuntime<'_, C, X>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: ModelClient + 'static,
+    X: CancellationSource + Clone + 'static,
+{
+    // Unbundle so the body below stays the single-agent code it was —
+    // byte-identical behavior for `filter: None`.
+    let AgentRuntime {
+        config,
+        messages,
+        state,
+        mut steering_rx,
+        steering_accepted_tx,
+        mut session,
+        client,
+        cancel,
+        console,
+        filter,
+    } = rt;
     let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
@@ -422,6 +452,7 @@ pub(crate) async fn process_turn(
                         call,
                         cancel as &(dyn CancellationSource + Send + Sync),
                         &policy,
+                        filter,
                     )
                     .await;
                     out.push((name, input, outcome, started.elapsed()));
@@ -435,10 +466,14 @@ pub(crate) async fn process_turn(
                     let call = call.clone();
                     let cancel = cancel.clone();
                     let policy = policy.clone();
+                    // Owned per task: the future must be 'static, so it
+                    // cannot hold the turn's borrowed filter — same shape
+                    // as the per-task policy clone above.
+                    let filter = filter.cloned();
                     set.spawn(async move {
                         let started = Instant::now();
                         let (name, input, outcome) =
-                            execute_tool_call(&call, &cancel, &policy).await;
+                            execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
                         (idx, name, input, outcome, started.elapsed())
                     });
                 }
@@ -784,17 +819,18 @@ mod tests {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
-        let result = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &MockModel,
-            &NeverCancel,
-            &crate::core::console::Console::none(),
-        )
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &MockModel,
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "hello from mock");
@@ -860,17 +896,18 @@ mod tests {
         let mut state = ToolState::default();
         let (sink_tx, mut sink_rx) = mpsc::channel(32);
         let (approval_tx, _approval_rx) = mpsc::channel(16);
-        let _ = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &ToolThenAnswer::new(),
-            &NeverCancel,
-            &crate::core::console::Console::daemon(sink_tx, approval_tx),
-        )
+        let _ = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &ToolThenAnswer::new(),
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::daemon(sink_tx, approval_tx),
+            filter: None,
+        })
         .await;
         let mut events = Vec::new();
         while let Ok(e) = sink_rx.try_recv() {
@@ -991,17 +1028,18 @@ mod tests {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
-        let err = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &AlwaysTool,
-            &NeverCancel,
-            &crate::core::console::Console::none(),
-        )
+        let err = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &AlwaysTool,
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await
         .unwrap_err()
         .to_string();
@@ -1070,19 +1108,20 @@ mod tests {
             messages.push(ChatMessage::assistant(format!("a{i}: {}", "y".repeat(300))));
         }
         let mut state = ToolState::default();
-        let result = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &OverflowThenOk {
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &OverflowThenOk {
                 round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
-            &NeverCancel,
-            &crate::core::console::Console::none(),
-        )
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await;
         assert!(
             result.is_ok(),
@@ -1127,17 +1166,18 @@ mod tests {
             cancel2.cancel();
         });
         let start = std::time::Instant::now();
-        let err = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &Hanging,
-            &cancel,
-            &crate::core::console::Console::none(),
-        )
+        let err = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &Hanging,
+            cancel: &cancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await
         .unwrap_err();
         assert_eq!(err.to_string(), "cancelled by user");
@@ -1202,19 +1242,20 @@ mod tests {
             cancel2.cancel();
         });
         let start = std::time::Instant::now();
-        let err = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &SleepOnce {
+        let err = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &SleepOnce {
                 round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
-            &cancel,
-            &crate::core::console::Console::none(),
-        )
+            cancel: &cancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await
         .unwrap_err();
         assert_eq!(err.to_string(), "cancelled by user");
@@ -1293,14 +1334,14 @@ mod tests {
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
         let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
-        let _ = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &RepeatedGuardScript::new(vec![
+        let _ = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &RepeatedGuardScript::new(vec![
                 "echo repeat-probe",
                 "echo other-a",
                 "echo other-b",
@@ -1309,9 +1350,10 @@ mod tests {
                 "echo other-d",
                 "echo repeat-probe",
             ]),
-            &NeverCancel,
-            &crate::core::console::Console::none(),
-        )
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await;
         let guard_hits = messages
             .iter()
@@ -1333,17 +1375,18 @@ mod tests {
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
         let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
-        let _ = process_turn(
-            &config,
-            &mut messages,
-            &mut state,
-            None,
-            None,
-            None,
-            &RepeatedGuardScript::new(vec!["echo probe", "echo probe", "echo probe"]),
-            &NeverCancel,
-            &crate::core::console::Console::none(),
-        )
+        let _ = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &RepeatedGuardScript::new(vec!["echo probe", "echo probe", "echo probe"]),
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+        })
         .await;
         let guard_hits = messages
             .iter()
@@ -1362,6 +1405,119 @@ mod tests {
             last_tool,
             Some(guard_err),
             "the guard error must land on the third call's result"
+        );
+    }
+
+    /// Phase 2 exit: a child runs the same loop with its own seed, no
+    /// steering, and a filter — the allowlist is enforced at dispatch
+    /// (denied `bash` fails closed as a tool result) while the allowed
+    /// `read` runs, and the history is the child's own.
+    #[derive(Clone)]
+    struct FilterProbe {
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FilterProbe {
+        fn new() -> Self {
+            Self {
+                round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ModelClient for FilterProbe {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _with_tools: bool,
+            _sink: Option<mpsc::Sender<SinkLine>>,
+            _cancel: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round == 0 {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![
+                        crate::core::types::LlmToolCall {
+                            id: "call-1".into(),
+                            call_type: "function".into(),
+                            function: crate::core::types::FunctionCall {
+                                name: "read".into(),
+                                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                            },
+                        },
+                        crate::core::types::LlmToolCall {
+                            id: "call-2".into(),
+                            call_type: "function".into(),
+                            function: crate::core::types::FunctionCall {
+                                name: "bash".into(),
+                                arguments: r#"{"command":"echo hi"}"#.into(),
+                            },
+                        },
+                    ],
+                )
+            } else {
+                ChatMessage::assistant("done")
+            };
+            Ok(Turn {
+                message,
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    cached_tokens: None,
+                }),
+                stop_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_child_run_enforces_allowlist_and_keeps_own_history() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("child seed: explore only")];
+        let mut state = ToolState::default();
+        let filter = ToolFilter::new("explorer", ["read", "ffgrep", "fffind"]);
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &FilterProbe::new(),
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: Some(&filter),
+        })
+        .await;
+        assert_eq!(result.unwrap(), "done");
+        let tool_text: String = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            tool_text.contains("dex"),
+            "allowed read must run: {tool_text}"
+        );
+        assert!(
+            tool_text.contains("not in explorer's tool allowlist"),
+            "denied bash must fail closed with the policy reason: {tool_text}"
+        );
+        // The child's history is its own seed plus this turn — no parent
+        // transcript is ever inherited.
+        assert_eq!(
+            messages.first().and_then(|m| m.content.as_deref()),
+            Some("child seed: explore only")
+        );
+        assert!(
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("parent transcript"))),
+            "child must never see the parent transcript"
         );
     }
 }

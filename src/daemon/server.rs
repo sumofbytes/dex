@@ -13,7 +13,7 @@ use futures_core::Stream;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::agent::r#loop::process_turn;
+use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
 use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
@@ -1185,17 +1185,19 @@ async fn run_turn_inner(
     loop {
         // Reborrow `&mut Receiver` from `Option<&mut Receiver>` without moving.
         let steering_reborrow = steering_opt.as_deref_mut();
-        let result = process_turn(
-            &config,
-            &mut messages,
-            &mut tool_state,
-            steering_reborrow,
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut tool_state,
+            steering_rx: steering_reborrow,
             steering_accepted_tx,
-            Some(&mut session),
-            &config,
+            session: Some(&mut session),
+            client: &config,
             cancel,
-            &console,
-        )
+            console: &console,
+            // Main agent: unfiltered (children pass Some via the manager).
+            filter: None,
+        })
         .await;
         match result {
             Ok(resp) => {
@@ -1680,11 +1682,13 @@ async fn session_shell(
     );
     // Explicit user `!` invocation: the `!` itself is the approval, so this
     // runs trusted (same rationale as `execute_sync` for `dex run`).
+    // Unfiltered: explicit invocations never run under a child allowlist.
     let (output, success, code) = match crate::tools::execute(
         "bash",
         &args,
         &shell_cancel,
         &crate::tools::Policy::trusted(),
+        None,
     )
     .await
     {

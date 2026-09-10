@@ -4,6 +4,7 @@ mod fff;
 use self::fff::{tool_fffind, tool_ffgrep};
 use serde_json::{Map, Value};
 use similar::TextDiff;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -1100,6 +1101,7 @@ async fn tool_chain(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
     let steps = args
         .get("steps")
@@ -1119,7 +1121,7 @@ async fn tool_chain(
 
     let mut completed: Vec<(String, String)> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
-        match run_chain_step(step, index, &completed, cancel, policy).await {
+        match run_chain_step(step, index, &completed, cancel, policy, filter).await {
             Ok(pair) => completed.push(pair),
             Err(error) => {
                 let mut text = render_chain_steps(&completed);
@@ -1155,6 +1157,7 @@ async fn run_chain_step(
     completed: &[(String, String)],
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<(String, String), ToolError> {
     let invalid = |message: String| ToolError::InvalidArgument(format!("step {index}: {message}"));
     let obj = step
@@ -1221,7 +1224,7 @@ async fn run_chain_step(
         );
     }
 
-    let output = Box::pin(execute(tool, &step_args, cancel, policy)).await?;
+    let output = Box::pin(execute(tool, &step_args, cancel, policy, filter)).await?;
     Ok((tool.to_string(), output))
 }
 
@@ -1372,12 +1375,52 @@ async fn enforce_policy(
     }
 }
 
+/// Allowlist enforced at dispatch (Phase 2 runtime extraction; plan §11).
+/// `owner` names the agent the set belongs to and appears in denial errors
+/// so the model can self-correct; `allowed` holds exact tool names plus
+/// `prefix*` wildcards (`mcp__gh__*` covers one server; `mcp__*` covers all
+/// MCP tools). A bare `*` would allow everything — never put it in a child
+/// set. `None` (no filter) preserves the parent's unfiltered behavior at
+/// every existing call site.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolFilter {
+    pub(crate) owner: String,
+    pub(crate) allowed: BTreeSet<String>,
+}
+
+impl ToolFilter {
+    // Test-only until the Phase 4 manager builds child filters from
+    // definitions (same precedent as DaemonState::is_session_approved).
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        owner: impl Into<String>,
+        allowed: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            owner: owner.into(),
+            allowed: allowed.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Exact name match, or a `prefix*` wildcard entry covering it.
+    pub(crate) fn allows(&self, name: &str) -> bool {
+        if self.allowed.contains(name) {
+            return true;
+        }
+        self.allowed
+            .iter()
+            .filter_map(|entry| entry.strip_suffix('*'))
+            .any(|prefix| name.starts_with(prefix))
+    }
+}
+
 /// Execute a tool using paths confined to the current workspace.
 pub(crate) async fn execute(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
     let requirement = if name.starts_with("mcp__") {
         // MCP tools are external processes: most restrictive gate, same as
@@ -1393,6 +1436,18 @@ pub(crate) async fn execute(
     if let Err(error) = enforce_policy(name, args, requirement, cancel, policy).await {
         audit(name, args, &error.to_string());
         return Err(error);
+    }
+    // Availability before approval: a sharper, cheaper rejection naming the
+    // agent's allowlist (plan §11 — the model self-corrects, never executes).
+    if let Some(filter) = filter {
+        if !filter.allows(name) {
+            let error = ToolError::Denied(format!(
+                "tool '{name}' is not in {}'s tool allowlist",
+                filter.owner
+            ));
+            audit(name, args, &error.to_string());
+            return Err(error);
+        }
     }
     if name.starts_with("mcp__") {
         let result = crate::mcp::call_global(name, args, cancel).await;
@@ -1428,7 +1483,7 @@ pub(crate) async fn execute(
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
         "ls" => tool_ls(args).await,
         "git" => tool_git(args, cancel).await,
-        "chain" => tool_chain(args, cancel, policy).await,
+        "chain" => tool_chain(args, cancel, policy, filter).await,
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
     let outcome = match &result {
@@ -1447,6 +1502,7 @@ pub(crate) async fn execute_outcome(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> ToolOutcome {
     // Capture the unified diff BEFORE `execute` mutates the file; the
     // before-image is gone afterwards. Display-only: it never reaches the
@@ -1456,7 +1512,7 @@ pub(crate) async fn execute_outcome(
     } else {
         None
     };
-    match execute(name, args, cancel, policy).await {
+    match execute(name, args, cancel, policy, filter).await {
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
@@ -1472,13 +1528,14 @@ pub(crate) async fn execute_outcome(
 
 /// Sync wrappers for `dex run <tool>` / `dex --tool` raw paths (no async CLI
 /// plumbing needed per plan §5). Explicit user invocations run trusted —
-/// the command itself is the approval — so no policy parameter.
+/// the command itself is the approval — so no policy parameter; unfiltered
+/// too (explicit invocations run the full toolset, never a child allowlist).
 pub(crate) fn execute_sync(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
-    crate::client::http::block_on(execute(name, args, cancel, &Policy::trusted()))
+    crate::client::http::block_on(execute(name, args, cancel, &Policy::trusted(), None))
 }
 
 #[cfg(test)]
@@ -1534,13 +1591,13 @@ mod tests {
     async fn tool_arguments_are_validated() {
         let args = Map::new();
         assert!(matches!(
-            execute("read", &args, &GlobalCancellation, &Policy::trusted()).await,
+            execute("read", &args, &GlobalCancellation, &Policy::trusted(), None).await,
             Err(ToolError::Missing("path"))
         ));
         let mut args = Map::new();
         args.insert("path".into(), Value::Bool(true));
         assert!(matches!(
-            execute("read", &args, &GlobalCancellation, &Policy::trusted()).await,
+            execute("read", &args, &GlobalCancellation, &Policy::trusted(), None).await,
             Err(ToolError::NotString("path"))
         ));
     }
@@ -1550,13 +1607,27 @@ mod tests {
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("*".into()));
         assert!(matches!(
-            execute("fffind", &args, &GlobalCancellation, &Policy::trusted()).await,
+            execute(
+                "fffind",
+                &args,
+                &GlobalCancellation,
+                &Policy::trusted(),
+                None
+            )
+            .await,
             Err(ToolError::InvalidArgument(_))
         ));
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("".into()));
         assert!(matches!(
-            execute("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await,
+            execute(
+                "ffgrep",
+                &args,
+                &GlobalCancellation,
+                &Policy::trusted(),
+                None
+            )
+            .await,
             Err(ToolError::InvalidArgument(_))
         ));
     }
@@ -1570,17 +1641,21 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("content".into(), Value::String("first\n".into()));
-        assert!(
-            execute("write", &args, &GlobalCancellation, &Policy::trusted())
-                .await
-                .is_ok()
-        );
+        assert!(execute(
+            "write",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None
+        )
+        .await
+        .is_ok());
         // Content round-trips and no `.dex-write-*` temp file survives.
         assert_eq!(fs::read_to_string(&full).unwrap(), "first\n");
         args.insert("oldText".into(), Value::String("first".into()));
         args.insert("newText".into(), Value::String("second".into()));
         assert!(
-            execute("edit", &args, &GlobalCancellation, &Policy::trusted())
+            execute("edit", &args, &GlobalCancellation, &Policy::trusted(), None)
                 .await
                 .is_ok()
         );
@@ -1612,16 +1687,20 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("content".into(), Value::String("#!/bin/sh\n".into()));
-        assert!(
-            execute("write", &args, &GlobalCancellation, &Policy::trusted())
-                .await
-                .is_ok()
-        );
+        assert!(execute(
+            "write",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None
+        )
+        .await
+        .is_ok());
         std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
         args.insert("oldText".into(), Value::String("#!/bin/sh".into()));
         args.insert("newText".into(), Value::String("#!/bin/sh\necho hi".into()));
         assert!(
-            execute("edit", &args, &GlobalCancellation, &Policy::trusted())
+            execute("edit", &args, &GlobalCancellation, &Policy::trusted(), None)
                 .await
                 .is_ok()
         );
@@ -1703,7 +1782,7 @@ mod tests {
         args.insert("newText".into(), Value::String("v2".into()));
         args.insert("expected_hash".into(), Value::String(h.clone()));
         assert!(
-            execute("edit", &args, &GlobalCancellation, &Policy::trusted())
+            execute("edit", &args, &GlobalCancellation, &Policy::trusted(), None)
                 .await
                 .is_ok()
         );
@@ -1716,7 +1795,14 @@ mod tests {
         stale.insert("newText".into(), Value::String("v3".into()));
         stale.insert("expected_hash".into(), Value::String("deadbeef".into()));
         assert!(matches!(
-            execute("edit", &stale, &GlobalCancellation, &Policy::trusted()).await,
+            execute(
+                "edit",
+                &stale,
+                &GlobalCancellation,
+                &Policy::trusted(),
+                None
+            )
+            .await,
             Err(ToolError::StaleFile { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
@@ -1778,7 +1864,8 @@ mod tests {
         args.insert("path".into(), Value::String(rel.into()));
         args.insert("oldText".into(), Value::String("b\n".into()));
         args.insert("newText".into(), Value::String("B\n".into()));
-        let outcome = execute_outcome("edit", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("edit", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(outcome.ok, "{}", outcome.text);
         let diff = outcome.diff.expect("edit outcome carries a diff");
         assert!(diff.contains("-b"), "{diff}");
@@ -1880,7 +1967,8 @@ mod tests {
 
         let mut args = Map::new();
         args.insert("path".into(), Value::String(path.display().to_string()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(outcome.ok, "{}", outcome.text);
         // Line numbers are now right-aligned with two spaces (no raw tab) and file
         // tabs are expanded per tab_width, so the separator is stable.
@@ -1891,11 +1979,13 @@ mod tests {
 
         args.insert("offset".into(), Value::Number(2.into()));
         args.insert("limit".into(), Value::Number(1.into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert_eq!(outcome.text, "   2  two");
 
         args.insert("offset".into(), Value::Number(9.into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(!outcome.ok, "offset past end must fail: {}", outcome.text);
 
         // Binary content is refused instead of dumped into the context.
@@ -1905,7 +1995,8 @@ mod tests {
             "path".into(),
             Value::String(root.join("blob.bin").display().to_string()),
         );
-        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("binary file"), "{}", outcome.text);
 
@@ -1933,7 +2024,8 @@ mod tests {
                 Value::String(root.join("b.txt").display().to_string()),
             ]),
         );
-        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("==> "), "{}", outcome.text);
         assert!(outcome.text.contains("   1  alpha"), "{}", outcome.text);
@@ -1943,7 +2035,8 @@ mod tests {
         // Glob fan-out, sorted, capped.
         let mut args = Map::new();
         args.insert("glob".into(), Value::String("*.txt".into()));
-        let outcome = execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("a.txt"), "{}", outcome.text);
         assert!(outcome.text.contains("b.txt"), "{}", outcome.text);
@@ -1971,8 +2064,14 @@ mod tests {
         args.insert("pattern".into(), Value::String(needle.clone()));
         args.insert("output_mode".into(), Value::String("content".into()));
         args.insert("context".into(), Value::Number(1.into()));
-        let outcome =
-            execute_outcome("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "ffgrep",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("before"), "{}", outcome.text);
         assert!(outcome.text.contains("after"), "{}", outcome.text);
@@ -2003,8 +2102,14 @@ mod tests {
             Value::String(format!("UserAccountControlel{}", "r")),
         );
         args.insert("output_mode".into(), Value::String("content".into()));
-        let outcome =
-            execute_outcome("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "ffgrep",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("approximate"), "{}", outcome.text);
         assert!(
@@ -2038,8 +2143,14 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome =
-            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "chain",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("--- step 0: ffgrep ---"),
@@ -2067,8 +2178,14 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome =
-            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "chain",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("read-only"), "{}", outcome.text);
 
@@ -2082,8 +2199,14 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome =
-            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "chain",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(outcome.text.contains("earlier step"), "{}", outcome.text);
 
@@ -2097,8 +2220,14 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let outcome =
-            execute_outcome("chain", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "chain",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(!outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("step 0: ffgrep") && outcome.text.contains("step 1 failed"),
@@ -2117,8 +2246,14 @@ mod tests {
         let needle = format!("zxq{}wvut", std::process::id());
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String(needle));
-        let outcome =
-            execute_outcome("ffgrep", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "ffgrep",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(
             outcome.ok,
             "no matches (exact or fuzzy) must be ok: {}",
@@ -2136,8 +2271,14 @@ mod tests {
         super::fff::rescan();
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("tools mod".into()));
-        let outcome =
-            execute_outcome("fffind", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "fffind",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(outcome.ok, "{}", outcome.text);
         assert!(
             outcome.text.contains("src/tools/mod.rs"),
@@ -2150,7 +2291,8 @@ mod tests {
     async fn failed_shell_command_keeps_output_and_exit_marker() {
         let mut args = Map::new();
         args.insert("command".into(), Value::String("echo boom; exit 2".into()));
-        let outcome = execute_outcome("bash", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome =
+            execute_outcome("bash", &args, &GlobalCancellation, &Policy::trusted(), None).await;
         assert!(!outcome.ok);
         assert!(outcome.text.contains("boom"));
         assert!(outcome.text.contains("[exit 2]"));
@@ -2182,7 +2324,7 @@ mod tests {
             ),
         );
         // Use workspace_path resolution via execute (paths confined).
-        let out = execute("read", &args, &GlobalCancellation, &Policy::trusted())
+        let out = execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
             .await
             .unwrap();
         // All good files present, in input order (==> path <== sections sorted by input, not completion).
@@ -2255,7 +2397,7 @@ mod tests {
             "command".to_string(),
             serde_json::Value::String("sleep 30".to_string()),
         );
-        let outcome = execute_outcome("bash", &args, &cancel, &Policy::trusted()).await;
+        let outcome = execute_outcome("bash", &args, &cancel, &Policy::trusted(), None).await;
         assert!(!outcome.ok);
         assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
     }
@@ -2281,7 +2423,7 @@ mod tests {
             "command".into(),
             serde_json::Value::String("echo hi".into()),
         );
-        let ok = execute("bash", &args, &GlobalCancellation, &Policy::trusted())
+        let ok = execute("bash", &args, &GlobalCancellation, &Policy::trusted(), None)
             .await
             .unwrap();
         assert!(ok.contains("hi"));
@@ -2302,7 +2444,7 @@ mod tests {
         args.insert("path".into(), serde_json::Value::String(rel.into()));
         args.insert("offset".into(), serde_json::Value::from(3u64));
         args.insert("limit".into(), serde_json::Value::from(2u64));
-        let out = execute("read", &args, &GlobalCancellation, &Policy::trusted())
+        let out = execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
             .await
             .unwrap();
         assert!(out.contains("3"), "{out}");
@@ -2315,9 +2457,15 @@ mod tests {
             .unwrap();
         let mut bargs = Map::new();
         bargs.insert("path".into(), serde_json::Value::String(bin_rel.into()));
-        let err = execute("read", &bargs, &GlobalCancellation, &Policy::trusted())
-            .await
-            .unwrap_err();
+        let err = execute(
+            "read",
+            &bargs,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("binary"), "{err}");
         let _ = tokio::fs::remove_file(cwd.join(rel)).await;
         let _ = tokio::fs::remove_file(cwd.join(bin_rel)).await;
@@ -2333,9 +2481,15 @@ mod tests {
                 serde_json::json!({"tool": "bash", "args": {"command": "echo hi"}}),
             ]),
         );
-        let err = execute("chain", &args, &GlobalCancellation, &Policy::trusted())
-            .await
-            .unwrap_err();
+        let err = execute(
+            "chain",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("read-only"), "{err}");
     }
 
@@ -2372,7 +2526,7 @@ mod tests {
         let args = phase0_write_args(rel);
         let expected_input = Value::Object(args.clone()).to_string();
         let mut handle = tokio::spawn(async move {
-            execute_outcome("write", &args, &GlobalCancellation, &policy).await
+            execute_outcome("write", &args, &GlobalCancellation, &policy, None).await
         });
         // The call blocks: no outcome before the verdict …
         assert!(
@@ -2414,7 +2568,7 @@ mod tests {
         let policy = Policy::turn(PermissionMode::AskWrites, &console);
         let args = phase0_write_args(rel);
         let handle = tokio::spawn(async move {
-            execute_outcome("write", &args, &GlobalCancellation, &policy).await
+            execute_outcome("write", &args, &GlobalCancellation, &policy, None).await
         });
         let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
             .await
@@ -2444,7 +2598,7 @@ mod tests {
         let args = phase0_write_args(rel);
         let policy2 = policy.clone();
         let first = tokio::spawn(async move {
-            execute_outcome("write", &args, &GlobalCancellation, &policy2).await
+            execute_outcome("write", &args, &GlobalCancellation, &policy2, None).await
         });
         let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
             .await
@@ -2465,7 +2619,7 @@ mod tests {
         let args2 = phase0_write_args(rel);
         let policy3 = policy.clone();
         let second = tokio::spawn(async move {
-            execute_outcome("write", &args2, &GlobalCancellation, &policy3).await
+            execute_outcome("write", &args2, &GlobalCancellation, &policy3, None).await
         });
         let request2 = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
             .await
@@ -2485,7 +2639,7 @@ mod tests {
         let args3 = phase0_write_args(rel);
         let outcome3 = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_outcome("write", &args3, &GlobalCancellation, &policy),
+            execute_outcome("write", &args3, &GlobalCancellation, &policy, None),
         )
         .await
         .expect("session-approved call must not block");
@@ -2506,7 +2660,7 @@ mod tests {
         let args = phase0_write_args(rel);
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_outcome("write", &args, &GlobalCancellation, &policy),
+            execute_outcome("write", &args, &GlobalCancellation, &policy, None),
         )
         .await
         .expect("read-only rejection must not block");
@@ -2524,8 +2678,14 @@ mod tests {
         let rel = "target/phase0-trusted.txt";
         let _ = fs::remove_file(rel);
         let args = phase0_write_args(rel);
-        let outcome =
-            execute_outcome("write", &args, &GlobalCancellation, &Policy::trusted()).await;
+        let outcome = execute_outcome(
+            "write",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await;
         assert!(outcome.ok, "{}", outcome.text);
         assert_eq!(fs::read_to_string(rel).unwrap(), "phase0\n");
         let _ = fs::remove_file(rel);
@@ -2540,7 +2700,7 @@ mod tests {
         let args = phase0_write_args(rel);
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_outcome("write", &args, &GlobalCancellation, &policy),
+            execute_outcome("write", &args, &GlobalCancellation, &policy, None),
         )
         .await
         .expect("ask-shell write must not block");
@@ -2552,7 +2712,7 @@ mod tests {
         let mut args = Map::new();
         args.insert("command".into(), Value::String("echo phase0".into()));
         let handle = tokio::spawn(async move {
-            execute_outcome("bash", &args, &GlobalCancellation, &policy).await
+            execute_outcome("bash", &args, &GlobalCancellation, &policy, None).await
         });
         let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
             .await
@@ -2586,7 +2746,9 @@ mod tests {
         let cancel2 = cancel.clone();
         let args = phase0_write_args(rel);
         let handle =
-            tokio::spawn(async move { execute_outcome("write", &args, &cancel2, &policy).await });
+            tokio::spawn(
+                async move { execute_outcome("write", &args, &cancel2, &policy, None).await },
+            );
         // Wait for the parked prompt, then cancel instead of answering.
         let _request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
             .await
@@ -2600,5 +2762,92 @@ mod tests {
         assert!(!outcome.ok);
         assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
         assert!(!std::path::Path::new(rel).exists());
+    }
+
+    // Phase 2 (runtime extraction): the explicit ToolFilter allowlist,
+    // enforced at dispatch. `None` preserves the parent path everywhere.
+    #[test]
+    fn tool_filter_matches_exact_and_wildcard_only() {
+        let filter = ToolFilter::new("explorer", ["read", "ffgrep", "mcp__gh__*"]);
+        assert!(filter.allows("read"));
+        assert!(filter.allows("ffgrep"));
+        assert!(filter.allows("mcp__gh__search"));
+        assert!(!filter.allows("bash"));
+        assert!(!filter.allows("mcp__other__tool"));
+        assert!(!filter.allows("read_all"), "no accidental prefix match");
+        assert!(!filter.allows("delegate"));
+    }
+
+    #[tokio::test]
+    async fn filtered_out_tool_is_rejected_with_allowlist_error() {
+        let filter = ToolFilter::new("explorer", ["read"]);
+        let mut args = Map::new();
+        args.insert("command".into(), Value::String("echo hi".into()));
+        let err = execute(
+            "bash",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            Some(&filter),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("explorer"), "{err}");
+        assert!(err.to_string().contains("allowlist"), "{err}");
+        // An allowed tool still runs under the same filter.
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String("Cargo.toml".into()));
+        let out = execute(
+            "read",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            Some(&filter),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("dex"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_stays_unknown_under_filter() {
+        let filter = ToolFilter::new("explorer", ["read"]);
+        let args = Map::new();
+        let err = execute(
+            "nope",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            Some(&filter),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown tool"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn chain_steps_run_under_the_same_filter() {
+        // `chain` itself is allowed; its `read` step is not (chain's own
+        // read-only gate rejects non-read steps before dispatch, so probe
+        // the filter with a read step instead).
+        let filter = ToolFilter::new("explorer", ["ffgrep", "chain"]);
+        let mut args = Map::new();
+        args.insert(
+            "steps".into(),
+            serde_json::Value::Array(vec![
+                serde_json::json!({"tool": "ffgrep", "args": {"pattern": "dex"}}),
+                serde_json::json!({"tool": "read", "args": {"path": "Cargo.toml"}}),
+            ]),
+        );
+        let err = execute(
+            "chain",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            Some(&filter),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("allowlist"), "{err}");
     }
 }
