@@ -1347,13 +1347,12 @@ impl SlashSuggestionsView {
                     Style::default().fg(theme::muted_fg())
                 };
                 let command_style = if selected {
+                    // Bold marks the selected row; unselected rows stay plain cyan.
                     Style::default()
                         .fg(theme::surface_fg())
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::Cyan)
                 };
                 let description_style = if selected {
                     Style::default().fg(theme::surface_fg())
