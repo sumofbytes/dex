@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -34,11 +34,11 @@ use super::slash::{
     slash_suggestions, EXPAND_ON_ENTER,
 };
 use super::{
-    append_sink_line, bump_thinking_stamps, close_thinking, flush_assistant, last_col,
-    line_selection_text, mouse_display_cell, push_banner, push_info, push_info_line,
+    append_sink_line, bump_thinking_stamps, close_thinking, deny_all_approvals, flush_assistant,
+    last_col, line_selection_text, mouse_display_cell, push_banner, push_info, push_info_line,
     render_user_prompt, resolve_approval, scroll_transcript, selection_text, settle_activity,
-    start_activity, view, word_bounds, App, EnableMouseScroll, PendingApproval, Selection,
-    TerminalCleanup,
+    start_activity, view, word_bounds, AgentChip, App, EnableMouseScroll, PendingApproval,
+    Selection, TerminalCleanup,
 };
 
 /// Process start for the `ready in …` session-start line. Marked at `main()`
@@ -58,6 +58,9 @@ pub(crate) fn mark_launch_start() {
 enum WorkerMessage {
     /// A stream event from the daemon.
     Stream(StreamEvent),
+    /// The turn's final journal cursor (V1b): the idle events poller resumes
+    /// past everything the turn's own SSE already delivered.
+    Cursor(u64),
     /// The SSE stream closed; carries a transport error if any.
     Finished(Option<String>),
     /// Background git poll result (off UI thread, every 2s).
@@ -90,15 +93,23 @@ struct RemoteApp {
     /// A cancel for the in-flight shell was already requested (second
     /// Ctrl+C force-quits instead of re-sending, mirroring the turn path).
     shell_cancel_requested: bool,
-    /// Paired with the current turn's worker; approval overlays resolve
-    /// through it.
-    decision_tx: mpsc::Sender<CoreApprovalDecision>,
     /// Shared with the active worker so approvals arriving after a cancel
     /// request are denied instead of parking the turn on the overlay.
     cancel_flag: Arc<AtomicBool>,
     /// Last left press (time, transcript cell, consecutive-click count) for
     /// double-/triple-click detection; the count caps at 3.
     last_click: Option<(Instant, (usize, usize), u8)>,
+    /// Shared with the idle events poller: true while a child agent may be
+    /// live (§15: the client polls `GET /events?since=` once it knows
+    /// children can be running) and while a turn is streaming (the poller
+    /// pauses so live SSE rows are never duplicated).
+    live_children: Arc<AtomicBool>,
+    busy_poll: Arc<AtomicBool>,
+    /// Highest journal seq delivered to the UI (V1b): the idle poller's
+    /// resume cursor, shared with it. The turn worker publishes its SSE
+    /// cursor as it streams; the poller advances it while idle, so rows
+    /// a live turn already rendered are never re-fetched.
+    events_cursor: Arc<AtomicU64>,
 }
 
 /// How often an idle TUI re-polls `GET /api/git` for the footer. The daemon
@@ -120,6 +131,62 @@ fn apply_git_info(remote: &mut RemoteApp, info: &crate::protocol::GitInfo) -> bo
 /// Background git poll off the UI thread (Phase 5): task polls every 2s via
 /// `get_git_async`, pushes into the worker channel; UI loop only applies.
 /// Daemon 5s cache stays; per-frame cost zero even when busy.
+/// How often the idle TUI polls the event journal while child agents may be
+/// live (§15 V1b). Same cost class as the git poller: one HTTP fetch per
+/// interval, zero per-frame work.
+const EVENTS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Idle journal poll (§15 V1b): child-agent lifecycle lines, labeled child
+/// approvals, and wake turns are journaled outside any turn's SSE stream, so
+/// the client learns about them through `GET /events?since=<cursor>`. The
+/// poller starts only after the session shows child activity and pauses
+/// while a turn streams (that stream carries the live rows; its final
+/// cursor arrives via `WorkerMessage::Cursor`).
+fn spawn_events_poller(
+    client: DaemonClient,
+    session_id: String,
+    tx: mpsc::Sender<WorkerMessage>,
+    live: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
+    cursor: Arc<AtomicU64>,
+) {
+    crate::client::http::spawn_task(async move {
+        // Seed the cursor from the daemon's journal so rows rendered by the
+        // initial replay (or by a local JSONL rebuild) are never re-fetched.
+        if let Ok(resp) = client.reattach(&session_id) {
+            cursor.fetch_max(resp.seq, Ordering::SeqCst);
+        }
+        loop {
+            tokio::time::sleep(EVENTS_POLL_INTERVAL).await;
+            if busy.load(Ordering::SeqCst) || !live.load(Ordering::SeqCst) {
+                continue;
+            }
+            let since = cursor.load(Ordering::SeqCst);
+            let Ok(resp) = client.events_async(&session_id, since).await else {
+                continue;
+            };
+            for env in resp.events {
+                // A parked parent-turn approval is dead (denied at its
+                // turn's teardown); a child approval stays answerable and
+                // must surface. Replays skip the dead ones the same way.
+                let parked_parent = matches!(
+                    &env.event,
+                    StreamEvent::ApprovalRequired { agent: None, .. }
+                );
+                if parked_parent {
+                    continue;
+                }
+                if tx.send(WorkerMessage::Stream(env.event)).await.is_err() {
+                    return;
+                }
+            }
+            // next_seq counts raw journal rows (even unknown types), so the
+            // cursor keeps moving past anything this client skips.
+            cursor.fetch_max(resp.next_seq, Ordering::SeqCst);
+        }
+    });
+}
+
 fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Sender<WorkerMessage>) {
     crate::client::http::spawn_task(async move {
         loop {
@@ -156,22 +223,35 @@ fn map_approval_decision(decision: CoreApprovalDecision) -> ProtocolApprovalDeci
     }
 }
 
-/// Next approval decision for the worker task. Auto-denies when a cancel was
-/// requested (so the turn unwinds without parking on the overlay); otherwise
-/// awaits the overlay. A closed channel means the turn went away — deny.
-async fn next_worker_decision(
-    cancel_flag: &AtomicBool,
-    decision_rx: &mut mpsc::Receiver<CoreApprovalDecision>,
-) -> ProtocolApprovalDecision {
-    if cancel_flag.load(Ordering::SeqCst) {
-        return ProtocolApprovalDecision::Deny;
-    }
-    map_approval_decision(
-        decision_rx
+/// One decision courier per queued approval (V1b): the overlay resolves the
+/// front entry through its own sender and this task POSTs the decision for
+/// that request_id. Child approvals can be queued while the parent turn's
+/// worker is busy elsewhere, so decisions can no longer ride one shared
+/// per-turn channel.
+fn spawn_approval_poster(
+    client: DaemonClient,
+    session_id: String,
+    request_id: String,
+    decision_rx: mpsc::Receiver<CoreApprovalDecision>,
+) {
+    crate::client::http::spawn_task(async move {
+        let mut decision_rx = decision_rx;
+        // A closed channel (the TUI went away) resolves to deny: the parked
+        // approval must never strand the requesting agent thread.
+        let decision = decision_rx
             .recv()
             .await
-            .unwrap_or(CoreApprovalDecision::Deny),
-    )
+            .unwrap_or(CoreApprovalDecision::Deny);
+        if let Err(e) = client
+            .approve_async(&session_id, &request_id, map_approval_decision(decision))
+            .await
+        {
+            crate::llm::client::provider_log(
+                "approval_delivery_failed",
+                &crate::llm::client::error_chain_message(&*e),
+            );
+        }
+    });
 }
 
 /// Terminal-close classification for the worker task. The daemon always ends
@@ -346,7 +426,6 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     let options = crate::chat_options_from_args(args);
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(256);
-    let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>(16);
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let app = App {
@@ -369,7 +448,8 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         cancel_requested: false,
         cancel_presses: 0,
         approval_rx: None,
-        pending_approval: None,
+        pending_approvals: Vec::new(),
+        agents: Vec::new(),
         busy: false,
         autoscroll: true,
         scroll: 0,
@@ -395,6 +475,13 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         notice: None,
     };
 
+    // Shared poller gates (§15 V1b): children live → poll the journal;
+    // turn streaming → pause (the turn's own SSE carries those rows).
+    let live_children = Arc::new(AtomicBool::new(false));
+    let busy_poll = Arc::new(AtomicBool::new(false));
+    // Shared journal cursor: the turn worker publishes (fetch_max) the seq
+    // its SSE stream has delivered; the idle poller resumes from it.
+    let events_cursor = Arc::new(AtomicU64::new(0));
     let mut remote = RemoteApp {
         app,
         client: client.clone(),
@@ -402,16 +489,29 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
         options,
         worker_tx: worker_tx.clone(),
         worker_rx,
-        decision_tx,
         cancel_flag,
         last_click: None,
         shell_running: false,
         shell_cancel_requested: false,
+        live_children: live_children.clone(),
+        busy_poll: busy_poll.clone(),
+        events_cursor: events_cursor.clone(),
     };
     // Background git poll off the UI thread (Phase 5): task polls every 2s,
     // pushes into the worker channel; UI loop only applies. Daemon 5s cache
     // stays; per-frame cost zero even when busy.
-    spawn_git_poller(client.clone(), worker_tx);
+    spawn_git_poller(client.clone(), worker_tx.clone());
+    // Idle events poll (§15 V1b + §12 V1b): once the session may have child
+    // agents, poll the journal so lifecycle lines, labeled approvals, and
+    // wake turns surface without waiting for a user turn.
+    spawn_events_poller(
+        client.clone(),
+        remote.session_id.clone(),
+        worker_tx,
+        live_children.clone(),
+        busy_poll.clone(),
+        events_cursor,
+    );
     if !is_reattach {
         // Keep the local placeholder's display name in sync with the daemon
         // record (a reattach overwrites `app.session` from disk below).
@@ -539,6 +639,9 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
                         }
                         handle_stream_event(&mut remote, event);
                     }
+                    Ok(WorkerMessage::Cursor(seq)) => {
+                        remote.events_cursor.fetch_max(seq, Ordering::SeqCst);
+                    }
                     Ok(WorkerMessage::Finished(error)) => {
                         streamed = true;
                         finish_turn(&mut remote, error);
@@ -570,13 +673,16 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             // A `!` shell run animates like a turn even with no agent turn in
             // flight (otherwise a long shell looks frozen).
             let busy = remote.app.busy || remote.shell_running;
+            // The idle poller pauses while anything streams (the turn's own
+            // SSE carries those rows) and resumes at the published cursor.
+            remote.busy_poll.store(busy, Ordering::SeqCst);
             // Cheap when unchanged (outside Herdr it is a no-op).
             herdr.sync(
                 busy,
                 remote
                     .app
-                    .pending_approval
-                    .as_ref()
+                    .pending_approvals
+                    .first()
                     .map(|a| a.name.as_str()),
             );
             // An expired status notice needs one more frame to disappear.
@@ -849,19 +955,55 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             }
             render_user_prompt(app, &content);
         }
-        StreamEvent::ApprovalRequired { name, input, .. } => {
-            // Invariant: the daemon parks at most one approval per turn
-            // (agent thread blocks until it is resolved), so overwriting would
-            // drop the prior sender. If it happens, deny the stale one.
-            if let Some(stale) = remote.app.pending_approval.take() {
-                let _ = stale.response.try_send(CoreApprovalDecision::Deny);
-            }
-            remote.app.pending_approval = Some(PendingApproval {
+        StreamEvent::ApprovalRequired {
+            request_id,
+            name,
+            input,
+            agent,
+        } => {
+            // Queue (V1b): child agents park labeled prompts that outlive
+            // the parent turn, so several can be answerable at once. The
+            // overlay resolves the front; each entry POSTs its own decision.
+            let (response, decision_rx) = mpsc::channel::<CoreApprovalDecision>(1);
+            remote.app.pending_approvals.push(PendingApproval {
                 name,
                 input,
-                response: remote.decision_tx.clone(),
+                response,
                 selected: 0,
+                request_id: request_id.clone(),
+                agent,
             });
+            spawn_approval_poster(
+                remote.client.clone(),
+                remote.session_id.clone(),
+                request_id,
+                decision_rx,
+            );
+        }
+        // V1b typed child lifecycle (§15): the transcript keeps rendering
+        // the V1a System lines; these update the status-bar chips.
+        StreamEvent::AgentSpawned { agent_id, name } => {
+            remote.app.agents.push(AgentChip {
+                id: agent_id,
+                name,
+                tool: None,
+            });
+            remote.live_children.store(true, Ordering::SeqCst);
+        }
+        StreamEvent::AgentProgress {
+            agent_id,
+            current_tool,
+            ..
+        } => {
+            if let Some(chip) = remote.app.agents.iter_mut().find(|a| a.id == agent_id) {
+                chip.tool = current_tool;
+            }
+        }
+        StreamEvent::AgentCompleted { agent_id, .. } => {
+            remote.app.agents.retain(|a| a.id != agent_id);
+            if remote.app.agents.is_empty() {
+                remote.live_children.store(false, Ordering::SeqCst);
+            }
         }
         StreamEvent::TurnComplete { usage, cached, .. } => {
             if let Some(usage) = usage {
@@ -983,21 +1125,25 @@ fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) 
 /// flushes the throttled assistant buffer so the replay is visible.
 fn replay_remote_events(remote: &mut RemoteApp, session_id: &str) {
     let mut since = 0u64;
-    let mut batches = 0;
     loop {
+        let prev = since;
         match remote.client.events(session_id, since) {
             Ok(resp) => {
-                if resp.events.is_empty() {
-                    break;
-                }
                 for env in resp.events {
-                    if !matches!(env.event, StreamEvent::ApprovalRequired { .. }) {
+                    // A parked parent-turn approval is dead (denied at its
+                    // turn's teardown); a child approval (V1b) stays
+                    // answerable and must surface.
+                    if !matches!(env.event, StreamEvent::ApprovalRequired { agent: None, .. }) {
                         handle_stream_event(remote, env.event);
                     }
                 }
                 since = resp.next_seq;
-                batches += 1;
-                if batches > 10_000 {
+                // The idle poller resumes from here.
+                remote
+                    .events_cursor
+                    .fetch_max(resp.next_seq, Ordering::SeqCst);
+                // No forward progress means the journal is drained.
+                if since <= prev {
                     break;
                 }
             }
@@ -1269,7 +1415,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
 
     // Approval overlay takes precedence: the worker is blocked until a
     // decision arrives.
-    if app.pending_approval.is_some() {
+    if !app.pending_approvals.is_empty() {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Deny the pending approval and cancel the turn; another
@@ -1278,12 +1424,12 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 request_cancel(remote);
             }
             KeyCode::Up | KeyCode::Left => {
-                if let Some(approval) = app.pending_approval.as_mut() {
+                if let Some(approval) = app.pending_approvals.first_mut() {
                     approval.selected = approval.selected.saturating_sub(1);
                 }
             }
             KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
-                if let Some(approval) = app.pending_approval.as_mut() {
+                if let Some(approval) = app.pending_approvals.first_mut() {
                     approval.selected = (approval.selected + 1).min(2);
                 }
             }
@@ -1298,8 +1444,8 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             }
             KeyCode::Enter => {
                 let decision =
-                    app.pending_approval
-                        .as_ref()
+                    app.pending_approvals
+                        .first()
                         .map(|approval| match approval.selected {
                             0 => CoreApprovalDecision::Once,
                             1 => CoreApprovalDecision::Session,
@@ -1502,11 +1648,9 @@ fn request_cancel(remote: &mut RemoteApp) {
     if turn_running && !remote.app.cancel_requested {
         remote.app.cancel_requested = true;
         remote.cancel_flag.store(true, Ordering::SeqCst);
-        // If an approval is blocking the turn, deny it first so the agent thread
-        // can unwind.
-        if remote.app.pending_approval.take().is_some() {
-            let _ = remote.decision_tx.try_send(CoreApprovalDecision::Deny);
-        }
+        // Deny every queued approval so the blocked agent threads unwind
+        // (child agents may have parked several).
+        deny_all_approvals(&mut remote.app);
     }
     if remote.shell_running && !remote.shell_cancel_requested {
         remote.shell_cancel_requested = true;
@@ -1771,8 +1915,6 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     options.idempotency_key = Some(uuid::Uuid::new_v4().to_string());
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
-    let mut decision_rx = remote.take_decision_receiver();
-    let cancel_flag = remote.cancel_flag.clone();
 
     crate::client::http::spawn_task(async move {
         let mut saw_terminal = false;
@@ -1796,35 +1938,17 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
         loop {
             match stream.next_event().await {
                 Some(Ok(event)) => {
-                    let request_id = match &event {
-                        StreamEvent::ApprovalRequired { request_id, .. } => {
-                            Some(request_id.clone())
-                        }
-                        StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. } => {
-                            saw_terminal = true;
-                            None
-                        }
-                        _ => None,
-                    };
+                    if matches!(
+                        &event,
+                        StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. }
+                    ) {
+                        saw_terminal = true;
+                    }
                     last_seq = last_seq.max(stream.last_seq());
                     // Backpressured: awaits UI drain instead of dropping when
                     // the transcript bursts faster than the 8fps redraw.
                     if event_tx.send(WorkerMessage::Stream(event)).await.is_err() {
                         return;
-                    }
-                    if let Some(request_id) = request_id {
-                        // After a cancel request, deny automatically so the
-                        // turn can unwind without user interaction.
-                        let decision = next_worker_decision(&cancel_flag, &mut decision_rx).await;
-                        if let Err(e) = client
-                            .approve_async(&session_id, &request_id, decision)
-                            .await
-                        {
-                            crate::llm::client::provider_log(
-                                "approval_delivery_failed",
-                                &crate::llm::client::error_chain_message(&*e),
-                            );
-                        }
                     }
                 }
                 // A transport failure (`Some(Err)`) or a close without a
@@ -1843,6 +1967,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                     if saw_terminal {
                         // The daemon always closes right after the terminal
                         // event; a clean close here is success.
+                        let _ = event_tx.send(WorkerMessage::Cursor(last_seq)).await;
                         let _ = event_tx.send(WorkerMessage::Finished(None)).await;
                         return;
                     }
@@ -1869,10 +1994,12 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                                 continue;
                             }
                             Reconnect::Terminal => {
+                                let _ = event_tx.send(WorkerMessage::Cursor(last_seq)).await;
                                 let _ = event_tx.send(WorkerMessage::Finished(None)).await;
                                 return;
                             }
                             Reconnect::Failed(msg) => {
+                                let _ = event_tx.send(WorkerMessage::Cursor(last_seq)).await;
                                 let _ = event_tx.send(WorkerMessage::Finished(Some(msg))).await;
                                 return;
                             }
@@ -1881,6 +2008,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                     // Recovery exhausted: surface the real transport failure
                     // (the daemon always closes with TurnComplete/TurnFailed,
                     // so a close without one is a transport failure too).
+                    let _ = event_tx.send(WorkerMessage::Cursor(last_seq)).await;
                     let _ = event_tx
                         .send(WorkerMessage::Finished(
                             transport_error.or_else(|| premature_close_error(false)),
@@ -1969,16 +2097,6 @@ async fn try_reconnect(
                 Reconnect::Failed(format!("connection lost and reattach failed: {msg}"))
             }
         }
-    }
-}
-
-impl RemoteApp {
-    /// Swap in a fresh decision channel per turn; the worker for this turn
-    /// owns the old receiver.
-    fn take_decision_receiver(&mut self) -> mpsc::Receiver<CoreApprovalDecision> {
-        let (tx, rx) = mpsc::channel(16);
-        self.decision_tx = tx;
-        rx
     }
 }
 
@@ -2643,37 +2761,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_decision_auto_denies_after_cancel_without_waiting() {
-        // Regression: approvals arriving after a cancel request must deny
-        // immediately instead of parking the turn on the overlay. The channel
-        // stays empty here — if the worker waited, the timeout fires.
-        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (_tx, mut rx) = tokio::sync::mpsc::channel::<CoreApprovalDecision>(16);
-        let decision = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            next_worker_decision(&cancel_flag, &mut rx),
-        )
-        .await
-        .expect("cancel path must not wait on the overlay");
-        assert!(matches!(decision, ProtocolApprovalDecision::Deny));
-    }
-
-    #[tokio::test]
-    async fn worker_decision_forwards_overlay_and_defaults_closed_to_deny() {
-        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CoreApprovalDecision>(16);
-        tx.send(CoreApprovalDecision::Session).await.unwrap();
-        let decision = next_worker_decision(&cancel_flag, &mut rx).await;
-        assert!(matches!(decision, ProtocolApprovalDecision::AllowSession));
-        // Turn went away (sender dropped): deny rather than hang.
+    async fn closed_decision_channel_resolves_to_deny() {
+        // V1b: each queued approval carries its own decision channel; the
+        // TUI going away must resolve to Deny instead of stranding the
+        // parked approval (the overlay's resolve path owns the sender).
+        // `spawn_approval_poster` maps the `None` from a closed channel to
+        // `Deny`; here we pin the channel semantics it relies on.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CoreApprovalDecision>(1);
         drop(tx);
-        let decision = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            next_worker_decision(&cancel_flag, &mut rx),
-        )
-        .await
-        .expect("closed channel must resolve, not hang");
-        assert!(matches!(decision, ProtocolApprovalDecision::Deny));
+        assert!(
+            rx.recv().await.is_none(),
+            "no sender: the poster maps None to Deny"
+        );
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> crossterm::event::KeyEvent {
@@ -2741,7 +2840,8 @@ mod tests {
             cancel_requested: false,
             cancel_presses: 0,
             approval_rx: None,
-            pending_approval: None,
+            pending_approvals: Vec::new(),
+            agents: Vec::new(),
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -2768,7 +2868,6 @@ mod tests {
             notice: None,
         };
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(16);
-        let (decision_tx, _decision_rx) = mpsc::channel::<CoreApprovalDecision>(16);
         RemoteApp {
             app,
             client: DaemonClient::new("http://127.0.0.1:9").expect("test client builds"),
@@ -2776,11 +2875,13 @@ mod tests {
             options: ChatOptions::default(),
             worker_tx,
             worker_rx,
-            decision_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             last_click: None,
             shell_running: false,
             shell_cancel_requested: false,
+            live_children: Arc::new(AtomicBool::new(false)),
+            busy_poll: Arc::new(AtomicBool::new(false)),
+            events_cursor: Arc::new(AtomicU64::new(0)),
         }
     }
 

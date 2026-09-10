@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::{AgentManager, AgentNotice};
+use crate::agent::subagent::{AgentEvent, AgentManager};
 use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, QueueMsg};
-use crate::protocol::StreamEvent;
+use crate::protocol::{StreamEnvelope, StreamEvent};
 
 // ---------------------------------------------------------------------------
 // Daemon bearer token
@@ -124,6 +124,10 @@ pub(crate) struct PendingApproval {
     /// the child outlives the parent turn, so turn-end teardown and parent
     /// cancel must not deny its approval — it stays parked and answerable.
     pub(crate) agent_id: Option<String>,
+    /// The child's definition name for the labeled prompt (V1b, §12):
+    /// rendered "explorer wants to run bash: …". `None` for the parent
+    /// turn's own tools.
+    pub(crate) agent: Option<String>,
 }
 
 /// A completed chat turn kept for `Idempotency-Key` dedup (P10): replaying
@@ -188,6 +192,19 @@ pub(crate) struct DaemonState {
     /// Surfaced via `/health` so operators can tell a partial registry apart
     /// from an empty one.
     pub rebuild_complete: AtomicBool,
+    /// Live SSE streams per session (V1b): lifecycle events that are
+    /// journaled outside a turn (child agents, wake turns) are also pushed
+    /// to any attached client's turn stream, so the TUI sees them live
+    /// instead of waiting for its next poll.
+    pub active_streams: Mutex<HashMap<String, Vec<mpsc::Sender<StreamEnvelope>>>>,
+    /// Per-session idle wake turn tokens (V1b, plan §10b). A user chat POST
+    /// steals the wake: "chat wins, wake skips" — a user-visible 409 must
+    /// never lose a race with a background notice.
+    pub wakes: Mutex<HashMap<String, CancellationToken>>,
+    /// Last time a client read this session's event journal (V1b presence,
+    /// §10b): every `GET /events` refreshes it. A wake fires only when a
+    /// client is plausibly listening.
+    pub last_client_seen: Mutex<HashMap<String, Instant>>,
 }
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
@@ -216,7 +233,110 @@ impl DaemonState {
             session_approvals: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
             rebuild_complete: AtomicBool::new(false),
+            active_streams: Mutex::new(HashMap::new()),
+            wakes: Mutex::new(HashMap::new()),
+            last_client_seen: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Register a live SSE stream for a session (V1b): journaled agent
+    /// events are pushed to it while it lasts.
+    pub(crate) fn register_stream(&self, session_id: &str, tx: &mpsc::Sender<StreamEnvelope>) {
+        self.active_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .push(tx.clone());
+    }
+
+    /// Drop one stream registration (identity-matched, so a turn's teardown
+    /// cannot remove a newer turn's registration).
+    pub(crate) fn unregister_stream(&self, session_id: &str, tx: &mpsc::Sender<StreamEnvelope>) {
+        self.active_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .retain(|existing| !existing.same_channel(tx));
+    }
+
+    /// Push one journal event to every attached stream, best effort: the
+    /// journal is the source of truth; the push is a latency nicety and a
+    /// full/closed channel is harmless.
+    pub(crate) fn broadcast_event(&self, session_id: &str, env: &StreamEnvelope) {
+        let senders = self
+            .active_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        for tx in senders {
+            let _ = tx.try_send(env.clone());
+        }
+    }
+
+    /// Presence heartbeat (V1b): a client read this session's journal now.
+    pub(crate) fn touch_client_seen(&self, session_id: &str) {
+        self.last_client_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), Instant::now());
+    }
+
+    /// A client read the journal within `window` — plausibly an audience.
+    pub(crate) fn client_seen_fresh(&self, session_id: &str, window: Duration) -> bool {
+        self.last_client_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .is_some_and(|seen| seen.elapsed() < window)
+    }
+
+    /// Claim the idle-wake slot for a session. `None` when a wake is
+    /// already live — one at a time per session (plan §10b).
+    pub(crate) fn claim_wake(&self, session_id: &str) -> Option<CancellationToken> {
+        let token = CancellationToken::new();
+        let mut wakes = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        if wakes.contains_key(session_id) {
+            return None;
+        }
+        wakes.insert(session_id.to_string(), token.clone());
+        Some(token)
+    }
+
+    /// Steal (cancel) a session's idle wake — the user chat POST wins.
+    pub(crate) fn cancel_wake(&self, session_id: &str) -> Option<CancellationToken> {
+        let token = self
+            .wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id)?;
+        token.cancel();
+        Some(token)
+    }
+
+    /// Collect (and remove) still-pending child-agent approvals for a
+    /// session so cancel/shutdown paths can deny them. The counterpart of
+    /// `take_session_pendings`, which deliberately skips these.
+    pub(crate) fn take_agent_pendings(
+        &self,
+        session_id: Option<&str>,
+    ) -> Vec<tokio::sync::mpsc::Sender<ApprovalDecision>> {
+        let mut out = Vec::new();
+        self.pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, p| {
+                if p.agent_id.is_some() && session_id.is_none_or(|sid| p.session_id == sid) {
+                    out.push(p.response.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        out
     }
 
     /// Collect (and remove) the parent turn's still-pending approvals for a
@@ -257,8 +377,8 @@ impl DaemonState {
             .or_insert_with(|| {
                 let state = Arc::clone(self);
                 let sid = session_id.to_string();
-                AgentManager::new(session_id).with_journal(Arc::new(move |notice| {
-                    journal_agent_notice(&state, &sid, notice);
+                AgentManager::new(session_id).with_events(Arc::new(move |event| {
+                    journal_agent_event(&state, &sid, event);
                 }))
             })
             .clone()
@@ -271,6 +391,12 @@ impl DaemonState {
     /// they land (Phase 5/6); until then it stays `dead_code`.
     #[allow(dead_code)]
     pub(crate) async fn remove_session_agents(&self, session_id: &str) {
+        // The children are about to be cancelled: deny their still-parked
+        // approvals so a blocked tool call wakes and unwinds instead of
+        // waiting on a prompt nobody will answer (§12 V1b timeout rule).
+        for sender in self.take_agent_pendings(Some(session_id)) {
+            let _ = sender.send(ApprovalDecision::Deny).await;
+        }
         let manager = self
             .agents
             .lock()
@@ -291,6 +417,9 @@ impl DaemonState {
         };
         for manager in managers {
             manager.shutdown().await;
+        }
+        for sender in self.take_agent_pendings(None) {
+            let _ = sender.send(ApprovalDecision::Deny).await;
         }
     }
 
@@ -465,8 +594,13 @@ impl DaemonState {
 /// manager's terminal path — every ending (completed/failed/cancelled/
 /// timed out/panic) lands here at completion time, even while no turn is
 /// live, so a client's `?since=` poll picks it up without a turn.
-fn journal_agent_notice(state: &DaemonState, session_id: &str, notice: &AgentNotice) {
-    let seq = state.next_seq(session_id);
+/// §15 V1a + V1b: journal one event per typed lifecycle event, fired from
+/// the manager's single choke points. Completions keep their V1a `System`
+/// line (old clients render it) and add the typed variant (new clients read
+/// fields); both are broadcast to any attached live stream so a TUI mid-turn
+/// sees child lifecycle live. A completion also schedules the idle wake
+/// turn (§10b V1b).
+fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentEvent) {
     let path = state
         .sessions
         .lock()
@@ -476,9 +610,53 @@ fn journal_agent_notice(state: &DaemonState, session_id: &str, notice: &AgentNot
     let Some(path) = path else {
         return;
     };
-    if let Ok(mut journal) = crate::session::Session::from_path(&path) {
-        let event = StreamEvent::System(notice.text());
-        let _ = journal.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
+    let Ok(mut journal) = crate::session::Session::from_path(&path) else {
+        return;
+    };
+    let (typed, system_line) = match &event {
+        AgentEvent::Spawned { agent_id, name } => (
+            StreamEvent::AgentSpawned {
+                agent_id: agent_id.to_string(),
+                name: name.clone(),
+            },
+            None,
+        ),
+        AgentEvent::Progress {
+            agent_id,
+            current_tool,
+        } => (
+            StreamEvent::AgentProgress {
+                agent_id: agent_id.to_string(),
+                state: "running".to_string(),
+                current_tool: current_tool.clone(),
+            },
+            None,
+        ),
+        AgentEvent::Completed(notice) => (
+            StreamEvent::AgentCompleted {
+                agent_id: notice.agent_id.to_string(),
+                status: crate::agent::subagent::status_word(notice.status).to_string(),
+            },
+            Some(notice.text()),
+        ),
+    };
+    // The V1a line first, so a replay renders the transcript line before it
+    // consumes the typed variant.
+    if let Some(line) = system_line {
+        let seq = state.next_seq(session_id);
+        let env = StreamEnvelope {
+            seq,
+            event: StreamEvent::System(line),
+        };
+        let _ = journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+        state.broadcast_event(session_id, &env);
+    }
+    let seq = state.next_seq(session_id);
+    let env = StreamEnvelope { seq, event: typed };
+    let _ = journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+    state.broadcast_event(session_id, &env);
+    if matches!(event, AgentEvent::Completed(_)) {
+        crate::daemon::server::schedule_idle_wake(state.clone(), session_id.to_string());
     }
 }
 
@@ -635,6 +813,97 @@ mod tests {
         assert_eq!(state.next_seq("a"), 1);
         assert_eq!(state.next_seq("b"), 0);
         assert_eq!(state.next_seq("a"), 2);
+    }
+
+    #[test]
+    fn wake_slot_holds_one_wake_per_session_and_frees_on_cancel() {
+        // §10b V1b: one wake at a time — a second claim loses; the steal
+        // path frees the slot and cancels the loser's token.
+        let state = DaemonState::new();
+        let first = state.claim_wake("s").expect("first claim wins");
+        assert!(state.claim_wake("s").is_none(), "one at a time");
+        assert!(state.claim_wake("other").is_some(), "sessions are separate");
+        let stolen = state.cancel_wake("s").expect("steal finds the wake");
+        assert!(
+            stolen.is_cancelled(),
+            "a stolen wake must stop; the claim returns the same token"
+        );
+        assert!(first.is_cancelled(), "a stolen wake must stop");
+        assert!(state.cancel_wake("s").is_none(), "already removed");
+        assert!(state.claim_wake("s").is_some(), "slot freed");
+    }
+
+    #[test]
+    fn client_seen_presence_needs_a_recent_journal_read() {
+        // §10b V1b presence gate: no read → no audience; a read inside the
+        // window counts; a read older than the window does not.
+        let state = DaemonState::new();
+        assert!(!state.client_seen_fresh("s", std::time::Duration::from_secs(30)));
+        state.touch_client_seen("s");
+        assert!(state.client_seen_fresh("s", std::time::Duration::from_secs(30)));
+        assert!(!state.client_seen_fresh("s", std::time::Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn take_agent_pendings_takes_only_session_children() {
+        // The counterpart of `take_session_pendings`: parent approvals stay
+        // (their turn owns them); children leave so their parked prompts
+        // deny when the session goes away.
+        use crate::core::types::ApprovalDecision;
+        let state = DaemonState::new();
+        let (tx_parent, mut rx_parent) = tokio::sync::mpsc::channel(1);
+        let (tx_child, mut rx_child) = tokio::sync::mpsc::channel(1);
+        let (tx_other, mut rx_other) = tokio::sync::mpsc::channel(1);
+        {
+            let mut pending = state.pending_approvals.lock().unwrap();
+            pending.insert(
+                "p".into(),
+                PendingApproval {
+                    session_id: "s".into(),
+                    response: tx_parent,
+                    name: "write".into(),
+                    input: "{}".into(),
+                    agent_id: None,
+                    agent: None,
+                },
+            );
+            pending.insert(
+                "c".into(),
+                PendingApproval {
+                    session_id: "s".into(),
+                    response: tx_child,
+                    name: "bash".into(),
+                    input: "{}".into(),
+                    agent_id: Some("s-0".into()),
+                    agent: Some("tester".into()),
+                },
+            );
+            pending.insert(
+                "o".into(),
+                PendingApproval {
+                    session_id: "other".into(),
+                    response: tx_other,
+                    name: "bash".into(),
+                    input: "{}".into(),
+                    agent_id: Some("other-0".into()),
+                    agent: Some("tester".into()),
+                },
+            );
+        }
+
+        let taken = state.take_agent_pendings(Some("s"));
+        assert_eq!(taken.len(), 1, "only the session's child approval");
+        let _ = taken[0].send(ApprovalDecision::Deny).await;
+        assert_eq!(rx_child.try_recv().ok(), Some(ApprovalDecision::Deny));
+        {
+            let pending = state.pending_approvals.lock().unwrap();
+            assert!(pending.contains_key("p"), "parent approval is turn-owned");
+            assert!(pending.contains_key("o"), "other session untouched");
+        }
+        let all = state.take_agent_pendings(None);
+        assert_eq!(all.len(), 1, "shutdown sweeps the remaining child");
+        assert!(rx_parent.try_recv().is_err());
+        assert!(rx_other.try_recv().is_err());
     }
 
     #[test]

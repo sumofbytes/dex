@@ -550,7 +550,7 @@ double delivery. Steering stays user-owned throughout: agent notices never
 use it mid-turn; they wait for the boundary — the convergence rule from §2,
 kept intact.
 
-## V1b (deferred): idle wake + presence gating
+## V1b (as built in Phase 10): idle wake + presence gating
 
 Rev 4 specified a wake turn (a daemon task spawning a full LLM turn to
 deliver a notice to an idle session) with `last_client_seen` heartbeating
@@ -564,13 +564,16 @@ what the TUI can render as a toast from its existing event poll for free;
 near-always open) while adding a mutex write to the hottest read path, and
 the "client retries 409 once" logic does not exist anywhere.
 
-When V1b lands, it keeps these constraints: wake fires only when
-`active_turns` is empty **and** a real presence signal (designed then, not
-assumed now) confirms an audience; a wake never contends with a user's own
-chat POST — chat wins, wake skips (no user-visible 409 may ever lose a race
-with a background notice); reattach-with-backlog wakes at most once. The
-V1a notice queue, drain seam, and `System`-line events are the unchanged
-foundation it builds on.
+As built (Phase 10), those constraints hold: the wake fires only when
+`active_turns` is empty **and** a real presence signal — the client's
+journal read within the window (`GET /events` refreshes
+`last_client_seen`) — confirms an audience; the user's chat POST steals
+the wake's slot (`steal_wake_and_claim`) instead of racing it to a 409;
+one wake at a time per session (`claim_wake`); the wake holds the turn
+slot with the session's last-used model and the daemon's own permission
+ceiling, re-arming (bounded) while notices remain, and `agent_wake:`
+config / `DEX_AGENT_WAKE=0` turns the whole thing off. The V1a notice
+queue, drain seam, and `System`-line events are the unchanged foundation.
 
 **OneShot / no-daemon modes:** `delegate` is not registered — there is no
 daemon to run children in, background or otherwise.
@@ -640,20 +643,25 @@ already allowed still runs. Net effect on built-ins: `explorer`/`reviewer`
 never prompt (prompt-free tools); `tester`'s `bash` runs under `trusted`
 parents and auto-denies under `ask-*` in V1a.
 
-**V1b (deferred): labeled prompts.** A child's approval sender
-parks in the same `pending_approvals` map and emits `ApprovalRequired {
+**V1b (as built): labeled prompts.** A per-turn bridge
+(`child_approval_bridge`) parks a child's request in the same
+`pending_approvals` map and emits `ApprovalRequired {
 request_id, name, input, agent: Some("explorer") }` — the `agent` wire
-field (optional, serde-defaulted; older clients ignore it) and the TUI
-render "explorer wants to run bash: …" stay V1b (CC's v2.1.186 pattern, to
-be re-verified at implementation time). The guard-side plumbing shipped in
-Phase 4: `ApprovalRequest.agent_id: Option<String>` flows into
+field is optional and serde-defaulted, so older clients ignore it, and the
+TUI renders "explorer wants to run bash: …" from a per-entry queue. A
+parked prompt denied after five minutes of silence and every deny is
+audited (`audit.jsonl`, with the agent label and reason). The guard-side
+plumbing shipped in Phase 4: `ApprovalRequest.agent_id: Option<String>` flows into
 `PendingApproval.agent_id`, and both deny sites — turn-end teardown and
 parent `/cancel`, via `DaemonState::take_session_pendings` — already skip
 entries with `agent_id.is_some()`: children outlive the parent turn; their
 parked approvals belong to the session, not the turn. Session-level
-approvals apply to children, consulted live from `session_approvals` since
-children outlive the turn that restored them. Prompt timeout: a parked
-child approval unanswered for 5 minutes denies and records.
+approvals apply to children, consulted live from the daemon's map so a
+decision granted after the child spawned still applies. Prompt timeout: a
+parked child approval unanswered for 5 minutes denies and records.
+Teardown keeps the Phase 4 rule: parent `/cancel` and turn-end teardown
+leave child entries parked; session delete/reset and daemon shutdown deny
+them (`take_agent_pendings`) so a blocked tool call unwinds.
 
 No second permission engine; `PermissionRequirement`
 (`src/tools/mod.rs:185`) is the single source of truth throughout.
@@ -730,14 +738,17 @@ deduped by `seq` (the cursor the reattach path already maintains).
 The TUI consumes lines only; it never inspects agent internals.
 The runtime is fully usable without the TUI (events are optional sinks).
 
-## V1b (deferred): first-class variants
+## V1b (as built in Phase 10): first-class variants
 
 `AgentSpawned { agent_id, name }` / `AgentProgress { agent_id, state,
-current_tool }` / `AgentCompleted { agent_id, status }` as real
-`StreamEvent` variants — declared then as an explicit wire bump with a
-client-fallback rule for old clients (ignore unknown `type`, keep the
-`seq` cursor moving). Only build this once a consumer needs typed fields
-the `System` prefix cannot carry.
+current_tool }` / `AgentCompleted { agent_id, status }` are real
+`StreamEvent` variants, journaled *after* their V1a `System` line so a
+replay always renders the transcript line first, plus an optional
+`agent` field on `ApprovalRequired`. The fallback rule holds: unknown
+event `type`s are skipped for the payload but still advance the `seq`
+cursor (`next_seq` follows raw journal rows), so an old client never
+re-fetches the same range forever. The TUI consumes the typed variants
+for status-bar agent chips while the transcript keeps the `System` text.
 
 ---
 
@@ -888,16 +899,21 @@ labeled child approval prompts    V1b (§12) — V1a has detached auto-deny on t
 first-class agent event variants  V1b (§15) — V1a uses System text lines
 ```
 
-Each is a possible extension; none may complicate the V1a core.
+Each is a possible extension; none may complicate the V1a core. The last
+three are exactly what V1b (Phase 10) then built on the pre-committed
+seams — see §10b/§12/§15.
 
 ---
 
 # 21. Implementation Sequence
 
-Status after the Phase 9 pass: **0–9 done** (gate, runtime, types,
+Status after the Phase 10 pass: **0–10 done** (gate, runtime, types,
 manager, delegate tools, boundary drains, policies incl. detached
 auto-deny, child JSONL, §18 usage journaling + session listings surfacing
-`agents/` runs, full §22 V1a pass). Phase 10 is V1b.
+`agents/` runs, full §22 V1a pass; then V1b — typed lifecycle events,
+labeled child approvals with timeout deny + audit, idle wake with
+presence gating and chat-steals-wake, idle events poller, and the §10
+protocol/presence endpoint).
 
 | Phase | Content | Exit condition |
 |---|---|---|
