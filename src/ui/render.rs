@@ -42,13 +42,14 @@ pub(super) fn input_outer_height(content_rows: u16) -> u16 {
     content_rows + super::INPUT_BORDER_ROWS + super::INPUT_PAD_Y * 2
 }
 
-pub(super) fn activity_height(item_count: u16) -> u16 {
+pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
     if item_count == 0 {
         return 0;
     }
-    item_count
-        .saturating_mul(2)
-        .saturating_sub(1)
+    // One content row per line (a multiline queued item spans several rows),
+    // one blank separator between items, gutters above and below.
+    line_count
+        .saturating_add(item_count.saturating_sub(1))
         .saturating_add(super::VERTICAL_GUTTER * 2)
 }
 
@@ -80,19 +81,36 @@ pub(super) struct UiLayout {
     pub(super) footer: Rect,
 }
 
+/// Items and content rows the pending-queue strip renders, straight from
+/// `queue_groups` so sizing agrees with the drawing.
+#[derive(Clone, Copy)]
+pub(super) struct QueueMetrics {
+    pub(super) items: u16,
+    pub(super) rows: u16,
+}
+
 pub(super) fn compute_layout(
     area: Rect,
     input_rows: u16,
-    activity_items: u16,
+    queue: QueueMetrics,
     approval_pending: bool,
 ) -> Option<UiLayout> {
-    let activity_h = activity_height(activity_items);
-    let approval_h = if approval_pending {
+    let mut activity_h = activity_height(queue.items, queue.rows);
+    let mut approval_h = if approval_pending {
         super::APPROVAL_HEIGHT
     } else {
         0
     };
     let footer_height = super::INPUT_STATUS_GUTTER + status_height();
+    // Too short for the full bottom pane: drop the queue strip and the
+    // reserved approval band before touching the composer. Queued text
+    // survives in app state and reappears once space returns; a vanished
+    // composer leaves the agent uncontrollable.
+    if area.height < minimum_view_height(activity_h, approval_h) {
+        activity_h = 0;
+        approval_h = 0;
+    }
+    // Below composer + footer minimums nothing fits: transcript-only.
     if area.height < minimum_view_height(activity_h, approval_h) {
         return Some(UiLayout {
             transcript: area,
@@ -1077,6 +1095,75 @@ fn pad_row(line: &mut Line<'static>, width: u16, hl: Style) {
 
 struct ActivityView;
 
+/// Queued items shown in the strip before the `+N more` tail.
+const QUEUE_MAX_ITEMS: usize = 3;
+/// Rows rendered per queued item — badge row plus continuation rows, with
+/// overflow collapsed into a `…` row. Without the cap a large paste would
+/// grow the strip past the terminal and collapse the bottom pane into
+/// `compute_layout`'s transcript-only fallback.
+const QUEUE_MAX_ITEM_ROWS: usize = 4;
+
+/// One group of the pending-queue strip: a queued item's rows, or the
+/// `+N more` tail when `badge` is `None`.
+struct QueueGroup {
+    badge: Option<&'static str>,
+    lines: Vec<String>,
+}
+
+/// The pending queue as drawn: badge row plus one row per continuation
+/// line per item (long items collapse into a `…` row), then the `+N more`
+/// tail. Single source of truth for `pending_queue_metrics` (sizing) and
+/// `ActivityView::render` (drawing) — the two must agree or multiline
+/// submissions clip.
+fn queue_groups(app: &App) -> Vec<QueueGroup> {
+    let total = app.pending_steering.len() + app.pending_followups.len();
+    let mut groups: Vec<QueueGroup> = app
+        .pending_steering
+        .iter()
+        .map(|p| (true, p))
+        .chain(app.pending_followups.iter().map(|p| (false, p)))
+        .take(QUEUE_MAX_ITEMS)
+        .map(|(is_steer, pending)| {
+            let mut lines: Vec<String> = pending
+                .lines()
+                .take(QUEUE_MAX_ITEM_ROWS)
+                .map(str::to_string)
+                .collect();
+            if lines.is_empty() {
+                // Empty queued text still gets its badge row.
+                lines.push(String::new());
+            }
+            if pending.lines().count() > lines.len() {
+                // Never the badge row: an overflowing item keeps at least
+                // one continuation line before the collapse.
+                *lines.last_mut().expect("non-empty") = "…".into();
+            }
+            QueueGroup {
+                badge: Some(if is_steer { "steer" } else { "follow-up" }),
+                lines,
+            }
+        })
+        .collect();
+    if total > QUEUE_MAX_ITEMS {
+        groups.push(QueueGroup {
+            badge: None,
+            lines: vec![format!("+{} more queued", total - QUEUE_MAX_ITEMS)],
+        });
+    }
+    groups
+}
+
+/// Items and content rows the strip renders, straight from `queue_groups`
+/// so sizing can't drift from the drawing.
+fn pending_queue_metrics(app: &App) -> QueueMetrics {
+    let groups = queue_groups(app);
+    QueueMetrics {
+        items: u16::try_from(groups.len()).unwrap_or(u16::MAX),
+        rows: u16::try_from(groups.iter().map(|g| g.lines.len()).sum::<usize>())
+            .unwrap_or(u16::MAX),
+    }
+}
+
 impl ActivityView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
         // Always clear the rect first: ratatui only repaints cells the
@@ -1087,50 +1174,35 @@ impl ActivityView {
         // The busy "● Working" spinner and the "worked for …" summary now
         // live in the transcript as the turn-activity block; this strip
         // only carries the pending steer/follow-up queue.
-        if app.pending_steering.is_empty() && app.pending_followups.is_empty() {
+        let groups = queue_groups(app);
+        if groups.is_empty() {
             return;
         }
         let content_width = area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2);
-        let mut activity_lines = Vec::new();
-        let mut shown = 0;
-        for pending in app.pending_steering.iter().take(3) {
-            activity_lines.push(Line::from(Span::styled(
-                truncate_display(&format!("steer · {pending}"), content_width),
-                Style::default().fg(Color::Yellow),
-            )));
-            shown += 1;
-        }
-        for pending in app
-            .pending_followups
-            .iter()
-            .take(3usize.saturating_sub(shown))
-        {
-            activity_lines.push(Line::from(Span::styled(
-                truncate_display(&format!("follow-up · {pending}"), content_width),
-                Style::default().fg(Color::Yellow),
-            )));
-            shown += 1;
-        }
-        let pending_total = app.pending_steering.len() + app.pending_followups.len();
-        if pending_total > shown {
-            activity_lines.push(Line::from(Span::styled(
-                truncate_display(
-                    &format!("+{} more queued", pending_total - shown),
-                    content_width,
-                ),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-
-        let mut spaced = Vec::with_capacity(activity_lines.len() * 2 - 1);
-        for (index, line) in activity_lines.into_iter().enumerate() {
-            if index > 0 {
-                spaced.push(Line::from(String::new()));
+        let style = Style::default().fg(Color::Yellow);
+        // Blank separator between groups only — a group's continuation
+        // rows sit directly under their badge.
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for group in groups {
+            if !rows.is_empty() {
+                rows.push(Line::from(String::new()));
             }
-            spaced.push(line);
+            let mut lines = group.lines.into_iter();
+            let first = lines.next().unwrap_or_default();
+            let text = match group.badge {
+                Some(badge) => format!("{badge} · {first}"),
+                None => first,
+            };
+            rows.push(Line::from(Span::styled(
+                truncate_display(&text, content_width),
+                style,
+            )));
+            rows.extend(lines.map(|rest| {
+                Line::from(Span::styled(truncate_display(&rest, content_width), style))
+            }));
         }
         f.render_widget(
-            Paragraph::new(spaced).block(Block::default().padding(surface_padding())),
+            Paragraph::new(rows).block(Block::default().padding(surface_padding())),
             area,
         );
     }
@@ -1580,17 +1652,13 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // render it, so don't pay `render_input` twice per frame.
     let (input_lines, input_cursor) = render_input(&app.input, input_content_width(area.width));
     let input_rows = input_lines.len() as u16;
-    let pending_total = app.pending_steering.len() + app.pending_followups.len();
-    let visible_pending = pending_total.min(3) as u16;
-    let extra_queue_line = u16::from(pending_total > 3);
     // The busy "● Working" status lives in the transcript (turn-activity
     // block); this strip only sizes for the pending queue.
-    let activity_items = visible_pending + extra_queue_line;
+    let queue = pending_queue_metrics(app);
     // Approval is a centered modal, not a bottom-pane split — don't reserve
     // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
     // no reason and push the composer up.
-    let layout =
-        compute_layout(area, input_rows, activity_items, false).expect("layout always exists");
+    let layout = compute_layout(area, input_rows, queue, false).expect("layout always exists");
 
     TranscriptView::render(f, layout.transcript, app);
     BottomPane::render(f, &layout, app, input_lines, input_cursor);
@@ -2029,16 +2097,178 @@ mod tests {
             input_block().inner(Rect::new(0, 0, 80, 24)).width
         );
         // Guard keeps the queue-only strip collapsed at zero items.
-        assert_eq!(activity_height(0), 0);
-        assert_eq!(activity_height(1), 3);
-        assert_eq!(activity_height(3), 7);
+        assert_eq!(activity_height(0, 0), 0);
+        assert_eq!(activity_height(1, 1), 3);
+        assert_eq!(activity_height(3, 3), 7);
         assert_eq!(status_height(), 2);
     }
 
     #[test]
     fn minimum_view_height_accounts_for_all_gutters() {
-        assert_eq!(minimum_view_height(activity_height(1), 0), 9);
-        assert_eq!(minimum_view_height(activity_height(3), 0), 13);
+        assert_eq!(minimum_view_height(activity_height(1, 1), 0), 9);
+        assert_eq!(minimum_view_height(activity_height(3, 3), 0), 13);
+    }
+
+    #[test]
+    fn multiline_pending_steer_renders_each_source_line() {
+        // A multiline submission queued while busy must keep its line breaks
+        // above the composer: `truncate_display`/`cell_safe` strip control
+        // chars, so feeding the whole text to one badge row used to flatten
+        // it into a single raw line.
+        let mut app = test_app();
+        app.busy = true;
+        app.pending_steering
+            .push("first steer line\nsecond steer line".into());
+        app.pending_followups.push("follow one\ntwo".into());
+
+        let queue = pending_queue_metrics(&app);
+        assert_eq!(queue.items, 2);
+        assert_eq!(queue.rows, 4);
+        assert_eq!(activity_height(queue.items, queue.rows), 4 + 1 + 2);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let buffer = terminal.backend().buffer();
+        let rendered: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        for expected in [
+            "steer · first steer line",
+            "second steer line",
+            "follow-up · follow one",
+            "two",
+        ] {
+            assert!(
+                rendered.iter().any(|row| row == expected),
+                "missing row {expected:?} in {rendered:?}"
+            );
+        }
+        // The pre-fix failure mode: newlines dropped, lines concatenated.
+        assert!(
+            !rendered
+                .iter()
+                .any(|row| row.contains("first steer linesecond steer line")),
+            "steer lines were flattened: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn long_multiline_queue_is_capped_per_item() {
+        // A large paste queued while busy must not grow the strip without
+        // bound: rows per item are capped and the overflow collapses into a
+        // `…` row, keeping the strip (and the layout that sizes from it)
+        // within one terminal's height.
+        let mut app = test_app();
+        app.busy = true;
+        let paste = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.pending_steering.push(paste);
+
+        let queue = pending_queue_metrics(&app);
+        assert_eq!(queue.items, 1);
+        assert_eq!(queue.rows, QUEUE_MAX_ITEM_ROWS as u16);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let buffer = terminal.backend().buffer();
+        let rendered: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        for expected in ["steer · line 1", "line 2", "line 3", "…"] {
+            assert!(
+                rendered.iter().any(|row| row == expected),
+                "missing row {expected:?} in {rendered:?}"
+            );
+        }
+        assert!(
+            !rendered.iter().any(|row| row.contains("line 4")),
+            "overflow rows should collapse into the `…` row: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn full_queue_height_stays_bounded() {
+        // A maxed-out queue (every visible item at the per-item row cap,
+        // plus the tail) must still fit a standard terminal with the
+        // composer and footer intact.
+        let mut app = test_app();
+        app.busy = true;
+        let ten = (1..=10)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..6 {
+            let text = format!("item {i}\n{ten}");
+            if i % 2 == 0 {
+                app.pending_steering.push(text);
+            } else {
+                app.pending_followups.push(text);
+            }
+        }
+        let queue = pending_queue_metrics(&app);
+        assert_eq!(queue.items, 4); // 3 items + tail
+        assert_eq!(queue.rows, 3 * QUEUE_MAX_ITEM_ROWS as u16 + 1);
+
+        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, queue, false)
+            .expect("maxed queue must fit a 24-row terminal");
+        assert!(layout.activity.height > 0);
+        assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
+        assert_eq!(layout.footer.height, status_height());
+    }
+
+    #[test]
+    fn degenerate_layout_keeps_composer_and_footer() {
+        // When the queue can't fit (short terminal), the strip yields
+        // first — a vanished composer leaves the agent uncontrollable.
+        let mut app = test_app();
+        app.busy = true;
+        let ten = (1..=10)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..6 {
+            let text = format!("item {i}\n{ten}");
+            if i % 2 == 0 {
+                app.pending_steering.push(text);
+            } else {
+                app.pending_followups.push(text);
+            }
+        }
+        let queue = pending_queue_metrics(&app);
+        // activity_h = 18 here, so a 20-row terminal can't fit the strip.
+        let layout =
+            compute_layout(Rect::new(0, 0, 80, 20), 1, queue, false).expect("layout should exist");
+        assert_eq!(layout.activity.height, 0);
+        assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
+        assert_eq!(layout.footer.height, status_height());
+        assert!(layout.transcript.height > 0);
+
+        // A handful of rows can't fit even the composer: transcript-only.
+        let layout =
+            compute_layout(Rect::new(0, 0, 80, 4), 1, queue, false).expect("layout should exist");
+        assert_eq!(layout.transcript.height, 4);
+        assert_eq!(layout.input.height, 0);
+        assert_eq!(layout.footer.height, 0);
     }
 
     #[test]
@@ -2056,7 +2286,8 @@ mod tests {
     #[test]
     fn layout_reserves_bottom_pane_before_transcript() {
         let area = Rect::new(0, 0, 80, 24);
-        let layout = compute_layout(area, 1, 1, false).expect("terminal should fit layout");
+        let layout = compute_layout(area, 1, QueueMetrics { items: 1, rows: 1 }, false)
+            .expect("terminal should fit layout");
         assert_eq!(layout.transcript.y, 0);
         assert!(layout.transcript.height > 0);
         assert_eq!(
@@ -2675,7 +2906,13 @@ mod tests {
         terminal
             .draw(|frame| view(frame, &mut app))
             .expect("render should succeed");
-        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, 1, false).unwrap();
+        let layout = compute_layout(
+            Rect::new(0, 0, 80, 24),
+            1,
+            QueueMetrics { items: 1, rows: 1 },
+            false,
+        )
+        .unwrap();
         assert!(layout.transcript.bottom() <= layout.activity.top());
         assert!(layout.activity.bottom() <= layout.input.top());
         assert!(layout.input.bottom() <= layout.footer.top());
@@ -2861,7 +3098,8 @@ mod tests {
         let input_rows = render_input(&app.input, input_content_width(area.width))
             .0
             .len() as u16;
-        let layout = compute_layout(area, input_rows, 1, false).unwrap();
+        let layout =
+            compute_layout(area, input_rows, QueueMetrics { items: 1, rows: 1 }, false).unwrap();
         let inner = input_block().inner(layout.input);
         let (_, cursor) = render_input(&app.input, inner.width);
         terminal
@@ -3071,11 +3309,8 @@ mod tests {
             let input_rows = render_input(&app.input, input_content_width(area.width))
                 .0
                 .len() as u16;
-            let pending_total = app.pending_steering.len() + app.pending_followups.len();
-            let visible_pending = pending_total.min(3) as u16;
-            let extra = u16::from(pending_total > 3);
-            let activity_items = visible_pending + extra;
-            let layout = compute_layout(area, input_rows, activity_items, false).unwrap();
+            let queue = pending_queue_metrics(&app);
+            let layout = compute_layout(area, input_rows, queue, false).unwrap();
             // Check every cell in input and footer does not contain ghost fragments
             // Ghost contains distinctive substrings that should never leak into chrome
             let forbidden = [
