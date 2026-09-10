@@ -152,7 +152,7 @@ pub(crate) struct ApprovalRequest {
 /// applies recalls in arrival order, so a recall only cancels an item that has
 /// not yet been injected into the conversation — an already-injected item is
 /// part of the transcript and cannot be pulled back.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum QueueMsg {
     Content(String),
     Recall(String),
