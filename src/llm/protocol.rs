@@ -241,6 +241,29 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
     tools
 }
 
+/// Chat-completions wire messages: serialized from [`ChatMessage`] minus
+/// dex-internal fields. `name` is a local tag (`steering`, `skill`,
+/// `summary`, `follow-up`, `agent-notifications`) that the model never needs
+/// and strict OpenAI-compatible endpoints reject (`messages[i]: "name" is
+/// not supported by this endpoint`). `reasoning_items` are Responses-API
+/// blobs the Responses wire replays inside `input` (and the Anthropic wire
+/// filters in `assistant_blocks`) — as a chat-completions field they would
+/// be garbage. `reasoning_content` stays: it is the model-facing DeepSeek
+/// field.
+pub(crate) fn chat_completions_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut wire = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
+            if let Some(object) = wire.as_object_mut() {
+                object.remove("name");
+                object.remove("reasoning_items");
+            }
+            wire
+        })
+        .collect()
+}
+
 pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
@@ -347,8 +370,8 @@ pub(crate) fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Va
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_chat_tool_call, response_call_index, response_tool_call, responses_input,
-        tools_schema, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
+        chat_completions_messages, merge_chat_tool_call, response_call_index, response_tool_call,
+        responses_input, tools_schema, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
     };
     use crate::core::types::StreamFunctionCall;
     use serde_json::json;
@@ -434,6 +457,27 @@ mod tests {
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
+    }
+
+    /// Strict OpenAI-compatible endpoints reject dex's internal `name` tag
+    /// (`messages[i]: "name" is not supported by this endpoint`) and stray
+    /// `reasoning_items` from sessions that started on the Responses wire.
+    #[test]
+    fn chat_completions_messages_strips_internal_fields() {
+        let mut tagged = ChatMessage::user_named("hi", "steering");
+        tagged.reasoning_items = Some(vec![json!({"type": "reasoning", "content": "x"})]);
+        let msgs = vec![
+            ChatMessage::system("sys"),
+            tagged,
+            ChatMessage::tool_result("call_1", "out"),
+        ];
+        let wire = chat_completions_messages(&msgs);
+        assert_eq!(wire[0], json!({"role": "system", "content": "sys"}));
+        assert_eq!(wire[1], json!({"role": "user", "content": "hi"}));
+        assert_eq!(
+            wire[2],
+            json!({"role": "tool", "content": "out", "tool_call_id": "call_1"})
+        );
     }
 
     #[test]
