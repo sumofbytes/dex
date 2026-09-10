@@ -1159,10 +1159,13 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
                 .get(url)
                 .send()
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|e| crate::llm::client::error_chain_message(&e))?
                 .error_for_status()
-                .map_err(|e| e.to_string())?;
-            let text = resp.text().await.map_err(|e| e.to_string())?;
+                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
             if serde_json::from_str::<serde_json::Value>(&text).is_err() {
                 return Err("response is not valid JSON".to_string());
             }
@@ -1179,10 +1182,10 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
             let tmp = unique_tmp_path(&path);
             tokio::fs::write(&tmp, text)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
             tokio::fs::rename(&tmp, &path)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
             println!("cached models.dev {} to {}", url, path.display());
             Ok(())
         }
