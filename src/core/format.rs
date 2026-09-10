@@ -487,7 +487,12 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
             let hits = if files_mode {
                 text.lines()
                     .filter(|line| {
-                        !line.trim().is_empty() && !line.trim_start().starts_with("[...")
+                        let line = line.trim_start();
+                        !line.is_empty()
+                            && !line.starts_with("[...")
+                            // Fuzzy fallback header (`0 exact matches…`):
+                            // prose, not a path.
+                            && !line.starts_with("0 exact matches for '")
                     })
                     .count()
             } else {
@@ -1295,6 +1300,17 @@ mod tests {
                 true
             ),
             "3 files matched"
+        );
+        // Files-mode fuzzy fallback lists paths under a prose header:
+        // the header is not a file.
+        assert_eq!(
+            tool_result_summary(
+                "ffgrep",
+                "{}",
+                "0 exact matches for 'q'. 2 approximate:\nsrc/a.rs\nsrc/b.rs",
+                true
+            ),
+            "2 files matched"
         );
         // Empty successful output says so instead of a bare "ok".
         assert_eq!(tool_result_summary("bash", "{}", "", true), "(no output)");
