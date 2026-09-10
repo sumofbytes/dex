@@ -347,6 +347,13 @@ happen only at the delivery points in §10b. Does not contain model or
 provider logic — children resolve their model through the existing config
 path.
 
+As built (Phase 4), `spawn` takes the child body as a third argument —
+`spawn(def, seed, run)` where `run` receives the child token and resolves
+to the terminal `AgentResult`. The sketch above leaves the body implied;
+passing it in keeps model logic out of the manager while giving the caller
+(parent turn / delegate tool) ownership of the child future. Results are
+filed under the allocated id, so bodies cannot misattribute.
+
 Lifecycle (rev 5 — previously unspecified): the entry is created lazily on
 first `delegate` for a session and removed when the session is deleted/reset
 (which cancels running children first, then drops the entry); daemon
