@@ -348,16 +348,24 @@ provider logic — children resolve their model through the existing config
 path.
 
 As built (Phase 4), `spawn` takes the child body as a third argument —
-`spawn(def, seed, run)` where `run` receives the child token and resolves
-to the terminal `AgentResult`. The sketch above leaves the body implied;
-passing it in keeps model logic out of the manager while giving the caller
-(parent turn / delegate tool) ownership of the child future. Results are
-filed under the allocated id, so bodies cannot misattribute.
+`spawn(def, seed, run)` where `run` receives the child token plus a
+scoped `ProgressReporter` (`set`/`clear`, the §15 `progress <tool>` source)
+and resolves to the terminal `AgentResult`. The sketch above leaves the
+body implied; passing it in keeps model logic out of the manager while
+giving the caller (parent turn / delegate tool) ownership of the child
+future. Results are filed under the allocated id, so bodies cannot
+misattribute. The wrapper itself owns three more mechanics so no terminal
+path can orphan an entry (§14): body panics funnel a synthesized `Failed`
+through `finish`; a run outliving `def.timeout` is dropped and ended
+`TimedOut`; and after `shutdown` the manager is closed — `spawn` rejects,
+so a stale clone cannot respawn into a registry nobody will join.
 
 Lifecycle (rev 5 — previously unspecified): the entry is created lazily on
 first `delegate` for a session and removed when the session is deleted/reset
 (which cancels running children first, then drops the entry); daemon
-shutdown cancels all managers' children and joins the tasks (§14). After a
+shutdown cancels all managers' children and joins the tasks (§14) — wired
+as of Phase 4 to the ctrl-C exit path in `run_daemon`; the session
+delete/reset wiring lands with those endpoints (Phase 5/6). After a
 daemon restart the map is empty by design (in-process); the parent
 transcript's `delegate` call plus the child JSONL on disk are the record,
 and resume surfaces those children as interrupted (§14, §16). No orphaned
@@ -591,19 +599,20 @@ same path as the parent's own prompts; no child-specific labeling yet. Net
 effect on built-ins: `explorer`/`reviewer` never prompt (prompt-free tools);
 `tester`'s `bash` prompts when attached, auto-denies when detached.
 
-**V1b (deferred): labeled prompts + guard fix.** A child's approval sender
+**V1b (deferred): labeled prompts.** A child's approval sender
 parks in the same `pending_approvals` map and emits `ApprovalRequired {
-request_id, name, input, agent: Some("explorer") }` — the `agent` field a
-new, optional, serde-defaulted wire addition (older clients ignore it); the
-TUI renders "explorer wants to run bash: …" (CC's v2.1.186 pattern, to be
-re-verified at implementation time). Session-level approvals apply to
-children, consulted live from `session_approvals` since children outlive
-the turn that restored them. Prompt timeout: a parked child approval
-unanswered for 5 minutes denies and records. Turn-end guard fix: the guard
-that Denies parked approvals when a turn ends
-(`src/daemon/server.rs:658-674`) must skip entries with `agent.is_some()` —
-children outlive the parent turn; their parked approvals belong to the
-session, not the turn.
+request_id, name, input, agent: Some("explorer") }` — the `agent` wire
+field (optional, serde-defaulted; older clients ignore it) and the TUI
+render "explorer wants to run bash: …" stay V1b (CC's v2.1.186 pattern, to
+be re-verified at implementation time). The guard-side plumbing shipped in
+Phase 4: `ApprovalRequest.agent_id: Option<String>` flows into
+`PendingApproval.agent_id`, and both deny sites — turn-end teardown and
+parent `/cancel`, via `DaemonState::take_session_pendings` — already skip
+entries with `agent_id.is_some()`: children outlive the parent turn; their
+parked approvals belong to the session, not the turn. Session-level
+approvals apply to children, consulted live from `session_approvals` since
+children outlive the turn that restored them. Prompt timeout: a parked
+child approval unanswered for 5 minutes denies and records.
 
 No second permission engine; `PermissionRequirement`
 (`src/tools/mod.rs:185`) is the single source of truth throughout.

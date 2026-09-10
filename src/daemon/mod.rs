@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::manager::AgentManager;
+use crate::agent::subagent::AgentManager;
 use crate::core::console::CancellationToken;
 use crate::core::types::ApprovalDecision;
 
@@ -119,6 +119,10 @@ pub(crate) struct PendingApproval {
     pub(crate) response: tokio::sync::mpsc::Sender<ApprovalDecision>,
     pub(crate) name: String,
     pub(crate) input: String,
+    /// Set when the requester is a background child agent (plan §12 V1b):
+    /// the child outlives the parent turn, so turn-end teardown and parent
+    /// cancel must not deny its approval — it stays parked and answerable.
+    pub(crate) agent_id: Option<String>,
 }
 
 /// A completed chat turn kept for `Idempotency-Key` dedup (P10): replaying
@@ -172,8 +176,10 @@ pub(crate) struct DaemonState {
     pub session_approvals: Mutex<HashMap<String, HashSet<String>>>,
     /// Per-session child-agent managers (Phase 4 lifecycle: spawn cap,
     /// cancel, completion notices). Lazily created by `manager_for`;
-    /// dropped by `remove_session_agents` / `shutdown_agents` so no
-    /// orphaned child task survives its session or the daemon.
+    /// `shutdown_agents` joins everything on the ctrl-C exit, and
+    /// `remove_session_agents` drops a session's manager once session
+    /// delete/reset endpoints exist. Managers are closed on shutdown, so
+    /// stale clones cannot respawn children into a dropped registry.
     pub agents: Mutex<HashMap<String, AgentManager>>,
     /// Set once the background startup rebuild has merged the disk registry.
     /// Surfaced via `/health` so operators can tell a partial registry apart
@@ -210,6 +216,30 @@ impl DaemonState {
         }
     }
 
+    /// Collect (and remove) the parent turn's still-pending approvals for a
+    /// session so the caller can deny them without holding the lock across
+    /// an await. Child-agent approvals (`agent_id` set, plan §12 V1b) are
+    /// skipped: a background child outlives the parent turn, and denying its
+    /// approval would strand a still-running child with no way to proceed.
+    pub(crate) fn take_session_pendings(
+        &self,
+        session_id: &str,
+    ) -> Vec<tokio::sync::mpsc::Sender<ApprovalDecision>> {
+        let mut out = Vec::new();
+        self.pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, p| {
+                if p.agent_id.is_none() && p.session_id == session_id {
+                    out.push(p.response.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        out
+    }
+
     /// Lazily create (or return) the child-agent manager for a session.
     /// Clones share one registry, so any handle sees every child.
     /// Phase 5's delegate tool is the first caller.
@@ -224,8 +254,10 @@ impl DaemonState {
     }
 
     /// Cancel + join a session's children, then drop its manager, so no
-    /// orphaned child task survives its session. Daemon lifecycle hook —
-    /// wired to the session delete/reset paths when they land (Phase 4).
+    /// orphaned child task survives its session. `shutdown` marks the
+    /// manager closed, so stale clones cannot respawn into the dropped
+    /// registry. Session delete/reset hook — wired to those endpoints when
+    /// they land (Phase 5/6); until then it stays `dead_code`.
     #[allow(dead_code)]
     pub(crate) async fn remove_session_agents(&self, session_id: &str) {
         let manager = self
@@ -239,8 +271,8 @@ impl DaemonState {
     }
 
     /// Cancel + join every session's children and drop all managers.
-    /// Daemon shutdown hook: after this returns no child task is live.
-    #[allow(dead_code)]
+    /// Daemon shutdown hook, wired to the ctrl-C exit path in `run_daemon`:
+    /// after this returns no child task is live and every manager is closed.
     pub(crate) async fn shutdown_agents(&self) {
         let managers: Vec<AgentManager> = {
             let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
@@ -476,6 +508,22 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
     // before registration.
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+
+    // Headless exit path: ctrl-C stops serving, cancels + joins every
+    // session's children (§14: no orphaned tokio task survives this exit),
+    // then exits. A spawned watcher — not `with_graceful_shutdown` — so a
+    // still-connected SSE client cannot hold the process open while it
+    // drains; once children are joined nothing is lost by exiting hard.
+    {
+        let state_for_exit = state.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                state_for_exit.shutdown_agents().await;
+                std::process::exit(0);
+            }
+        });
+    }
+
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -485,7 +533,7 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
 mod tests {
     use super::*;
     use crate::agent::subagent::{
-        AgentDefinition, AgentResult, AgentState, ContextSeed, WaitOutcome,
+        AgentDefinition, AgentResult, AgentState, ContextSeed, ProgressReporter, WaitOutcome,
     };
 
     fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
@@ -502,7 +550,7 @@ mod tests {
         (def, seed)
     }
 
-    async fn done_body(_token: CancellationToken) -> AgentResult {
+    async fn done_body(_token: CancellationToken, _progress: ProgressReporter) -> AgentResult {
         AgentResult {
             status: AgentState::Completed,
             summary: "done".to_string(),
@@ -510,7 +558,7 @@ mod tests {
         }
     }
 
-    async fn cancel_body(token: CancellationToken) -> AgentResult {
+    async fn cancel_body(token: CancellationToken, _progress: ProgressReporter) -> AgentResult {
         token.cancelled().await;
         AgentResult {
             status: AgentState::Cancelled,
@@ -566,7 +614,6 @@ mod tests {
         let id = state
             .manager_for("s1")
             .spawn(&def, seed, done_body)
-            .await
             .unwrap();
         match state
             .manager_for("s1")
@@ -582,7 +629,6 @@ mod tests {
         let other = state
             .manager_for("s2")
             .spawn(&def2, seed2, done_body)
-            .await
             .unwrap();
         assert_eq!(other.to_string(), "s2-0");
     }
@@ -592,7 +638,7 @@ mod tests {
         let state = DaemonState::new();
         let manager = state.manager_for("s1");
         let (def, seed) = agent_test_parts("explorer");
-        let id = manager.spawn(&def, seed, cancel_body).await.unwrap();
+        let id = manager.spawn(&def, seed, cancel_body).unwrap();
         assert_eq!(manager.active_count(), 1);
         state.remove_session_agents("s1").await;
         // The pre-removal handle still sees the reaped child (shared
@@ -616,8 +662,8 @@ mod tests {
         let second = state.manager_for("s2");
         let (def1, seed1) = agent_test_parts("explorer");
         let (def2, seed2) = agent_test_parts("tester");
-        first.spawn(&def1, seed1, cancel_body).await.unwrap();
-        second.spawn(&def2, seed2, cancel_body).await.unwrap();
+        first.spawn(&def1, seed1, cancel_body).unwrap();
+        second.spawn(&def2, seed2, cancel_body).unwrap();
         state.shutdown_agents().await;
         assert_eq!(first.active_count(), 0);
         assert_eq!(second.active_count(), 0);

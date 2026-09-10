@@ -143,6 +143,10 @@ pub(crate) enum ApprovalDecision {
 pub(crate) struct ApprovalRequest {
     pub name: String,
     pub input: String,
+    /// Set when the requester is a background child agent (plan §12 V1b):
+    /// children outlive the parent turn, so turn-end teardown must not deny
+    /// their parked approvals. `None` for the parent turn's own tools.
+    pub agent_id: Option<String>,
     pub response: tokio::sync::mpsc::Sender<ApprovalDecision>,
 }
 

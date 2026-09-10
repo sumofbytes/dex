@@ -44,4 +44,8 @@ pub(crate) struct AgentInstance {
     pub(crate) parent_id: Option<AgentId>,
     pub(crate) context: ContextSeed,
     pub(crate) state: AgentState,
+    /// Tool the child is currently running, as reported through its
+    /// [`ProgressReporter`](super::manager::ProgressReporter) — the
+    /// Phase 6 `progress <tool>` render reads this (plan §15).
+    pub(crate) progress: Option<String>,
 }
