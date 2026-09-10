@@ -17,6 +17,7 @@ use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
 use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, SinkLine};
+use crate::core::unwind::CatchUnwind;
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt;
 use crate::protocol::{
@@ -607,33 +608,6 @@ impl Stream for ReceiverStream {
     }
 }
 
-/// `Future::catch_unwind` without a new dependency: polls the inner future
-/// inside `std::panic::catch_unwind` per poll, so a panic in
-/// `run_turn_inner` becomes `Err("turn panicked")` (the pre-async contract)
-/// instead of aborting the spawned turn task with no terminal SSE event —
-/// the client would otherwise hang until keep-alive timeout with cleanup
-/// done (via `TurnGuard::drop`) but no `TurnFailed` ever sent. The inner
-/// future is boxed so polling needs no unsafe pin projection.
-struct CatchUnwind<F>(std::pin::Pin<Box<F>>);
-
-impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
-    type Output = Result<F::Output, String>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        // `CatchUnwind<F>` is `Unpin` (`Pin<Box<F>>` is), so `get_mut` is safe;
-        // polling stays in safe Rust (no pin projection).
-        let inner = self.get_mut().0.as_mut();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
-            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
-            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
-            Err(_) => std::task::Poll::Ready(Err("turn panicked".to_string())),
-        }
-    }
-}
-
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Async:
 /// spawned via `tokio::spawn`, bridges are tasks with `send().await`.
 #[allow(clippy::too_many_arguments)]
@@ -657,20 +631,12 @@ async fn run_agent_turn(
     }
     impl Drop for TurnGuard {
         fn drop(&mut self) {
-            {
-                let mut pending = self
-                    .state
-                    .pending_approvals
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                pending.retain(|_, p| {
-                    if p.session_id == self.session_id {
-                        let _ = p.response.try_send(ApprovalDecision::Deny);
-                        false
-                    } else {
-                        true
-                    }
-                });
+            // Deny the parent turn's still-pending approvals so blocked agent
+            // threads wake up promptly. Child-agent approvals are skipped —
+            // see `take_session_pendings` (§12 V1b): the child outlives the
+            // parent turn and must stay answerable.
+            for sender in self.state.take_session_pendings(&self.session_id) {
+                let _ = sender.try_send(ApprovalDecision::Deny);
             }
             self.state
                 .active_turns
@@ -781,8 +747,8 @@ async fn run_agent_turn(
     // Own receivers mutably for the async turn (tokio try_recv needs &mut).
     let mut steering_rx = steering_rx;
     let mut followup_rx = followup_rx;
-    let result: Result<(String, Option<u64>, Option<u64>), String> =
-        match CatchUnwind(Box::pin(run_turn_inner(
+    let result: Result<(String, Option<u64>, Option<u64>), String> = match CatchUnwind::new(
+        Box::pin(run_turn_inner(
             &state,
             &session_id,
             &req,
@@ -792,12 +758,14 @@ async fn run_agent_turn(
             Some(&steering_accepted_tx),
             Some(&mut followup_rx),
             Some(&followup_accepted_tx),
-        )))
-        .await
-        {
-            Ok(inner) => inner,
-            Err(panicked) => Err(panicked),
-        };
+        )),
+        "turn panicked",
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(panicked) => Err(panicked),
+    };
     // Drop the guard now before sending the terminal event so a new turn can
     // be accepted promptly; drop ordering handles pending approvals/active turns.
     drop(_guard);
@@ -1144,6 +1112,7 @@ async fn run_turn_inner(
                     response: request.response,
                     name: name_clone,
                     input: input_clone,
+                    agent_id: request.agent_id,
                 };
                 let replaced = state
                     .pending_approvals
@@ -1374,28 +1343,10 @@ async fn cancel(
         token.cancel();
     }
 
-    // Deny any approvals still pending for this session so agent tasks
-    // blocked on them wake up promptly. Collect senders under the lock,
-    // then send without holding it (std MutexGuard is !Send across await).
-    let to_deny = {
-        let mut pending = state
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let stale: Vec<String> = pending
-            .iter()
-            .filter(|(_, p)| p.session_id == session_id)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut out = Vec::new();
-        for id in stale {
-            if let Some(p) = pending.remove(&id) {
-                out.push(p.response);
-            }
-        }
-        out
-    };
-    for sender in to_deny {
+    // Deny the parent turn's approvals still pending for this session so
+    // agent tasks blocked on them wake up promptly. Child-agent approvals
+    // are skipped — see `take_session_pendings` (§12 V1b).
+    for sender in state.take_session_pendings(&session_id) {
         let _ = sender.send(ApprovalDecision::Deny).await;
     }
 
@@ -2098,6 +2049,7 @@ mod handler_tests {
                 response: tx,
                 name: "bash".into(),
                 input: "{}".into(),
+                agent_id: None,
             },
         );
         let r = approve(
@@ -2154,6 +2106,7 @@ mod handler_tests {
                     response: tx_a,
                     name: "write".into(),
                     input: "{}".into(),
+                    agent_id: None,
                 },
             );
             pending.insert(
@@ -2163,6 +2116,7 @@ mod handler_tests {
                     response: tx_b,
                     name: "write".into(),
                     input: "{}".into(),
+                    agent_id: None,
                 },
             );
         }
@@ -2174,6 +2128,40 @@ mod handler_tests {
             Some(crate::core::types::ApprovalDecision::Deny)
         );
         assert!(rx_b.try_recv().is_err(), "other sessions must be untouched");
+    }
+
+    #[tokio::test]
+    async fn cancel_leaves_child_agent_approvals_pending() {
+        let state = Arc::new(DaemonState::new());
+        let (tx_child, mut rx_child) = mpsc::channel(1);
+        state.pending_approvals.lock().unwrap().insert(
+            "r-child".into(),
+            PendingApproval {
+                session_id: "s-a".into(),
+                response: tx_child,
+                name: "write".into(),
+                input: "{}".into(),
+                agent_id: Some("s-a-0".into()),
+            },
+        );
+
+        let _ = cancel(State(state.clone()), Path("s-a".into())).await;
+
+        // A background child outlives the parent turn (§12 V1b): its
+        // approval stays parked and answerable instead of being denied with
+        // the turn — denying it would strand a still-running child.
+        assert!(
+            state
+                .pending_approvals
+                .lock()
+                .unwrap()
+                .contains_key("r-child"),
+            "child approval must survive parent cancel"
+        );
+        assert!(
+            rx_child.try_recv().is_err(),
+            "child approval must not be resolved by parent cancel"
+        );
     }
 
     #[tokio::test]

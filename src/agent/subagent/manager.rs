@@ -1,13 +1,19 @@
 //! Phase 4 — per-session child-agent lifecycle: registry, spawn cap,
-//! bounded wait, cancel, and completion notices.
+//! bounded wait, cancel, timeout, and completion notices.
 //!
 //! The manager owns *mechanics only*: id allocation, the spawn cap,
 //! cancellation tokens, task handles, result retention, and the notice
 //! queue. It never builds prompts, touches the model, or interprets
 //! results — the caller supplies the child body at [`AgentManager::spawn`]
 //! (Phase 5's delegate tool builds it from the parent turn; Phase 7 adds
-//! tool filtering, model override, and timeout). Tests inject mock bodies,
+//! tool filtering and the model override). Tests inject mock bodies,
 //! which keeps every lifecycle path hermetic.
+//!
+//! Mechanics the wrapper enforces here so no terminal path can orphan a
+//! registry entry (plan §14): body panics funnel a synthesized `Failed`
+//! result through `finish`; a run outliving its definition's `timeout`
+//! ends `TimedOut`; and after `shutdown` the manager is closed, so a
+//! stale clone cannot orphan a child into a registry nobody will join.
 //!
 //! Note on the plan (§7, §14): the sketch shows `spawn(def, seed)` with the
 //! child body implied. The body arrives as an argument instead, because the
@@ -24,6 +30,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::core::console::CancellationToken;
+use crate::core::unwind::CatchUnwind;
 
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
@@ -66,13 +73,15 @@ pub(crate) enum WaitOutcome {
 }
 
 /// `spawn` rejection. `AtCapacity` carries the running list so the caller
-/// (model or operator) can pick a waiter instead of guessing.
+/// (model or operator) can pick a waiter instead of guessing; `Closed`
+/// means the manager was shut down — no new children, ever.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SpawnError {
     AtCapacity {
         limit: usize,
         running: Vec<(AgentId, String)>,
     },
+    Closed,
 }
 
 impl fmt::Display for SpawnError {
@@ -90,11 +99,53 @@ impl fmt::Display for SpawnError {
                      wait for or cancel one before spawning"
                 )
             }
+            Self::Closed => {
+                write!(f, "agent manager is shut down; no new children can start")
+            }
         }
     }
 }
 
 impl std::error::Error for SpawnError {}
+
+/// Live progress handle for one child (plan §15: the `progress <tool>`
+/// System line). Phase 5's child body reports around each tool call with
+/// [`ProgressReporter::set`]; once the child's registry entry is gone the
+/// no-ops are harmless. Cheap to clone; the shared `Arc` is the same one
+/// the wrapper already holds.
+#[derive(Clone)]
+pub(crate) struct ProgressReporter {
+    manager: Arc<Mutex<Inner>>,
+    id: AgentId,
+}
+
+impl ProgressReporter {
+    /// Record the tool the child is currently running (e.g. `"bash"`).
+    pub(crate) fn set(&self, tool: &str) {
+        if let Some(child) = self
+            .manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running
+            .get_mut(&self.id)
+        {
+            child.instance.progress = Some(tool.to_string());
+        }
+    }
+
+    /// Clear the record when the tool call returns.
+    pub(crate) fn clear(&self) {
+        if let Some(child) = self
+            .manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running
+            .get_mut(&self.id)
+        {
+            child.instance.progress = None;
+        }
+    }
+}
 
 /// Per-session child-agent registry. Cheap to clone; all clones share one
 /// `Mutex<Inner>` so concurrent completions cannot tear registry state
@@ -107,6 +158,10 @@ pub(crate) struct AgentManager {
 struct Inner {
     session: String,
     next_counter: u64,
+    /// Set by `shutdown`: after it, `spawn` rejects. A stale `AgentManager`
+    /// clone (e.g. held by an in-flight tool call) cannot then orphan a
+    /// child into a registry nobody will ever join (plan §14).
+    closed: bool,
     running: HashMap<AgentId, RunningChild>,
     results: HashMap<AgentId, AgentResult>,
     /// Insertion order of `results`, for oldest-first eviction.
@@ -128,6 +183,7 @@ impl AgentManager {
             inner: Arc::new(Mutex::new(Inner {
                 session: session.to_string(),
                 next_counter: 0,
+                closed: false,
                 running: HashMap::new(),
                 results: HashMap::new(),
                 result_order: VecDeque::new(),
@@ -143,27 +199,40 @@ impl AgentManager {
 
     /// Spawn a child agent.
     ///
-    /// `run` receives the child's [`CancellationToken`] and produces its
-    /// terminal [`AgentResult`]; results are filed under the allocated id,
-    /// so bodies cannot misattribute. Every terminal path — completion,
-    /// failure, cancel — funnels through result retention, the notice
-    /// queue, and registry removal.
+    /// `run` receives the child's [`CancellationToken`] and a
+    /// [`ProgressReporter`] scoped to it, and produces its terminal
+    /// [`AgentResult`]; results are filed under the allocated id, so bodies
+    /// cannot misattribute. Every terminal path — completion, failure,
+    /// cancel, timeout, panic — funnels through result retention, the
+    /// notice queue, and registry removal.
+    ///
+    /// The wrapper enforces the definition's `timeout` (default
+    /// [`DEFAULT_AGENT_TIMEOUT`]): a run that outlasts it is dropped and
+    /// ended `TimedOut` with a synthesized partial-status error. A
+    /// panicking body becomes `Failed` instead of aborting the spawned task
+    /// with its registry entry still live (plan §14).
     ///
     /// The instance starts `Running`: the task is spawned before this
     /// returns, so `Pending` is unobservable and would only race status
     /// checks. (`Pending` stays for future queued spawns.)
-    pub(crate) async fn spawn<F, Fut>(
+    ///
+    /// Never blocks: rejects synchronously when the manager is closed
+    /// (post-`shutdown`) or already at [`MAX_CHILDREN`] live children.
+    pub(crate) fn spawn<F, Fut>(
         &self,
         def: &AgentDefinition,
         seed: ContextSeed,
         run: F,
     ) -> Result<AgentId, SpawnError>
     where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(CancellationToken, ProgressReporter) -> Fut + Send + 'static,
         Fut: Future<Output = AgentResult> + Send + 'static,
     {
-        let (id, token) = {
+        let (id, token, timeout) = {
             let mut inner = self.lock();
+            if inner.closed {
+                return Err(SpawnError::Closed);
+            }
             if inner.running.len() >= MAX_CHILDREN {
                 let running = inner
                     .running
@@ -187,22 +256,46 @@ impl AgentManager {
                         parent_id: None,
                         context: seed,
                         state: AgentState::Running,
+                        progress: None,
                     },
                     token: token.clone(),
                     handle: None,
                 },
             );
-            (id, token)
+            (id, token, def.timeout)
         };
 
         let manager = self.clone();
         let name = def.name.clone();
         let task_id = id.clone();
         let handle = tokio::spawn(async move {
-            // Cancel wins over a body that ignores its token: without this
-            // select, `cancel` would only flag while the child ran forever.
+            // Cancel wins over a body that ignores its token, and the body
+            // gets the definition's `timeout` to finish (plan §14): a run
+            // outliving it is dropped and ended `TimedOut`. Either way the
+            // wrapper funnels exactly one result through `finish`.
             let result = tokio::select! {
-                result = run(token.clone()) => result,
+                result = tokio::time::timeout(
+                    timeout,
+                    CatchUnwind::new(
+                        Box::pin(run(token.clone(), ProgressReporter {
+                            manager: manager.inner.clone(),
+                            id: task_id.clone(),
+                        })),
+                        "child panicked",
+                    ),
+                ) => match result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(panicked)) => AgentResult {
+                        status: AgentState::Failed,
+                        summary: String::new(),
+                        error: Some(panicked),
+                    },
+                    Err(_elapsed) => AgentResult {
+                        status: AgentState::TimedOut,
+                        summary: String::new(),
+                        error: Some(format!("timed out after {}s", timeout.as_secs())),
+                    },
+                },
                 () = token.cancelled() => AgentResult {
                     status: AgentState::Cancelled,
                     summary: String::new(),
@@ -285,7 +378,7 @@ impl AgentManager {
     /// unknown ids); the `Cancelled` result itself lands via `finish` once
     /// the wrapper observes the token. Signalling a finished id is a
     /// harmless no-op lookup.
-    pub(crate) async fn cancel(&self, id: &AgentId) -> Option<AgentState> {
+    pub(crate) fn cancel(&self, id: &AgentId) -> Option<AgentState> {
         let inner = self.lock();
         if let Some(child) = inner.running.get(id) {
             child.token.cancel();
@@ -294,9 +387,18 @@ impl AgentManager {
         inner.results.get(id).map(|result| result.status)
     }
 
+    /// Tool the child last reported through its [`ProgressReporter`], if
+    /// any. `None` for unknown ids (never spawned, finished, or evicted).
+    pub(crate) fn progress(&self, id: &AgentId) -> Option<String> {
+        self.lock()
+            .running
+            .get(id)
+            .and_then(|child| child.instance.progress.clone())
+    }
+
     /// Drain queued completion notices, oldest first. Results stay
     /// retained — draining never loses fetchability.
-    pub(crate) async fn drain_notices(&self) -> Vec<AgentNotice> {
+    pub(crate) fn drain_notices(&self) -> Vec<AgentNotice> {
         self.lock().notices.drain(..).collect()
     }
 
@@ -313,13 +415,16 @@ impl AgentManager {
         self.lock().running.len()
     }
 
-    /// Cancel every live child and join their tasks. After this returns,
-    /// every child has funneled through `finish` (results + notices
-    /// retained) and `active_count` is zero: a joined handle means its
-    /// wrapper already stored and removed its entry.
+    /// Cancel every live child, join their tasks, and close the manager.
+    /// After this returns, every child has funneled through `finish`
+    /// (results + notices retained), `active_count` is zero, and `spawn`
+    /// rejects: a joined handle means its wrapper already stored and
+    /// removed its entry, and a stale clone cannot respawn into this
+    /// registry.
     pub(crate) async fn shutdown(&self) {
         let handles: Vec<JoinHandle<AgentResult>> = {
             let mut inner = self.lock();
+            inner.closed = true;
             for child in inner.running.values() {
                 child.token.cancel();
             }
@@ -381,7 +486,7 @@ mod tests {
 
     /// A body that only ends through its token — the shape Phase 7's real
     /// runner has. Lets tests hold children live without sleeps.
-    async fn token_body(token: CancellationToken) -> AgentResult {
+    async fn token_body(token: CancellationToken, _progress: ProgressReporter) -> AgentResult {
         token.cancelled().await;
         AgentResult {
             status: AgentState::Cancelled,
@@ -396,16 +501,14 @@ mod tests {
         // `spawn` never yields before returning, so on a single-threaded
         // runtime the wrapper cannot have run yet: fully deterministic.
         let first = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
                 completed("findings")
             })
-            .await
             .unwrap();
         let second = mgr
-            .spawn(&test_def("tester"), test_seed(), |_| async {
+            .spawn(&test_def("tester"), test_seed(), |_, _| async {
                 completed("pass")
             })
-            .await
             .unwrap();
         assert_eq!(first.to_string(), "sess-0");
         assert_eq!(second.to_string(), "sess-1");
@@ -417,10 +520,9 @@ mod tests {
     async fn completing_child_files_result_and_notice() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
                 completed("findings")
             })
-            .await
             .unwrap();
         match mgr.wait(&id, Duration::from_secs(5)).await {
             WaitOutcome::Finished(result) => {
@@ -432,7 +534,7 @@ mod tests {
         }
         assert_eq!(mgr.status(&id), Some(AgentState::Completed));
         assert_eq!(mgr.active_count(), 0);
-        let notices = mgr.drain_notices().await;
+        let notices = mgr.drain_notices();
         assert_eq!(
             notices,
             vec![AgentNotice {
@@ -448,10 +550,9 @@ mod tests {
     async fn failed_result_preserved_with_error() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("tester"), test_seed(), |_| async {
+            .spawn(&test_def("tester"), test_seed(), |_, _| async {
                 failed("boom")
             })
-            .await
             .unwrap();
         match mgr.wait(&id, Duration::from_secs(5)).await {
             WaitOutcome::Finished(result) => {
@@ -460,7 +561,7 @@ mod tests {
             }
             other => panic!("expected Finished, got {other:?}"),
         }
-        let notices = mgr.drain_notices().await;
+        let notices = mgr.drain_notices();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].status, AgentState::Failed);
     }
@@ -469,11 +570,10 @@ mod tests {
     async fn wait_times_out_then_finishes() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 completed("late")
             })
-            .await
             .unwrap();
         match mgr.wait(&id, Duration::from_millis(50)).await {
             WaitOutcome::Running(state) => assert_eq!(state, AgentState::Running),
@@ -494,8 +594,8 @@ mod tests {
             WaitOutcome::Unknown
         );
         assert_eq!(mgr.status(&unknown), None);
-        assert_eq!(mgr.cancel(&unknown).await, None);
-        assert!(mgr.drain_notices().await.is_empty());
+        assert_eq!(mgr.cancel(&unknown), None);
+        assert!(mgr.drain_notices().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -503,9 +603,8 @@ mod tests {
         let mgr = AgentManager::new("sess");
         let id = mgr
             .spawn(&test_def("explorer"), test_seed(), token_body)
-            .await
             .unwrap();
-        assert_eq!(mgr.cancel(&id).await, Some(AgentState::Running));
+        assert_eq!(mgr.cancel(&id), Some(AgentState::Running));
         // `cancel` never yields, so on a single-threaded runtime the
         // wrapper cannot have reaped the entry yet: the fired token is
         // observably the child's own.
@@ -522,7 +621,7 @@ mod tests {
             other => panic!("expected Finished, got {other:?}"),
         }
         assert_eq!(mgr.active_count(), 0);
-        let notices = mgr.drain_notices().await;
+        let notices = mgr.drain_notices();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].status, AgentState::Cancelled);
     }
@@ -534,14 +633,10 @@ mod tests {
         for n in 0..MAX_CHILDREN {
             ids.push(
                 mgr.spawn(&test_def(&format!("agent-{n}")), test_seed(), token_body)
-                    .await
                     .unwrap(),
             );
         }
-        match mgr
-            .spawn(&test_def("one-too-many"), test_seed(), token_body)
-            .await
-        {
+        match mgr.spawn(&test_def("one-too-many"), test_seed(), token_body) {
             Err(SpawnError::AtCapacity { limit, running }) => {
                 assert_eq!(limit, MAX_CHILDREN);
                 assert_eq!(running.len(), MAX_CHILDREN);
@@ -554,18 +649,16 @@ mod tests {
         }
         assert!(mgr
             .spawn(&test_def("x"), test_seed(), token_body)
-            .await
             .unwrap_err()
             .to_string()
             .contains(&ids[0].to_string()));
         // Freeing one slot unblocks spawn.
-        mgr.cancel(&ids[0]).await;
+        mgr.cancel(&ids[0]);
         match mgr.wait(&ids[0], Duration::from_secs(5)).await {
             WaitOutcome::Finished(result) => assert_eq!(result.status, AgentState::Cancelled),
             other => panic!("expected Finished, got {other:?}"),
         }
         mgr.spawn(&test_def("fits-now"), test_seed(), token_body)
-            .await
             .unwrap();
     }
 
@@ -574,17 +667,16 @@ mod tests {
         let mgr = AgentManager::new("sess");
         for _ in 0..(MAX_NOTICES + 3) {
             let id = mgr
-                .spawn(&test_def("explorer"), test_seed(), |_| async {
+                .spawn(&test_def("explorer"), test_seed(), |_, _| async {
                     completed("done")
                 })
-                .await
                 .unwrap();
             assert!(matches!(
                 mgr.wait(&id, Duration::from_secs(5)).await,
                 WaitOutcome::Finished(_)
             ));
         }
-        let notices = mgr.drain_notices().await;
+        let notices = mgr.drain_notices();
         assert_eq!(notices.len(), MAX_NOTICES);
         // FIFO: the retained notices are the first completions.
         assert_eq!(notices[0].agent_id.to_string(), "sess-0");
@@ -596,16 +688,15 @@ mod tests {
     async fn results_survive_notice_drain() {
         let mgr = AgentManager::new("sess");
         let id = mgr
-            .spawn(&test_def("explorer"), test_seed(), |_| async {
+            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
                 completed("durable")
             })
-            .await
             .unwrap();
         assert!(matches!(
             mgr.wait(&id, Duration::from_secs(5)).await,
             WaitOutcome::Finished(_)
         ));
-        assert_eq!(mgr.drain_notices().await.len(), 1);
+        assert_eq!(mgr.drain_notices().len(), 1);
         match mgr.wait(&id, Duration::from_secs(5)).await {
             WaitOutcome::Finished(result) => assert_eq!(result.summary, "durable"),
             other => panic!("expected retained Finished, got {other:?}"),
@@ -617,11 +708,9 @@ mod tests {
         let mgr = AgentManager::new("sess");
         let first = mgr
             .spawn(&test_def("explorer"), test_seed(), token_body)
-            .await
             .unwrap();
         let second = mgr
             .spawn(&test_def("tester"), test_seed(), token_body)
-            .await
             .unwrap();
         mgr.shutdown().await;
         assert_eq!(mgr.active_count(), 0);
@@ -633,7 +722,7 @@ mod tests {
                 other => panic!("expected Finished, got {other:?}"),
             }
         }
-        assert_eq!(mgr.drain_notices().await.len(), 2);
+        assert_eq!(mgr.drain_notices().len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -647,12 +736,11 @@ mod tests {
                 mgr.spawn(
                     &test_def(&format!("agent-{n}")),
                     test_seed(),
-                    |_| async move {
+                    |_, _| async move {
                         gate.wait().await;
                         completed("through the gate")
                     },
                 )
-                .await
                 .unwrap(),
             );
         }
@@ -665,7 +753,104 @@ mod tests {
             }
         }
         assert_eq!(mgr.active_count(), 0);
-        assert_eq!(mgr.drain_notices().await.len(), MAX_CHILDREN);
+        assert_eq!(mgr.drain_notices().len(), MAX_CHILDREN);
         assert_eq!(mgr.take_overflow(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn panicking_body_fails_without_orphaning_the_entry() {
+        let mgr = AgentManager::new("sess");
+        let id = mgr
+            .spawn(&test_def("explorer"), test_seed(), |_, _| async {
+                panic!("body exploded")
+            })
+            .unwrap();
+        // The wrapper catches the panic and funnels a synthesized `Failed`
+        // through `finish` — no entry left Running, no slot leaked (§14).
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Failed);
+                assert_eq!(result.error.as_deref(), Some("child panicked"));
+                assert_eq!(result.summary, "");
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert_eq!(mgr.status(&id), Some(AgentState::Failed));
+        assert_eq!(mgr.active_count(), 0);
+        assert_eq!(mgr.drain_notices().len(), 1);
+        // Cleanup ran: a fresh spawn still works.
+        mgr.spawn(&test_def("explorer"), test_seed(), token_body)
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_timeout_ends_timed_out() {
+        let mgr = AgentManager::new("sess");
+        let mut def = test_def("explorer");
+        def.timeout = Duration::from_millis(50);
+        let id = mgr
+            .spawn(&def, test_seed(), |_, _| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                completed("never")
+            })
+            .unwrap();
+        // The wrapper enforces the definition's timeout (§14): the hung body
+        // is dropped and the run ends TimedOut with a synthesized error.
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::TimedOut);
+                assert!(result.error.unwrap().contains("timed out"));
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_after_shutdown_rejects_closed() {
+        let mgr = AgentManager::new("sess");
+        let id = mgr
+            .spawn(&test_def("explorer"), test_seed(), token_body)
+            .unwrap();
+        mgr.shutdown().await;
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Cancelled)
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // A stale clone (an in-flight tool call holds one) cannot respawn a
+        // child nobody will ever join.
+        assert!(matches!(
+            mgr.spawn(&test_def("x"), test_seed(), token_body),
+            Err(SpawnError::Closed)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn progress_reports_current_tool_and_clears() {
+        let mgr = AgentManager::new("sess");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let id = mgr
+            .spawn(&test_def("explorer"), test_seed(), move |_, progress| {
+                async move {
+                    progress.set("bash");
+                    let _ = rx.await; // hold the "tool call" until observed
+                    progress.clear();
+                    completed("done")
+                }
+            })
+            .unwrap();
+        // Current-thread runtime: the wrapper has not run yet.
+        assert_eq!(mgr.progress(&id), None);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mgr.progress(&id), Some("bash".to_string()));
+        let _ = tx.send(());
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => assert_eq!(result.summary, "done"),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // Finished children carry no live progress.
+        assert_eq!(mgr.progress(&id), None);
     }
 }
