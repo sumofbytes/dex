@@ -1,10 +1,11 @@
 # dex
 
-A terminal-based coding agent written in Rust. `dex` talks to OpenAI-compatible
-Chat Completions or Responses APIs, calls tools (`read`, `bash`, `write`, `edit`, `ffgrep`,
-`fffind`) to operate on your local files, and offers an interactive TUI, a
-one-shot prompt mode, and a raw JSON tool mode. Conversations are persisted as
-sessions and can be resumed.
+A terminal coding agent written in Rust. `dex` talks to OpenAI-compatible Chat
+Completions or Responses APIs and Anthropic's native Messages wire, calls tools
+(`read`, `bash`, `write`, `edit`, `ffgrep`, `fffind`, plus MCP servers) to
+operate on your local files, and offers an interactive TUI, a one-shot prompt
+mode, and a raw JSON tool mode. All agent work can run in a daemon over
+HTTP+SSE, and conversations persist as resumable JSONL sessions.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how
 to build, test, and submit changes. Please follow the
@@ -13,22 +14,34 @@ to build, test, and submit changes. Please follow the
 
 ## Features
 
-- **OpenAI-compatible backend** — supports Chat Completions and Responses
-  endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, etc.). Streaming responses,
-  automatic retries with exponential backoff, and configurable reasoning effort.
+- **Multi-provider backends** — OpenAI-compatible Chat Completions and
+  Responses endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, …), Anthropic's
+  native Messages wire, and ChatGPT-backed Codex OAuth. Streaming responses,
+  stalled-stream retries with idle watchdogs, automatic protocol fallback
+  (responses → completions, remembered per endpoint+model), and configurable
+  reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write
-  and edit files, search the filesystem. Extra tools (`git`, `chain`) behind `DEX_EXTRA_TOOLS=1`. Tool output caching is off by default; set `DEX_TOOL_CACHE=1` to opt in.
+  and edit files, and search the filesystem. External tools arrive via MCP
+  servers (stdio or HTTP/SSE, with OAuth). Extra built-ins (`git`, `chain`)
+  sit behind `DEX_EXTRA_TOOLS=1`. Tool output caching is off by default; set `DEX_TOOL_CACHE=1` to opt in.
+- **Client–daemon architecture** — the TUI is a pure HTTP client; a daemon
+  does the LLM calls, tools, and sessions. Attach from anywhere, reconnect
+  with journal replay, and approve tool calls remotely.
 - **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript,
   multi-line input, autoscroll, a status bar, and a visible
-  steering/follow-up queue while the agent is working.
-- **Session persistence** — each conversation is saved as a JSONL log. A fresh
-  session starts by default; use `--session` to explicitly continue one.
+  steering/follow-up queue while the agent is working. `!` shell escape for
+  direct commands without the agent.
+- **Session persistence** — each conversation is saved as a crash-safe JSONL
+  journal. A fresh session starts by default; use `--session` to explicitly
+  continue one.
 - **Skills** — lightweight, discoverable agent skills (directories with a
   `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
   demand via `/skill:<name>`.
 - **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
+- **Runtime logging** — `DEX_LOG=off|error|warn|info|debug|trace` with a
+  TUI-safe sink (stderr outside the TUI, `dex.log` inside); no new dependencies.
 - **Herdr-aware** — running inside a [Herdr](https://herdr.dev) pane
   (`HERDR_ENV=1`), dex reports `working`/`blocked`/`idle` to the Herdr sidebar
   via `pane report-agent`; no-op everywhere else.
@@ -113,12 +126,9 @@ providers:
 model: zen/gpt-5.6-luna    # endpoint-or-provider / model
 ```
 
-Or without a file:
-
-```sh
-export OPENCODE_API_KEY=sk-...   # the only required setting
-dex                             # model/base_url/protocol resolve themselves
-```
+No file at all also works: export the provider's key and run `dex` — the
+daemon bootstraps the models.dev catalog in the background, so a fresh
+install needs no manual `dex update --models`.
 
 Run `dex update --models` once to cache the models.dev catalog. After that
 a bare `/model <id>` moves `base_url` to the endpoint serving that id, and
@@ -221,6 +231,17 @@ Ask it to do something:
 > read src/main.rs and summarize what it does
 ```
 
+### Doctor
+
+`dex doctor` shows the fully resolved configuration — provider, endpoint,
+model, wire protocol, key source, thinking effort, catalog state — each with
+the origin (flag > env > file > default). It never touches the network and is
+the first thing to run when setup misbehaves.
+
+```sh
+dex doctor
+```
+
 ### One-shot mode
 
 Pass a prompt as arguments to get a single answer (no TUI):
@@ -260,7 +281,8 @@ done
 ### Model catalog
 
 `dex update --models` refreshes the cached model catalog (context windows
-and `/model` autocomplete).
+and `/model` autocomplete). A fresh daemon bootstraps it in the background,
+so this is a manual refresh, not a required step.
 
 ```sh
 dex update --models
@@ -339,7 +361,7 @@ or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
 `connect`, `run`, `update --models`, `mcp`, `doctor`) are covered under
-Usage / Model catalog above; `--help`/`-h` and `--version`/`-V` print help
+Usage / MCP servers above; `--help`/`-h` and `--version`/`-V` print help
 and version without touching config or network.
 
 ## TUI slash commands
@@ -505,7 +527,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_HTTP_REQUEST_TIMEOUT_SECS` | Total request bound, applied only when explicitly set — streaming LLM/chat paths default to no total timeout so long turns aren't killed. |
 | `DEX_TOOL_TIMEOUT_SECS` | Shell command timeout in seconds (default 120). |
 | `DEX_TOOL_OUTPUT_BYTES` | Maximum captured stdout/stderr bytes per stream (default 1 MiB). |
-| `DEX_STREAM_IDLE_TIMEOUT_SECS` | SSE idle watchdog: fail the stream when no chunk (or keep-alive) arrives for this long (default 90; `0` disables). Slow reasoning models that buffer longer than this trip it while healthy — raise it (e.g. 300). |
+| `DEX_STREAM_IDLE_TIMEOUT_SECS` | SSE idle watchdog: no chunk (or keep-alive) for this long counts as a stall (default 90, 300 for reasoning-capable models; `0` disables). Pre-output stalls and dropped connections retry automatically same-protocol (2 retries) before failing the turn. |
 | `DEX_MAX_TOOL_ITERATIONS` | Per-turn cap on tool rounds — one round per assistant batch with calls, not per call (default 200). A looping model is stopped with partial progress preserved and a transcript marker. |
 | `DEX_DAEMON_TOKEN` | Bearer token for the daemon API. Required by clients when `dex serve` binds a non-loopback address (auto-generated and written to `$XDG_DATA_HOME/dex/daemon.token`, 0600) or when the operator sets one. Loopback-only daemons need no token. |
 | `DEX_MODEL_APIS` | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id). |
