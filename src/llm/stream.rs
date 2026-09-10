@@ -275,6 +275,22 @@ fn driver_err(driver: &mut SseDriver, message: &str) -> Box<dyn std::error::Erro
     stream_err(message, driver.output_flowed)
 }
 
+/// Transport-failure variant of [`driver_err`]: pre-output the caller's
+/// `chunk()` error is marked with [`StreamTransportError`] (provenance for
+/// the retry gate) and otherwise passes through untouched; post-output it
+/// wraps as [`MidStreamError`] like any other failure.
+fn driver_err_transport(
+    driver: &mut SseDriver,
+    err: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    driver.end_thinking();
+    if driver.output_flowed {
+        Box::new(MidStreamError(err.to_string()))
+    } else {
+        Box::new(StreamTransportError(err))
+    }
+}
+
 /// Mid-stream events a parser emits per SSE line; the driver owns what
 /// happens to them (printing, accumulation, usage threading, lifecycle).
 enum StreamEvent {
@@ -587,6 +603,43 @@ pub(crate) fn is_dropped_connection(message: &str) -> bool {
     .any(|s| message.contains(s))
 }
 
+/// Provenance marker: this error came out of `response.chunk()` — the head
+/// was accepted and the body then proved unreadable (dropped socket, reset,
+/// truncated encoding). `run_sse` is the only constructor, so presence in
+/// the chain means transport death by construction: no wording or
+/// `reqwest::Error`-kind matching (both shift across reqwest versions — the
+/// same mid-body FIN reads as `is_decode` on one, `is_body` on another).
+/// `Display` forwards to the inner error so logs and retry notices read
+/// unchanged.
+#[derive(Debug)]
+pub(crate) struct StreamTransportError(pub Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for StreamTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for StreamTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+/// Transport-death check for retry gates: a [`StreamTransportError`] in the
+/// chain means `run_sse` itself saw the body die — matched by provenance,
+/// never by wording, so provider error text can never trip this gate.
+pub(crate) fn is_transport_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.downcast_ref::<StreamTransportError>().is_some() {
+            return true;
+        }
+        source = std::error::Error::source(e);
+    }
+    false
+}
+
 /// Idle budget for one stream: the explicit env override wins, `0`
 /// disables; otherwise reasoning-capable models (thinking enabled for this
 /// call, or the models.dev catalog advertises effort options for the model)
@@ -653,15 +706,26 @@ async fn run_sse<P: StreamParser>(
             // sending. Without it a stalled stream parks the turn forever.
             // Disabled (`None`) arms no timer at all — no overflow-prone
             // infinite deadline.
-            chunk_res = async {
-                match idle_timeout {
-                    Some(t) => match tokio::time::timeout(t, response.chunk()).await {
-                        Err(_) => Err(None),
-                        Ok(r) => r.map_err(|e| Some(e.to_string())),
-                    },
-                    None => response.chunk().await.map_err(|e| Some(e.to_string())),
-                }
-            } => {
+              // Transport errors keep their type *and* provenance: a `chunk()`
+              // failure is marked with `StreamTransportError` pre-output, so
+              // the retry gate matches the marker instead of message wording
+              // or `reqwest::Error` kind (both shift across reqwest
+              // versions). Only the watchdog timeout — which has no source
+              // error — travels as a plain message.
+              chunk_res = async {
+                  match idle_timeout {
+                      Some(t) => match tokio::time::timeout(t, response.chunk()).await {
+                          Err(_) => Err(None),
+                          Ok(r) => r.map_err(|e| {
+                              Some(Box::new(e)
+                                  as Box<dyn std::error::Error + Send + Sync>)
+                          }),
+                      },
+                      None => response.chunk().await.map_err(|e| {
+                          Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                      }),
+                  }
+              } => {
                 match chunk_res {
                     Err(None) => {
                         let secs = idle_timeout.map(|t| t.as_secs()).unwrap_or(0);
@@ -672,9 +736,9 @@ async fn run_sse<P: StreamParser>(
                             ),
                         ));
                     }
-                    Err(Some(msg)) => {
-                        return Err(driver_err(&mut driver, &msg));
-                    }
+                      Err(Some(err)) => {
+                          return Err(driver_err_transport(&mut driver, err));
+                      }
                     Ok(None) => break,
                       Ok(Some(bytes)) => {
                           buf.extend_from_slice(&bytes);
@@ -1343,8 +1407,9 @@ impl StreamParser for AnthropicParser {
 #[cfg(test)]
 mod tests {
     use super::{
-        delta_thought, driver_err, is_dropped_connection, read_stream, stream_err,
-        stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta, StreamPrinter, Usage,
+        delta_thought, driver_err, is_dropped_connection, is_transport_error, read_stream,
+        stream_err, stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta, StreamPrinter,
+        Usage,
     };
     use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
@@ -2075,6 +2140,69 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
         assert!(!is_dropped_connection(
             "stream idle for over 90s; the provider stalled"
         ));
+    }
+
+    /// A server that sends headers then drops the socket must surface a
+    /// marked transport error pre-output (not a bare string): the retry gate
+    /// matches on the `StreamTransportError` marker, so new transport
+    /// wordings and `reqwest::Error` kinds need no matcher updates.
+    #[tokio::test]
+    async fn pre_output_drop_preserves_typed_transport_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head, advertise a body, then die: the client
+            // sees a mid-body EOF on its first `chunk()`.
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 100\r\n\r\n",
+                )
+                .await;
+            // Socket drops here with the body unsent.
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
+        let err = read_stream(
+            response,
+            None,
+            &CancellationToken::new(),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap_err();
+        // Provenance, not wording or kind: the same mid-body FIN reads as
+        // `is_decode` on this reqwest version (`is_body` on others), so the
+        // gate matches the marker `run_sse` attached, not the taxonomy.
+        assert!(is_transport_error(&*err));
+        assert!(!crate::llm::streaming::is_mid_stream(&*err));
+        // The marker preserves the transport cause for logs and notices.
+        let mut source = std::error::Error::source(&*err);
+        let mut found_cause = false;
+        while let Some(e) = source {
+            if e.downcast_ref::<reqwest::Error>().is_some() {
+                found_cause = true;
+                break;
+            }
+            source = std::error::Error::source(e);
+        }
+        assert!(found_cause, "marker keeps the reqwest cause in-chain");
     }
 
     /// A provider that sends response headers and then never sends a byte
