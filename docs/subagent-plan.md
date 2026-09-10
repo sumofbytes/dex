@@ -1,6 +1,6 @@
 # Dex Sub-Agent Architecture — Implementation Plan
 
-Status: planned (rev 5). Rev 2 revised after a design review against prior art —
+Status: built (rev 5) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 2 revised after a design review against prior art —
 pi's subagent design, Claude Code's task/agent system, Amp's oracle, and
 Codex's sandbox-boundary model — and a source audit of dex's actual
 integration points. Rev 3 verified the prior-art claims against primary
@@ -956,7 +956,7 @@ protocol/presence endpoint).
 ## D. Turn boundaries (V1a) and wake (V1b)
 - [x] V1a: completion notices drain only at real turn starts (chained follow-up, next user chat) — never mid-turn, never via the steering channel.
 - [x] V1a: notice queue bounded at 32; overflow folds into a summary notice.
-- [ ] V1b: wake fires only when the session is idle and a real presence signal confirms an audience; never steals a race with a user chat POST (chat wins, wake skips — no user-visible 409); reattach wakes at most once.
+- [x] V1b: wake fires only when the session is idle and a real presence signal confirms an audience; never steals a race with a user chat POST (chat wins, wake skips — no user-visible 409); reattach wakes at most once.
 
 ## E. Lifecycle
 - [x] Well-defined states; `Completed`/`Failed`/`Cancelled`/`TimedOut` all reachable and tested; each queues its completion notice.
@@ -970,7 +970,7 @@ protocol/presence endpoint).
 - [x] `delegate`/`delegate_output`/`delegate_stop` never available to children (no recursion, depth 1).
 - [x] `explorer` read-only; `reviewer` has no write/edit/bash.
 - [x] V1a: detached children auto-deny mutating calls and record the denial.
-- [ ] V1b: child approval prompts surface labeled in the parent session; `AllowSession` applies to children; 5-minute timeout; the parent-turn-end guard leaves child approvals parked.
+- [x] V1b: child approval prompts surface labeled in the parent session; `AllowSession` applies to children; 5-minute timeout; the parent-turn-end guard leaves child approvals parked.
 
 ## G. Model configuration
 - [x] Per-definition model through the existing resolver; no provider-specific code in the sub-agent module.
@@ -988,7 +988,7 @@ protocol/presence endpoint).
 
 ## K. Events and TUI
 - [x] V1a: lifecycle lines are seq-journaled `System` envelopes; TUI matches the stable prefix via existing poll + replay, deduped by `seq`; zero wire change.
-- [ ] V1b: typed variants ship as a declared wire bump with old-client fallback.
+- [x] V1b: typed variants ship as a declared wire bump with old-client fallback.
 - [x] Core runtime runs with no TUI attached.
 
 ## L. Built-ins
