@@ -559,14 +559,20 @@ impl SseDriver {
 /// timer. `DEX_STREAM_IDLE_TIMEOUT_SECS` overrides; `0` disables the
 /// watchdog entirely (no timer armed).
 ///
-/// Note: providers that buffer slow reasoning for longer than this without
-/// emitting a chunk trip the watchdog even though the turn is healthy —
-/// raise it for thinking models (`DEX_STREAM_IDLE_TIMEOUT_SECS=300`).
+/// The default (300s) covers slow reasoning models that buffer for minutes
+/// without emitting a chunk; a stall past it is retried automatically by the
+/// caller (same protocol, bounded) before it ever fails the turn.
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+
+pub(crate) fn is_stream_idle_error(message: &str) -> bool {
+    message.contains("stream idle for over")
+}
+
 fn stream_idle_timeout() -> Option<Duration> {
     match env_secs("DEX_STREAM_IDLE_TIMEOUT_SECS") {
         Some(0) => None,
         Some(secs) => Some(Duration::from_secs(secs)),
-        None => Some(Duration::from_secs(90)),
+        None => Some(Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)),
     }
 }
 
@@ -1946,9 +1952,12 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
         // immediate timeout and not an infinite deadline).
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "0");
         assert_eq!(stream_idle_timeout(), None);
-        // Garbage falls back to the 90s default.
+        // Garbage falls back to the default.
         std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", "junk");
-        assert_eq!(stream_idle_timeout(), Some(Duration::from_secs(90)));
+        assert_eq!(
+            stream_idle_timeout(),
+            Some(Duration::from_secs(super::DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
+        );
         match prev {
             Some(v) => std::env::set_var("DEX_STREAM_IDLE_TIMEOUT_SECS", v),
             None => std::env::remove_var("DEX_STREAM_IDLE_TIMEOUT_SECS"),
