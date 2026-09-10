@@ -204,12 +204,26 @@ async fn post_with_retry(
     let mut active_config = config.clone();
     for attempt in 0..=MAX_HTTP_RETRIES {
         let request = config.client.post(url);
+        crate::log!(
+            Debug,
+            "POST {url} (model {}, attempt {attempt})",
+            config.model
+        );
+        let started = std::time::Instant::now();
         let resp = match authenticated_request(request, &active_config)
             .json(body)
             .send()
             .await
         {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                crate::log!(
+                    Debug,
+                    "HTTP {} {url} in {:?}",
+                    resp.status(),
+                    started.elapsed()
+                );
+                resp
+            }
             Err(e) if attempt < MAX_HTTP_RETRIES => {
                 let delay = backoff_delay(attempt, None);
                 with_console(sink.is_some(), || {
@@ -224,6 +238,7 @@ async fn post_with_retry(
             }
             Err(e) => {
                 provider_log("request_failed", &error_chain_message(&e));
+                crate::log!(Warn, "request failed: {}", error_chain_message(&e));
                 return Err(Box::new(e));
             }
         };
@@ -267,6 +282,9 @@ async fn post_with_retry(
                 continue;
             }
             provider_log("api_error", &format!("{}: {}", status, body_text));
+            // Cap the logged body: some providers return whole HTML pages.
+            let head: String = body_text.chars().take(400).collect();
+            crate::log!(Warn, "api error {status}: {head}");
             // Opaque 5xx / missing route from `/responses` usually means the
             // model only speaks chat-completions (proven for e.g.
             // glm-5.3-flash on zen/go) — point at the per-model override
