@@ -463,7 +463,10 @@ impl DaemonClient {
                 let request_id = request_id.clone();
                 let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
                 if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
-                    crate::llm::client::provider_log("approval_delivery_failed", &e.to_string());
+                    crate::llm::client::provider_log(
+                        "approval_delivery_failed",
+                        &crate::llm::client::error_chain_message(&*e),
+                    );
                 }
                 continue;
             }
