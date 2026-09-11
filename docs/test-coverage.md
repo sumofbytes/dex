@@ -10,7 +10,8 @@ cargo llvm-cov --all-targets --summary-only  # quick per-file table
 Baseline (2026-09-11): **78.05% lines, 75.43% functions** over 515 tests
 (514 unit + 1 integration), ~20s wall.
 
-After the plan below: **82.76% lines, 80.01% functions** over 562 tests.
+After the plan below: **82.76% lines, 80.01% functions** over 561 tests
+(560 unit + 1 integration).
 
 ## Where we stand
 

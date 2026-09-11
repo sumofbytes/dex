@@ -910,8 +910,9 @@ mod tests {
                 .collect();
         let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
-        let other = Session::new("/tmp".to_string(), Some("other".to_string())).unwrap();
-        std::mem::forget(other); // keep the file; no drop side effects expected
+        // The session file stays on disk after the handle drops — `Session`
+        // has no `Drop` impl and appends are synchronous writes.
+        Session::new("/tmp".to_string(), Some("other".to_string())).unwrap();
 
         let mut app = new_app();
         type_input(&mut app, "/resume");
@@ -1096,17 +1097,29 @@ mod tests {
 
     #[test]
     fn handle_slash_mcp_variants() {
-        // The `/mcp` snapshot depends on whether some other test has already
-        // initialized the global manager (process-wide, parallel tests), so
-        // both outcomes are valid: unavailable, or a rendered panel.
+        // Pin the process-global manager (`OnceLock`, never unset): without
+        // this the snapshot races whichever parallel test initializes the
+        // manager first. A concurrent refresh can still win a `try_read`
+        // against the snapshot, so the expectation is derived from the same
+        // global before/after the handler and asserted only while both
+        // observations agree (a flip means the outcome was genuinely
+        // ambiguous — skip rather than guess).
+        crate::mcp::global_manager();
         let mut app = new_app();
+        let before = crate::mcp::cached_statuses().is_some();
         assert!(!handle_slash(&mut app, "/mcp"));
+        let after = crate::mcp::cached_statuses().is_some();
         let texts = info_texts(&app).join(" | ");
-        let initialized = crate::mcp::cached_statuses().is_some();
-        if initialized {
-            assert!(!texts.contains("MCP status unavailable"), "{texts}");
-        } else {
-            assert!(texts.contains("MCP status unavailable"), "{texts}");
+        if before && after {
+            assert!(
+                !texts.contains("MCP status unavailable"),
+                "initialized manager renders the panel: {texts}"
+            );
+        } else if !before && !after {
+            assert!(
+                texts.contains("MCP status unavailable"),
+                "no manager, no panel: {texts}"
+            );
         }
 
         let mut app = new_app();

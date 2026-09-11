@@ -397,33 +397,12 @@ mod tests {
         let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
-        // Spawn the real daemon router on a dedicated thread (no LLM needed).
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                tx.send(listener.local_addr().unwrap().to_string()).ok();
-                axum::serve(
-                    listener,
-                    crate::daemon::server::router(std::sync::Arc::new(
-                        crate::daemon::DaemonState::new(),
-                    )),
-                )
-                .await
-                .unwrap();
-            });
-        });
-        let addr = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("daemon address");
+        // The real daemon router (no LLM involved).
+        let daemon_base = crate::client::http::tests::spawn_daemon_sync(
+            crate::daemon::server::router(std::sync::Arc::new(crate::daemon::DaemonState::new())),
+        );
 
-        let client = DaemonClient::new(&format!("http://{addr}")).unwrap();
+        let client = DaemonClient::new(&daemon_base).unwrap();
         client.wait_until_ready(Duration::from_secs(10)).unwrap();
         // `!` runs and feeds the next turn; `!!` stays out of context.
         one_shot(
