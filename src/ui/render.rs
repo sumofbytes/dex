@@ -1291,8 +1291,8 @@ impl SlashSuggestionsView {
         // native terminal selection pastes plain commands (at worst one
         // leading `────` line to drop). No background either: rows carry no
         // fill, so nothing extra to strip. The `> ` marker plus the
-        // brighter fg is the only selection indicator (skip the 2-wide
-        // marker gutter when
+        // default fg (vs cyan) is the only selection indicator (skip the
+        // 2-wide marker gutter when
         // copying a command, as with any picker affordance).
         let height = (visible as u16 + 2).min(area.y);
         if height < 3 {

@@ -1031,7 +1031,11 @@ mod tests {
         // Keyword (`fn`) and comment (italic) carry SGR runs; the keyword
         // is colored but never bold (bold is markdown emphasis, not chrome).
         assert!(out.contains("\x1b["), "no SGR emitted: {out:?}");
-        assert!(out.contains("\x1b[3"), "comment not italic: {out:?}");
+        // `style_to_sgr` joins codes (italic first, then fg), so a run
+        // starting with `3;` is exactly italic+fg — a bare `\x1b[3` would
+        // also match plain fg runs (`\x1b[35m`), which say nothing about
+        // italics.
+        assert!(out.contains("\x1b[3;"), "comment not italic: {out:?}");
         let kw = out.split("fn").next().expect("keyword must survive");
         assert!(
             kw.rsplit("\x1b[")

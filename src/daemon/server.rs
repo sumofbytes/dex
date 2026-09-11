@@ -2845,6 +2845,661 @@ mod handler_tests {
         // cleanup: the created session file lives under data_dir
         let _ = std::fs::remove_dir_all(&data_dir);
     }
+    // ---- coverage fixes (docs/test-coverage.md §1) ----
+
+    #[tokio::test]
+    async fn steer_and_followup_land_on_the_turn_queue() {
+        let state = Arc::new(DaemonState::new());
+        state.sessions.lock().unwrap().insert(
+            "s".into(),
+            SessionEntry {
+                path: "/tmp/does-not-exist.jsonl".into(),
+                name: None,
+                cwd: "/tmp".into(),
+            },
+        );
+        let (stx, mut srx) = mpsc::channel::<QueueMsg>(4);
+        let (ftx, mut frx) = mpsc::channel::<QueueMsg>(4);
+        state.steering_txs.lock().unwrap().insert("s".into(), stx);
+        state.followup_txs.lock().unwrap().insert("s".into(), ftx);
+        // Content is trimmed before it lands on the queue.
+        let r = steer(
+            State(state.clone()),
+            Path("s".into()),
+            Json(SteerRequest {
+                content: "  mid-turn note  ".into(),
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(
+            matches!(srx.try_recv(), Ok(QueueMsg::Content(c)) if c == "mid-turn note"),
+            "steer must land on the steering queue"
+        );
+        let r = followup(
+            State(state),
+            Path("s".into()),
+            Json(FollowupRequest {
+                content: "next turn".into(),
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(
+            matches!(frx.try_recv(), Ok(QueueMsg::Content(c)) if c == "next turn"),
+            "followup must land on the followup queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_reaches_the_followup_queue_too() {
+        let state = Arc::new(DaemonState::new());
+        state.sessions.lock().unwrap().insert(
+            "s".into(),
+            SessionEntry {
+                path: "/tmp/does-not-exist.jsonl".into(),
+                name: None,
+                cwd: "/tmp".into(),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
+        state.followup_txs.lock().unwrap().insert("s".into(), tx);
+        let r = recall(
+            State(state),
+            Path("s".into()),
+            Json(RecallRequest {
+                content: "typo".into(),
+                followup: true,
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(matches!(rx.try_recv(), Ok(QueueMsg::Recall(c)) if c == "typo"));
+    }
+
+    #[tokio::test]
+    async fn cancel_cancels_the_turn_and_shell_tokens() {
+        let state = Arc::new(DaemonState::new());
+        let turn = CancellationToken::new();
+        let shell = CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert("s".into(), turn.clone());
+        state
+            .shell_tokens
+            .lock()
+            .unwrap()
+            .insert("s".into(), shell.clone());
+        let _ = cancel(State(state), Path("s".into())).await;
+        assert!(turn.is_cancelled(), "Esc must unwind the in-flight turn");
+        assert!(shell.is_cancelled(), "Esc must cancel an in-flight `!` run");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+    async fn approve_allow_session_records_approval_and_writes_audit() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data_dir = std::env::temp_dir().join(format!("dex-srv-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            [("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]
+                .into_iter()
+                .collect();
+        let _env = crate::session::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+
+        let state = Arc::new(DaemonState::new());
+        // Parent turn approves for the whole session: recorded so later turns
+        // skip the overlay, and audited with actor "remote".
+        let (tx, mut rx) = mpsc::channel(1);
+        state.pending_approvals.lock().unwrap().insert(
+            "req-s".into(),
+            PendingApproval {
+                session_id: "s-a".into(),
+                response: tx,
+                name: "bash".into(),
+                input: "{}".into(),
+                agent_id: None,
+                agent: None,
+            },
+        );
+        let r = approve(
+            State(state.clone()),
+            Path("s-a".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "req-s".into(),
+                decision: crate::protocol::ApprovalDecision::AllowSession,
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(rx.try_recv().ok(), Some(ApprovalDecision::Session));
+        assert!(
+            state.is_session_approved("s-a", "bash", "{}"),
+            "AllowSession must persist for the session"
+        );
+        let audit_path = data_dir.join("dex/audit.jsonl");
+        let text = std::fs::read_to_string(&audit_path).expect("audit row written");
+        let row: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(row["session_id"], "s-a");
+        assert_eq!(row["request_id"], "req-s");
+        assert_eq!(row["tool"], "bash");
+        assert_eq!(row["decision"], "session");
+        assert_eq!(row["actor"], "remote");
+        assert!(row["agent"].is_null());
+        assert!(
+            row["input_hash"].as_str().is_some_and(|h| h.len() == 16),
+            "input is redacted to a hash: {row}"
+        );
+
+        // A child-agent decision carries the child's label into the audit
+        // row (§12 V1b) and does NOT record a session approval.
+        let (tx, mut rx_child) = mpsc::channel(1);
+        state.pending_approvals.lock().unwrap().insert(
+            "req-c".into(),
+            PendingApproval {
+                session_id: "s-a".into(),
+                response: tx,
+                name: "write".into(),
+                input: r#"{"path":"x"}"#.into(),
+                agent_id: Some("s-a-0".into()),
+                agent: Some("explorer".into()),
+            },
+        );
+        let r = approve(
+            State(state.clone()),
+            Path("s-a".into()),
+            Json(crate::protocol::ApprovalResponse {
+                request_id: "req-c".into(),
+                decision: crate::protocol::ApprovalDecision::Deny,
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(rx_child.try_recv().ok(), Some(ApprovalDecision::Deny));
+        let text = std::fs::read_to_string(&audit_path).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "one row per resolution: {text}");
+        assert_eq!(rows[1]["agent"], "explorer");
+        assert_eq!(rows[1]["decision"], "deny");
+        assert!(
+            !state.is_session_approved("s-a", "write", r#"{"path":"x"}"#),
+            "Deny must not grant anything"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn load_skill_finds_fresh_skills_and_persists_content() {
+        let root = std::env::temp_dir().join(format!(
+            "dex-srv-skill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let dir = root.join("skills");
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        let content = "---\nname: demo\ndescription: \"Test skill\"\n---\nBody";
+        std::fs::write(dir.join("demo/SKILL.md"), content).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "dex-skill-load-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-skill-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp/dex-test-cwd\"}\n",
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+
+        // Unknown name -> 404 even though the session exists.
+        let r = load_skill(
+            State(state.clone()),
+            Path(id.clone()),
+            Json(LoadSkillRequest {
+                name: "missing".into(),
+                skill_dirs: vec![dir.to_string_lossy().into_owned()],
+            }),
+        )
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
+
+        // Explicit loads bypass the discovery cache, so a just-added skill
+        // resolves immediately.
+        let r = load_skill(
+            State(state),
+            Path(id),
+            Json(LoadSkillRequest {
+                name: "demo".into(),
+                skill_dirs: vec![dir.to_string_lossy().into_owned()],
+            }),
+        )
+        .await;
+        let body = r.expect("skill loads").0;
+        assert_eq!(body["name"], "demo");
+        assert_eq!(body["description"], "Test skill");
+        assert_eq!(body["content"], content);
+        // The skill is persisted as a named message for the next turn.
+        let loaded = crate::session::load_messages_from_session(&path).unwrap();
+        assert!(
+            loaded
+                .iter()
+                .any(|m| m.content_str().contains("--- Skill: demo ---")),
+            "skill message persisted: {:?}",
+            loaded.iter().map(|m| m.content_str()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn session_events_skip_unknown_types_but_advance_cursor() {
+        let dir = std::env::temp_dir().join(format!("dex-srv-events-2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "test-events-2";
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            r#"{"type":"session","version":1,"id":"test-events-2","timestamp":"t","cwd":"/tmp/x"}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.events.jsonl")),
+            r#"{"seq":0,"payload":{"type":"system","data":"one"}}
+{"seq":1,"payload":{"type":"yet_unknown_kind","data":"skip me"}}
+this line is torn and not json
+{"seq":2,"payload":{"type":"system","data":"three"}}
+"#,
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("since".to_string(), "0".to_string());
+        let r = session_events(State(state), Path(id), Query(params))
+            .await
+            .unwrap();
+        // Unknown event types are skipped for the payload but still advance
+        // the cursor, and torn lines are dropped. (`since` is exclusive, so
+        // seq 0 is skipped here.)
+        assert_eq!(r.events.len(), 1, "{:?}", r.events);
+        assert_eq!(r.events[0].seq, 2);
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "three"));
+        assert_eq!(r.next_seq, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_events_without_journal_replay_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "dex-srv-nojournal-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-nojournal\",\"timestamp\":\"t\",\"cwd\":\"/tmp/x\"}\n",
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+        // No `since` param defaults to 0; no journal file replays nothing and
+        // leaves the cursor at 0.
+        let r = session_events(
+            State(state),
+            Path(id),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .unwrap();
+        assert!(r.events.is_empty());
+        assert_eq!(r.next_seq, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+    async fn lookup_entry_disk_fallback_and_reattach_seed_from_disk() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data_dir =
+            std::env::temp_dir().join(format!("dex-srv-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            [("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]
+                .into_iter()
+                .collect();
+        let _env = crate::session::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        let dir = data_dir.join("dex/sessions/fb");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fb-1.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"fb-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp/fb-cwd\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fb-1.events.jsonl"),
+            r#"{"seq":0,"payload":{"type":"system","data":"a"}}
+{"seq":1,"payload":{"type":"system","data":"b"}}
+{"seq":2,"payload":{"type":"system","data":"c"}}
+{"seq":3,"payload":{"type":"system","data":"d"}}
+"#,
+        )
+        .unwrap();
+
+        let state = Arc::new(DaemonState::new());
+        // The startup rebuild runs in the background, so a registry miss
+        // falls back to disk and registers the hit for later lookups.
+        let entry = lookup_entry(&state, "fb-1").expect("session found on disk");
+        assert!(entry.path.exists());
+        assert_eq!(entry.cwd, "/tmp/fb-cwd");
+        assert!(
+            state.sessions.lock().unwrap().contains_key("fb-1"),
+            "disk hit must register in memory"
+        );
+        assert!(lookup_entry(&state, "fb-2").is_none(), "unknown stays None");
+
+        // Reattach resolves the same disk fallback and returns the replay
+        // cursor: the highest journaled seq.
+        let r = reattach(State(state.clone()), Path("fb-1".into()))
+            .await
+            .expect("reattach");
+        assert_eq!(r.session_id, "fb-1");
+        assert_eq!(r.seq, 3);
+        assert!(matches!(
+            reattach(State(state), Path("fb-2".into())).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn session_trace_reads_rows_and_skips_torn_lines() {
+        let dir = std::env::temp_dir().join(format!("dex-srv-trace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "test-trace-1";
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-trace-1\",\"timestamp\":\"t\",\"cwd\":\"/tmp/x\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.trace.jsonl")),
+            r#"{"tool":"bash","ok":true}
+not json
+{"tool":"write","ok":false}
+"#,
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+        let Json(value) = session_trace(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap();
+        let rows = value["trace"].as_array().expect("trace array");
+        assert_eq!(rows.len(), 2, "torn lines are skipped: {rows:?}");
+        assert_eq!(rows[0]["tool"], "bash");
+        assert_eq!(rows[1]["tool"], "write");
+
+        // A session without a trace journal reports an empty trace.
+        let bare = std::env::temp_dir().join(format!(
+            "dex-srv-notrace-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(
+            &bare,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-trace-2\",\"timestamp\":\"t\",\"cwd\":\"/tmp/x\"}\n",
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&bare);
+        let Json(value) = session_trace(State(state), Path(id)).await.unwrap();
+        assert!(value["trace"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&bare);
+    }
+
+    #[tokio::test]
+    async fn session_undo_restores_and_refuses_conflicts() {
+        let dir = std::env::temp_dir().join(format!(
+            "dex-srv-undo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.txt");
+        std::fs::write(&target, "before").unwrap();
+        let before_hash = crate::tools::hash_file(&target.to_string_lossy());
+        std::fs::write(&target, "after").unwrap();
+        let after_hash = crate::tools::hash_file(&target.to_string_lossy());
+        let path = dir.join("test-undo-1.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-undo-1\",\"timestamp\":\"t\",\"cwd\":\"/tmp/x\"}\n",
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+        {
+            let mut session = Session::from_path(&path).unwrap();
+            crate::session::record_change(
+                &mut session,
+                crate::session::make_change_record(
+                    "write",
+                    &target.to_string_lossy(),
+                    Some("before"),
+                    Some("after"),
+                    &before_hash,
+                    &after_hash,
+                ),
+            )
+            .unwrap();
+        }
+
+        // Undo reverts the file and reports what it did.
+        let Json(body) = session_undo(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(body["status"], "ok");
+        assert!(
+            body["message"].as_str().unwrap().contains("undid write"),
+            "{}",
+            body["message"]
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+
+        // Ledger empty now -> 404 (nothing left to undo).
+        assert!(matches!(
+            session_undo(State(state.clone()), Path(id.clone())).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+
+        // File moved on since the change -> 409, no silent revert.
+        std::fs::write(&target, "two").unwrap();
+        let after2 = crate::tools::hash_file(&target.to_string_lossy());
+        {
+            let mut session = Session::from_path(&path).unwrap();
+            crate::session::record_change(
+                &mut session,
+                crate::session::make_change_record(
+                    "edit",
+                    &target.to_string_lossy(),
+                    Some("before"),
+                    Some("two"),
+                    &before_hash,
+                    &after2,
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(&target, "modified since").unwrap();
+        assert!(matches!(
+            session_undo(State(state), Path(id)).await,
+            Err(StatusCode::CONFLICT)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "modified since",
+            "conflicting undo must not touch the file"
+        );
+
+        // Unknown session -> 404.
+        assert!(matches!(
+            session_undo(State(Arc::new(DaemonState::new())), Path("nope".into())).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_waive_requires_reason_and_records_disposition() {
+        let path = std::env::temp_dir().join(format!(
+            "dex-srv-waive-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-waive-1\",\"timestamp\":\"t\",\"cwd\":\"/tmp/x\"}\n",
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+        // P9: waived requires a reason; missing or blank is a 400.
+        for body in [json!({}), json!({"reason": "   "})] {
+            let r = session_waive(State(state.clone()), Path(id.clone()), Json(body.clone())).await;
+            assert!(
+                matches!(r, Err(StatusCode::BAD_REQUEST)),
+                "expected 400 for {body}"
+            );
+        }
+        let r = session_waive(
+            State(state),
+            Path(id),
+            Json(json!({"reason": "  flaky env " })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["status"], "ok");
+        // The reason is recorded as a user-authored message the model sees,
+        // plus a verify-state disposition.
+        let loaded = crate::session::load_messages_from_session(&path).unwrap();
+        assert!(
+            loaded
+                .iter()
+                .any(|m| m.content_str() == "[verify waived] flaky env"),
+            "waive message persisted: {:?}",
+            loaded.iter().map(|m| m.content_str()).collect::<Vec<_>>()
+        );
+        let state_map = crate::session::load_session_state(&path).unwrap();
+        let verify = state_map.get("verify").expect("verify state written");
+        assert!(verify.contains("\"disposition\":\"waived\""), "{verify}");
+        assert!(verify.contains("flaky env"), "{verify}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn session_name_validates_and_renames() {
+        let path = std::env::temp_dir().join(format!(
+            "dex-srv-name-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":1,\"id\":\"test-name-1\",\"timestamp\":\"t\",\"cwd\":\"/tmp/x\"}\n",
+        )
+        .unwrap();
+        let (state, id) = state_with_session(&path);
+        // Missing or blank names are a 400.
+        for body in [json!({}), json!({"name": "   "})] {
+            let r = session_name(State(state.clone()), Path(id.clone()), Json(body.clone())).await;
+            assert!(
+                matches!(r, Err(StatusCode::BAD_REQUEST)),
+                "expected 400 for {body}"
+            );
+        }
+        // Unknown session -> 404 before any rename.
+        assert!(matches!(
+            session_name(
+                State(Arc::new(DaemonState::new())),
+                Path("nope".into()),
+                Json(json!({"name": "x"}))
+            )
+            .await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+        // Names are trimmed before they are recorded.
+        let r = session_name(
+            State(state),
+            Path(id),
+            Json(json!({"name": "  Fancy Name  "})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["status"], "ok");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("\"type\":\"session_info\"") && l.contains("Fancy Name")),
+            "rename persisted: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn health_and_mcp_meta_endpoints_return_shapes() {
+        let state = Arc::new(DaemonState::new());
+        let Json(h) = health(State(state)).await;
+        assert_eq!(h["status"], "ok");
+        // A fresh daemon has no background rebuild in flight.
+        assert_eq!(h["rebuild_complete"], false);
+
+        let Json(mcp) = get_mcp().await;
+        assert!(mcp["servers"].is_array());
+        assert!(mcp["truncated"].is_u64());
+
+        // Reconnecting an unconfigured server surfaces the error (state down)
+        // instead of only recording `down`.
+        let Json(re) = mcp_reconnect(Path("no-such-server".into())).await;
+        assert_eq!(re["server"], "no-such-server");
+        assert_eq!(re["state"], "down");
+        assert!(re["error"].is_string());
+
+        let Json(skills) = list_skills().await;
+        assert!(skills["skills"].is_array());
+    }
 }
 
 #[cfg(test)]
@@ -3446,6 +4101,264 @@ mod e2e_tests {
             child_text.contains("find where the gate lives"),
             "child transcript carries the task: {child_text}"
         );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+    // ---- coverage fixes (docs/test-coverage.md §1) ----
+
+    /// Bearer gate over real HTTP: `/health` stays open, every `/api/*` route
+    /// requires `Authorization: Bearer <token>` when the daemon requires a
+    /// token, and `/api/config` renders resolved daemon info on success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env + token global must stay pinned
+    async fn bearer_gate_blocks_api_routes_and_config_reports_info() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data_dir = std::env::temp_dir().join(format!("dex-e2e-bearer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_PERMISSION",
+            "DEX_DAEMON_TOKEN",
+            "DEX_LOG",
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        let _env = crate::session::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            "active_provider: opencode\napi: openai-completions\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
+        for v in [
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ] {
+            std::env::remove_var(v);
+        }
+        // Exercise the per-request log line too (`DEX_LOG=info dex serve`).
+        std::env::set_var("DEX_LOG", "info");
+        crate::core::logging::init();
+
+        std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
+        crate::daemon::prepare_daemon_token(&"127.0.0.1:9".parse().unwrap());
+        assert_eq!(
+            required_token().as_deref(),
+            Some("s3cret-token"),
+            "loopback bind with explicit DEX_DAEMON_TOKEN requires it"
+        );
+
+        let base = spawn_app(router(Arc::new(DaemonState::new()))).await;
+        let http = reqwest::Client::new();
+        let url = |path: &str| format!("{base}{path}");
+
+        // Liveness stays open without credentials.
+        let status = http.get(url("/health")).send().await.unwrap().status();
+        assert_eq!(status, 200);
+
+        // API routes without / with a wrong token -> 401.
+        for auth in [None, Some("Bearer wrong")] {
+            let mut r = http.get(url("/api/config"));
+            if let Some(auth) = auth {
+                r = r.header("authorization", auth);
+            }
+            let resp = r.send().await.unwrap();
+            assert_eq!(resp.status(), 401, "auth {auth:?} must be rejected");
+        }
+
+        // The right token gets through; /api/config reports resolved info.
+        let resp = http
+            .get(url("/api/config"))
+            .header("authorization", "Bearer s3cret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let info: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(info["provider"], "opencode");
+        assert_eq!(info["permission"], "ask-writes");
+        assert_eq!(
+            info["cwd"],
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+
+        // Incomplete config still renders (best-effort info, no error).
+        std::env::set_var("DEX_PROVIDER", "definitely-not-a-provider");
+        let resp = http
+            .get(url("/api/config"))
+            .header("authorization", "Bearer s3cret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let info: serde_json::Value = resp.json().await.unwrap();
+        assert!(info.get("provider").is_some());
+
+        // Restore the process-global token for the other tests.
+        crate::daemon::reset_daemon_token_for_tests();
+        std::env::set_var("DEX_LOG", "warn");
+        crate::core::logging::init();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// P10 idempotency over real HTTP: the same `Idempotency-Key` replays the
+    /// recorded terminal event instead of re-running the turn (the model is
+    /// NOT called a second time).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
+    async fn idempotent_chat_replays_the_recorded_terminal_event() {
+        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\ndata: [DONE]\n\n";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let fake_llm = Router::new().route(
+            "/chat/completions",
+            post(move |AxumState(_): AxumState<Arc<AtomicUsize>>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(DONE_SSE.to_string()))
+                        .unwrap()
+                }
+            }),
+        );
+        let fake_llm = fake_llm.with_state(calls.clone());
+        let llm_base = spawn_app(fake_llm).await;
+        let daemon_base = spawn_app(router(Arc::new(DaemonState::new()))).await;
+
+        let data_dir = std::env::temp_dir().join(format!("dex-e2e-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_PERMISSION",
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+            "DEX_VERIFY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        let _env = crate::session::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_VERIFY", "false");
+        for v in [
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ] {
+            std::env::remove_var(v);
+        }
+
+        let calls_in = calls.clone();
+        let (calls_after_first, replay_events) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&daemon_base).unwrap();
+            client.wait_until_ready(Duration::from_secs(10)).unwrap();
+            let session_id = client
+                .create_session("/tmp/dex-e2e-cwd", Some("idem"))
+                .unwrap()
+                .session_id;
+            // First turn runs for real.
+            let mut first = Vec::new();
+            client
+                .chat(
+                    &session_id,
+                    "hello",
+                    ChatOptions {
+                        idempotency_key: Some("key-1".into()),
+                        ..Default::default()
+                    },
+                    &mut |event| {
+                        first.push(event);
+                        None
+                    },
+                )
+                .unwrap();
+            let calls_after_first = calls_in.load(Ordering::SeqCst);
+            // Same key + same request body: replay, no second model call.
+            let mut second = Vec::new();
+            client
+                .chat(
+                    &session_id,
+                    "hello",
+                    ChatOptions {
+                        idempotency_key: Some("key-1".into()),
+                        ..Default::default()
+                    },
+                    &mut |event| {
+                        second.push(event);
+                        None
+                    },
+                )
+                .unwrap();
+            (calls_after_first, second)
+        })
+        .await
+        .unwrap();
+
+        assert!(calls_after_first >= 1, "the first turn runs for real");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_first,
+            "the replay must not call the model again"
+        );
+        assert_eq!(
+            replay_events.len(),
+            1,
+            "replay emits exactly the recorded terminal event: {replay_events:?}"
+        );
+        match &replay_events[0] {
+            crate::protocol::StreamEvent::TurnComplete { response, .. } => {
+                assert_eq!(response, "all done");
+            }
+            other => panic!("expected TurnComplete replay, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
