@@ -1528,6 +1528,14 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             app.show_thinking = !app.show_thinking;
             bump_thinking_stamps(app);
         }
+        // Alt+V: cycle the user voice color. Global chrome like Ctrl+T
+        // above, so it sits before the slash-popup arm and works with the
+        // popup open; already-submitted rows keep the voice they were
+        // sent in, the composer and new prompts use the new one.
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => {
+            let name = super::theme::cycle_voice();
+            app.notice = Some((format!("voice: {name}"), Instant::now()));
+        }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
             KeyCode::Esc => {
                 // Discard the drafted slash command and close the popup

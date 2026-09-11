@@ -51,3 +51,12 @@ pub(crate) fn muted_rgb() -> Option<(u8, u8, u8)> {
         blend(p.foreground, p.background, amount)
     })
 }
+
+/// Hairline-rule dim: barely-visible separator lines (composer frame, sheet
+/// rules). Far fainter than `muted_rgb` — not readable text, just an edge.
+pub(crate) fn faint_rgb() -> Option<(u8, u8, u8)> {
+    term_palette().map(|p| {
+        let amount = if p.dark { 0.80 } else { 0.75 };
+        blend(p.foreground, p.background, amount)
+    })
+}
