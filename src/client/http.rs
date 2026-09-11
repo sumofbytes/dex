@@ -963,8 +963,10 @@ impl DaemonClient {
     }
 }
 
+// `pub(crate)`: `client/repl.rs` tests reuse `spawn_daemon_sync` (same test
+// binary), following the `llm::config::tests` precedent.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1237,8 +1239,9 @@ mod tests {
         assert_eq!(*approvals.lock().unwrap(), vec![ApprovalDecision::Deny]);
     }
 
-    /// Spawn a router on a loopback port from sync code; returns the base URL.
-    fn spawn_daemon_sync(app: axum::Router) -> String {
+    /// Spawn a router on a loopback port from sync code; returns the base
+    /// URL. Shared with the `client/repl.rs` tests.
+    pub(crate) fn spawn_daemon_sync(app: axum::Router) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let (tx, rx) = std::sync::mpsc::channel::<String>();
