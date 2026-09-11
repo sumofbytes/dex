@@ -2,7 +2,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{block::Padding, Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui_markdown::highlight::CodeHighlighter;
 use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer, RenderHooks};
 use ratatui_markdown::ThemeConfig;
 use std::time::Duration;
@@ -371,9 +370,8 @@ pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Spa
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    let mut segs = highlight::shared_highlighter().highlight(lang, code);
+    let segs = highlight::highlight_segments(lang, code);
     if !segs.is_empty() {
-        segs.sort_by_key(|s| (s.start, s.end));
         return highlight::code_block_spans(code, &segs);
     }
     highlight::fallback_code_block(lang, code)
@@ -1292,8 +1290,9 @@ impl SlashSuggestionsView {
         // separation, no box-drawing elsewhere (`╭`/`│ `/`───` per row) so a
         // native terminal selection pastes plain commands (at worst one
         // leading `────` line to drop). No background either: rows carry no
-        // fill, so nothing extra to strip. The `> ` marker plus bold is the
-        // only selection indicator (skip the 2-wide marker gutter when
+        // fill, so nothing extra to strip. The `> ` marker plus the
+        // brighter fg is the only selection indicator (skip the 2-wide
+        // marker gutter when
         // copying a command, as with any picker affordance).
         let height = (visible as u16 + 2).min(area.y);
         if height < 3 {
@@ -1341,17 +1340,14 @@ impl SlashSuggestionsView {
             .map(|(offset, (command, description))| {
                 let selected = start + offset == app.slash_selected;
                 let marker_style = if selected {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::Cyan)
                 } else {
                     Style::default().fg(theme::muted_fg())
                 };
                 let command_style = if selected {
-                    // Bold marks the selected row; unselected rows stay plain cyan.
-                    Style::default()
-                        .fg(theme::surface_fg())
-                        .add_modifier(Modifier::BOLD)
+                    // `>` plus the brighter fg mark the selection; unselected
+                    // rows stay plain cyan. No bold — chrome stays quiet.
+                    Style::default().fg(theme::surface_fg())
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
@@ -1497,11 +1493,7 @@ impl ApprovalOverlay {
         f.render_widget(Clear, popup);
         let block = Block::default()
             .title(format!(" {} — {} ", title, approval.name))
-            .title_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .title_style(Style::default().fg(Color::Yellow))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .padding(Padding::new(1, 1, 1, 1))
@@ -1521,12 +1513,7 @@ impl ApprovalOverlay {
         .split(inner);
 
         let header_line = Line::from(vec![
-            Span::styled(
-                title.to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(title.to_string(), Style::default().fg(Color::Cyan)),
             Span::styled("  ·  ", Style::default().fg(theme::muted_fg())),
             Span::styled(
                 format!("{} risk", risk_label),
@@ -1539,9 +1526,7 @@ impl ApprovalOverlay {
         ]);
         let sub = Line::from(Span::styled(
             summary.clone(),
-            Style::default()
-                .fg(theme::surface_fg())
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::surface_fg()),
         ));
         f.render_widget(
             Paragraph::new(vec![header_line, sub]).wrap(Wrap { trim: false }),
@@ -1585,10 +1570,8 @@ impl ApprovalOverlay {
             .map(|(idx, (label, key, hint))| {
                 let sel = approval.selected == idx;
                 let style = if sel {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                    // Black-on-yellow inversion is emphasis enough; no bold.
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else {
                     Style::default()
                         .fg(theme::surface_fg())
