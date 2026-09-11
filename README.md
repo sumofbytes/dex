@@ -584,6 +584,8 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_KEEP_RECENT_TOKENS` | Recent tokens kept on compaction (default 20000). |
 | `DEX_TOOL_CACHE` | `1` to cache tool results across runs (`dex-tool-cache.json`; default off). |
 | `DEX_CONFIG` | Override the config file path (default `$XDG_CONFIG_HOME/dex/config.yaml`). |
+| `DEX_REPO` | GitHub repo `dex update` downloads releases from, `owner/name` (default `arpitsr/dex`). |
+| `DEX_VERSION` | Version pin for `dex update`: `vX.Y.Z` (bare or `V`-prefixed also accepted) installs that exact release, enabling downgrades; `latest` (default) follows the newest release. Both also honored by `scripts/install.sh`. |
 | `CODEX_HOME` | Directory holding Codex `auth.json` (default `~/.codex`). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` | XDG base dirs for config/data/cache. |
 | `HOME`               | Fallback when XDG vars are unset.                        |

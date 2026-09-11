@@ -53,11 +53,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
 
     let (tag, latest) = match &pinned {
         Some(v) => {
-            let tag = if v.starts_with('v') {
-                v.clone()
-            } else {
-                format!("v{v}")
-            };
+            let tag = pinned_tag(v);
             let version = parse_version(&tag)
                 .ok_or_else(|| format!("DEX_VERSION '{v}' is not a vX.Y.Z version"))?;
             (tag, version)
@@ -254,10 +250,18 @@ fn asset_name(tag: &str, target: &str) -> String {
     format!("dex-{tag}-{target}.tar.gz")
 }
 
-/// Parse `vX.Y.Z` (or bare `X.Y.Z`) into a comparable tuple; pre-release
-/// tags do not parse (we only publish plain vX.Y.Z).
+/// Normalize a pinned `DEX_VERSION` value into a release tag: `v`/`V`
+/// prefixes and bare versions all become `vX.Y.Z` (prefix matched
+/// case-insensitively so `DEX_VERSION=V0.4.0` works too).
+fn pinned_tag(v: &str) -> String {
+    format!("v{}", v.trim().trim_start_matches(['v', 'V']))
+}
+
+/// Parse `vX.Y.Z` (or bare `X.Y.Z`, prefix case-insensitive) into a
+/// comparable tuple; pre-release tags do not parse (we only publish plain
+/// vX.Y.Z).
 fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
-    let version = tag.trim().trim_start_matches('v');
+    let version = tag.trim().trim_start_matches(['v', 'V']);
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -307,10 +311,14 @@ mod tests {
     #[test]
     fn parses_and_compares_versions() {
         assert_eq!(parse_version("v0.4.2"), Some((0, 4, 2)));
+        assert_eq!(parse_version("V1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("v1.0.0-rc1"), None);
         assert_eq!(parse_version("nope"), None);
         assert!(parse_version("v0.4.2") > parse_version("v0.4.1"));
+        assert_eq!(pinned_tag("v0.4.0"), "v0.4.0");
+        assert_eq!(pinned_tag("V0.4.0"), "v0.4.0");
+        assert_eq!(pinned_tag(" 0.4.0 "), "v0.4.0");
     }
 
     #[test]
