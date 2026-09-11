@@ -483,9 +483,22 @@ schema):
 | `fffind` | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`). |
 | `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
 | `chain`* | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`. |
+| `delegate`* | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`) and return its id immediately. Daemon sessions only. |
+| `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result. |
+| `delegate_stop`* | Cancel a running child and return its terminal result. |
 
 `*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
 cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
+
+### Sub-agents
+
+`delegate` hands a self-contained task to a background child (three built-ins: `explorer`, `reviewer`, `tester`) that runs the same
+turn loop with its own context, tool allowlist, and JSONL transcript (`$XDG_DATA_HOME/dex/sessions/<slug>/agents/*.jsonl`).
+Completions are announced at the next turn boundary and, while the session is idle with a client attached, a wake turn surfaces
+them immediately (off with `agent_wake: false` / `DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children
+cannot delegate (depth 1). Under `ask-*` modes a mutating call parks a labeled prompt in the session's approval queue —
+"explorer wants to run bash: …" — unanswered for five minutes it denies; session-level "allow" approvals apply to children too.
+Set `DEX_SUBAGENTS=0` to unregister the tools.
 
 ### MCP servers
 
@@ -543,6 +556,8 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
+| `DEX_SUBAGENTS` | `0` to unregister the `delegate`/`delegate_output`/`delegate_stop` tools (default on in daemon sessions). |
+| `DEX_AGENT_WAKE` | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice. |
 | `DEX_MCP_SERVERS_JSON` | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests). |
 | `DEX_MCP` / `DEX_NO_MCP` | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers. |
 | `DEX_MCP_MAX_TOOLS` | Cap on merged MCP schema tools (default 200; head kept sorted by name). |

@@ -4,13 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use crate::agent::subagent::{AgentEvent, AgentManager};
 use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, QueueMsg};
+use crate::protocol::{StreamEnvelope, StreamEvent};
 
 // ---------------------------------------------------------------------------
 // Daemon bearer token
@@ -118,6 +120,14 @@ pub(crate) struct PendingApproval {
     pub(crate) response: tokio::sync::mpsc::Sender<ApprovalDecision>,
     pub(crate) name: String,
     pub(crate) input: String,
+    /// Set when the requester is a background child agent (plan §12 V1b):
+    /// the child outlives the parent turn, so turn-end teardown and parent
+    /// cancel must not deny its approval — it stays parked and answerable.
+    pub(crate) agent_id: Option<String>,
+    /// The child's definition name for the labeled prompt (V1b, §12):
+    /// rendered "explorer wants to run bash: …". `None` for the parent
+    /// turn's own tools.
+    pub(crate) agent: Option<String>,
 }
 
 /// A completed chat turn kept for `Idempotency-Key` dedup (P10): replaying
@@ -171,10 +181,30 @@ pub(crate) struct DaemonState {
     /// scope as `Console::approval_key`). Lives on the daemon so a decision
     /// survives across turns; previously `Console` was per-turn and lost it.
     pub session_approvals: Mutex<HashMap<String, HashSet<String>>>,
+    /// Per-session child-agent managers (Phase 4 lifecycle: spawn cap,
+    /// cancel, completion notices). Lazily created by `manager_for`;
+    /// `shutdown_agents` joins everything on the ctrl-C exit, and
+    /// `remove_session_agents` drops a session's manager once session
+    /// delete/reset endpoints exist. Managers are closed on shutdown, so
+    /// stale clones cannot respawn children into a dropped registry.
+    pub agents: Mutex<HashMap<String, AgentManager>>,
     /// Set once the background startup rebuild has merged the disk registry.
     /// Surfaced via `/health` so operators can tell a partial registry apart
     /// from an empty one.
     pub rebuild_complete: AtomicBool,
+    /// Live SSE streams per session (V1b): lifecycle events that are
+    /// journaled outside a turn (child agents, wake turns) are also pushed
+    /// to any attached client's turn stream, so the TUI sees them live
+    /// instead of waiting for its next poll.
+    pub active_streams: Mutex<HashMap<String, Vec<mpsc::Sender<StreamEnvelope>>>>,
+    /// Per-session idle wake turn tokens (V1b, plan §10b). A user chat POST
+    /// steals the wake: "chat wins, wake skips" — a user-visible 409 must
+    /// never lose a race with a background notice.
+    pub wakes: Mutex<HashMap<String, CancellationToken>>,
+    /// Last time a client read this session's event journal (V1b presence,
+    /// §10b): every `GET /events` refreshes it. A wake fires only when a
+    /// client is plausibly listening.
+    pub last_client_seen: Mutex<HashMap<String, Instant>>,
 }
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
@@ -201,7 +231,195 @@ impl DaemonState {
             event_seqs: Mutex::new(HashMap::new()),
             idempotency: Mutex::new(HashMap::new()),
             session_approvals: Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
             rebuild_complete: AtomicBool::new(false),
+            active_streams: Mutex::new(HashMap::new()),
+            wakes: Mutex::new(HashMap::new()),
+            last_client_seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a live SSE stream for a session (V1b): journaled agent
+    /// events are pushed to it while it lasts.
+    pub(crate) fn register_stream(&self, session_id: &str, tx: &mpsc::Sender<StreamEnvelope>) {
+        self.active_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .push(tx.clone());
+    }
+
+    /// Drop one stream registration (identity-matched, so a turn's teardown
+    /// cannot remove a newer turn's registration).
+    pub(crate) fn unregister_stream(&self, session_id: &str, tx: &mpsc::Sender<StreamEnvelope>) {
+        self.active_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .retain(|existing| !existing.same_channel(tx));
+    }
+
+    /// Push one journal event to every attached stream, best effort: the
+    /// journal is the source of truth; the push is a latency nicety and a
+    /// full/closed channel is harmless.
+    pub(crate) fn broadcast_event(&self, session_id: &str, env: &StreamEnvelope) {
+        let senders = self
+            .active_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        for tx in senders {
+            let _ = tx.try_send(env.clone());
+        }
+    }
+
+    /// Presence heartbeat (V1b): a client read this session's journal now.
+    pub(crate) fn touch_client_seen(&self, session_id: &str) {
+        self.last_client_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), Instant::now());
+    }
+
+    /// A client read the journal within `window` — plausibly an audience.
+    pub(crate) fn client_seen_fresh(&self, session_id: &str, window: Duration) -> bool {
+        self.last_client_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .is_some_and(|seen| seen.elapsed() < window)
+    }
+
+    /// Claim the idle-wake slot for a session. `None` when a wake is
+    /// already live — one at a time per session (plan §10b).
+    pub(crate) fn claim_wake(&self, session_id: &str) -> Option<CancellationToken> {
+        let token = CancellationToken::new();
+        let mut wakes = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        if wakes.contains_key(session_id) {
+            return None;
+        }
+        wakes.insert(session_id.to_string(), token.clone());
+        Some(token)
+    }
+
+    /// Steal (cancel) a session's idle wake — the user chat POST wins.
+    pub(crate) fn cancel_wake(&self, session_id: &str) -> Option<CancellationToken> {
+        let token = self
+            .wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id)?;
+        token.cancel();
+        Some(token)
+    }
+
+    /// Collect (and remove) still-pending child-agent approvals for a
+    /// session so cancel/shutdown paths can deny them. The counterpart of
+    /// `take_session_pendings`, which deliberately skips these.
+    pub(crate) fn take_agent_pendings(
+        &self,
+        session_id: Option<&str>,
+    ) -> Vec<tokio::sync::mpsc::Sender<ApprovalDecision>> {
+        let mut out = Vec::new();
+        self.pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, p| {
+                if p.agent_id.is_some() && session_id.is_none_or(|sid| p.session_id == sid) {
+                    out.push(p.response.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        out
+    }
+
+    /// Collect (and remove) the parent turn's still-pending approvals for a
+    /// session so the caller can deny them without holding the lock across
+    /// an await. Child-agent approvals (`agent_id` set, plan §12 V1b) are
+    /// skipped: a background child outlives the parent turn, and denying its
+    /// approval would strand a still-running child with no way to proceed.
+    pub(crate) fn take_session_pendings(
+        &self,
+        session_id: &str,
+    ) -> Vec<tokio::sync::mpsc::Sender<ApprovalDecision>> {
+        let mut out = Vec::new();
+        self.pending_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, p| {
+                if p.agent_id.is_none() && p.session_id == session_id {
+                    out.push(p.response.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        out
+    }
+
+    /// Lazily create (or return) the child-agent manager for a session.
+    /// Clones share one registry, so any handle sees every child. The
+    /// terminal-path journal hook (§15 V1a) closes over this state, making
+    /// a state → manager → hook cycle; `shutdown_agents` and
+    /// `remove_session_agents` take the managers out of the map, which
+    /// drops the hooks and breaks it — nothing leaks.
+    /// Phase 5's delegate tool is the first caller.
+    pub(crate) fn manager_for(self: &Arc<Self>, session_id: &str) -> AgentManager {
+        let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        agents
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                let state = Arc::clone(self);
+                let sid = session_id.to_string();
+                AgentManager::new(session_id).with_events(Arc::new(move |event| {
+                    journal_agent_event(&state, &sid, event);
+                }))
+            })
+            .clone()
+    }
+
+    /// Cancel + join a session's children, then drop its manager, so no
+    /// orphaned child task survives its session. `shutdown` marks the
+    /// manager closed, so stale clones cannot respawn into the dropped
+    /// registry. Session delete/reset hook — wired to those endpoints when
+    /// they land (Phase 5/6); until then it stays `dead_code`.
+    #[allow(dead_code)]
+    pub(crate) async fn remove_session_agents(&self, session_id: &str) {
+        // The children are about to be cancelled: deny their still-parked
+        // approvals so a blocked tool call wakes and unwinds instead of
+        // waiting on a prompt nobody will answer (§12 V1b timeout rule).
+        for sender in self.take_agent_pendings(Some(session_id)) {
+            let _ = sender.send(ApprovalDecision::Deny).await;
+        }
+        let manager = self
+            .agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        if let Some(manager) = manager {
+            manager.shutdown().await;
+        }
+    }
+
+    /// Cancel + join every session's children and drop all managers.
+    /// Daemon shutdown hook, wired to the ctrl-C exit path in `run_daemon`:
+    /// after this returns no child task is live and every manager is closed.
+    pub(crate) async fn shutdown_agents(&self) {
+        let managers: Vec<AgentManager> = {
+            let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *agents).into_values().collect()
+        };
+        for manager in managers {
+            manager.shutdown().await;
+        }
+        for sender in self.take_agent_pendings(None) {
+            let _ = sender.send(ApprovalDecision::Deny).await;
         }
     }
 
@@ -371,6 +589,77 @@ impl DaemonState {
     }
 }
 
+/// Journal one child lifecycle line (§15 V1a): a `System` event with the
+/// stable `[agent <name>:<id>]` prefix the TUI matches on. Called from the
+/// manager's terminal path — every ending (completed/failed/cancelled/
+/// timed out/panic) lands here at completion time, even while no turn is
+/// live, so a client's `?since=` poll picks it up without a turn.
+/// §15 V1a + V1b: journal one event per typed lifecycle event, fired from
+/// the manager's single choke points. Completions keep their V1a `System`
+/// line (old clients render it) and add the typed variant (new clients read
+/// fields); both are broadcast to any attached live stream so a TUI mid-turn
+/// sees child lifecycle live. A completion also schedules the idle wake
+/// turn (§10b V1b).
+fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentEvent) {
+    let path = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .map(|entry| entry.path.clone());
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(mut journal) = crate::session::Session::from_path(&path) else {
+        return;
+    };
+    let (typed, system_line) = match &event {
+        AgentEvent::Spawned { agent_id, name } => (
+            StreamEvent::AgentSpawned {
+                agent_id: agent_id.to_string(),
+                name: name.clone(),
+            },
+            None,
+        ),
+        AgentEvent::Progress {
+            agent_id,
+            current_tool,
+        } => (
+            StreamEvent::AgentProgress {
+                agent_id: agent_id.to_string(),
+                state: "running".to_string(),
+                current_tool: current_tool.clone(),
+            },
+            None,
+        ),
+        AgentEvent::Completed(notice) => (
+            StreamEvent::AgentCompleted {
+                agent_id: notice.agent_id.to_string(),
+                status: crate::agent::subagent::status_word(notice.status).to_string(),
+            },
+            Some(notice.text()),
+        ),
+    };
+    // The V1a line first, so a replay renders the transcript line before it
+    // consumes the typed variant.
+    if let Some(line) = system_line {
+        let seq = state.next_seq(session_id);
+        let env = StreamEnvelope {
+            seq,
+            event: StreamEvent::System(line),
+        };
+        let _ = journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+        state.broadcast_event(session_id, &env);
+    }
+    let seq = state.next_seq(session_id);
+    let env = StreamEnvelope { seq, event: typed };
+    let _ = journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+    state.broadcast_event(session_id, &env);
+    if matches!(event, AgentEvent::Completed(_)) {
+        crate::daemon::server::schedule_idle_wake(state.clone(), session_id.to_string());
+    }
+}
+
 /// Start the daemon HTTP server on an already-bound listener.
 pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     // MCP bootstrap: connects servers in the background and merges their
@@ -430,6 +719,22 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
     // before registration.
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+
+    // Headless exit path: ctrl-C stops serving, cancels + joins every
+    // session's children (§14: no orphaned tokio task survives this exit),
+    // then exits. A spawned watcher — not `with_graceful_shutdown` — so a
+    // still-connected SSE client cannot hold the process open while it
+    // drains; once children are joined nothing is lost by exiting hard.
+    {
+        let state_for_exit = state.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                state_for_exit.shutdown_agents().await;
+                std::process::exit(0);
+            }
+        });
+    }
+
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -438,6 +743,50 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::subagent::{
+        AgentDefinition, AgentResult, AgentState, ContextSeed, ProgressReporter, WaitOutcome,
+    };
+
+    fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
+        let mut def = crate::agent::subagent::builtin_definitions()
+            .into_iter()
+            .next()
+            .expect("built-in agents");
+        def.name = name.to_string();
+        let seed = ContextSeed {
+            task: "do the thing".to_string(),
+            file_hints: Vec::new(),
+            parent_summary: None,
+        };
+        (def, seed)
+    }
+
+    async fn done_body(
+        _token: CancellationToken,
+        _progress: ProgressReporter,
+        _id: crate::agent::subagent::AgentId,
+    ) -> AgentResult {
+        AgentResult {
+            status: AgentState::Completed,
+            summary: "done".to_string(),
+            error: None,
+            usage: None,
+        }
+    }
+
+    async fn cancel_body(
+        token: CancellationToken,
+        _progress: ProgressReporter,
+        _id: crate::agent::subagent::AgentId,
+    ) -> AgentResult {
+        token.cancelled().await;
+        AgentResult {
+            status: AgentState::Cancelled,
+            summary: String::new(),
+            error: Some("child saw cancel".to_string()),
+            usage: None,
+        }
+    }
 
     #[test]
     fn idempotency_key_replays_same_turn_and_rejects_different_request() {
@@ -464,6 +813,177 @@ mod tests {
         assert_eq!(state.next_seq("a"), 1);
         assert_eq!(state.next_seq("b"), 0);
         assert_eq!(state.next_seq("a"), 2);
+    }
+
+    #[test]
+    fn wake_slot_holds_one_wake_per_session_and_frees_on_cancel() {
+        // §10b V1b: one wake at a time — a second claim loses; the steal
+        // path frees the slot and cancels the loser's token.
+        let state = DaemonState::new();
+        let first = state.claim_wake("s").expect("first claim wins");
+        assert!(state.claim_wake("s").is_none(), "one at a time");
+        assert!(state.claim_wake("other").is_some(), "sessions are separate");
+        let stolen = state.cancel_wake("s").expect("steal finds the wake");
+        assert!(
+            stolen.is_cancelled(),
+            "a stolen wake must stop; the claim returns the same token"
+        );
+        assert!(first.is_cancelled(), "a stolen wake must stop");
+        assert!(state.cancel_wake("s").is_none(), "already removed");
+        assert!(state.claim_wake("s").is_some(), "slot freed");
+    }
+
+    #[test]
+    fn client_seen_presence_needs_a_recent_journal_read() {
+        // §10b V1b presence gate: no read → no audience; a read inside the
+        // window counts; a read older than the window does not.
+        let state = DaemonState::new();
+        assert!(!state.client_seen_fresh("s", std::time::Duration::from_secs(30)));
+        state.touch_client_seen("s");
+        assert!(state.client_seen_fresh("s", std::time::Duration::from_secs(30)));
+        assert!(!state.client_seen_fresh("s", std::time::Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn take_agent_pendings_takes_only_session_children() {
+        // The counterpart of `take_session_pendings`: parent approvals stay
+        // (their turn owns them); children leave so their parked prompts
+        // deny when the session goes away.
+        use crate::core::types::ApprovalDecision;
+        let state = DaemonState::new();
+        let (tx_parent, mut rx_parent) = tokio::sync::mpsc::channel(1);
+        let (tx_child, mut rx_child) = tokio::sync::mpsc::channel(1);
+        let (tx_other, mut rx_other) = tokio::sync::mpsc::channel(1);
+        {
+            let mut pending = state.pending_approvals.lock().unwrap();
+            pending.insert(
+                "p".into(),
+                PendingApproval {
+                    session_id: "s".into(),
+                    response: tx_parent,
+                    name: "write".into(),
+                    input: "{}".into(),
+                    agent_id: None,
+                    agent: None,
+                },
+            );
+            pending.insert(
+                "c".into(),
+                PendingApproval {
+                    session_id: "s".into(),
+                    response: tx_child,
+                    name: "bash".into(),
+                    input: "{}".into(),
+                    agent_id: Some("s-0".into()),
+                    agent: Some("tester".into()),
+                },
+            );
+            pending.insert(
+                "o".into(),
+                PendingApproval {
+                    session_id: "other".into(),
+                    response: tx_other,
+                    name: "bash".into(),
+                    input: "{}".into(),
+                    agent_id: Some("other-0".into()),
+                    agent: Some("tester".into()),
+                },
+            );
+        }
+
+        let taken = state.take_agent_pendings(Some("s"));
+        assert_eq!(taken.len(), 1, "only the session's child approval");
+        let _ = taken[0].send(ApprovalDecision::Deny).await;
+        assert_eq!(rx_child.try_recv().ok(), Some(ApprovalDecision::Deny));
+        {
+            let pending = state.pending_approvals.lock().unwrap();
+            assert!(pending.contains_key("p"), "parent approval is turn-owned");
+            assert!(pending.contains_key("o"), "other session untouched");
+        }
+        let all = state.take_agent_pendings(None);
+        assert_eq!(all.len(), 1, "shutdown sweeps the remaining child");
+        assert!(rx_parent.try_recv().is_err());
+        assert!(rx_other.try_recv().is_err());
+    }
+
+    #[test]
+    fn fresh_state_has_no_agent_managers() {
+        // Restart-empty: no child registries until first delegate.
+        let state = std::sync::Arc::new(DaemonState::new());
+        assert!(state
+            .agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manager_for_is_shared_per_session_and_isolated_across() {
+        let state = std::sync::Arc::new(DaemonState::new());
+        let (def, seed) = agent_test_parts("explorer");
+        // A child spawned through one handle is visible through another
+        // handle for the same session: clones share one registry.
+        let id = state
+            .manager_for("s1")
+            .spawn(&def, seed, done_body)
+            .unwrap();
+        match state
+            .manager_for("s1")
+            .wait(&id, std::time::Duration::from_secs(5))
+            .await
+        {
+            WaitOutcome::Finished(result) => assert_eq!(result.status, AgentState::Completed),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // Other sessions are isolated: unknown id, fresh counter.
+        assert_eq!(state.manager_for("s2").status(&id), None);
+        let (def2, seed2) = agent_test_parts("explorer");
+        let other = state
+            .manager_for("s2")
+            .spawn(&def2, seed2, done_body)
+            .unwrap();
+        assert_eq!(other.to_string(), "s2-0");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_session_agents_cancels_children_and_drops_manager() {
+        let state = std::sync::Arc::new(DaemonState::new());
+        let manager = state.manager_for("s1");
+        let (def, seed) = agent_test_parts("explorer");
+        let id = manager.spawn(&def, seed, cancel_body).unwrap();
+        assert_eq!(manager.active_count(), 1);
+        state.remove_session_agents("s1").await;
+        // The pre-removal handle still sees the reaped child (shared
+        // registry), now terminal through the Cancelled path.
+        match manager.wait(&id, std::time::Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Cancelled)
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert_eq!(manager.active_count(), 0);
+        // A fresh lookup starts empty; removing an unknown session is a no-op.
+        assert_eq!(state.manager_for("s1").active_count(), 0);
+        state.remove_session_agents("missing").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_agents_joins_every_session() {
+        let state = Arc::new(DaemonState::new());
+        let first = state.manager_for("s1");
+        let second = state.manager_for("s2");
+        let (def1, seed1) = agent_test_parts("explorer");
+        let (def2, seed2) = agent_test_parts("tester");
+        first.spawn(&def1, seed1, cancel_body).unwrap();
+        second.spawn(&def2, seed2, cancel_body).unwrap();
+        state.shutdown_agents().await;
+        assert_eq!(first.active_count(), 0);
+        assert_eq!(second.active_count(), 0);
+        assert!(state
+            .agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     #[test]

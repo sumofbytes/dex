@@ -143,6 +143,13 @@ pub(crate) enum ApprovalDecision {
 pub(crate) struct ApprovalRequest {
     pub name: String,
     pub input: String,
+    /// Set when the requester is a background child agent (plan §12 V1b):
+    /// children outlive the parent turn, so turn-end teardown must not deny
+    /// their parked approvals. `None` for the parent turn's own tools.
+    pub agent_id: Option<String>,
+    /// The child's definition name for the labeled prompt (V1b): rendered
+    /// as "explorer wants to run bash: …". `None` for the parent's own.
+    pub agent: Option<String>,
     pub response: tokio::sync::mpsc::Sender<ApprovalDecision>,
 }
 
@@ -286,12 +293,13 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
-/// Serialized straight onto the wire; borrows the request history instead of
-/// cloning it per call (`messages` can hold the whole compacted session).
+/// Serialized straight onto the wire; `messages` arrive wire-shaped (see
+/// [`crate::llm::protocol::chat_completions_messages`]) so dex-internal
+/// `ChatMessage` fields never reach a strict OpenAI-compatible endpoint.
 #[derive(Serialize)]
 pub(crate) struct ChatRequest<'a> {
     pub(crate) model: &'a str,
-    pub(crate) messages: &'a [ChatMessage],
+    pub(crate) messages: Vec<Value>,
     pub(crate) tools: Vec<ToolDefinition>,
     pub(crate) stream: bool,
     pub(crate) stream_options: StreamOptions,

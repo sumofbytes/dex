@@ -15,7 +15,7 @@ use crate::cli::{Args, Mode};
 use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::execute_sync as execute;
 
-use crate::agent::r#loop::process_turn;
+use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
 use crate::core::types::ChatMessage;
@@ -203,17 +203,20 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     }
     let mut state = ToolState::load();
     let console = crate::core::console::Console::none();
-    let result = crate::client::http::block_on(process_turn(
-        &config,
-        &mut messages,
-        &mut state,
-        None,
-        None,
-        session.as_mut(),
-        &config,
-        &crate::agent::state::GlobalCancellation,
-        &console,
-    ));
+    let result = crate::client::http::block_on(process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: session.as_mut(),
+        client: &config,
+        cancel: &crate::agent::state::GlobalCancellation,
+        console: &console,
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+    }));
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {
             "turn_complete"
@@ -332,6 +335,10 @@ fn main() {
     install_sigint_handler();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
+    // Delegation tools register only in daemon-backed processes (§10): a
+    // one-shot run has no manager to spawn into, so the tools stay out of
+    // its schema entirely. Dispatch rejects them there regardless (§11).
+    crate::agent::subagent::set_daemon_linked(matches!(mode, Mode::Serve { .. } | Mode::Default));
 
     match mode {
         Mode::Help => {

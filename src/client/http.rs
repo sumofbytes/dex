@@ -160,10 +160,7 @@ impl SseFramer {
         self.buf.extend_from_slice(bytes);
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            if let Some(env) = Self::parse_envelope(&String::from_utf8_lossy(&line)) {
-                self.last_seq = self.last_seq.max(env.seq);
-                self.pending.push_back(env.event);
-            }
+            self.ingest(&String::from_utf8_lossy(&line));
         }
     }
 
@@ -172,9 +169,30 @@ impl SseFramer {
         if !self.buf.is_empty() {
             let tail = String::from_utf8_lossy(&self.buf).into_owned();
             self.buf.clear();
-            if let Some(env) = Self::parse_envelope(&tail) {
+            self.ingest(&tail);
+        }
+    }
+
+    /// Wire-tolerant ingest (P10 + V1b fallback): a `data:` payload that
+    /// parses as an envelope is queued; one carrying a `seq` this client
+    /// does not have a variant for (older daemon, or a newer daemon's event
+    /// type) is skipped — but its `seq` still advances the cursor, so a
+    /// reconnect's replay never re-fetches the same range forever.
+    fn ingest(&mut self, line: &str) {
+        let Some(data) = Self::data_payload(line) else {
+            return;
+        };
+        match serde_json::from_str::<StreamEnvelope>(data) {
+            Ok(env) => {
                 self.last_seq = self.last_seq.max(env.seq);
                 self.pending.push_back(env.event);
+            }
+            Err(_) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(seq) = value.get("seq").and_then(|v| v.as_u64()) {
+                        self.last_seq = self.last_seq.max(seq);
+                    }
+                }
             }
         }
     }
@@ -182,8 +200,17 @@ impl SseFramer {
     /// Parse one raw SSE line into a full envelope (event + journal seq).
     /// Pure (no I/O, no runtime) so it is safe from any context and trivial
     /// to unit-test. Returns `None` for keep-alives (`ping`), blanks,
-    /// non-`data:` lines, and unparsable payloads.
+    /// non-`data:` lines, and unparsable payloads. Lenient consumers should
+    /// prefer [`SseFramer::ingest`], which keeps the cursor moving past
+    /// unknown event types.
     fn parse_envelope(line: &str) -> Option<StreamEnvelope> {
+        let data = Self::data_payload(line)?;
+        serde_json::from_str::<StreamEnvelope>(data).ok()
+    }
+
+    /// Strip the SSE framing: `None` for blanks, non-`data:` lines, and
+    /// keep-alives.
+    fn data_payload(line: &str) -> Option<&str> {
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
             return None;
@@ -192,7 +219,7 @@ impl SseFramer {
         if data.is_empty() || data == "ping" {
             return None;
         }
-        serde_json::from_str::<StreamEnvelope>(data).ok()
+        Some(data)
     }
 }
 
@@ -667,7 +694,10 @@ impl DaemonClient {
         block_on(self.reattach_async(session_id))
     }
 
-    /// Replay journaled stream events after `since` (P10).
+    /// Replay journaled stream events after `since` (P10). Lenient per row
+    /// (V1b fallback): an event type this client does not know is skipped
+    /// while `next_seq` still advances past it, so a replay never stalls on
+    /// a newer daemon's events.
     pub async fn events_async(
         &self,
         session_id: &str,
@@ -682,10 +712,22 @@ impl DaemonClient {
             .headers(self.api_headers())
             .send()
             .await?
-            .error_for_status()?
-            .json::<EventsResponse>()
-            .await?;
-        Ok(resp)
+            .error_for_status()?;
+        let text = resp.text().await?;
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        let next_seq = value
+            .get("next_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(since);
+        let mut events = Vec::new();
+        if let Some(rows) = value.get("events").and_then(|v| v.as_array()) {
+            for row in rows {
+                if let Ok(env) = serde_json::from_value::<StreamEnvelope>(row.clone()) {
+                    events.push(env);
+                }
+            }
+        }
+        Ok(EventsResponse { events, next_seq })
     }
 
     pub fn events(
@@ -1108,6 +1150,7 @@ mod tests {
                     request_id: "r1".to_string(),
                     name: "bash".to_string(),
                     input: "{}".to_string(),
+                    agent: None,
                 },
                 2
             ),
@@ -1173,6 +1216,7 @@ mod tests {
                     request_id: "r9".to_string(),
                     name: "bash".to_string(),
                     input: "{}".to_string(),
+                    agent: None,
                 },
                 2
             )
