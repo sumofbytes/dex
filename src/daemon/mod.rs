@@ -709,11 +709,11 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
 
     let app = server::router(state.clone());
 
-    let addr = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    println!("dex daemon listening on {addr}");
+    // Note: no startup announcement here. The headless `dex serve` caller
+    // prints one; the embedded (`dex` default) daemon shares the process
+    // with the TUI and must stay silent — anything printed before the
+    // alt-screen is entered lingers in scrollback after quit and reads as
+    // if a daemon were still listening.
 
     // tokio refuses blocking fds; the std listener must be non-blocking
     // before registration.

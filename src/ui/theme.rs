@@ -7,9 +7,11 @@
 //! background blended a step toward the foreground, so it keeps the theme's
 //! hue and always contrasts with text on it.
 
+use std::sync::{Mutex, OnceLock};
+
 use ratatui::style::Color;
 
-use crate::core::palette::{blend, fg_rgb, muted_rgb, term_palette};
+use crate::core::palette::{blend, faint_rgb, fg_rgb, muted_rgb, term_palette};
 
 /// Which side of the light/dark split the terminal background sits on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,6 +85,122 @@ pub(crate) fn muted_fg() -> Color {
     tool_muted_fg()
 }
 
+/// Foreground for hairline separator rules (sheet top rule): barely visible, far dimmer than readable muted text. Keeps the
+/// terminal's hue via the same foreground-toward-background blend.
+pub(crate) fn hairline_fg() -> Color {
+    match faint_rgb() {
+        Some((r, g, b)) => Color::Rgb(r, g, b),
+        None => Color::DarkGray,
+    }
+}
+
+/// One selectable user voice: the status-notice name plus the bright shade
+/// for dark terminals and the deep shade for light ones. Every accent entry
+/// steers clear of the claimed slots — Cyan chrome, LightGreen ok-states,
+/// Yellow warnings, Red errors; `plain` is the pre-voice original, the
+/// inherited foreground on both themes.
+struct Voice {
+    name: &'static str,
+    dark: Color,
+    light: Color,
+}
+
+const VOICES: &[Voice] = &[
+    Voice {
+        name: "magenta",
+        dark: Color::LightMagenta,
+        light: Color::Magenta,
+    },
+    Voice {
+        name: "sky",
+        dark: Color::LightBlue,
+        light: Color::Blue,
+    },
+    Voice {
+        name: "peach",
+        dark: Color::Rgb(255, 190, 130),
+        light: Color::Rgb(176, 92, 24),
+    },
+    Voice {
+        name: "violet",
+        dark: Color::Rgb(200, 160, 255),
+        light: Color::Rgb(110, 60, 180),
+    },
+    Voice {
+        name: "rose",
+        dark: Color::Rgb(255, 150, 180),
+        light: Color::Rgb(190, 45, 95),
+    },
+    Voice {
+        name: "amber",
+        dark: Color::Rgb(255, 195, 85),
+        light: Color::Rgb(150, 95, 5),
+    },
+    Voice {
+        name: "coral",
+        dark: Color::Rgb(255, 140, 115),
+        light: Color::Rgb(185, 65, 40),
+    },
+    Voice {
+        name: "plain",
+        dark: Color::Reset,
+        light: Color::Reset,
+    },
+];
+
+/// Default voice index: `plain`, the pre-voice inherited foreground.
+/// A lookup (not a literal) so reordering [`VOICES`] can't silently change
+/// the default. The first `Alt+V` press steps into magenta.
+fn default_voice() -> usize {
+    VOICES
+        .iter()
+        .position(|voice| voice.name == "plain")
+        .unwrap_or(0)
+}
+
+/// Active voice index into [`VOICES`]. The event loop is single-threaded,
+/// so a plain mutex around the slot is plenty.
+static VOICE: OnceLock<Mutex<usize>> = OnceLock::new();
+
+fn voice_idx() -> usize {
+    VOICE
+        .get_or_init(|| Mutex::new(default_voice()))
+        .lock()
+        .map(|slot| *slot)
+        .unwrap_or(default_voice())
+        % VOICES.len()
+}
+
+/// Advance to the next voice, returning its name for the status-bar notice.
+/// The composer and newly submitted prompts pick it up via [`user_fg`];
+/// already-submitted rows keep the voice they were sent in.
+pub(crate) fn cycle_voice() -> &'static str {
+    let mut slot = VOICE
+        .get_or_init(|| Mutex::new(default_voice()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = (*slot + 1) % VOICES.len();
+    VOICES[*slot].name
+}
+
+/// Signature color for the user's own words, in the composer and in
+/// submitted prompts: a rotatable voice, plain (the inherited foreground)
+/// by default and instantly separable from the assistant once rotated.
+/// Accent hues can't be derived from the queried
+/// palette, so each shade is picked per background — bright on dark
+/// terminals, deep on light ones — and inherits the default foreground when
+/// the theme is unknown rather than risk an unreadable pick. `Alt+V` cycles
+/// the voice — magenta → sky → peach → violet → rose → amber → coral →
+/// plain — and the default is `plain`, the inherited foreground.
+pub(crate) fn user_fg() -> Color {
+    let voice = &VOICES[voice_idx()];
+    match background() {
+        Background::Dark => voice.dark,
+        Background::Light => voice.light,
+        Background::Unknown => Color::Reset,
+    }
+}
+
 /// Core readable color for secondary tool text (args + previews).
 /// Derived from the terminal's actual foreground blended toward its
 /// background so it keeps the theme's hue and contrasts on both light
@@ -150,5 +268,88 @@ mod tests {
             assert_eq!(surface_fg(), Color::Reset);
             assert_eq!(surface_bg(), Color::Reset);
         }
+    }
+
+    static VOICE_SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn user_voice_matches_background() {
+        // The default voice is `plain`: the inherited foreground on every
+        // theme — never an unreadable pick.
+        let _guard = VOICE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *VOICE
+            .get_or_init(|| Mutex::new(default_voice()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = default_voice();
+        assert_eq!(user_fg(), Color::Reset);
+    }
+
+    #[test]
+    fn default_voice_is_plain() {
+        // Out of the box the user's words inherit the terminal foreground;
+        // the first `Alt+V` press steps into magenta.
+        let _guard = VOICE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let mut slot = VOICE
+                .get_or_init(|| Mutex::new(default_voice()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = default_voice();
+        }
+        assert_eq!(VOICES[voice_idx()].name, "plain");
+        assert_eq!(user_fg(), Color::Reset);
+        assert_eq!(cycle_voice(), "magenta");
+        *VOICE
+            .get_or_init(|| Mutex::new(default_voice()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = default_voice();
+    }
+
+    #[test]
+    fn voices_have_distinct_names_and_theme_shades() {
+        let mut names: Vec<_> = VOICES.iter().map(|voice| voice.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            VOICES.len(),
+            "each voice needs a distinct status-notice name"
+        );
+        for voice in VOICES {
+            assert!(!voice.name.is_empty());
+            if voice.name == "plain" {
+                // The pre-voice original: inherited foreground on both themes.
+                assert_eq!(voice.dark, Color::Reset);
+                assert_eq!(voice.light, Color::Reset);
+            } else {
+                assert_ne!(
+                    voice.dark, voice.light,
+                    "voice {} needs distinct dark/light shades",
+                    voice.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn voice_rotation_wraps_around() {
+        let _guard = VOICE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let start = voice_idx();
+        let start_fg = user_fg();
+        for _ in 0..VOICES.len() {
+            let name = cycle_voice();
+            assert!(
+                VOICES.iter().any(|voice| voice.name == name),
+                "cycle_voice returned an unknown voice: {name}"
+            );
+        }
+        assert_eq!(voice_idx(), start, "a full rotation must restore the voice");
+        assert_eq!(user_fg(), start_fg);
     }
 }

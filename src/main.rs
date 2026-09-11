@@ -373,6 +373,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            println!(
+                "dex daemon listening on {}",
+                listener.local_addr().unwrap_or(addr)
+            );
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             rt.block_on(async {
                 if let Err(e) = daemon::run_daemon(listener).await {
