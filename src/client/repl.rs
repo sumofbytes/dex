@@ -60,7 +60,14 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
                 eprintln!("      {line}");
             }
         }
-        StreamEvent::ApprovalRequired { name, input, .. } => {
+        StreamEvent::ApprovalRequired {
+            name, input, agent, ..
+        } => {
+            // A child agent's request is labeled (V1b); the CLI still
+            // answers it like any other parked approval.
+            if let Some(agent) = agent {
+                eprintln!("  [{agent}] requests {name}");
+            }
             return Some(prompt_for_approval(&name, &input));
         }
         StreamEvent::TurnFailed { error } => {
@@ -80,6 +87,23 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
         }
         StreamEvent::FollowupAccepted { content } => {
             eprintln!("[follow-up] {content}");
+        }
+        // Child-agent lifecycle (V1b): one line per transition, mirroring
+        // the V1a System lines without parsing text.
+        StreamEvent::AgentSpawned { agent_id, name } => {
+            eprintln!("[agent {name}:{agent_id}] started");
+        }
+        StreamEvent::AgentProgress {
+            agent_id,
+            current_tool,
+            ..
+        } => {
+            if let Some(tool) = current_tool {
+                eprintln!("[agent …:{agent_id}] running {tool} …");
+            }
+        }
+        StreamEvent::AgentCompleted { agent_id, status } => {
+            eprintln!("[agent …:{agent_id}] {status}");
         }
     }
     None
