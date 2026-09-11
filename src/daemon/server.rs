@@ -4162,6 +4162,15 @@ mod e2e_tests {
 
         std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
         crate::daemon::prepare_daemon_token(&"127.0.0.1:9".parse().unwrap());
+        // Reset the pinned token even when an assertion panics: the global is
+        // process-wide and would 401 every later daemon test in the binary.
+        struct TokenReset;
+        impl Drop for TokenReset {
+            fn drop(&mut self) {
+                crate::daemon::reset_daemon_token_for_tests();
+            }
+        }
+        let _token_reset = TokenReset;
         assert_eq!(
             required_token().as_deref(),
             Some("s3cret-token"),
@@ -4217,9 +4226,10 @@ mod e2e_tests {
         let info: serde_json::Value = resp.json().await.unwrap();
         assert!(info.get("provider").is_some());
 
-        // Restore the process-global token for the other tests.
-        crate::daemon::reset_daemon_token_for_tests();
-        std::env::set_var("DEX_LOG", "warn");
+        // Restore the log subscriber from the original env (the token global
+        // is reset by the drop guard above; the env guard restores the
+        // variables it pinned).
+        drop(_env);
         crate::core::logging::init();
         let _ = std::fs::remove_dir_all(&data_dir);
     }
