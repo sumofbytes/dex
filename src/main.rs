@@ -10,6 +10,7 @@ mod session;
 mod skills;
 mod tools;
 mod ui;
+mod update;
 
 use crate::cli::{Args, Mode};
 use crate::session::{load_llm_messages_from_session, Session};
@@ -317,7 +318,7 @@ fn print_help() {
         run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
         doctor                    show resolved provider/model config + origins\n  \
         mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
-        update --models           refresh model catalog\n  \
+        update [--models|--all]   update dex itself; --models refreshes the model catalog\n  \
         --tool                    raw JSON tool mode (stdin)\n\
         \n\
         Options:\n  \
@@ -416,15 +417,23 @@ fn main() {
                 )
             );
         }
-        Mode::Update { models } => {
-            if models {
+        Mode::Update { models, all } => {
+            // Bare `dex update` self-updates the binary; `--models` keeps the
+            // old catalog refresh; `--all` does both.
+            if all || !models {
+                match crate::update::self_update() {
+                    Ok(message) => println!("{message}"),
+                    Err(e) => {
+                        eprintln!("self-update failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if models || all {
                 if let Err(e) = crate::llm::config::refresh_models_cache() {
                     eprintln!("update --models failed: {e}");
                     std::process::exit(1);
                 }
-            } else {
-                eprintln!("usage: dex update --models");
-                std::process::exit(1);
             }
         }
         Mode::Default => {
