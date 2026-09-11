@@ -377,13 +377,39 @@ pub(crate) fn highlight_code_block(lang: &str, code: &str) -> Option<Vec<Vec<Spa
     highlight::fallback_code_block(lang, code)
 }
 
-/// Transcript `▸ tool arg` row. Bash commands highlight via the compiled
-/// bash grammar (keywords/strings/flags read apart instead of one dim
-/// blob); every other tool keeps the dim arg. Unknown/unhighlightable bash
-/// falls back to dim, so this never regresses.
+/// Per-tool glyph heading the transcript input row — `$ bash git status` —
+/// standing in for the generic `▸`. Each reads like the tool's own notation:
+/// shell `$`, vim-style search `/`, diff `±` for edit, branch for git.
+/// Bold, like the composer prompt glyph, so it reads as an affordance rather
+/// than content. Unknown tools (and the replay fallback row) keep the generic `▸`.
+fn tool_glyph(name: &str) -> &'static str {
+    match name {
+        "bash" => "$",
+        "read" => "¶",
+        "write" => "✎",
+        "edit" => "±",
+        "grep" | "ffgrep" | "find" | "fffind" => "/",
+        "ls" => "☰",
+        "git" => "⎇",
+        "chain" => "→",
+        name if name.starts_with("mcp__") => "⇄",
+        _ => "▸",
+    }
+}
+
+/// Transcript `▸ tool arg` row, headed by the tool's own glyph (`$ bash …`).
+/// Bash commands highlight via the compiled bash grammar (keywords/strings/
+/// flags read apart instead of one dim blob); every other tool keeps the dim
+/// arg. Unknown/unhighlightable bash falls back to dim, so this never
+/// regresses.
 pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
     let mut spans = vec![
-        Span::styled("▸ ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{} ", tool_glyph(name)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
     ];
     // Single-line commands only: highlight_code_block splits per row and
@@ -3686,17 +3712,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_glyphs_head_the_input_row() {
+        // Every known tool heads its row with its own glyph; unknown tools
+        // keep the generic `▸`.
+        let text = |name: &str, arg: &str| -> String {
+            render_tool_input(name, arg)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim_start()
+                .to_string()
+        };
+        assert!(text("bash", "ls -la").starts_with("$ bash ls -la"));
+        assert!(text("read", "a.rs").starts_with("¶ read a.rs"));
+        assert!(text("write", "a.rs").starts_with("✎ write a.rs"));
+        assert!(text("edit", "a.rs").starts_with("± edit a.rs"));
+        assert!(text("grep", "pat").starts_with("/ grep pat"));
+        assert!(text("fffind", "*.rs").starts_with("/ fffind *.rs"));
+        assert!(text("ls", ".").starts_with("☰ ls ."));
+        assert!(text("git", "status").starts_with("⎇ git status"));
+        assert!(text("chain", "2 steps").starts_with("→ chain 2 steps"));
+        assert!(text("mcp__srv__t", "{}").starts_with("⇄ mcp__srv__t"));
+        assert!(text("mystery", "x").starts_with("▸ mystery x"));
+    }
+
+    #[test]
     fn bash_tool_input_highlights_while_other_tools_stay_dim() {
         // A bash command with a string + comment must split into styled spans
-        // past the `\u25b8 bash ` prefix; a plain tool arg stays one dim span.
+        // past the `$ bash ` prefix; a plain tool arg stays one dim span.
         let line = render_tool_input("bash", "echo \"hi\" # done");
-        // indent + `\u25b8 ` + name + ` ` + highlighted code spans.
+        // indent + glyph + name + ` ` + highlighted code spans.
         assert!(line.spans.len() > 4, "bash should highlight: {line:?}");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("echo"), "{text}");
 
         let line = render_tool_input("read", "src/main.rs:1-20");
-        // indent + `\u25b8 ` + name + dim arg: no highlight split.
+        // indent + glyph + name + dim arg: no highlight split.
         assert_eq!(line.spans.len(), 4, "{line:?}");
 
         // Multi-line bash keeps the full dim arg (highlighting splits per
