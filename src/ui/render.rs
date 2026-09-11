@@ -1226,7 +1226,7 @@ impl ComposerView {
         // No raised surface: the composer is a plain prompt line on the
         // terminal background; the `▶` prompt glyph marks it (busy state dims
         // text and glyph together).
-        let input_style = if app.busy || app.pending_approval.is_some() {
+        let input_style = if app.busy || !app.pending_approvals.is_empty() {
             Style::default().fg(theme::muted_fg())
         } else {
             Style::default().fg(theme::surface_fg())
@@ -1245,7 +1245,7 @@ impl ComposerView {
         // including while the agent works, since typing + Enter queues a
         // steering message. The dim busy style signals the state; only the
         // approval modal (which consumes keys) hides the cursor.
-        if app.pending_approval.is_none() {
+        if app.pending_approvals.is_empty() {
             let cur_y = cursor.2.saturating_sub(scroll);
             f.set_cursor_position((inner.x + cursor.1, inner.y + cur_y));
         }
@@ -1461,9 +1461,16 @@ struct ApprovalOverlay;
 
 impl ApprovalOverlay {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
-        let Some(approval) = app.pending_approval.as_ref() else {
+        let Some(approval) = app.pending_approvals.first() else {
             return;
         };
+        // V1b: child agents label their prompts and can queue several.
+        let extra = app.pending_approvals.len().saturating_sub(1);
+        let agent_prefix = approval
+            .agent
+            .as_deref()
+            .map(|agent| format!("{agent} wants to "))
+            .unwrap_or_default();
         // — centered modal, clean readable command —
         let details = crate::core::format::approval_details(&approval.name, &approval.input);
         let title = crate::core::format::approval_title(&approval.name);
@@ -1540,13 +1547,24 @@ impl ApprovalOverlay {
             Paragraph::new(vec![header_line, sub]).wrap(Wrap { trim: false }),
             chunks[0],
         );
+        let wants = format!("The {agent_prefix}agent wants to run:");
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "The agent wants to run:",
+                wants,
                 Style::default().fg(theme::muted_fg()),
             ))),
             chunks[1],
         );
+        // Queued behind this one (V1b): child agents can park several.
+        if extra > 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("+{extra} more approval(s) waiting"),
+                    Style::default().fg(Color::Yellow),
+                ))),
+                chunks[5],
+            );
+        }
         let detail_lines: Vec<Line> = details
             .iter()
             .map(|d| render_approval_detail(&approval.name, d))
@@ -1624,7 +1642,7 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let (input_lines, input_cursor) = render_input(
         &app.input,
         input_content_width(area.width),
-        app.busy || app.pending_approval.is_some(),
+        app.busy || !app.pending_approvals.is_empty(),
     );
     let input_rows = input_lines.len() as u16;
     // The busy "● Working" status lives in the transcript (turn-activity
@@ -1637,7 +1655,7 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
 
     TranscriptView::render(f, layout.transcript, app);
     BottomPane::render(f, &layout, app, input_lines, input_cursor);
-    if app.pending_approval.is_some() {
+    if !app.pending_approvals.is_empty() {
         ApprovalOverlay::render(f, area, app);
     }
     SlashSuggestionsView::render(f, layout.input, app);
@@ -1905,7 +1923,8 @@ mod tests {
             cancel_requested: false,
             cancel_presses: 0,
             approval_rx: None,
-            pending_approval: None,
+            pending_approvals: Vec::new(),
+            agents: Vec::new(),
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -2796,12 +2815,14 @@ mod tests {
         // plus the human title, not the raw `bash cargo test` dump.
         let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
         let mut app = test_app();
-        app.pending_approval = Some(super::super::PendingApproval {
+        app.pending_approvals = vec![super::super::PendingApproval {
             name: "bash".to_string(),
             input: r#"{"command":"cargo test"}"#.to_string(),
             response: response_tx,
             selected: 1,
-        });
+            request_id: "req-1".to_string(),
+            agent: None,
+        }];
         let backend = TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
@@ -2840,12 +2861,14 @@ mod tests {
         // Second check: write tool formats path/lines, not raw JSON
         let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
         let mut app2 = test_app();
-        app2.pending_approval = Some(super::super::PendingApproval {
+        app2.pending_approvals = vec![super::super::PendingApproval {
             name: "write".to_string(),
             input: r#"{"path":"src/main.rs","content":"hello\nworld\n"}"#.to_string(),
             response: tx2,
             selected: 0,
-        });
+            request_id: "req-2".to_string(),
+            agent: Some("explorer".to_string()),
+        }];
         let backend2 = TestBackend::new(80, 24);
         let mut term2 = ratatui::Terminal::new(backend2).expect("test terminal");
         term2.draw(|f| view(f, &mut app2)).expect("render");

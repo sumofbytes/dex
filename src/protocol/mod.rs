@@ -26,6 +26,14 @@ pub struct SessionInfo {
     pub created_at: String,
     #[serde(default)]
     pub message_count: usize,
+    /// Child-agent runs recorded under this session (§16); `0` from older
+    /// daemons that don't report them.
+    #[serde(default)]
+    pub child_agents: usize,
+    /// Child runs whose last turn marker is an unterminated `turn_start`
+    /// (crashed or daemon-restart-killed children).
+    #[serde(default)]
+    pub interrupted_children: usize,
 }
 
 /// Request to run a shell command directly (`!`/`!!` prefix in the TUI),
@@ -163,12 +171,18 @@ pub enum StreamEvent {
         duration: f64,
     },
 
-    /// The agent needs user approval for a tool.
+    /// The agent needs user approval for a tool. `agent` is set (V1b, plan
+    /// §12) when the requester is a background child agent: the prompt
+    /// renders labeled ("explorer wants to run bash: …") and stays
+    /// answerable after the parent turn ends. Optional with a serde default
+    /// so older clients/datasets parse unchanged.
     #[serde(rename = "approval_required")]
     ApprovalRequired {
         request_id: String,
         name: String,
         input: String,
+        #[serde(default)]
+        agent: Option<String>,
     },
 
     /// The turn completed successfully. `usage` is the daemon-reported prompt
@@ -240,6 +254,28 @@ pub enum StreamEvent {
     /// Follow-up message was accepted and queued for the next chained turn.
     #[serde(rename = "followup_accepted")]
     FollowupAccepted { content: String },
+
+    /// V1b typed child-agent lifecycle (plan §15): first-class variants so a
+    /// consumer reads typed fields instead of parsing the V1a `System`
+    /// prefix. An explicit wire bump — the shipped client skips unknown
+    /// types but still advances its seq cursor, so replay never stalls;
+    /// the V1a `System` lines stay journaled beside them for old clients.
+    #[serde(rename = "agent_spawned")]
+    AgentSpawned { agent_id: String, name: String },
+
+    /// The child's state advanced: which tool it is running now (§15).
+    #[serde(rename = "agent_progress")]
+    AgentProgress {
+        agent_id: String,
+        state: String,
+        #[serde(default)]
+        current_tool: Option<String>,
+    },
+
+    /// A child reached a terminal state (§15): status is the same word the
+    /// V1a lifecycle line uses ("completed"/"failed"/"cancelled"/"timed out").
+    #[serde(rename = "agent_completed")]
+    AgentCompleted { agent_id: String, status: String },
 }
 
 /// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session

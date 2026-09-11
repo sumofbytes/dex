@@ -274,6 +274,28 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     pieces
 }
 
+/// Live child agents (V1b typed events): `agents: explorer·bash, tester`.
+/// The typed `AgentSpawned/Progress/Completed` events keep this current
+/// without parsing the V1a transcript lines.
+fn agents_pieces(app: &App) -> Vec<Piece> {
+    if app.agents.is_empty() {
+        return Vec::new();
+    }
+    let text = app
+        .agents
+        .iter()
+        .map(|agent| match &agent.tool {
+            Some(tool) => format!("{}·{}", agent.name, tool),
+            None => agent.name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        sep(),
+        (format!("agents: {text}"), Style::default().fg(Color::Green)),
+    ]
+}
+
 pub(super) fn ui_status(app: &App) -> String {
     status_pieces(app, true)
         .into_iter()
@@ -292,6 +314,7 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
     }
     push_sep(&mut pieces);
     pieces.push(quiet(app.config.model.clone()));
+    pieces.extend(agents_pieces(app));
     push_cost(&mut pieces, app);
     pieces
 }
