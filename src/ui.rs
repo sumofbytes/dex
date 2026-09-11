@@ -1017,8 +1017,8 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             preview,
             duration,
         } => {
-            // The ▸ line above already names the tool; the └ line leads with
-            // the outcome (glyph + summary) and trails timing in dim.
+            // The glyph line above already names the tool; the └ line leads
+            // with the outcome (glyph + summary) and trails timing in dim.
             let failed = !success;
             let color = if failed {
                 Color::LightRed
