@@ -30,7 +30,14 @@ pub(crate) use render::view;
 use input::InputField;
 
 const VERTICAL_GUTTER: u16 = 1;
-const HORIZONTAL_GUTTER: u16 = 1;
+/// Left/right air shared by every full-width surface (composer, footer,
+/// queue strip, slash popup) and the transcript's leading indent, so rendered
+/// transcript text and the composer's text column always start on the same
+/// cell. The composer's surface band is painted across the whole row (flush to
+/// the window edge), so this is the box's *inside* padding — there is no
+/// separate outer margin to shrink. Tuning it moves the composer cursor and
+/// the transcript indent together, which is what keeps them aligned.
+const HORIZONTAL_GUTTER: u16 = 2;
 const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
 const INPUT_BORDER_ROWS: u16 = 0;
 const INPUT_PAD_Y: u16 = 1;
@@ -1665,7 +1672,11 @@ mod tests {
         ];
         for (line, row) in lines.iter().zip(art) {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert_eq!(text, format!(" {row}"), "indent + art row, in order");
+            assert_eq!(
+                text,
+                format!("{}{row}", transcript_indent()),
+                "indent + art row, in order"
+            );
         }
         // Art rows carry the info color (the indent span is unstyled).
         assert!(lines.iter().all(|l| l
@@ -2083,7 +2094,7 @@ mod tests {
     fn indent_transcript_line_adds_gutter() {
         let line = Line::from("test");
         let indented = indent_transcript_line(line);
-        assert!(indented.spans[0].content.as_ref() == " ");
+        assert_eq!(indented.spans[0].content.as_ref(), transcript_indent());
     }
 
     #[test]
