@@ -288,6 +288,23 @@ so this is a manual refresh, not a required step.
 dex update --models
 ```
 
+### Self-update
+
+Bare `dex update` replaces the running binary with the latest release
+(`--all` also refreshes the model catalog). It resolves the latest version
+via the `/releases/latest` redirect, verifies the download against the
+release's `SHA256SUMS`, and atomically renames the new binary over the
+running one, so a crash mid-update can never leave a torn install. It
+refuses (with a pointer at the right command) when the binary was built
+from source, installed via `cargo install`, or is a Windows build. It honors
+the same `DEX_REPO` and `DEX_VERSION` envs as `scripts/install.sh`:
+
+```sh
+dex update                     # latest release
+DEX_VERSION=v0.4.0 dex update  # pin (or downgrade to) a release
+dex update --all               # self-update + refresh the model catalog
+```
+
 ### Client–server mode
 
 The TUI is a pure HTTP client; all agent work (LLM calls, tools, sessions)
@@ -360,7 +377,7 @@ Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`,
 or `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
-`connect`, `run`, `update --models`, `mcp`, `doctor`) are covered under
+`connect`, `run`, `update`, `mcp`, `doctor`) are covered under
 Usage / MCP servers above; `--help`/`-h` and `--version`/`-V` print help
 and version without touching config or network.
 
