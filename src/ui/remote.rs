@@ -153,7 +153,10 @@ fn spawn_events_poller(
     crate::client::http::spawn_task(async move {
         // Seed the cursor from the daemon's journal so rows rendered by the
         // initial replay (or by a local JSONL rebuild) are never re-fetched.
-        if let Ok(resp) = client.reattach(&session_id) {
+        // Async form: this task runs on the shared runtime, and the sync
+        // wrapper's `block_on` would panic ("cannot start a runtime from
+        // within a runtime") on a worker thread.
+        if let Ok(resp) = client.reattach_async(&session_id).await {
             cursor.fetch_max(resp.seq, Ordering::SeqCst);
         }
         loop {
