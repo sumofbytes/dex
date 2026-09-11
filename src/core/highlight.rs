@@ -58,6 +58,18 @@ pub(crate) fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
         .clone()
 }
 
+/// Shared highlighter segments, sorted and stripped of `BOLD`: the crate's
+/// default theme bolds keywords, which fills code-heavy screens — code
+/// tokens keep color only (bold is markdown emphasis, not chrome).
+pub(crate) fn highlight_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
+    let mut segs = shared_highlighter().highlight(lang, code);
+    segs.sort_by_key(|s| (s.start, s.end));
+    for seg in &mut segs {
+        seg.style = seg.style.remove_modifier(Modifier::BOLD);
+    }
+    segs
+}
+
 /// Highlight a snippet to an ANSI-escaped string in ONE tree-sitter pass.
 /// Returns `None` when the language is unknown or yields nothing — callers
 /// try the generic lexer next, then dim.
@@ -65,11 +77,10 @@ pub(crate) fn highlight_ansi(lang: &str, code: &str) -> Option<String> {
     if lang.is_empty() || code.is_empty() {
         return None;
     }
-    let mut segs = shared_highlighter().highlight(lang, code);
+    let segs = highlight_segments(lang, code);
     if segs.is_empty() {
         return None;
     }
-    segs.sort_by_key(|s| (s.start, s.end));
     Some(ansi_from_segments(code, &segs))
 }
 
@@ -215,9 +226,10 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
     }
     let lang = fallback_key(lang);
     let colors = code_colors();
-    let kw = Style::default()
-        .fg(colors.keyword)
-        .add_modifier(Modifier::BOLD);
+    // Color only: bold is reserved for authored/structural emphasis
+    // (headings, `**bold**`), not code chrome — unstyled keyword weight
+    // keeps fences from filling the screen.
+    let kw = Style::default().fg(colors.keyword);
     let string = Style::default().fg(colors.string);
     let number = Style::default().fg(colors.number);
     let comment = Style::default()
@@ -1016,14 +1028,16 @@ mod tests {
         let out = highlight_ansi("rust", code).expect("rust must highlight");
         // No bytes lost or reordered; styles are annotations only.
         assert_eq!(strip_sgr(&out), code);
-        // Keyword (`fn`, bold) and comment (italic) carry SGR runs.
+        // Keyword (`fn`) and comment (italic) carry SGR runs; the keyword
+        // is colored but never bold (bold is markdown emphasis, not chrome).
         assert!(out.contains("\x1b["), "no SGR emitted: {out:?}");
-        let bold = out.split("fn").next().expect("keyword must survive");
+        assert!(out.contains("\x1b[3"), "comment not italic: {out:?}");
+        let kw = out.split("fn").next().expect("keyword must survive");
         assert!(
-            bold.rsplit("\x1b[")
+            kw.rsplit("\x1b[")
                 .next()
-                .is_some_and(|sgr| sgr.starts_with('1')),
-            "keyword not bold: {out:?}"
+                .is_some_and(|sgr| !sgr.is_empty() && !sgr.starts_with('1')),
+            "keyword bold or unstyled: {out:?}"
         );
     }
 
