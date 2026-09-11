@@ -42,8 +42,9 @@ pub(crate) enum Mode {
     RunTool { name: String, args: Vec<String> },
     /// Print the resolved provider/model config and each value's origin.
     Doctor,
-    /// Refresh the model catalog (`dex update --models`).
-    Update { models: bool },
+    /// Update the dex binary itself (bare `dex update`), refresh the model
+    /// catalog (`--models`), or both (`--all`).
+    Update { models: bool, all: bool },
     /// Print usage (`dex --help`/`-h`) without touching config, network, or LLM.
     Help,
     /// Print version (`dex --version`/`-V`).
@@ -129,8 +130,9 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
     }
     match args.rest.first().map(|s| s.as_str()) {
         Some("update") => {
-            let models = args.rest.iter().any(|a| a == "--models" || a == "--all");
-            Mode::Update { models }
+            let models = args.rest.iter().any(|a| a == "--models");
+            let all = args.rest.iter().any(|a| a == "--all");
+            Mode::Update { models, all }
         }
         Some("doctor") => Mode::Doctor,
         Some("serve") => {
@@ -275,6 +277,32 @@ mod tests {
             resolve_mode(&args_with_rest(&["explain", "--help"])),
             Mode::OneShot { .. }
         ));
+    }
+
+    #[test]
+    fn update_mode_flags() {
+        // Bare `update` is self-update; `--models` is catalog only; `--all` both.
+        assert_eq!(
+            resolve_mode(&args_with_rest(&["update"])),
+            Mode::Update {
+                models: false,
+                all: false
+            }
+        );
+        assert_eq!(
+            resolve_mode(&args_with_rest(&["update", "--models"])),
+            Mode::Update {
+                models: true,
+                all: false
+            }
+        );
+        assert_eq!(
+            resolve_mode(&args_with_rest(&["update", "--all"])),
+            Mode::Update {
+                models: false,
+                all: true
+            }
+        );
     }
 
     #[test]
