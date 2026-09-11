@@ -1319,12 +1319,14 @@ impl SlashSuggestionsView {
         // fill, so nothing extra to strip. The `> ` marker plus the
         // default fg (vs cyan) is the only selection indicator (skip the
         // 2-wide marker gutter when copying a command, as with any picker
-        // affordance).
-        let height = (visible as u16 + 2).min(area.y);
-        if height < 3 {
+        // affordance). One blank gutter row sits between the header text
+        // and the first command so the list breathes instead of butting the
+        // header.
+        let height = (visible as u16 + 3).min(area.y);
+        if height < 4 {
             return;
         }
-        visible = visible.min(height.saturating_sub(2) as usize);
+        visible = visible.min(height.saturating_sub(3) as usize);
         if visible == 0 {
             return;
         }
@@ -1418,6 +1420,8 @@ impl SlashSuggestionsView {
         // Single `─` rule across the top is the sheet's only border: it
         // separates the popup from the transcript without side/corner
         // glyphs, and a stray leading `────` line is the only copy artifact.
+        // The row at `popup.y + 2` stays cleared (blank gutter) so the first
+        // command at `+ 3` doesn't butt the header text at `+ 1`.
         f.render_widget(Clear, popup);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1447,7 +1451,7 @@ impl SlashSuggestionsView {
             List::new(items),
             Rect {
                 x: popup.x,
-                y: popup.y + 2,
+                y: popup.y + 3,
                 width: popup.width,
                 height: visible as u16,
             },
@@ -2768,6 +2772,37 @@ mod tests {
             }
         }
         assert!(rows.iter().any(|r| r.contains("> ")), "{rows:?}");
+    }
+
+    #[test]
+    fn slash_popup_header_has_gutter_below_header() {
+        // One blank gutter row sits between the header text and the first
+        // command so the list doesn't butt the header; the header itself
+        // stays directly under the top `─` rule (original top gap).
+        let mut app = test_app();
+        app.input = InputField::from_text("/");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                SlashSuggestionsView::render(frame, Rect::new(0, 21, 80, 3), &mut app);
+            })
+            .expect("render should succeed");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let rule = rows.iter().position(|r| r.contains('─')).expect("top rule");
+        let header = rows
+            .iter()
+            .position(|r| r.contains("Slash commands"))
+            .expect("header text");
+        assert_eq!(header, rule + 1, "header directly under the top rule");
+        assert!(
+            rows[rule + 2].trim().is_empty(),
+            "gutter row must be blank: {:?}",
+            rows[rule + 2]
+        );
     }
 
     #[test]
