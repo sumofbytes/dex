@@ -1737,10 +1737,11 @@ pub(super) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
         whitespace: bool,
     }
 
-    let mut graphemes = line.styled_graphemes(Style::default());
-    if output_indent {
-        graphemes.next();
-    }
+    // Drop the whole leading indent span (TRANSCRIPT_INDENT cells), not just
+    // one grapheme — the indent is re-added per wrapped row below.
+    let graphemes = line
+        .styled_graphemes(Style::default())
+        .skip(if output_indent { indent_width } else { 0 });
     // Keep tabs as separate units for tabstop-aware expansion; drop other C0.
     let mut raw: Vec<(String, Style, bool)> = Vec::new();
     for sg in graphemes {
@@ -2006,9 +2007,12 @@ mod tests {
 
     #[test]
     fn shared_surface_dimensions_are_consistent() {
-        assert_eq!(input_content_width(80), 78);
+        // Content width tracks the shared knob so the wrap width equals the
+        // rendered inner width at any gutter value.
+        let gutter = super::super::HORIZONTAL_GUTTER;
+        assert_eq!(input_content_width(80), 80 - gutter * 2);
         assert_eq!(input_content_width(1), 0);
-        assert_eq!(input_content_width(3), 1);
+        assert_eq!(input_content_width(3), (3u16).saturating_sub(gutter * 2));
         assert_eq!(
             input_content_width(80),
             input_block().inner(Rect::new(0, 0, 80, 24)).width
@@ -2197,7 +2201,10 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(rendered, " ▸ tool");
+        assert_eq!(
+            rendered,
+            format!("{}▸ tool", super::super::transcript_indent())
+        );
     }
 
     #[test]
@@ -2478,22 +2485,26 @@ mod tests {
         let text =
             |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
         let art = [
-            " ██████╗ ███████╗██╗  ██╗",
-            " ██╔══██╗██╔════╝╚██╗██╔╝",
-            " ██║  ██║█████╗   ╚███╔╝",
-            " ██║  ██║██╔══╝   ██╔██╗",
-            " ██████╔╝███████╗██╔╝ ██╗",
-            " ╚═════╝ ╚══════╝╚═╝  ╚═╝",
+            "██████╗ ███████╗██╗  ██╗",
+            "██╔══██╗██╔════╝╚██╗██╔╝",
+            "██║  ██║█████╗   ╚███╔╝",
+            "██║  ██║██╔══╝   ██╔██╗",
+            "██████╔╝███████╗██╔╝ ██╗",
+            "╚═════╝ ╚══════╝╚═╝  ╚═╝",
         ];
+        let expected: Vec<String> = art
+            .iter()
+            .map(|row| format!("{}{row}", super::super::transcript_indent()))
+            .collect();
         let rows: Vec<String> = app.display_cache.iter().map(text).collect();
         let start = rows
             .iter()
-            .position(|r| r.starts_with(" ██████╗"))
+            .position(|r| r.starts_with(&expected[0]))
             .expect("banner top row present in display");
-        for (i, expected) in art.iter().enumerate() {
+        for (i, expected) in expected.iter().enumerate() {
             assert_eq!(
                 rows[start + i].as_str(),
-                *expected,
+                expected.as_str(),
                 "six art rows contiguous and in order — no block gap inside the banner"
             );
         }
@@ -2732,8 +2743,13 @@ mod tests {
             .collect();
         assert!(!symbols.chars().any(char::is_control));
         assert!(!symbols.contains('\t'), "tab must be expanded: {symbols}");
-        // Indented preview: " " + "  35\tlet" -> indent 1 + 2 spaces + 2 chars = col 5 before tab => 3 spaces
-        assert!(symbols.contains("35   let cwd"), "{symbols}");
+        // Indented preview: indent + "  35\tlet" -> indent + 2 spaces + 2 chars
+        // before the tab, which then fills to the next tabstop column.
+        let tab_pad = TAB_WIDTH - ((super::super::TRANSCRIPT_INDENT + 4) % TAB_WIDTH);
+        assert!(
+            symbols.contains(&format!("35{}let cwd", " ".repeat(tab_pad))),
+            "{symbols}"
+        );
         assert!(!symbols.contains("35      let cwd") || true); // raw cell_safe check above covers 6-space case without indent
     }
 
@@ -3510,7 +3526,10 @@ mod tests {
             .map(|x| buffer.cell((x, text_row)).unwrap().symbol())
             .collect();
         assert!(
-            prompt_row.starts_with(" can you check pillar"),
+            prompt_row.starts_with(&format!(
+                "{}can you check pillar",
+                super::super::transcript_indent()
+            )),
             "prompt row must sit on the transcript margin: {prompt_row:?}"
         );
         let bg = theme::surface_bg();
