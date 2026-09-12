@@ -105,6 +105,23 @@ fn max_tool_iterations() -> usize {
         .unwrap_or(200)
 }
 
+/// Phrases meaning "the input no longer fits the context window",
+/// matched on a lowercased message by `is_context_overflow`.
+const OVERFLOW_PHRASES: &[&str] = &[
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "context size",
+    "context too large",
+    "input length",
+    "input is too long",
+    "prompt is too long",
+    "prompt too long",
+    "too many tokens",
+    "token limit",
+];
+
 /// Provider wording for "the input no longer fits the context window".
 /// Matched on lowercase; providers phrase it many ways. The generic
 /// "reduce the length" only counts with a context/token/prompt/input
@@ -112,18 +129,7 @@ fn max_tool_iterations() -> usize {
 /// a wasteful emergency compaction.
 fn is_context_overflow(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("context length")
-        || message.contains("context_length")
-        || message.contains("maximum context")
-        || message.contains("context window")
-        || message.contains("context size")
-        || message.contains("context too large")
-        || message.contains("input length")
-        || message.contains("input is too long")
-        || message.contains("prompt is too long")
-        || message.contains("prompt too long")
-        || message.contains("too many tokens")
-        || message.contains("token limit")
+    OVERFLOW_PHRASES.iter().any(|p| message.contains(*p))
         || (message.contains("reduce the length")
             && (message.contains("context")
                 || message.contains("token")
@@ -359,7 +365,7 @@ where
     let mut policy = Policy::turn(config.permission, console);
     policy.agent = agent_ctx;
 
-    for _iteration in 0..1_000_000 {
+    loop {
         persist_pending(&mut session, messages, &mut persisted_cursor)?;
         if cancellation.is_cancelled() {
             let _ = cancellation.take_cancelled();
@@ -1029,6 +1035,10 @@ where
             return Ok(text);
         }
     }
+    // The `loop` above never breaks — every path returns or continues — so
+    // this expression is unreachable; kept for exhaustiveness (AGT-2), the
+    // failure wording stays documented at the end of the turn pipeline.
+    #[allow(unreachable_code)]
     Err("turn did not complete after many tool iterations; partial progress preserved.".into())
 }
 
