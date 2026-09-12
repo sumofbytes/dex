@@ -1857,9 +1857,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_and_edit_leave_no_temp_files_and_round_trip() {
+        // Own subdirectory: other tests write into `target/` concurrently, and
+        // their in-flight `.dex-write-*` temp files would race this scan.
+        let dir = "target/dex-atomic-write-test";
         let cwd = std::env::current_dir().unwrap();
-        fs::create_dir_all(cwd.join("target")).unwrap();
-        let rel = "target/dex-atomic-write-test.txt";
+        fs::create_dir_all(cwd.join(dir)).unwrap();
+        let rel = "target/dex-atomic-write-test/file.txt";
         let full = cwd.join(rel);
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
@@ -1883,7 +1886,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(fs::read_to_string(&full).unwrap(), "second\n");
-        let strays: Vec<_> = fs::read_dir(cwd.join("target"))
+        let strays: Vec<_> = fs::read_dir(cwd.join(dir))
             .unwrap()
             .flatten()
             .filter(|e| {
@@ -1896,7 +1899,7 @@ mod tests {
             strays.is_empty(),
             "temp files must be renamed away, not left"
         );
-        let _ = fs::remove_file(&full);
+        let _ = fs::remove_dir_all(cwd.join(dir));
     }
 
     /// `then_run` runs after a successful mutation and its output
