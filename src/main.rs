@@ -76,6 +76,28 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
     }
 }
 
+/// Shared session-open ladder: `--new` creates a fresh session, otherwise
+/// open/continue `--session` (or the newest one). On failure, warn to
+/// stderr and return `None` so the caller continues without persistence;
+/// `--name` renaming stays with the callers that do it.
+fn open_session(args: &Args, cwd: &str) -> Option<Session> {
+    let opened = if args.new_session {
+        Session::new(cwd.to_string(), args.session_name.clone())
+    } else {
+        Session::open_or_continue(cwd.to_string(), args.session_path.as_deref(), false)
+    };
+    match opened {
+        Ok(session) => Some(session),
+        Err(error) => {
+            eprintln!(
+                "[session] could not open session ({}); continuing without persistence",
+                error
+            );
+            None
+        }
+    }
+}
+
 fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // `!`/`!!` shell escape: run directly, no agent turn, no
     // approval — the `!` itself is the approval. A bare `!`/`!!` falls
@@ -100,35 +122,24 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             let cwd = env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let opened = if args.new_session {
-                Session::new(cwd, args.session_name.clone())
-            } else {
-                Session::open_or_continue(cwd, args.session_path.as_deref(), false)
-            };
-            match opened {
-                Ok(mut session) => {
-                    // Same text the daemon persists for shell runs;
-                    // `!!` is tagged out of the model-bound history.
-                    let text = crate::core::format::bash_context_text(
-                        &command,
-                        &output,
-                        success,
-                        code,
-                        crate::core::console::is_interrupted(),
-                    );
-                    let msg = if excluded {
-                        ChatMessage::user_named(text, crate::core::types::BASH_EXCLUDED_NAME)
-                    } else {
-                        ChatMessage::user(text)
-                    };
-                    if let Err(error) = session.append_message(&msg) {
-                        eprintln!("[session] could not persist shell run ({error})");
-                    }
+            if let Some(mut session) = open_session(args, &cwd) {
+                // Same text the daemon persists for shell runs;
+                // `!!` is tagged out of the model-bound history.
+                let text = crate::core::format::bash_context_text(
+                    &command,
+                    &output,
+                    success,
+                    code,
+                    crate::core::console::is_interrupted(),
+                );
+                let msg = if excluded {
+                    ChatMessage::user_named(text, crate::core::types::BASH_EXCLUDED_NAME)
+                } else {
+                    ChatMessage::user(text)
+                };
+                if let Err(error) = session.append_message(&msg) {
+                    eprintln!("[session] could not persist shell run ({error})");
                 }
-                Err(error) => eprintln!(
-                    "[session] could not open session ({}); continuing without persistence",
-                    error
-                ),
             }
         }
         return match result {
@@ -162,26 +173,13 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     let mut session = if args.no_session {
         None
     } else {
-        match if args.new_session {
-            Session::new(cwd.clone(), args.session_name.clone())
-        } else {
-            Session::open_or_continue(cwd.clone(), args.session_path.as_deref(), false)
-        } {
-            Ok(mut session) => {
-                if let Some(name) = &args.session_name {
-                    let _ = session.set_name(name.clone());
-                }
-                Some(session)
-            }
-            Err(error) => {
-                eprintln!(
-                    "[session] could not open session ({}); continuing without persistence",
-                    error
-                );
-                None
-            }
-        }
+        open_session(args, &cwd)
     };
+    if let Some(name) = &args.session_name {
+        if let Some(session) = session.as_mut() {
+            let _ = session.set_name(name.clone());
+        }
+    }
     let mut messages = vec![ChatMessage::system(system_prompt(&skills))];
     if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
         // Model-bound load: `!!` shell runs stay out of the LLM context.
@@ -332,6 +330,64 @@ fn print_help() {
     );
 }
 
+/// Run the `dex serve` daemon: resolve the bind address, warn when it is
+/// unspecified, prepare the bearer token, bind, and block on the server.
+/// Parse, bind, and daemon failures exit 1.
+fn run_serve(bind: &str) {
+    let addr: std::net::SocketAddr = if bind.contains(':') {
+        bind.parse().unwrap_or_else(|_| {
+            eprintln!("error: invalid bind address '{bind}' (use [host:]port)");
+            std::process::exit(1);
+        })
+    } else {
+        ([127, 0, 0, 1], bind.parse().unwrap_or(8420)).into()
+    };
+    if addr.ip().is_unspecified() {
+        eprintln!(
+            "warning: daemon listening on {addr} is exposed on all interfaces — a bearer token is required (set DEX_DAEMON_TOKEN or copy the generated daemon.token); prefer 127.0.0.1 for local use"
+        );
+    }
+    // Non-loopback binds (or an explicit DEX_DAEMON_TOKEN) get a
+    // bearer token: the daemon runs tools in a workspace, so an
+    // unauthenticated reachable endpoint is remote code execution.
+    daemon::prepare_daemon_token(&addr);
+    let listener = match std::net::TcpListener::bind(addr) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("daemon error: cannot bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "dex daemon listening on {}",
+        listener.local_addr().unwrap_or(addr)
+    );
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        if let Err(e) = daemon::run_daemon(listener).await {
+            eprintln!("daemon error: {e}");
+            std::process::exit(1);
+        }
+    });
+}
+
+/// Shared `dex mcp <action>` outcome plumbing: print the action's Ok
+/// message; on Err, report with `fail_prefix` and exit 1; a missing server
+/// argument (`None`) prints the arm's usage instead.
+fn run_or_exit(result: Option<Result<String, String>>, usage: &str, fail_prefix: &str) {
+    match result {
+        Some(Ok(message)) => println!("{message}"),
+        Some(Err(error)) => {
+            eprintln!("{fail_prefix}{error}");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("{usage}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     crate::core::logging::init();
     crate::ui::mark_launch_start();
@@ -355,41 +411,7 @@ fn main() {
             println!("dex {}", env!("CARGO_PKG_VERSION"));
         }
         Mode::Serve { bind } => {
-            let addr: std::net::SocketAddr = if bind.contains(':') {
-                bind.parse().unwrap_or_else(|_| {
-                    eprintln!("error: invalid bind address '{bind}' (use [host:]port)");
-                    std::process::exit(1);
-                })
-            } else {
-                ([127, 0, 0, 1], bind.parse().unwrap_or(8420)).into()
-            };
-            if addr.ip().is_unspecified() {
-                eprintln!(
-                    "warning: daemon listening on {addr} is exposed on all interfaces — a bearer token is required (set DEX_DAEMON_TOKEN or copy the generated daemon.token); prefer 127.0.0.1 for local use"
-                );
-            }
-            // Non-loopback binds (or an explicit DEX_DAEMON_TOKEN) get a
-            // bearer token: the daemon runs tools in a workspace, so an
-            // unauthenticated reachable endpoint is remote code execution.
-            daemon::prepare_daemon_token(&addr);
-            let listener = match std::net::TcpListener::bind(addr) {
-                Ok(listener) => listener,
-                Err(e) => {
-                    eprintln!("daemon error: cannot bind {addr}: {e}");
-                    std::process::exit(1);
-                }
-            };
-            println!(
-                "dex daemon listening on {}",
-                listener.local_addr().unwrap_or(addr)
-            );
-            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-            rt.block_on(async {
-                if let Err(e) = daemon::run_daemon(listener).await {
-                    eprintln!("daemon error: {e}");
-                    std::process::exit(1);
-                }
-            });
+            run_serve(&bind);
         }
         Mode::Connect { url } => {
             // `dex connect <url>` opens the TUI; `dex connect <url> "prompt"`
@@ -507,38 +529,23 @@ fn main() {
                     println!("{line}");
                 }
             }
-            "login" => match server.as_deref() {
-                Some(server) => {
-                    match crate::client::http::block_on(crate::mcp::oauth::login(server)) {
-                        Ok(message) => println!("{message}"),
-                        Err(error) => {
-                            eprintln!("mcp login failed: {error}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                None => {
-                    eprintln!("usage: dex mcp login <server>");
-                    std::process::exit(1);
-                }
-            },
-            "logout" => match server.as_deref() {
-                Some(server) => match crate::mcp::oauth::logout(server) {
-                    Ok(message) => println!("{message}"),
-                    Err(error) => {
-                        eprintln!("mcp logout failed: {error}");
-                        std::process::exit(1);
-                    }
-                },
-                None => {
-                    eprintln!("usage: dex mcp logout <server>");
-                    std::process::exit(1);
-                }
-            },
-            _ => {
-                eprintln!("usage: dex mcp [status|login <server>|logout <server>]");
-                std::process::exit(1);
-            }
+            "login" => run_or_exit(
+                server
+                    .as_deref()
+                    .map(|server| crate::client::http::block_on(crate::mcp::oauth::login(server))),
+                "usage: dex mcp login <server>",
+                "mcp login failed: ",
+            ),
+            "logout" => run_or_exit(
+                server.as_deref().map(crate::mcp::oauth::logout),
+                "usage: dex mcp logout <server>",
+                "mcp logout failed: ",
+            ),
+            _ => run_or_exit(
+                None,
+                "usage: dex mcp [status|login <server>|logout <server>]",
+                "",
+            ),
         },
     }
 }
