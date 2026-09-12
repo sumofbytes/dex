@@ -160,6 +160,58 @@ pub(crate) struct Session {
     events_journal: Option<File>,
 }
 
+/// Shared directory scan behind every session listing (SES-1): each direct
+/// `*.jsonl` file under `dir` whose first line parses as a session header.
+/// Unreadable directories are skipped and per-file failures (open, empty,
+/// bad JSON) drop the entry — only the header is needed, and session files
+/// grow large, so listings stream just the first line. Callers apply
+/// `sort_newest_first` for the canonical newest-first order.
+fn scan_jsonl_dir(dir: &Path) -> Vec<(PathBuf, SessionHeader)> {
+    let mut sessions = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                if let Some(first) = read_first_line(&path) {
+                    if let Ok(header) = serde_json::from_str::<SessionHeader>(first.trim_end()) {
+                        sessions.push((path, header));
+                    }
+                }
+            }
+        }
+    }
+    sessions
+}
+
+/// Canonical listing order: header timestamp, newest first.
+fn sort_newest_first(sessions: &mut [(PathBuf, SessionHeader)]) {
+    sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+}
+
+/// Stream a file line by line, handing each line (newline included) to `f`
+/// (SES-2). Owns the read loop shared by the journal/state scanners:
+/// `Interrupted` (EINTR) retries instead of ending the scan — treating it
+/// as EOF silently truncates a mid-journal read — and any other read error
+/// stops the scan like EOF, so the helper's `Err` is the open failure only.
+/// Per-scanner work (substring prefilters, JSON parsing) stays in `f`.
+fn for_each_line(path: &Path, mut f: impl FnMut(&str)) -> io::Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Ok(()),
+            // EINTR: retry, never treat as EOF — that would silently
+            // truncate the scan mid-file.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Torn/invalid read: stop the scan (matches `load_events`).
+            Err(_) => return Ok(()),
+            Ok(_) => {}
+        }
+        f(&line);
+    }
+}
+
 impl Session {
     fn session_dir() -> PathBuf {
         if let Some(dir) = env::var_os("XDG_DATA_HOME") {
@@ -448,22 +500,8 @@ impl Session {
 
     pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
         let dir = Self::session_dir().join(Self::cwd_slug(cwd));
-        let mut sessions = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    // Only the header is needed; session files grow large.
-                    if let Some(first) = read_first_line(&path) {
-                        if let Ok(header) = serde_json::from_str::<SessionHeader>(first.trim_end())
-                        {
-                            sessions.push((path, header));
-                        }
-                    }
-                }
-            }
-        }
-        sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        let mut sessions = scan_jsonl_dir(&dir);
+        sort_newest_first(&mut sessions);
         Ok(sessions)
     }
 
@@ -478,24 +516,10 @@ impl Session {
                 if !dir.is_dir() {
                     continue;
                 }
-                if let Ok(files) = fs::read_dir(&dir) {
-                    for file in files.flatten() {
-                        let path = file.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                            // Only the header is needed; session files grow large.
-                            if let Some(first) = read_first_line(&path) {
-                                if let Ok(header) =
-                                    serde_json::from_str::<SessionHeader>(first.trim_end())
-                                {
-                                    sessions.push((path, header));
-                                }
-                            }
-                        }
-                    }
-                }
+                sessions.extend(scan_jsonl_dir(&dir));
             }
         }
-        sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        sort_newest_first(&mut sessions);
         Ok(sessions)
     }
 
@@ -512,23 +536,17 @@ impl Session {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("agents");
-        let mut children = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                    if let Some(first) = read_first_line(&path) {
-                        if let Ok(header) = serde_json::from_str::<SessionHeader>(first.trim_end())
-                        {
-                            let turn_state = Self::last_turn_state(&path);
-                            children.push((path, header, turn_state));
-                        }
-                    }
-                }
-            }
-        }
-        children.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
-        Ok(children)
+        let mut children = scan_jsonl_dir(&dir);
+        sort_newest_first(&mut children);
+        // Enrich with the turn state after the shared scan/sort: the state
+        // is derived per path, so the newest-first order is unaffected.
+        Ok(children
+            .into_iter()
+            .map(|(path, header)| {
+                let turn_state = Self::last_turn_state(&path);
+                (path, header, turn_state)
+            })
+            .collect())
     }
 
     pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Self> {
@@ -747,37 +765,24 @@ impl Session {
     /// SESSION file; the journal lives at `<session>.events.jsonl`.
     pub(crate) fn load_events(path: &Path, since: u64) -> io::Result<Vec<(u64, String)>> {
         let events_path = path.with_extension("events.jsonl");
-        // Stream line by line like `max_event_seq` — the journal is the hot
+        // Streamed line by line via `for_each_line`: the journal is the hot
         // file (one line per stream delta) and replay drops everything with
         // `seq <= since`, so don't slurp it into memory first.
-        let file = File::open(&events_path)?;
         let mut out = Vec::new();
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                // EINTR: retry, never treat as EOF — that would silently
-                // truncate the replay mid-journal.
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                // Torn/invalid line: skip it (matches `max_event_seq`).
-                Err(_) => break,
-                Ok(_) => {}
-            }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
+        for_each_line(&events_path, |line| {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                return;
             };
             let Some(seq) = value.get("seq").and_then(Value::as_u64) else {
-                continue;
+                return;
             };
             if seq <= since {
-                continue;
+                return;
             }
             if let Some(payload) = value.get("payload") {
                 out.push((seq, payload.to_string()));
             }
-        }
+        })?;
         Ok(out)
     }
 
@@ -785,56 +790,40 @@ impl Session {
     /// journaled yet — distinct from a journal holding exactly seq 0).
     pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
         let events_path = path.with_extension("events.jsonl");
-        // Stream line by line; the journal is the hot file (one line per
-        // stream delta) and replay only needs the max seq, not the text.
-        let Ok(file) = File::open(&events_path) else {
-            return None;
-        };
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        // Streamed via `for_each_line`: the journal is the hot file (one line
+        // per stream delta) and this only needs the max seq, not the text.
+        // Open failure still yields `None`; mid-read errors stop the scan
+        // inside the helper like EOF.
         let mut max: Option<u64> = None;
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+        let _ = for_each_line(&events_path, |line| {
             // append_event writes {"seq":N,...}; skip parsing other shapes.
             if !line.contains("\"seq\":") {
-                continue;
+                return;
             }
             if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
                 if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
                     max = Some(max.map_or(seq, |m| m.max(seq)));
                 }
             }
-        }
+        });
         max
     }
 
     /// Terminal state of the most recent turn: "complete", "failed", or
     /// "interrupted" when a `turn_start` has no terminal entry after it.
     pub(crate) fn last_turn_state(path: &Path) -> &'static str {
-        // Stream line by line; sessions hold thousands of non-marker entries.
-        let Ok(file) = File::open(path) else {
-            return "unknown";
-        };
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        // Streamed via `for_each_line`; sessions hold thousands of
+        // non-marker entries. Open failure still reads as "unknown"; the
+        // helper stops mid-scan on read errors like EOF.
         let mut state = "none";
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+        let scan = for_each_line(path, |line| {
             // Turn entries serialize as {"type":"turn_*",...}; skip parsing
             // everything else.
             if !line.contains("\"type\":\"turn_") {
-                continue;
+                return;
             }
             let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
-                continue;
+                return;
             };
             match value.get("type").and_then(Value::as_str) {
                 Some("turn_start") => state = "interrupted",
@@ -842,6 +831,9 @@ impl Session {
                 Some("turn_failed") => state = "failed",
                 _ => {}
             }
+        });
+        if scan.is_err() {
+            return "unknown";
         }
         state
     }
@@ -1024,24 +1016,7 @@ impl Session {
         }
         let mut set = tokio::task::JoinSet::new();
         for dir in dirs {
-            set.spawn(tokio::task::spawn_blocking(move || {
-                let mut out = Vec::new();
-                if let Ok(files) = fs::read_dir(&dir) {
-                    for file in files.flatten() {
-                        let path = file.path();
-                        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                            if let Some(first) = read_first_line(&path) {
-                                if let Ok(header) =
-                                    serde_json::from_str::<SessionHeader>(first.trim_end())
-                                {
-                                    out.push((path, header));
-                                }
-                            }
-                        }
-                    }
-                }
-                out
-            }));
+            set.spawn(tokio::task::spawn_blocking(move || scan_jsonl_dir(&dir)));
         }
         let mut sessions = Vec::new();
         while let Some(r) = set.join_next().await {
@@ -1070,22 +1045,21 @@ pub(crate) fn save_plan(session: &mut Session, plan: &crate::core::types::Plan) 
 pub(crate) fn load_session_state(
     path: &Path,
 ) -> io::Result<std::collections::HashMap<String, String>> {
-    let mut reader = BufReader::new(File::open(path)?);
     let mut state = std::collections::HashMap::new();
-    let mut line = String::new();
-    reader.read_line(&mut line)?; // header
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
+    let mut header = true;
+    for_each_line(path, |line| {
+        // Line 1 is the session header, not a state entry.
+        if header {
+            header = false;
+            return;
         }
         // set_state writes {"type":"session_state",...}; quotes inside state
         // values are JSON-escaped, so this substring can only be the marker.
         if !line.contains("\"type\":\"session_state\"") {
-            continue;
+            return;
         }
         let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
-            continue;
+            return;
         };
         if let (Some(key), Some(val)) = (
             value.get("key").and_then(Value::as_str),
@@ -1093,7 +1067,7 @@ pub(crate) fn load_session_state(
         ) {
             state.insert(key.into(), val.into());
         }
-    }
+    })?;
     Ok(state)
 }
 
