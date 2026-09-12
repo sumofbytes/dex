@@ -199,6 +199,7 @@ async fn execute_tool_call(
                     text: format!("Error: invalid tool arguments: {}", error),
                     ok: false,
                     diff: None,
+                    shell: None,
                 },
             )
         }
@@ -211,6 +212,7 @@ async fn execute_tool_call(
                 text: "Error: tool arguments must be a JSON object".into(),
                 ok: false,
                 diff: None,
+                shell: None,
             },
         );
     };
@@ -611,6 +613,7 @@ where
                                 text: "Error: tool worker panicked".into(),
                                 ok: false,
                                 diff: None,
+                                shell: None,
                             },
                             Duration::ZERO,
                         )),
@@ -714,7 +717,7 @@ where
                 // byte for byte against the archived raw output. Any
                 // uncheckable receipt falls open: the raw (clamped) result
                 // is kept untouched and the observation pack handles it.
-                if let Some(reduced) = crate::agent::evidence_reducer::process(
+                let processed = crate::agent::evidence_reducer::process(
                     config,
                     policy
                         .agent
@@ -728,10 +731,30 @@ where
                         input_json: &input,
                         result_text: &result,
                         ok: succeeded,
+                        shell: outcome.shell.as_ref(),
                     },
                 )
-                .await
-                {
+                .await;
+                // The reducer call's spend is real even when its receipt is
+                // rejected: fold it into the session totals and the usage
+                // stream, priced at the model that actually ran.
+                let crate::agent::evidence_reducer::Processed {
+                    reduction,
+                    usage,
+                    pricing,
+                } = processed;
+                if let Some(usage) = usage {
+                    record_usage(
+                        pricing.as_ref().unwrap_or(config),
+                        state,
+                        console,
+                        usage,
+                        None,
+                    )
+                    .await;
+                    state.dirty = true;
+                }
+                if let Some(reduced) = reduction {
                     result = reduced.receipt;
                     let note = format!(
                         "evidence reducer: {} -> {} (verified)",
