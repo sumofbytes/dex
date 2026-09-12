@@ -85,8 +85,9 @@ pub(crate) fn muted_fg() -> Color {
     tool_muted_fg()
 }
 
-/// Foreground for hairline separator rules (sheet top rule): barely visible, far dimmer than readable muted text. Keeps the
-/// terminal's hue via the same foreground-toward-background blend.
+/// Foreground for hairline separator rules (the sheet top rule): barely
+/// visible, far dimmer than readable muted text. Keeps the terminal's hue via
+/// the same foreground-toward-background blend.
 pub(crate) fn hairline_fg() -> Color {
     match faint_rgb() {
         Some((r, g, b)) => Color::Rgb(r, g, b),
@@ -162,13 +163,16 @@ fn default_voice() -> usize {
 /// so a plain mutex around the slot is plenty.
 static VOICE: OnceLock<Mutex<usize>> = OnceLock::new();
 
+/// Serializes tests that read or rotate the process-global voice slot (the
+/// theme tests below and the `Alt+V` keybinding test in `ui/remote.rs`).
+#[cfg(test)]
+pub(crate) static VOICE_SERIAL: Mutex<()> = Mutex::new(());
+
 fn voice_idx() -> usize {
-    VOICE
+    *VOICE
         .get_or_init(|| Mutex::new(default_voice()))
         .lock()
-        .map(|slot| *slot)
-        .unwrap_or(default_voice())
-        % VOICES.len()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Advance to the next voice, returning its name for the status-bar notice.
@@ -193,8 +197,14 @@ pub(crate) fn cycle_voice() -> &'static str {
 /// the voice — magenta → sky → peach → violet → rose → amber → coral →
 /// plain — and the default is `plain`, the inherited foreground.
 pub(crate) fn user_fg() -> Color {
-    let voice = &VOICES[voice_idx()];
-    match background() {
+    voice_shade(&VOICES[voice_idx()], background())
+}
+
+/// One voice's shade on a detected background: the bright accent on dark
+/// terminals, the deep one on light, and the inherited foreground when the
+/// theme is unknown rather than risk an unreadable pick.
+fn voice_shade(voice: &Voice, background: Background) -> Color {
+    match background {
         Background::Dark => voice.dark,
         Background::Light => voice.light,
         Background::Unknown => Color::Reset,
@@ -270,8 +280,6 @@ mod tests {
         }
     }
 
-    static VOICE_SERIAL: Mutex<()> = Mutex::new(());
-
     #[test]
     fn user_voice_matches_background() {
         // The default voice is `plain`: the inherited foreground on every
@@ -332,6 +340,17 @@ mod tests {
                     voice.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn voice_shade_picks_a_shade_per_background() {
+        // Every voice resolves per detected background: bright on dark, deep
+        // on light, inherited foreground when the terminal never answered.
+        for voice in VOICES {
+            assert_eq!(voice_shade(voice, Background::Dark), voice.dark);
+            assert_eq!(voice_shade(voice, Background::Light), voice.light);
+            assert_eq!(voice_shade(voice, Background::Unknown), Color::Reset);
         }
     }
 
