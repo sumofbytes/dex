@@ -6,6 +6,22 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// whose single lines would dominate the context window.
 const MAX_LINE_CHARS: usize = 2_000;
 
+/// Clip a string to at most `max_chars` *characters* — char-boundary-safe,
+/// appending a single `…` when anything was cut. The shared body of every
+/// char-count clip in the display layer (not display columns — see
+/// [`truncate_cols`]).
+pub(crate) fn clip_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}…", &s[..end])
+}
+
 /// Head+tail output clamp shared by every tool: keeps the first and last
 /// lines (errors and summaries live at the end, imports and context at the
 /// start) and replaces the middle with a marker carrying the real counts, so
@@ -14,18 +30,7 @@ const MAX_LINE_CHARS: usize = 2_000;
 pub(crate) fn clamp_lines(text: &str, max_lines: usize, max_bytes: usize) -> String {
     let clipped: Vec<String> = text
         .lines()
-        .map(|line| {
-            let limit = line
-                .char_indices()
-                .nth(MAX_LINE_CHARS)
-                .map(|(i, _)| i)
-                .unwrap_or(line.len());
-            if limit < line.len() {
-                format!("{}…", &line[..limit])
-            } else {
-                line.to_string()
-            }
-        })
+        .map(|line| clip_chars(line, MAX_LINE_CHARS))
         .collect();
     let total = clipped.len();
     let width = |lines: &[String]| -> usize { lines.iter().map(|l| l.len() + 1).sum::<usize>() };
@@ -901,10 +906,7 @@ fn then_run_of(obj: Option<&serde_json::Map<String, Value>>) -> Option<String> {
     if command.is_empty() {
         return None;
     }
-    Some(match command.char_indices().nth(120).map(|(idx, _)| idx) {
-        Some(idx) if idx < command.len() => format!("{}…", &command[..idx]),
-        _ => command.to_string(),
-    })
+    Some(clip_chars(command, 120))
 }
 
 /// The `· then: …` tail `approval_summary` appends for a `write`/`edit`
@@ -920,6 +922,15 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
     let v = serde_json::from_str::<Value>(input).ok();
     let obj = v.as_ref().and_then(|v| v.as_object());
     let get = |k: &str| obj.and_then(|o| o.get(k)).and_then(|x| x.as_str());
+    // An arm that assembled no structured detail rows falls back to the raw
+    // input line.
+    let fallback = |out: Vec<String>| {
+        if out.is_empty() {
+            vec![input.to_string()]
+        } else {
+            out
+        }
+    };
     match name {
         "bash" => {
             if let Some(cmd) = get("command") {
@@ -934,17 +945,7 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                             break;
                         }
                         let line = line.trim_end();
-                        let limit = line
-                            .char_indices()
-                            .nth(88)
-                            .map(|(idx, _)| idx)
-                            .unwrap_or(line.len());
-                        let clipped = if limit < line.len() {
-                            format!("{}…", &line[..limit])
-                        } else {
-                            line.to_string()
-                        };
-                        out.push(format!("  {}", clipped));
+                        out.push(format!("  {}", clip_chars(line, 88)));
                     }
                     out
                 }
@@ -967,28 +968,14 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                 if lines > 0 {
                     out.push("content:".to_string());
                     for (i, line) in content.lines().take(4).enumerate() {
-                        let limit = line
-                            .char_indices()
-                            .nth(72)
-                            .map(|(idx, _)| idx)
-                            .unwrap_or(line.len());
-                        let clipped = if limit < line.len() {
-                            format!("{}…", &line[..limit])
-                        } else {
-                            line.to_string()
-                        };
-                        out.push(format!("  {:>3} │ {}", i + 1, clipped));
+                        out.push(format!("  {:>3} │ {}", i + 1, clip_chars(line, 72)));
                     }
                     if lines > 4 {
                         out.push(format!("  … +{} more lines", lines - 4));
                     }
                 }
             }
-            if out.is_empty() {
-                vec![input.to_string()]
-            } else {
-                out
-            }
+            fallback(out)
         }
         "edit" => {
             let mut out = Vec::new();
@@ -1004,50 +991,22 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                     old.lines().count(),
                     new.lines().count()
                 ));
-                let old_preview: Vec<&str> = old.lines().take(3).collect();
-                let new_preview: Vec<&str> = new.lines().take(3).collect();
-                if !old_preview.is_empty() {
-                    out.push("  − old:".to_string());
-                    for l in old_preview {
-                        let limit = l
-                            .char_indices()
-                            .nth(68)
-                            .map(|(idx, _)| idx)
-                            .unwrap_or(l.len());
-                        out.push(format!(
-                            "    {}",
-                            if limit < l.len() {
-                                format!("{}…", &l[..limit])
-                            } else {
-                                l.to_string()
-                            }
-                        ));
+                // The old/new previews are verbatim twins: same 3-line
+                // take, same 68-char clip, same indent — only the label and
+                // the source differ.
+                let push_preview = |out: &mut Vec<String>, label: &str, text: &str| {
+                    let preview: Vec<&str> = text.lines().take(3).collect();
+                    if !preview.is_empty() {
+                        out.push(label.to_string());
+                        for l in preview {
+                            out.push(format!("    {}", clip_chars(l, 68)));
+                        }
                     }
-                }
-                if !new_preview.is_empty() {
-                    out.push("  + new:".to_string());
-                    for l in new_preview {
-                        let limit = l
-                            .char_indices()
-                            .nth(68)
-                            .map(|(idx, _)| idx)
-                            .unwrap_or(l.len());
-                        out.push(format!(
-                            "    {}",
-                            if limit < l.len() {
-                                format!("{}…", &l[..limit])
-                            } else {
-                                l.to_string()
-                            }
-                        ));
-                    }
-                }
+                };
+                push_preview(&mut out, "  − old:", old);
+                push_preview(&mut out, "  + new:", new);
             }
-            if out.is_empty() {
-                vec![input.to_string()]
-            } else {
-                out
-            }
+            fallback(out)
         }
         "read" => {
             if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
@@ -1082,11 +1041,7 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
             if let Some(mode) = get("output_mode") {
                 out.push(format!("mode: {}", mode));
             }
-            if out.is_empty() {
-                vec![input.to_string()]
-            } else {
-                out
-            }
+            fallback(out)
         }
         "find" | "fffind" => {
             if let Some(pat) = get("pattern") {
@@ -1187,7 +1142,7 @@ pub(crate) fn render_mcp_panel(
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                lines.push(format!("  · {short} — {}", truncate_chars(&one_line, 100)));
+                lines.push(format!("  · {short} — {}", clip_chars(&one_line, 100)));
             }
         } else {
             let reason = server
@@ -1205,7 +1160,7 @@ pub(crate) fn render_mcp_panel(
             lines.push(format!(
                 "✗ {} — down: {}",
                 server.name,
-                truncate_chars(&reason, 160)
+                clip_chars(&reason, 160)
             ));
         }
     }
@@ -1227,19 +1182,6 @@ fn short_mcp_tool<'a>(server: &'a str, full: &'a str) -> Option<&'a str> {
         return Some(short);
     }
     full.strip_prefix(&format!("mcp__{server}_"))
-}
-
-/// Char-boundary-safe truncation with an ellipsis marker.
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let end = text
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    format!("{}…", &text[..end])
 }
 
 /// Git branch + dirty flag for a working directory, for status displays.
