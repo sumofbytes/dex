@@ -7,9 +7,9 @@ use crate::agent::compaction::{
     compact_history, effective_tokens, estimate_tokens, KEEP_RECENT_MESSAGES,
 };
 use crate::agent::online::{
-    analyze_plan_transition, decide_compaction, online_compaction_enabled, parse_plan_steps,
-    post_compaction_reminder, CompactionEconomics, PlanStep, DEFAULT_COMPACTION_ECONOMICS,
-    NATIVE_SUMMARY_TOKEN_ESTIMATE,
+    analyze_plan_transition, decide_compaction, online_compaction_enabled, parse_plan_progress,
+    parse_plan_steps, post_compaction_reminder, CompactionEconomics, PlanStep,
+    DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
 };
 use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::core::console::{
@@ -663,6 +663,45 @@ where
                     }
                     outcome.text
                 };
+                // Online context compaction (`DEX_ONLINE_COMPACTION=1`):
+                // a completed plan step is a boundary — a safe point where
+                // history can be compacted if the economics say the cache
+                // re-write pays for itself before the work ends. The
+                // boundary bookkeeping runs *before* the sink emit so
+                // plan-hygiene advice is part of the `result` the user sees;
+                // the compaction decision itself runs after the tool result
+                // is appended so the transcript keeps assistant →
+                // tool_result → reminder order (pi's reference aborts the
+                // turn instead; dex compacts inline, and the ordering must
+                // stay wire-valid). At most one boundary per turn is
+                // evaluated.
+                let mut boundary: Option<Vec<PlanStep>> = None;
+                if online_compaction_enabled() && name == "update_plan" && ok {
+                    // Parse once: the tool layer validated `steps`, so a
+                    // parse failure here would be a state bug — fall back to
+                    // ignoring the update rather than failing the turn.
+                    let parsed = serde_json::from_str::<Value>(&input).ok().and_then(|args| {
+                        let steps = args.get("steps")?.clone();
+                        let progress = parse_plan_progress(args.get("progress")).ok()?;
+                        parse_plan_steps(&steps).ok().map(|steps| (steps, progress))
+                    });
+                    if let Some((steps, progress)) = parsed {
+                        let transition = analyze_plan_transition(&state.online.plan, &steps);
+                        if !transition.advice.is_empty() {
+                            result.push('\n');
+                            result.push_str(&transition.advice.join("\n"));
+                        }
+                        if transition.completed.is_empty() {
+                            if state.online.plan != steps || state.online.progress != progress {
+                                state.online.plan = steps;
+                                state.online.progress = progress;
+                            }
+                        } else {
+                            state.online.progress = progress;
+                            boundary = Some(steps);
+                        }
+                    }
+                }
                 if console.sink().is_some() {
                     let mut summary = tool_result_summary(&name, &input, &result, ok);
                     if cache_hit {
@@ -692,36 +731,11 @@ where
                         );
                     });
                 }
-                // Online context compaction (`DEX_ONLINE_COMPACTION=1`):
-                // a completed plan step is a boundary — a safe point where
-                // history can be compacted if the economics say the cache
-                // re-write pays for itself before the work ends. Plan-hygiene advice lands in the tool result; the
-                // boundary itself is processed *after* the tool result is
-                // appended so the transcript keeps assistant → tool_result →
-                // reminder order (pi's reference aborts the turn instead;
-                // dex compacts inline, and the ordering must stay
-                // wire-valid). At most one boundary per turn is evaluated.
-                let mut boundary: Option<Vec<PlanStep>> = None;
-                if online_compaction_enabled() && name == "update_plan" && ok {
-                    let steps = serde_json::from_str::<Value>(&input).ok().and_then(|args| {
-                        let steps = args.get("steps")?.clone();
-                        parse_plan_steps(&steps).ok()
-                    });
-                    if let Some(steps) = steps {
-                        let transition = analyze_plan_transition(&state.online.plan, &steps);
-                        if !transition.advice.is_empty() {
-                            result.push('\n');
-                            result.push_str(&transition.advice.join("\n"));
-                        }
-                        if transition.completed.is_empty() {
-                            if state.online.plan != steps {
-                                state.online.plan = steps;
-                            }
-                        } else {
-                            boundary = Some(steps);
-                        }
-                    }
-                }
+                // The boundary (computed above, before the emit) is
+                // processed after the tool result is appended so the
+                // transcript keeps assistant → tool_result → reminder order
+                // (pi's reference aborts the turn instead; dex compacts
+                // inline, and the ordering must stay wire-valid).
                 messages.push(ChatMessage::tool_result(
                     call.id.clone(),
                     model_tool_result(&result),
@@ -785,7 +799,10 @@ where
                                 let (debt, repayment) = decision.cache_debt();
                                 // The reminder lists the remaining goals — build
                                 // it before record_compaction clears the plan.
-                                let reminder = post_compaction_reminder(&state.online.plan);
+                                let reminder = post_compaction_reminder(
+                                    &state.online.plan,
+                                    &state.online.progress,
+                                );
                                 state.online.record_compaction(debt, repayment);
                                 messages.push(ChatMessage::user_named(reminder, "compact"));
                                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
@@ -1168,7 +1185,14 @@ mod tests {
 
     #[tokio::test]
     async fn online_compaction_compacts_at_an_economical_boundary() {
+        // Shared env lock + panic-safe restore: the var is read by other
+        // test modules in this binary (e.g. the protocol schema test), so
+        // unsynchronized set/remove flakes those assertions.
         let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        let _env = crate::session::EnvGuard(vec![(
+            crate::agent::online::ONLINE_COMPACTION_ENV,
+            std::env::var_os(crate::agent::online::ONLINE_COMPACTION_ENV),
+        )]);
         std::env::set_var("DEX_ONLINE_COMPACTION", "1");
         // The read tool clamps a single file to ~64 KiB (~16k tokens), so
         // shrink keep_recent below that: the archive then clears the
@@ -1210,7 +1234,6 @@ mod tests {
             tool_budget: Some(64),
         })
         .await;
-        std::env::remove_var("DEX_ONLINE_COMPACTION");
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.as_deref().unwrap(), "done");

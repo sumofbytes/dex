@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::online::{format_plan_snapshot, parse_plan_steps};
+use crate::agent::online::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::console::Console;
 use crate::core::format::clamp_lines;
@@ -279,7 +279,8 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
 fn tool_update_plan(args: &Map<String, Value>) -> Result<String, ToolError> {
     let steps = args.get("steps").ok_or(ToolError::Missing("steps"))?;
     let steps = parse_plan_steps(steps).map_err(ToolError::InvalidArgument)?;
-    Ok(format_plan_snapshot(&steps))
+    let progress = parse_plan_progress(args.get("progress")).map_err(ToolError::InvalidArgument)?;
+    Ok(format_plan_snapshot(&steps, &progress))
 }
 
 impl std::fmt::Display for ToolError {
@@ -757,7 +758,7 @@ async fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
     Ok(paths)
 }
 
-/// The `then_run` field: the verification command a
+/// The `then_run` field (SoL-Pi-compatible): the verification command a
 /// `write`/`edit` call carries. Only those two tools accept it; `null`, empty and whitespace-only
 /// values all mean "no command" so an omitted optional field stays harmless.
 /// A present-but-unusable value (object, array, number) is an error rather than
