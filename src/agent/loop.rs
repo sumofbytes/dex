@@ -687,7 +687,8 @@ where
                         )))
                         .await;
                 } else {
-                    with_console(console.sink().is_some(), || {
+                    // The sink is None in this branch: console IO always runs.
+                    with_console(false, || {
                         eprintln!(
                             "{}[tool input] {} {}{}",
                             TOOL_INPUT_COLOR,
@@ -817,7 +818,8 @@ where
                     }
                 }
                 if console.sink().is_some() {
-                    let mut summary = tool_result_summary(&name, &input, &result, ok);
+                    let mut summary =
+                        tool_result_summary(&name, &input, &result, ok, diff.as_deref());
                     if cache_hit {
                         summary = format!("cached · {summary}");
                     }
@@ -837,7 +839,8 @@ where
                         })
                         .await;
                 } else {
-                    with_console(console.sink().is_some(), || {
+                    // The sink is None in this branch: console IO always runs.
+                    with_console(false, || {
                         let body = tool_preview_body(&name, ok, diff.as_deref(), &result);
                         eprintln!(
                             "{}[tool output] {}:\n{}{}",

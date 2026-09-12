@@ -57,8 +57,15 @@ fn handle_event_with(
             io::stdout().flush().ok();
         }
         StreamEvent::Thinking(_) => {}
-        StreamEvent::ToolCall { name, .. } => {
-            eprintln!("\n  > {name}...");
+        StreamEvent::ToolCall { name, args } => {
+            // The daemon ships the same short-arg preview the local path
+            // prints (`read src/main.rs`) — show it, not just the tool name.
+            let arg = args.as_str().unwrap_or_default();
+            if arg.is_empty() {
+                eprintln!("\n  > {name}...");
+            } else {
+                eprintln!("\n  > {name} {arg}...");
+            }
         }
         StreamEvent::ToolResult {
             name,
