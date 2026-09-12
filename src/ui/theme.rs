@@ -40,8 +40,8 @@ fn raised(amount: f32) -> Color {
 /// BG for overlays: a "raised" surface.
 pub(crate) fn surface_bg() -> Color {
     match background() {
-        Background::Dark => raised(0.10),
-        Background::Light => raised(0.06),
+        Background::Dark => raised(0.05),
+        Background::Light => raised(0.03),
         Background::Unknown => Color::Reset,
     }
 }
