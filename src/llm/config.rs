@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -9,16 +10,41 @@ use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
 use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
 
+/// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
+/// unset or unparseable. Single-sources the
+/// `env::var(..).ok().and_then(|v| v.parse().ok()).unwrap_or(..)` ladder
+/// repeated through `from_env`.
+fn env_parse<T: FromStr>(name: &str, default: T) -> T {
+    env_parse_opt(name).unwrap_or(default)
+}
+
+/// Same env read + parse, but the caller keeps the fallback chain — used
+/// where the default is reached only after catalog lookups
+/// (`DEX_CONTEXT_WINDOW`).
+fn env_parse_opt<T: FromStr>(name: &str) -> Option<T> {
+    env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// Shared XDG-vs-HOME directory resolution: `$<env_var>/dex/<rel>` when the
+/// XDG variable is set, else `$HOME/<home_sub>/dex/<rel>`, else `None` (no
+/// `HOME`). Pure re-expression of the layout every config/cache path below
+/// uses; the env var is a parameter because the sites use three different
+/// ones (`DEX_CONFIG` overrides the whole config path, so its check stays
+/// at that call site).
+fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathBuf> {
+    if let Some(dir) = env::var_os(env_var) {
+        return Some(std::path::PathBuf::from(dir).join(rel));
+    }
+    env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(home_sub).join(rel))
+}
+
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
 /// > `~/.config/dex/config.yaml`.
 fn config_file_path() -> Option<std::path::PathBuf> {
     if let Some(p) = env::var_os("DEX_CONFIG") {
         return Some(std::path::PathBuf::from(p));
     }
-    let dir = env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-    Some(dir.join("dex/config.yaml"))
+    xdg_path("XDG_CONFIG_HOME", ".config", "dex/config.yaml")
 }
 
 /// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
@@ -556,11 +582,7 @@ pub(crate) fn resolve_credentials(
 /// protocol. ponytail: no expiry — a model that speaks completions keeps
 /// working even after the provider adds responses support.
 fn learned_apis_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/learned-apis.json"));
-    }
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/dex/learned-apis.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/learned-apis.json")
 }
 
 /// Learned wire protocols, cached process-wide and invalidated by file
@@ -680,11 +702,7 @@ pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
 /// ponytail: read-through, no process cache — the file holds a handful of
 /// entries; add file-identity caching like `learned-apis.json` if it grows.
 fn thinking_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/thinking-effort.json"));
-    }
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/dex/thinking-effort.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/thinking-effort.json")
 }
 
 fn thinking_map() -> serde_json::Map<String, serde_json::Value> {
@@ -794,10 +812,7 @@ fn persist_selection(
 }
 
 fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/models.dev.json"));
-    }
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.dev.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.dev.json")
 }
 
 /// True when no cached models.dev catalog exists yet (fresh install). The
@@ -816,10 +831,7 @@ pub(crate) fn catalog_cache_missing() -> bool {
 /// Written by `refresh_models_cache` and lazily rebuilt whenever the catalog
 /// is newer than the index.
 fn dex_ctx_index_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/models.ctx.json"));
-    }
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.ctx.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.ctx.json")
 }
 
 fn ctx_from_index(model: &str) -> Option<u64> {
@@ -1621,12 +1633,7 @@ impl LlmConfig {
         permission_override: Option<PermissionMode>,
         header_overrides: &[String],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        crate::tools::set_output_limit(
-            env::var("DEX_TOOL_OUTPUT_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_048_576),
-        );
+        crate::tools::set_output_limit(env_parse("DEX_TOOL_OUTPUT_BYTES", 1_048_576));
         let permission = match permission_override {
             Some(mode) => mode,
             None => permission_from_env()?,
@@ -1752,11 +1759,10 @@ impl LlmConfig {
                     e
                 }
             })?;
-        let context_window = env::var("DEX_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            // Slim cross-process index first (KBs); the 4MB catalog parse
-            // is the cold-path fallback, which then refreshes the index.
+        // DEX_CONTEXT_WINDOW first; else the slim cross-process index
+        // (KBs); the 4MB catalog parse is the cold-path fallback, which
+        // then refreshes the index.
+        let context_window = env_parse_opt("DEX_CONTEXT_WINDOW")
             .or_else(|| ctx_from_index(&model))
             .or_else(|| {
                 load_dex_catalog().and_then(|c| {
@@ -1767,22 +1773,10 @@ impl LlmConfig {
             })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         // Reserve 16384, keep 20000 tokens recent (not 12 messages)
-        let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16_384);
-        let keep_recent_tokens = env::var("DEX_KEEP_RECENT_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20_000);
-        let connect_secs: u64 = env::var("DEX_HTTP_CONNECT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        let request_secs: u64 = env::var("DEX_HTTP_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let reserve_tokens = env_parse("DEX_RESERVE_TOKENS", 16_384);
+        let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
+        let connect_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
+        let request_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
         // Streaming generations must not have a total request timeout:
         // reqwest's `.timeout()` covers the whole SSE body, killing long
         // generations with `error decoding response body`. The default path
