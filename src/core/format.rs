@@ -625,6 +625,23 @@ pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
 }
 
+/// Child-agent lifecycle system lines (`[agent <name>:<id>] started|finished
+/// …`, formatted in `subagent/tools.rs` / `subagent/manager.rs`) get their own
+/// spawn/terminal marker so a delegation pops out of the muted system notes,
+/// like the per-tool glyphs do. One owner for the TUI and the headless REPL —
+/// the format lives in two emit sites, so the parser must not be duplicated.
+/// Returns the marker (`◈` spawn / `◇` terminal) and the text after the
+/// `[agent ` prefix.
+pub(crate) fn agent_lifecycle(s: &str) -> Option<(&'static str, &str)> {
+    let rest = s.strip_prefix("[agent ")?;
+    let marker = if rest.contains(" finished ") {
+        "◇"
+    } else {
+        "◈"
+    };
+    Some((marker, rest))
+}
+
 /// Model-facing text for a `!`/`!!` shell run:
 /// the persisted message the next turn reads. The output is already clamped
 /// for the context window by the bash tool. Single owner for the daemon
@@ -1179,6 +1196,23 @@ mod tests {
     /// shared [`PREVIEW_LINE_COLS`] budget.
     fn display_cols(s: &str) -> usize {
         UnicodeWidthStr::width(s)
+    }
+
+    #[test]
+    fn agent_lifecycle_markers() {
+        // The two emit formats (spawn in `subagent/tools.rs`, terminal in
+        // `subagent/manager.rs`) must both parse — a wording change here
+        // downgrades the lines to muted system notes.
+        let (marker, rest) = agent_lifecycle("[agent explorer:sess-1] started").unwrap();
+        assert_eq!(marker, "◈");
+        assert_eq!(rest, "explorer:sess-1] started");
+        let (marker, rest) =
+            agent_lifecycle("[agent explorer:sess-1] finished completed · 3 tok").unwrap();
+        assert_eq!(marker, "◇");
+        assert_eq!(rest, "explorer:sess-1] finished completed · 3 tok");
+        // Non-lifecycle system notes stay muted.
+        assert!(agent_lifecycle("obs pack: bash result 45 KiB archived").is_none());
+        assert!(agent_lifecycle("").is_none());
     }
 
     /// The budget's canonical cut of `l`-filler: budget-1 columns of content
