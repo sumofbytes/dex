@@ -2454,6 +2454,24 @@ pub(crate) fn doctor(
                     "models.dev catalog / measured fallback",
                 );
             }
+            let (obs_pack, obs_pack_source) =
+                if env::var_os(crate::agent::obs_pack::OBSERVATION_PACK_ENV).is_some() {
+                    let enabled = crate::agent::obs_pack::observation_pack_enabled();
+                    (
+                        if enabled { "on" } else { "off" },
+                        crate::agent::obs_pack::OBSERVATION_PACK_ENV,
+                    )
+                } else {
+                    (
+                        if crate::agent::obs_pack::observation_pack_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        "built-in default (off)",
+                    )
+                };
+            row(&mut out, "obs pack", obs_pack, obs_pack_source);
 
             let (chain_effort, effort_source) =
                 if let Some(e) = stored_thinking_effort(&base_url, &model) {
@@ -4651,8 +4669,10 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "DEX_MODEL",
             "OPENCODE_API_KEY",
+            "DEX_OBSERVATION_PACK",
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::remove_var("DEX_OBSERVATION_PACK");
         // Point at a missing file so the host config can't color the output.
         std::env::set_var(
             "DEX_CONFIG",
@@ -4664,6 +4684,42 @@ pub(crate) mod tests {
         assert!(out.contains("OPENCODE_API_KEY"), "{out}");
         assert!(out.contains("built-in default"), "{out}");
         assert!(out.contains("resolve"), "{out}");
+        // Observation pack row: default off, origin named.
+        let obs = out
+            .lines()
+            .find(|l| l.starts_with("obs pack "))
+            .expect("obs pack row");
+        assert!(obs.contains("off"), "{obs}");
+        assert!(obs.contains("built-in default"), "{obs}");
+    }
+
+    /// The obs pack row reflects `DEX_OBSERVATION_PACK=1` and names the env
+    /// var as its origin.
+    #[test]
+    fn doctor_reports_obs_pack_env() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "OPENCODE_API_KEY",
+            "DEX_OBSERVATION_PACK",
+        ]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-obs-doctor-{}", std::process::id())),
+        );
+        std::env::set_var("DEX_OBSERVATION_PACK", "1");
+        let out = doctor(None, None, None, &[]);
+        let obs = out
+            .lines()
+            .find(|l| l.starts_with("obs pack "))
+            .expect("obs pack row");
+        assert!(obs.contains("on"), "{obs}");
+        assert!(obs.contains("DEX_OBSERVATION_PACK"), "{obs}");
     }
 
     /// Rows whose value overflows the value column wrap instead of

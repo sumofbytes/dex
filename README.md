@@ -507,8 +507,9 @@ schema):
 | `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result. |
 | `delegate_stop`* | Cancel a running child and return its terminal result. |
 | `update_plan`† | Replace the complete working plan (`steps`, optional `progress`). A completed step is a compaction boundary. Behind `DEX_ONLINE_COMPACTION=1`. |
+| `obs_recall`‡ | Read one page of an archived large tool result (`id`, optional byte `offset`); continue with the returned `next_offset`. Behind `DEX_OBSERVATION_PACK=1`. |
 
-`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. `†` behind `DEX_ONLINE_COMPACTION=1`. Tool results are truncated before being sent back to the model, and a result
+`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. `†` behind `DEX_ONLINE_COMPACTION=1`. `‡` behind `DEX_OBSERVATION_PACK=1` — large tool results (> 10 KB) are sent in full for their first 2 provider requests, then replaced with a placeholder; the original bytes are archived beside the session JSONL and paged back with this tool. Tool results are truncated before being sent back to the model, and a result
 cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path`, any `bash`, or any call carrying `then_run` (which runs a shell command) serializes the batch.
 
 `write`/`edit` take an optional `then_run` shell command that runs in the same call *after* a successful change, so a build, formatter or
@@ -582,6 +583,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default. |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
 | `DEX_ONLINE_COMPACTION` | `1` to enable online context compaction: adds the `update_plan` tool and compacts at completed plan steps when the cache re-write pays for itself. While on, the fixed message-count cap is suspended (the token threshold still bounds growth). |
+| `DEX_OBSERVATION_PACK` | `1` to enable the observation pack: tool results > 10 KB stop being re-sent after a 2-request grace period and are replaced with placeholders; `obs_recall` pages the archived original back. Compaction, resume, and fork still see intact history. |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
