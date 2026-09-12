@@ -2195,7 +2195,8 @@ async fn session_shell(
     // the co-located transcript rebuild draws from the message above.
     let input_json = serde_json::json!({"command": command}).to_string();
     let short = crate::core::format::short_arg("bash", &input_json);
-    let summary = crate::core::format::tool_result_summary("bash", &input_json, &output, success);
+    let summary =
+        crate::core::format::tool_result_summary("bash", &input_json, &output, success, None);
     let preview = crate::core::format::tool_preview("bash", success, None, &output, true);
     let (call_seq, result_seq) = state.next_seq_pair(&session_id);
     let call_event = serde_json::to_string(&StreamEvent::ToolCall {
