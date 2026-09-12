@@ -6,7 +6,7 @@ use super::http::{ChatOptions, DaemonClient};
 
 fn prompt_for_approval(name: &str, input: &str) -> ApprovalDecision {
     use crate::core::format::{approval_details, approval_summary, approval_title};
-    let title = approval_title(name);
+    let title = approval_title(name, input);
     let summary = approval_summary(name, input);
     let details = approval_details(name, input);
     eprintln!();
