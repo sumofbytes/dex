@@ -21,6 +21,7 @@ use ratatui::Terminal;
 
 use crate::cli::Args;
 use crate::client::http::{ChatOptions, ChatStream, DaemonClient};
+use crate::core::console::{DIM, RESET};
 use crate::core::types::{
     ApiProtocol, ApprovalDecision as CoreApprovalDecision, PermissionMode, Provider, SinkLine,
 };
@@ -351,7 +352,14 @@ fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     )])
 }
 
-pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std::io::Result<()> {
+/// `daemon_is_local` says whether this process owns the daemon it talks to
+/// (`Mode::Default`) rather than connecting to one it does not (`Mode::Connect`).
+/// It decides the quit-time resume command — see `resume_command`.
+pub(crate) fn run_ratatui_repl_with_remote(
+    args: &Args,
+    daemon_url: &str,
+    daemon_is_local: bool,
+) -> std::io::Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
@@ -545,6 +553,22 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
             &mut remote.app,
             format!("reattached to session {session_id}"),
         );
+        // The daemon resolves the tool workspace from its own cwd, not the
+        // session header (`create_session` records the daemon cwd for exactly
+        // that reason). Reattaching across directories therefore replays this
+        // session while `read`/`write`/`bash` land in *this* tree — say so
+        // instead of surprising them mid-turn.
+        let session_cwd = remote.app.session.cwd().to_string();
+        let workspace_cwd = remote.app.cwd.clone();
+        if !same_workspace(&session_cwd, &workspace_cwd) {
+            push_info(
+                &mut remote.app,
+                format!(
+                    "dex: this session came from {session_cwd}; tools run in {workspace_cwd} \
+                     (the daemon workspace) — `cd {session_cwd}` to reattach there"
+                ),
+            );
+        }
     }
 
     // Detect the terminal background before raw mode / the alternate screen
@@ -575,7 +599,7 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // from the theme query above or from anything else querying this tty,
     // at any time — are swallowed whole by `strip_osc_report` in the event
     // loop below.
-    let _cleanup = TerminalCleanup;
+    let cleanup = TerminalCleanup;
     let mut stdout = io::stdout();
     // Wheel reporting (DECSET 1000 + SGR 1006): scroll events arrive as real
     // `Event::Mouse` input instead of the terminal synthesizing Up/Down arrow
@@ -750,16 +774,36 @@ pub(crate) fn run_ratatui_repl_with_remote(args: &Args, daemon_url: &str) -> std
     // error) — otherwise a stale agent row lingers in the Herdr sidebar.
     herdr.release();
     // Always restore the terminal, even if the loop returned early via `?`.
-    // The Kitty disambiguate pop is intentionally left to `TerminalCleanup`'s
-    // Drop: enhancement flags are a push/pop stack, so popping here *and* in
-    // Drop would pop twice and unbalance a terminal we don't own (e.g. when
-    // nested in another Kitty-aware app). Drop runs on every path.
     disable_raw_mode().ok();
     let _ = execute!(
         io::stdout(),
         LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableMouseCapture
+    );
+    // Drop `TerminalCleanup` here rather than at the end of the function. Its
+    // Drop writes `CSI ?1049l` / the Kitty pop, and `CSI ?1049l` also *restores
+    // the cursor* to where it sat before the TUI (xterm's `srm_OPT_ALTBUF_CURSOR`,
+    // followed by DECRC). Left to the end, that lands after the resume hint, the
+    // shell redraws its prompt on the restored line, and the prompt overwrites
+    // the hint's prefix — leaving just the tail (the session id) visible.
+    // Drop runs on every path, so the early returns above stay covered. The
+    // Kitty disambiguate pop stays there (not in the `execute!` above): the
+    // flags are a push/pop stack, so popping in both places would unbalance a
+    // terminal we don't own (e.g. nested in another Kitty-aware app).
+    drop(cleanup);
+    // ratatui's `Terminal` Drop re-shows the cursor; nothing may follow the hint.
+    drop(terminal);
+    // The session outlives the TUI (the daemon persisted it), so hand the user
+    // the exact command to come back instead of making them hunt `/resume`.
+    // Printed on every quit, reattach included: the id and the daemon URL are
+    // what the user needs, and they are not always the ones they typed. Nothing
+    // may be written to the terminal after this point.
+    print_resume_hint(
+        daemon_url,
+        &remote.session_id,
+        remote.app.session.cwd(),
+        daemon_is_local,
     );
     res
 }
@@ -1343,9 +1387,9 @@ fn strip_osc_report(ev: Event, pending: &mut VecDeque<Event>) -> std::io::Result
     Ok(Some(lead_in_ev))
 }
 
-/// How the engine is reached: loopback daemons are "local", everything else
-/// is reported by host. Used by the status bar instead of a startup banner.
-pub(crate) fn connection_label(daemon_url: &str) -> String {
+/// Host part of a daemon URL with any userinfo/port/path stripped; a bracketed
+/// IPv6 literal keeps its brackets.
+fn url_host(daemon_url: &str) -> &str {
     let authority = daemon_url
         .split_once("://")
         .map_or(daemon_url, |(_, rest)| rest);
@@ -1357,14 +1401,20 @@ pub(crate) fn connection_label(daemon_url: &str) -> String {
     };
     // Bracketed IPv6 literals: everything through `]` is the host, the rest
     // (if any) is the port. Otherwise a trailing `:digits` is a port.
-    let host = if let Some(close) = authority.find(']') {
+    if let Some(close) = authority.find(']') {
         &authority[..=close]
     } else {
         match authority.rsplit_once(':') {
             Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
             _ => authority,
         }
-    };
+    }
+}
+
+/// How the engine is reached: loopback daemons are "local", everything else
+/// is reported by host. Used by the status bar instead of a startup banner.
+pub(crate) fn connection_label(daemon_url: &str) -> String {
+    let host = url_host(daemon_url);
     if is_loopback(host) {
         format!("[L] {host}")
     } else {
@@ -1379,6 +1429,80 @@ fn is_loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     let octets: Vec<_> = bare.split('.').collect();
     octets.len() == 4 && octets[0] == "127" && octets[1..].iter().all(|o| o.parse::<u8>().is_ok())
+}
+
+/// True when both strings name the same directory. Best-effort: a path that no
+/// longer exists (deleted checkout) falls back to a literal comparison.
+fn same_workspace(left: &str, right: &str) -> bool {
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    canon(left) == canon(right)
+}
+
+/// Quote a value for the shell only when it needs it, so the common case stays
+/// copy-pasteable (`--reattach sess-1`, not `'sess-1'`).
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | ':' | '@' | '_' | '-' | '+' | '=' | ',' | '~')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Command that brings the user back to this session.
+///
+/// Locality comes from how the client was invoked, never from the URL host: a
+/// loopback URL is still remote when it is an SSH port-forward or a daemon in
+/// another container, and a bare local `dex --reattach` against it would 404.
+///
+/// A locally owned daemon resolves its workspace from its own cwd, so when the
+/// session came from a different directory the command has to `cd` back first —
+/// the id carries the workspace *name*, never its path.
+fn resume_command(
+    daemon_url: &str,
+    session_id: &str,
+    session_cwd: &str,
+    daemon_is_local: bool,
+) -> String {
+    let session_id = shell_quote(session_id);
+    if !daemon_is_local {
+        return format!(
+            "dex connect {} --reattach {session_id}",
+            shell_quote(daemon_url)
+        );
+    }
+    let client_cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if same_workspace(session_cwd, &client_cwd) {
+        format!("dex --reattach {session_id}")
+    } else {
+        format!(
+            "cd {} && dex --reattach {session_id}",
+            shell_quote(session_cwd)
+        )
+    }
+}
+
+/// Show the resume command after the alternate screen is gone so it lands in
+/// the shell's scrollback next to the prompt. Must be the last write to the
+/// terminal: any escape sequence after it (a stray `CSI ?1049l`) restores the
+/// cursor onto this line and the shell's next prompt overwrites it. The one
+/// exception is the SGR pair around the text, which neither moves the cursor
+/// nor ends the line — and `RESET` before the closing newline keeps the
+/// shell's next prompt in its own colors.
+fn print_resume_hint(daemon_url: &str, session_id: &str, session_cwd: &str, daemon_is_local: bool) {
+    let command = resume_command(daemon_url, session_id, session_cwd, daemon_is_local);
+    // Dim only on a terminal: redirected stderr should stay greppable.
+    if io::stderr().is_terminal() {
+        eprintln!("\n{DIM}To resume this session: {command}{RESET}");
+    } else {
+        eprintln!("\nTo resume this session: {command}");
+    }
 }
 
 /// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
@@ -2594,6 +2718,60 @@ mod tests {
         assert_eq!(
             connection_label("https://agent.example.com/api"),
             "[R] agent.example.com"
+        );
+    }
+
+    #[test]
+    fn resume_command_matches_invocation_not_url_host() {
+        let here = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Locally owned daemon, same workspace: the id alone is enough.
+        assert_eq!(
+            resume_command("http://127.0.0.1:4113", "dex-k3m9x2qp7w4n8t5v", &here, true),
+            "dex --reattach dex-k3m9x2qp7w4n8t5v"
+        );
+        // Locally owned daemon but a session from elsewhere: its tools are
+        // confined to the daemon cwd, so the command must cd back first.
+        assert_eq!(
+            resume_command(
+                "http://127.0.0.1:4113",
+                "dex-k3m9x2qp7w4n8t5v",
+                "/srv/other-repo",
+                true
+            ),
+            "cd /srv/other-repo && dex --reattach dex-k3m9x2qp7w4n8t5v"
+        );
+        // A loopback URL can still be remote (SSH port-forward, container):
+        // `connect` means this process does not own that daemon.
+        assert_eq!(
+            resume_command("http://127.0.0.1:4113", "sess-1", "/srv/other-repo", false),
+            "dex connect http://127.0.0.1:4113 --reattach sess-1"
+        );
+        assert_eq!(
+            resume_command(
+                "https://agent.example.com",
+                "sess-1",
+                "/srv/other-repo",
+                false
+            ),
+            "dex connect https://agent.example.com --reattach sess-1"
+        );
+        // Shell metacharacters (globs, separators, spaces) get quoted.
+        assert_eq!(
+            resume_command(
+                "http://user:pw@host:8420/x?t=1",
+                "sess-1",
+                "/srv/other-repo",
+                false
+            ),
+            "dex connect 'http://user:pw@host:8420/x?t=1' --reattach sess-1"
+        );
+        assert_eq!(
+            shell_quote("/srv/my repo"),
+            "'/srv/my repo'",
+            "a cwd with a space must survive one shell round trip"
         );
     }
 

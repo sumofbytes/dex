@@ -183,6 +183,14 @@ impl Session {
     /// outside `[a-z0-9]` folded to `-`; the suffix is 7 k8s-style
     /// `[a-z0-9]` chars, unique per session (see `Session::new`).
     pub(crate) fn default_session_name(cwd: &str) -> String {
+        format!("{}-{}", Self::workspace_slug(cwd), Self::random_suffix(7))
+    }
+
+    /// The cwd basename, lowercased, anything outside `[a-z0-9]` folded to `-`,
+    /// runs collapsed and trimmed, capped at 32 chars, `session` when nothing
+    /// survives. Shared by the session name and id so both carry the workspace
+    /// *name* — the basename, not the path, so `/srv/dex` and `~/dex` agree.
+    fn workspace_slug(cwd: &str) -> String {
         let base = std::path::Path::new(cwd)
             .file_name()
             .and_then(|s| s.to_str())
@@ -207,18 +215,33 @@ impl Session {
                 slug = "session".to_string();
             }
         }
-        format!("{}-{}", slug, Self::random_suffix_7())
+        slug
     }
 
-    /// 7 random `[a-z0-9]` chars sourced from a v4 UUID (OS RNG, already a
-    /// dependency): 36^7 combinations, no coordination needed.
-    fn random_suffix_7() -> String {
+    /// `n` random `[a-z0-9]` chars (`n <= 16`) sourced from a v4 UUID (OS RNG,
+    /// already a dependency). `% 36` per byte is mildly biased and a v4 UUID
+    /// pins the version/variant bits (bytes 6 and 8), so 16 chars is ~78 bits
+    /// rather than 36^16 — still far past collision-free for one sessions dir.
+    fn random_suffix(n: usize) -> String {
         const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        debug_assert!(n <= 16, "a v4 UUID only carries 16 bytes");
         let bytes = *uuid::Uuid::new_v4().as_bytes();
-        bytes[..7]
+        bytes[..n]
             .iter()
             .map(|b| ALPHABET[usize::from(*b % 36)] as char)
             .collect()
+    }
+
+    /// Session id: `<workspace>-<16 k8s-style [a-z0-9] chars>`, e.g.
+    /// `dex-k3m9x2qp7w4n8t5v`. The workspace prefix is the workspace *name*
+    /// (basename, not path), so an id shown without its header hints where it
+    /// came from — the quit-time resume hint, daemon logs. Uniqueness still
+    /// rests on the 16 random chars, which must cover every sessions directory
+    /// at once because the id is both the JSONL filename and the daemon
+    /// registry key. Creation order comes from the header `timestamp`, not the
+    /// id.
+    fn new_id(cwd: &str) -> String {
+        format!("{}-{}", Self::workspace_slug(cwd), Self::random_suffix(16))
     }
 
     pub(crate) fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
@@ -228,10 +251,27 @@ impl Session {
             Some(n) if !n.is_empty() => Some(n),
             _ => Some(Self::default_session_name(&cwd)),
         };
-        let id = format!("{}_{}", Self::now_ms(), uuid4());
         let dir = Self::session_dir().join(Self::cwd_slug(&cwd));
         fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.jsonl", id));
+        // The id is both the filename and the daemon registry key, so
+        // uniqueness rests on its 16 random chars (see `new_id`). `create_new`
+        // refuses a name that is already taken instead of appending a second
+        // header to someone else's session; a collision just draws a new id.
+        let mut attempts = 0;
+        let (id, path, mut file) = loop {
+            attempts += 1;
+            let id = Self::new_id(&cwd);
+            let path = dir.join(format!("{}.jsonl", id));
+            match fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(file) => break (id, path, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempts < 8 => continue,
+                Err(e) => return Err(e),
+            }
+        };
         let header = SessionHeader {
             entry_type: "session".to_string(),
             version: SESSION_VERSION,
@@ -241,10 +281,6 @@ impl Session {
             name,
         };
         let line = serde_json::to_string(&header).map_err(io::Error::other)?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
         writeln!(file, "{}", line)?;
         let mut session = Self {
             header,
@@ -382,7 +418,7 @@ impl Session {
             header: SessionHeader {
                 entry_type: "session".to_string(),
                 version: SESSION_VERSION,
-                id: format!("{}_{}", Self::now_ms(), uuid4()),
+                id: Self::new_id(&cwd),
                 timestamp: Self::now_iso(),
                 cwd,
                 name: None,
@@ -640,14 +676,14 @@ impl Session {
             .unwrap_or_default()
             .to_rfc3339()
     }
-    fn now_ms() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    }
     pub(crate) fn id(&self) -> &str {
         &self.header.id
+    }
+    /// The workspace the session was recorded from (its header cwd). The tool
+    /// workspace is the daemon's cwd, so the two differ after a cross-directory
+    /// reattach.
+    pub(crate) fn cwd(&self) -> &str {
+        &self.header.cwd
     }
     pub(crate) fn name(&self) -> Option<&str> {
         self.header.name.as_deref()
@@ -809,10 +845,6 @@ impl Session {
         }
         state
     }
-}
-
-fn uuid4() -> String {
-    uuid::Uuid::new_v4().to_string()
 }
 
 /// Serialize discovered skills for the session-start `skills` state entry:
@@ -1497,12 +1529,44 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let header: SessionHeader = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(header.name(), Some(name.as_str()));
+        // The id is `<workspace>-<16 chars>`: self-describing so the resume
+        // hint and daemon logs say which workspace *name* a session belongs to.
+        let id = s.id().to_string();
+        let (id_slug, id_suffix) = id.rsplit_once('-').unwrap();
+        assert_eq!(id_slug, "dex-name-default", "got: {id}");
+        assert_eq!(id_suffix.len(), 16, "got: {id}");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "got: {id}"
+        );
+        // The same slug rules drive the name's workspace half, so id and name
+        // agree on the workspace even though the suffixes are drawn separately.
+        assert_eq!(id_slug, name.rsplit_once('-').unwrap().0);
+        assert!(Session::new_id("/").starts_with("session-"));
+        assert!(Session::new_id("").starts_with("session-"));
+        assert_eq!(path.file_stem().and_then(|s| s.to_str()), Some(id.as_str()));
         let _ = std::fs::remove_file(&path);
 
         let s = Session::new("/tmp/dex-name-explicit".into(), Some("mine".into())).unwrap();
         assert_eq!(s.name(), Some("mine"));
         let path = s.path().unwrap().to_path_buf();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_ids_are_unique_within_a_workspace() {
+        // The id is both the JSONL filename and the daemon registry key, and
+        // the old epoch prefix is gone: distinctness rests entirely on the 16
+        // random chars, so two sessions in one workspace must never collide.
+        let ids: std::collections::HashSet<String> = (0..256)
+            .map(|_| Session::new_id("/tmp/dex-unique-workspace"))
+            .collect();
+        assert_eq!(ids.len(), 256);
+        assert_ne!(
+            Session::new_id("/tmp/dex-unique-workspace"),
+            Session::new_id("/tmp/dex-unique-workspace")
+        );
     }
 
     #[tokio::test]

@@ -33,7 +33,8 @@ to build, test, and submit changes. Please follow the
   direct commands without the agent.
 - **Session persistence** — each conversation is saved as a crash-safe JSONL
   journal. A fresh session starts by default; use `--session` to explicitly
-  continue one.
+  continue one, or `--reattach <id>` to reattach to a daemon session. Quitting
+  the TUI prints the exact resume command for that session.
 - **Skills** — lightweight, discoverable agent skills (directories with a
   `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
   demand via `/skill:<name>`.
@@ -360,7 +361,7 @@ the daemon's working directory.
 | `-n`, `--new`      | Start a new session (the default).                       |
 | `--permission <mode>` | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted` (default `trusted`). |
 | `--name <name>`    | Name the session (default `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`).                                    |
-| `--reattach <id>`  | Attach to an existing daemon session and replay its event journal. |
+| `--reattach <id>`  | Attach to an existing daemon session and replay its event journal (bare `dex` or `dex connect <url>`, no prompt). |
 | `--skill <dir>`    | Add an extra skill directory to discover skills from.    |
 | `--tool`           | Run raw JSON tool mode (read JSON lines from stdin).     |
 
