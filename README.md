@@ -433,6 +433,7 @@ and `Esc`/`Ctrl+C` cancels it. `dex "!<command>"` and
 - **Alt+Up while working** — recall queued steers (newest first), then follow-ups, back into the composer to edit them before delivery; press again for the next one.
 - **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages (a third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt clears it first, and **Ctrl+D** on an empty line quits.
 - **Ctrl+T** — expand/collapse the full thinking block.
+- **Alt+V** — cycle your voice color (plain by default; magenta → sky → peach → violet → rose → amber → coral → plain); the composer and new prompts use it, already-sent rows keep theirs.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the transcript.
 - **Paste** — pasted text is inserted at the cursor.
 - **Mouse wheel** — scrolls the transcript. **Drag** — selects transcript text with a visible highlight and copies it to the clipboard on release (OSC 52; a click just clears). **Shift+drag** (Option+drag in iTerm2) still bypasses mouse reporting for native selection; tmux users may need `set -g set-clipboard on`.

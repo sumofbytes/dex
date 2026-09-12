@@ -1,0 +1,19 @@
+# Local patch for `lru` (GHSA-rhfx-m35p-ff5j: `IterMut` violates Stacked
+# Borrows). ratatui 0.29 pins `lru = "^0.12"`, and upstream shipped no fixed
+# 0.12.x (the fix landed in 0.16.3). We can't move to ratatui 0.30, which
+# drops lru entirely, because ratatui-markdown 0.3.6 caps ratatui at ^0.29.
+# This crate keeps the 0.12 version that ratatui's requirement needs while
+# re-exporting the patched upstream code, so the vulnerable implementation
+# never enters the dependency graph.
+[package]
+name = "lru"
+version = "0.12.6"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "lru"
+
+[dependencies]
+lru_upstream = { package = "lru", version = "0.16.3" }
