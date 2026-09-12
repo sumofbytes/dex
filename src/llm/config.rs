@@ -2028,10 +2028,16 @@ impl LlmConfig {
     }
 
     /// Cache-write / cache-read price ratio for the configured model, from
-    /// the models.dev catalog when it prices cache writes. Feeds the online
-    /// compaction economics; the OpenAI-compatible endpoints dex speaks
-    /// usually omit cache-write pricing, so the Anthropic-5m-derived default
-    /// (1.25x write / 0.1x read) applies.
+    /// the models.dev catalog when it prices the model. Feeds the online
+    /// compaction economics. Billing follows `usage_cost`: cache reads (and
+    /// writes) with no catalog rate bill at the plain input rate, so the
+    /// ratio is `write_rate / read_rate` — an explicit write surcharge
+    /// (Anthropic-style), `input / cache_read` when writes bill at the
+    /// plain input rate (the industry norm), and 1.0 when the provider
+    /// prices no caching at all (reads bill at input price, so re-writing
+    /// after a compaction costs the same as reading it). The measured
+    /// cross-provider fallback only covers models the catalog doesn't
+    /// price.
     pub(crate) fn cache_write_read_ratio(&self) -> f64 {
         const FALLBACK: f64 = crate::agent::online::DEFAULT_CACHE_WRITE_READ_RATIO;
         let Some(catalog) = load_dex_catalog() else {
@@ -2052,11 +2058,14 @@ impl LlmConfig {
                 .iter()
                 .find_map(|name| cost_val.get(*name).and_then(|v| v.as_f64()))
         };
-        match (
-            rate(&["cache_write", "cacheWrite"]),
-            rate(&["cache_read", "cacheRead"]),
-        ) {
-            (Some(write), Some(read)) if read > 0.0 && write > 0.0 => write / read,
+        let input_rate = rate(&["input"]).filter(|r| *r > 0.0);
+        // Same unbilled-rate assumptions as `usage_cost`: a missing rate
+        // bills at the input price, so `write / read` covers every pricing
+        // shape the catalog actually carries.
+        let read_rate = rate(&["cache_read", "cacheRead"]).or(input_rate);
+        let write_rate = rate(&["cache_write", "cacheWrite"]).or(input_rate);
+        match (write_rate, read_rate) {
+            (Some(write), Some(read)) if write > 0.0 && read > 0.0 => write / read,
             _ => FALLBACK,
         }
     }
@@ -2429,6 +2438,23 @@ pub(crate) fn doctor(
                 .unwrap_or(chain_ctx);
             row(&mut out, "context", &format!("{ctx} tokens"), &ctx_source);
 
+            // Online compaction economics: the cache re-write cost gate.
+            // Resolved live (same chain as `cache_write_read_ratio`), with
+            // the fallback spelled out so the origin is never a mystery.
+            if crate::agent::online::online_compaction_enabled() {
+                row(
+                    &mut out,
+                    "online",
+                    format!(
+                        "cache write/read ratio {:.2} (DEX_ONLINE_COMPACTION)",
+                        live.map(|c| c.cache_write_read_ratio())
+                            .unwrap_or(crate::agent::online::DEFAULT_CACHE_WRITE_READ_RATIO)
+                    )
+                    .as_str(),
+                    "models.dev catalog / measured fallback",
+                );
+            }
+
             let (chain_effort, effort_source) =
                 if let Some(e) = stored_thinking_effort(&base_url, &model) {
                     (e, "stored /thinking choice".to_string())
@@ -2693,6 +2719,68 @@ pub(crate) mod tests {
             Some(4.0)
         );
 
+        match prev_cache {
+            Some(v) => env::set_var("XDG_CACHE_HOME", v),
+            None => env::remove_var("XDG_CACHE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cache-write/read ratio resolution feeding the online compaction
+    /// economics: explicit write surcharge wins, unpriced writes derive
+    /// from input/cache_read (writes bill at the plain input rate), and no
+    /// cache pricing at all falls back to the measured cross-provider
+    /// default. Hermetic catalog via `XDG_CACHE_HOME`.
+    #[test]
+    fn cache_write_read_ratio_resolves_write_unpriced_and_fallback() {
+        // Serializes process-env redirection against other tests.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-ratio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                // Anthropic-style: explicit write surcharge.
+                "anthropic-like": {
+                    "models": {
+                        "surcharge": { "cost": { "input": 3.0, "cache_write": 3.75, "cache_read": 0.3, "output": 15.0 } }
+                    }
+                },
+                // The norm: cache_read priced, writes unpriced (input rate).
+                "plain": {
+                    "models": {
+                        "flat": { "cost": { "input": 1.25, "cache_read": 0.125, "output": 10.0 } }
+                    }
+                },
+                // No cache pricing at all: reads bill at the input rate.
+                "opaque": {
+                    "models": {
+                        "nada": { "cost": { "input": 2.0, "output": 8.0 } }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let prev_cache = env::var_os("XDG_CACHE_HOME");
+        env::set_var("XDG_CACHE_HOME", &dir);
+        let mut cfg = test_cfg();
+        // No model match at all → measured fallback.
+        assert!((cfg.cache_write_read_ratio() - 5.0).abs() < 1e-9);
+        cfg.model = "flat".into();
+        // Writes at the plain input rate: 1.25 / 0.125 = 10.
+        assert!((cfg.cache_write_read_ratio() - 10.0).abs() < 1e-9);
+        cfg.model = "surcharge".into();
+        // Explicit surcharge: 3.75 / 0.3 = 12.5.
+        assert!((cfg.cache_write_read_ratio() - 12.5).abs() < 1e-9);
+        cfg.model = "nada".into();
+        // No cache rates: both bill at input (like `usage_cost`), so a
+        // re-write after compaction costs exactly what a read costs → 1.0,
+        // and the economics see no surcharge to amortize.
+        assert!((cfg.cache_write_read_ratio() - 1.0).abs() < 1e-9);
         match prev_cache {
             Some(v) => env::set_var("XDG_CACHE_HOME", v),
             None => env::remove_var("XDG_CACHE_HOME"),

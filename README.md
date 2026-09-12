@@ -39,7 +39,7 @@ to build, test, and submit changes. Please follow the
   `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
   demand via `/skill:<name>`.
 - **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
-- **Online context compaction** — set `DEX_ONLINE_COMPACTION=1` to add an `update_plan` tool: the model keeps a working plan, and each completed step is a safe point where history may compact early if the cache re-write cost pays for itself within the projected remaining work (horizon learned from requests-per-boundary; port of SoL-Pi's online-context-compact).
+- **Online context compaction** — set `DEX_ONLINE_COMPACTION=1` to add an `update_plan` tool: the model keeps a working plan, and each completed step is a safe point where history may compact early if the cache re-write cost pays for itself within the projected remaining work (horizon learned from requests-per-boundary; port of SoL-Pi's online-context-compact). Cache-write/read pricing resolves from the models.dev catalog for the running model — explicit write surcharge, else `input / cache_read` (writes bill at the plain input rate), else `1.0` when the provider prices no caching (reads then bill at the input rate, so a re-write costs what a read costs) — with a measured cross-provider fallback of 5.0 for unpriced models.
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
 - **Runtime logging** — `DEX_LOG=off|error|warn|info|debug|trace` with a
@@ -581,6 +581,7 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_LOG` | Runtime log level: `off`, `error`, `warn` (default), `info`, `debug`, `trace` — works on release builds. Logs go to stderr, or to `$XDG_DATA_HOME/dex/dex.log` while the TUI runs. `debug` covers provider requests/responses and tool runs; `trace` adds raw provider SSE lines. |
 | `DEX_VERIFY`    | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default. |
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
+| `DEX_ONLINE_COMPACTION` | `1` to enable online context compaction: adds the `update_plan` tool and compacts at completed plan steps when the cache re-write pays for itself. While on, the fixed message-count cap is suspended (the token threshold still bounds growth). |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
