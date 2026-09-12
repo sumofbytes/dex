@@ -516,12 +516,17 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
         },
         "write" => {
             let written = get("content").unwrap_or_default().lines().count();
-            format!("{} line{} written", written, plural(written))
+            format!(
+                "{} line{} written{}",
+                written,
+                plural(written),
+                then_run_tail(text)
+            )
         }
         "edit" => {
             let removed = get("oldText").unwrap_or_default().lines().count();
             let added = get("newText").unwrap_or_default().lines().count();
-            format!("+{added} −{removed}")
+            format!("+{added} −{removed}{}", then_run_tail(text))
         }
         "chain" => {
             let steps = obj
@@ -551,6 +556,28 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// The ` · then_run: …` tail for a `write`/`edit` summary whose result carries
+/// a verification marker. Display-only: `ToolOutcome::ok` still means the
+/// mutation landed, so this keeps the verdict ("succeeded" / "failed (exit N)")
+/// in view instead of a bare green "N lines written" that implies the check
+/// passed. The marker is emitted verbatim by `tools::append_then_run`, never
+/// inferred from arbitrary output.
+fn then_run_tail(text: &str) -> String {
+    match then_run_verdict(text) {
+        Some(verdict) => format!(" · then_run: {verdict}"),
+        None => String::new(),
+    }
+}
+
+/// The verdict inside the last `[then_run:…]` marker in `text`, if any.
+fn then_run_verdict(text: &str) -> Option<String> {
+    let start = text.rfind("\n\n[then_run:")? + 2;
+    let body = text[start..].strip_prefix("[then_run:")?;
+    let end = body.find(']')?;
+    let verdict = body[..end].trim();
+    (!verdict.is_empty()).then(|| verdict.to_string())
 }
 
 /// A grep content-mode row is a match when shaped `path:123:text`; context
@@ -636,7 +663,12 @@ pub(crate) fn bash_context_text(
 /// `{"path":…}` / `{"command":…}` payloads into the short, scannable
 /// lines the overlay and CLI prompt show. No filesystem IO, pure formatting.
 /// ponytail: one place for all tool-to-human mapping; add a tool → add a branch.
-pub(crate) fn approval_title(name: &str) -> &'static str {
+pub(crate) fn approval_title(name: &str, input: &str) -> &'static str {
+    // A `then_run` makes a file write a shell command too; say so in the
+    // title rather than presenting it as a plain write.
+    if matches!(name, "write" | "edit") && input_has_then_run(input) {
+        return "File change + shell verification";
+    }
     match name {
         "bash" => "Run shell command",
         "write" => "Create / overwrite file",
@@ -651,13 +683,27 @@ pub(crate) fn approval_title(name: &str) -> &'static str {
     }
 }
 
-pub(crate) fn approval_risk(name: &str) -> (&'static str, ratatui::style::Color) {
+pub(crate) fn approval_risk(name: &str, input: &str) -> (&'static str, ratatui::style::Color) {
     use ratatui::style::Color;
+    // A `then_run` turns a file mutation into a shell command; the approver
+    // must see the same "high" risk as a bare `bash`.
+    if matches!(name, "write" | "edit") && input_has_then_run(input) {
+        return ("high", Color::LightRed);
+    }
     match name {
         "bash" => ("high", Color::LightRed),
         "write" | "edit" => ("medium", Color::Yellow),
         _ => ("low", Color::LightGreen),
     }
+}
+
+/// Whether the raw approval input carries a non-empty `then_run` command —
+/// the same field `then_run_suffix` renders in the summary.
+fn input_has_then_run(input: &str) -> bool {
+    serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|v| v.as_object().map(|obj| then_run_of(Some(obj)).is_some()))
+        .unwrap_or(false)
 }
 
 pub(crate) fn approval_summary(name: &str, input: &str) -> String {
@@ -673,18 +719,14 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
             let path = get("path").unwrap_or("(unknown path)");
             let content = get("content").unwrap_or("");
             let lines = content.lines().count();
-            format!(
-                "{} · {} line{}",
-                path,
-                lines,
-                if lines == 1 { "" } else { "s" }
-            )
+            let plural = if lines == 1 { "" } else { "s" };
+            format!("{path} · {lines} line{plural}{}", then_run_suffix(obj))
         }
         "edit" => {
             let path = get("path").unwrap_or("(unknown path)");
             let old = get("oldText").unwrap_or("").lines().count();
             let new = get("newText").unwrap_or("").lines().count();
-            format!("{} · -{} +{}", path, old, new)
+            format!("{} · -{} +{}{}", path, old, new, then_run_suffix(obj))
         }
         "read" => {
             if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
@@ -721,6 +763,31 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
             })
             .unwrap_or_else(|| "chain".to_string()),
         _ => short_arg(name, input),
+    }
+}
+
+/// A `write`/`edit` carrying `then_run` also runs a shell
+/// command. The approver must see that the file change is not all that will
+/// happen, so every approval surface carries the command. Clipped to one line —
+/// the prompt is a glance, not the transcript.
+fn then_run_of(obj: Option<&serde_json::Map<String, Value>>) -> Option<String> {
+    let command = obj?.get("then_run")?.as_str()?.replace('\n', " ");
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(match command.char_indices().nth(120).map(|(idx, _)| idx) {
+        Some(idx) if idx < command.len() => format!("{}…", &command[..idx]),
+        _ => command.to_string(),
+    })
+}
+
+/// The `· then: …` tail `approval_summary` appends for a `write`/`edit`
+/// carrying `then_run`.
+fn then_run_suffix(obj: Option<&serde_json::Map<String, Value>>) -> String {
+    match then_run_of(obj) {
+        Some(command) => format!(" · then: {command}"),
+        None => String::new(),
     }
 }
 
@@ -765,6 +832,9 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
             if let Some(path) = get("path") {
                 out.push(format!("path: {}", path));
             }
+            if let Some(command) = then_run_of(obj) {
+                out.push(format!("then: $ {command}"));
+            }
             if let Some(content) = get("content") {
                 let lines = content.lines().count();
                 let bytes = content.len();
@@ -799,6 +869,9 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
             let mut out = Vec::new();
             if let Some(path) = get("path") {
                 out.push(format!("path: {}", path));
+            }
+            if let Some(command) = then_run_of(obj) {
+                out.push(format!("then: $ {command}"));
             }
             if let (Some(old), Some(new)) = (get("oldText"), get("newText")) {
                 out.push(format!(
@@ -1112,6 +1185,77 @@ mod tests {
     /// plus the 1-column `…` marker — what any 400+-column line must clip to.
     fn clipped_at_budget() -> String {
         format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1))
+    }
+
+    /// The approval prompt must show the `then_run` shell command. An
+    /// approver who only sees the file diff is approving something broader than
+    /// what the summary describes.
+    #[test]
+    fn approval_prompt_shows_the_then_run_command() {
+        let input = r#"{"path":"src/a.rs","oldText":"a","newText":"b","then_run":"cargo clippy --all-targets"}"#;
+        assert_eq!(
+            approval_summary("edit", input),
+            "src/a.rs · -1 +1 · then: cargo clippy --all-targets"
+        );
+        assert!(
+            approval_details("edit", input)
+                .iter()
+                .any(|line| line == "then: $ cargo clippy --all-targets"),
+            "details must carry the command"
+        );
+        // No then_run → no trace of one.
+        assert_eq!(
+            approval_summary("edit", r#"{"path":"src/a.rs","oldText":"a","newText":"b"}"#),
+            "src/a.rs · -1 +1"
+        );
+        assert!(
+            !approval_details("write", r#"{"path":"x","content":"y"}"#)
+                .iter()
+                .any(|line| line.starts_with("then:")),
+            "a plain write has no command line"
+        );
+    }
+
+    /// A `then_run` mutation is a shell command in disguise: the approval
+    /// overlay must not label it a plain write or under-rate its risk.
+    #[test]
+    fn approval_surface_escalates_a_then_run_mutation() {
+        let input = r#"{"path":"src/a.rs","content":"x","then_run":"cargo test"}"#;
+        assert_eq!(
+            approval_title("write", input),
+            "File change + shell verification"
+        );
+        assert_eq!(approval_risk("write", input).0, "high");
+        // A plain write keeps its title and medium risk.
+        let plain = r#"{"path":"src/a.rs","content":"x"}"#;
+        assert_eq!(approval_title("write", plain), "Create / overwrite file");
+        assert_eq!(approval_risk("write", plain).0, "medium");
+        // …and a blank then_run is not a command.
+        let blank = r#"{"path":"src/a.rs","content":"x","then_run":"  "}"#;
+        assert_eq!(approval_title("write", blank), "Create / overwrite file");
+    }
+
+    /// A failed verification must not leave the transcript summary reading as
+    /// an unqualified success: the mutation landed, so `ok` stays true, but the
+    /// `then_run` verdict rides along.
+    #[test]
+    fn tool_summary_carries_the_then_run_verdict() {
+        let input = r#"{"path":"src/a.rs","content":"x\ny\n","then_run":"cargo test"}"#;
+        let passed = "wrote src/a.rs\n\n[then_run:succeeded] cargo test\nok";
+        assert_eq!(
+            tool_result_summary("write", input, passed, true),
+            "2 lines written · then_run: succeeded"
+        );
+        let failed = "wrote src/a.rs\n\n[then_run:failed (exit 3)] cargo test\nboom";
+        assert_eq!(
+            tool_result_summary("write", input, failed, true),
+            "2 lines written · then_run: failed (exit 3)"
+        );
+        // No marker → the summary is unchanged.
+        assert_eq!(
+            tool_result_summary("write", r#"{"content":"x"}"#, "wrote x", true),
+            "1 line written"
+        );
     }
 
     #[test]

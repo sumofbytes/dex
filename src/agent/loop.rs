@@ -27,8 +27,15 @@ pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
         let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments) else {
             return true;
         };
-        // Calls without a `path` (e.g. `bash`, which can still touch files
-        // via redirection) can't be checked — they never force
+        // `bash`, and any `write`/`edit` carrying `then_run`, spawn a shell
+        // command whose file effects we cannot see from `path` alone. Force
+        // the whole batch through the mutation lock rather than fan out
+        // several concurrent shells — a case the scheduler never had to
+        // consider while these calls were pure file writes.
+        if call.function.name == "bash" || carries_then_run(&value) {
+            return true;
+        }
+        // Calls without a `path` can't be checked — they never force
         // serialization on their own.
         let Some(path) = value.get("path").and_then(Value::as_str) else {
             return false;
@@ -39,6 +46,17 @@ pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
         // second silently clobbers the first.
         !paths.insert(crate::tools::normalize_conflict_path(path))
     })
+}
+
+/// Whether this call carries an executable `then_run` verification command.
+/// Mirrors the resolver in `tools::then_run_command`: only a non-empty string
+/// runs a shell, so a null / blank / wrong-typed field stays a plain write
+/// that can fan out in parallel.
+fn carries_then_run(value: &Value) -> bool {
+    value
+        .get("then_run")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty())
 }
 
 pub(crate) fn persist_pending(
@@ -991,6 +1009,32 @@ mod tests {
             },
         ];
         assert!(!tool_calls_conflict(&different));
+    }
+
+    #[test]
+    fn then_run_forces_serialization() {
+        // A `write`/`edit` carrying `then_run` runs a shell command, so the
+        // batch must serialize even across distinct paths — otherwise N edits
+        // fan out N concurrent shells.
+        let call = |name: &str, args: &str| crate::core::types::LlmToolCall {
+            id: name.into(),
+            call_type: "function".into(),
+            function: crate::core::types::FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        };
+        assert!(tool_calls_conflict(&[
+            call("edit", r#"{"path":"a.rs","then_run":"cargo test"}"#),
+            call("edit", r#"{"path":"b.rs"}"#),
+        ]));
+        // A bare `bash` likewise serializes the batch.
+        assert!(tool_calls_conflict(&[call("bash", r#"{"command":"ls"}"#)]));
+        // A blank `then_run` is not a command: the writes stay parallel.
+        assert!(!tool_calls_conflict(&[
+            call("edit", r#"{"path":"a.rs","then_run":"  "}"#),
+            call("edit", r#"{"path":"b.rs"}"#),
+        ]));
     }
 
     #[test]

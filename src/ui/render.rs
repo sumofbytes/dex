@@ -1543,8 +1543,9 @@ impl ApprovalOverlay {
             .unwrap_or_default();
         // — centered modal, clean readable command —
         let details = crate::core::format::approval_details(&approval.name, &approval.input);
-        let title = crate::core::format::approval_title(&approval.name);
-        let (risk_label, risk_color) = crate::core::format::approval_risk(&approval.name);
+        let title = crate::core::format::approval_title(&approval.name, &approval.input);
+        let (risk_label, risk_color) =
+            crate::core::format::approval_risk(&approval.name, &approval.input);
         let summary = crate::core::format::approval_summary(&approval.name, &approval.input);
         // width clamped so modal feels floating, not full-bleed; height grows with details
         let width = area
