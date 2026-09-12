@@ -1142,13 +1142,28 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
         }
         SinkLine::System(s) => {
             app.assistant_open = false;
-            app.transcript.push(TranscriptBlock::System {
-                stamp: 0,
-                line: indent_transcript_line(Line::from(vec![
+            // Child-agent lifecycle lines (`[agent <name>:<id>] started|
+            // finished …`) get their own bold green glyph so a delegation
+            // pops out of the muted system notes, like the per-tool glyphs
+            // do for tool rows.
+            let line = if let Some(rest) = s.strip_prefix("[agent ") {
+                let glyph = if rest.contains(" finished ") {
+                    "◇ "
+                } else {
+                    "◈ "
+                };
+                indent_transcript_line(Line::from(vec![
+                    Span::styled(glyph, Style::default().fg(Color::Green)),
+                    Span::styled(s, Style::default().fg(Color::Green)),
+                ]))
+            } else {
+                indent_transcript_line(Line::from(vec![
                     Span::styled("· ", Style::default().fg(theme::muted_fg())),
                     Span::styled(s, Style::default().fg(theme::muted_fg())),
-                ])),
-            });
+                ]))
+            };
+            app.transcript
+                .push(TranscriptBlock::System { stamp: 0, line });
         }
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
