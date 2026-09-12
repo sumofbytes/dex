@@ -4752,6 +4752,60 @@ pub(crate) mod tests {
         assert!(obs.contains("DEX_OBSERVATION_PACK"), "{obs}");
     }
 
+    /// The evidence reducer row only appears behind its gate, reports the
+    /// pack gate it depends on, and names `DEX_REDUCER_MODEL` as the model
+    /// origin when it is set.
+    #[test]
+    fn doctor_reports_evidence_reducer_env() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "OPENCODE_API_KEY",
+            "DEX_EVIDENCE_REDUCER",
+            "DEX_OBSERVATION_PACK",
+            "DEX_REDUCER_MODEL",
+        ]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-evidence-doctor-{}", std::process::id())),
+        );
+        // Gate off: no row at all.
+        std::env::remove_var("DEX_EVIDENCE_REDUCER");
+        std::env::remove_var("DEX_OBSERVATION_PACK");
+        std::env::remove_var("DEX_REDUCER_MODEL");
+        let out = doctor(None, None, None, &[]);
+        assert!(
+            !out.lines().any(|l| l.starts_with("evidence reducer")),
+            "gate off must not produce a row: {out}"
+        );
+        // Gate on but the pack off: the row explains what is missing.
+        std::env::set_var("DEX_EVIDENCE_REDUCER", "1");
+        let out = doctor(None, None, None, &[]);
+        let row = out
+            .lines()
+            .find(|l| l.starts_with("evidence reducer"))
+            .expect("evidence reducer row");
+        assert!(row.contains("needs DEX_OBSERVATION_PACK=1"), "{row}");
+        assert!(row.contains("main model"), "{row}");
+        // Pack on: fully enabled, and an explicit reducer model is named
+        // with its env origin.
+        std::env::set_var("DEX_OBSERVATION_PACK", "1");
+        std::env::set_var("DEX_REDUCER_MODEL", "openrouter/z-ai/glm-4.5-air");
+        let out = doctor(None, None, None, &[]);
+        let row = out
+            .lines()
+            .find(|l| l.starts_with("evidence reducer"))
+            .expect("evidence reducer row");
+        assert!(row.contains("on ·"), "{row}");
+        assert!(row.contains("openrouter/z-ai/glm-4.5-air"), "{row}");
+        assert!(row.contains("DEX_REDUCER_MODEL"), "{row}");
+    }
+
     /// Rows whose value overflows the value column wrap instead of
     /// colliding with the origin text; the origin hangs at the origin
     /// column (display columns 11+46 = 57).
