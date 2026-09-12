@@ -236,6 +236,15 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             requires_shell: true,
             permission: PermissionRequirement::Read,
         },
+        // Reads the session's observation archive; never touches the
+        // workspace.
+        "obs_recall" => ToolMetadata {
+            read_only: true,
+            mutating: false,
+            idempotent: true,
+            requires_shell: false,
+            permission: PermissionRequirement::Read,
+        },
         // Pure bookkeeping: validates and echoes the plan snapshot; the
         // agent loop owns the boundary state and compaction decision.
         "update_plan" => ToolMetadata {
@@ -1651,6 +1660,7 @@ pub(crate) async fn execute(
         "git" => tool_git(args, cancel).await,
         "chain" => tool_chain(args, cancel, policy, filter).await,
         "update_plan" => tool_update_plan(args),
+        "obs_recall" => tool_obs_recall(args, cancel, policy),
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
     // Run `then_run` in this same call so the mutation and its
@@ -1684,6 +1694,24 @@ pub(crate) async fn execute(
     };
     audit(name, args, &outcome);
     result
+}
+
+pub(crate) fn tool_obs_recall(
+    args: &Map<String, Value>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
+) -> Result<String, ToolError> {
+    // Only a daemon parent turn carries a session path (same source the
+    // projection reads): OneShot / direct runs / children have none and
+    // fail with a clear error rather than silently succeeding with an
+    // empty archive.
+    let Some(session_path) = policy.agent.as_ref().map(|ctx| ctx.session_path.clone()) else {
+        return Err(ToolError::InvalidArgument(
+            "obs_recall requires a daemon session (no session archive attached)".to_string(),
+        ));
+    };
+    let _ = cancel;
+    crate::agent::obs_pack::tool_obs_recall(&session_path, args)
 }
 
 /// Execute a tool, reporting success explicitly. Callers must not re-derive
@@ -1829,9 +1857,12 @@ mod tests {
 
     #[tokio::test]
     async fn write_and_edit_leave_no_temp_files_and_round_trip() {
+        // Own subdirectory: other tests write into `target/` concurrently, and
+        // their in-flight `.dex-write-*` temp files would race this scan.
+        let dir = "target/dex-atomic-write-test";
         let cwd = std::env::current_dir().unwrap();
-        fs::create_dir_all(cwd.join("target")).unwrap();
-        let rel = "target/dex-atomic-write-test.txt";
+        fs::create_dir_all(cwd.join(dir)).unwrap();
+        let rel = "target/dex-atomic-write-test/file.txt";
         let full = cwd.join(rel);
         let mut args = Map::new();
         args.insert("path".into(), Value::String(rel.into()));
@@ -1855,7 +1886,7 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(fs::read_to_string(&full).unwrap(), "second\n");
-        let strays: Vec<_> = fs::read_dir(cwd.join("target"))
+        let strays: Vec<_> = fs::read_dir(cwd.join(dir))
             .unwrap()
             .flatten()
             .filter(|e| {
@@ -1868,7 +1899,7 @@ mod tests {
             strays.is_empty(),
             "temp files must be renamed away, not left"
         );
-        let _ = fs::remove_file(&full);
+        let _ = fs::remove_dir_all(cwd.join(dir));
     }
 
     /// `then_run` runs after a successful mutation and its output
