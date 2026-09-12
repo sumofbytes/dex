@@ -100,6 +100,10 @@ pub(crate) struct ToolState {
     /// In-memory like the spend totals; a restart relearns at the next
     /// boundary.
     pub(crate) online: crate::agent::online::OnlineState,
+    /// Observation pack send counts (`DEX_OBSERVATION_PACK=1`): per-id
+    /// provider-request counts for the projection. In-memory; a restart
+    /// re-derives the grace period from the next assistant boundary.
+    pub(crate) obs_projection: crate::agent::obs_pack::ProjectionState,
 }
 
 impl ToolState {
