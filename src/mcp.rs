@@ -105,29 +105,37 @@ pub(crate) fn mcp_max_tools() -> usize {
 /// would turn a missing API key into an unauthenticated request.
 pub(crate) fn expand_env(raw: &str) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
-    let bytes = raw.as_bytes();
+    // Walk chars, not bytes: `bytes[i] as char` turned each byte of a
+    // multi-byte char into its own Latin-1 scalar (mojibake: `café$X` ->
+    // `cafÃ©<value>`). `i` is a char index; `start` keeps the byte offset of
+    // the current char for slicing `raw` (only ASCII can be a `$`/`${`
+    // marker, so char boundaries never split one).
+    let chars: Vec<(usize, char)> = raw.char_indices().collect();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'{' {
-                if let Some(end) = raw[i + 2..].find('}') {
-                    let key = &raw[i + 2..i + 2 + end];
+    while i < chars.len() {
+        let (start, c) = chars[i];
+        if c == '$' && i + 1 < chars.len() {
+            if chars[i + 1].1 == '{' {
+                if let Some(end) = raw[start + 2..].find('}') {
+                    let key = &raw[start + 2..start + 2 + end];
                     match std::env::var(key) {
                         Ok(v) => out.push_str(&v),
                         Err(_) => {
                             return Err(format!("mcp config: env var ${{{key}}} is not set"));
                         }
                     }
-                    i += 3 + end;
+                    // `$` + `{` + the key's chars + `}` are all consumed.
+                    i += 3 + key.chars().count();
                     continue;
                 }
             } else {
                 let mut j = i + 1;
-                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                while j < chars.len() && (chars[j].1.is_ascii_alphanumeric() || chars[j].1 == '_') {
                     j += 1;
                 }
                 if j > i + 1 {
-                    let key = &raw[i + 1..j];
+                    let end = chars.get(j).map_or(raw.len(), |&(b, _)| b);
+                    let key = &raw[start + 1..end];
                     match std::env::var(key) {
                         Ok(v) => out.push_str(&v),
                         Err(_) => {
@@ -139,7 +147,7 @@ pub(crate) fn expand_env(raw: &str) -> Result<String, String> {
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(c);
         i += 1;
     }
     Ok(out)
@@ -429,7 +437,10 @@ pub(crate) fn redact_secrets(text: &str) -> String {
 }
 
 fn redact_line(line: &str) -> String {
-    let lower = line.to_lowercase();
+    // `to_ascii_lowercase` preserves byte offsets; `to_lowercase` can expand
+    // non-ASCII (e.g. `İ` -> i + U+0307) and desync `lower` indexes from the
+    // `line`/`as_bytes` indexes below. Same fix as mcp/oauth.rs.
+    let lower = line.to_ascii_lowercase();
     let mut start: Option<usize> = None;
     for marker in SECRET_MARKERS {
         let mut search = 0;
@@ -1640,6 +1651,26 @@ mod tests {
     }
 
     #[test]
+    fn env_vars_expand_non_ascii() {
+        unsafe { std::env::set_var("DEX_MCP_TEST_UNICODE", "héllo") };
+        // Multi-byte chars adjacent to an expansion must pass through
+        // unchanged; `bytes[i] as char` used to mojibake `é` into `Ã©`.
+        assert_eq!(
+            expand_env("café $DEX_MCP_TEST_UNICODE bar").unwrap(),
+            "café héllo bar"
+        );
+        assert_eq!(
+            expand_env("café${DEX_MCP_TEST_UNICODE}!").unwrap(),
+            "caféhéllo!"
+        );
+        // Fail-closed missing-var error still fires next to multi-byte text.
+        assert_eq!(
+            expand_env("café $DEX_MCP_TEST_MISSING bar").unwrap_err(),
+            "mcp config: env var $DEX_MCP_TEST_MISSING is not set"
+        );
+    }
+
+    #[test]
     fn config_parses_stdio_and_http() {
         unsafe { std::env::set_var("DEX_MCP_TEST_X", "hello") };
         let yaml: serde_yaml::Value = serde_yaml::from_str(
@@ -1727,6 +1758,17 @@ mcp_servers:
         assert!(out.contains("Authorization: [redacted]"), "{out}");
         assert!(out.contains("x-api-key=[redacted]"), "{out}");
         assert_eq!(redact_secrets("plain boom"), "plain boom");
+    }
+
+    #[test]
+    fn redaction_is_non_ascii_safe() {
+        // Multi-byte chars around the marker survive redaction untouched.
+        let out = redact_line("café: authorization: Bearer sk-café123 rest");
+        assert_eq!(out, "café: authorization: [redacted]");
+        // `to_lowercase` expands some chars (`İ` -> i + U+0307) and desynced
+        // the byte offsets applied to `line`; ASCII markers must stay aligned.
+        let out = redact_line("İ: authorization: Bearer sk-secret");
+        assert_eq!(out, "İ: authorization: [redacted]");
     }
 
     #[test]
