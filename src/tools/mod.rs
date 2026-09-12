@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::agent::online::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::console::Console;
-use crate::core::format::clamp_lines;
+use crate::core::format::{clamp_lines, clip_chars};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, PermissionMode};
 use tokio::io::AsyncReadExt as _;
 
@@ -211,30 +211,25 @@ pub(crate) enum PermissionRequirement {
     Shell,
 }
 
+/// One row shared by the eight tools that neither mutate nor shell out:
+/// `read`, `ls`, the in-process fff tools (`grep`/`ffgrep`/`find`/`fffind`),
+/// `obs_recall` (reads the session's observation archive; never touches the
+/// workspace) and `update_plan` (pure bookkeeping: validates and echoes the
+/// plan snapshot; the agent loop owns the boundary state and compaction
+/// decision).
+const READONLY: ToolMetadata = ToolMetadata {
+    read_only: true,
+    mutating: false,
+    idempotent: true,
+    requires_shell: false,
+    permission: PermissionRequirement::Read,
+};
+
 pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
     Some(match name {
-        "read" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
-        // fff tools run in-process; only git shells out.
-        "grep" | "ffgrep" | "find" | "fffind" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
-        "ls" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
+        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "obs_recall" | "update_plan" => {
+            READONLY
+        }
         "git" => ToolMetadata {
             read_only: true,
             mutating: false,
@@ -247,24 +242,6 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             mutating: false,
             idempotent: false,
             requires_shell: true,
-            permission: PermissionRequirement::Read,
-        },
-        // Reads the session's observation archive; never touches the
-        // workspace.
-        "obs_recall" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
-        // Pure bookkeeping: validates and echoes the plan snapshot; the
-        // agent loop owns the boundary state and compaction decision.
-        "update_plan" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
             permission: PermissionRequirement::Read,
         },
         "bash" => ToolMetadata {
@@ -861,11 +838,7 @@ async fn append_then_run(
 /// command also rides the tool-input preview, so the marker needs only enough
 /// to identify it — not a second full copy of a very long command in context.
 fn clip_command(command: &str) -> String {
-    let single = command.replace('\n', " ");
-    match single.char_indices().nth(200).map(|(idx, _)| idx) {
-        Some(idx) => format!("{}…", &single[..idx]),
-        None => single,
-    }
+    clip_chars(&command.replace('\n', " "), 200)
 }
 
 /// The session path the evidence reducer archives into (`Some` only for
