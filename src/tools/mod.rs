@@ -738,6 +738,62 @@ async fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
     Ok(paths)
 }
 
+/// The `then_run` field (SoL-Pi-compatible): the verification command a
+/// `write`/`edit` call carries. Only those two tools accept it; `null`, empty and whitespace-only
+/// values all mean "no command" so an omitted optional field stays harmless.
+/// A present-but-unusable value (object, array, number) is an error rather than
+/// a silent no-op: a model guessing another harness's
+/// `then_run: {command: …, timeout: …}` shape would otherwise read the
+/// mutation's success as its own verification.
+fn then_run_command<'a>(
+    name: &str,
+    args: &'a Map<String, Value>,
+) -> Result<Option<&'a str>, ToolError> {
+    if !matches!(name, "write" | "edit") {
+        return Ok(None);
+    }
+    match args.get("then_run") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(command)) => Ok(Some(command.trim()).filter(|value| !value.is_empty())),
+        Some(_) => Err(ToolError::InvalidArgument(
+            "'then_run' must be a shell command string".to_string(),
+        )),
+    }
+}
+
+/// Append the `then_run` observation to a *successful* write/edit result.
+/// Same clamping and shell timeout as `bash`; a non-zero exit or timeout is
+/// reported in-band rather than as a tool error, because the mutation itself
+/// did succeed and the model needs both facts to decide what to do next.
+async fn append_then_run(
+    mut text: String,
+    command: &str,
+    cancel: &(dyn CancellationSource + Send + Sync),
+) -> String {
+    let (output, code) = match run_bash(command, cancel).await {
+        Ok(result) => result,
+        Err(error) => {
+            text.push_str(&format!(
+                "\n\n[then_run:failed] {command}\n(error: {error})"
+            ));
+            return text;
+        }
+    };
+    let marker = match code {
+        Some(0) => "succeeded".to_string(),
+        Some(code) => format!("failed (exit {code})"),
+        None => "failed".to_string(),
+    };
+    text.push_str(&format!("\n\n[then_run:{marker}] {command}\n"));
+    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
+    text.push_str(if clamped.trim().is_empty() {
+        "(no output)"
+    } else {
+        &clamped
+    });
+    text
+}
+
 async fn tool_bash(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
@@ -1463,12 +1519,31 @@ pub(crate) async fn execute(
         audit(name, args, &outcome);
         return result;
     }
+    // Resolve `then_run` once — it decides both the permission
+    // requirement below and the follow-up run, and a malformed value must fail
+    // before anything else happens.
+    let then_run = match then_run_command(name, args) {
+        Ok(command) => command,
+        Err(error) => {
+            audit(name, args, &error.to_string());
+            return Err(error);
+        }
+    };
     let requirement = if name.starts_with("mcp__") {
         // MCP tools are external processes: most restrictive gate, same as
         // shell. Resolved here so the gate below covers them too.
         PermissionRequirement::Shell
     } else if let Some(meta) = metadata(name) {
-        meta.permission
+        // A `write`/`edit` carrying `then_run` also runs a shell
+        // command, so it must clear the *shell* gate rather than the weaker
+        // write gate — `ask-shell` passes file mutations unprompted, which
+        // would otherwise make an `edit` with `then_run` a way to run a
+        // command unapproved.
+        if then_run.is_some() {
+            PermissionRequirement::Shell
+        } else {
+            meta.permission
+        }
     } else {
         let error = ToolError::Unknown(name.to_string());
         audit(name, args, &error.to_string());
@@ -1478,11 +1553,22 @@ pub(crate) async fn execute(
     // agent's allowlist (plan §11 — the model self-corrects, never executes).
     // Checked before `enforce_policy` so a denied tool never prompts.
     if let Some(filter) = filter {
-        if !filter.allows(name) {
-            let error = ToolError::Denied(format!(
+        let error = if !filter.allows(name) {
+            Some(ToolError::Denied(format!(
                 "tool '{name}' is not in {}'s tool allowlist",
                 filter.owner
-            ));
+            )))
+        } else if then_run.is_some() && !filter.allows("bash") {
+            // `then_run` runs a shell command, so an allowlist that permits
+            // `edit` but not `bash` must not become a shell escape hatch.
+            Some(ToolError::Denied(format!(
+                "'{name}' carries then_run, which needs 'bash' in {}'s tool allowlist",
+                filter.owner
+            )))
+        } else {
+            None
+        };
+        if let Some(error) = error {
             audit(name, args, &error.to_string());
             return Err(error);
         }
@@ -1528,6 +1614,16 @@ pub(crate) async fn execute(
         "chain" => tool_chain(args, cancel, policy, filter).await,
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
+    // Run `then_run` in this same call so the mutation and its
+    // verification arrive as one observation, instead of costing a second
+    // provider round-trip that re-sends the whole prefix just to learn whether
+    // the build passed. A failed mutation skips the command: the edit error is
+    // the observation, and a command output must never be handed back as if it
+    // had run against the new content.
+    let result = match (result, then_run) {
+        (Ok(text), Some(command)) => Ok(append_then_run(text, command, cancel).await),
+        (result, _) => result,
+    };
     let outcome = match &result {
         Ok(_) => "ok".to_string(),
         Err(error) => error.to_string(),
@@ -1548,7 +1644,10 @@ pub(crate) async fn execute_outcome(
 ) -> ToolOutcome {
     // Capture the unified diff BEFORE `execute` mutates the file; the
     // before-image is gone afterwards. Display-only: it never reaches the
-    // model, only the transcript preview via `ToolOutcome::diff`.
+    // model, only the transcript preview via `ToolOutcome::diff`. A `then_run`
+    // (e.g. a formatter) can touch the file again afterwards; the
+    // preview stays the mutation's diff, which is the change the model asked
+    // for and asked to see.
     let pending_diff = if matches!(name, "write" | "edit") {
         change_diff_async(name, args).await
     } else {
@@ -1716,6 +1815,234 @@ mod tests {
             "temp files must be renamed away, not left"
         );
         let _ = fs::remove_file(&full);
+    }
+
+    /// `then_run` runs after a successful mutation and its output
+    /// arrives in the same tool result, so the model learns the verification
+    /// outcome without a second round-trip that re-sends the whole prefix.
+    #[tokio::test]
+    async fn then_run_streams_verification_into_the_same_result() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-then-run-test.txt";
+        let full = cwd.join(rel);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("verified\n".into()));
+        args.insert("then_run".into(), Value::String(format!("cat {rel}")));
+        let out = execute(
+            "write",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("wrote"), "{out}");
+        assert!(
+            out.contains("[then_run:succeeded] cat target/dex-then-run-test.txt"),
+            "{out}"
+        );
+        // The command saw the new content: it runs after the write, not before.
+        assert!(out.trim_end().ends_with("verified"), "{out}");
+        let _ = fs::remove_file(&full);
+    }
+
+    /// A failing command is not a failed tool call: the write landed, and the
+    /// model needs both facts — the mutation and the exit status — not an
+    /// `Error:` that hides which half of the call did what.
+    #[tokio::test]
+    async fn then_run_failure_is_reported_in_band() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-then-run-fail.txt";
+        let full = cwd.join(rel);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("x\n".into()));
+        args.insert("then_run".into(), Value::String("echo boom; exit 3".into()));
+        let out = execute(
+            "write",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await
+        .expect("the write succeeded; the command's exit must not fail the call");
+        assert!(out.contains("[then_run:failed (exit 3)]"), "{out}");
+        assert!(out.contains("boom"), "{out}");
+        let _ = fs::remove_file(&full);
+    }
+
+    /// A failed mutation never runs the command: a stale verification output
+    /// must not reach the model attached to a change that never landed.
+    #[tokio::test]
+    async fn failed_mutation_skips_then_run() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-then-run-skip.txt";
+        let full = cwd.join(rel);
+        fs::write(&full, "present\n").unwrap();
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("oldText".into(), Value::String("absent\n".into()));
+        args.insert("newText".into(), Value::String("never\n".into()));
+        args.insert(
+            "then_run".into(),
+            Value::String("echo ran > target/dex-then-run-skip-ran.txt".into()),
+        );
+        let error = execute("edit", &args, &GlobalCancellation, &Policy::trusted(), None)
+            .await
+            .expect_err("oldText is absent");
+        assert!(matches!(error, ToolError::InvalidArgument(_)), "{error}");
+        assert!(
+            !cwd.join("target/dex-then-run-skip-ran.txt").exists(),
+            "the command must not run when the mutation failed"
+        );
+        assert_eq!(fs::read_to_string(&full).unwrap(), "present\n");
+        let _ = fs::remove_file(&full);
+    }
+
+    /// `then_run` must clear the *shell* gate, not the write gate:
+    /// `ask-shell` passes file mutations unprompted, so otherwise an `edit` with
+    /// `then_run` would be a way to run a command with no approval at all. No console is
+    /// attached here, so a shell requirement surfaces as a denial.
+    #[tokio::test]
+    async fn then_run_needs_the_shell_gate() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-then-run-gate.txt";
+        let full = cwd.join(rel);
+        fs::write(&full, "before\n").unwrap();
+        let policy = Policy {
+            mode: PermissionMode::AskShell,
+            console: None,
+            agent: None,
+        };
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("oldText".into(), Value::String("before".into()));
+        args.insert("newText".into(), Value::String("after".into()));
+        assert!(
+            execute("edit", &args, &GlobalCancellation, &policy, None)
+                .await
+                .is_ok(),
+            "a plain mutation is exactly what ask-shell permits"
+        );
+        args.insert("then_run".into(), Value::String("echo hi".into()));
+        let error = execute("edit", &args, &GlobalCancellation, &policy, None)
+            .await
+            .expect_err("a then_run shell command is not covered by the write gate");
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        assert_eq!(
+            fs::read_to_string(&full).unwrap(),
+            "after\n",
+            "the denial must land before the mutation, not after it"
+        );
+        let _ = fs::remove_file(&full);
+    }
+
+    /// Only write/edit take `then_run`; an unusable value fails loudly rather
+    /// than doing nothing while the model reads the mutation as verified.
+    #[test]
+    fn then_run_command_scope() {
+        let mut args = Map::new();
+        args.insert("then_run".into(), Value::String("   ".into()));
+        assert_eq!(then_run_command("write", &args).unwrap(), None);
+        args.insert("then_run".into(), Value::String(" cargo test ".into()));
+        assert_eq!(
+            then_run_command("write", &args).unwrap(),
+            Some("cargo test")
+        );
+        assert_eq!(then_run_command("edit", &args).unwrap(), Some("cargo test"));
+        // Other tools ignore it entirely: the field is not theirs.
+        assert_eq!(then_run_command("bash", &args).unwrap(), None);
+        assert_eq!(then_run_command("read", &args).unwrap(), None);
+        // `null` is "absent" — some clients serialize omitted optionals that way.
+        args.insert("then_run".into(), Value::Null);
+        assert_eq!(then_run_command("write", &args).unwrap(), None);
+        // A structured value is a caller mistake, not a request to skip.
+        args.insert("then_run".into(), json!({ "command": "cargo test" }));
+        assert!(matches!(
+            then_run_command("write", &args),
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
+
+    /// An agent allowlisting `edit` but not `bash` must not gain shell through
+    /// the `then_run` command: the same boundary the permission gate enforces,
+    /// one layer down at the child's tool set.
+    #[tokio::test]
+    async fn then_run_command_respects_a_child_tool_allowlist() {
+        let filter = ToolFilter {
+            owner: "child".to_string(),
+            allowed: BTreeSet::from(["edit".to_string()]),
+        };
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-then-run-filter.txt";
+        let full = cwd.join(rel);
+        fs::write(&full, "before\n").unwrap();
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("oldText".into(), Value::String("before".into()));
+        args.insert("newText".into(), Value::String("after".into()));
+        args.insert("then_run".into(), Value::String("echo hi".into()));
+        let error = execute(
+            "edit",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            Some(&filter),
+        )
+        .await
+        .expect_err("bash is not in the child's allowlist");
+        assert!(matches!(error, ToolError::Denied(_)), "{error}");
+        assert!(error.to_string().contains("bash"), "{error}");
+        assert_eq!(fs::read_to_string(&full).unwrap(), "before\n");
+        // The same call without `then_run` is exactly what the filter allows.
+        args.remove("then_run");
+        assert!(
+            execute(
+                "edit",
+                &args,
+                &GlobalCancellation,
+                &Policy::trusted(),
+                Some(&filter)
+            )
+            .await
+            .is_ok(),
+            "a plain edit is within the child's tools"
+        );
+        let _ = fs::remove_file(&full);
+    }
+
+    /// A malformed `then_run` fails before the mutation runs, so the model can
+    /// never mistake an unusable field for a check that came back clean.
+    #[tokio::test]
+    async fn malformed_then_run_does_not_mutate() {
+        let cwd = std::env::current_dir().unwrap();
+        fs::create_dir_all(cwd.join("target")).unwrap();
+        let rel = "target/dex-then-run-malformed.txt";
+        let full = cwd.join(rel);
+        let _ = fs::remove_file(&full);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String(rel.into()));
+        args.insert("content".into(), Value::String("x\n".into()));
+        args.insert("then_run".into(), json!({ "command": "cargo test" }));
+        let error = execute(
+            "write",
+            &args,
+            &GlobalCancellation,
+            &Policy::trusted(),
+            None,
+        )
+        .await
+        .expect_err("an object then_run is rejected");
+        assert!(matches!(error, ToolError::InvalidArgument(_)), "{error}");
+        assert!(!full.exists(), "the write must not have happened");
     }
 
     #[cfg(unix)]

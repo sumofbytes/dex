@@ -70,12 +70,13 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "write".to_string(),
-                description: "Write or overwrite a file (parent directories are created). For surgical changes to existing files, prefer `edit`.".to_string(),
+                description: "Write or overwrite a file (parent directories are created). For surgical changes to existing files, prefer `edit`. Pass then_run to verify the change in the same call — its output comes back in this result.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "content": { "type": "string" }
+                        "content": { "type": "string" },
+                        "then_run": { "type": "string", "description": "optional shell command to run in this same call after a successful write (e.g. a build, formatter or test); its output is appended to this result. Skipped, and never reported as if it ran, when the write fails." }
                     },
                     "required": ["path", "content"]
                 }),
@@ -85,14 +86,15 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit".to_string(),
-                description: "Replace text in a file. oldText must match exactly one location — include 2-3 surrounding lines to make it unique, or pass replaceAll for every occurrence. Whitespace-only mismatches are retried line-wise. On failure, read the file and retry with exact text.".to_string(),
+                description: "Replace text in a file. oldText must match exactly one location — include 2-3 surrounding lines to make it unique, or pass replaceAll for every occurrence. Whitespace-only mismatches are retried line-wise. On failure, read the file and retry with exact text. Pass then_run to verify the change in the same call — its output comes back in this result.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
                         "oldText": { "type": "string", "description": "exact existing text to replace" },
                         "newText": { "type": "string", "description": "replacement text" },
-                        "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" }
+                        "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
+                        "then_run": { "type": "string", "description": "optional shell command to run in this same call after a successful edit (e.g. a build, formatter or test); its output is appended to this result. Skipped, and never reported as if it ran, when the edit fails." }
                     },
                     "required": ["path", "oldText", "newText"]
                 }),
