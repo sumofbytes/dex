@@ -262,6 +262,19 @@ impl ChatStream {
 /// Auth lines from a `GET /api/mcp` body: the non-null `auth` fields in
 /// server order. `null` means stdio (no login possible) — skipped, so
 /// `/mcp` never nags about servers that can't take a login.
+/// Lenient list extraction shared by the list-style endpoints: rows that
+/// fail to deserialize are skipped rather than failing the whole call.
+fn lenient_array<T: serde::de::DeserializeOwned>(value: &serde_json::Value, key: &str) -> Vec<T> {
+    value[key]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn mcp_auth_lines(body: &serde_json::Value) -> Vec<String> {
     body["servers"]
         .as_array()
@@ -353,6 +366,11 @@ impl DaemonClient {
 
     /// Versioned-protocol headers (P10): declared on every `/api/*` request
     /// so the daemon can reject a mismatch. Health checks stay header-free.
+    /// `{base}/api/sessions/{sid}/{tail}` — every per-session endpoint.
+    fn session_url(&self, session_id: &str, tail: &str) -> String {
+        format!("{}/api/sessions/{}/{}", self.base_url, session_id, tail)
+    }
+
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Ok(value) = reqwest::header::HeaderValue::from_str("application/vnd.dex.v1+json") {
@@ -413,14 +431,7 @@ impl DaemonClient {
             .json()
             .await?;
 
-        let sessions = resp["sessions"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let sessions: Vec<SessionInfo> = lenient_array(&resp, "sessions");
 
         Ok(sessions)
     }
@@ -448,7 +459,7 @@ impl DaemonClient {
         prompt: &str,
         options: ChatOptions,
     ) -> Result<ChatStream, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{}/api/sessions/{}/chat", self.base_url, session_id);
+        let url = self.session_url(session_id, "chat");
         // The chat SSE stream lives as long as the turn (often minutes);
         // the shared client's total timeout would kill it mid-turn.
         let mut builder = shared_streaming_client()
@@ -495,7 +506,7 @@ impl DaemonClient {
         let mut stream = self
             .chat_stream(session_id, prompt, options)
             .await
-            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
         while let Some(item) = stream.next_event().await {
             let event = item.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
@@ -539,10 +550,7 @@ impl DaemonClient {
         decision: ApprovalDecision,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/approve",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "approve"))
             .headers(self.api_headers())
             .json(&ApprovalResponse {
                 request_id: request_id.to_string(),
@@ -566,10 +574,7 @@ impl DaemonClient {
     /// Cancel the active turn for a session.
     pub async fn cancel_async(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/cancel",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "cancel"))
             .headers(self.api_headers())
             .send()
             .await?
@@ -594,14 +599,7 @@ impl DaemonClient {
             .error_for_status()?
             .json()
             .await?;
-        let skills = resp["skills"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let skills: Vec<SkillInfo> = lenient_array(&resp, "skills");
         Ok(skills)
     }
 
@@ -706,8 +704,9 @@ impl DaemonClient {
         let resp = self
             .http
             .get(format!(
-                "{}/api/sessions/{}/events?since={}",
-                self.base_url, session_id, since
+                "{}?since={}",
+                self.session_url(session_id, "events"),
+                since
             ))
             .headers(self.api_headers())
             .send()
@@ -719,14 +718,7 @@ impl DaemonClient {
             .get("next_seq")
             .and_then(|v| v.as_u64())
             .unwrap_or(since);
-        let mut events = Vec::new();
-        if let Some(rows) = value.get("events").and_then(|v| v.as_array()) {
-            for row in rows {
-                if let Ok(env) = serde_json::from_value::<StreamEnvelope>(row.clone()) {
-                    events.push(env);
-                }
-            }
-        }
+        let events: Vec<StreamEnvelope> = lenient_array(&value, "events");
         Ok(EventsResponse { events, next_seq })
     }
 
@@ -745,10 +737,7 @@ impl DaemonClient {
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
         let resp: serde_json::Value = self
             .http
-            .get(format!(
-                "{}/api/sessions/{}/trace",
-                self.base_url, session_id
-            ))
+            .get(self.session_url(session_id, "trace"))
             .headers(self.api_headers())
             .send()
             .await?
@@ -769,10 +758,7 @@ impl DaemonClient {
     pub async fn undo_async(&self, session_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let resp = self
             .http
-            .post(format!(
-                "{}/api/sessions/{}/undo",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "undo"))
             .headers(self.api_headers())
             .send()
             .await?
@@ -793,10 +779,7 @@ impl DaemonClient {
         reason: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/waive",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "waive"))
             .headers(self.api_headers())
             .json(&serde_json::json!({ "reason": reason }))
             .send()
@@ -816,10 +799,7 @@ impl DaemonClient {
         name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/name",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "name"))
             .headers(self.api_headers())
             .json(&serde_json::json!({ "name": name }))
             .send()
@@ -847,10 +827,7 @@ impl DaemonClient {
     ) -> Result<ShellResponse, Box<dyn std::error::Error + Send + Sync>> {
         let resp = self
             .http
-            .post(format!(
-                "{}/api/sessions/{}/shell",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "shell"))
             .headers(self.api_headers())
             .json(&ShellRequest {
                 command: command.to_string(),
@@ -871,7 +848,7 @@ impl DaemonClient {
         exclude_from_context: bool,
     ) -> Result<ShellResponse, Box<dyn std::error::Error>> {
         block_on(self.shell_async(session_id, command, exclude_from_context))
-            .map_err(|e| e.to_string().into())
+            .map_err(|e| -> Box<dyn std::error::Error> { e })
     }
 
     /// Enqueue a steering message into an active turn (mid-turn injection).
@@ -881,10 +858,7 @@ impl DaemonClient {
         content: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/steer",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "steer"))
             .headers(self.api_headers())
             .json(&SteerRequest {
                 content: content.to_string(),
@@ -907,10 +881,7 @@ impl DaemonClient {
         content: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/followup",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "followup"))
             .headers(self.api_headers())
             .json(&FollowupRequest {
                 content: content.to_string(),
@@ -938,10 +909,7 @@ impl DaemonClient {
         followup: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.http
-            .post(format!(
-                "{}/api/sessions/{}/recall",
-                self.base_url, session_id
-            ))
+            .post(self.session_url(session_id, "recall"))
             .headers(self.api_headers())
             .json(&RecallRequest {
                 content: content.to_string(),
