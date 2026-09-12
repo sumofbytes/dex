@@ -11,6 +11,7 @@ mod skills;
 mod tools;
 mod ui;
 mod update;
+mod usage;
 
 use crate::cli::{Args, Mode};
 use crate::session::{load_llm_messages_from_session, Session};
@@ -316,8 +317,9 @@ fn print_help() {
         serve [bind]              daemon on 127.0.0.1:8420\n  \
         connect <url> [prompt]    TUI or one-shot against a daemon\n  \
         run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
-        doctor                    show resolved provider/model config + origins\n  \
-        mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
+          doctor                    show resolved provider/model config + origins\n  \
+          usage <id|path>           plot token usage per model call from a session's event journal\n  \
+          mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
         update [--models|--all]   update dex itself; --models refreshes the model catalog\n  \
         --tool                    raw JSON tool mode (stdin)\n\
         \n\
@@ -445,6 +447,12 @@ fn main() {
                     eprintln!("update --models failed: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Mode::Usage { session } => {
+            if let Err(e) = crate::usage::run(&session) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
         }
         Mode::Default => {

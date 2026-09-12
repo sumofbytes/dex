@@ -405,7 +405,7 @@ the arrow keys and Enter to choose `Allow once`, `Allow for this session`, or
 `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
-`connect`, `run`, `update`, `mcp`, `doctor`) are covered under Usage / MCP
+`connect`, `run`, `usage`, `update`, `mcp`, `doctor`) are covered under Usage / MCP
 servers above; `--help`/`-h` and `--version`/`-V` print help and version without
 touching config or network.
 
