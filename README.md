@@ -496,8 +496,8 @@ schema):
 | ------- | -----------------------------------------------------------------|
 | `read`  | Read a file (`path`, `paths`, `glob`). Line-numbered, tab-expanded. |
 | `bash`  | Run a shell command via `sh -c` (`command`).                     |
-| `write` | Write/overwrite a file (`path`, `content`).                      |
-| `edit`  | Replace exactly one occurrence of text (`path`, `oldText`, `newText`). |
+| `write` | Write/overwrite a file (`path`, `content`, optional `then_run`).  |
+| `edit`  | Replace exactly one occurrence of text (`path`, `oldText`, `newText`, optional `then_run`). |
 | `ffgrep` | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
 | `fffind` | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`). |
 | `git`*   | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.   |
@@ -508,6 +508,11 @@ schema):
 
 `*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
 cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path` or any `bash` still serializes.
+
+`write`/`edit` take an optional `then_run` shell command that runs in the same call *after* a successful change, so a build, formatter or
+test result arrives with the mutation instead of costing another round trip. It is skipped when the change fails, and the observation
+reports `[then_run:succeeded]` / `[then_run:failed (exit N)]` followed by the command's clamped output. Because it executes shell, a call
+carrying `then_run` clears the *shell* permission gate (not the write gate) and requires `bash` in a child agent's tool allowlist.
 
 ### Sub-agents
 

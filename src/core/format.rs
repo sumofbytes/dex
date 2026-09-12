@@ -673,18 +673,14 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
             let path = get("path").unwrap_or("(unknown path)");
             let content = get("content").unwrap_or("");
             let lines = content.lines().count();
-            format!(
-                "{} · {} line{}",
-                path,
-                lines,
-                if lines == 1 { "" } else { "s" }
-            )
+            let plural = if lines == 1 { "" } else { "s" };
+            format!("{path} · {lines} line{plural}{}", then_run_suffix(obj))
         }
         "edit" => {
             let path = get("path").unwrap_or("(unknown path)");
             let old = get("oldText").unwrap_or("").lines().count();
             let new = get("newText").unwrap_or("").lines().count();
-            format!("{} · -{} +{}", path, old, new)
+            format!("{} · -{} +{}{}", path, old, new, then_run_suffix(obj))
         }
         "read" => {
             if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
@@ -721,6 +717,31 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
             })
             .unwrap_or_else(|| "chain".to_string()),
         _ => short_arg(name, input),
+    }
+}
+
+/// A `write`/`edit` carrying `then_run` also runs a shell
+/// command. The approver must see that the file change is not all that will
+/// happen, so every approval surface carries the command. Clipped to one line —
+/// the prompt is a glance, not the transcript.
+fn then_run_of(obj: Option<&serde_json::Map<String, Value>>) -> Option<String> {
+    let command = obj?.get("then_run")?.as_str()?.replace('\n', " ");
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(match command.char_indices().nth(120).map(|(idx, _)| idx) {
+        Some(idx) if idx < command.len() => format!("{}…", &command[..idx]),
+        _ => command.to_string(),
+    })
+}
+
+/// The `· then: …` tail `approval_summary` appends for a `write`/`edit`
+/// carrying `then_run`.
+fn then_run_suffix(obj: Option<&serde_json::Map<String, Value>>) -> String {
+    match then_run_of(obj) {
+        Some(command) => format!(" · then: {command}"),
+        None => String::new(),
     }
 }
 
@@ -765,6 +786,9 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
             if let Some(path) = get("path") {
                 out.push(format!("path: {}", path));
             }
+            if let Some(command) = then_run_of(obj) {
+                out.push(format!("then: $ {command}"));
+            }
             if let Some(content) = get("content") {
                 let lines = content.lines().count();
                 let bytes = content.len();
@@ -799,6 +823,9 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
             let mut out = Vec::new();
             if let Some(path) = get("path") {
                 out.push(format!("path: {}", path));
+            }
+            if let Some(command) = then_run_of(obj) {
+                out.push(format!("then: $ {command}"));
             }
             if let (Some(old), Some(new)) = (get("oldText"), get("newText")) {
                 out.push(format!(
@@ -1112,6 +1139,35 @@ mod tests {
     /// plus the 1-column `…` marker — what any 400+-column line must clip to.
     fn clipped_at_budget() -> String {
         format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1))
+    }
+
+    /// The approval prompt must show the `then_run` shell command. An
+    /// approver who only sees the file diff is approving something broader than
+    /// what the summary describes.
+    #[test]
+    fn approval_prompt_shows_the_then_run_command() {
+        let input = r#"{"path":"src/a.rs","oldText":"a","newText":"b","then_run":"cargo clippy --all-targets"}"#;
+        assert_eq!(
+            approval_summary("edit", input),
+            "src/a.rs · -1 +1 · then: cargo clippy --all-targets"
+        );
+        assert!(
+            approval_details("edit", input)
+                .iter()
+                .any(|line| line == "then: $ cargo clippy --all-targets"),
+            "details must carry the command"
+        );
+        // No then_run → no trace of one.
+        assert_eq!(
+            approval_summary("edit", r#"{"path":"src/a.rs","oldText":"a","newText":"b"}"#),
+            "src/a.rs · -1 +1"
+        );
+        assert!(
+            !approval_details("write", r#"{"path":"x","content":"y"}"#)
+                .iter()
+                .any(|line| line.starts_with("then:")),
+            "a plain write has no command line"
+        );
     }
 
     #[test]
