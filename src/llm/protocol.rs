@@ -200,6 +200,47 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             },
         });
     }
+    // Online context compaction: the working-plan tool whose
+    // completed steps are compaction boundaries. Gated like the extra tools —
+    // it costs prompt tokens on every request and only pays off on
+    // long-horizon work.
+    if crate::agent::online::online_compaction_enabled() {
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "update_plan".to_string(),
+                description: "Replace the complete working plan. A newly completed step becomes a safe point where dex may compact context if doing so is economical. Send the complete plan on every call; keep at most one step in_progress and mark finished steps completed; when completing a step, include concise progress evidence when available.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "maxItems": 128,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "stable step id; reuse only for the same goal" },
+                                    "goal": { "type": "string" },
+                                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                                },
+                                "required": ["id", "goal", "status"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "progress": {
+                            "type": "object",
+                            "properties": {
+                                "files_changed": { "type": "array", "items": { "type": "string" } },
+                                "verification": { "type": "array", "items": { "type": "string" }, "description": "checks run and their outcome" },
+                                "decisions": { "type": "array", "items": { "type": "string" } }
+                            }
+                        }
+                    },
+                    "required": ["steps"]
+                }),
+            },
+        });
+    }
     if extra {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
@@ -433,18 +474,16 @@ mod tests {
     fn tools_schema_contains_all_tools() {
         let schema = tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
+        let mut expected: Vec<&str> = vec!["read", "bash", "write", "edit", "grep", "find", "ls"];
+        // DEX_ONLINE_COMPACTION=1 adds the plan tool.
+        if crate::agent::online::online_compaction_enabled() {
+            expected.push("update_plan");
+        }
         // Default is 6 tools; DEX_EXTRA_TOOLS=1 adds git+chain
         if std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1") {
-            assert_eq!(
-                names,
-                ["read", "bash", "write", "edit", "grep", "find", "ls", "git", "chain"]
-            );
-        } else {
-            assert_eq!(
-                names,
-                ["read", "bash", "write", "edit", "grep", "find", "ls"]
-            );
+            expected.extend(["git", "chain"]);
         }
+        assert_eq!(names, expected);
     }
 
     #[test]
