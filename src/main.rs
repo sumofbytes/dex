@@ -336,6 +336,10 @@ fn main() {
     install_sigint_handler();
     let args = cli::parse_args();
     let mode = cli::resolve_mode(&args);
+    if let Err(error) = cli::check_reattach_mode(&args, &mode) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
     // Delegation tools register only in daemon-backed processes (§10): a
     // one-shot run has no manager to spawn into, so the tools stay out of
     // its schema entirely. Dispatch rejects them there regardless (§11).
@@ -403,7 +407,10 @@ fn main() {
                         args.session_name.as_deref(),
                     )
                 }),
-                None => ui::run_ratatui_repl_with_remote(&args, &url).map_err(Into::into),
+                // `false`: a loopback URL here may still be an SSH port-forward
+                // or a container's daemon, so never assume the session is
+                // reachable by a bare local `dex --reattach`.
+                None => ui::run_ratatui_repl_with_remote(&args, &url, false).map_err(Into::into),
             };
             if let Err(e) = result {
                 eprintln!("client error: {}", e);
@@ -450,7 +457,9 @@ fn main() {
                 }
             };
             let url = format!("http://{addr}");
-            if let Err(e) = ui::run_ratatui_repl_with_remote(&args, &url) {
+            // `true`: this process owns the daemon it just started, so its cwd
+            // is the workspace a later `dex --reattach <id>` would resolve.
+            if let Err(e) = ui::run_ratatui_repl_with_remote(&args, &url, true) {
                 eprintln!("ui error: {}", e);
                 std::process::exit(1);
             }
