@@ -503,9 +503,14 @@ mod tests {
                 std::env::var_os(crate::agent::online::ONLINE_COMPACTION_ENV),
             ),
             ("DEX_EXTRA_TOOLS", std::env::var_os("DEX_EXTRA_TOOLS")),
+            (
+                "DEX_OBSERVATION_PACK",
+                std::env::var_os("DEX_OBSERVATION_PACK"),
+            ),
         ]);
         std::env::remove_var("DEX_ONLINE_COMPACTION");
         std::env::remove_var("DEX_EXTRA_TOOLS");
+        std::env::remove_var("DEX_OBSERVATION_PACK");
         let schema = tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
         let expected: Vec<&str> = vec!["read", "bash", "write", "edit", "grep", "find", "ls"];
@@ -518,6 +523,14 @@ mod tests {
             .map(|t| t.function.name.clone())
             .collect();
         assert!(names.iter().any(|n| n == "update_plan"), "{names:?}");
+
+        // DEX_OBSERVATION_PACK=1 adds the recall tool.
+        std::env::set_var("DEX_OBSERVATION_PACK", "1");
+        let names: Vec<String> = tools_schema()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "obs_recall"), "{names:?}");
     }
 
     #[test]
