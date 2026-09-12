@@ -52,6 +52,33 @@ struct CutPoint {
     is_split_turn: bool,
 }
 
+/// Build the `CutPoint` for keeping from `idx`: a turn start cuts exactly
+/// there; otherwise record the turn start (searching back to `start`) and
+/// flag the split turn.
+fn cut_point_at(messages: &[ChatMessage], idx: usize, start: usize) -> CutPoint {
+    let starts_turn = is_turn_start_message(&messages[idx]);
+    let turn_start = if starts_turn {
+        None
+    } else {
+        find_turn_start_index(messages, idx, start)
+    };
+    CutPoint {
+        first_kept_index: idx,
+        turn_start_index: turn_start,
+        is_split_turn: !starts_turn && turn_start.is_some(),
+    }
+}
+
+/// Back `idx` up over tool messages so a cut never orphans a tool result
+/// from its request; never crosses `start`.
+fn back_up_over_tools(messages: &[ChatMessage], idx: usize, start: usize) -> usize {
+    let mut idx = idx;
+    while idx > start && messages[idx].role == Role::Tool {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Find the cut point — walk backwards until `keepRecentTokens`, cut at
 /// next valid user/assistant boundary, handle split turns.
 /// `start` is boundaryStart (after previous compaction), `end` is messages.len().
@@ -111,18 +138,7 @@ fn find_cut_point(
     }
 
     // Never orphan tool: if cut lands on tool, back up (shouldn't happen via cut_points)
-    while cut_index > start && messages[cut_index].role == Role::Tool {
-        cut_index -= 1;
-    }
-
-    // Split-turn detection: if cut does not start a turn, find its turn start
-    let starts_turn = is_turn_start_message(&messages[cut_index]);
-    let turn_start = if starts_turn {
-        None
-    } else {
-        find_turn_start_index(messages, cut_index, start)
-    };
-    let is_split = !starts_turn && turn_start.is_some();
+    let cut_index = back_up_over_tools(messages, cut_index, start);
 
     // ponytail: never evict the most recent real user prompt — compaction
     // inside a turn can push it out of the keep_recent window and the model
@@ -134,33 +150,16 @@ fn find_cut_point(
     {
         if cut_index > last_user {
             // Would evict last user — keep from last_user instead, or abort if too small.
-            let mut adjusted = last_user;
-            while adjusted > start && messages[adjusted].role == Role::Tool {
-                adjusted -= 1;
-            }
+            let adjusted = back_up_over_tools(messages, last_user, start);
             // If adjusting would make summarized span too small, skip compaction.
             if adjusted <= start + MIN_MESSAGES_TO_SUMMARIZE {
                 return None;
             }
-            let adj_starts_turn = is_turn_start_message(&messages[adjusted]);
-            let adj_turn_start = if adj_starts_turn {
-                None
-            } else {
-                find_turn_start_index(messages, adjusted, start)
-            };
-            return Some(CutPoint {
-                first_kept_index: adjusted,
-                turn_start_index: adj_turn_start,
-                is_split_turn: !adj_starts_turn && adj_turn_start.is_some(),
-            });
+            return Some(cut_point_at(messages, adjusted, start));
         }
     }
 
-    Some(CutPoint {
-        first_kept_index: cut_index,
-        turn_start_index: turn_start,
-        is_split_turn: is_split,
-    })
+    Some(cut_point_at(messages, cut_index, start))
 }
 
 // File tracking — read/written/edited sets extracted from tool calls
