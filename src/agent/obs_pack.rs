@@ -54,7 +54,10 @@ fn hash_hex(data: &[u8]) -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub(crate) fn estimate_tokens(text: &str) -> usize {
+/// Token estimate for a single payload (~4 chars per token, same heuristic
+/// as `agent/tokens.rs` but per-payload; named differently to keep the two
+/// estimators distinct).
+fn payload_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
@@ -97,7 +100,7 @@ pub(crate) fn create_observation(tool_name: &str, text: &str) -> Option<Observat
         text: text.to_string(),
         bytes,
         lines: text.lines().count(),
-        tokens: estimate_tokens(text),
+        tokens: payload_tokens(text),
     })
 }
 
@@ -108,9 +111,10 @@ pub(crate) fn create_observation(tool_name: &str, text: &str) -> Option<Observat
 pub(crate) fn ensure_stored(session_path: &Path, observation: &Observation) -> std::io::Result<()> {
     let dir = observations_dir(session_path);
     fs::create_dir_all(&dir)?;
-    let metadata = fs::metadata(&dir)?;
+    // `symlink_metadata` does not follow a final symlink: an `obs` directory
+    // that is itself a symlink is refused before any file lands inside it.
     #[cfg(unix)]
-    if metadata.file_type().is_symlink() {
+    if fs::symlink_metadata(&dir)?.file_type().is_symlink() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "observation directory is a symlink",
@@ -141,11 +145,6 @@ pub(crate) fn ensure_stored(session_path: &Path, observation: &Observation) -> s
 /// Head+tail excerpt, whole lines only, within a byte budget.
 fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
     let lines: Vec<&str> = if from_end {
-        let mut reversed: Vec<&str> = text.lines().rev().collect();
-        reversed.reverse();
-        // Reversed order above is wrong for taking from the end while
-        // preserving order; rebuild properly.
-        let _ = reversed;
         text.lines().rev().collect()
     } else {
         text.lines().collect()
@@ -170,12 +169,32 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
     out
 }
 
+/// Character-bounded fallback excerpt for payloads without line breaks
+/// (minified JSON, base64): whole lines would produce an empty excerpt, so
+/// take a raw byte slice trimmed to a UTF-8 boundary.
+fn raw_excerpt(text: &str, budget: usize) -> String {
+    let mut end = budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// The stable placeholder that replaces the payload in the projection.
 pub(crate) fn placeholder_for(observation: &Observation) -> String {
     let head_budget = PLACEHOLDER_EXCERPT_BYTES / 2;
     let tail_budget = PLACEHOLDER_EXCERPT_BYTES - head_budget;
-    let head = complete_line_excerpt(&observation.text, head_budget, false);
-    let tail = complete_line_excerpt(&observation.text, tail_budget, true);
+    let mut head = complete_line_excerpt(&observation.text, head_budget, false);
+    let mut tail = complete_line_excerpt(&observation.text, tail_budget, true);
+    // Minified / single-line payloads: line excerpts are empty, fall back to
+    // a raw character slice so the model can still see what kind of content
+    // this is and judge whether recalling is worth it.
+    if head.is_empty() {
+        head = raw_excerpt(&observation.text, head_budget);
+    }
+    if tail.is_empty() {
+        tail = raw_excerpt(&observation.text, tail_budget);
+    }
     format!(
         "[large tool result replaced after its first {FULL_SENDS} provider requests]\n\
          id: {id}\n\
@@ -241,8 +260,7 @@ pub(crate) fn read_recall_chunk(
     }
     let (max_bytes, max_lines) = limits;
     let available = &full[offset..];
-    let take = available.len().min(max_bytes + 4);
-    let mut end = take.min(max_bytes);
+    let mut end = available.len().min(max_bytes);
     let mut newline_count = 0;
     for (index, byte) in available[..end].iter().enumerate() {
         if *byte == b'\n' {
@@ -302,18 +320,23 @@ pub(crate) fn recall_result(
     Ok(content)
 }
 
-/// Per-session send counts for the projection. Counted structurally —
-/// `project` recounts from the history each call — so this cache is only a
-/// fast path; a resume or fork rebuilds the counts from scratch and stays
+/// Per-session projection state: send counts for the grace period plus the
+/// set of ids already verified as stored. Counted structurally — `project`
+/// recounts from the history each call — so the send cache is only a fast
+/// path; a resume or fork rebuilds the counts from scratch and stays
 /// correct.
 pub(crate) struct ProjectionState {
     sends: Mutex<HashMap<String, usize>>,
+    /// Ids whose archive write has already been verified this run; skips
+    /// the per-request `fs::read` + re-hash of `ensure_stored`.
+    verified: Mutex<HashMap<String, ()>>,
 }
 
 impl ProjectionState {
     pub(crate) fn new() -> Self {
         Self {
             sends: Mutex::new(HashMap::new()),
+            verified: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -357,13 +380,37 @@ pub(crate) fn project(
         let mut packed = false;
         if message.role == Role::Tool {
             if let Some(session_path) = session_path {
-                if let Some(observation) = create_observation("tool", message.content_str()) {
-                    if ensure_stored(session_path, &observation).is_ok() {
+                // The wire `name` (when present) keeps different tools'
+                // outputs from colliding into one id and tells the model
+                // which tool a placeholder came from.
+                let tool_name = message.name.as_deref().unwrap_or("tool");
+                if let Some(observation) = create_observation(tool_name, message.content_str()) {
+                    // Already-verified ids skip the storage check entirely:
+                    // the object was written (or verified byte-for-byte)
+                    // earlier this run, and content addressing means it
+                    // cannot drift. This keeps steady-state requests at
+                    // zero archive IO.
+                    let verified = state
+                        .verified
+                        .lock()
+                        .map(|guard| guard.contains_key(&observation.id))
+                        .unwrap_or(false);
+                    let stored = verified
+                        || ensure_stored(session_path, &observation)
+                            .map(|_| {
+                                if let Ok(mut guard) = state.verified.lock() {
+                                    guard.insert(observation.id.clone(), ());
+                                }
+                            })
+                            .is_ok();
+                    if stored {
                         // Grace period: send in full until FULL_SENDS provider
                         // requests have seen this payload. The cached count is
                         // seeded from the structural count (assistant messages
                         // that follow the result), so a restart resumes in the
-                        // right phase.
+                        // right phase. The counter increments before the call
+                        // resolves, so a cancelled request still consumes a
+                        // grace send; the model can always obs_recall.
                         let previous = state
                             .sends
                             .lock()
@@ -468,11 +515,21 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_results_get_a_default_tool_name() {
+        let a = create_observation("tool", &big_text(600)).unwrap();
+        let b = create_observation("tool", &big_text(600)).unwrap();
+        assert_eq!(a.id, b.id);
+        let named = create_observation("read", &big_text(600)).unwrap();
+        assert_ne!(a.id, named.id, "no name and a name must not collide");
+    }
+
+    #[test]
     fn placeholder_carries_recall_instructions_and_excerpts() {
         let text = big_text(600);
         let observation = create_observation("bash", &text).unwrap();
         let placeholder = placeholder_for(&observation);
         assert!(placeholder.contains(&observation.id));
+        assert!(placeholder.contains(&observation.tool_name));
         assert!(placeholder.contains("original_bytes:"));
         assert!(placeholder.contains("obs_recall"));
         assert!(placeholder.contains("line 0:"), "head excerpt present");
@@ -487,6 +544,24 @@ mod tests {
     }
 
     #[test]
+    fn minified_payloads_get_a_raw_excerpt() {
+        // One enormous line: whole-line excerpts are empty, the raw
+        // fallback must still surface content.
+        let text = format!("{{\"data\":\"{}\"}}", "x".repeat(THRESHOLD_BYTES * 2));
+        let observation = create_observation("bash", &text).unwrap();
+        let placeholder = placeholder_for(&observation);
+        assert!(
+            placeholder.contains("\"data\":\""),
+            "raw head excerpt present"
+        );
+        assert!(
+            placeholder.contains(&observation.id),
+            "recall instructions still present"
+        );
+        assert!(placeholder.len() < 3000, "placeholder stays small");
+    }
+
+    #[test]
     fn storage_is_content_addressed_and_idempotent() {
         let dir = temp_session_dir("store");
         let session = dir.join("s.jsonl");
@@ -496,6 +571,25 @@ mod tests {
         let stored = fs::read_to_string(observation_path(&session, &observation.id)).unwrap();
         assert_eq!(stored, observation.text);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_observation_directory_is_refused() {
+        let dir = temp_session_dir("symlink");
+        let session = dir.join("s.jsonl");
+        let outside = temp_session_dir("symlink-target");
+        std::os::unix::fs::symlink(&outside, dir.join("obs")).unwrap();
+        let observation = create_observation("bash", &big_text(600)).unwrap();
+        let error = ensure_stored(&session, &observation).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        // Nothing was written through the symlink.
+        assert!(
+            fs::read_dir(outside.join("obs")).is_err(),
+            "no archive directory leaked outside"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -606,6 +700,31 @@ mod tests {
         let projected = project(&state2, None, &request);
         let tool_msg = projected.iter().find(|m| m.role == Role::Tool).unwrap();
         assert_eq!(tool_msg.content_str(), big);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projected_view_is_smaller_than_history() {
+        // The token estimator on the projected view must reflect the
+        // placeholder, not the archived payload — the compaction threshold
+        // and online-compaction sampling read the projection.
+        let dir = temp_session_dir("tokens");
+        let session = dir.join("s.jsonl");
+        let big = big_text(600);
+        let mut request = vec![ChatMessage::system("sys"), ChatMessage::user("go")];
+        request.push(ChatMessage::tool_result("call1", big.clone()));
+        request.push(ChatMessage::assistant("ack"));
+        request.push(ChatMessage::assistant("ack2"));
+        request.push(ChatMessage::assistant("ack3"));
+
+        let state = ProjectionState::new();
+        let projected = project(&state, Some(&session), &request);
+        let full = crate::agent::tokens::estimate_tokens(&request);
+        let packed = crate::agent::tokens::estimate_tokens(&projected);
+        assert!(
+            packed < full / 2,
+            "projected view must be much cheaper: {packed} vs {full}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
