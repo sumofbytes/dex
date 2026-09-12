@@ -473,6 +473,37 @@ pub(crate) fn tool_obs_recall(
     })
 }
 
+/// Build the observation object for any payload, without the participation
+/// threshold: the evidence reducer archives diagnostic bodies as small as
+/// 4 KiB, below `create_observation`'s 10 KiB floor.
+pub(crate) fn observation_for(tool_name: &str, text: &str) -> Observation {
+    let bytes = text.len();
+    let id = format!(
+        "obs_{}",
+        hash_hex(format!("{tool_name}\0{text}").as_bytes())
+    );
+    Observation {
+        id,
+        tool_name: tool_name.to_string(),
+        text: text.to_string(),
+        bytes,
+        lines: text.lines().count(),
+        tokens: payload_tokens(text),
+    }
+}
+
+/// Read one archived observation back as a string. The id is validated the
+/// same way recall validates it, so it is never a path traversal vector.
+pub(crate) fn read_observation(session_path: &Path, id: &str) -> std::io::Result<String> {
+    if !is_observation_id(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown observation id: {id}"),
+        ));
+    }
+    fs::read_to_string(observation_path(session_path, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

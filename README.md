@@ -40,6 +40,8 @@ to build, test, and submit changes. Please follow the
   demand via `/skill:<name>`.
 - **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
 - **Online context compaction** — set `DEX_ONLINE_COMPACTION=1` to add an `update_plan` tool: the model keeps a working plan, and each completed step is a safe point where history may compact early if the cache re-write cost pays for itself within the projected remaining work (horizon learned from requests-per-boundary; port of SoL-Pi's online-context-compact). Cache-write/read pricing resolves from the models.dev catalog for the running model — explicit write surcharge, else `input / cache_read` (writes bill at the plain input rate), else `1.0` when the provider prices no caching (reads then bill at the input rate, so a re-write costs what a read costs) — with a measured cross-provider fallback of 5.0 for unpriced models.
+- **Evidence-preserving reducer** — set `DEX_EVIDENCE_REDUCER=1` to delegate the first read of a large build/test log (`cargo`/`pytest`/`go test`/`make`/…) to a cheap model: the raw clamped output is archived beside the session, and the accepted reduction keeps only lines that are verified byte for byte against that archive (`status` is copied from the exit code, never judged by the model; an error log that names a failure must yield at least one failure quote). Any uncheckable receipt falls open to the raw result — delegation never requires trusting a fluent summary. Port of SoL-Pi's evidence-preserving-reducer; pairs with `obs_recall` for exact readback.
+
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
 - **Runtime logging** — `DEX_LOG=off|error|warn|info|debug|trace` with a
@@ -584,6 +586,8 @@ When an AS rejects `resource` with `invalid_target`, login retries once without 
 | `DEX_COMPACTION_LLM` | `1` to use LLM summarization for compaction (default deterministic). |
 | `DEX_ONLINE_COMPACTION` | `1` to enable online context compaction: adds the `update_plan` tool and compacts at completed plan steps when the cache re-write pays for itself. While on, the fixed message-count cap is suspended (the token threshold still bounds growth). |
 | `DEX_OBSERVATION_PACK` | `1` to enable the observation pack: tool results > 10 KB stop being re-sent after a 2-request grace period and are replaced with placeholders; `obs_recall` pages the archived original back. Compaction, resume, and fork still see intact history. |
+| `DEX_EVIDENCE_REDUCER` | `1` to enable the evidence-preserving reducer: large diagnostic tool results (`cargo`/`pytest`/`go test`/`make`/…) are reduced to a receipt whose quotes are verified byte for byte against the archived raw output; an uncheckable receipt falls back to the raw result. Requires a daemon session (uses the same archive as the observation pack). |
+| `DEX_REDUCER_MODEL` | Model selection (`provider/model`, same syntax as `DEX_MODEL`) for the evidence reducer's cheap delegate call. Unset: the main model is used (still verified, just not cheap). |
 | `DEX_DURABLE`   | `1` to `fsync` every session line (default only `turn_*`/`effect_*`). |
 | `DEX_AUDIT`     | `1` to write `audit.jsonl` per tool call (default off; session already journals). |
 | `DEX_EXTRA_TOOLS` | `1` to expose `git`+`chain` to the model (default 6 tools). |
