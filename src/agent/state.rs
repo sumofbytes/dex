@@ -95,6 +95,11 @@ pub(crate) struct ToolState {
     /// the first timed call and reset by `/new`.
     pub(crate) last_tok_s: Option<f64>,
     pub(crate) verify_dirty: bool,
+    /// Online context compaction bookkeeping (`DEX_ONLINE_COMPACTION=1`):
+    /// working plan, request/boundary counts, context growth, cache debt.
+    /// In-memory like the spend totals; a restart relearns at the next
+    /// boundary.
+    pub(crate) online: crate::agent::online::OnlineState,
 }
 
 impl ToolState {

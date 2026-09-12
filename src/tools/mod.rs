@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent::online::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::console::Console;
 use crate::core::format::clamp_lines;
@@ -235,6 +236,15 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             requires_shell: true,
             permission: PermissionRequirement::Read,
         },
+        // Pure bookkeeping: validates and echoes the plan snapshot; the
+        // agent loop owns the boundary state and compaction decision.
+        "update_plan" => ToolMetadata {
+            read_only: true,
+            mutating: false,
+            idempotent: true,
+            requires_shell: false,
+            permission: PermissionRequirement::Read,
+        },
         "bash" => ToolMetadata {
             read_only: false,
             mutating: true,
@@ -261,6 +271,16 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
         },
         _ => return None,
     })
+}
+
+/// `update_plan`: validate the full plan replacement and echo the snapshot.
+/// Pure — the boundary bookkeeping and the compaction decision live in the
+/// agent loop ([`crate::agent::online`]).
+fn tool_update_plan(args: &Map<String, Value>) -> Result<String, ToolError> {
+    let steps = args.get("steps").ok_or(ToolError::Missing("steps"))?;
+    let steps = parse_plan_steps(steps).map_err(ToolError::InvalidArgument)?;
+    let progress = parse_plan_progress(args.get("progress")).map_err(ToolError::InvalidArgument)?;
+    Ok(format_plan_snapshot(&steps, &progress))
 }
 
 impl std::fmt::Display for ToolError {
@@ -1630,6 +1650,7 @@ pub(crate) async fn execute(
         "ls" => tool_ls(args).await,
         "git" => tool_git(args, cancel).await,
         "chain" => tool_chain(args, cancel, policy, filter).await,
+        "update_plan" => tool_update_plan(args),
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
     // Run `then_run` in this same call so the mutation and its
