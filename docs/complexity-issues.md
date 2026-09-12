@@ -375,3 +375,14 @@ clippy --all-targets -- -D warnings`. Key guards: HTTP e2e (`client/http.rs:1271
 status-code order tests (`server.rs:2409-2435`, `2467-2558`), compaction tests
 (`agent/loop.rs`, `agent/compaction.rs`), config precedence/doctor tests,
 format/output tests, oauth local-mock tests.
+
+## Post-execution note (wave 2)
+
+Pre-existing flake observed once under heavy parallel contention (three full test
+suites + builds at once): `daemon::tests::rebuild_skips_failed_marking_for_live_turns`
+(panic at daemon/mod.rs:1082, expected `interrupted`, got `failed`). Root cause is in
+the tests, not the sweep: both `rebuild_*` tests share one hermetic session dir but
+own separate `DaemonState`s, so a concurrent rebuild from the sibling test can stamp
+`turn_failed` on the other test's live session. Reproduced 0/3 on pr-10 after the fix
+and 0/3 on base; `daemon::tests` alone is stable. Worth a dedicated test-isolation fix
+(separate hermetic dirs per test) outside this sweep.
