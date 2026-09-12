@@ -175,11 +175,24 @@ pub(crate) enum ToolError {
 /// output text, which may legitimately contain markers like `[exit 1]`.
 /// `diff` carries the display-only git diff for write/edit, captured before
 /// the file was mutated; it never reaches the model.
+/// Out-of-band shell facts a tool result carries beside its text: the
+/// archive id `evidence_reducer::capture` stored for the raw output, and the
+/// exit code it observed. Both travel outside the text on purpose — untrusted
+/// tool output must not be able to point verification at a different
+/// archive, or re-label a run's outcome. `None` for tools that ran no shell
+/// command (or ran one without the reducer gate on, in the id's case).
+#[derive(Clone, Debug)]
+pub(crate) struct ShellEvidence {
+    pub(crate) archive_id: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ToolOutcome {
     pub(crate) text: String,
     pub(crate) ok: bool,
     pub(crate) diff: Option<String>,
+    pub(crate) shell: Option<ShellEvidence>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -801,6 +814,8 @@ async fn append_then_run(
     mut text: String,
     command: &str,
     cancel: &(dyn CancellationSource + Send + Sync),
+    session: Option<&Path>,
+    shell_out: &mut Option<ShellEvidence>,
 ) -> (String, Option<i32>) {
     let (output, code) = match run_bash(command, cancel).await {
         Ok(result) => result,
@@ -809,6 +824,11 @@ async fn append_then_run(
                 "\n\n[then_run:failed] {}\n(error: {error})",
                 clip_command(command)
             ));
+            // No exit code and no archive: the command never produced output.
+            *shell_out = Some(ShellEvidence {
+                archive_id: None,
+                exit_code: None,
+            });
             return (text, None);
         }
     };
@@ -822,6 +842,13 @@ async fn append_then_run(
         clip_command(command)
     ));
     let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
+    let was_clamped = output.len() != clamped.len();
+    let (clamped, archive_id) =
+        crate::agent::evidence_reducer::capture(session, "then_run", &output, clamped, was_clamped);
+    *shell_out = Some(ShellEvidence {
+        archive_id,
+        exit_code: code,
+    });
     text.push_str(if clamped.trim().is_empty() {
         "(no output)"
     } else {
@@ -841,15 +868,31 @@ fn clip_command(command: &str) -> String {
     }
 }
 
+/// The session path the evidence reducer archives into (`Some` only for
+/// daemon parent turns — the same source the projection and recall read).
+fn evidence_session(policy: &Policy) -> Option<PathBuf> {
+    policy.agent.as_ref().map(|ctx| ctx.session_path.clone())
+}
+
 async fn tool_bash(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
+    session: Option<&Path>,
+    shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
     let (output, code) = run_bash(&arg_str(args, "command")?, cancel).await?;
+    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
+    let was_clamped = output.len() != clamped.len();
+    let (clamped, archive_id) =
+        crate::agent::evidence_reducer::capture(session, "bash", &output, clamped, was_clamped);
+    *shell_out = Some(ShellEvidence {
+        archive_id,
+        exit_code: code,
+    });
     match code {
-        Some(0) => Ok(clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES)),
+        Some(0) => Ok(clamped),
         code => Err(ToolError::Shell {
-            output: clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES),
+            output: clamped,
             code,
         }),
     }
@@ -1543,6 +1586,22 @@ pub(crate) async fn execute(
     policy: &Policy,
     filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
+    let mut shell = None;
+    execute_with_shell(name, args, cancel, policy, filter, &mut shell).await
+}
+
+/// Like `execute`, but surfaces the out-of-band shell facts (archive id,
+/// exit code) the evidence reducer needs without parsing them out of the
+/// result text. Only the agent loop's outcome path needs this; every other
+/// caller uses `execute`.
+pub(crate) async fn execute_with_shell(
+    name: &str,
+    args: &Map<String, Value>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
+    filter: Option<&ToolFilter>,
+    shell_out: &mut Option<ShellEvidence>,
+) -> Result<String, ToolError> {
     // Delegation tools route first (Phase 5): they are not workspace tools
     // and have no static registry entry. The child allowlist never contains
     // one, so the same availability gate rejects a child's call before any
@@ -1652,7 +1711,7 @@ pub(crate) async fn execute(
     }
     let result = match name {
         "read" => tool_read(args).await,
-        "bash" => tool_bash(args, cancel).await,
+        "bash" => tool_bash(args, cancel, evidence_session(policy).as_deref(), shell_out).await,
         "write" => tool_write(args).await,
         "edit" => tool_edit(args).await,
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
@@ -1671,7 +1730,14 @@ pub(crate) async fn execute(
     // had run against the new content.
     let result = match (result, then_run) {
         (Ok(text), Some(command)) => {
-            let (text, code) = append_then_run(text, command, cancel).await;
+            let (text, code) = append_then_run(
+                text,
+                command,
+                cancel,
+                evidence_session(policy).as_deref(),
+                shell_out,
+            )
+            .await;
             // Audit the shell run separately from the mutation: `DEX_AUDIT=1`
             // must show that a command ran and how it exited, not just a
             // successful `write`/`edit`.
@@ -1735,16 +1801,19 @@ pub(crate) async fn execute_outcome(
     } else {
         None
     };
-    match execute(name, args, cancel, policy, filter).await {
+    let mut shell = None;
+    match execute_with_shell(name, args, cancel, policy, filter, &mut shell).await {
         Ok(out) => ToolOutcome {
             text: out,
             ok: true,
             diff: pending_diff,
+            shell,
         },
         Err(e) => ToolOutcome {
             text: format!("Error: {}", e),
             ok: false,
             diff: None,
+            shell,
         },
     }
 }
