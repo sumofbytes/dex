@@ -1,5 +1,7 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
+use crate::core::console::{AGENT_COLOR, RESET};
+use crate::core::format::agent_lifecycle;
 use crate::protocol::{ApprovalDecision, StreamEvent};
 
 use super::http::{ChatOptions, DaemonClient};
@@ -55,8 +57,15 @@ fn handle_event_with(
             io::stdout().flush().ok();
         }
         StreamEvent::Thinking(_) => {}
-        StreamEvent::ToolCall { name, .. } => {
-            eprintln!("\n  > {name}...");
+        StreamEvent::ToolCall { name, args } => {
+            // The daemon ships the same short-arg preview the local path
+            // prints (`read src/main.rs`) — show it, not just the tool name.
+            let arg = args.as_str().unwrap_or_default();
+            if arg.is_empty() {
+                eprintln!("\n  > {name}...");
+            } else {
+                eprintln!("\n  > {name} {arg}...");
+            }
         }
         StreamEvent::ToolResult {
             name,
@@ -90,7 +99,19 @@ fn handle_event_with(
             eprintln!("\nerror: {error}");
         }
         StreamEvent::System(msg) => {
-            eprintln!("[system] {msg}");
+            // Child-agent lifecycle lines get their own colored marker so a
+            // delegation pops out of the muted `[system]` notes, matching
+            // the TUI's `◈`/`◇` glyphs. ANSI only on a real terminal; piped
+            // output stays plain like every other REPL line.
+            if let Some((marker, rest)) = agent_lifecycle(&msg) {
+                if io::stdout().is_terminal() {
+                    eprintln!("{AGENT_COLOR}{marker} [agent{rest}]{RESET}");
+                } else {
+                    eprintln!("[agent {rest}]");
+                }
+            } else {
+                eprintln!("[system] {msg}");
+            }
         }
         StreamEvent::Error(msg) => {
             eprintln!("[error] {msg}");

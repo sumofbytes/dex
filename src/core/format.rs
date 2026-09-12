@@ -224,8 +224,28 @@ fn strip_ansi(text: &str) -> String {
                     break;
                 }
             }
+            continue;
         }
-        // A lone ESC (or non-CSI sequence) is dropped.
+        if chars.peek() == Some(&']') {
+            chars.next();
+            // Consume the OSC payload (hyperlinks, window titles) up to its
+            // terminator: BEL, or the two-byte ST (ESC \). Dropping only the
+            // ESC would leak the payload text into previews.
+            loop {
+                match chars.next() {
+                    None | Some('\x07') => break,
+                    Some('\x1b') => {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        // A lone ESC (or non-CSI/OSC sequence) is dropped.
     }
     out
 }
@@ -461,8 +481,15 @@ fn read_gutter_number(line: &str) -> Option<u64> {
 /// what actually happened (counts, diffstats, first output line). Failure
 /// keeps the `failed ·` prefix: greppable, and it explains *why*. The tool
 /// input JSON is consulted for write/edit so the summary can show a diffstat
-/// without the caller doing extra IO.
-pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool) -> String {
+/// without the caller doing extra IO; `edit` prefers the real unified diff
+/// (`diff`) when the caller has one, so `replaceAll` replication counts.
+pub(crate) fn tool_result_summary(
+    name: &str,
+    input: &str,
+    text: &str,
+    ok: bool,
+    diff: Option<&str>,
+) -> String {
     if !ok {
         return format!("failed · {}", one_line_summary(text));
     }
@@ -470,7 +497,6 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
         .ok()
         .and_then(|v| v.as_object().cloned());
     let get = |k: &str| obj.as_ref().and_then(|o| o.get(k)).and_then(|x| x.as_str());
-    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
     match name {
         "read" => read_summary(obj.as_ref(), text),
         "grep" | "ffgrep" => {
@@ -508,8 +534,40 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
                 format!("{hits} matches")
             }
         }
-        "find" | "fffind" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
-        "ls" => format!("{} entr{}", lines, if lines == 1 { "y" } else { "ies" }),
+        "find" | "fffind" | "ls" => {
+            // Entry rows plus trailers: the picker's `[... N of M paths
+            // matched …]` and the ls clamp `[... N of M lines truncated …]`
+            // are truncation notes, not entries — fold their count into a
+            // `(+N more)` tail like read does.
+            let mut entries = 0usize;
+            let mut more = 0u64;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(n) = trailer_more_lines(trimmed) {
+                    more += n;
+                    continue;
+                }
+                if trimmed.starts_with("[...") {
+                    continue; // trailer without a count
+                }
+                if trimmed == "0 matches." || trimmed == "(empty)" {
+                    continue; // picker/ls empty-result prose, not an entry
+                }
+                entries += 1;
+            }
+            let mut out = if entries == 0 {
+                "empty".to_string()
+            } else {
+                format!("{} entr{}", entries, if entries == 1 { "y" } else { "ies" })
+            };
+            if more > 0 {
+                out.push_str(&format!(" (+{more} more)"));
+            }
+            out
+        }
         "bash" => match one_line_summary(text) {
             first if first.is_empty() => "(no output)".to_string(),
             first => first,
@@ -524,8 +582,15 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
             )
         }
         "edit" => {
-            let removed = get("oldText").unwrap_or_default().lines().count();
-            let added = get("newText").unwrap_or_default().lines().count();
+            // Diffstat from the actual unified diff when available — it
+            // counts replicated hunks too, so a `replaceAll` edit reports
+            // every occurrence, not just the input's one spelling.
+            let (added, removed) = diff_stat(diff).unwrap_or_else(|| {
+                (
+                    get("newText").unwrap_or_default().lines().count(),
+                    get("oldText").unwrap_or_default().lines().count(),
+                )
+            });
             format!("+{added} −{removed}{}", then_run_tail(text))
         }
         "chain" => {
@@ -535,13 +600,35 @@ pub(crate) fn tool_result_summary(name: &str, input: &str, text: &str, ok: bool)
                 .and_then(Value::as_array)
                 .map(|steps| steps.len())
                 .unwrap_or(0);
-            // Each fan-out read emits a `==> path <==` section header.
+            // Each fan-out read emits a `==> path <==` section header. Step
+            // outputs are clamped, so their trailers are truncation notes —
+            // excluded from the line count and folded into `(+N more)`.
             let files = text.matches("==> ").count();
-            format!(
+            let mut lines = 0usize;
+            let mut more = 0u64;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(n) = trailer_more_lines(trimmed) {
+                    more += n;
+                    continue;
+                }
+                if trimmed.starts_with("[...") {
+                    continue;
+                }
+                lines += 1;
+            }
+            let mut out = format!(
                 "{steps} steps · {files} file{} · {lines} line{}",
                 if files == 1 { "" } else { "s" },
                 plural(lines)
-            )
+            );
+            if more > 0 {
+                out.push_str(&format!(" (+{more} more)"));
+            }
+            out
         }
         _ => match one_line_summary(text) {
             first if first.is_empty() => "(no output)".to_string(),
@@ -578,6 +665,27 @@ fn then_run_verdict(text: &str) -> Option<String> {
     let end = body.find(']')?;
     let verdict = body[..end].trim();
     (!verdict.is_empty()).then(|| verdict.to_string())
+}
+
+/// Truthful diffstat from the unified diff: counts `+`/`-` hunk lines, so a
+/// `replaceAll` edit reports every replicated occurrence. `None` when no
+/// diff is available (callers fall back to the input's newText/oldText
+/// estimate).
+fn diff_stat(diff: Option<&str>) -> Option<(usize, usize)> {
+    let diff = diff?;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    Some((added, removed))
 }
 
 /// A grep content-mode row is a match when shaped `path:123:text`; context
@@ -623,6 +731,23 @@ pub(crate) fn format_duration(secs: f64) -> String {
 
 pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
+}
+
+/// Child-agent lifecycle system lines (`[agent <name>:<id>] started|finished
+/// …`, formatted in `subagent/tools.rs` / `subagent/manager.rs`) get their own
+/// spawn/terminal marker so a delegation pops out of the muted system notes,
+/// like the per-tool glyphs do. One owner for the TUI and the headless REPL —
+/// the format lives in two emit sites, so the parser must not be duplicated.
+/// Returns the marker (`◈` spawn / `◇` terminal) and the text after the
+/// `[agent ` prefix.
+pub(crate) fn agent_lifecycle(s: &str) -> Option<(&'static str, &str)> {
+    let rest = s.strip_prefix("[agent ")?;
+    let marker = if rest.contains(" finished ") {
+        "◇"
+    } else {
+        "◈"
+    };
+    Some((marker, rest))
 }
 
 /// Model-facing text for a `!`/`!!` shell run:
@@ -1175,10 +1300,33 @@ pub(crate) async fn git_context_async(cwd: &str) -> (Option<String>, bool) {
 mod tests {
     use super::*;
 
+    /// Four-arg convenience for the common no-diff case; tests that pass a
+    /// unified diff call [`tool_result_summary`] directly.
+    fn summary(name: &str, input: &str, text: &str, ok: bool) -> String {
+        tool_result_summary(name, input, text, ok, None)
+    }
+
     /// Display columns of a string (wide chars count 2) — the unit of the
     /// shared [`PREVIEW_LINE_COLS`] budget.
     fn display_cols(s: &str) -> usize {
         UnicodeWidthStr::width(s)
+    }
+
+    #[test]
+    fn agent_lifecycle_markers() {
+        // The two emit formats (spawn in `subagent/tools.rs`, terminal in
+        // `subagent/manager.rs`) must both parse — a wording change here
+        // downgrades the lines to muted system notes.
+        let (marker, rest) = agent_lifecycle("[agent explorer:sess-1] started").unwrap();
+        assert_eq!(marker, "◈");
+        assert_eq!(rest, "explorer:sess-1] started");
+        let (marker, rest) =
+            agent_lifecycle("[agent explorer:sess-1] finished completed · 3 tok").unwrap();
+        assert_eq!(marker, "◇");
+        assert_eq!(rest, "explorer:sess-1] finished completed · 3 tok");
+        // Non-lifecycle system notes stay muted.
+        assert!(agent_lifecycle("obs pack: bash result 45 KiB archived").is_none());
+        assert!(agent_lifecycle("").is_none());
     }
 
     /// The budget's canonical cut of `l`-filler: budget-1 columns of content
@@ -1243,17 +1391,17 @@ mod tests {
         let input = r#"{"path":"src/a.rs","content":"x\ny\n","then_run":"cargo test"}"#;
         let passed = "wrote src/a.rs\n\n[then_run:succeeded] cargo test\nok";
         assert_eq!(
-            tool_result_summary("write", input, passed, true),
+            summary("write", input, passed, true),
             "2 lines written · then_run: succeeded"
         );
         let failed = "wrote src/a.rs\n\n[then_run:failed (exit 3)] cargo test\nboom";
         assert_eq!(
-            tool_result_summary("write", input, failed, true),
+            summary("write", input, failed, true),
             "2 lines written · then_run: failed (exit 3)"
         );
         // No marker → the summary is unchanged.
         assert_eq!(
-            tool_result_summary("write", r#"{"content":"x"}"#, "wrote x", true),
+            summary("write", r#"{"content":"x"}"#, "wrote x", true),
             "1 line written"
         );
     }
@@ -1389,7 +1537,7 @@ mod tests {
         // A successful read whose content happens to contain the shell
         // failure marker must not be reported as failed.
         assert_eq!(
-            tool_result_summary(
+            summary(
                 "read",
                 "{}",
                 "use serde_json::{Map, Value};\nresult.push_str(\"[exit 1]\");\n",
@@ -1399,16 +1547,13 @@ mod tests {
         );
         // A genuinely failed tool reports failure with its first output line.
         assert_eq!(
-            tool_result_summary("bash", "{}", "ls: no such file\n[exit 2]", false),
+            summary("bash", "{}", "ls: no such file\n[exit 2]", false),
             "failed · ls: no such file"
         );
         // grep defaults to files mode: the summary counts files, not matches.
+        assert_eq!(summary("grep", "{}", "", true), "0 files matched");
         assert_eq!(
-            tool_result_summary("grep", "{}", "", true),
-            "0 files matched"
-        );
-        assert_eq!(
-            tool_result_summary(
+            summary(
                 "grep",
                 r#"{"output_mode":"content"}"#,
                 "src/a.rs:1:hit",
@@ -1419,7 +1564,7 @@ mod tests {
         // Context rows and the truncation trailer are not matches; fuzzy
         // fallback rows (`12: code` under a path header) are.
         assert_eq!(
-            tool_result_summary(
+            summary(
                 "grep",
                 r#"{"output_mode":"content"}"#,
                 "src/a.rs:2:hit\nsrc/a.rs:1-before\nsrc/a.rs:3-after\n[... 1 match shown, more files unscanned; continue with file_offset 2 ...]",
@@ -1428,7 +1573,7 @@ mod tests {
             "1 match"
         );
         assert_eq!(
-            tool_result_summary(
+            summary(
                 "grep",
                 r#"{"output_mode":"content"}"#,
                 "0 exact matches for 'q'. 2 approximate:\nsrc/a.rs\n  12: first\n  30: second",
@@ -1437,7 +1582,7 @@ mod tests {
             "2 matches"
         );
         assert_eq!(
-            tool_result_summary(
+            summary(
                 "grep",
                 "{}",
                 "a.rs\nb.rs\nc.rs\n[... 3 files shown, more files unscanned; continue with file_offset 3 ...]",
@@ -1448,7 +1593,7 @@ mod tests {
         // Files-mode fuzzy fallback lists paths under a prose header:
         // the header is not a file.
         assert_eq!(
-            tool_result_summary(
+            summary(
                 "ffgrep",
                 "{}",
                 "0 exact matches for 'q'. 2 approximate:\nsrc/a.rs\nsrc/b.rs",
@@ -1457,9 +1602,9 @@ mod tests {
             "2 files matched"
         );
         // Empty successful output says so instead of a bare "ok".
-        assert_eq!(tool_result_summary("bash", "{}", "", true), "(no output)");
+        assert_eq!(summary("bash", "{}", "", true), "(no output)");
         assert_eq!(
-            tool_result_summary("bash", "{}", "hello world\nrest", true),
+            summary("bash", "{}", "hello world\nrest", true),
             "hello world"
         );
     }
@@ -1468,17 +1613,17 @@ mod tests {
     fn mutation_summaries_show_diffstats_from_input() {
         let write_input = r#"{"path":"src/x.rs","content":"a\nb\nc\n"}"#;
         assert_eq!(
-            tool_result_summary("write", write_input, "wrote src/x.rs", true),
+            summary("write", write_input, "wrote src/x.rs", true),
             "3 lines written"
         );
         let single = r#"{"path":"src/x.rs","content":"only"}"#;
         assert_eq!(
-            tool_result_summary("write", single, "wrote src/x.rs", true),
+            summary("write", single, "wrote src/x.rs", true),
             "1 line written"
         );
         let edit_input = r#"{"path":"src/x.rs","oldText":"a\nb","newText":"x\ny\nz"}"#;
         assert_eq!(
-            tool_result_summary("edit", edit_input, "edited src/x.rs", true),
+            summary("edit", edit_input, "edited src/x.rs", true),
             "+3 −2"
         );
     }
@@ -1636,13 +1781,67 @@ mod tests {
     #[test]
     fn summaries_cover_the_ff_aliases() {
         assert_eq!(
-            tool_result_summary("ffgrep", "{}", "a.rs\nb.rs\n", true),
+            summary("ffgrep", "{}", "a.rs\nb.rs\n", true),
             "2 files matched"
         );
+        assert_eq!(summary("fffind", "{}", "a.rs\n", true), "1 entry");
+    }
+
+    #[test]
+    fn entry_summaries_exclude_truncation_trailers() {
+        // fffind's truncation note is not an entry; its count becomes the tail.
         assert_eq!(
-            tool_result_summary("fffind", "{}", "a.rs\n", true),
-            "1 entry"
+            summary(
+                "fffind",
+                "{}",
+                "a.rs\nb.rs\n[... 3 of 5 paths matched; raise limit or narrow the query ...]",
+                true
+            ),
+            "2 entries (+3 more)"
         );
+        // The picker's empty result is prose, not one entry.
+        assert_eq!(summary("fffind", "{}", "0 matches.", true), "empty");
+        // ls clamp trailer: 500 real entries shown, N omitted.
+        assert_eq!(
+            summary("ls", "{}", "a\nb\n[... 7 of 507 lines truncated ...]", true),
+            "2 entries (+7 more)"
+        );
+        assert_eq!(summary("ls", "{}", "(empty)", true), "empty");
+        // chain: step-output trailers stay out of the line count.
+        assert_eq!(
+            summary(
+                "chain",
+                r#"{"steps":[{"tool":"ls"},{"tool":"ls"}]}"#,
+                "==> src/a.rs <==\nmain.rs\n[... 4 of 10 lines truncated ...]",
+                true
+            ),
+            "2 steps · 1 file · 2 lines (+4 more)"
+        );
+    }
+
+    #[test]
+    fn edit_diffstat_counts_replicated_hunks_from_the_diff() {
+        // replaceAll turned one hunk into three: the input shows a single
+        // spelling, the real diff shows all three.
+        let input = r#"{"path":"x.rs","oldText":"old","newText":"new"}"#;
+        let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n-old\n+new\n-old\n+new\n-old\n+new\n";
+        assert_eq!(
+            tool_result_summary("edit", input, "edited x.rs", true, Some(diff)),
+            "+3 −3"
+        );
+        // No diff available: the input-based estimate still applies.
+        assert_eq!(summary("edit", input, "edited x.rs", true), "+1 −1");
+    }
+
+    #[test]
+    fn strip_ansi_consumes_osc_payloads() {
+        // Hyperlink: OSC 8 payload with an ST terminator.
+        assert_eq!(
+            one_line_summary("\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\ here"),
+            "link here"
+        );
+        // Window title with a BEL terminator.
+        assert_eq!(one_line_summary("\x1b]0;title\x07done"), "done");
     }
 
     #[tokio::test]

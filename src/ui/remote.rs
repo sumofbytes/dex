@@ -1858,7 +1858,8 @@ fn finish_shell_command(
         &mut remote.app,
         SinkLine::ToolInput(format!("bash {short}")),
     );
-    let mut summary = crate::core::format::tool_result_summary("bash", &input, output, success);
+    let mut summary =
+        crate::core::format::tool_result_summary("bash", &input, output, success, None);
     if excluded {
         summary.push_str(" · excluded from context");
     }
