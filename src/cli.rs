@@ -58,6 +58,11 @@ pub(crate) enum Mode {
         /// Server name for `login`/`logout`.
         server: Option<String>,
     },
+    /// Plot per-call token usage from a session (`dex usage <id|path>`).
+    Usage {
+        /// Session id or session/events file path.
+        session: String,
+    },
 }
 
 pub(crate) fn parse_args() -> Args {
@@ -176,6 +181,18 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
             name: args.rest[1].clone(),
             args: args.rest[2..].to_vec(),
         },
+        Some("usage") => {
+            // Strict like `mcp`: a missing or extra argument is an error,
+            // never a one-shot prompt that burns a network call.
+            if args.rest.len() != 2 {
+                return Mode::Usage {
+                    session: "__invalid__".to_string(),
+                };
+            }
+            Mode::Usage {
+                session: args.rest[1].clone(),
+            }
+        }
         Some(prompt) if !prompt.starts_with('-') => Mode::OneShot {
             prompt: args.rest.join(" "),
         },
@@ -197,7 +214,7 @@ pub(crate) fn check_reattach_mode(args: &Args, mode: &Mode) -> Result<(), String
         return Ok(());
     };
     // Informational modes win before any session is touched.
-    if matches!(mode, Mode::Help | Mode::Version) {
+    if matches!(mode, Mode::Help | Mode::Version | Mode::Usage { .. }) {
         return Ok(());
     }
     // These pick or disable a session; `--reattach` already picked one, so
@@ -411,6 +428,23 @@ mod tests {
         match resolve_mode(&args_with_rest(&["mcp", "login", "a", "b"])) {
             Mode::Mcp { action, .. } => assert_eq!(action, "__invalid__"),
             other => panic!("expected invalid Mcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_resolves_to_usage_mode() {
+        match resolve_mode(&args_with_rest(&["usage", "dex-k3m9x2q"])) {
+            Mode::Usage { session } => assert_eq!(session, "dex-k3m9x2q"),
+            other => panic!("expected Mode::Usage, got {other:?}"),
+        }
+        // Missing and extra args are invalid, never a one-shot prompt.
+        match resolve_mode(&args_with_rest(&["usage"])) {
+            Mode::Usage { session } => assert_eq!(session, "__invalid__"),
+            other => panic!("expected invalid Usage, got {other:?}"),
+        }
+        match resolve_mode(&args_with_rest(&["usage", "a", "b"])) {
+            Mode::Usage { session } => assert_eq!(session, "__invalid__"),
+            other => panic!("expected invalid Usage, got {other:?}"),
         }
     }
 }
