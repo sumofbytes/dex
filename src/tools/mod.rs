@@ -762,21 +762,25 @@ fn then_run_command<'a>(
 }
 
 /// Append the `then_run` observation to a *successful* write/edit result.
-/// Same clamping and shell timeout as `bash`; a non-zero exit or timeout is
-/// reported in-band rather than as a tool error, because the mutation itself
-/// did succeed and the model needs both facts to decide what to do next.
+/// Returns the enriched text plus the command's exit code (`None` when the
+/// command failed to spawn, timed out, or was cancelled) so the caller can
+/// record the shell run on the audit trail. Same clamping and shell timeout as
+/// `bash`; a non-zero exit or timeout is reported in-band rather than as a tool
+/// error, because the mutation itself did succeed and the model needs both
+/// facts to decide what to do next.
 async fn append_then_run(
     mut text: String,
     command: &str,
     cancel: &(dyn CancellationSource + Send + Sync),
-) -> String {
+) -> (String, Option<i32>) {
     let (output, code) = match run_bash(command, cancel).await {
         Ok(result) => result,
         Err(error) => {
             text.push_str(&format!(
-                "\n\n[then_run:failed] {command}\n(error: {error})"
+                "\n\n[then_run:failed] {}\n(error: {error})",
+                clip_command(command)
             ));
-            return text;
+            return (text, None);
         }
     };
     let marker = match code {
@@ -784,14 +788,28 @@ async fn append_then_run(
         Some(code) => format!("failed (exit {code})"),
         None => "failed".to_string(),
     };
-    text.push_str(&format!("\n\n[then_run:{marker}] {command}\n"));
+    text.push_str(&format!(
+        "\n\n[then_run:{marker}] {}\n",
+        clip_command(command)
+    ));
     let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
     text.push_str(if clamped.trim().is_empty() {
         "(no output)"
     } else {
         &clamped
     });
-    text
+    (text, code)
+}
+
+/// One-line clip for the `then_run` command echoed in the result marker. The
+/// command also rides the tool-input preview, so the marker needs only enough
+/// to identify it — not a second full copy of a very long command in context.
+fn clip_command(command: &str) -> String {
+    let single = command.replace('\n', " ");
+    match single.char_indices().nth(200).map(|(idx, _)| idx) {
+        Some(idx) => format!("{}…", &single[..idx]),
+        None => single,
+    }
 }
 
 async fn tool_bash(
@@ -1621,7 +1639,22 @@ pub(crate) async fn execute(
     // the observation, and a command output must never be handed back as if it
     // had run against the new content.
     let result = match (result, then_run) {
-        (Ok(text), Some(command)) => Ok(append_then_run(text, command, cancel).await),
+        (Ok(text), Some(command)) => {
+            let (text, code) = append_then_run(text, command, cancel).await;
+            // Audit the shell run separately from the mutation: `DEX_AUDIT=1`
+            // must show that a command ran and how it exited, not just a
+            // successful `write`/`edit`.
+            let mut shell_args = Map::new();
+            shell_args.insert("command".into(), Value::String(command.to_string()));
+            shell_args.insert("then_run_of".into(), Value::String(name.to_string()));
+            let shell_outcome = match code {
+                Some(0) => "ok".to_string(),
+                Some(code) => format!("exit {code}"),
+                None => "no exit status (timeout, cancel, or spawn failure)".to_string(),
+            };
+            audit("bash", &shell_args, &shell_outcome);
+            Ok(text)
+        }
         (result, _) => result,
     };
     let outcome = match &result {
@@ -1820,6 +1853,7 @@ mod tests {
     /// `then_run` runs after a successful mutation and its output
     /// arrives in the same tool result, so the model learns the verification
     /// outcome without a second round-trip that re-sends the whole prefix.
+    #[cfg(unix)]
     #[tokio::test]
     async fn then_run_streams_verification_into_the_same_result() {
         let cwd = std::env::current_dir().unwrap();
@@ -1852,6 +1886,7 @@ mod tests {
     /// A failing command is not a failed tool call: the write landed, and the
     /// model needs both facts — the mutation and the exit status — not an
     /// `Error:` that hides which half of the call did what.
+    #[cfg(unix)]
     #[tokio::test]
     async fn then_run_failure_is_reported_in_band() {
         let cwd = std::env::current_dir().unwrap();
