@@ -1528,6 +1528,14 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             app.show_thinking = !app.show_thinking;
             bump_thinking_stamps(app);
         }
+        // Alt+V: cycle the user voice color. Global chrome like Ctrl+T
+        // above, so it sits before the slash-popup arm and works with the
+        // popup open; already-submitted rows keep the voice they were
+        // sent in, the composer and new prompts use the new one.
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => {
+            let name = super::theme::cycle_voice();
+            app.notice = Some((format!("voice: {name}"), Instant::now()));
+        }
         _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
             KeyCode::Esc => {
                 // Discard the drafted slash command and close the popup
@@ -2917,6 +2925,31 @@ mod tests {
         handle_key(&mut remote, ctrl_c());
         assert!(!remote.app.quit);
         assert!(remote.app.input.text().is_empty());
+    }
+
+    #[test]
+    fn alt_v_cycles_the_voice_without_touching_the_draft() {
+        // The voice slot is process-global, so serialize against the theme
+        // tests that assert on it.
+        let _guard = crate::ui::theme::VOICE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut remote = test_remote();
+        remote.app.input.insert_paste("draft");
+        handle_key(
+            &mut remote,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::ALT,
+            ),
+        );
+        let (notice, _) = remote.app.notice.clone().expect("Alt+V shows a notice");
+        assert!(notice.starts_with("voice: "), "unexpected notice: {notice}");
+        assert_eq!(
+            remote.app.input.text(),
+            "draft",
+            "Alt+V must not edit the draft"
+        );
     }
 
     #[test]

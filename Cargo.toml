@@ -84,6 +84,14 @@ sha2 = "0.10"
 [dev-dependencies]
 http = "1"
 
+# ratatui 0.29 pins lru ^0.12, which is vulnerable (GHSA-rhfx-m35p-ff5j:
+# `IterMut` violates Stacked Borrows) and got no 0.12.x fix; upstream patched
+# in 0.16.3. ratatui-markdown 0.3.6 caps ratatui at ^0.29, so the ratatui 0.30
+# line (which drops lru) isn't reachable yet. vendor/lru keeps ratatui's ^0.12
+# requirement satisfied while wiring in the patched upstream code.
+[patch.crates-io]
+lru = { path = "vendor/lru" }
+
 # Symbols for profilers (parca-agent / perf / heaptrack) without touching
 # release output: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
 [profile.profiling]

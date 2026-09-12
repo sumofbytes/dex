@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crossterm::Command;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -30,7 +30,14 @@ pub(crate) use render::view;
 use input::InputField;
 
 const VERTICAL_GUTTER: u16 = 1;
-const HORIZONTAL_GUTTER: u16 = 1;
+/// Left/right air shared by every full-width surface (composer, footer,
+/// queue strip, slash popup) and the transcript's leading indent, so rendered
+/// transcript text and the composer's text column always start on the same
+/// cell. The composer's surface band is painted across the whole row (flush to
+/// the window edge), so this is the box's *inside* padding — there is no
+/// separate outer margin to shrink. Tuning it moves the composer cursor and
+/// the transcript indent together, which is what keeps them aligned.
+const HORIZONTAL_GUTTER: u16 = 2;
 const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
 const INPUT_BORDER_ROWS: u16 = 0;
 const INPUT_PAD_Y: u16 = 1;
@@ -668,7 +675,16 @@ fn leading_border_range(line: &Line<'static>) -> (usize, usize) {
 fn copy_text(line: &Line<'static>) -> String {
     let (start, end) = leading_border_range(line);
     if start == end {
-        return line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // User-band rows are padded to the full width with `surface_bg()`
+        // spaces so the submitted prompt reads as the composer's echo;
+        // strip that display fill so copies stay clean.
+        return line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            .trim_end()
+            .to_string();
     }
     let mut out = String::new();
     let mut col = 0usize;
@@ -1337,32 +1353,25 @@ pub(super) fn scroll_transcript(app: &mut App, delta: i32) {
 }
 
 /// Render the user's submitted prompt with the shared transcript grid.
+/// The words keep the user's signature voice color from the composer, so
+/// your turns read as yours against the assistant's default foreground.
 /// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
 pub(super) fn render_user_prompt(app: &mut App, line: &str) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
-    // Same head glyph as the live composer (`render_input`), on the same
-    // left margin: the transcript indent puts `▶` at the column the
-    // composer's glyph occupies, so submitted and typed prompts (and the
-    // rest of the grid) share one left edge. No background.
+    // Plain words on the shared transcript margin: no prompt glyph, just
+    // the user's signature voice color from the composer, so your turns
+    // read as yours against the assistant's default foreground.
+    // No background is stored here: `wrap_block` paints the composer
+    // `surface_bg()` band plus `INPUT_PAD_Y` air at wrap time.
+    let user_style = Style::default().fg(theme::user_fg());
     let mut block_lines = Vec::new();
-    for (i, sub) in line.split('\n').enumerate() {
-        let row = if i == 0 {
-            Line::from(vec![
-                Span::styled(
-                    render::COMPOSER_PROMPT,
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::raw(sub.to_string()),
-            ])
-        } else {
-            Line::from(Span::raw(sub.to_string()))
-        };
-        block_lines.push(indent_transcript_line(row));
+    for sub in line.split('\n') {
+        block_lines.push(indent_transcript_line(Line::from(Span::styled(
+            sub.to_string(),
+            user_style,
+        ))));
     }
     app.transcript.push(TranscriptBlock::User {
         stamp: 0,
@@ -1663,7 +1672,11 @@ mod tests {
         ];
         for (line, row) in lines.iter().zip(art) {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert_eq!(text, format!(" {row}"), "indent + art row, in order");
+            assert_eq!(
+                text,
+                format!("{}{row}", transcript_indent()),
+                "indent + art row, in order"
+            );
         }
         // Art rows carry the info color (the indent span is unstyled).
         assert!(lines.iter().all(|l| l
@@ -2081,7 +2094,33 @@ mod tests {
     fn indent_transcript_line_adds_gutter() {
         let line = Line::from("test");
         let indented = indent_transcript_line(line);
-        assert!(indented.spans[0].content.as_ref() == " ");
+        assert_eq!(indented.spans[0].content.as_ref(), transcript_indent());
+    }
+
+    #[test]
+    fn submitted_prompt_keeps_user_voice() {
+        // Submitted words keep the composer's signature color, so your turns
+        // read as yours against the assistant's default foreground. No
+        // prompt glyph — bare text on the transcript margin.
+        let mut app = test_app();
+        render_user_prompt(&mut app, "hello\nworld");
+        let lines = match app.transcript.last() {
+            Some(TranscriptBlock::User { lines, .. }) => lines,
+            other => panic!("expected user block, got {other:?}"),
+        };
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.style.fg == Some(theme::user_fg())),
+                "every submitted row carries the voice color: {line:?}"
+            );
+            assert!(
+                line.spans.iter().all(|s| !s.content.contains("▶")),
+                "no prompt glyph in submitted rows: {line:?}"
+            );
+        }
     }
 
     #[test]
