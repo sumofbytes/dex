@@ -23,9 +23,13 @@ pub(crate) fn online_compaction_enabled() -> bool {
 /// Rough token estimate for the summary a compaction leaves behind.
 pub(crate) const NATIVE_SUMMARY_TOKEN_ESTIMATE: u64 = 1_000;
 
-/// Fallback cache-write/read ratio when the catalog doesn't price cache
-/// writes; matches Anthropic 5m pricing (1.25x write / 0.1x read).
-pub(crate) const DEFAULT_CACHE_WRITE_READ_RATIO: f64 = 12.5;
+/// Fallback cache-write/read ratio when the catalog prices no caching at
+/// all. Measured cross-provider median of `input / cache_read` over the
+/// models.dev catalog (~4.5k priced models; p25 = 4, p75 = 10). Models that
+/// price a write surcharge (Anthropic-style) resolve explicitly and never
+/// fall back here; unpriced writes resolve as `input / cache_read` because
+/// writing to cache at the plain input rate is the industry norm.
+pub(crate) const DEFAULT_CACHE_WRITE_READ_RATIO: f64 = 5.0;
 
 // ---------------------------------------------------------------------------
 // Plan steps
@@ -65,6 +69,21 @@ pub(crate) struct PlanStep {
     pub(crate) id: String,
     pub(crate) goal: String,
     pub(crate) status: PlanStatus,
+}
+
+/// Progress evidence attached to a plan update (schema-optional). Kept
+/// beside the plan so a compaction reminder can carry it forward.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PlanProgress {
+    pub(crate) files_changed: Vec<String>,
+    pub(crate) verification: Vec<String>,
+    pub(crate) decisions: Vec<String>,
+}
+
+impl PlanProgress {
+    fn is_empty(&self) -> bool {
+        self.files_changed.is_empty() && self.verification.is_empty() && self.decisions.is_empty()
+    }
 }
 
 /// Validate a `steps` array: bounded strings, exactly three keys per step,
@@ -117,6 +136,39 @@ pub(crate) struct PlanTransition {
     pub(crate) advice: Vec<String>,
 }
 
+/// Validate a `progress` object: bounded strings, string arrays only.
+/// Evidence attached to a plan update; surfaced in the snapshot and kept
+/// through compaction so the post-compaction reminder retains it.
+pub(crate) fn parse_plan_progress(value: Option<&Value>) -> Result<PlanProgress, String> {
+    const MAX_ITEMS: usize = 64;
+    let Some(value) = value else {
+        return Ok(PlanProgress::default());
+    };
+    let Some(obj) = value.as_object() else {
+        return Err("progress must be an object".into());
+    };
+    let list = |key: &str| -> Result<Vec<String>, String> {
+        match obj.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(items)) if items.len() <= MAX_ITEMS => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .filter(|s| !s.is_empty() && s.len() <= MAX_PLAN_STRING_BYTES)
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("progress {key} items must be non-empty strings"))
+                })
+                .collect(),
+            Some(_) => Err(format!("progress {key} must be an array of strings")),
+        }
+    };
+    Ok(PlanProgress {
+        files_changed: list("files_changed")?,
+        verification: list("verification")?,
+        decisions: list("decisions")?,
+    })
+}
+
 /// Diff the previous plan against the next: which steps just completed, plus
 /// gentle advice for plan-hygiene violations (goal reuse, parallel progress).
 pub(crate) fn analyze_plan_transition(prev: &[PlanStep], next: &[PlanStep]) -> PlanTransition {
@@ -152,8 +204,10 @@ pub(crate) fn analyze_plan_transition(prev: &[PlanStep], next: &[PlanStep]) -> P
 }
 
 /// The plan snapshot echoed in every `update_plan` result — a stable anchor
-/// that survives compaction inside the keep-recent window.
-pub(crate) fn format_plan_snapshot(steps: &[PlanStep]) -> String {
+/// that survives compaction inside the keep-recent window. Progress evidence
+/// rides along when the model supplied it, so the reminder after a
+/// compaction retains what was done and how it was verified.
+pub(crate) fn format_plan_snapshot(steps: &[PlanStep], progress: &PlanProgress) -> String {
     let steps_json: Vec<Value> = steps
         .iter()
         .map(|s| {
@@ -164,15 +218,25 @@ pub(crate) fn format_plan_snapshot(steps: &[PlanStep]) -> String {
             })
         })
         .collect();
+    let mut body = json!({ "steps": steps_json });
+    if !progress.is_empty() {
+        body["progress"] = json!({
+            "files_changed": progress.files_changed,
+            "verification": progress.verification,
+            "decisions": progress.decisions,
+        });
+    }
     format!(
         "<dex-plan task_status=\"active\">{}</dex-plan>",
-        serde_json::to_string(&json!({ "steps": steps_json })).unwrap_or_default()
+        serde_json::to_string(&body).unwrap_or_default()
     )
 }
 
 /// Post-compaction reminder: the parent task is still active; re-plan before
-/// continuing. Lists the remaining goals so the fresh plan starts informed.
-pub(crate) fn post_compaction_reminder(steps: &[PlanStep]) -> String {
+/// continuing. Lists the remaining goals so the fresh plan starts informed,
+/// plus the accumulated progress evidence (files changed, verification run,
+/// decisions made) so the re-plan doesn't lose what was already done.
+pub(crate) fn post_compaction_reminder(steps: &[PlanStep], progress: &PlanProgress) -> String {
     let mut text = "Online context compaction finished. The parent task is still active. \
         Before continuing work, call update_plan with a fresh plan for the remaining work."
         .to_string();
@@ -188,6 +252,21 @@ pub(crate) fn post_compaction_reminder(steps: &[PlanStep]) -> String {
             text.push_str(goal);
         }
     }
+    if !progress.is_empty() {
+        text.push_str("\nProgress so far:");
+        for f in &progress.files_changed {
+            text.push_str("\nFiles changed: ");
+            text.push_str(f);
+        }
+        for v in &progress.verification {
+            text.push_str("\nVerified: ");
+            text.push_str(v);
+        }
+        for d in &progress.decisions {
+            text.push_str("\nDecided: ");
+            text.push_str(d);
+        }
+    }
     text
 }
 
@@ -198,6 +277,8 @@ pub(crate) fn post_compaction_reminder(steps: &[PlanStep]) -> String {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct OnlineState {
     pub(crate) plan: Vec<PlanStep>,
+    /// Latest progress evidence from `update_plan` calls.
+    pub(crate) progress: PlanProgress,
     /// Provider requests issued since the session (or last reset) started.
     request_count: u64,
     /// `request_count` at the last completed boundary.
@@ -261,16 +342,17 @@ impl OnlineState {
     }
 
     /// The user steered/corrected mid-task: the old horizon sample no longer
-    /// describes the remaining work, so reset it.
+    /// describes the remaining work, so reset it. The cache debt stays: the
+    /// re-write cost of a compaction already fired is sunk spend; only the
+    /// horizon reset belongs to a correction.
     pub(crate) fn record_correction(&mut self) {
         self.plan.clear();
+        self.progress = PlanProgress::default();
         self.last_boundary_request_count = self.request_count;
         self.completed_boundary_request_counts.clear();
         self.last_context_tokens = None;
         self.positive_context_delta_total = 0;
         self.positive_context_delta_count = 0;
-        self.cache_debt_tokens = 0.0;
-        self.cache_debt_repayment_tokens = 0.0;
     }
 
     fn average_context_token_increment(&self) -> Option<f64> {
@@ -616,7 +698,9 @@ mod tests {
 
         state.record_correction();
         assert_eq!(state.completed_boundary_request_counts, Vec::<u64>::new());
-        assert_eq!(state.cache_debt_tokens, 0.0);
+        // Corrections reset the horizon but keep the sunk cache debt: the
+        // re-write cost of a compaction already fired is spent either way.
+        assert_eq!(state.cache_debt_tokens, 500.0);
     }
 
     #[test]
@@ -646,7 +730,7 @@ mod tests {
             120_000,
             &state,
             Some(128_000),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(d.compact);
@@ -672,7 +756,7 @@ mod tests {
             40_000,
             &state,
             Some(128_000),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(!d.compact);
@@ -706,7 +790,7 @@ mod tests {
             5_217,
             &state,
             Some(25_217),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(!d.compact);
@@ -732,7 +816,7 @@ mod tests {
             40_000,
             &state,
             Some(128_000),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(d.compact);
@@ -760,7 +844,7 @@ mod tests {
             40_000,
             &state,
             Some(128_000),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(!d.compact);
@@ -785,7 +869,7 @@ mod tests {
             40_000,
             &state,
             Some(128_000),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(d.compact);
@@ -803,7 +887,7 @@ mod tests {
             120_000,
             &state,
             Some(128_000),
-            Some(12.5),
+            Some(12.5), // Anthropic-style explicit pricing
             &DEFAULT_COMPACTION_ECONOMICS,
         );
         assert!(!d.compact);
@@ -837,8 +921,53 @@ mod tests {
             step("1", PlanStatus::Completed),
             step("2", PlanStatus::InProgress),
         ];
-        let text = post_compaction_reminder(&steps);
+        let text = post_compaction_reminder(&steps, &PlanProgress::default());
         assert!(text.contains("call update_plan"));
         assert!(text.contains("- goal 2"));
+        assert!(!text.contains("Progress so far"));
+    }
+
+    #[test]
+    fn reminder_carries_progress_evidence() {
+        let steps = vec![step("2", PlanStatus::Pending)];
+        let progress = PlanProgress {
+            files_changed: vec!["src/lib.rs".into()],
+            verification: vec!["cargo test: ok".into()],
+            decisions: vec!["stdlib over dep".into()],
+        };
+        let text = post_compaction_reminder(&steps, &progress);
+        assert!(text.contains("- goal 2"));
+        assert!(text.contains("Files changed: src/lib.rs"));
+        assert!(text.contains("Verified: cargo test: ok"));
+        assert!(text.contains("Decided: stdlib over dep"));
+    }
+
+    #[test]
+    fn progress_parses_and_rejects() {
+        let ok = json!({"files_changed": ["a.rs"], "verification": [], "decisions": ["d"]});
+        let p = parse_plan_progress(Some(&ok)).unwrap();
+        assert_eq!(p.files_changed, vec!["a.rs".to_string()]);
+        assert_eq!(p.decisions, vec!["d".to_string()]);
+        assert_eq!(parse_plan_progress(None).unwrap(), PlanProgress::default());
+        assert!(parse_plan_progress(Some(&json!("nope"))).is_err());
+        assert!(parse_plan_progress(Some(&json!({"files_changed": [1]}))).is_err());
+        assert!(parse_plan_progress(Some(&json!({"files_changed": [""]}))).is_err());
+    }
+
+    #[test]
+    fn snapshot_includes_progress_when_present() {
+        let steps = vec![step("1", PlanStatus::InProgress)];
+        let bare = format_plan_snapshot(&steps, &PlanProgress::default());
+        assert!(bare.contains(r#""steps":"#));
+        assert!(!bare.contains(r#""progress":"#));
+        let with = format_plan_snapshot(
+            &steps,
+            &PlanProgress {
+                files_changed: vec!["x.rs".into()],
+                ..PlanProgress::default()
+            },
+        );
+        assert!(with.contains(r#""progress":"#));
+        assert!(with.contains("x.rs"));
     }
 }

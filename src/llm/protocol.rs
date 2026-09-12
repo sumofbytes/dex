@@ -472,18 +472,32 @@ mod tests {
 
     #[test]
     fn tools_schema_contains_all_tools() {
+        // Serializes against tests in other modules that flip the env vars
+        // these gates read (online compaction, extra tools).
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::session::EnvGuard(vec![
+            (
+                crate::agent::online::ONLINE_COMPACTION_ENV,
+                std::env::var_os(crate::agent::online::ONLINE_COMPACTION_ENV),
+            ),
+            ("DEX_EXTRA_TOOLS", std::env::var_os("DEX_EXTRA_TOOLS")),
+        ]);
+        std::env::remove_var("DEX_ONLINE_COMPACTION");
+        std::env::remove_var("DEX_EXTRA_TOOLS");
         let schema = tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
-        let mut expected: Vec<&str> = vec!["read", "bash", "write", "edit", "grep", "find", "ls"];
-        // DEX_ONLINE_COMPACTION=1 adds the plan tool.
-        if crate::agent::online::online_compaction_enabled() {
-            expected.push("update_plan");
-        }
-        // Default is 6 tools; DEX_EXTRA_TOOLS=1 adds git+chain
-        if std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1") {
-            expected.extend(["git", "chain"]);
-        }
+        let expected: Vec<&str> = vec!["read", "bash", "write", "edit", "grep", "find", "ls"];
         assert_eq!(names, expected);
+
+        // DEX_ONLINE_COMPACTION=1 adds the plan tool.
+        std::env::set_var("DEX_ONLINE_COMPACTION", "1");
+        let names: Vec<String> = tools_schema()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert!(names.iter().any(|n| n == "update_plan"), "{names:?}");
     }
 
     #[test]
