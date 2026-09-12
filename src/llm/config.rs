@@ -2488,10 +2488,17 @@ pub(crate) fn doctor(
                             "built-in default — set DEX_REDUCER_MODEL for a cheap reducer",
                         ),
                     };
+                // Reduction requires a recallable source archive; without
+                // the pack the receipts would have no readback path.
+                let mode = if crate::agent::obs_pack::observation_pack_enabled() {
+                    "on"
+                } else {
+                    "off (needs DEX_OBSERVATION_PACK=1)"
+                };
                 row(
                     &mut out,
                     "evidence reducer",
-                    &format!("on · reducer model {reducer_model}"),
+                    &format!("{mode} · reducer model {reducer_model}"),
                     model_source,
                 );
             }
