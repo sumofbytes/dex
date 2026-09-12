@@ -383,9 +383,21 @@ where
         // in the schema before bootstrap either, so the budget stays exact
         // and a budget probe never spawns the background refresh.
         let ephemerals = [crate::mcp::ephemeral_line()];
+        // Observation pack projection: the provider-bound view replaces
+        // stale large tool results with placeholders. Built fresh from the
+        // intact history on every request; the stored session never changes.
+        // Token accounting (compaction threshold, online sampling) reads
+        // this view too — archived payloads must not pressure the window
+        // estimate after their grace period expires.
+        let projected = if crate::agent::obs_pack::observation_pack_enabled() {
+            let obs_session = policy.agent.as_ref().map(|ctx| ctx.session_path.clone());
+            crate::agent::obs_pack::project(&state.obs_projection, obs_session.as_deref(), messages)
+        } else {
+            messages.clone()
+        };
         let mut compaction_attempts = 0;
         while compaction_attempts < 3 {
-            let eff = effective_tokens(messages, &ephemerals, true);
+            let eff = effective_tokens(&projected, &ephemerals, true);
             let need_by_tokens = eff > config.compaction_threshold();
             // The message-count fallback is a global cap — exactly what the
             // online compaction economics replace. With
@@ -440,10 +452,11 @@ where
         // Online compaction bookkeeping (`DEX_ONLINE_COMPACTION=1`): sample
         // the context size of every provider request — the growth rate and
         // the per-boundary request counts feed the compaction economics.
+        // Sampled on the projected view: only bytes actually sent count.
         if online_compaction_enabled() {
             state
                 .online
-                .record_request(effective_tokens(messages, &ephemerals, true));
+                .record_request(effective_tokens(&projected, &ephemerals, true));
         }
 
         // Async LLM call with prompt cancel: `select!(cancelled, complete)`
@@ -455,7 +468,7 @@ where
             _ = wait_cancelled(cancel_ref) => {
                 return Err("cancelled by user".into());
             }
-            r = client.complete(messages, true, console.sink().cloned(), cancel_ref) => match r {
+            r = client.complete(&projected, true, console.sink().cloned(), cancel_ref) => match r {
                 Ok(result) => result,
                 Err(e) => {
                     let msg = e.to_string();
@@ -899,6 +912,7 @@ where
                     total_cost: state.total_cost,
                     last_tok_s: state.last_tok_s,
                     verify_dirty: state.verify_dirty,
+                    obs_projection: crate::agent::obs_pack::ProjectionState::new(),
                 };
                 to_save.save_async().await;
                 state.dirty = false;
