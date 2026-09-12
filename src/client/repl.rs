@@ -90,7 +90,19 @@ fn handle_event_with(
             eprintln!("\nerror: {error}");
         }
         StreamEvent::System(msg) => {
-            eprintln!("[system] {msg}");
+            // Child-agent lifecycle lines get their own colored marker so a
+            // delegation pops out of the muted `[system]` notes, matching
+            // the TUI's `◈`/`◇` glyphs.
+            if let Some(rest) = msg.strip_prefix("[agent ") {
+                let (marker, rest) = if rest.contains(" finished ") {
+                    ("\x1b[1;32m◇", rest)
+                } else {
+                    ("\x1b[1;32m◈", rest)
+                };
+                eprintln!("{marker} [agent{rest}\x1b[0m");
+            } else {
+                eprintln!("[system] {msg}");
+            }
         }
         StreamEvent::Error(msg) => {
             eprintln!("[error] {msg}");
