@@ -7,8 +7,8 @@ use crate::agent::compaction::{
     compact_history, effective_tokens, estimate_tokens, KEEP_RECENT_MESSAGES,
 };
 use crate::agent::online::{
-    analyze_plan_transition, decide_compaction, online_compaction_enabled, parse_plan_progress,
-    parse_plan_steps, post_compaction_reminder, CompactionEconomics, PlanStep,
+    analyze_plan_transition, cache_debt_for_ratio, decide_compaction, online_compaction_enabled,
+    parse_plan_progress, parse_plan_steps, post_compaction_reminder, CompactionEconomics, PlanStep,
     DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
 };
 use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
@@ -128,6 +128,21 @@ fn is_context_overflow(message: &str) -> bool {
 /// which are billed too. `gen_ms` is the caller-measured wall-clock
 /// duration of the LLM call (`None` when untimed, e.g. compaction): it
 /// becomes the footer's tokens/s denominator on the client.
+/// Tokens a compaction can actually archive: the transcript minus the
+/// system message (never summarized) and the larger of the keep-recent
+/// token window and the `KEEP_RECENT_MESSAGES` message floor that
+/// `compact_history` enforces. Bounds the economics' saving estimate to
+/// what a cut can really remove.
+fn archivable_tokens(messages: &[ChatMessage], config: &LlmConfig) -> u64 {
+    let transcript = estimate_tokens(messages.get(1..).unwrap_or(&[]));
+    let recent = estimate_tokens(
+        messages
+            .get(messages.len().saturating_sub(KEEP_RECENT_MESSAGES)..)
+            .unwrap_or(&[]),
+    );
+    transcript.saturating_sub(recent.max(config.keep_recent_tokens()))
+}
+
 async fn record_usage(
     config: &LlmConfig,
     state: &mut ToolState,
@@ -382,6 +397,10 @@ where
             if !need_by_tokens && !need_by_count {
                 break;
             }
+            // Measure the re-write cost and the archivable slice before
+            // `compact_history` rewrites `messages`.
+            let online =
+                online_compaction_enabled().then(|| (eff, archivable_tokens(messages, config)));
             match compact_history(config, messages, cancel, false).await {
                 Ok((true, compacted)) => {
                     compaction_attempts += 1;
@@ -397,6 +416,19 @@ where
                         }
                     }
                     persisted_cursor = messages.len();
+                    if let Some((write, archive)) = online {
+                        // A threshold compaction bypasses the boundary
+                        // economics, but the state must still see it:
+                        // pressure samples reset, the re-write is carried
+                        // as debt the next boundary repays, and the plan
+                        // survives (the model was not asked to re-plan).
+                        let (debt, repayment) = cache_debt_for_ratio(
+                            write,
+                            archive,
+                            Some(config.cache_write_read_ratio()),
+                        );
+                        state.online.record_threshold_compaction(debt, repayment);
+                    }
                     continue;
                 }
                 Ok((false, _)) => break,
@@ -731,11 +763,9 @@ where
                         );
                     });
                 }
-                // The boundary (computed above, before the emit) is
-                // processed after the tool result is appended so the
-                // transcript keeps assistant → tool_result → reminder order
-                // (pi's reference aborts the turn instead; dex compacts
-                // inline, and the ordering must stay wire-valid).
+                // The tool result lands before any boundary reminder so the
+                // transcript stays assistant → tool_result → reminder (see
+                // the boundary note above).
                 messages.push(ChatMessage::tool_result(
                     call.id.clone(),
                     model_tool_result(&result),
@@ -758,11 +788,12 @@ where
                         };
                         let decision = decide_compaction(
                             context_tokens,
-                            // Archivable slice: the transcript only. The
-                            // ephemeral preamble and tool schema are re-sent on
-                            // every request and never archived — the reference
-                            // excludes the system prompt the same way.
-                            estimate_tokens(messages).saturating_sub(config.keep_recent_tokens()),
+                            // Archivable slice: what a cut can actually
+                            // remove (see `archivable_tokens`) — the system
+                            // message and the keep-recent window are never
+                            // archived, and the ephemeral preamble + tool
+                            // schema are re-sent on every request.
+                            archivable_tokens(messages, config),
                             NATIVE_SUMMARY_TOKEN_ESTIMATE,
                             context_tokens,
                             &state.online,
@@ -778,34 +809,46 @@ where
                             decision.archive_tokens
                         );
                         if decision.compact {
-                            if let Ok((true, usage)) =
-                                compact_history(config, messages, cancel, false).await
-                            {
-                                if let Some(u) = usage {
-                                    record_usage(config, state, console, u, None).await;
-                                }
-                                if let Some(session) = session.as_deref_mut() {
-                                    session.clear_messages()?;
-                                    for message in messages.iter().skip(1) {
-                                        session.append_message(message)?;
+                            match compact_history(config, messages, cancel, false).await {
+                                Ok((true, usage)) => {
+                                    if let Some(u) = usage {
+                                        record_usage(config, state, console, u, None).await;
                                     }
+                                    if let Some(session) = session.as_deref_mut() {
+                                        session.clear_messages()?;
+                                        for message in messages.iter().skip(1) {
+                                            session.append_message(message)?;
+                                        }
+                                    }
+                                    persisted_cursor = messages.len();
+                                    // The compaction forces the retained prefix to
+                                    // be re-written at cache-write price on the next
+                                    // request; carry that as debt the following
+                                    // boundaries must repay before another compaction
+                                    // is economical.
+                                    let (debt, repayment) = decision.cache_debt();
+                                    // The reminder lists the remaining goals — build
+                                    // it before record_compaction clears the plan.
+                                    let reminder = post_compaction_reminder(
+                                        &state.online.plan,
+                                        &state.online.progress,
+                                    );
+                                    state.online.record_compaction(debt, repayment);
+                                    messages.push(ChatMessage::user_named(reminder, "compact"));
+                                    persist_pending(&mut session, messages, &mut persisted_cursor)?;
                                 }
-                                persisted_cursor = messages.len();
-                                // The compaction forces the retained prefix to
-                                // be re-written at cache-write price on the next
-                                // request; carry that as debt the following
-                                // boundaries must repay before another compaction
-                                // is economical.
-                                let (debt, repayment) = decision.cache_debt();
-                                // The reminder lists the remaining goals — build
-                                // it before record_compaction clears the plan.
-                                let reminder = post_compaction_reminder(
-                                    &state.online.plan,
-                                    &state.online.progress,
-                                );
-                                state.online.record_compaction(debt, repayment);
-                                messages.push(ChatMessage::user_named(reminder, "compact"));
-                                persist_pending(&mut session, messages, &mut persisted_cursor)?;
+                                // Below the summarize floor (e.g. a boundary
+                                // right after the previous compaction) or a
+                                // summarizer failure: nothing was cut, so no
+                                // cache debt is carried — log why anyway.
+                                Ok((false, _)) => {
+                                    crate::log!(Debug,
+                                        "online compaction boundary declined: history below the summarize floor"
+                                    );
+                                }
+                                Err(e) => {
+                                    crate::log!(Debug, "online compaction boundary failed: {e}");
+                                }
                             }
                         }
                     }
@@ -1234,6 +1277,9 @@ mod tests {
             tool_budget: Some(64),
         })
         .await;
+        // Remove the fixture before asserting so a failed assert doesn't
+        // leak it into `target/`.
+        let _ = std::fs::remove_file(big_path);
 
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.as_deref().unwrap(), "done");
@@ -1256,7 +1302,6 @@ mod tests {
             .find(|m| m.name.as_deref() == Some("compact"))
             .unwrap();
         assert!(reminder.content.as_deref().unwrap().contains("- second"));
-        let _ = std::fs::remove_file(big_path);
     }
 
     #[tokio::test]

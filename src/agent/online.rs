@@ -294,6 +294,9 @@ pub(crate) struct OnlineState {
     /// compactions, repaid `cache_debt_repayment_tokens` per request.
     cache_debt_tokens: f64,
     cache_debt_repayment_tokens: f64,
+    /// The first request after a compaction *is* the re-write — it pays the
+    /// surcharge itself, so amortization starts one request later.
+    skip_next_repayment: bool,
 }
 
 impl OnlineState {
@@ -309,11 +312,18 @@ impl OnlineState {
         let delta = self
             .last_context_tokens
             .map_or(0, |last| context_tokens.saturating_sub(last));
-        let debt = (self.cache_debt_tokens - self.cache_debt_repayment_tokens).max(0.0);
         self.request_count += 1;
         self.last_context_tokens = Some(context_tokens);
         self.positive_context_delta_total += delta;
         self.positive_context_delta_count += u64::from(delta > 0);
+        if self.skip_next_repayment {
+            // The first request after a compaction *is* the re-write: it
+            // pays the surcharge itself, so amortization starts one
+            // request later.
+            self.skip_next_repayment = false;
+            return;
+        }
+        let debt = (self.cache_debt_tokens - self.cache_debt_repayment_tokens).max(0.0);
         self.cache_debt_tokens = debt;
         if debt == 0.0 {
             self.cache_debt_repayment_tokens = 0.0;
@@ -330,13 +340,23 @@ impl OnlineState {
         self.completed_boundary_request_counts.push(interval);
     }
 
-    /// A compaction happened: reset pressure samples, carry the cache debt.
+    /// A compaction happened: clear the plan (the reminder asks the model
+    /// for a fresh one), reset pressure samples, carry the cache debt.
     pub(crate) fn record_compaction(&mut self, debt_tokens: f64, repayment_tokens: f64) {
         self.plan.clear();
+        self.record_threshold_compaction(debt_tokens, repayment_tokens);
+    }
+
+    /// A threshold (non-boundary) compaction fired on the token cap: reset
+    /// pressure samples and carry the cache re-write as debt, but keep the
+    /// plan — the model was not asked to re-plan, so its next `update_plan`
+    /// still diffs against the same steps.
+    pub(crate) fn record_threshold_compaction(&mut self, debt_tokens: f64, repayment_tokens: f64) {
         self.last_context_tokens = None;
         self.positive_context_delta_total = 0;
         self.positive_context_delta_count = 0;
         self.native_compaction_count += 1;
+        self.skip_next_repayment = true;
         self.cache_debt_tokens = debt_tokens.max(0.0);
         self.cache_debt_repayment_tokens = repayment_tokens.max(0.0);
     }
@@ -470,15 +490,39 @@ impl CompactionDecision {
     /// by the per-request token saving (`repayment`) on each subsequent
     /// request. Lives here — next to the economics — not in the turn loop.
     pub(crate) fn cache_debt(&self) -> (f64, f64) {
-        let ratio = self.incremental_cache_cost_ratio.unwrap_or(0.0);
-        #[allow(clippy::cast_precision_loss)]
-        let debt = self.write_tokens as f64 * ratio;
-        #[allow(clippy::cast_precision_loss)]
-        let repayment = self
-            .archive_tokens
-            .saturating_sub(NATIVE_SUMMARY_TOKEN_ESTIMATE) as f64;
-        (debt, repayment)
+        cache_debt_for(
+            self.write_tokens,
+            self.archive_tokens,
+            self.incremental_cache_cost_ratio,
+        )
     }
+}
+
+/// Cache re-write debt for a compaction archiving `archive_tokens` of a
+/// `write_tokens` prefix, at a full `cache_write_read_ratio` (`None` → no
+/// surcharge). Shared by the boundary economics and the threshold path.
+pub(crate) fn cache_debt_for_ratio(
+    write_tokens: u64,
+    archive_tokens: u64,
+    cache_write_read_ratio: Option<f64>,
+) -> (f64, f64) {
+    cache_debt_for(
+        write_tokens,
+        archive_tokens,
+        cache_write_read_ratio.map(|ratio| (ratio - 1.0).max(0.0)),
+    )
+}
+
+fn cache_debt_for(
+    write_tokens: u64,
+    archive_tokens: u64,
+    incremental_cache_cost_ratio: Option<f64>,
+) -> (f64, f64) {
+    #[allow(clippy::cast_precision_loss)]
+    let debt = write_tokens as f64 * incremental_cache_cost_ratio.unwrap_or(0.0);
+    #[allow(clippy::cast_precision_loss)]
+    let repayment = archive_tokens.saturating_sub(NATIVE_SUMMARY_TOKEN_ESTIMATE) as f64;
+    (debt, repayment)
 }
 
 /// Decide whether compacting now is worth it. Window protection always wins
@@ -701,6 +745,57 @@ mod tests {
         // Corrections reset the horizon but keep the sunk cache debt: the
         // re-write cost of a compaction already fired is spent either way.
         assert_eq!(state.cache_debt_tokens, 500.0);
+    }
+
+    #[test]
+    fn repayment_starts_after_the_rewrite_request() {
+        let mut state = OnlineState::default();
+        state.record_compaction(300.0, 100.0);
+        // The first request after the compaction *is* the re-write: it pays
+        // the surcharge itself, so the debt is untouched.
+        state.record_request(1_000);
+        assert_eq!(state.cache_debt_tokens, 300.0);
+        // Amortization starts on the following request.
+        state.record_request(1_000);
+        assert_eq!(state.cache_debt_tokens, 200.0);
+        state.record_request(1_000);
+        assert_eq!(state.cache_debt_tokens, 100.0);
+        state.record_request(1_000);
+        assert_eq!(state.cache_debt_tokens, 0.0);
+        assert_eq!(state.cache_debt_repayment_tokens, 0.0);
+    }
+
+    #[test]
+    fn threshold_compaction_keeps_the_plan() {
+        let mut state = OnlineState {
+            plan: vec![
+                step("1", PlanStatus::Completed),
+                step("2", PlanStatus::Pending),
+            ],
+            ..OnlineState::default()
+        };
+        state.record_request(100);
+        state.record_threshold_compaction(500.0, 100.0);
+        // The model was not asked to re-plan, so its next `update_plan` must
+        // still diff against the same steps — clearing the plan here would
+        // count already-completed steps as new boundaries.
+        assert_eq!(state.plan.len(), 2);
+        assert_eq!(state.native_compaction_count, 1);
+        assert_eq!(state.last_context_tokens, None);
+        assert_eq!(state.cache_debt_tokens, 500.0);
+    }
+
+    #[test]
+    fn cache_debt_for_ratio_matches_the_decision_path() {
+        // Explicit surcharge: write * (ratio - 1).
+        let (debt, repayment) = cache_debt_for_ratio(40_000, 20_000, Some(12.5));
+        assert!((debt - 40_000.0 * 11.5).abs() < 1e-9);
+        assert!((repayment - 19_000.0).abs() < 1e-9);
+        // No ratio (or ratio 1.0): no surcharge to amortize.
+        let (debt, _) = cache_debt_for_ratio(40_000, 20_000, None);
+        assert_eq!(debt, 0.0);
+        let (debt, _) = cache_debt_for_ratio(40_000, 20_000, Some(1.0));
+        assert_eq!(debt, 0.0);
     }
 
     #[test]
