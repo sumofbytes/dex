@@ -330,6 +330,12 @@ pub(crate) struct ProjectionState {
     /// Ids whose archive write has already been verified this run; skips
     /// the per-request `fs::read` + re-hash of `ensure_stored`.
     verified: Mutex<HashMap<String, ()>>,
+    /// Ids already reported as packed this run — the transcript note fires
+    /// once per id, not on every request.
+    reported: Mutex<HashMap<String, ()>>,
+    /// User-facing notes accumulated by `project` and drained by the agent
+    /// loop after each request.
+    notes: Mutex<Vec<String>>,
 }
 
 impl ProjectionState {
@@ -337,7 +343,18 @@ impl ProjectionState {
         Self {
             sends: Mutex::new(HashMap::new()),
             verified: Mutex::new(HashMap::new()),
+            reported: Mutex::new(HashMap::new()),
+            notes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Drain the user-facing notes accumulated by the last `project` call:
+    /// one line per id the placeholder took over for the first time.
+    pub(crate) fn take_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .map(|mut notes| std::mem::take(&mut *notes))
+            .unwrap_or_default()
     }
 }
 
@@ -434,6 +451,22 @@ pub(crate) fn project(
                                 reasoning_content: None,
                             });
                             packed = true;
+                            // First takeover of this id this run: leave a
+                            // note the agent loop surfaces in the transcript,
+                            // so the otherwise-invisible swap is observable.
+                            if let Ok(mut reported) = state.reported.lock() {
+                                if reported.insert(observation.id.clone(), ()).is_none() {
+                                    if let Ok(mut notes) = state.notes.lock() {
+                                        notes.push(format!(
+                                            "obs pack: {} result {} archived — the model recalls pages with obs_recall",
+                                            observation.tool_name,
+                                            crate::agent::evidence_reducer::format_bytes(
+                                                observation.bytes
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -731,6 +764,45 @@ mod tests {
         let projected = project(&state2, None, &request);
         let tool_msg = projected.iter().find(|m| m.role == Role::Tool).unwrap();
         assert_eq!(tool_msg.content_str(), big);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_placeholder_takeover_leaves_a_note_once() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = temp_session_dir("notes");
+        let session = dir.join("s.jsonl");
+        let big = big_text(600);
+        let mut request = vec![ChatMessage::system("sys"), ChatMessage::user("go")];
+        request.push(ChatMessage::tool_result("call1", big.clone()));
+
+        let state = ProjectionState::new();
+        for turn in 0..FULL_SENDS {
+            let projected = project(&state, Some(&session), &request);
+            let tool_msg = projected.iter().find(|m| m.role == Role::Tool).unwrap();
+            assert_eq!(tool_msg.content_str(), big, "grace period sends full");
+            assert!(state.take_notes().is_empty(), "grace sends are silent");
+            request.push(ChatMessage::assistant(format!("ack {turn}")));
+        }
+        // First takeover: exactly one note, naming the tool and the size.
+        let projected = project(&state, Some(&session), &request);
+        let tool_msg = projected.iter().find(|m| m.role == Role::Tool).unwrap();
+        assert!(tool_msg.content_str().contains("obs_recall"));
+        let notes = state.take_notes();
+        assert_eq!(notes.len(), 1, "one note for the first takeover: {notes:?}");
+        assert!(notes[0].contains("tool result"), "{notes:?}");
+        assert!(notes[0].contains("obs_recall"), "{notes:?}");
+        // Later requests keep placeholdering but never repeat the note.
+        let projected = project(&state, Some(&session), &request);
+        assert!(projected
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .unwrap()
+            .content_str()
+            .contains("obs_recall"));
+        assert!(state.take_notes().is_empty(), "no repeat note");
         let _ = fs::remove_dir_all(&dir);
     }
 

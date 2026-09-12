@@ -26,6 +26,16 @@ use crate::llm::stream::Turn;
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
+/// Emit a system note on every surface: a transcript line when a sink is
+/// attached (TUI / daemon), `eprintln` headless.
+async fn system_note(console: &Console, note: &str) {
+    if console.sink().is_some() {
+        console.emit_async(SinkLine::System(note.to_string())).await;
+    } else {
+        with_console(false, || eprintln!("[dex] {note}"));
+    }
+}
+
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
     let mut paths = std::collections::HashSet::new();
     calls.iter().any(|call| {
@@ -397,6 +407,11 @@ where
         } else {
             messages.clone()
         };
+        // Placeholder takeovers are otherwise invisible — the stored history
+        // never changes — so surface each first takeover to the user.
+        for note in state.obs_projection.take_notes() {
+            system_note(console, &note).await;
+        }
         let mut compaction_attempts = 0;
         while compaction_attempts < 3 {
             let eff = effective_tokens(&projected, &ephemerals, true);
@@ -756,18 +771,15 @@ where
                 }
                 if let Some(reduced) = reduction {
                     result = reduced.receipt;
-                    let note = format!(
-                        "evidence reducer: {} -> {} (verified)",
-                        crate::agent::evidence_reducer::format_bytes(reduced.source_bytes),
-                        crate::agent::evidence_reducer::format_bytes(reduced.receipt_bytes),
-                    );
-                    if console.sink().is_some() {
-                        console.emit_async(SinkLine::System(note)).await;
-                    } else {
-                        with_console(console.sink().is_some(), || {
-                            eprintln!("[dex] {note}");
-                        });
-                    }
+                    system_note(
+                        console,
+                        &format!(
+                            "evidence reducer: {} -> {} (verified)",
+                            crate::agent::evidence_reducer::format_bytes(reduced.source_bytes),
+                            crate::agent::evidence_reducer::format_bytes(reduced.receipt_bytes),
+                        ),
+                    )
+                    .await;
                 }
                 // Online context compaction (`DEX_ONLINE_COMPACTION=1`):
                 // a completed plan step is a boundary — a safe point where
@@ -910,6 +922,17 @@ where
                                     state.online.record_compaction(debt, repayment);
                                     messages.push(ChatMessage::user_named(reminder, "compact"));
                                     persist_pending(&mut session, messages, &mut persisted_cursor)?;
+                                    // The boundary fired silently before; a
+                                    // system line is the only user-visible
+                                    // proof the economics paid out.
+                                    system_note(
+                                        console,
+                                        &format!(
+                                            "online compaction: history compacted at plan boundary (~{} tokens archived)",
+                                            decision.archive_tokens
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 // Below the summarize floor (e.g. a boundary
                                 // right after the previous compaction) or a
