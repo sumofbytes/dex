@@ -241,6 +241,26 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             },
         });
     }
+    // Observation pack recall: the pull-back side of the projection.
+    // Gated like the other prompt-token-costing tools — only registered
+    // when the packer itself is on, so the schema cost tracks the feature.
+    if crate::agent::obs_pack::observation_pack_enabled() {
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "obs_recall".to_string(),
+                description: "Read a stored large tool result by observation id and byte offset. Older large tool results in this conversation were replaced with placeholders; recall a paged excerpt from the placeholder's id when you need the original content again. Continue with the returned next_offset.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "observation id from a placeholder" },
+                        "offset": { "type": "integer", "description": "byte offset, default 0" }
+                    },
+                    "required": ["id"]
+                }),
+            },
+        });
+    }
     if extra {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),

@@ -236,6 +236,15 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             requires_shell: true,
             permission: PermissionRequirement::Read,
         },
+        // Reads the session's observation archive; never touches the
+        // workspace.
+        "obs_recall" => ToolMetadata {
+            read_only: true,
+            mutating: false,
+            idempotent: true,
+            requires_shell: false,
+            permission: PermissionRequirement::Read,
+        },
         // Pure bookkeeping: validates and echoes the plan snapshot; the
         // agent loop owns the boundary state and compaction decision.
         "update_plan" => ToolMetadata {
@@ -1651,6 +1660,7 @@ pub(crate) async fn execute(
         "git" => tool_git(args, cancel).await,
         "chain" => tool_chain(args, cancel, policy, filter).await,
         "update_plan" => tool_update_plan(args),
+        "obs_recall" => tool_obs_recall(args, cancel, policy),
         _ => unreachable!("metadata and dispatch must stay in sync"),
     };
     // Run `then_run` in this same call so the mutation and its
@@ -1684,6 +1694,24 @@ pub(crate) async fn execute(
     };
     audit(name, args, &outcome);
     result
+}
+
+pub(crate) fn tool_obs_recall(
+    args: &Map<String, Value>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
+) -> Result<String, ToolError> {
+    // Only a daemon parent turn carries a session path (same source the
+    // projection reads): OneShot / direct runs / children have none and
+    // fail with a clear error rather than silently succeeding with an
+    // empty archive.
+    let Some(session_path) = policy.agent.as_ref().map(|ctx| ctx.session_path.clone()) else {
+        return Err(ToolError::InvalidArgument(
+            "obs_recall requires a daemon session (no session archive attached)".to_string(),
+        ));
+    };
+    let _ = cancel;
+    crate::agent::obs_pack::tool_obs_recall(&session_path, args)
 }
 
 /// Execute a tool, reporting success explicitly. Callers must not re-derive
