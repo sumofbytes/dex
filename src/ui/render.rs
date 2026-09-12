@@ -27,12 +27,12 @@ pub(super) fn surface_padding() -> Padding {
 }
 
 pub(super) fn input_block() -> Block<'static> {
-    // Borderless composer: the old top/bottom rules are blank `surface_bg()`
-    // padding rows now, so the outer height is unchanged and the strip still
-    // reads as one surface separating the transcript above from the status
-    // line below (no rules, no side borders). Typing and history align on
-    // the shared transcript margin (no prompt glyph — the text column is the
-    // left edge); the right pad just keeps the cursor off the last cell.
+    // Borderless composer: one `surface_bg()` band separating the transcript
+    // above from the status line below (no rules, no side borders). The
+    // padding is the shared `HORIZONTAL_GUTTER`, so the caret and the
+    // transcript's leading indent land on the same cell (no prompt glyph —
+    // the text column is the left edge); the right pad just keeps the cursor
+    // off the last cell.
     Block::default()
         .style(Style::default().bg(theme::surface_bg()))
         .padding(Padding {
@@ -2150,8 +2150,8 @@ mod tests {
         assert_eq!(queue.items, 4); // 3 items + tail
         assert_eq!(queue.rows, 3 * QUEUE_MAX_ITEM_ROWS as u16 + 1);
 
-        let layout = compute_layout(Rect::new(0, 0, 80, 26), 1, queue, false)
-            .expect("maxed queue must fit a 26-row terminal");
+        let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, queue, false)
+            .expect("maxed queue must fit a 24-row terminal");
         assert!(layout.activity.height > 0);
         assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
         assert_eq!(layout.footer.height, status_height());
@@ -3003,15 +3003,20 @@ mod tests {
 
     #[test]
     fn composer_has_no_border_rules() {
-        // The composer is borderless: a single `surface_bg()` band with no
-        // `─` rules; the old top/bottom rule rows are blank padding rows so
-        // the outer height is unchanged (content rows + 2).
-        assert_eq!(input_outer_height(1), 3);
+        // The composer is a borderless band: one `surface_bg()` row set with
+        // no `─` rules, height = content rows + the shared vertical padding.
+        assert_eq!(input_outer_height(1), 1 + super::super::INPUT_PAD_Y * 2);
         let area = Rect::new(0, 0, 20, 3);
         let backend = TestBackend::new(20, 3);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|f| {
+                // Sentinel background: the band assertion below only means
+                // something if the cells would otherwise keep a different bg.
+                f.render_widget(
+                    Block::default().style(Style::default().bg(Color::Magenta)),
+                    area,
+                );
                 f.render_widget(Paragraph::new("hi").block(input_block()), area);
             })
             .expect("render should succeed");
@@ -3034,6 +3039,25 @@ mod tests {
             );
         }
         assert!(row(1).contains("hi"), "content should render on the band");
+    }
+
+    #[test]
+    fn composer_text_column_matches_transcript_indent() {
+        // Typing and history share one left edge: the composer's inside
+        // padding and the transcript's leading indent must resolve to the
+        // same column, or the caret jumps sideways when a prompt is sent.
+        let area = Rect::new(0, 0, 40, 3);
+        let composer_col = input_block().inner(area).x as usize;
+        assert_eq!(composer_col, super::super::TRANSCRIPT_INDENT);
+        let indent = super::super::transcript_indent();
+        assert_eq!(indent.len(), composer_col);
+        assert!(indent.chars().all(|c| c == ' '));
+        // The caret wraps against the block's own inside width, so it never
+        // escapes the padded band.
+        assert_eq!(
+            input_block().inner(area).width,
+            input_content_width(area.width)
+        );
     }
 
     #[test]

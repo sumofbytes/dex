@@ -2928,6 +2928,31 @@ mod tests {
     }
 
     #[test]
+    fn alt_v_cycles_the_voice_without_touching_the_draft() {
+        // The voice slot is process-global, so serialize against the theme
+        // tests that assert on it.
+        let _guard = crate::ui::theme::VOICE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut remote = test_remote();
+        remote.app.input.insert_paste("draft");
+        handle_key(
+            &mut remote,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::ALT,
+            ),
+        );
+        let (notice, _) = remote.app.notice.clone().expect("Alt+V shows a notice");
+        assert!(notice.starts_with("voice: "), "unexpected notice: {notice}");
+        assert_eq!(
+            remote.app.input.text(),
+            "draft",
+            "Alt+V must not edit the draft"
+        );
+    }
+
+    #[test]
     fn busy_ctrl_c_needs_three_presses_to_force_quit() {
         let mut remote = test_remote();
         remote.app.busy = true;
