@@ -801,6 +801,7 @@ async fn append_then_run(
     mut text: String,
     command: &str,
     cancel: &(dyn CancellationSource + Send + Sync),
+    session: Option<&Path>,
 ) -> (String, Option<i32>) {
     let (output, code) = match run_bash(command, cancel).await {
         Ok(result) => result,
@@ -822,6 +823,9 @@ async fn append_then_run(
         clip_command(command)
     ));
     let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
+    let was_clamped = output.len() != clamped.len();
+    let clamped =
+        crate::agent::evidence_reducer::capture(session, "then_run", &output, clamped, was_clamped);
     text.push_str(if clamped.trim().is_empty() {
         "(no output)"
     } else {
@@ -841,15 +845,26 @@ fn clip_command(command: &str) -> String {
     }
 }
 
+/// The session path the evidence reducer archives into (`Some` only for
+/// daemon parent turns — the same source the projection and recall read).
+fn evidence_session(policy: &Policy) -> Option<PathBuf> {
+    policy.agent.as_ref().map(|ctx| ctx.session_path.clone())
+}
+
 async fn tool_bash(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
+    session: Option<&Path>,
 ) -> Result<String, ToolError> {
     let (output, code) = run_bash(&arg_str(args, "command")?, cancel).await?;
+    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
+    let was_clamped = output.len() != clamped.len();
+    let clamped =
+        crate::agent::evidence_reducer::capture(session, "bash", &output, clamped, was_clamped);
     match code {
-        Some(0) => Ok(clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES)),
+        Some(0) => Ok(clamped),
         code => Err(ToolError::Shell {
-            output: clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES),
+            output: clamped,
             code,
         }),
     }
@@ -1652,7 +1667,7 @@ pub(crate) async fn execute(
     }
     let result = match name {
         "read" => tool_read(args).await,
-        "bash" => tool_bash(args, cancel).await,
+        "bash" => tool_bash(args, cancel, evidence_session(policy).as_deref()).await,
         "write" => tool_write(args).await,
         "edit" => tool_edit(args).await,
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
@@ -1671,7 +1686,8 @@ pub(crate) async fn execute(
     // had run against the new content.
     let result = match (result, then_run) {
         (Ok(text), Some(command)) => {
-            let (text, code) = append_then_run(text, command, cancel).await;
+            let (text, code) =
+                append_then_run(text, command, cancel, evidence_session(policy).as_deref()).await;
             // Audit the shell run separately from the mutation: `DEX_AUDIT=1`
             // must show that a command ran and how it exited, not just a
             // successful `write`/`edit`.

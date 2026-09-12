@@ -2473,6 +2473,29 @@ pub(crate) fn doctor(
                 };
             row(&mut out, "obs pack", obs_pack, obs_pack_source);
 
+            // Evidence-preserving reducer: the delegation gate and where its
+            // model selection came from — the mechanism is invisible in a
+            // session otherwise.
+            if crate::agent::evidence_reducer::enabled() {
+                let (reducer_model, model_source) =
+                    match env::var(crate::agent::evidence_reducer::MODEL_ENV)
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        Some(model) => (model, crate::agent::evidence_reducer::MODEL_ENV),
+                        None => (
+                            format!("{model} (main model)"),
+                            "built-in default — set DEX_REDUCER_MODEL for a cheap reducer",
+                        ),
+                    };
+                row(
+                    &mut out,
+                    "evidence reducer",
+                    &format!("on · reducer model {reducer_model}"),
+                    model_source,
+                );
+            }
+
             let (chain_effort, effort_source) =
                 if let Some(e) = stored_thinking_effort(&base_url, &model) {
                     (e, "stored /thinking choice".to_string())
