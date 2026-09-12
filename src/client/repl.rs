@@ -1,5 +1,7 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
+use crate::core::console::{AGENT_COLOR, RESET};
+use crate::core::format::agent_lifecycle;
 use crate::protocol::{ApprovalDecision, StreamEvent};
 
 use super::http::{ChatOptions, DaemonClient};
@@ -92,14 +94,14 @@ fn handle_event_with(
         StreamEvent::System(msg) => {
             // Child-agent lifecycle lines get their own colored marker so a
             // delegation pops out of the muted `[system]` notes, matching
-            // the TUI's `◈`/`◇` glyphs.
-            if let Some(rest) = msg.strip_prefix("[agent ") {
-                let (marker, rest) = if rest.contains(" finished ") {
-                    ("\x1b[1;32m◇", rest)
+            // the TUI's `◈`/`◇` glyphs. ANSI only on a real terminal; piped
+            // output stays plain like every other REPL line.
+            if let Some((marker, rest)) = agent_lifecycle(&msg) {
+                if io::stdout().is_terminal() {
+                    eprintln!("{AGENT_COLOR}{marker} [agent{rest}]{RESET}");
                 } else {
-                    ("\x1b[1;32m◈", rest)
-                };
-                eprintln!("{marker} [agent{rest}\x1b[0m");
+                    eprintln!("[agent {rest}]");
+                }
             } else {
                 eprintln!("[system] {msg}");
             }
