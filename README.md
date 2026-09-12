@@ -39,6 +39,7 @@ to build, test, and submit changes. Please follow the
   `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
   demand via `/skill:<name>`.
 - **History compaction** — when the context window is exceeded, older turns are summarized deterministically (no LLM call) to keep requests bounded. Set `DEX_COMPACTION_LLM=1` for model summarization.
+- **Online context compaction** — set `DEX_ONLINE_COMPACTION=1` to add an `update_plan` tool: the model keeps a working plan, and each completed step is a safe point where history may compact early if the cache re-write cost pays for itself within the projected remaining work (horizon learned from requests-per-boundary; port of SoL-Pi's online-context-compact).
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
 - **Runtime logging** — `DEX_LOG=off|error|warn|info|debug|trace` with a
@@ -505,8 +506,9 @@ schema):
 | `delegate`* | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`) and return its id immediately. Daemon sessions only. |
 | `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result. |
 | `delegate_stop`* | Cancel a running child and return its terminal result. |
+| `update_plan`† | Replace the complete working plan (`steps`, optional `progress`). A completed step is a compaction boundary. Behind `DEX_ONLINE_COMPACTION=1`. |
 
-`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. Tool results are truncated before being sent back to the model, and a result
+`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. `†` behind `DEX_ONLINE_COMPACTION=1`. Tool results are truncated before being sent back to the model, and a result
 cache (`dex-tool-cache.json`) is kept only when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same `path`, any `bash`, or any call carrying `then_run` (which runs a shell command) serializes the batch.
 
 `write`/`edit` take an optional `then_run` shell command that runs in the same call *after* a successful change, so a build, formatter or

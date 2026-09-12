@@ -2027,6 +2027,40 @@ impl LlmConfig {
         self.context_window.saturating_sub(self.reserve_tokens)
     }
 
+    /// Cache-write / cache-read price ratio for the configured model, from
+    /// the models.dev catalog when it prices cache writes. Feeds the online
+    /// compaction economics; the OpenAI-compatible endpoints dex speaks
+    /// usually omit cache-write pricing, so the Anthropic-5m-derived default
+    /// (1.25x write / 0.1x read) applies.
+    pub(crate) fn cache_write_read_ratio(&self) -> f64 {
+        const FALLBACK: f64 = crate::agent::online::DEFAULT_CACHE_WRITE_READ_RATIO;
+        let Some(catalog) = load_dex_catalog() else {
+            return FALLBACK;
+        };
+        let needle = self.model.to_ascii_lowercase();
+        let keys = self.provider.catalog_keys();
+        let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
+            entry.get("api").and_then(|v| v.as_str()) == Some(self.base_url.as_str())
+        })
+        .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.iter().any(|k| k == key)))
+        .or_else(|| catalog_cost(&catalog, &needle, |_, _| true));
+        let Some(cost_val) = cost_val else {
+            return FALLBACK;
+        };
+        let rate = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| cost_val.get(*name).and_then(|v| v.as_f64()))
+        };
+        match (
+            rate(&["cache_write", "cacheWrite"]),
+            rate(&["cache_read", "cacheRead"]),
+        ) {
+            (Some(write), Some(read)) if read > 0.0 && write > 0.0 => write / read,
+            _ => FALLBACK,
+        }
+    }
+
     pub(crate) fn keep_recent_tokens(&self) -> u64 {
         self.keep_recent_tokens
     }
