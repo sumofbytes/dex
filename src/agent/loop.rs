@@ -262,15 +262,11 @@ async fn emergency_compact(
         }
     }
     let note = if compacted_any {
-        "context overflow: compacted history and retrying the model call once".to_string()
+        "context overflow: compacted history and retrying the model call once"
     } else {
-        "context overflow: nothing compactable; the input (likely one message or tool result) is too large".to_string()
+        "context overflow: nothing compactable; the input (likely one message or tool result) is too large"
     };
-    if console.sink().is_some() {
-        console.emit_async(SinkLine::System(note)).await;
-    } else {
-        with_console(false, || eprintln!("[dex] {note}"));
-    }
+    system_note(console, note).await;
     Ok(compacted_any)
 }
 
@@ -975,11 +971,7 @@ where
             if !budget_warned && tool_iterations * 5 >= tool_budget * 4 {
                 budget_warned = true;
                 let note = format!("{tool_iterations}/{tool_budget} tool rounds used this turn");
-                if console.sink().is_some() {
-                    console.emit_async(SinkLine::System(note)).await;
-                } else {
-                    with_console(false, || eprintln!("[dex] {note}"));
-                }
+                system_note(console, &note).await;
             }
             // Write-through persist (best-effort, tiny JSON): awaited so a
             // process exit right after the turn can't lose it — a detached
