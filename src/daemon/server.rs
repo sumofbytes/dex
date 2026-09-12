@@ -30,7 +30,7 @@ use crate::protocol::{
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
 
-use super::{required_token, DaemonState, PendingApproval, SessionEntry};
+use super::{lock_map, required_token, DaemonState, PendingApproval, SessionEntry};
 
 /// Bearer-token gate: every `/api/*` route requires `Authorization: Bearer
 /// <token>` when the daemon requires a token (non-loopback bind or an
@@ -147,20 +147,14 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
         dirty: bool,
     }
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Entry>>> = OnceLock::new();
-    if let Some(hit) = CACHE
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    if let Some(hit) = lock_map(CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())))
         .get(cwd)
         .filter(|e| e.at.elapsed() < Duration::from_secs(5))
     {
         return (hit.branch.clone(), hit.dirty);
     }
     let (branch, dirty) = crate::core::format::git_context_async(cwd).await;
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache = lock_map(CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())));
     if cache.len() > 32 {
         cache.clear();
     }
@@ -301,7 +295,7 @@ async fn load_skill(
         return Err(StatusCode::BAD_REQUEST);
     }
     let entry = {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = lock_map(&state.sessions);
         sessions.get(&session_id).cloned()
     }
     .ok_or(StatusCode::NOT_FOUND)?;
@@ -375,11 +369,7 @@ async fn create_session(
         name: session.name().map(ToString::to_string),
         cwd,
     };
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(session_id.clone(), entry);
+    lock_map(&state.sessions).insert(session_id.clone(), entry);
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -449,7 +439,7 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
     }
     // Preserve in-memory sessions that have no file yet (shouldn't happen).
     {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = lock_map(&state.sessions);
         for (id, entry) in sessions.iter() {
             by_id.entry(id.clone()).or_insert_with(|| {
                 json!({
@@ -542,27 +532,15 @@ async fn chat(
         // and the stream reader poll it; it never leaks across sessions or
         // later turns.
         let cancel = CancellationToken::new();
-        state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.clone(), cancel.clone());
+        lock_map(&state.cancel_tokens).insert(session_id.clone(), cancel.clone());
         cancel_for_turn = Some(cancel);
         // Steering / follow-up queues for this turn (mirrors old local
         // `event.rs` channels). Insert now so the HTTP handlers can push
         // immediately.
         let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
         let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
-        state
-            .steering_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.clone(), steering_tx);
-        state
-            .followup_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.clone(), followup_tx);
+        lock_map(&state.steering_txs).insert(session_id.clone(), steering_tx);
+        lock_map(&state.followup_txs).insert(session_id.clone(), followup_tx);
         steering_rx_opt = Some(steering_rx);
         followup_rx_opt = Some(followup_rx);
     }
@@ -668,11 +646,7 @@ async fn run_agent_turn(
             // stolen by a user chat POST must not remove the user turn's
             // fresh registration (identity-checked via the cancel token).
             let owned = {
-                let mut tokens = self
-                    .state
-                    .cancel_tokens
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut tokens = lock_map(&self.state.cancel_tokens);
                 let owned = tokens
                     .get(&self.session_id)
                     .is_some_and(|token| token.same_token(&self.cancel));
@@ -682,15 +656,9 @@ async fn run_agent_turn(
                 owned
             };
             if owned {
-                self.state
-                    .active_turns
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&self.session_id);
+                lock_map(&self.state.active_turns).remove(&self.session_id);
                 for map in [&self.state.steering_txs, &self.state.followup_txs] {
-                    map.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&self.session_id);
+                    lock_map(map).remove(&self.session_id);
                 }
                 self.state
                     .unregister_stream(&self.session_id, &self.stream_tx);
@@ -716,16 +684,8 @@ async fn run_agent_turn(
         _ => {
             let (steering_tx, sr) = mpsc::channel::<QueueMsg>(16);
             let (followup_tx, fr) = mpsc::channel::<QueueMsg>(16);
-            state
-                .steering_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), steering_tx);
-            state
-                .followup_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), followup_tx);
+            lock_map(&state.steering_txs).insert(session_id.clone(), steering_tx);
+            lock_map(&state.followup_txs).insert(session_id.clone(), followup_tx);
             (sr, fr)
         }
     };
@@ -738,12 +698,7 @@ async fn run_agent_turn(
         let tx_clone = tx.clone();
         let state_clone = state.clone();
         let sid = session_id.clone();
-        let entry_path = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&sid)
-            .map(|e| e.path.clone());
+        let entry_path = lock_map(&state.sessions).get(&sid).map(|e| e.path.clone());
         tokio::spawn(async move {
             let mut journal = entry_path
                 .as_deref()
@@ -764,12 +719,7 @@ async fn run_agent_turn(
         let tx_clone = tx.clone();
         let state_clone = state.clone();
         let sid = session_id.clone();
-        let entry_path = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&sid)
-            .map(|e| e.path.clone());
+        let entry_path = lock_map(&state.sessions).get(&sid).map(|e| e.path.clone());
         tokio::spawn(async move {
             let mut journal = entry_path
                 .as_deref()
@@ -840,10 +790,7 @@ async fn run_agent_turn(
         event: terminal,
     };
     let serialized = serde_json::to_string(&env).unwrap_or_default();
-    if let Some(path) = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    if let Some(path) = lock_map(&state.sessions)
         .get(&session_id)
         .map(|e| e.path.clone())
     {
@@ -879,7 +826,7 @@ async fn run_turn_inner(
     approval_done: tokio::sync::oneshot::Sender<()>,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = lock_map(&state.sessions);
         sessions.get(session_id).cloned()
     }
     .ok_or_else(|| "session not found".to_string())?;
@@ -993,10 +940,7 @@ async fn run_turn_inner(
         let state = state.clone();
         let sid = session_id.to_string();
         Arc::new(move |key: &str| {
-            state
-                .session_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock_map(&state.session_approvals)
                 .get(&sid)
                 .is_some_and(|approved| approved.contains(key))
         })
@@ -1011,10 +955,7 @@ async fn run_turn_inner(
         cwd: entry.cwd.clone(),
         config: Arc::new(config.clone()),
         manager: state.manager_for(session_id),
-        session_approvals: state
-            .session_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        session_approvals: lock_map(&state.session_approvals)
             .get(session_id)
             .cloned()
             .unwrap_or_default(),
@@ -1070,13 +1011,7 @@ async fn run_turn_inner(
     let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
-    if let Some(set) = state
-        .session_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(session_id)
-        .cloned()
-    {
+    if let Some(set) = lock_map(&state.session_approvals).get(session_id).cloned() {
         console.seed_session_approvals(set);
     }
     // Fast-path daemon check before we even park the turn: if the session
@@ -1226,11 +1161,8 @@ async fn run_turn_inner(
                     agent_id: request.agent_id,
                     agent: agent.clone(),
                 };
-                let replaced = state
-                    .pending_approvals
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(request_id.clone(), parked);
+                let replaced =
+                    lock_map(&state.pending_approvals).insert(request_id.clone(), parked);
                 if let Some(stale) = replaced {
                     // Should not happen (request_ids are unique); deny to
                     // avoid a deadlock in a stray agent thread.
@@ -1436,12 +1368,7 @@ async fn child_approval_bridge(
     while let Some(request) = rx.recv().await {
         // The session's manager was dropped (deleted/reset): deny so the
         // child's blocked tool call unwinds instead of parking forever.
-        if !state
-            .agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&session_id)
-        {
+        if !lock_map(&state.agents).contains_key(&session_id) {
             let _ = request.response.try_send(ApprovalDecision::Deny);
             continue;
         }
@@ -1460,11 +1387,7 @@ async fn child_approval_bridge(
             agent_id: request.agent_id.clone(),
             agent: agent.clone(),
         };
-        let replaced = state
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id.clone(), parked);
+        let replaced = lock_map(&state.pending_approvals).insert(request_id.clone(), parked);
         if let Some(stale) = replaced {
             let _ = stale.response.try_send(ApprovalDecision::Deny);
         }
@@ -1479,10 +1402,7 @@ async fn child_approval_bridge(
                 agent: agent.clone(),
             },
         };
-        if let Some(path) = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        if let Some(path) = lock_map(&state.sessions)
             .get(&session_id)
             .map(|e| e.path.clone())
         {
@@ -1532,10 +1452,7 @@ async fn child_approval_bridge(
 fn timeout_pending(
     state: &Arc<DaemonState>,
 ) -> std::sync::MutexGuard<'_, HashMap<String, PendingApproval>> {
-    state
-        .pending_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lock_map(&state.pending_approvals)
 }
 
 /// One audit row for an approval resolution (the same shape `approve`
@@ -1609,12 +1526,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             if !state.client_seen_fresh(&session_id, WAKE_PRESENCE_WINDOW) {
                 return;
             }
-            if state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&session_id)
-            {
+            if lock_map(&state.active_turns).contains(&session_id) {
                 // A user turn is live: it drains at its boundary. Re-check
                 // after it ends so a notice landing mid-turn still wakes.
                 tokio::time::sleep(WAKE_RETRY).await;
@@ -1628,33 +1540,17 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 return; // one wake at a time per session
             };
             // Re-check idle after claiming (the claim raced a user turn).
-            if state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&session_id)
-            {
+            if lock_map(&state.active_turns).contains(&session_id) {
                 state.cancel_wake(&session_id);
                 continue;
             }
             // The wake holds the session's turn slot, so the append-only log
             // stays serialized; the user chat POST steals instead of 409ing.
-            state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone());
-            state
-                .cancel_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), wake_cancel.clone());
+            lock_map(&state.active_turns).insert(session_id.clone());
+            lock_map(&state.cancel_tokens).insert(session_id.clone(), wake_cancel.clone());
             // Same model the session's last turn used (stored per session);
             // permission resolves from the daemon's own ceiling.
-            let model = state
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let model = lock_map(&state.sessions)
                 .get(&session_id)
                 .and_then(|entry| {
                     crate::session::load_session_state(&entry.path)
@@ -1701,11 +1597,7 @@ async fn approve(
     Path(session_id): Path<String>,
     Json(req): Json<ApprovalResponse>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let pending = state
-        .pending_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&req.request_id);
+    let pending = lock_map(&state.pending_approvals).remove(&req.request_id);
 
     match pending {
         Some(pending) if pending.session_id == session_id => {
@@ -1741,11 +1633,7 @@ async fn approve(
         Some(pending) => {
             // Restore on cross-session attempt so the legitimate session can
             // still resolve it.
-            state
-                .pending_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(req.request_id, pending);
+            lock_map(&state.pending_approvals).insert(req.request_id, pending);
             Err(StatusCode::NOT_FOUND)
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -1760,25 +1648,13 @@ async fn cancel(
     // loop poll this token between steps. A missing entry means no turn is
     // running for the session, so there is nothing to cancel. Cloned under
     // the lock, cancelled outside it — never hold the mutex across the call.
-    if let Some(token) = state
-        .cancel_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&session_id)
-        .cloned()
-    {
+    if let Some(token) = lock_map(&state.cancel_tokens).get(&session_id).cloned() {
         token.cancel();
     }
     // Same for an in-flight `!` shell run (Esc cancels it).
     // One Esc cancels whatever is running; a turn and a shell overlap only
     // when the user explicitly started both.
-    if let Some(token) = state
-        .shell_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&session_id)
-        .cloned()
-    {
+    if let Some(token) = lock_map(&state.shell_tokens).get(&session_id).cloned() {
         token.cancel();
     }
 
@@ -1807,7 +1683,7 @@ async fn steer(
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = {
-        let map = state.steering_txs.lock().unwrap_or_else(|e| e.into_inner());
+        let map = lock_map(&state.steering_txs);
         map.get(&session_id).cloned()
     }
     .ok_or(StatusCode::CONFLICT)?;
@@ -1831,7 +1707,7 @@ async fn followup(
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = {
-        let map = state.followup_txs.lock().unwrap_or_else(|e| e.into_inner());
+        let map = lock_map(&state.followup_txs);
         map.get(&session_id).cloned()
     }
     .ok_or(StatusCode::CONFLICT)?;
@@ -1860,9 +1736,9 @@ async fn recall(
     }
     let tx = {
         let map = if req.followup {
-            state.followup_txs.lock().unwrap_or_else(|e| e.into_inner())
+            lock_map(&state.followup_txs)
         } else {
-            state.steering_txs.lock().unwrap_or_else(|e| e.into_inner())
+            lock_map(&state.steering_txs)
         };
         map.get(&session_id).cloned()
     }
@@ -1878,13 +1754,7 @@ async fn recall(
 /// been scanned yet. A disk hit is registered (live entries win over the
 /// later rebuild merge via `or_insert`) so subsequent lookups stay in-memory.
 fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
-    if let Some(entry) = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(session_id)
-        .cloned()
-    {
+    if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
     let (path, header) = session::Session::list_all()
@@ -1896,11 +1766,7 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
         name: header.name().map(ToOwned::to_owned),
         cwd: header.cwd().to_string(),
     };
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(session_id.to_string(), entry.clone());
+    lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
     Some(entry)
 }
 
@@ -1923,7 +1789,7 @@ async fn steal_wake_and_claim(state: &Arc<DaemonState>, session_id: &str) -> boo
         // The guard dies inside this block, before the poll sleep below —
         // a std::sync guard must never span an await.
         let claimed = {
-            let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = lock_map(&state.active_turns);
             if active.contains(session_id) {
                 false
             } else {
@@ -2117,7 +1983,7 @@ async fn session_shell(
     let session_file = session_path(&state, &session_id)?;
     let shell_cancel = CancellationToken::new();
     {
-        let mut running = state.shell_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = lock_map(&state.shell_tokens);
         if running.contains_key(&session_id) {
             return Err(StatusCode::CONFLICT);
         }
@@ -2131,11 +1997,7 @@ async fn session_shell(
     }
     impl Drop for ShellGuard {
         fn drop(&mut self) {
-            self.state
-                .shell_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
+            lock_map(&self.state.shell_tokens).remove(&self.session_id);
         }
     }
     let _guard = ShellGuard {
@@ -2810,9 +2672,7 @@ mod handler_tests {
     async fn create_session_registers_and_lists_from_disk() {
         // Redirects where ALL sessions live; serialize against other tests
         // that read/write the sessions dir.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-srv-create-{}", std::process::id()));
         let _env =
             crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
@@ -2941,9 +2801,7 @@ mod handler_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     async fn approve_allow_session_records_approval_and_writes_audit() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-srv-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
@@ -3178,9 +3036,7 @@ this line is torn and not json
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     async fn lookup_entry_disk_fallback_and_reattach_seed_from_disk() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir =
             std::env::temp_dir().join(format!("dex-srv-fallback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -3514,9 +3370,7 @@ mod permission_gate_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
 
         // Hermetic session storage.
         let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
@@ -3673,9 +3527,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn client_denies_write_then_turn_completes() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
 
         // Fake provider: request 0 asks for a write; later requests finish.
         const TOOL_SSE: &str = concat!(
@@ -3834,9 +3686,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn delegate_runs_child_and_notice_drains_next_turn() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
 
         const DELEGATE_SSE: &str = concat!(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"delegate","arguments":"{\"agent\":\"explorer\",\"task\":\"find where the gate lives\"}"}}]}}]}"#,
@@ -3867,9 +3717,7 @@ mod e2e_tests {
                     async move {
                         let parsed: serde_json::Value =
                             serde_json::from_str(&body).unwrap_or_default();
-                        seen.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(parsed.clone());
+                        lock_map(&seen).push(parsed.clone());
                         let system = parsed["messages"][0]["content"]
                             .as_str()
                             .unwrap_or_default();
@@ -4039,7 +3887,7 @@ mod e2e_tests {
 
         // The second chat's LLM request carried the notice: the status line
         // plus the child's summary (what the parent consumes, §6).
-        let bodies = requests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let bodies = lock_map(&requests).clone();
         let last = bodies.last().unwrap();
         let notice_messages: Vec<&serde_json::Value> = last["messages"]
             .as_array()
@@ -4113,9 +3961,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env + token global must stay pinned
     async fn bearer_gate_blocks_api_routes_and_config_reports_info() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-e2e-bearer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -4241,9 +4087,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn idempotent_chat_replays_the_recorded_terminal_event() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         const DONE_SSE: &str =
             "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\ndata: [DONE]\n\n";
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4383,9 +4227,7 @@ mod async_parallel_tests {
     #[allow(clippy::await_holding_lock)]
     async fn list_sessions_joins_parallel_and_sorts() {
         // TDD Phase 4 (S2): JoinSet per-file scans, join, sort — same as sequential, ~50ms not ~500ms.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-list-par-{}", std::process::id()));
         let saved = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &data_dir);
