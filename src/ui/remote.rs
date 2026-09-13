@@ -1052,6 +1052,14 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 remote.live_children.store(false, Ordering::SeqCst);
             }
         }
+        // The superseded generation's `AgentCompleted` already dropped
+        // its chip and `AgentSpawned` pushed the new one; label it until
+        // the first progress update lands.
+        StreamEvent::AgentRecovered { agent_id, .. } => {
+            if let Some(chip) = remote.app.agents.iter_mut().find(|a| a.id == agent_id) {
+                chip.tool = Some("recovered".to_string());
+            }
+        }
         StreamEvent::TurnComplete { usage, cached, .. } => {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);

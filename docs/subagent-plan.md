@@ -1257,11 +1257,11 @@ throughout, so each phase ships behind green, unchanged suites.
 
 ### Phase 12 — `ChildSpec` + recovery
 
-- [ ] `supervision.recover` parses (`never | fresh | resume`); unknown values reject cleanly with the available set.
-- [ ] `recover: resume` auto-continues after `Transient`/`Exhausted` deaths within intensity; `fresh` re-runs with an empty transcript; `never` escalates immediately (today's behavior).
-- [ ] Recovery emits `AgentRecovered` (typed, wire-bumped like V1b) + a §15-style lifecycle line; terminal notice only on policy exhaustion.
-- [ ] Escalation notices carry the recovery history verbatim.
-- [ ] `recover: never` everywhere leaves V1a/V1b behavior byte-identical (existing suite green, unchanged).
+- [x] `supervision.recover` parses (`never | fresh | resume`); unknown values reject cleanly with the available set.
+- [x] `recover: resume` auto-continues after `Transient`/`Exhausted` deaths within intensity; `fresh` re-runs with an empty transcript; `never` escalates immediately (today's behavior).
+- [x] Recovery emits `AgentRecovered` (typed, wire-bumped like V1b) + a §15-style lifecycle line; terminal notice only on policy exhaustion.
+- [x] Escalation notices carry the recovery history verbatim.
+- [x] `recover: never` everywhere leaves V1a/V1b behavior byte-identical (existing suite green, unchanged).
 
 ### Phase 13 — supervisor
 
