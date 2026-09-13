@@ -5018,7 +5018,7 @@ pub(crate) mod tests {
         std::env::set_var("XDG_DATA_HOME", "/tmp/dex-doctor-snapshot/data");
         let out = doctor(None, None, None, &[]);
         let expected = concat!(
-            "dex 0.6.0\n",
+            "dex 0.7.0\n",
             "\n",
             "config     /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
             "catalog    /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
