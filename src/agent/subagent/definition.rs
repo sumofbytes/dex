@@ -19,7 +19,21 @@ const KNOWN_TOOLS: &[&str] = &[
 /// Safe default when a definition names no tools: the explorer trio.
 /// Read-only, never prompts — a definition that grants nothing dangerous
 /// by omission.
-pub(crate) const READ_ONLY_TOOLS: &[&str] = &["read", "ffgrep", "fffind"];
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "find"];
+
+/// Alias frontmatter entries → canonical registry names. `ToolFilter::allows`
+/// matches exactly and the schema exposes only canonical names, so an alias
+/// left in an allowlist would deny every call. Pre-rename user files keep
+/// parsing; they canonicalize here. If `KNOWN_TOOLS` ever drops the legacy
+/// names, the unknown-tool check runs before this mapping — keep both in
+/// sync or old definitions start failing validation.
+fn canonical_tool(entry: &str) -> &str {
+    match entry {
+        "ffgrep" => "grep",
+        "fffind" => "find",
+        other => other,
+    }
+}
 
 /// Permission policy inheritance (plan §12). V1a has exactly one rule —
 /// the child inherits the parent's mode — as an enum (not a bool) so
@@ -199,7 +213,7 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
                         KNOWN_TOOLS.join(", ")
                     ));
                 }
-                set.insert(entry.to_string());
+                set.insert(canonical_tool(entry).to_string());
             }
             if set.is_empty() {
                 return Err(format!(
@@ -294,7 +308,9 @@ mod tests {
         assert_eq!(def.supervision, SupervisionSpec::default());
         assert_eq!(def.supervision.recover, RecoverMode::Never);
         assert!(def.tools.contains("read"));
-        assert!(def.tools.contains("ffgrep"));
+        // Frontmatter aliases parse and canonicalize to schema names.
+        assert!(def.tools.contains("grep"), "{:?}", def.tools);
+        assert!(!def.tools.contains("ffgrep"));
         assert!(def.tools.contains("mcp__gh__*"));
     }
 
