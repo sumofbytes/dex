@@ -12,6 +12,7 @@
 
 mod context;
 mod definition;
+mod exit;
 mod instance;
 pub(crate) mod manager;
 mod result;
@@ -24,10 +25,16 @@ pub(crate) use definition::{
     AgentDefinition, PermissionInherit, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS,
 };
 #[allow(unused_imports)]
+pub(crate) use exit::{
+    classify_body_error, on_exit, resume_note, transcript_holds_progress, ExhaustKind, ExitReason,
+    OnExit, ResumeHandle,
+};
+#[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
 #[allow(unused_imports)]
 pub(crate) use manager::{
-    AgentEvent, AgentManager, AgentNotice, ProgressReporter, SpawnError, WaitOutcome,
+    AgentEvent, AgentManager, AgentNotice, ChildInfo, ProgressReporter, SpawnError, SpawnMeta,
+    WaitOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use result::AgentResult;
