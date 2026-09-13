@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::agent::online::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::console::Console;
-use crate::core::format::clamp_lines;
+use crate::core::format::{clamp_lines, clip_chars};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, PermissionMode};
 use tokio::io::AsyncReadExt as _;
 
@@ -211,30 +211,25 @@ pub(crate) enum PermissionRequirement {
     Shell,
 }
 
+/// One row shared by the eight tools that neither mutate nor shell out:
+/// `read`, `ls`, the in-process fff tools (`grep`/`ffgrep`/`find`/`fffind`),
+/// `obs_recall` (reads the session's observation archive; never touches the
+/// workspace) and `update_plan` (pure bookkeeping: validates and echoes the
+/// plan snapshot; the agent loop owns the boundary state and compaction
+/// decision).
+const READONLY: ToolMetadata = ToolMetadata {
+    read_only: true,
+    mutating: false,
+    idempotent: true,
+    requires_shell: false,
+    permission: PermissionRequirement::Read,
+};
+
 pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
     Some(match name {
-        "read" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
-        // fff tools run in-process; only git shells out.
-        "grep" | "ffgrep" | "find" | "fffind" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
-        "ls" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
+        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "obs_recall" | "update_plan" => {
+            READONLY
+        }
         "git" => ToolMetadata {
             read_only: true,
             mutating: false,
@@ -247,24 +242,6 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             mutating: false,
             idempotent: false,
             requires_shell: true,
-            permission: PermissionRequirement::Read,
-        },
-        // Reads the session's observation archive; never touches the
-        // workspace.
-        "obs_recall" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
-            permission: PermissionRequirement::Read,
-        },
-        // Pure bookkeeping: validates and echoes the plan snapshot; the
-        // agent loop owns the boundary state and compaction decision.
-        "update_plan" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: false,
             permission: PermissionRequirement::Read,
         },
         "bash" => ToolMetadata {
@@ -861,11 +838,7 @@ async fn append_then_run(
 /// command also rides the tool-input preview, so the marker needs only enough
 /// to identify it — not a second full copy of a very long command in context.
 fn clip_command(command: &str) -> String {
-    let single = command.replace('\n', " ");
-    match single.char_indices().nth(200).map(|(idx, _)| idx) {
-        Some(idx) => format!("{}…", &single[..idx]),
-        None => single,
-    }
+    clip_chars(&command.replace('\n', " "), 200)
 }
 
 /// The session path the evidence reducer archives into (`Some` only for
@@ -1602,132 +1575,23 @@ pub(crate) async fn execute_with_shell(
     filter: Option<&ToolFilter>,
     shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
-    // Delegation tools route first (Phase 5): they are not workspace tools
-    // and have no static registry entry. The child allowlist never contains
-    // one, so the same availability gate rejects a child's call before any
-    // delegation logic runs (§11 — depth 1 at dispatch).
-    if crate::agent::subagent::is_delegation(name) {
-        if let Some(filter) = filter {
-            if !filter.allows(name) {
-                let error = ToolError::Denied(format!(
-                    "tool '{name}' is not in {}'s tool allowlist",
-                    filter.owner
-                ));
-                audit(name, args, &error.to_string());
-                return Err(error);
-            }
-        }
-        let result = crate::agent::subagent::execute_delegation(name, args, cancel, policy).await;
-        let outcome = match &result {
-            Ok(_) => "ok".to_string(),
-            Err(e) => e.to_string(),
-        };
-        audit(name, args, &outcome);
-        return result;
-    }
-    // Resolve `then_run` once — it decides both the permission
-    // requirement below and the follow-up run, and a malformed value must fail
-    // before anything else happens.
+    // Resolve `then_run` once — it decides both the permission requirement
+    // inside `dispatch_tool` and the follow-up run below, and a malformed
+    // value must fail before anything else happens. Only `write`/`edit`
+    // accept the field, so for every other tool — delegation and MCP ones
+    // included — this is a side-effect-free `Ok(None)`.
     let then_run = match then_run_command(name, args) {
         Ok(command) => command,
-        Err(error) => {
-            audit(name, args, &error.to_string());
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
-    let requirement = if name.starts_with("mcp__") {
-        // MCP tools are external processes: most restrictive gate, same as
-        // shell. Resolved here so the gate below covers them too.
-        PermissionRequirement::Shell
-    } else if let Some(meta) = metadata(name) {
-        // A `write`/`edit` carrying `then_run` also runs a shell
-        // command, so it must clear the *shell* gate rather than the weaker
-        // write gate — `ask-shell` passes file mutations unprompted, which
-        // would otherwise make an `edit` with `then_run` a way to run a
-        // command unapproved.
-        if then_run.is_some() {
-            PermissionRequirement::Shell
-        } else {
-            meta.permission
-        }
-    } else {
-        let error = ToolError::Unknown(name.to_string());
-        audit(name, args, &error.to_string());
-        return Err(error);
-    };
-    // Availability before approval: a sharper, cheaper rejection naming the
-    // agent's allowlist (plan §11 — the model self-corrects, never executes).
-    // Checked before `enforce_policy` so a denied tool never prompts.
-    if let Some(filter) = filter {
-        let error = if !filter.allows(name) {
-            Some(ToolError::Denied(format!(
-                "tool '{name}' is not in {}'s tool allowlist",
-                filter.owner
-            )))
-        } else if then_run.is_some() && !filter.allows("bash") {
-            // `then_run` runs a shell command, so an allowlist that permits
-            // `edit` but not `bash` must not become a shell escape hatch.
-            Some(ToolError::Denied(format!(
-                "'{name}' carries then_run, which needs 'bash' in {}'s tool allowlist",
-                filter.owner
-            )))
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            audit(name, args, &error.to_string());
-            return Err(error);
-        }
-    }
-    if let Err(error) = enforce_policy(name, args, requirement, cancel, policy).await {
-        audit(name, args, &error.to_string());
-        return Err(error);
-    }
-    if name.starts_with("mcp__") {
-        let result = crate::mcp::call_global(name, args, cancel).await;
-        let outcome = match &result {
-            Ok(_) => "ok".to_string(),
-            Err(e) => e.clone(),
-        };
-        audit(name, args, &outcome);
-        return result.map_err(ToolError::Internal);
-    }
-    // fff owns its threads + lock; run inside spawn_blocking (10s grep budget stays).
-    if matches!(name, "grep" | "ffgrep" | "find" | "fffind") {
-        let name_owned = name.to_string();
-        let args_owned = args.clone();
-        let res = tokio::task::spawn_blocking(move || match name_owned.as_str() {
-            "grep" | "ffgrep" => tool_ffgrep(&args_owned),
-            _ => tool_fffind(&args_owned),
-        })
-        .await
-        .unwrap_or(Err(ToolError::Internal("fff worker panicked".into())));
-        let outcome = match &res {
-            Ok(_) => "ok".to_string(),
-            Err(e) => e.to_string(),
-        };
-        audit(name, args, &outcome);
-        return res;
-    }
-    let result = match name {
-        "read" => tool_read(args).await,
-        "bash" => tool_bash(args, cancel, evidence_session(policy).as_deref(), shell_out).await,
-        "write" => tool_write(args).await,
-        "edit" => tool_edit(args).await,
-        "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
-        "ls" => tool_ls(args).await,
-        "git" => tool_git(args, cancel).await,
-        "chain" => tool_chain(args, cancel, policy, filter).await,
-        "update_plan" => tool_update_plan(args),
-        "obs_recall" => tool_obs_recall(args, cancel, policy),
-        _ => unreachable!("metadata and dispatch must stay in sync"),
-    };
+    let result = dispatch_tool(name, args, then_run, cancel, policy, filter, shell_out).await;
     // Run `then_run` in this same call so the mutation and its
     // verification arrive as one observation, instead of costing a second
     // provider round-trip that re-sends the whole prefix just to learn whether
     // the build passed. A failed mutation skips the command: the edit error is
     // the observation, and a command output must never be handed back as if it
-    // had run against the new content.
+    // had run against the new content. (`then_run` is only ever `Some` for
+    // `write`/`edit`, which always take the workspace path above.)
     let result = match (result, then_run) {
         (Ok(text), Some(command)) => {
             let (text, code) = append_then_run(
@@ -1754,12 +1618,121 @@ pub(crate) async fn execute_with_shell(
         }
         (result, _) => result,
     };
+    // One audit row per tool call: every exit path — the delegation denial, a
+    // malformed `then_run`, an unknown tool, the allowlist rejections, the
+    // policy denial, the provider/tool failure — lands here with exactly the
+    // outcome string the per-exit audits used to record.
     let outcome = match &result {
         Ok(_) => "ok".to_string(),
         Err(error) => error.to_string(),
     };
     audit(name, args, &outcome);
     result
+}
+
+/// The tool-selection core behind `execute_with_shell`: routes and gates a
+/// call, then runs it — with no `audit` calls (the single audit row lives in
+/// the caller). The gate order is load-bearing (§11): delegation route first,
+/// then the permission requirement, then the child allowlist (a sharper,
+/// cheaper rejection than a prompt), then `enforce_policy` — so a denial
+/// never triggers a prompt — and only then dispatch.
+async fn dispatch_tool(
+    name: &str,
+    args: &Map<String, Value>,
+    then_run: Option<&str>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
+    filter: Option<&ToolFilter>,
+    shell_out: &mut Option<ShellEvidence>,
+) -> Result<String, ToolError> {
+    // Delegation tools route first (Phase 5): they are not workspace tools
+    // and have no static registry entry. The child allowlist never contains
+    // one, so the same availability gate rejects a child's call before any
+    // delegation logic runs (§11 — depth 1 at dispatch).
+    if crate::agent::subagent::is_delegation(name) {
+        if let Some(filter) = filter {
+            if !filter.allows(name) {
+                return Err(ToolError::Denied(format!(
+                    "tool '{name}' is not in {}'s tool allowlist",
+                    filter.owner
+                )));
+            }
+        }
+        return crate::agent::subagent::execute_delegation(name, args, cancel, policy).await;
+    }
+    let requirement = match metadata(name) {
+        // MCP tools are external processes: their `metadata()` row already
+        // carries the most restrictive gate (same as shell), so the separate
+        // `mcp__` requirement check is gone from here.
+        Some(meta) => {
+            // A `write`/`edit` carrying `then_run` also runs a shell
+            // command, so it must clear the *shell* gate rather than the weaker
+            // write gate — `ask-shell` passes file mutations unprompted, which
+            // would otherwise make an `edit` with `then_run` a way to run a
+            // command unapproved.
+            if then_run.is_some() {
+                PermissionRequirement::Shell
+            } else {
+                meta.permission
+            }
+        }
+        None => return Err(ToolError::Unknown(name.to_string())),
+    };
+    // Availability before approval: a sharper, cheaper rejection naming the
+    // agent's allowlist (plan §11 — the model self-corrects, never executes).
+    // Checked before `enforce_policy` so a denied tool never prompts.
+    if let Some(filter) = filter {
+        let error = if !filter.allows(name) {
+            Some(ToolError::Denied(format!(
+                "tool '{name}' is not in {}'s tool allowlist",
+                filter.owner
+            )))
+        } else if then_run.is_some() && !filter.allows("bash") {
+            // `then_run` runs a shell command, so an allowlist that permits
+            // `edit` but not `bash` must not become a shell escape hatch.
+            Some(ToolError::Denied(format!(
+                "'{name}' carries then_run, which needs 'bash' in {}'s tool allowlist",
+                filter.owner
+            )))
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+    enforce_policy(name, args, requirement, cancel, policy).await?;
+    if name.starts_with("mcp__") {
+        // `ToolError::Internal` displays as the raw message, so the caller's
+        // single audit row records exactly the string audited here before.
+        return crate::mcp::call_global(name, args, cancel)
+            .await
+            .map_err(ToolError::Internal);
+    }
+    // fff owns its threads + lock; run inside spawn_blocking (10s grep budget stays).
+    if matches!(name, "grep" | "ffgrep" | "find" | "fffind") {
+        let name_owned = name.to_string();
+        let args_owned = args.clone();
+        return tokio::task::spawn_blocking(move || match name_owned.as_str() {
+            "grep" | "ffgrep" => tool_ffgrep(&args_owned),
+            _ => tool_fffind(&args_owned),
+        })
+        .await
+        .unwrap_or(Err(ToolError::Internal("fff worker panicked".into())));
+    }
+    match name {
+        "read" => tool_read(args).await,
+        "bash" => tool_bash(args, cancel, evidence_session(policy).as_deref(), shell_out).await,
+        "write" => tool_write(args).await,
+        "edit" => tool_edit(args).await,
+        "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
+        "ls" => tool_ls(args).await,
+        "git" => tool_git(args, cancel).await,
+        "chain" => tool_chain(args, cancel, policy, filter).await,
+        "update_plan" => tool_update_plan(args),
+        "obs_recall" => tool_obs_recall(args, cancel, policy),
+        _ => unreachable!("metadata and dispatch must stay in sync"),
+    }
 }
 
 pub(crate) fn tool_obs_recall(

@@ -69,7 +69,7 @@ pub(crate) fn cache_fingerprint(name: &str, input: &str) -> String {
     fingerprint
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ToolState {
     pub(crate) cache: HashMap<String, String>,
     pub(crate) dirty: bool,
@@ -151,37 +151,31 @@ impl ToolState {
         }
     }
 
-    /// Async load: cache hits are cheap; file read goes through async fs
-    /// (Phase 6). Best-effort, never fails the turn.
+    /// Async load: thin `spawn_blocking` wrapper over the sync `load` — one
+    /// implementation for both paths, and the file read never runs on the
+    /// async workers. The `DEX_TOOL_CACHE` gate short-circuits inside `load`
+    /// itself (this sits on the daemon hot path, daemon/server.rs). Awaits
+    /// the JoinHandle — a detached spawn would be dropped on teardown before
+    /// it ever ran. Best-effort, never fails the turn.
     pub(crate) async fn load_async() -> Self {
-        let mut state = Self::default();
-        if env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
-            return state;
-        }
-        if let Some(path) = cache_file_path() {
-            if let Ok(contents) = tokio::fs::read_to_string(&path).await {
-                if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&contents) {
-                    state.cache = map;
-                }
-            }
-        }
-        state
+        tokio::task::spawn_blocking(Self::load)
+            .await
+            .unwrap_or_else(|_| Self::default())
     }
 
-    /// Async save: spawned so turn teardown never waits on it (today it
-    /// already does not fail the turn; keep that).
+    /// Async save: thin `spawn_blocking` wrapper over the sync `save` — the
+    /// `dirty`/`DEX_TOOL_CACHE` checks stay inside `save`. `save` reads only
+    /// `cache` + `dirty`, so a snapshot of those satisfies the `'static`
+    /// bound without cloning live projection state. Awaits the JoinHandle so
+    /// turn teardown (the sole caller, agent/loop.rs) cannot drop the write.
+    /// Best-effort, never fails the turn.
     pub(crate) async fn save_async(&self) {
-        if !self.dirty || env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
-            return;
-        }
-        if let Some(path) = cache_file_path() {
-            if let Some(parent) = path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            if let Ok(json) = serde_json::to_string(&self.cache) {
-                let _ = tokio::fs::write(&path, json).await;
-            }
-        }
+        let snapshot = Self {
+            cache: self.cache.clone(),
+            dirty: self.dirty,
+            ..Self::default()
+        };
+        let _ = tokio::task::spawn_blocking(move || snapshot.save()).await;
     }
 }
 

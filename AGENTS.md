@@ -60,4 +60,4 @@ All of this lives in `src/llm/config.rs` — don't add a second way to express a
 
 ## Before submitting
 
-Run the three checks above. Keep diffs minimal, reuse existing helpers, don't add scaffolding for later.
+Run the three checks above. Keep diffs minimal, reuse existing helpers, don't add scaffolding for later. Don't commit `docs/` working notes (plans, sweep ledgers, reviews) — agent scratch stays local; only user-facing docs (`README.md`) are committed.

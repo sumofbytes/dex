@@ -652,6 +652,41 @@ fn token_from_response(
     })
 }
 
+/// Failure from `post_token_form`: a non-2xx token reply (raw body, so the
+/// caller can sniff grant errors like `invalid_grant`) or a transport/decode
+/// failure (already formatted with the caller's context).
+enum TokenError {
+    Status(String),
+    Other(String),
+}
+
+/// POST a form-encoded grant request to a token endpoint and parse the JSON
+/// reply. Shared by the authorization-code exchange and the refresh grant.
+async fn post_token_form(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    pairs: &[(&str, &str)],
+    context: &str,
+) -> Result<serde_json::Value, TokenError> {
+    ensure_https_or_loopback(token_endpoint, "token_endpoint").map_err(TokenError::Other)?;
+    let resp = http
+        .post(token_endpoint)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECS))
+        .body(form_body(pairs))
+        .send()
+        .await
+        .map_err(|e| TokenError::Other(format!("mcp oauth: {context}: {e}")))?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(TokenError::Status(text));
+    }
+    resp.json()
+        .await
+        .map_err(|e| TokenError::Other(format!("mcp oauth: {context}: {e}")))
+}
+
 async fn exchange_code(
     http: &reqwest::Client,
     token_endpoint: &str,
@@ -661,7 +696,6 @@ async fn exchange_code(
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<OAuthToken, String> {
-    ensure_https_or_loopback(token_endpoint, "token_endpoint")?;
     let mut pairs = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -674,23 +708,11 @@ async fn exchange_code(
         secret = s.to_string();
         pairs.push(("client_secret", secret.as_str()));
     }
-    let resp = http
-        .post(token_endpoint)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("accept", "application/json")
-        .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECS))
-        .body(form_body(&pairs))
-        .send()
-        .await
-        .map_err(|e| format!("mcp oauth: code exchange: {e}"))?;
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(http_error("code exchange failed", &text));
-    }
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("mcp oauth: code exchange: {e}"))?;
+    let v = match post_token_form(http, token_endpoint, &pairs, "code exchange").await {
+        Ok(v) => v,
+        Err(TokenError::Other(e)) => return Err(e),
+        Err(TokenError::Status(text)) => return Err(http_error("code exchange failed", &text)),
+    };
     token_from_response(
         &v,
         token_endpoint,
@@ -706,7 +728,6 @@ pub(crate) async fn refresh_access_token(saved: &OAuthToken) -> Result<OAuthToke
     if !saved.refreshable() {
         return Err("mcp oauth: stored token is not refreshable (log in again)".to_string());
     }
-    ensure_https_or_loopback(&saved.token_endpoint, "token_endpoint")?;
     let http = crate::client::http::shared_async_client();
     let refresh = saved.refresh_token.clone().unwrap_or_default();
     let mut pairs = vec![
@@ -719,26 +740,16 @@ pub(crate) async fn refresh_access_token(saved: &OAuthToken) -> Result<OAuthToke
         secret = s.to_string();
         pairs.push(("client_secret", secret.as_str()));
     }
-    let resp = http
-        .post(&saved.token_endpoint)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("accept", "application/json")
-        .timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECS))
-        .body(form_body(&pairs))
-        .send()
-        .await
-        .map_err(|e| format!("mcp oauth: refresh: {e}"))?;
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        if text.contains("invalid_grant") {
-            return Err("mcp oauth: refresh rejected (invalid_grant)".to_string());
+    let v = match post_token_form(&http, &saved.token_endpoint, &pairs, "refresh").await {
+        Ok(v) => v,
+        Err(TokenError::Other(e)) => return Err(e),
+        Err(TokenError::Status(text)) => {
+            if text.contains("invalid_grant") {
+                return Err("mcp oauth: refresh rejected (invalid_grant)".to_string());
+            }
+            return Err(http_error("refresh failed", &text));
         }
-        return Err(http_error("refresh failed", &text));
-    }
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("mcp oauth: refresh: {e}"))?;
+    };
     token_from_response(
         &v,
         &saved.token_endpoint,
@@ -973,16 +984,7 @@ pub(crate) async fn login(server: &str) -> Result<String, String> {
         .unwrap_or_else(|| rm.scopes.join(" "));
     let asm = fetch_auth_server_metadata(&http, &issuer).await?;
 
-    // Client: configured credentials win, then a saved registration for the
-    // same token endpoint (no re-registration every login), else register.
     // The loopback binds first: its port is part of the redirect URI.
-    let known = if let Some(id) = cfg.oauth_client_id.clone() {
-        Some((id, cfg.oauth_client_secret.clone()))
-    } else {
-        load_token(&server)
-            .filter(|s| !s.client_id.is_empty() && s.token_endpoint == asm.token_endpoint)
-            .map(|s| (s.client_id, s.client_secret))
-    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("mcp oauth: loopback bind: {e}"))?;
@@ -991,51 +993,20 @@ pub(crate) async fn login(server: &str) -> Result<String, String> {
         .map_err(|e| format!("mcp oauth: loopback addr: {e}"))?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let (client_id, client_secret) = match known {
-        Some(pair) => pair,
-        None => {
-            let endpoint = asm.registration_endpoint.as_deref().ok_or(
-                "mcp oauth: server needs a pre-registered client (no registration_endpoint); set oauth_client_id/oauth_client_secret in config".to_string(),
-            )?;
-            let reg = register_client(&http, endpoint, &redirect_uri).await?;
-            (reg.client_id, reg.client_secret)
-        }
+    let (client_id, client_secret) =
+        resolve_client(&cfg, &server, &asm, &redirect_uri, &http).await?;
+    let client = ResolvedClient {
+        id: client_id,
+        secret: client_secret,
     };
-
-    let (verifier, challenge) = pkce_pair();
-    // `resource` (RFC8707) is sent first; AS servers that do not understand
-    // it fail with `invalid_target` — then retry once without it.
-    let mut resource = base.clone();
-    let mut state = random_state();
-    let code = loop {
-        launch_browser(&authorize_url(
-            &asm.authorization_endpoint,
-            &client_id,
-            &redirect_uri,
-            &scope,
-            &resource,
-            &challenge,
-            &state,
-        ));
-        match wait_for_callback(&listener, &state).await {
-            Ok(code) => break code,
-            Err(e) if e.contains("invalid_target") && !resource.is_empty() => {
-                eprintln!("dex: server rejected `resource`; retrying without it…");
-                resource.clear();
-                state = random_state();
-                continue;
-            }
-            Err(e) => return Err(e),
-        }
-    };
-    let tok = exchange_code(
+    let tok = authorize_and_exchange(
         &http,
-        &asm.token_endpoint,
-        &client_id,
-        client_secret.as_deref(),
-        &code,
+        &asm,
+        &client,
         &redirect_uri,
-        &verifier,
+        &scope,
+        &base,
+        &listener,
     )
     .await?;
     save_token(&server, &tok)?;
@@ -1049,6 +1020,91 @@ pub(crate) async fn login(server: &str) -> Result<String, String> {
             redact_secrets(&e)
         )),
     }
+}
+
+/// OAuth client credentials resolved for one login attempt.
+struct ResolvedClient {
+    id: String,
+    secret: Option<String>,
+}
+
+/// Pick OAuth client credentials: configured ones win, then a saved
+/// registration for the same token endpoint (no re-registration every
+/// login), else dynamic registration against `asm.registration_endpoint`.
+async fn resolve_client(
+    cfg: &super::McpServerConfig,
+    server: &str,
+    asm: &AuthServerMetadata,
+    redirect_uri: &str,
+    http: &reqwest::Client,
+) -> Result<(String, Option<String>), String> {
+    let known = if let Some(id) = cfg.oauth_client_id.clone() {
+        Some((id, cfg.oauth_client_secret.clone()))
+    } else {
+        load_token(server)
+            .filter(|s| !s.client_id.is_empty() && s.token_endpoint == asm.token_endpoint)
+            .map(|s| (s.client_id, s.client_secret))
+    };
+    match known {
+        Some(pair) => Ok(pair),
+        None => {
+            let endpoint = asm.registration_endpoint.as_deref().ok_or(
+                "mcp oauth: server needs a pre-registered client (no registration_endpoint); set oauth_client_id/oauth_client_secret in config".to_string(),
+            )?;
+            let reg = register_client(http, endpoint, redirect_uri).await?;
+            Ok((reg.client_id, reg.client_secret))
+        }
+    }
+}
+
+/// Open the browser, wait for the loopback callback (retrying once without
+/// `resource` if the AS rejects it with `invalid_target`), then exchange the
+/// code for a token.
+async fn authorize_and_exchange(
+    http: &reqwest::Client,
+    asm: &AuthServerMetadata,
+    client: &ResolvedClient,
+    redirect_uri: &str,
+    scope: &str,
+    resource_base: &str,
+    listener: &tokio::net::TcpListener,
+) -> Result<OAuthToken, String> {
+    let (verifier, challenge) = pkce_pair();
+    // `resource` (RFC8707) is sent first; AS servers that do not understand
+    // it fail with `invalid_target` — then retry once without it.
+    let mut resource = resource_base.to_string();
+    let mut state = random_state();
+    let code = loop {
+        launch_browser(&authorize_url(
+            &asm.authorization_endpoint,
+            &client.id,
+            redirect_uri,
+            scope,
+            &resource,
+            &challenge,
+            &state,
+        ));
+        match wait_for_callback(listener, &state).await {
+            Ok(code) => break code,
+            Err(e) if e.contains("invalid_target") && !resource.is_empty() => {
+                eprintln!("dex: server rejected `resource`; retrying without it…");
+                resource.clear();
+                state = random_state();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    exchange_code(
+        http,
+        &asm.token_endpoint,
+        &client.id,
+        client.secret.as_deref(),
+        &code,
+        redirect_uri,
+        &verifier,
+    )
+    .await
 }
 
 pub(crate) fn logout(server: &str) -> Result<String, String> {
