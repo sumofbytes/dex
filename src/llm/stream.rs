@@ -782,8 +782,9 @@ fn stop_reason_from_finish(finish: &str) -> Option<StopReason> {
     }
 }
 
-/// `POST /chat/completions` stream: JSON chunks under `data: ` (note the
-/// space), terminated by `[DONE]`. Tool-call deltas merge by `index`.
+/// `POST /chat/completions` stream: JSON chunks under `data:` (the space
+/// after the colon is optional per SSE, like the other parsers accept),
+/// terminated by `[DONE]`. Tool-call deltas merge by `index`.
 #[derive(Default)]
 struct ChatCompletionsParser {
     tool_calls: Vec<LlmToolCall>,
@@ -793,7 +794,7 @@ struct ChatCompletionsParser {
 
 impl StreamParser for ChatCompletionsParser {
     fn feed(&mut self, line: &str) -> Vec<StreamEvent> {
-        let Some(data) = line.strip_prefix("data: ") else {
+        let Some(data) = line.strip_prefix("data:") else {
             return Vec::new();
         };
         let data = data.trim();
@@ -1682,6 +1683,23 @@ mod tests {
         };
         assert!(matches!(&lines[0], SinkLine::Assistant(s) if s == "hello world"));
         assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "second line"));
+    }
+
+    /// SSE allows `data:{...}` without the space: a chat-completions
+    /// endpoint that omits it must still stream (the Responses/Anthropic
+    /// parsers already accept both spellings).
+    #[tokio::test]
+    async fn chat_stream_accepts_data_without_space() {
+        let (tx, _rx) = mpsc::channel(32);
+        let lines: &[&str] = &[
+            r#"data:{"choices":[{"delta":{"content":"hi"}}]}"#,
+            "data:[DONE]",
+        ];
+        let msg = read_chat_lines(lines, Some(tx), &CancellationToken::new())
+            .await
+            .unwrap()
+            .message;
+        assert_eq!(msg.content.as_deref(), Some("hi"));
     }
 
     /// A code fence opened mid-stream is buffered and flushed as one block;
