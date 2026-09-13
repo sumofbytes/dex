@@ -1,6 +1,6 @@
 # Dex Sub-Agent Architecture — Implementation Plan
 
-Status: built (rev 5) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 6 (§24) plans phases 11–13 — the generic supervision regime and partial-work recovery; designed, not yet implemented. Rev 2 revised after a design review against prior art —
+Status: built (rev 6) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 6 (§24) added phases 11–13 — the generic supervision regime and partial-work recovery; all built, §24.8 boxes ticked. Rev 2 revised after a design review against prior art —
 pi's subagent design, Claude Code's task/agent system, Amp's oracle, and
 Codex's sandbox-boundary model — and a source audit of dex's actual
 integration points. Rev 3 verified the prior-art claims against primary
@@ -916,7 +916,8 @@ presence gating and chat-steals-wake, idle events poller, and the §10
 protocol/presence endpoint).
 
 Rev 6 (§24) adds phases 11–13 — the generic supervision regime and
-partial-work recovery. Designed below; not yet implemented.
+partial-work recovery. Specified below; built as phases 11–13 (all §24.8
+boxes ticked).
 
 | Phase | Content | Exit condition |
 |---|---|---|
@@ -1265,8 +1266,8 @@ throughout, so each phase ships behind green, unchanged suites.
 
 ### Phase 13 — supervisor
 
-- [ ] The ledger counts recoveries across children per window; exhaustion opens the breaker.
-- [ ] Breaker open: new spawns queue FIFO as `Pending`; a terminal sibling starts the next; a user chat turn preempts; the breaker clears on window expiry.
-- [ ] Session close cancels + joins all children and retains results and notices — no orphans (extends the §22.E lifecycle tests).
-- [ ] The idle reaper is `ShutDown` on client-absence TTL: notices retained for the next boundary, no wake turn spawned by the reaper itself.
-- [ ] No new dependency; `AgentManager` stays a struct.
+- [x] The ledger counts recoveries across children per window; exhaustion opens the breaker.
+- [x] Breaker open: new spawns queue FIFO as `Pending`; a terminal sibling starts the next; a user chat turn preempts; the breaker clears on window expiry.
+- [x] Session close cancels + joins all children and retains results and notices — no orphans (extends the §22.E lifecycle tests).
+- [x] The idle reaper is `ShutDown` on client-absence TTL: notices retained for the next boundary, no wake turn spawned by the reaper itself.
+- [x] No new dependency; `AgentManager` stays a struct.
