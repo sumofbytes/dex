@@ -328,6 +328,27 @@ async fn delegate_stop(
     }
 }
 
+/// Assemble a resume generation's conversation (§24.3): the definition's
+/// system prompt first (re-derived — the transcript never journals it and
+/// the loader drops `Role::System` lines), the prior generation's
+/// messages verbatim, then the interruption nudge. Returns what the LLM
+/// sees and what the journal records; the journal mirrors the fresh path
+/// (no system line), so re-resuming a resumed generation re-derives the
+/// prompt again instead of duplicating it.
+fn resume_conversation(
+    def: &AgentDefinition,
+    replayed: Vec<ChatMessage>,
+    request: &ResumeRequest,
+) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+    let mut in_memory = vec![ChatMessage::system(child_system_prompt(def))];
+    in_memory.extend(replayed);
+    let nudge = ChatMessage::user_named(resume_nudge(request), "resume");
+    in_memory.push(nudge.clone());
+    let journal = in_memory[1..].to_vec();
+    debug_assert!(!journal.is_empty());
+    (in_memory, journal)
+}
+
 /// The interruption nudge appended to a replayed transcript (§24.3):
 /// why the prior generation stopped, what changed, and the meter left.
 fn resume_nudge(request: &ResumeRequest) -> String {
@@ -416,7 +437,14 @@ async fn resolve_resume_handle(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.starts_with(&prefix) || !name.ends_with(".jsonl") {
+        // `resume_from` takes either the bare agent id (`sess-9`, what
+        // live and retained rows advertise) or what `delegate_list` prints
+        // for on-disk rows — the transcript file stem (`sess-9-explorer`,
+        // `sess-9-explorer.g2`), which has no live registry to translate
+        // it back.
+        let by_id = name.starts_with(&prefix);
+        let by_stem = name.strip_suffix(".jsonl") == Some(id.0.as_str());
+        if !by_id && !by_stem {
             continue;
         }
         if turn_state != "interrupted" {
@@ -649,31 +677,29 @@ async fn child_run(
                 };
             }
         };
-    // Fresh: system prompt + the parent-written task. Resume: replay the
-    // prior generation's transcript verbatim — its first message is the
-    // persona prompt it actually ran under, so no drift — then append the
-    // interruption nudge as a named user message. An unreadable or empty
-    // transcript falls back to fresh: a resume must never fail for
-    // journal reasons.
+    // Fresh: system prompt + the parent-written task. Resume: re-derive
+    // the system prompt — the transcript never journals it (the fresh
+    // path journals only the task) and the session loader drops
+    // `Role::System` lines, so a verbatim replay would send the child
+    // back with no persona and no tool rules — then replay the prior
+    // generation's messages and append the interruption nudge as a named
+    // user message. An unreadable or empty transcript falls back to
+    // fresh: a resume must never fail for journal reasons.
     let mut messages: Vec<ChatMessage> = match &resume {
         Some(request) => {
             let replayed =
                 load_llm_messages_from_session(&request.handle.transcript).unwrap_or_default();
+            let _ = session.turn_event("turn_start");
             if replayed.is_empty() {
                 let user_message = ChatMessage::user(seed_task_text(&seed));
-                let _ = session.turn_event("turn_start");
                 let _ = session.append_message(&user_message);
                 vec![ChatMessage::system(child_system_prompt(&def)), user_message]
             } else {
-                let mut replayed = replayed;
-                let _ = session.turn_event("turn_start");
-                for message in &replayed {
+                let (in_memory, journal) = resume_conversation(&def, replayed, request);
+                for message in &journal {
                     let _ = session.append_message(message);
                 }
-                let nudge = ChatMessage::user_named(resume_nudge(request), "resume");
-                let _ = session.append_message(&nudge);
-                replayed.push(nudge);
-                replayed
+                in_memory
             }
         }
         None => {
@@ -1050,6 +1076,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resume_conversation_prepends_system_prompt_and_journals_without_it() {
+        // The transcript never journals the system prompt and the loader
+        // drops `Role::System` lines — the resume must re-derive it, or
+        // the generation runs with no persona and no tool rules.
+        let def = super::super::builtin_definitions()
+            .into_iter()
+            .next()
+            .unwrap();
+        let replayed = vec![
+            ChatMessage::user("do the thing"),
+            ChatMessage::assistant("on it"),
+        ];
+        let request = ResumeRequest {
+            handle: ResumeHandle {
+                agent_id: AgentId("sess-0".to_string()),
+                transcript: PathBuf::from("/tmp/x.jsonl"),
+                generation: 0,
+                remaining_budget: Some(5),
+                note: "timed out".to_string(),
+            },
+            instruction: Some("skip the build".to_string()),
+            file_hints: Vec::new(),
+        };
+        let (in_memory, journal) = resume_conversation(&def, replayed, &request);
+        assert_eq!(in_memory.len(), 4);
+        assert_eq!(in_memory[0].role, crate::core::types::Role::System);
+        assert!(!in_memory[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+        assert_eq!(in_memory[1].content.as_deref(), Some("do the thing"));
+        assert_eq!(in_memory[2].content.as_deref(), Some("on it"));
+        assert_eq!(in_memory[3].name.as_deref(), Some("resume"));
+        assert!(
+            in_memory[3]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("skip the build"),
+            "{}",
+            in_memory[3].content.as_deref().unwrap_or_default()
+        );
+        // The journal mirrors the fresh path: no system line, nudge last.
+        assert_eq!(journal.len(), 3);
+        assert_ne!(journal[0].role, crate::core::types::Role::System);
+        assert_eq!(journal[2].name.as_deref(), Some("resume"));
+    }
+
     fn resume_test_ctx(manager: AgentManager, session_path: PathBuf) -> Arc<AgentTurnContext> {
         Arc::new(AgentTurnContext {
             session_id: "sess".to_string(),
@@ -1193,6 +1269,17 @@ mod tests {
         assert_eq!(handle.remaining_budget, None);
         assert!(handle.transcript.ends_with("agents/sess-4-explorer.jsonl"));
         let handle = resolve_resume_handle(&ctx, &AgentId("sess-5".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.generation, 2);
+        // `delegate_list` prints on-disk rows under their transcript stem;
+        // the advertised id must round-trip back into a handle.
+        let handle = resolve_resume_handle(&ctx, &AgentId("sess-4-explorer".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.generation, 0);
+        assert!(handle.transcript.ends_with("agents/sess-4-explorer.jsonl"));
+        let handle = resolve_resume_handle(&ctx, &AgentId("sess-5-tester.g2".to_string()))
             .await
             .unwrap();
         assert_eq!(handle.generation, 2);
