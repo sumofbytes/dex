@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::{AgentEvent, AgentManager};
+use crate::agent::subagent::{
+    exit_reason_word, recover_mode_word, AgentEvent, AgentManager, RecoverMode,
+};
 use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
@@ -214,6 +216,13 @@ pub(crate) struct DaemonState {
 /// 60-second window during which an `Idempotency-Key` replays its recorded
 /// turn instead of running it again.
 const IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
+/// §24.5 idle reaper: a session's children are ShutDown once its client
+/// has been absent this long (the wake presence window is 30 s — the
+/// reaper deliberately waits far longer, since children are meant to
+/// outlive short client gaps like a tab switch or a laptop sleep).
+const AGENT_REAPER_TTL: Duration = Duration::from_secs(600);
+/// How often the reaper sweeps. Cost is one map scan per minute.
+const AGENT_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct SessionEntry {
@@ -383,6 +392,38 @@ impl DaemonState {
         if let Some(manager) = manager {
             manager.shutdown().await;
         }
+    }
+
+    /// §24.5 idle reaper: ShutDown children whose session's client has
+    /// been absent past [`AGENT_REAPER_TTL`] — background children must
+    /// not burn tokens for an audience that left. Live children cancel
+    /// through their tokens (the wrapper funnels `Cancelled` → `finish`,
+    /// notices retained for the next real boundary); queued children are
+    /// removed with a synthesized `Cancelled` (`cancel`, no task to
+    /// join). Sessions with a live turn are skipped: they are producing
+    /// activity, and the reaper's job is abandoned children only. No
+    /// wake turn is spawned by the reaper itself — the wake path's
+    /// presence gate (`schedule_idle_wake`) returns early with no fresh
+    /// client, so a reaper `Completed` event stays in the journal.
+    pub(crate) async fn reap_idle_agents(self: &Arc<Self>) -> usize {
+        let sessions: Vec<String> = lock_map(&self.agents).keys().cloned().collect();
+        let mut cancelled = 0usize;
+        for session_id in sessions {
+            if lock_map(&self.active_turns).contains(&session_id) {
+                continue;
+            }
+            if self.client_seen_fresh(&session_id, AGENT_REAPER_TTL) {
+                continue;
+            }
+            let manager = lock_map(&self.agents).get(&session_id).cloned();
+            let Some(manager) = manager else { continue };
+            for id in manager.cancellable_ids() {
+                if manager.cancel(&id).is_some() {
+                    cancelled += 1;
+                }
+            }
+        }
+        cancelled
     }
 
     /// Cancel + join every session's children and drop all managers.
@@ -616,6 +657,35 @@ fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentE
             },
             Some(notice.text()),
         ),
+        AgentEvent::Recovered {
+            agent_id,
+            name,
+            attempt,
+            mode,
+            reason,
+        } => (
+            StreamEvent::AgentRecovered {
+                agent_id: agent_id.to_string(),
+                name: name.clone(),
+                attempt: *attempt,
+                mode: match mode {
+                    RecoverMode::Fresh => "fresh".to_string(),
+                    RecoverMode::Resume => "resume".to_string(),
+                    // Unreachable: recovery only fires for Fresh/Resume.
+                    RecoverMode::Never => "never".to_string(),
+                },
+                reason: exit_reason_word(*reason).to_string(),
+            },
+            // §15-style lifecycle line, journaled beside the typed
+            // variant like every other agent event. No wake scheduling
+            // below: the lineage is still running, so there is nothing
+            // to wake for — the terminal notice arrives on exhaustion.
+            Some(format!(
+                "[agent {name}:{agent_id}] recovered (attempt {attempt}, {} after {})",
+                recover_mode_word(*mode),
+                exit_reason_word(*reason)
+            )),
+        ),
     };
     // The V1a line first, so a replay renders the transcript line before it
     // consumes the typed variant.
@@ -632,7 +702,7 @@ fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentE
     let env = StreamEnvelope { seq, event: typed };
     let _ = journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
     state.broadcast_event(session_id, &env);
-    if matches!(event, AgentEvent::Completed(_)) {
+    if matches!(&event, AgentEvent::Completed(notice) if notice.queued) {
         crate::daemon::server::schedule_idle_wake(state.clone(), session_id.to_string());
     }
 }
@@ -656,6 +726,19 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
     tokio::spawn(async move {
         warm.rebuild_async().await;
     });
+
+    // §24.5 idle reaper: the sweeper half of the supervisor's root
+    // ownership — children of absent clients get ShutDown; see
+    // [`DaemonState::reap_idle_agents`].
+    {
+        let state_for_reaper = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(AGENT_REAPER_INTERVAL).await;
+                state_for_reaper.reap_idle_agents().await;
+            }
+        });
+    }
 
     // Fresh installs have no models.dev catalog until `dex update --models`
     // runs, which silently degrades context windows and `/model` autocomplete.
@@ -721,7 +804,8 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
 mod tests {
     use super::*;
     use crate::agent::subagent::{
-        AgentDefinition, AgentResult, AgentState, ContextSeed, ProgressReporter, WaitOutcome,
+        AgentDefinition, AgentResult, AgentState, ContextSeed, ExitReason, ProgressReporter,
+        SpawnMeta, WaitOutcome,
     };
 
     fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
@@ -748,6 +832,9 @@ mod tests {
             summary: "done".to_string(),
             error: None,
             usage: None,
+            reason: ExitReason::Normal,
+            tool_calls: 0,
+            resume: None,
         }
     }
 
@@ -762,6 +849,9 @@ mod tests {
             summary: String::new(),
             error: Some("child saw cancel".to_string()),
             usage: None,
+            reason: ExitReason::ShutDown,
+            tool_calls: 0,
+            resume: None,
         }
     }
 
@@ -898,7 +988,7 @@ mod tests {
         // handle for the same session: clones share one registry.
         let id = state
             .manager_for("s1")
-            .spawn(&def, seed, done_body)
+            .spawn(&def, seed, SpawnMeta::fresh(), done_body)
             .unwrap();
         match state
             .manager_for("s1")
@@ -913,7 +1003,7 @@ mod tests {
         let (def2, seed2) = agent_test_parts("explorer");
         let other = state
             .manager_for("s2")
-            .spawn(&def2, seed2, done_body)
+            .spawn(&def2, seed2, SpawnMeta::fresh(), done_body)
             .unwrap();
         assert_eq!(other.to_string(), "s2-0");
     }
@@ -923,7 +1013,9 @@ mod tests {
         let state = std::sync::Arc::new(DaemonState::new());
         let manager = state.manager_for("s1");
         let (def, seed) = agent_test_parts("explorer");
-        let id = manager.spawn(&def, seed, cancel_body).unwrap();
+        let id = manager
+            .spawn(&def, seed, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
         assert_eq!(manager.active_count(), 1);
         state.remove_session_agents("s1").await;
         // The pre-removal handle still sees the reaped child (shared
@@ -941,14 +1033,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reap_idle_agents_cancels_children_of_absent_clients() {
+        // §24.5: a child whose session's client never registered presence
+        // (tests: no entry at all → stale) is ShutDown; notices stay
+        // retained for the next real boundary. An active turn exempts the
+        // session from the sweep.
+        let state = Arc::new(DaemonState::new());
+        let manager = state.manager_for("s1");
+        let (def, seed) = agent_test_parts("explorer");
+        let live = manager
+            .spawn(&def, seed, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
+        // No client seen → stale after any TTL.
+        let cancelled = state.reap_idle_agents().await;
+        assert_eq!(cancelled, 1);
+        match manager.wait(&live, std::time::Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => assert_eq!(result.status, AgentState::Cancelled),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // Notices are retained, not drained: the wake's fire condition
+        // stays honest for the next real turn.
+        assert!(manager.has_notices());
+        // The second sweep is a no-op: nothing is left to cancel.
+        assert_eq!(state.reap_idle_agents().await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_agents_joins_every_session() {
         let state = Arc::new(DaemonState::new());
         let first = state.manager_for("s1");
         let second = state.manager_for("s2");
         let (def1, seed1) = agent_test_parts("explorer");
         let (def2, seed2) = agent_test_parts("tester");
-        first.spawn(&def1, seed1, cancel_body).unwrap();
-        second.spawn(&def2, seed2, cancel_body).unwrap();
+        first
+            .spawn(&def1, seed1, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
+        second
+            .spawn(&def2, seed2, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
         state.shutdown_agents().await;
         assert_eq!(first.active_count(), 0);
         assert_eq!(second.active_count(), 0);
