@@ -471,9 +471,11 @@ where
         }
         out
     } else {
-        // JoinSet tasks (async tools): N threads → N tasks, input-ordered
-        // via indexed results + sort (S3). Panics propagate as tool errors.
-        let mut set = tokio::task::JoinSet::new();
+        // One `tokio::spawn` per call, awaited in input order: tasks still
+        // run concurrently, but each handle stays paired with its own index,
+        // so a panicking worker is attributed to its own call instead of
+        // landing on a positional guess after a completion-order sort (S3).
+        let mut handles = Vec::with_capacity(calls.len());
         for (idx, call) in calls.iter().enumerate() {
             let call = call.clone();
             let cancel = cancel.clone();
@@ -482,36 +484,37 @@ where
             // cannot hold the turn's borrowed filter — same shape
             // as the per-task policy clone above.
             let filter = filter.cloned();
-            set.spawn(async move {
-                let started = Instant::now();
-                let (name, input, outcome) =
-                    execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
-                (idx, name, input, outcome, started.elapsed())
-            });
+            handles.push((
+                idx,
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let (name, input, outcome) =
+                        execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
+                    (name, input, outcome, started.elapsed())
+                }),
+            ));
         }
-        let mut indexed: Vec<(usize, String, String, ToolOutcome, Duration)> = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(v) => indexed.push(v),
-                Err(_) => indexed.push((
-                    usize::MAX,
-                    String::new(),
-                    String::new(),
-                    ToolOutcome {
-                        text: "Error: tool worker panicked".into(),
-                        ok: false,
-                        diff: None,
-                        shell: None,
-                    },
-                    Duration::ZERO,
-                )),
+        let mut out = Vec::with_capacity(calls.len());
+        for (idx, handle) in handles {
+            match handle.await {
+                Ok((name, input, outcome, elapsed)) => out.push((name, input, outcome, elapsed)),
+                Err(_) => {
+                    let call = &calls[idx];
+                    out.push((
+                        call.function.name.clone(),
+                        call.function.arguments.clone(),
+                        ToolOutcome {
+                            text: "Error: tool worker panicked".into(),
+                            ok: false,
+                            diff: None,
+                            shell: None,
+                        },
+                        Duration::ZERO,
+                    ))
+                }
             }
         }
-        indexed.sort_by_key(|(idx, _, _, _, _)| *idx);
-        indexed
-            .into_iter()
-            .map(|(_, n, i, o, d)| (n, i, o, d))
-            .collect::<Vec<(String, String, ToolOutcome, Duration)>>()
+        out
     }
 }
 
@@ -1547,6 +1550,38 @@ mod tests {
             },
         ];
         assert!(!tool_calls_conflict(&different));
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_preserves_input_order() {
+        // Distinct-path reads take the parallel fan-out; results must come
+        // back input-ordered so the caller can zip them with the original
+        // calls — a slow first worker must never shift attribution onto the
+        // second call's result.
+        use crate::tools::Policy;
+        let call = |id: &str, path: &str| crate::core::types::LlmToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: crate::core::types::FunctionCall {
+                name: "read".into(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+            },
+        };
+        let calls = vec![
+            call("a", "definitely-not-here-a.rs"),
+            call("b", "definitely-not-here-b.rs"),
+        ];
+        assert!(!tool_calls_conflict(&calls));
+        let results = run_tool_batch(&calls, &NeverCancel, &Policy::trusted(), None).await;
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].1.contains("definitely-not-here-a.rs"),
+            "first result keeps first call's input"
+        );
+        assert!(
+            results[1].1.contains("definitely-not-here-b.rs"),
+            "second result keeps second call's input"
+        );
     }
 
     #[test]
