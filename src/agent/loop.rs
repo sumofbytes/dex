@@ -29,10 +29,27 @@ use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 /// Emit a system note on every surface: a transcript line when a sink is
 /// attached (TUI / daemon), `eprintln` headless.
 async fn system_note(console: &Console, note: &str) {
+    note_sink(
+        console,
+        || SinkLine::System(note.to_string()),
+        || format!("[dex] {note}"),
+    )
+    .await;
+}
+
+/// Emit one line on every surface: the sink line when a sink is attached
+/// (TUI / daemon), `eprintln` headless (console IO always runs — the
+/// headless path must not swallow output). Both arms are lazy: the unused
+/// side is never built.
+async fn note_sink(
+    console: &Console,
+    line: impl FnOnce() -> SinkLine,
+    plain: impl FnOnce() -> String,
+) {
     if console.sink().is_some() {
-        console.emit_async(SinkLine::System(note.to_string())).await;
+        console.emit_async(line()).await;
     } else {
-        with_console(false, || eprintln!("[dex] {note}"));
+        with_console(false, || eprintln!("{}", plain()));
     }
 }
 
@@ -88,6 +105,50 @@ pub(crate) fn persist_pending(
         *cursor = messages.len();
     }
     Ok(())
+}
+
+/// Re-persist the (compacted) history: clear the session file and rewrite
+/// every message after the system prompt. Single-sources the journal
+/// invariant that the file mirrors `messages` after any compaction
+/// rewrites it (threshold gate, emergency, online boundary).
+fn rewrite_session(
+    session: Option<&mut Session>,
+    messages: &[ChatMessage],
+    persisted_cursor: &mut usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(session) = session {
+        session.clear_messages()?;
+        for message in messages.iter().skip(1) {
+            session.append_message(message)?;
+        }
+    }
+    *persisted_cursor = messages.len();
+    Ok(())
+}
+
+/// Drain queued steering messages and inject them as user-role messages,
+/// notifying the accepted channel per message. Returns true when any
+/// steering was injected (the caller records the horizon correction and
+/// persists).
+async fn inject_steering(
+    rx: &mut mpsc::Receiver<QueueMsg>,
+    accepted: Option<&mpsc::Sender<String>>,
+    messages: &mut Vec<ChatMessage>,
+) -> bool {
+    let mut drained: Vec<String> = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        apply_queue_msg(&mut drained, msg);
+    }
+    if drained.is_empty() {
+        return false;
+    }
+    for content in drained {
+        if let Some(accepted) = accepted {
+            let _ = accepted.send(content.clone()).await;
+        }
+        messages.push(ChatMessage::user_named(content, "steering"));
+    }
+    true
 }
 
 /// Per-turn cap on tool rounds (one round = one assistant batch with tool
@@ -318,6 +379,464 @@ pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
     }
 }
 
+/// Proactive compaction gate, run before every model call: compact while
+/// the (projected) context exceeds the token threshold or — without online
+/// compaction — the message-count cap, at most three attempts. Threshold
+/// compactions carry their cache re-write as debt the boundary economics
+/// repay (math moved verbatim from the original inline block).
+#[allow(clippy::too_many_arguments)]
+async fn compaction_gate(
+    config: &LlmConfig,
+    console: &Console,
+    messages: &mut Vec<ChatMessage>,
+    projected: &[ChatMessage],
+    ephemerals: &[Option<String>],
+    cancel: &(dyn CancellationSource + Send + Sync),
+    mut session: Option<&mut Session>,
+    persisted_cursor: &mut usize,
+    state: &mut ToolState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut compaction_attempts = 0;
+    while compaction_attempts < 3 {
+        let eff = effective_tokens(projected, ephemerals, true);
+        let need_by_tokens = eff > config.compaction_threshold();
+        // The message-count fallback is a global cap — exactly what the
+        // online compaction economics replace. With
+        // `DEX_ONLINE_COMPACTION=1` the count cap is dropped: short
+        // turns compact at plan boundaries when economical, and the
+        // token threshold stays as window protection.
+        let need_by_count =
+            !online_compaction_enabled() && messages.len() > 1 + KEEP_RECENT_MESSAGES;
+        if !need_by_tokens && !need_by_count {
+            break;
+        }
+        // Measure the re-write cost and the archivable slice before
+        // `compact_history` rewrites `messages`.
+        let online =
+            online_compaction_enabled().then(|| (eff, archivable_tokens(messages, config)));
+        match compact_history(config, messages, cancel, false).await {
+            Ok((true, compacted)) => {
+                compaction_attempts += 1;
+                // Summarizer calls are billed like any other; account
+                // them so the status-bar spend includes compaction.
+                if let Some(u) = compacted {
+                    record_usage(config, state, console, u, None).await;
+                }
+                rewrite_session(session.as_deref_mut(), messages, persisted_cursor)?;
+                if let Some((write, archive)) = online {
+                    // A threshold compaction bypasses the boundary
+                    // economics, but the state must still see it:
+                    // pressure samples reset, the re-write is carried
+                    // as debt the next boundary repays, and the plan
+                    // survives (the model was not asked to re-plan).
+                    let (debt, repayment) =
+                        cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()));
+                    state.online.record_threshold_compaction(debt, repayment);
+                }
+                continue;
+            }
+            Ok((false, _)) => break,
+            Err(e) if e.contains("cancelled") => return Err(e.into()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Execute one batch of tool calls: serialized under the mutation lock when
+/// the calls conflict, else fanned out on JoinSet tasks (input-ordered via
+/// indexed results + sort; panics surface as tool errors).
+async fn run_tool_batch<X>(
+    calls: &[LlmToolCall],
+    cancel: &X,
+    policy: &Policy,
+    filter: Option<&ToolFilter>,
+) -> Vec<(String, String, ToolOutcome, Duration)>
+where
+    X: CancellationSource + Clone + 'static,
+{
+    if tool_calls_conflict(calls) {
+        let _guard = TOOL_MUTATION_LOCK.lock().await;
+        let mut out = Vec::new();
+        for call in calls {
+            let started = Instant::now();
+            let (name, input, outcome) = execute_tool_call(
+                call,
+                cancel as &(dyn CancellationSource + Send + Sync),
+                policy,
+                filter,
+            )
+            .await;
+            out.push((name, input, outcome, started.elapsed()));
+        }
+        out
+    } else {
+        // JoinSet tasks (async tools): N threads → N tasks, input-ordered
+        // via indexed results + sort (S3). Panics propagate as tool errors.
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, call) in calls.iter().enumerate() {
+            let call = call.clone();
+            let cancel = cancel.clone();
+            let policy = policy.clone();
+            // Owned per task: the future must be 'static, so it
+            // cannot hold the turn's borrowed filter — same shape
+            // as the per-task policy clone above.
+            let filter = filter.cloned();
+            set.spawn(async move {
+                let started = Instant::now();
+                let (name, input, outcome) =
+                    execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
+                (idx, name, input, outcome, started.elapsed())
+            });
+        }
+        let mut indexed: Vec<(usize, String, String, ToolOutcome, Duration)> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(v) => indexed.push(v),
+                Err(_) => indexed.push((
+                    usize::MAX,
+                    String::new(),
+                    String::new(),
+                    ToolOutcome {
+                        text: "Error: tool worker panicked".into(),
+                        ok: false,
+                        diff: None,
+                        shell: None,
+                    },
+                    Duration::ZERO,
+                )),
+            }
+        }
+        indexed.sort_by_key(|(idx, _, _, _, _)| *idx);
+        indexed
+            .into_iter()
+            .map(|(_, n, i, o, d)| (n, i, o, d))
+            .collect::<Vec<(String, String, ToolOutcome, Duration)>>()
+    }
+}
+
+/// Everything one tool result in a completed batch touches, bundled so
+/// `process_tool_result` stays a plain function instead of an 11-arg one.
+/// `'a` is the turn-wide borrow (config, policy, cancel, ephemerals); `'b`
+/// is the per-batch scope the mutable state is reborrowed for.
+struct ToolResultCtx<'a, 'b> {
+    config: &'a LlmConfig,
+    console: &'a Console,
+    state: &'b mut ToolState,
+    policy: &'a Policy,
+    messages: &'b mut Vec<ChatMessage>,
+    session: &'b mut Option<&'a mut Session>,
+    persisted_cursor: &'b mut usize,
+    cancel: &'a (dyn CancellationSource + Send + Sync),
+    ephemerals: &'b [Option<String>],
+    online_boundary_handled: &'b mut bool,
+    last_tools: &'b mut Vec<String>,
+}
+
+/// Process one tool result from a completed batch: repeated-call guard,
+/// cache, evidence reducer, plan-boundary bookkeeping, sink emit, transcript
+/// append, and (at most one per turn) the online compaction decision. Moved
+/// verbatim from the inline per-result loop body.
+async fn process_tool_result(
+    ctx: &mut ToolResultCtx<'_, '_>,
+    call: &LlmToolCall,
+    turn_cwd: &str,
+    name: &str,
+    input: &str,
+    outcome: ToolOutcome,
+    elapsed: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config: &LlmConfig = ctx.config;
+    let console: &Console = ctx.console;
+    let policy: &Policy = ctx.policy;
+    let cancel: &(dyn CancellationSource + Send + Sync) = ctx.cancel;
+    let ephemerals: &[Option<String>] = ctx.ephemerals;
+    let state: &mut ToolState = ctx.state;
+    let messages: &mut Vec<ChatMessage> = ctx.messages;
+    let session: &mut Option<&mut Session> = ctx.session;
+    let persisted_cursor: &mut usize = ctx.persisted_cursor;
+    let online_boundary_handled: &mut bool = ctx.online_boundary_handled;
+    let last_tools: &mut Vec<String> = ctx.last_tools;
+    let cache_key = format!(
+        "{}:{}:{}{}",
+        turn_cwd,
+        name,
+        input,
+        cache_fingerprint(name, input)
+    );
+    let succeeded = outcome.ok;
+    // Captured before `outcome.text` is moved below: the
+    // pre-mutation unified diff for write/edit results.
+    let diff = outcome.diff.clone();
+    // Occurrences counted AFTER the push: when the ring is full
+    // the evicted front entry may itself be a match, so a
+    // pre-push count over-counts by one and can trip the
+    // `>= 3` guard a call early (regression:
+    // repeated_tool_guard_counts_after_ring_eviction). The
+    // filter borrows `cache_key`; that borrow ends before the
+    // `state.insert` move below.
+    if succeeded {
+        if last_tools.len() >= 6 {
+            last_tools.remove(0);
+        }
+        last_tools.push(cache_key.clone());
+    }
+    let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
+    note_sink(
+        console,
+        || SinkLine::ToolInput(format!("{} {}", call.function.name, short_arg(name, input))),
+        || {
+            format!(
+                "{}[tool input] {} {}{}",
+                TOOL_INPUT_COLOR,
+                call.function.name,
+                short_arg(name, input),
+                RESET
+            )
+        },
+    )
+    .await;
+
+    let cacheable = matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls");
+    let mut cache_hit = false;
+    let mut ok = succeeded;
+    let mut result = if repeated_count >= 3 {
+        ok = false;
+        "Error: repeated identical tool call; choose a different action or finish.".to_string()
+    } else if cacheable && succeeded {
+        if let Some(cached) = state.cache.get(&cache_key) {
+            cache_hit = true;
+            cached.clone()
+        } else {
+            state.insert(cache_key, outcome.text.clone());
+            outcome.text
+        }
+    } else {
+        if matches!(name, "write" | "edit") {
+            state.clear();
+        }
+        outcome.text
+    };
+    // Evidence-preserving reducer (`DEX_EVIDENCE_REDUCER=1`):
+    // delegate the first read of a large build/test log to the
+    // configured reducer model and verify every quoted line
+    // byte for byte against the archived raw output. Any
+    // uncheckable receipt falls open: the raw (clamped) result
+    // is kept untouched and the observation pack handles it.
+    let processed = crate::agent::evidence_reducer::process(
+        config,
+        policy
+            .agent
+            .as_ref()
+            .map(|ctx| ctx.session_path.clone())
+            .as_deref(),
+        cancel,
+        crate::agent::evidence_reducer::ToolResultView {
+            call_id: call.id.as_str(),
+            tool_name: name,
+            input_json: input,
+            result_text: &result,
+            ok: succeeded,
+            shell: outcome.shell.as_ref(),
+        },
+    )
+    .await;
+    // The reducer call's spend is real even when its receipt is
+    // rejected: fold it into the session totals and the usage
+    // stream, priced at the model that actually ran.
+    let crate::agent::evidence_reducer::Processed {
+        reduction,
+        usage,
+        pricing,
+    } = processed;
+    if let Some(usage) = usage {
+        record_usage(
+            pricing.as_ref().unwrap_or(config),
+            state,
+            console,
+            usage,
+            None,
+        )
+        .await;
+        state.dirty = true;
+    }
+    if let Some(reduced) = reduction {
+        result = reduced.receipt;
+        system_note(
+            console,
+            &format!(
+                "evidence reducer: {} -> {} (verified)",
+                crate::agent::evidence_reducer::format_bytes(reduced.source_bytes),
+                crate::agent::evidence_reducer::format_bytes(reduced.receipt_bytes),
+            ),
+        )
+        .await;
+    }
+    // Online context compaction (`DEX_ONLINE_COMPACTION=1`):
+    // a completed plan step is a boundary — a safe point where
+    // history can be compacted if the economics say the cache
+    // re-write pays for itself before the work ends. The
+    // boundary bookkeeping runs *before* the sink emit so
+    // plan-hygiene advice is part of the `result` the user sees;
+    // the compaction decision itself runs after the tool result
+    // is appended so the transcript keeps assistant →
+    // tool_result → reminder order (pi's reference aborts the
+    // turn instead; dex compacts inline, and the ordering must
+    // stay wire-valid). At most one boundary per turn is
+    // evaluated.
+    let mut boundary: Option<Vec<PlanStep>> = None;
+    if online_compaction_enabled() && name == "update_plan" && ok {
+        // Parse once: the tool layer validated `steps`, so a
+        // parse failure here would be a state bug — fall back to
+        // ignoring the update rather than failing the turn.
+        let parsed = serde_json::from_str::<Value>(input).ok().and_then(|args| {
+            let steps = args.get("steps")?.clone();
+            let progress = parse_plan_progress(args.get("progress")).ok()?;
+            parse_plan_steps(&steps).ok().map(|steps| (steps, progress))
+        });
+        if let Some((steps, progress)) = parsed {
+            let transition = analyze_plan_transition(&state.online.plan, &steps);
+            if !transition.advice.is_empty() {
+                result.push('\n');
+                result.push_str(&transition.advice.join("\n"));
+            }
+            if transition.completed.is_empty() {
+                if state.online.plan != steps || state.online.progress != progress {
+                    state.online.plan = steps;
+                    state.online.progress = progress;
+                }
+            } else {
+                state.online.progress = progress;
+                boundary = Some(steps);
+            }
+        }
+    }
+    note_sink(
+        console,
+        || {
+            let mut summary = tool_result_summary(name, input, &result, ok, diff.as_deref());
+            if cache_hit {
+                summary = format!("cached · {summary}");
+            }
+            let counts_only = matches!(
+                name,
+                "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "chain"
+            );
+            let skip_first = !counts_only || !ok;
+            let preview = tool_preview(name, ok, diff.as_deref(), &result, skip_first);
+            SinkLine::ToolOutput {
+                name: name.to_string(),
+                summary,
+                success: ok,
+                preview,
+                duration: elapsed.as_secs_f64(),
+            }
+        },
+        || {
+            let body = tool_preview_body(name, ok, diff.as_deref(), &result);
+            format!(
+                "{}[tool output] {}:\n{}{}",
+                TOOL_OUTPUT_COLOR, name, body, RESET
+            )
+        },
+    )
+    .await;
+    // The tool result lands before any boundary reminder so the
+    // transcript stays assistant → tool_result → reminder (see
+    // the boundary note above).
+    messages.push(ChatMessage::tool_result(
+        call.id.clone(),
+        model_tool_result(&result),
+    ));
+    persist_pending(session, messages, persisted_cursor)?;
+    if let Some(steps) = boundary {
+        state.online.record_boundary(steps);
+        if !*online_boundary_handled {
+            *online_boundary_handled = true;
+            let context_tokens = effective_tokens(messages, ephemerals, true);
+            // The reference pins windowReserveTokens at a fixed
+            // 16 KiB, independent of the host's compaction reserve;
+            // dex's default reserve_tokens is also 16_384, and
+            // following dex's configured edge keeps window
+            // protection consistent with the pre-call compaction
+            // threshold.
+            let economics = CompactionEconomics {
+                window_reserve_tokens: config.reserve_tokens,
+                ..DEFAULT_COMPACTION_ECONOMICS
+            };
+            let decision = decide_compaction(
+                context_tokens,
+                // Archivable slice: what a cut can actually
+                // remove (see `archivable_tokens`) — the system
+                // message and the keep-recent window are never
+                // archived, and the ephemeral preamble + tool
+                // schema are re-sent on every request.
+                archivable_tokens(messages, config),
+                NATIVE_SUMMARY_TOKEN_ESTIMATE,
+                context_tokens,
+                &state.online,
+                Some(config.context_window),
+                Some(config.cache_write_read_ratio()),
+                &economics,
+            );
+            crate::log!(
+                Debug,
+                "online compaction boundary: {} (write {}, archive {})",
+                decision.reason,
+                decision.write_tokens,
+                decision.archive_tokens
+            );
+            if decision.compact {
+                match compact_history(config, messages, cancel, false).await {
+                    Ok((true, usage)) => {
+                        if let Some(u) = usage {
+                            record_usage(config, state, console, u, None).await;
+                        }
+                        rewrite_session(session.as_deref_mut(), messages, persisted_cursor)?;
+                        // The compaction forces the retained prefix to
+                        // be re-written at cache-write price on the next
+                        // request; carry that as debt the following
+                        // boundaries must repay before another compaction
+                        // is economical.
+                        let (debt, repayment) = decision.cache_debt();
+                        // The reminder lists the remaining goals — build
+                        // it before record_compaction clears the plan.
+                        let reminder =
+                            post_compaction_reminder(&state.online.plan, &state.online.progress);
+                        state.online.record_compaction(debt, repayment);
+                        messages.push(ChatMessage::user_named(reminder, "compact"));
+                        persist_pending(session, messages, persisted_cursor)?;
+                        // The boundary fired silently before; a
+                        // system line is the only user-visible
+                        // proof the economics paid out.
+                        system_note(
+                            console,
+                            &format!(
+                                "online compaction: history compacted at plan boundary (~{} tokens archived)",
+                                decision.archive_tokens
+                            ),
+                        )
+                        .await;
+                    }
+                    // Below the summarize floor (e.g. a boundary
+                    // right after the previous compaction) or a
+                    // summarizer failure: nothing was cut, so no
+                    // cache debt is carried — log why anyway.
+                    Ok((false, _)) => {
+                        crate::log!(Debug,
+                            "online compaction boundary declined: history below the summarize floor"
+                        );
+                    }
+                    Err(e) => {
+                        crate::log!(Debug, "online compaction boundary failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn process_turn<C, X>(
     rt: AgentRuntime<'_, C, X>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
@@ -372,20 +891,11 @@ where
             return Err("cancelled by user".into());
         }
         if let Some(rx) = steering_rx.as_mut() {
-            let mut drained: Vec<String> = Vec::new();
-            while let Ok(msg) = rx.try_recv() {
-                apply_queue_msg(&mut drained, msg);
-            }
             // A steer redirects the work: the horizon learned from completed
             // boundaries no longer describes the remaining effort.
-            if !drained.is_empty() {
+            let injected = inject_steering(rx, steering_accepted_tx, messages).await;
+            if injected {
                 state.online.record_correction();
-            }
-            for steering in &drained {
-                if let Some(accepted) = &steering_accepted_tx {
-                    let _ = accepted.send(steering.clone()).await;
-                }
-                messages.push(ChatMessage::user_named(steering.clone(), "steering"));
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
         }
@@ -414,59 +924,18 @@ where
         for note in state.obs_projection.take_notes() {
             system_note(console, &note).await;
         }
-        let mut compaction_attempts = 0;
-        while compaction_attempts < 3 {
-            let eff = effective_tokens(&projected, &ephemerals, true);
-            let need_by_tokens = eff > config.compaction_threshold();
-            // The message-count fallback is a global cap — exactly what the
-            // online compaction economics replace. With
-            // `DEX_ONLINE_COMPACTION=1` the count cap is dropped: short
-            // turns compact at plan boundaries when economical, and the
-            // token threshold stays as window protection.
-            let need_by_count =
-                !online_compaction_enabled() && messages.len() > 1 + KEEP_RECENT_MESSAGES;
-            if !need_by_tokens && !need_by_count {
-                break;
-            }
-            // Measure the re-write cost and the archivable slice before
-            // `compact_history` rewrites `messages`.
-            let online =
-                online_compaction_enabled().then(|| (eff, archivable_tokens(messages, config)));
-            match compact_history(config, messages, cancel, false).await {
-                Ok((true, compacted)) => {
-                    compaction_attempts += 1;
-                    // Summarizer calls are billed like any other; account
-                    // them so the status-bar spend includes compaction.
-                    if let Some(u) = compacted {
-                        record_usage(config, state, console, u, None).await;
-                    }
-                    if let Some(session) = session.as_deref_mut() {
-                        session.clear_messages()?;
-                        for message in messages.iter().skip(1) {
-                            session.append_message(message)?;
-                        }
-                    }
-                    persisted_cursor = messages.len();
-                    if let Some((write, archive)) = online {
-                        // A threshold compaction bypasses the boundary
-                        // economics, but the state must still see it:
-                        // pressure samples reset, the re-write is carried
-                        // as debt the next boundary repays, and the plan
-                        // survives (the model was not asked to re-plan).
-                        let (debt, repayment) = cache_debt_for_ratio(
-                            write,
-                            archive,
-                            Some(config.cache_write_read_ratio()),
-                        );
-                        state.online.record_threshold_compaction(debt, repayment);
-                    }
-                    continue;
-                }
-                Ok((false, _)) => break,
-                Err(e) if e.contains("cancelled") => return Err(e.into()),
-                Err(e) => return Err(e.into()),
-            }
-        }
+        compaction_gate(
+            config,
+            console,
+            messages,
+            &projected,
+            &ephemerals,
+            cancellation,
+            session.as_deref_mut(),
+            &mut persisted_cursor,
+            state,
+        )
+        .await?;
 
         // Online compaction bookkeeping (`DEX_ONLINE_COMPACTION=1`): sample
         // the context size of every provider request — the growth rate and
@@ -512,13 +981,11 @@ where
                         .await
                         {
                             Ok(true) => {
-                                if let Some(session) = session.as_deref_mut() {
-                                    session.clear_messages()?;
-                                    for message in messages.iter().skip(1) {
-                                        session.append_message(message)?;
-                                    }
-                                }
-                                persisted_cursor = messages.len();
+                                rewrite_session(
+                                    session.as_deref_mut(),
+                                    messages,
+                                    &mut persisted_cursor,
+                                )?;
                                 continue;
                             }
                             _ => return Err(msg.into()),
@@ -538,37 +1005,22 @@ where
         // The provider cut the reply off mid-generation (output-token limit
         // or a content filter): whatever landed is likely incomplete. Say so
         // instead of silently keeping a truncated reply as if it were complete.
-        match console.sink() {
-            Some(_) => {
-                match turn.stop_reason {
-                    Some(StopReason::Length) => {
-                        console
-                            .emit_async(SinkLine::System(
-                                "model output hit the output-token limit and may be truncated"
-                                    .to_string(),
-                            ))
-                            .await;
-                    }
-                    Some(StopReason::ContentFilter) => {
-                        console.emit_async(SinkLine::System(
-                          "model output was cut off by a content filter and may be incomplete"
-                              .to_string(),
-                      )).await;
-                    }
-                    _ => {}
-                }
+        let truncation = match turn.stop_reason {
+            Some(StopReason::Length) => {
+                Some("model output hit the output-token limit and may be truncated")
             }
-            None => with_console(false, || match turn.stop_reason {
-                Some(StopReason::Length) => {
-                    eprintln!("[dex] model output hit the output-token limit and may be truncated")
-                }
-                Some(StopReason::ContentFilter) => {
-                    eprintln!(
-                        "[dex] model output was cut off by a content filter and may be incomplete"
-                    )
-                }
-                _ => {}
-            }),
+            Some(StopReason::ContentFilter) => {
+                Some("model output was cut off by a content filter and may be incomplete")
+            }
+            _ => None,
+        };
+        if let Some(note) = truncation {
+            note_sink(
+                console,
+                || SinkLine::System(note.to_string()),
+                || format!("[dex] {note}"),
+            )
+            .await;
         }
         let mut message = turn.message;
 
@@ -583,65 +1035,7 @@ where
                 reasoning_content: message.reasoning_content,
             });
 
-            let serialize_batch = tool_calls_conflict(&calls);
-            let results: Vec<_> = if serialize_batch {
-                let _guard = TOOL_MUTATION_LOCK.lock().await;
-                let mut out = Vec::new();
-                for call in &calls {
-                    let started = Instant::now();
-                    let (name, input, outcome) = execute_tool_call(
-                        call,
-                        cancel as &(dyn CancellationSource + Send + Sync),
-                        &policy,
-                        filter,
-                    )
-                    .await;
-                    out.push((name, input, outcome, started.elapsed()));
-                }
-                out
-            } else {
-                // JoinSet tasks (async tools): N threads → N tasks, input-ordered
-                // via indexed results + sort (S3). Panics propagate as tool errors.
-                let mut set = tokio::task::JoinSet::new();
-                for (idx, call) in calls.iter().enumerate() {
-                    let call = call.clone();
-                    let cancel = cancel.clone();
-                    let policy = policy.clone();
-                    // Owned per task: the future must be 'static, so it
-                    // cannot hold the turn's borrowed filter — same shape
-                    // as the per-task policy clone above.
-                    let filter = filter.cloned();
-                    set.spawn(async move {
-                        let started = Instant::now();
-                        let (name, input, outcome) =
-                            execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
-                        (idx, name, input, outcome, started.elapsed())
-                    });
-                }
-                let mut indexed: Vec<(usize, String, String, ToolOutcome, Duration)> = Vec::new();
-                while let Some(joined) = set.join_next().await {
-                    match joined {
-                        Ok(v) => indexed.push(v),
-                        Err(_) => indexed.push((
-                            usize::MAX,
-                            String::new(),
-                            String::new(),
-                            ToolOutcome {
-                                text: "Error: tool worker panicked".into(),
-                                ok: false,
-                                diff: None,
-                                shell: None,
-                            },
-                            Duration::ZERO,
-                        )),
-                    }
-                }
-                indexed.sort_by_key(|(idx, _, _, _, _)| *idx);
-                indexed
-                    .into_iter()
-                    .map(|(_, n, i, o, d)| (n, i, o, d))
-                    .collect::<Vec<(String, String, ToolOutcome, Duration)>>()
-            };
+            let results = run_tool_batch(&calls, cancel, &policy, filter).await;
 
             // Cancel landed during tool IO: the per-tool "cancelled"
             // errors above are shutdown noise, not model input. Suppress
@@ -658,302 +1052,23 @@ where
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
-                let cache_key = format!(
-                    "{}:{}:{}{}",
-                    turn_cwd,
-                    name,
-                    input,
-                    cache_fingerprint(&name, &input)
-                );
-                let succeeded = outcome.ok;
-                // Captured before `outcome.text` is moved below: the
-                // pre-mutation unified diff for write/edit results.
-                let diff = outcome.diff.clone();
-                // Occurrences counted AFTER the push: when the ring is full
-                // the evicted front entry may itself be a match, so a
-                // pre-push count over-counts by one and can trip the
-                // `>= 3` guard a call early (regression:
-                // repeated_tool_guard_counts_after_ring_eviction). The
-                // filter borrows `cache_key`; that borrow ends before the
-                // `state.insert` move below.
-                if succeeded {
-                    if last_tools.len() >= 6 {
-                        last_tools.remove(0);
-                    }
-                    last_tools.push(cache_key.clone());
-                }
-                let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
-                if console.sink().is_some() {
-                    console
-                        .emit_async(SinkLine::ToolInput(format!(
-                            "{} {}",
-                            call.function.name,
-                            short_arg(&name, &input)
-                        )))
-                        .await;
-                } else {
-                    // The sink is None in this branch: console IO always runs.
-                    with_console(false, || {
-                        eprintln!(
-                            "{}[tool input] {} {}{}",
-                            TOOL_INPUT_COLOR,
-                            call.function.name,
-                            short_arg(&name, &input),
-                            RESET
-                        );
-                    });
-                }
-
-                let cacheable = matches!(
-                    name.as_str(),
-                    "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls"
-                );
-                let mut cache_hit = false;
-                let mut ok = succeeded;
-                let mut result = if repeated_count >= 3 {
-                    ok = false;
-                    "Error: repeated identical tool call; choose a different action or finish."
-                        .to_string()
-                } else if cacheable && succeeded {
-                    if let Some(cached) = state.cache.get(&cache_key) {
-                        cache_hit = true;
-                        cached.clone()
-                    } else {
-                        state.insert(cache_key, outcome.text.clone());
-                        outcome.text
-                    }
-                } else {
-                    if matches!(name.as_str(), "write" | "edit") {
-                        state.clear();
-                    }
-                    outcome.text
-                };
-                // Evidence-preserving reducer (`DEX_EVIDENCE_REDUCER=1`):
-                // delegate the first read of a large build/test log to the
-                // configured reducer model and verify every quoted line
-                // byte for byte against the archived raw output. Any
-                // uncheckable receipt falls open: the raw (clamped) result
-                // is kept untouched and the observation pack handles it.
-                let processed = crate::agent::evidence_reducer::process(
+            {
+                let mut ctx = ToolResultCtx {
                     config,
-                    policy
-                        .agent
-                        .as_ref()
-                        .map(|ctx| ctx.session_path.clone())
-                        .as_deref(),
-                    cancellation,
-                    crate::agent::evidence_reducer::ToolResultView {
-                        call_id: call.id.as_str(),
-                        tool_name: &name,
-                        input_json: &input,
-                        result_text: &result,
-                        ok: succeeded,
-                        shell: outcome.shell.as_ref(),
-                    },
-                )
-                .await;
-                // The reducer call's spend is real even when its receipt is
-                // rejected: fold it into the session totals and the usage
-                // stream, priced at the model that actually ran.
-                let crate::agent::evidence_reducer::Processed {
-                    reduction,
-                    usage,
-                    pricing,
-                } = processed;
-                if let Some(usage) = usage {
-                    record_usage(
-                        pricing.as_ref().unwrap_or(config),
-                        state,
-                        console,
-                        usage,
-                        None,
-                    )
-                    .await;
-                    state.dirty = true;
-                }
-                if let Some(reduced) = reduction {
-                    result = reduced.receipt;
-                    system_note(
-                        console,
-                        &format!(
-                            "evidence reducer: {} -> {} (verified)",
-                            crate::agent::evidence_reducer::format_bytes(reduced.source_bytes),
-                            crate::agent::evidence_reducer::format_bytes(reduced.receipt_bytes),
-                        ),
-                    )
-                    .await;
-                }
-                // Online context compaction (`DEX_ONLINE_COMPACTION=1`):
-                // a completed plan step is a boundary — a safe point where
-                // history can be compacted if the economics say the cache
-                // re-write pays for itself before the work ends. The
-                // boundary bookkeeping runs *before* the sink emit so
-                // plan-hygiene advice is part of the `result` the user sees;
-                // the compaction decision itself runs after the tool result
-                // is appended so the transcript keeps assistant →
-                // tool_result → reminder order (pi's reference aborts the
-                // turn instead; dex compacts inline, and the ordering must
-                // stay wire-valid). At most one boundary per turn is
-                // evaluated.
-                let mut boundary: Option<Vec<PlanStep>> = None;
-                if online_compaction_enabled() && name == "update_plan" && ok {
-                    // Parse once: the tool layer validated `steps`, so a
-                    // parse failure here would be a state bug — fall back to
-                    // ignoring the update rather than failing the turn.
-                    let parsed = serde_json::from_str::<Value>(&input).ok().and_then(|args| {
-                        let steps = args.get("steps")?.clone();
-                        let progress = parse_plan_progress(args.get("progress")).ok()?;
-                        parse_plan_steps(&steps).ok().map(|steps| (steps, progress))
-                    });
-                    if let Some((steps, progress)) = parsed {
-                        let transition = analyze_plan_transition(&state.online.plan, &steps);
-                        if !transition.advice.is_empty() {
-                            result.push('\n');
-                            result.push_str(&transition.advice.join("\n"));
-                        }
-                        if transition.completed.is_empty() {
-                            if state.online.plan != steps || state.online.progress != progress {
-                                state.online.plan = steps;
-                                state.online.progress = progress;
-                            }
-                        } else {
-                            state.online.progress = progress;
-                            boundary = Some(steps);
-                        }
-                    }
-                }
-                if console.sink().is_some() {
-                    let mut summary =
-                        tool_result_summary(&name, &input, &result, ok, diff.as_deref());
-                    if cache_hit {
-                        summary = format!("cached · {summary}");
-                    }
-                    let counts_only = matches!(
-                        name.as_str(),
-                        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "chain"
-                    );
-                    let skip_first = !counts_only || !ok;
-                    let preview = tool_preview(&name, ok, diff.as_deref(), &result, skip_first);
-                    console
-                        .emit_async(SinkLine::ToolOutput {
-                            name: name.clone(),
-                            summary,
-                            success: ok,
-                            preview,
-                            duration: elapsed.as_secs_f64(),
-                        })
-                        .await;
-                } else {
-                    // The sink is None in this branch: console IO always runs.
-                    with_console(false, || {
-                        let body = tool_preview_body(&name, ok, diff.as_deref(), &result);
-                        eprintln!(
-                            "{}[tool output] {}:\n{}{}",
-                            TOOL_OUTPUT_COLOR, name, body, RESET
-                        );
-                    });
-                }
-                // The tool result lands before any boundary reminder so the
-                // transcript stays assistant → tool_result → reminder (see
-                // the boundary note above).
-                messages.push(ChatMessage::tool_result(
-                    call.id.clone(),
-                    model_tool_result(&result),
-                ));
-                persist_pending(&mut session, messages, &mut persisted_cursor)?;
-                if let Some(steps) = boundary {
-                    state.online.record_boundary(steps);
-                    if !online_boundary_handled {
-                        online_boundary_handled = true;
-                        let context_tokens = effective_tokens(messages, &ephemerals, true);
-                        // The reference pins windowReserveTokens at a fixed
-                        // 16 KiB, independent of the host's compaction reserve;
-                        // dex's default reserve_tokens is also 16_384, and
-                        // following dex's configured edge keeps window
-                        // protection consistent with the pre-call compaction
-                        // threshold.
-                        let economics = CompactionEconomics {
-                            window_reserve_tokens: config.reserve_tokens,
-                            ..DEFAULT_COMPACTION_ECONOMICS
-                        };
-                        let decision = decide_compaction(
-                            context_tokens,
-                            // Archivable slice: what a cut can actually
-                            // remove (see `archivable_tokens`) — the system
-                            // message and the keep-recent window are never
-                            // archived, and the ephemeral preamble + tool
-                            // schema are re-sent on every request.
-                            archivable_tokens(messages, config),
-                            NATIVE_SUMMARY_TOKEN_ESTIMATE,
-                            context_tokens,
-                            &state.online,
-                            Some(config.context_window),
-                            Some(config.cache_write_read_ratio()),
-                            &economics,
-                        );
-                        crate::log!(
-                            Debug,
-                            "online compaction boundary: {} (write {}, archive {})",
-                            decision.reason,
-                            decision.write_tokens,
-                            decision.archive_tokens
-                        );
-                        if decision.compact {
-                            match compact_history(config, messages, cancel, false).await {
-                                Ok((true, usage)) => {
-                                    if let Some(u) = usage {
-                                        record_usage(config, state, console, u, None).await;
-                                    }
-                                    if let Some(session) = session.as_deref_mut() {
-                                        session.clear_messages()?;
-                                        for message in messages.iter().skip(1) {
-                                            session.append_message(message)?;
-                                        }
-                                    }
-                                    persisted_cursor = messages.len();
-                                    // The compaction forces the retained prefix to
-                                    // be re-written at cache-write price on the next
-                                    // request; carry that as debt the following
-                                    // boundaries must repay before another compaction
-                                    // is economical.
-                                    let (debt, repayment) = decision.cache_debt();
-                                    // The reminder lists the remaining goals — build
-                                    // it before record_compaction clears the plan.
-                                    let reminder = post_compaction_reminder(
-                                        &state.online.plan,
-                                        &state.online.progress,
-                                    );
-                                    state.online.record_compaction(debt, repayment);
-                                    messages.push(ChatMessage::user_named(reminder, "compact"));
-                                    persist_pending(&mut session, messages, &mut persisted_cursor)?;
-                                    // The boundary fired silently before; a
-                                    // system line is the only user-visible
-                                    // proof the economics paid out.
-                                    system_note(
-                                        console,
-                                        &format!(
-                                            "online compaction: history compacted at plan boundary (~{} tokens archived)",
-                                            decision.archive_tokens
-                                        ),
-                                    )
-                                    .await;
-                                }
-                                // Below the summarize floor (e.g. a boundary
-                                // right after the previous compaction) or a
-                                // summarizer failure: nothing was cut, so no
-                                // cache debt is carried — log why anyway.
-                                Ok((false, _)) => {
-                                    crate::log!(Debug,
-                                        "online compaction boundary declined: history below the summarize floor"
-                                    );
-                                }
-                                Err(e) => {
-                                    crate::log!(Debug, "online compaction boundary failed: {e}");
-                                }
-                            }
-                        }
-                    }
+                    console,
+                    state: &mut *state,
+                    policy: &policy,
+                    messages: &mut *messages,
+                    session: &mut session,
+                    persisted_cursor: &mut persisted_cursor,
+                    cancel: cancellation,
+                    ephemerals: &ephemerals,
+                    online_boundary_handled: &mut online_boundary_handled,
+                    last_tools: &mut last_tools,
+                };
+                for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
+                    process_tool_result(&mut ctx, call, &turn_cwd, &name, &input, outcome, elapsed)
+                        .await?;
                 }
             }
             // Per-turn tool budget: a model that churns without converging
@@ -1007,18 +1122,9 @@ where
                 reasoning_content: message.reasoning_content,
             });
             if let Some(rx) = steering_rx.as_mut() {
-                let mut steering: Vec<String> = Vec::new();
-                while let Ok(msg) = rx.try_recv() {
-                    apply_queue_msg(&mut steering, msg);
-                }
-                if !steering.is_empty() {
+                let injected = inject_steering(rx, steering_accepted_tx, messages).await;
+                if injected {
                     state.online.record_correction();
-                    for content in steering {
-                        if let Some(accepted) = &steering_accepted_tx {
-                            let _ = accepted.send(content.clone()).await;
-                        }
-                        messages.push(ChatMessage::user_named(content, "steering"));
-                    }
                     state.last_usage = last_usage;
                     continue;
                 }
