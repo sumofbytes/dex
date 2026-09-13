@@ -66,7 +66,10 @@ pub(crate) fn is_delegation(name: &str) -> bool {
 /// (`finished completed`, `finished timed out`).
 pub(crate) fn status_word(state: AgentState) -> &'static str {
     match state {
-        AgentState::Pending => "pending",
+        // One word for `Pending` everywhere (`delegate`/`delegate_output`
+        // say "queued" too) — the registry state and the queue state are
+        // the same fact.
+        AgentState::Pending => "queued",
         AgentState::Running => "running",
         AgentState::Completed => "completed",
         AgentState::Failed => "failed",
@@ -233,10 +236,21 @@ async fn delegate(
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
             )
             .map_err(|error| ToolError::Denied(error.to_string()))?;
-        emit_started(policy, &def.name, &id).await;
+        // §24.5: under the cap or an open breaker the spawn queues — the
+        // lifecycle line and the tool result say so instead of "started".
+        let queued = ctx.manager.is_queued(&id);
+        if let Some(console) = policy.console.as_ref() {
+            let line = if queued {
+                format!("[agent {}:{id}] queued (waiting for a slot)", def.name)
+            } else {
+                format!("[agent {}:{id}] started", def.name)
+            };
+            console.emit_async(SinkLine::System(line)).await;
+        }
+        let state = if queued { "queued" } else { "running" };
         return Ok(json!({
             "agent_id": id.to_string(),
-            "state": "running",
+            "state": state,
             "resumed_from": handle.agent_id.to_string(),
             "generation": generation,
         })
@@ -267,19 +281,19 @@ async fn delegate(
             child_body(ctx.clone(), def.clone(), seed, None),
         )
         .map_err(|error| ToolError::Denied(error.to_string()))?;
-    emit_started(policy, &def.name, &id).await;
-    Ok(json!({ "agent_id": id.to_string(), "state": "running" }).to_string())
-}
-
-/// The §15 V1a started line rides the parent turn's journal (already
-/// streaming); the finished line is journaled by the manager's hook on
-/// every terminal path, whenever the child actually ends.
-async fn emit_started(policy: &Policy, name: &str, id: &AgentId) {
+    // §24.5: under the cap or an open breaker the spawn queues — the
+    // lifecycle line and the tool result say so instead of "started".
+    let queued = ctx.manager.is_queued(&id);
     if let Some(console) = policy.console.as_ref() {
-        console
-            .emit_async(SinkLine::System(format!("[agent {name}:{id}] started")))
-            .await;
+        let line = if queued {
+            format!("[agent {}:{id}] queued (waiting for a slot)", def.name)
+        } else {
+            format!("[agent {}:{id}] started", def.name)
+        };
+        console.emit_async(SinkLine::System(line)).await;
     }
+    let state = if queued { "queued" } else { "running" };
+    Ok(json!({ "agent_id": id.to_string(), "state": state }).to_string())
 }
 
 /// `delegate_output(agent_id, wait_seconds?)` — bounded poll-wait (§10.2):
@@ -307,9 +321,9 @@ async fn delegate_output(
                      or its result aged out of retention"
                 )));
             }
-            WaitOutcome::Running(_) => {
+            WaitOutcome::Running(state) => {
                 if cancel.is_cancelled() || Instant::now() >= deadline {
-                    return Ok(running_json(&id, ctx.manager.progress(&id)));
+                    return Ok(running_json(&id, state, ctx.manager.progress(&id)));
                 }
             }
         }
@@ -550,12 +564,44 @@ fn result_json(id: &AgentId, result: &AgentResult) -> String {
     .to_string()
 }
 
-fn running_json(id: &AgentId, progress: Option<String>) -> String {
+fn running_json(id: &AgentId, state: AgentState, progress: Option<String>) -> String {
+    // Tool-JSON wording (not the SSE wire): a queued child (§24.5) reads
+    // "queued" — it has an id and a slot request, but no live process.
+    let state = match state {
+        AgentState::Pending => "queued",
+        _ => "running",
+    };
     match progress {
-        Some(tool) => json!({ "agent_id": id.to_string(), "state": "running", "progress": tool }),
-        None => json!({ "agent_id": id.to_string(), "state": "running" }),
+        Some(tool) => json!({ "agent_id": id.to_string(), "state": state, "progress": tool }),
+        None => json!({ "agent_id": id.to_string(), "state": state }),
     }
     .to_string()
+}
+
+/// Build the resumed conversation (§24.3): persona re-applied first (the
+/// journal never stores the System role — `load_messages_from_session`
+/// skips it — so the persona comes from the same definition every
+/// generation, no drift), the prior generation's messages verbatim, the
+/// interruption nudge last. `Err` = the replay came back empty (crash
+/// between `turn_start` and the first `append_message`, or an unreadable
+/// journal): a resume with no history would run the degenerate seed task
+/// ("resume <id> generation N"), which is worse than failing loudly — the
+/// parent re-delegates with a fresh task instead.
+fn resume_messages(
+    def: &AgentDefinition,
+    request: &ResumeRequest,
+) -> Result<Vec<ChatMessage>, String> {
+    let replayed = load_llm_messages_from_session(&request.handle.transcript).unwrap_or_default();
+    if replayed.is_empty() {
+        return Err(format!(
+            "transcript {} has no replayable messages; re-delegate with a fresh task instead",
+            request.handle.transcript.display()
+        ));
+    }
+    let mut messages = vec![ChatMessage::system(child_system_prompt(def))];
+    messages.extend(replayed.iter().cloned());
+    messages.push(ChatMessage::user_named(resume_nudge(request), "resume"));
+    Ok(messages)
 }
 
 /// The child's task prompt (§5): the parent model's own words, plus optional
@@ -707,32 +753,43 @@ async fn child_run(
                 };
             }
         };
-    // Fresh: system prompt + the parent-written task. Resume: re-derive
-    // the system prompt — the transcript never journals it (the fresh
-    // path journals only the task) and the session loader drops
-    // `Role::System` lines, so a verbatim replay would send the child
-    // back with no persona and no tool rules — then replay the prior
-    // generation's messages and append the interruption nudge as a named
-    // user message. A `Fresh` recovery replays nothing: same seed, full
-    // meter, correct generation suffix. An unreadable or empty
-    // transcript falls back to fresh: a resume must never fail for
-    // journal reasons.
+    // Fresh: system prompt + the parent-written task. Resume: replay the
+    // prior generation's transcript, then append the interruption nudge as
+    // a named user message. The journal never stores the System role
+    // (`load_messages_from_session` skips it), so the persona prompt is
+    // re-applied from the definition on every generation — same definition,
+    // no drift. A replay that comes back EMPTY (crash between `turn_start`
+    // and the first `append_message`, or an unreadable journal) is a
+    // Permanent failure: a resume with no history would run the degenerate
+    // seed task ("resume <id> generation N"), which is worse than failing
+    // loudly — the parent can re-delegate with a fresh task instead. A
+    // `Fresh` recovery rides the same request but replays nothing: same
+    // seed, full meter, generation-suffixed file the registry points at.
     let mut messages: Vec<ChatMessage> = match &resume {
         Some(request) if request.mode == RecoverMode::Resume => {
-            let replayed =
-                load_llm_messages_from_session(&request.handle.transcript).unwrap_or_default();
+            let messages = match resume_messages(&def, request) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    return AgentResult {
+                        status: AgentState::Failed,
+                        summary: String::new(),
+                        error: Some(error),
+                        usage: None,
+                        reason: ExitReason::Permanent,
+                        tool_calls: 0,
+                        resume: None,
+                    };
+                }
+            };
             let _ = session.turn_event("turn_start");
-            if replayed.is_empty() {
-                let user_message = ChatMessage::user(seed_task_text(&seed));
-                let _ = session.append_message(&user_message);
-                vec![ChatMessage::system(child_system_prompt(&def)), user_message]
-            } else {
-                let (in_memory, journal) = resume_conversation(&def, replayed, request);
-                for message in &journal {
+            // The persona (System role) is rebuilt per generation, never
+            // journaled — same rule the fresh path follows.
+            for message in &messages {
+                if message.role != crate::core::types::Role::System {
                     let _ = session.append_message(message);
                 }
-                in_memory
             }
+            messages
         }
         _ => {
             let user_message = ChatMessage::user(seed_task_text(&seed));
@@ -1072,6 +1129,128 @@ mod tests {
         // at generation 0 is indistinguishable from generation 1.
         assert_eq!(parse_generation("sess-0-my.g1.jsonl"), 1);
         assert_eq!(parse_generation("sess-0-explorer.gx.jsonl"), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_messages_reapplies_persona_and_appends_nudge() {
+        // §24.3 (review fix): the journal never stores the System role, so
+        // `resume_messages` must re-apply the persona from the definition —
+        // a resumed child runs with the same persona it started with.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from("/tmp/dex-supervision-resume-msgs");
+        let parent_path = dir.join("sess.jsonl");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        let mut child = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-resume-msgs",
+            "sess-2",
+            "tester",
+            0,
+        )
+        .unwrap();
+        let _ = child.turn_event("turn_start");
+        child
+            .append_message(&ChatMessage::user("check the build"))
+            .unwrap();
+        child
+            .append_message(&ChatMessage::assistant("found three risks"))
+            .unwrap();
+        drop(child);
+        let def = super::super::builtin_definitions()
+            .into_iter()
+            .find(|def| def.name == "tester")
+            .unwrap();
+        let request = ResumeRequest {
+            mode: RecoverMode::Resume,
+            handle: ResumeHandle {
+                agent_id: AgentId("sess-2".to_string()),
+                transcript: Session::child_path(&parent_path, "sess-2", "tester", 0),
+                generation: 0,
+                remaining_budget: Some(7),
+                note: "timed out after 3 tool calls; continue from the transcript".to_string(),
+                history: Vec::new(),
+            },
+            instruction: Some("skip the build".to_string()),
+            file_hints: Vec::new(),
+        };
+        let messages = resume_messages(&def, &request).unwrap();
+        // Persona leads, from the definition — not from the journal.
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(&def.prompt)),
+            "first message must be the persona: {:?}",
+            messages[0].content
+        );
+        // Replay is verbatim and in order.
+        assert_eq!(messages[1].content.as_deref(), Some("check the build"));
+        assert_eq!(messages[2].content.as_deref(), Some("found three risks"));
+        // The nudge lands last, carrying the instruction.
+        let last = messages.last().unwrap();
+        assert_eq!(last.name.as_deref(), Some("resume"));
+        let nudge = last.content.as_deref().unwrap();
+        assert!(nudge.contains("timed out after 3 tool calls"), "{nudge}");
+        assert!(nudge.contains("skip the build"), "{nudge}");
+        assert!(nudge.contains("at most 7 further tool calls"), "{nudge}");
+        // The persona never journals (System role skipped on replay too).
+        let reloaded = crate::session::load_messages_from_session(&Session::child_path(
+            &parent_path,
+            "sess-2",
+            "tester",
+            0,
+        ))
+        .unwrap();
+        assert!(reloaded
+            .iter()
+            .all(|m| m.role != crate::core::types::Role::System));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_messages_rejects_an_empty_transcript_loudly() {
+        // §24.3 review fix: an empty replay (turn_start without any message
+        // line) must NOT fall back to the degenerate seed task — it fails
+        // Permanent so the parent re-delegates with a fresh task.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from("/tmp/dex-supervision-resume-empty");
+        let parent_path = dir.join("sess.jsonl");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        let mut child = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-resume-empty",
+            "sess-3",
+            "tester",
+            0,
+        )
+        .unwrap();
+        let _ = child.turn_event("turn_start");
+        drop(child);
+        let def = super::super::builtin_definitions()
+            .into_iter()
+            .find(|def| def.name == "tester")
+            .unwrap();
+        let request = ResumeRequest {
+            mode: RecoverMode::Resume,
+            handle: ResumeHandle {
+                agent_id: AgentId("sess-3".to_string()),
+                transcript: Session::child_path(&parent_path, "sess-3", "tester", 0),
+                generation: 0,
+                remaining_budget: None,
+                note: "interrupted".to_string(),
+                history: Vec::new(),
+            },
+            instruction: None,
+            file_hints: Vec::new(),
+        };
+        let error = resume_messages(&def, &request).unwrap_err();
+        assert!(error.contains("no replayable messages"), "{error}");
+        assert!(error.contains("re-delegate"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
