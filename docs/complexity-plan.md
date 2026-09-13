@@ -87,22 +87,23 @@ separately). Do not compare against stale review-era estimates.
 
 | File | Branch sites (measured) | LOC (measured) | Post-sweep |
 |---|---|---|---|
-| src/llm/config.rs | 303 | 4886 | |
-| src/llm/stream.rs | 127 | 2249 | |
-| src/daemon/server.rs | 193 | 4425 | |
-| src/daemon/mod.rs | 61 | 1219 | |
-| src/agent/loop.rs | 77 | 2058 | |
-| src/agent/compaction.rs | 90 | 1091 | |
-| src/agent/state.rs | 26 | 254 | |
-| src/session.rs | 94 | 1804 | |
-| src/core/format.rs | 158 | 1953 | |
-| src/tools/mod.rs | 139 | 3466 | |
-| src/mcp.rs | 105 | 1943 | |
-| src/mcp/oauth.rs | 70 | 1715 | |
-| src/client/http.rs | 33 | 1411 | |
-| src/main.rs | 55 | 565 | |
-| src/cli.rs | 29 | 450 | |
-| src/skills.rs | 29 | 428 | |
+| src/llm/config.rs | 303 | 4886 | 288 / 4993 |
+| src/llm/stream.rs | 127 | 2249 | 115 / 2173 |
+| src/daemon/server.rs | 193 | 4425 | 130 / 4238 |
+| src/daemon/mod.rs | 61 | 1219 | 31 / 1212 |
+| src/agent/loop.rs | 77 | 2058 | 72 / 2167 |
+| src/agent/compaction.rs | 90 | 1091 | 87 / 1112 |
+| src/agent/state.rs | 26 | 254 | 19 / 248 |
+| src/session.rs | 94 | 1804 | 81 / 1778 |
+| src/core/format.rs | 158 | 1953 | 148 / 1895 |
+| src/tools/mod.rs | 139 | 3466 | 133 / 3439 |
+| src/mcp.rs | 105 | 1943 | 104 / 1997 |
+| src/mcp/oauth.rs | 70 | 1715 | 72 / 1771 |
+| src/client/http.rs | 33 | 1411 | 31 / 1379 |
+| src/main.rs | 55 | 565 | 53 / 572 |
+| src/cli.rs | 29 | 450 | 28 / 447 |
+| src/skills.rs | 29 | 428 | 26 / 423 |
+| **Total** | **1589** | **29917** | **1418 / 29844** |
 
 (Grep proxy counts matches inside comments/strings too — acceptable as a consistent
 before/after proxy, not a cyclomatic number.)
@@ -293,6 +294,40 @@ effort L
 - Re-run the metric once; fill the final column; if targets are short by >30%,
   record why and decide on skip-list items (LLM-5, LLM-10, CLI-4).
 - Update `docs/complexity-issues.md` checkboxes; archive the metric diff here.
+
+#### Closure record (done)
+
+Metric re-run at `sweep/main` = `c6520e4` (all 19 PRs merged), same grep proxy:
+
+- **Branch sites: 1589 → 1418 (−171, −10.8%).** Biggest single wins: server.rs
+  −63 (SRV-1 `lock_map`, SRV-3..7), daemon/mod.rs −30 (SRV-1), stream.rs −12
+  (LLM-6/7), session.rs −13 (SES-1/2), config.rs −15 (LLM-1/2/3/4/8/9/10).
+- **LOC: 29917 → 29844 (−73 raw).** Raw LOC is roughly flat because the sweep
+  added tests as it went (config.rs +107 is mostly the PR-18 doctor snapshot
+  gate and additive coverage; mcp.rs +54, oauth.rs +56 are PR-1/PR-15 additive
+  non-ASCII and mock tests). Per-PR net production deletions claimed in the PR
+  bodies sum near the 900–1200 goal, but the one-shot proxy can't separate
+  test from production lines, so the honest headline is the branch-site drop.
+- **Short by >30%?** The branch-site target (~several hundred) is short ~45%;
+  recorded reasons: LLM-5 and CLI-4 were default-skips and the metrics gate did
+  not demand pulling them in (the gate is informational, not a pass/fail); the
+  two unplanned skips below account for most of the rest.
+- **Skip-list decisions:**
+  - `LLM-5` (`catalog_models` iterator) — skipped, per plan default; six
+    dual-shape scans stay, medium risk for ~30 branch pts.
+  - `CLI-4` (`content_lines` classifier) — skipped, per plan default; optional.
+  - `LLM-10` (header merge funnels) — **landed** in PR-16 (was listed optional).
+  - `MCP-5` (`refresh_and_retry`/`extract_reply` in HttpTransport) — skipped:
+    never pulled into a PR; the 401-retry sites stay inline. Lowest-value MCP
+    item; revisit if the transport grows another retry path.
+  - `MCP-10` (`expand_env` `resolve` closure) — skipped: BUG-2 (the mojibake
+    fix) landed in PR-1, but the two `match std::env::var` arms remain
+    duplicated. Cosmetic; the bug it accompanied is fixed.
+- Ledger status recorded per item in `docs/complexity-issues.md` § Index
+  (Status column; there were no checkboxes to tick — the index table is the
+  tracking surface).
+- Three checks green at the closure point: fmt, `cargo test --all-targets`
+  (659 passed), clippy `-D warnings`.
 
 ## Dependency graph (PR → must land after)
 
