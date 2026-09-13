@@ -992,7 +992,7 @@ mod tests {
         // §11 depth-1 rule at dispatch: the child allowlist never contains a
         // delegation tool, so the standard availability gate rejects the
         // call before any delegation logic runs.
-        let filter = ToolFilter::new("explorer", ["read", "ffgrep", "fffind"]);
+        let filter = ToolFilter::new("explorer", ["read", "grep", "find"]);
         let policy = Policy::trusted();
         let mut args = Map::new();
         args.insert("agent".into(), json!("explorer"));
@@ -1040,10 +1040,7 @@ mod tests {
         let prompt = child_system_prompt(&def);
         assert!(prompt.starts_with(&def.prompt), "persona leads");
         // BTreeSet iteration is sorted.
-        assert!(
-            prompt.contains("Your tools: fffind, ffgrep, read"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("Your tools: find, grep, read"), "{prompt}");
         // project_context() appends the repo's own instructions when present
         // (this repo has one); the marker matches the main prompt's shape.
         if crate::llm::prompt::project_context().is_some() {
