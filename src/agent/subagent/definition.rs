@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use super::exit::{RecoverMode, SupervisionSpec, DEFAULT_RECOVER_MAX, DEFAULT_RECOVER_WINDOW};
 use crate::skills::unquote;
 
 /// Default child timeout (§14): a run exceeding it ends `TimedOut` with a
@@ -53,6 +54,12 @@ pub(crate) struct AgentDefinition {
     pub(crate) max_tool_iterations: Option<u32>,
     /// Per-definition timeout; defaults to [`DEFAULT_AGENT_TIMEOUT`].
     pub(crate) timeout: Duration,
+    /// Supervision policy (§24.2): flat frontmatter keys `recover` /
+    /// `recover_max` / `recover_window_secs` (an indented block under a
+    /// `supervision:` line parses identically — the parent line is
+    /// ignored and the sub-keys read flat). Defaults to `Never`: V1a/V1b
+    /// behavior is byte-identical until a definition opts in.
+    pub(crate) supervision: SupervisionSpec,
 }
 
 /// Parse one `markdown + frontmatter` definition — the shape user-defined
@@ -63,7 +70,9 @@ pub(crate) struct AgentDefinition {
 /// Recognized keys: `name` (required, ascii alnum/`-`/`_`), `description`
 /// (required — the parent routes on it), `model`, `tools` (comma list,
 /// defaults to the read-only trio), `permissions` (`inherit`, the only V1
-/// rule), `max_tool_iterations`, `timeout_secs`. The body after the
+/// rule), `max_tool_iterations`, `timeout_secs`, `recover`
+/// (`never`/`fresh`/`resume`, default `never`), `recover_max`,
+/// `recover_window_secs`. The body after the
 /// closing `---` is the persona prompt (required, non-empty).
 pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
     let mut lines = text.lines();
@@ -80,6 +89,9 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
     let mut permissions: Option<String> = None;
     let mut max_tool_iterations: Option<String> = None;
     let mut timeout_secs: Option<String> = None;
+    let mut recover: Option<String> = None;
+    let mut recover_max: Option<String> = None;
+    let mut recover_window_secs: Option<String> = None;
     let mut prompt: Option<String> = None;
     for line in lines.by_ref() {
         if line.trim() == "---" {
@@ -102,6 +114,9 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
             "permissions" => permissions = Some(value),
             "max_tool_iterations" => max_tool_iterations = Some(value),
             "timeout_secs" => timeout_secs = Some(value),
+            "recover" => recover = Some(value),
+            "recover_max" => recover_max = Some(value),
+            "recover_window_secs" => recover_window_secs = Some(value),
             // Forward-compatible: unknown keys are ignored (user files may
             // carry post-V1 keys before this build understands them).
             _ => {}
@@ -195,6 +210,53 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
         }
     };
     let model = model.filter(|m| !m.is_empty());
+    // Supervision (§24.2): `recover` selects the mode, `recover_max` /
+    // `recover_window_secs` the intensity. Invalid values reject even
+    // under `recover: never` — fail fast on typos, not at 2 a.m.
+    let recover = match recover.as_deref().map(str::trim) {
+        None | Some("") | Some("never") => RecoverMode::Never,
+        Some("fresh") => RecoverMode::Fresh,
+        Some("resume") => RecoverMode::Resume,
+        Some(other) => {
+            return Err(format!(
+                "agent '{name}' has unknown recover '{other}': want one of never, fresh, resume"
+            ));
+        }
+    };
+    let recover_max = match recover_max {
+        None => DEFAULT_RECOVER_MAX,
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| {
+                format!("agent '{name}' has invalid recover_max '{raw}': want a positive integer")
+            })
+            .and_then(|n| {
+                if n > 0 {
+                    Ok(n)
+                } else {
+                    Err(format!(
+                        "agent '{name}' has invalid recover_max '{raw}': want a positive integer"
+                    ))
+                }
+            })?,
+    };
+    let recover_window = match recover_window_secs {
+        None => DEFAULT_RECOVER_WINDOW,
+        Some(raw) => {
+            let secs: u64 = raw.trim().parse().map_err(|_| {
+                format!(
+                    "agent '{name}' has invalid recover_window_secs '{raw}': want positive seconds"
+                )
+            })?;
+            if secs == 0 {
+                return Err(format!(
+                    "agent '{name}' has invalid recover_window_secs '{raw}': want positive seconds"
+                ));
+            }
+            Duration::from_secs(secs)
+        }
+    };
     Ok(AgentDefinition {
         name,
         description,
@@ -204,6 +266,11 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
         permissions,
         max_tool_iterations,
         timeout,
+        supervision: SupervisionSpec {
+            recover,
+            max: recover_max,
+            window: recover_window,
+        },
     })
 }
 
@@ -223,6 +290,9 @@ mod tests {
         assert_eq!(def.permissions, PermissionInherit::Inherit);
         assert_eq!(def.max_tool_iterations, Some(50));
         assert_eq!(def.timeout, Duration::from_secs(120));
+        // No supervision keys: the V1 default (never recovers).
+        assert_eq!(def.supervision, SupervisionSpec::default());
+        assert_eq!(def.supervision.recover, RecoverMode::Never);
         assert!(def.tools.contains("read"));
         assert!(def.tools.contains("ffgrep"));
         assert!(def.tools.contains("mcp__gh__*"));
@@ -246,6 +316,39 @@ mod tests {
                 .map(|t| t.to_string())
                 .collect::<BTreeSet<_>>()
         );
+    }
+
+    #[test]
+    fn supervision_keys_parse_and_reject_cleanly() {
+        let def = parse_definition(
+            "---\nname: x\ndescription: d\nrecover: resume\nrecover_max: 3\nrecover_window_secs: 120\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(def.supervision.recover, RecoverMode::Resume);
+        assert_eq!(def.supervision.max, 3);
+        assert_eq!(def.supervision.window, Duration::from_secs(120));
+        let def =
+            parse_definition("---\nname: x\ndescription: d\nrecover: fresh\n---\nbody\n").unwrap();
+        assert_eq!(def.supervision.recover, RecoverMode::Fresh);
+        assert_eq!(def.supervision.max, DEFAULT_RECOVER_MAX);
+        assert_eq!(def.supervision.window, DEFAULT_RECOVER_WINDOW);
+        // An indented block under a `supervision:` line reads flat — the
+        // parent line is ignored, the sub-keys parse as usual.
+        let def = parse_definition(
+            "---\nname: x\ndescription: d\nsupervision:\n  recover: resume\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(def.supervision.recover, RecoverMode::Resume);
+        // Unknown modes and non-positive intensity reject with the
+        // available set, mirroring the `permissions: escalate` rule.
+        for bad in [
+            "---\nname: x\ndescription: d\nrecover: always\n---\nbody\n",
+            "---\nname: x\ndescription: d\nrecover: resume\nrecover_max: 0\n---\nbody\n",
+            "---\nname: x\ndescription: d\nrecover: resume\nrecover_max: many\n---\nbody\n",
+            "---\nname: x\ndescription: d\nrecover_window_secs: 0\n---\nbody\n",
+        ] {
+            assert!(parse_definition(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
