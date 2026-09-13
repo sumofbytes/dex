@@ -312,7 +312,7 @@ fn print_help() {
         Usage: dex [OPTIONS] [COMMAND|PROMPT]\n\
         \n\
         Commands:\n  \
-        serve [bind]              daemon on 127.0.0.1:8420\n  \
+        serve [bind] [--fd n]    daemon on 127.0.0.1:8420; --fd <n> adopts a pre-bound listener\n  \
         connect <url> [prompt]    TUI or one-shot against a daemon\n  \
         run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
           doctor                    show resolved provider/model config + origins\n  \
@@ -333,35 +333,67 @@ fn print_help() {
 /// Run the `dex serve` daemon: resolve the bind address, warn when it is
 /// unspecified, prepare the bearer token, bind, and block on the server.
 /// Parse, bind, and daemon failures exit 1.
-fn run_serve(bind: &str) {
-    let addr: std::net::SocketAddr = if bind.contains(':') {
-        bind.parse().unwrap_or_else(|_| {
-            eprintln!("error: invalid bind address '{bind}' (use [host:]port)");
-            std::process::exit(1);
-        })
-    } else {
-        ([127, 0, 0, 1], bind.parse().unwrap_or(8420)).into()
-    };
-    if addr.ip().is_unspecified() {
-        eprintln!(
+fn run_serve(bind: &str, fd: Option<&str>) {
+    let listener = match fd {
+        // Adopted listener: the parent (den's platform) pre-bound a host
+        // listener and passed it down; skip our own bind entirely.
+        Some(raw) => {
+            let n: i32 = match raw.parse() {
+                Ok(n) if n >= 0 => n,
+                _ => {
+                    eprintln!("error: --fd expects a listener fd number, got '{raw}'");
+                    std::process::exit(1);
+                }
+            };
+            let listener = match daemon::adopt_listener(n) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("daemon error: cannot adopt listener fd {n}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let addr = match listener.local_addr() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("daemon error: adopted listener has no address: {e}");
+                    std::process::exit(1);
+                }
+            };
+            daemon::prepare_daemon_token(&addr);
+            listener
+        }
+        None => {
+            let addr: std::net::SocketAddr = if bind.contains(':') {
+                bind.parse().unwrap_or_else(|_| {
+                    eprintln!("error: invalid bind address '{bind}' (use [host:]port)");
+                    std::process::exit(1);
+                })
+            } else {
+                ([127, 0, 0, 1], bind.parse().unwrap_or(8420)).into()
+            };
+            if addr.ip().is_unspecified() {
+                eprintln!(
             "warning: daemon listening on {addr} is exposed on all interfaces — a bearer token is required (set DEX_DAEMON_TOKEN or copy the generated daemon.token); prefer 127.0.0.1 for local use"
         );
-    }
-    // Non-loopback binds (or an explicit DEX_DAEMON_TOKEN) get a
-    // bearer token: the daemon runs tools in a workspace, so an
-    // unauthenticated reachable endpoint is remote code execution.
-    daemon::prepare_daemon_token(&addr);
-    let listener = match std::net::TcpListener::bind(addr) {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("daemon error: cannot bind {addr}: {e}");
-            std::process::exit(1);
+            }
+            // Non-loopback binds (or an explicit DEX_DAEMON_TOKEN) get a
+            // bearer token: the daemon runs tools in a workspace, so an
+            // unauthenticated reachable endpoint is remote code execution.
+            daemon::prepare_daemon_token(&addr);
+            let listener = match std::net::TcpListener::bind(addr) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("daemon error: cannot bind {addr}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            listener
         }
     };
-    println!(
-        "dex daemon listening on {}",
-        listener.local_addr().unwrap_or(addr)
-    );
+    match listener.local_addr() {
+        Ok(addr) => println!("dex daemon listening on {addr}"),
+        Err(_) => println!("dex daemon listening on (unknown address)"),
+    }
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
         if let Err(e) = daemon::run_daemon(listener).await {
@@ -410,8 +442,12 @@ fn main() {
         Mode::Version => {
             println!("dex {}", env!("CARGO_PKG_VERSION"));
         }
-        Mode::Serve { bind } => {
-            run_serve(&bind);
+        Mode::Serve { bind, fd, invalid } => {
+            if let Some(msg) = invalid {
+                eprintln!("error: {msg}");
+                std::process::exit(1);
+            }
+            run_serve(&bind, fd.as_deref());
         }
         Mode::Connect { url } => {
             // `dex connect <url>` opens the TUI; `dex connect <url> "prompt"`

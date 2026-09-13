@@ -30,7 +30,13 @@ pub(crate) struct Args {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     /// Start a headless HTTP server (`dex serve [host:port|port]`).
-    Serve { bind: String },
+    /// `--fd <n>` adopts a pre-bound listener (den's platform) instead of
+    /// binding; `invalid` carries a strict-parse error for main to print.
+    Serve {
+        bind: String,
+        fd: Option<String>,
+        invalid: Option<String>,
+    },
     /// Start the TUI connected to a remote daemon (`dex connect <url>`).
     Connect { url: String },
     /// Start both server + TUI in the same process (default `dex`).
@@ -143,12 +149,36 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
         }
         Some("doctor") => Mode::Doctor,
         Some("serve") => {
-            let bind = args
-                .rest
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "127.0.0.1:8420".to_string());
-            Mode::Serve { bind }
+            // `dex serve [bind] [--fd <n>]`: --fd adopts a pre-bound
+            // listening socket instead of binding. Strict: an unknown flag
+            // or a second positional is an error, never a silent 8420 bind.
+            let mut bind = None;
+            let mut fd = None;
+            let mut invalid = None;
+            let mut it = args.rest.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--fd" => match it.next() {
+                        Some(v) => fd = Some(v.clone()),
+                        None => invalid = Some("--fd needs a listener fd number".to_string()),
+                    },
+                    s if s.starts_with('-') => {
+                        invalid = Some(format!("unknown serve flag '{s}'"));
+                    }
+                    s => {
+                        if bind.is_some() {
+                            invalid = Some(format!("unexpected serve argument '{s}'"));
+                        } else {
+                            bind = Some(s.to_string());
+                        }
+                    }
+                }
+            }
+            Mode::Serve {
+                bind: bind.unwrap_or_else(|| "127.0.0.1:8420".to_string()),
+                fd,
+                invalid,
+            }
         }
         Some("connect") => {
             let url = args

@@ -2,6 +2,7 @@ pub(crate) mod server;
 
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
+use std::os::unix::io::FromRawFd as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,6 +84,22 @@ fn write_token_file(path: &PathBuf, token: &str) -> bool {
             Err(_) => false,
         }
     }
+}
+
+/// Adopt a pre-bound listening socket handed down by a parent process.
+///
+/// den's platform binds a host-loopback listener and passes it into the
+/// sandboxed daemon (the fd survives the exec chain because den clears
+/// CLOEXEC), so clients can attach from outside the sandbox's network
+/// namespace. Adoption re-arms CLOEXEC immediately: agent-spawned child
+/// processes (tools) must never inherit the listening socket.
+pub(crate) fn adopt_listener(fd: i32) -> std::io::Result<TcpListener> {
+    // SAFETY: the fd is a valid socket owned by this process (the parent
+    // cleared CLOEXEC so it survived exec); FromRawFd takes ownership.
+    let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    // SAFETY: fcntl on the fd we just took ownership of.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Ok(listener)
 }
 
 pub(crate) fn prepare_daemon_token(addr: &std::net::SocketAddr) {
@@ -1330,5 +1347,39 @@ mod tests {
             .unwrap();
         assert!(allowed.status().is_success(), "{}", allowed.status());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopt_listener_takes_over_and_rearms_cloexec() {
+        use std::io::{Read, Write};
+        use std::os::unix::io::AsRawFd as _;
+        let bound = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = bound.local_addr().unwrap();
+        let fd = bound.as_raw_fd();
+        // den clears CLOEXEC so the fd survives the exec chain; adoption
+        // must re-arm it so agent-spawned children never inherit the socket
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        // fd ownership moved into adopt_listener; keep the original alive
+        // (never dropped) via ManuallyDrop so the test cannot double-close
+        let _bound = std::mem::ManuallyDrop::new(bound);
+        let adopted = adopt_listener(fd).unwrap();
+        assert_eq!(adopted.local_addr().unwrap(), addr);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "listener must be CLOEXEC after adoption"
+        );
+        // still serving: connect + accept round-trip on the adopted fd
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (mut sock, _) = adopted.accept().unwrap();
+        sock.write_all(b"ok").unwrap();
+        drop(sock);
+        let mut buf = [0u8; 2];
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok");
     }
 }

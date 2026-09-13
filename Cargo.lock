@@ -439,6 +439,7 @@ dependencies = [
  "fff-search",
  "futures-core",
  "http",
+ "libc",
  "ratatui",
  "ratatui-markdown",
  "reqwest",

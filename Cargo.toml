@@ -75,6 +75,8 @@ axum = "0.8"
   tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util", "signal"] }
 futures-core = "0.3"
 uuid = { version = "1", features = ["v4"] }
+# listener adoption for den's platform (--fd): fcntl to re-arm CLOEXEC
+libc = "0.2"
 terminal-colorsaurus = "1.0.3"
 fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
 # MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
