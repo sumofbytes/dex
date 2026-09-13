@@ -1009,8 +1009,8 @@ mod tests {
     async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
         // Hermetic sessions dir: rebuild_async scans everything under
         // XDG_DATA_HOME, so concurrent test binaries must not see each other.
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _guard = hermetic_xdg();
+        let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _xdg_guard = hermetic_xdg();
         // A session killed mid-turn: turn_start with no terminal entry.
         let mut s = crate::session::Session::new("/tmp/dex-rebuild-test".into(), None).unwrap();
         let id = s.id().to_string();
@@ -1060,8 +1060,8 @@ mod tests {
         // A reattach + chat racing the background rebuild owns the journal:
         // stamping `turn_failed` under its live `turn_start` would corrupt it.
         // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _guard = hermetic_xdg();
+        let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _xdg_guard = hermetic_xdg();
         let mut s =
             crate::session::Session::new("/tmp/dex-rebuild-live-test".into(), None).unwrap();
         let id = s.id().to_string();
@@ -1087,8 +1087,8 @@ mod tests {
         // Sessions claimed (reattached/created) mid-rebuild win over disk via
         // `or_insert` — the rebuild must not clobber them.
         // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _guard = hermetic_xdg();
+        let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _xdg_guard = hermetic_xdg();
         let s = crate::session::Session::new("/tmp/dex-rebuild-wins-test".into(), None).unwrap();
         let id = s.id().to_string();
         let path = s.path().unwrap().to_path_buf();
