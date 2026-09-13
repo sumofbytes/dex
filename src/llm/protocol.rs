@@ -158,15 +158,17 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "delegate".to_string(),
-                description: "Delegate a task to a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing.".to_string(),
+                description: "Delegate a task to a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing. Pass resume_from (a prior agent_id) to continue a resumable child from its transcript as a new generation — task is then optional and instruction plus file_hints fold into the continuation note; delegate_list shows resumable children.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "agent": { "type": "string", "description": "agent name: explorer | reviewer | tester" },
-                        "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation" },
-                        "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" }
+                        "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation (unneeded with resume_from)" },
+                        "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" },
+                        "resume_from": { "type": "string", "description": "prior agent_id to resume from its transcript as a new generation" },
+                        "instruction": { "type": "string", "description": "refined instruction folded into the resume continuation note" }
                     },
-                    "required": ["agent", "task"]
+                    "required": ["agent"]
                 }),
             },
         });
@@ -196,6 +198,18 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                         "agent_id": { "type": "string", "description": "id returned by delegate" }
                     },
                     "required": ["agent_id"]
+                }),
+            },
+        });
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "delegate_list".to_string(),
+                description: "List this session's sub-agent children: live ones with their progress, finished ones with status and resumability, and interrupted on-disk runs a daemon restart left behind. Read-only. Use it when spawn-result lines scrolled away or after compaction.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }),
             },
         });

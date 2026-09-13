@@ -721,7 +721,8 @@ pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std:
 mod tests {
     use super::*;
     use crate::agent::subagent::{
-        AgentDefinition, AgentResult, AgentState, ContextSeed, ProgressReporter, WaitOutcome,
+        AgentDefinition, AgentResult, AgentState, ContextSeed, ExitReason, ProgressReporter,
+        SpawnMeta, WaitOutcome,
     };
 
     fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
@@ -748,6 +749,9 @@ mod tests {
             summary: "done".to_string(),
             error: None,
             usage: None,
+            reason: ExitReason::Normal,
+            tool_calls: 0,
+            resume: None,
         }
     }
 
@@ -762,6 +766,9 @@ mod tests {
             summary: String::new(),
             error: Some("child saw cancel".to_string()),
             usage: None,
+            reason: ExitReason::ShutDown,
+            tool_calls: 0,
+            resume: None,
         }
     }
 
@@ -898,7 +905,7 @@ mod tests {
         // handle for the same session: clones share one registry.
         let id = state
             .manager_for("s1")
-            .spawn(&def, seed, done_body)
+            .spawn(&def, seed, SpawnMeta::fresh(), done_body)
             .unwrap();
         match state
             .manager_for("s1")
@@ -913,7 +920,7 @@ mod tests {
         let (def2, seed2) = agent_test_parts("explorer");
         let other = state
             .manager_for("s2")
-            .spawn(&def2, seed2, done_body)
+            .spawn(&def2, seed2, SpawnMeta::fresh(), done_body)
             .unwrap();
         assert_eq!(other.to_string(), "s2-0");
     }
@@ -923,7 +930,9 @@ mod tests {
         let state = std::sync::Arc::new(DaemonState::new());
         let manager = state.manager_for("s1");
         let (def, seed) = agent_test_parts("explorer");
-        let id = manager.spawn(&def, seed, cancel_body).unwrap();
+        let id = manager
+            .spawn(&def, seed, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
         assert_eq!(manager.active_count(), 1);
         state.remove_session_agents("s1").await;
         // The pre-removal handle still sees the reaped child (shared
@@ -947,8 +956,12 @@ mod tests {
         let second = state.manager_for("s2");
         let (def1, seed1) = agent_test_parts("explorer");
         let (def2, seed2) = agent_test_parts("tester");
-        first.spawn(&def1, seed1, cancel_body).unwrap();
-        second.spawn(&def2, seed2, cancel_body).unwrap();
+        first
+            .spawn(&def1, seed1, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
+        second
+            .spawn(&def2, seed2, SpawnMeta::fresh(), cancel_body)
+            .unwrap();
         state.shutdown_agents().await;
         assert_eq!(first.active_count(), 0);
         assert_eq!(second.active_count(), 0);
