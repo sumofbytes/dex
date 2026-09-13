@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::{AgentEvent, AgentManager};
+use crate::agent::subagent::{
+    exit_reason_word, recover_mode_word, AgentEvent, AgentManager, RecoverMode,
+};
 use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
@@ -615,6 +617,35 @@ fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentE
                 status: crate::agent::subagent::status_word(notice.status).to_string(),
             },
             Some(notice.text()),
+        ),
+        AgentEvent::Recovered {
+            agent_id,
+            name,
+            attempt,
+            mode,
+            reason,
+        } => (
+            StreamEvent::AgentRecovered {
+                agent_id: agent_id.to_string(),
+                name: name.clone(),
+                attempt: *attempt,
+                mode: match mode {
+                    RecoverMode::Fresh => "fresh".to_string(),
+                    RecoverMode::Resume => "resume".to_string(),
+                    // Unreachable: recovery only fires for Fresh/Resume.
+                    RecoverMode::Never => "never".to_string(),
+                },
+                reason: exit_reason_word(*reason).to_string(),
+            },
+            // §15-style lifecycle line, journaled beside the typed
+            // variant like every other agent event. No wake scheduling
+            // below: the lineage is still running, so there is nothing
+            // to wake for — the terminal notice arrives on exhaustion.
+            Some(format!(
+                "[agent {name}:{agent_id}] recovered (attempt {attempt}, {} after {})",
+                recover_mode_word(*mode),
+                exit_reason_word(*reason)
+            )),
         ),
     };
     // The V1a line first, so a replay renders the transcript line before it
