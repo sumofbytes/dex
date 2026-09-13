@@ -378,7 +378,7 @@ fn classify_selection(selection: &str, known: &BTreeSet<String>) -> SelectionRou
         Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => {
             SelectionRoute::ProviderQualified {
                 provider: prefix.trim().to_ascii_lowercase(),
-                rest: rest.to_string(),
+                rest: rest.trim().to_string(),
             }
         }
         _ if Provider::parse_known(selection, known).is_some() => SelectionRoute::BareProvider {
@@ -1164,8 +1164,12 @@ fn resolve_model_cost<'a>(
     base_url: &str,
 ) -> Option<&'a serde_json::Value> {
     let needle = model.to_ascii_lowercase();
+    let base = base_url.trim_end_matches('/');
     catalog_cost(catalog, &needle, |_, entry| {
-        entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
+        entry
+            .get("api")
+            .and_then(|v| v.as_str())
+            .is_some_and(|api| api.trim_end_matches('/') == base)
     })
     .or_else(|| {
         catalog_cost(catalog, &needle, |key, _| {
@@ -2818,6 +2822,28 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn resolve_model_cost_ignores_trailing_slash() {
+        let catalog = serde_json::json!({
+            "go": {
+                "api": "https://go.example/v1",
+                "models": {"m-1": {"cost": {"input": 1.0}}}
+            }
+        });
+        // A pinned `base_url` with a trailing slash still hits the
+        // endpoint-exact tier instead of falling through to reseller pricing.
+        let cost = super::resolve_model_cost(
+            &catalog,
+            "m-1",
+            &["go".to_string()],
+            "https://go.example/v1/",
+        );
+        assert_eq!(
+            cost.and_then(|c| c.get("input")).and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
+    }
+
     /// Cache-write/read ratio resolution feeding the online compaction
     /// economics: explicit write surcharge wins, unpriced writes derive
     /// from input/cache_read (writes bill at the plain input rate), and no
@@ -3095,6 +3121,21 @@ pub(crate) mod tests {
         assert_eq!(
             Provider::OpenAiCodex.default_base_url(),
             Some("https://chatgpt.com/backend-api/codex")
+        );
+    }
+
+    #[test]
+    fn selection_trims_whitespace_around_provider_and_model() {
+        let known: BTreeSet<String> = ["zai".to_string()].into_iter().collect();
+        // The provider side already trims via `parse_known`; a stray space
+        // on the model side must not survive into the catalog lookup.
+        assert_eq!(
+            super::split_selection("zai/ glm-x", &known),
+            (Some("zai".to_string()), "glm-x".to_string())
+        );
+        assert_eq!(
+            super::split_selection(" zai / glm-x ", &known),
+            (Some("zai".to_string()), "glm-x".to_string())
         );
     }
 
