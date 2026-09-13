@@ -2491,19 +2491,29 @@ pub(crate) fn doctor(
             // Online compaction economics: the cache re-write cost gate.
             // Resolved live (same chain as `cache_write_read_ratio`), with
             // the fallback spelled out so the origin is never a mystery.
-            if crate::agent::online::online_compaction_enabled() {
-                row(
-                    &mut out,
-                    "online",
+            // The row is printed unconditionally (snapshot byte-stability:
+            // a set/unset `DEX_ONLINE_COMPACTION` in the caller's shell
+            // must not change doctor output); when off, the value says so.
+            let online_on = crate::agent::online::online_compaction_enabled();
+            row(
+                &mut out,
+                "online",
+                if online_on {
                     format!(
                         "cache write/read ratio {:.2} (DEX_ONLINE_COMPACTION)",
                         live.map(|c| c.cache_write_read_ratio())
                             .unwrap_or(crate::agent::online::DEFAULT_CACHE_WRITE_READ_RATIO)
                     )
-                    .as_str(),
-                    "models.dev catalog / measured fallback",
-                );
-            }
+                } else {
+                    "off (set DEX_ONLINE_COMPACTION=1)".to_string()
+                }
+                .as_str(),
+                if online_on {
+                    "models.dev catalog / measured fallback"
+                } else {
+                    "built-in default (off)"
+                },
+            );
             let (obs_pack, obs_pack_source) =
                 if env::var_os(crate::agent::obs_pack::OBSERVATION_PACK_ENV).is_some() {
                     let enabled = crate::agent::obs_pack::observation_pack_enabled();
@@ -5020,6 +5030,7 @@ pub(crate) mod tests {
             "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
             "protocol   openai-responses                              default (auto-fallback to completions)\n",
             "context    128000 tokens                                 built-in default\n",
+              "online     off (set DEX_ONLINE_COMPACTION=1)             built-in default (off)\n",
             "obs pack   off                                           built-in default (off)\n",
             "thinking   (unset)                                       model default\n",
             "permission trusted                                       built-in default\n",
