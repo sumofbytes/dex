@@ -220,6 +220,7 @@ async fn delegate(
                 SpawnMeta {
                     generation,
                     parent_session: Some(ctx.session_path.clone()),
+                    parent_id: Some(handle.agent_id.clone()),
                 },
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
             )
@@ -246,6 +247,7 @@ async fn delegate(
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(ctx.session_path.clone()),
+                parent_id: None,
             },
             child_body(ctx.clone(), def.clone(), seed, None),
         )
@@ -433,8 +435,9 @@ async fn resolve_resume_handle(
         });
     }
     Err(ToolError::InvalidArgument(format!(
-        "unknown agent id '{id}': never spawned in this session, \
-         or its result aged out of retention"
+        "unknown agent id '{id}': never spawned in this session, or its \
+         result aged out of retention; delegate_list shows live, retained, \
+         and interrupted children"
     )))
 }
 
@@ -1106,6 +1109,12 @@ mod tests {
                 },
             )
             .unwrap();
+        // The body returns immediately, but the spawned task still has to
+        // be polled once: join it through a bounded wait before resolving.
+        match manager.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(_) => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
         let handle = resolve_resume_handle(&ctx, &id).await.unwrap();
         assert_eq!(handle.remaining_budget, Some(46));
         assert_eq!(handle.generation, 0);
