@@ -37,7 +37,8 @@ use crate::session::Session;
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
 use super::exit::{
-    on_exit, resume_note, transcript_holds_progress, ExhaustKind, ExitReason, OnExit, ResumeHandle,
+    advertised_remaining, on_exit, resume_note, transcript_holds_progress, ExhaustKind, ExitReason,
+    OnExit, ResumeHandle,
 };
 use super::instance::{AgentId, AgentInstance, AgentState};
 use super::result::{AgentResult, AgentUsage};
@@ -533,13 +534,11 @@ impl AgentManager {
                 .is_some_and(transcript_holds_progress);
         if on_exit(result.reason, progress_made) == OnExit::EscalateWithResume {
             if let Some((generation, Some(transcript), budget)) = record {
-                let remaining =
-                    budget.map(|cap| (cap as usize).saturating_sub(result.tool_calls as usize));
                 result.resume = Some(ResumeHandle {
                     agent_id: id.clone(),
                     transcript,
                     generation,
-                    remaining_budget: remaining,
+                    remaining_budget: advertised_remaining(budget, result.tool_calls),
                     note: resume_note(result.reason, result.tool_calls),
                 });
             }
@@ -1442,6 +1441,73 @@ mod tests {
         let notices = mgr.drain_notices();
         assert!(notices.iter().any(|notice| notice.resumable));
         assert!(notices[0].text().contains("resume_from"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn escalate_clamps_exhausted_meter_to_full_cap() {
+        // tool_calls == cap: a Some(0) handle would promise "write your
+        // final summary without tools" while the loop still runs one
+        // post-hoc round and then hard-fails — the handle advertises None
+        // (the definition's full cap) instead; partial spend keeps the
+        // honest remainder.
+        let dir = PathBuf::from("/tmp/dex-supervision-clamp");
+        let mgr = AgentManager::new("sess");
+        let mut def = test_def("explorer");
+        def.max_tool_iterations = Some(2);
+        let spent_all = mgr
+            .spawn(
+                &def,
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
+                },
+                |_, _, _| async {
+                    AgentResult {
+                        status: AgentState::TimedOut,
+                        summary: "partial".to_string(),
+                        error: Some("timed out after 600s".to_string()),
+                        usage: None,
+                        reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                        tool_calls: 2,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        let spent_one = mgr
+            .spawn(
+                &def,
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
+                },
+                |_, _, _| async {
+                    AgentResult {
+                        status: AgentState::TimedOut,
+                        summary: "partial".to_string(),
+                        error: Some("timed out after 600s".to_string()),
+                        usage: None,
+                        reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                        tool_calls: 1,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        for (id, expected) in [(&spent_all, None), (&spent_one, Some(1))] {
+            match mgr.wait(id, Duration::from_secs(5)).await {
+                WaitOutcome::Finished(result) => {
+                    let handle = result.resume.expect("escalated with progress");
+                    assert_eq!(handle.remaining_budget, expected);
+                }
+                other => panic!("expected Finished, got {other:?}"),
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
