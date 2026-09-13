@@ -5020,6 +5020,8 @@ pub(crate) mod tests {
             "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
             "protocol   openai-responses                              default (auto-fallback to completions)\n",
             "context    128000 tokens                                 built-in default\n",
+            "online     cache write/read ratio 5.00 (DEX_ONLINE_COMPACTION)\n",
+            "                                                         models.dev catalog / measured fallback\n",
             "obs pack   off                                           built-in default (off)\n",
             "thinking   (unset)                                       model default\n",
             "permission trusted                                       built-in default\n",
