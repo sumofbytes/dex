@@ -1,6 +1,6 @@
 # Dex Sub-Agent Architecture — Implementation Plan
 
-Status: built (rev 5) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 6 (§24) plans phases 11–13 — the generic supervision regime and partial-work recovery; designed, not yet implemented. Rev 2 revised after a design review against prior art —
+Status: built (rev 6) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 6 (§24) added phases 11–13 — the generic supervision regime and partial-work recovery; all built, §24.8 boxes ticked. Rev 2 revised after a design review against prior art —
 pi's subagent design, Claude Code's task/agent system, Amp's oracle, and
 Codex's sandbox-boundary model — and a source audit of dex's actual
 integration points. Rev 3 verified the prior-art claims against primary
@@ -916,7 +916,8 @@ presence gating and chat-steals-wake, idle events poller, and the §10
 protocol/presence endpoint).
 
 Rev 6 (§24) adds phases 11–13 — the generic supervision regime and
-partial-work recovery. Designed below; not yet implemented.
+partial-work recovery. Specified below; built as phases 11–13 (all §24.8
+boxes ticked).
 
 | Phase | Content | Exit condition |
 |---|---|---|
