@@ -59,8 +59,10 @@ pub(crate) fn classify_body_error(message: &str) -> ExitReason {
 }
 
 /// The Phase-11 decision: `Drop` keeps today's behavior (terminal result
-/// + notice, child gone); `EscalateWithResume` additionally advertises a
-/// resume handle. Recovery itself stays manual — the model calls
+/// and notice, child gone); `EscalateWithResume` additionally advertises
+/// a resume handle.
+///
+/// Recovery itself stays manual — the model calls
 /// `delegate(resume_from = …)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OnExit {
