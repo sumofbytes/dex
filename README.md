@@ -2,7 +2,7 @@
 
 A terminal coding agent written in Rust. `dex` talks to OpenAI-compatible Chat
 Completions or Responses APIs and Anthropic's native Messages wire, calls tools
-(`read`, `bash`, `write`, `edit`, `ffgrep`, `fffind`, plus MCP servers) to
+(`read`, `bash`, `write`, `edit`, `grep`, `find`, `ls`, plus MCP servers) to
 operate on your local files, and offers an interactive TUI, a one-shot prompt
 mode, and a raw JSON tool mode. All agent work can run in a daemon over
 HTTP+SSE, and conversations persist as resumable JSONL sessions.
@@ -298,7 +298,7 @@ available as `$DEX_BIN`, so ONE bash call can stitch a whole read-only pipeline
 intermediate output never enters the conversation:
 
 ```sh
-"$DEX_BIN" run ffgrep pattern=TODO output_mode=files | while IFS= read -r f; do
+"$DEX_BIN" run grep pattern=TODO output_mode=files | while IFS= read -r f; do
   "$DEX_BIN" run read "path=$f" limit=3
 done
 ```
@@ -541,18 +541,23 @@ schema):
 | `bash`             | Run a shell command via `sh -c` (`command`).                                                                                                                                                                                                                             |
 | `write`            | Write/overwrite a file (`path`, `content`, optional `then_run`).                                                                                                                                                                                                         |
 | `edit`             | Replace exactly one occurrence of text (`path`, `oldText`, `newText`, optional `then_run`).                                                                                                                                                                              |
-| `ffgrep`           | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
-| `fffind`           | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
+| `grep`             | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
+| `find`             | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
+| `ls`               | List files and directories (`path`, default `.`).                                                                                                                                                                                                                        |
 | `git`*             | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.                                                                                                                                                                                                           |
 | `chain`*           | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`.                                                                                                                                                                                             |
-| `delegate`*        | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`) and return its id immediately; pass `resume_from` to continue a resumable child from its transcript. Daemon sessions only.                                                                                                                                                  |
+| `delegate`*        | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`) and return its id immediately; pass `resume_from` to continue a resumable child from its transcript. Daemon sessions only.                                                                                 |
 | `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result.                                                                                                                                                                                                            |
 | `delegate_stop`*   | Cancel a running child and return its terminal result.                                                                                                                                                                                                                   |
 | `delegate_list`*   | List this session's children — live, finished, and interrupted on-disk runs — with resumability. Read-only.                                                                                                                                                              |
 | `update_plan`†     | Replace the complete working plan (`steps`, optional `progress`). A completed step is a compaction boundary. Behind `DEX_ONLINE_COMPACTION=1`.                                                                                                                           |
 | `obs_recall`‡      | Read one page of an archived large tool result (`id`, optional byte `offset`); continue with the returned `next_offset`. Behind `DEX_OBSERVATION_PACK=1`.                                                                                                                |
 
-`*` behind `DEX_EXTRA_TOOLS=1` — default is 6 tools. `†` behind
+The model-facing schema registers `grep` and `find`; both are also dispatched
+under their fff-engine names, `ffgrep`/`fffind` (`dex run ffgrep …` and older
+transcripts keep working).
+
+`*` behind `DEX_EXTRA_TOOLS=1` — default is 7 tools. `†` behind
 `DEX_ONLINE_COMPACTION=1`. `‡` behind `DEX_OBSERVATION_PACK=1` — large tool
 results (> 10 KB) are sent in full for their first 2 provider requests, then
 replaced with a placeholder; the original bytes are archived beside the session
@@ -703,7 +708,7 @@ dex/
     ├── core/             # console sinks, formatting, highlighting, types
     ├── llm/              # provider clients, streaming parsers, auth, config
     ├── session.rs        # JSONL session persistence
-    ├── tools/            # builtin tools: read, bash, write, edit, ffgrep, fffind (fff engine)
+    ├── tools/            # builtin tools: read, bash, write, edit, grep, find, ls (fff engine; aliases ffgrep/fffind)
     ├── mcp.rs + mcp/     # MCP client: stdio/HTTP/SSE servers, OAuth login
     ├── skills.rs         # skill discovery
     └── ui.rs + ui/       # ratatui TUI (local event loop + remote client UI)

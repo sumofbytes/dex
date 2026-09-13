@@ -314,7 +314,7 @@ fn print_help() {
         Commands:\n  \
         serve [bind]              daemon on 127.0.0.1:8420\n  \
         connect <url> [prompt]    TUI or one-shot against a daemon\n  \
-        run <tool> k=v...         one-shot tool (read, bash, write, edit, ffgrep, fffind)\n  \
+        run <tool> k=v...         one-shot tool (read, ls, bash, write, edit, grep, find)\n  \
           doctor                    show resolved provider/model config + origins\n  \
           usage <id|path>           plot token usage per model call from a session's event journal\n  \
           mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
