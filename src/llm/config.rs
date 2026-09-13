@@ -38,6 +38,52 @@ fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathB
     env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(home_sub).join(rel))
 }
 
+/// File-identity cache entry shared by the config file, learned-apis map,
+/// and models.dev catalog: the parse is served while (path, mtime, len) is
+/// unchanged.
+struct FileCache<T> {
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    value: T,
+}
+
+/// Stat `path` and serve `cache`'s stored parse while (path, mtime, len) is
+/// unchanged; on a miss, read the file and hand the text to `parse`, storing
+/// the result. `parse` gets `None` when the read failed and returns `None`
+/// when nothing should be cached (stat/read/parse failure) — the caller
+/// decides what that means (empty default vs hard failure).
+/// Poisoned-mutex recovery matches the rest of the daemon: keep the value.
+fn cached_parse<T: Clone>(
+    cache: &OnceLock<Mutex<Option<FileCache<T>>>>,
+    path: &std::path::Path,
+    parse: impl FnOnce(Option<String>) -> Option<T>,
+) -> Option<T> {
+    let meta = std::fs::metadata(path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    if let Some(hit) = cache
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+    {
+        return Some(hit.value.clone());
+    }
+    let value = parse(std::fs::read_to_string(path).ok())?;
+    cache
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(FileCache {
+            path: path.to_path_buf(),
+            mtime,
+            len,
+            value: value.clone(),
+        });
+    Some(value)
+}
+
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
 /// > `~/.config/dex/config.yaml`.
 fn config_file_path() -> Option<std::path::PathBuf> {
@@ -52,77 +98,54 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 /// Cached process-wide and invalidated by file identity (path + mtime +
 /// length): `from_env` runs per chat turn on the daemon, and each call was
 /// re-reading + re-parsing the file.
-struct CachedConfigFile {
-    path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
-    value: Option<serde_yaml::Value>,
-}
-
-static CONFIG_CACHE: OnceLock<Mutex<Option<CachedConfigFile>>> = OnceLock::new();
+static CONFIG_CACHE: OnceLock<Mutex<Option<FileCache<Option<serde_yaml::Value>>>>> =
+    OnceLock::new();
 
 fn load_config_file() -> Option<serde_yaml::Value> {
     let path = config_file_path()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
-    if let Some(hit) = CONFIG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
-    {
-        return hit.value.clone();
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value = match serde_yaml::from_str::<serde_yaml::Value>(&text) {
-        Ok(value) => {
-            // Unknown keys are almost always typos; name them instead of
-            // letting a misspelled setting silently do nothing.
-            if let Some(map) = value.as_mapping() {
-                let unknown: Vec<&str> = map
-                    .keys()
-                    .filter_map(|k| k.as_str())
-                    .filter(|k| !KNOWN_FILE_KEYS.contains(k))
-                    .collect();
-                if !unknown.is_empty() {
-                    warn_once(
-                        "config:unknown-keys",
-                        &format!(
-                            "unknown config key(s) {} in {} — valid keys: {}",
-                            unknown.join(", "),
-                            path.display(),
-                            KNOWN_FILE_KEYS.join(", ")
-                        ),
-                    );
+    cached_parse(&CONFIG_CACHE, &path, |text| {
+        // Unknown keys are almost always typos; name them instead of
+        // letting a misspelled setting silently do nothing. A typo'd file
+        // must not silently disable every user setting — the parse failure
+        // is cached as `None` so `warn_once` stays the only report. A read
+        // failure caches nothing.
+        let text = text?;
+        Some(match serde_yaml::from_str::<serde_yaml::Value>(&text) {
+            Ok(value) => {
+                if let Some(map) = value.as_mapping() {
+                    let unknown: Vec<&str> = map
+                        .keys()
+                        .filter_map(|k| k.as_str())
+                        .filter(|k| !KNOWN_FILE_KEYS.contains(k))
+                        .collect();
+                    if !unknown.is_empty() {
+                        warn_once(
+                            "config:unknown-keys",
+                            &format!(
+                                "unknown config key(s) {} in {} — valid keys: {}",
+                                unknown.join(", "),
+                                path.display(),
+                                KNOWN_FILE_KEYS.join(", ")
+                            ),
+                        );
+                    }
                 }
+                Some(value)
             }
-            Some(value)
-        }
-        Err(e) => {
-            // A typo'd file must not silently disable every user setting.
-            warn_once(
-                "config:invalid",
-                &format!(
-                    "ignoring invalid config {}: {e}\n     valid top-level keys: {}",
-                    path.display(),
-                    KNOWN_FILE_KEYS.join(", ")
-                ),
-            );
-            None
-        }
-    };
-    CONFIG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(CachedConfigFile {
-            path,
-            mtime,
-            len,
-            value: value.clone(),
-        });
-    value
+            Err(e) => {
+                warn_once(
+                    "config:invalid",
+                    &format!(
+                        "ignoring invalid config {}: {e}\n     valid top-level keys: {}",
+                        path.display(),
+                        KNOWN_FILE_KEYS.join(", ")
+                    ),
+                );
+                None
+            }
+        })
+    })
+    .flatten()
 }
 
 fn invalidate_config_cache() {
@@ -588,49 +611,25 @@ fn learned_apis_path() -> Option<std::path::PathBuf> {
 /// Learned wire protocols, cached process-wide and invalidated by file
 /// identity. `from_env` consulted this file on every turn (one read + parse
 /// per turn); hits are now a mutex bump.
-struct CachedLearnedApis {
-    path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
-    map: serde_json::Map<String, serde_json::Value>,
-}
+type LearnedApiMap = serde_json::Map<String, serde_json::Value>;
 
-static LEARNED_CACHE: OnceLock<Mutex<Option<CachedLearnedApis>>> = OnceLock::new();
+static LEARNED_CACHE: OnceLock<Mutex<Option<FileCache<LearnedApiMap>>>> = OnceLock::new();
 
 fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
     let Some(path) = learned_apis_path() else {
         return Default::default();
     };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return Default::default();
-    };
-    let (Ok(mtime), len) = (meta.modified(), meta.len()) else {
-        return Default::default();
-    };
-    if let Some(hit) = LEARNED_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
-    {
-        return hit.map.clone();
-    }
-    let map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    LEARNED_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(CachedLearnedApis {
-            path,
-            mtime,
-            len,
-            map: map.clone(),
-        });
-    map
+    // A missing or unparseable file is an empty map (and gets cached as
+    // one): learning simply starts over.
+    cached_parse(&LEARNED_CACHE, &path, |text| {
+        Some(
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                &text.unwrap_or_default(),
+            )
+            .unwrap_or_default(),
+        )
+    })
+    .unwrap_or_default()
 }
 
 fn learned_api(base_url: &str, model: &str) -> Option<ApiProtocol> {
@@ -942,42 +941,16 @@ fn ensure_ctx_index(catalog: &serde_json::Value) {
 /// re-parsed on every `LlmConfig::from_env` — i.e. on each TUI launch (via
 /// `/api/config`) and each chat turn (~180ms a pop). Shared through an `Arc`
 /// so cache hits are an atomic bump, not a deep clone of the whole tree.
-struct CachedCatalog {
-    path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
-    value: std::sync::Arc<serde_json::Value>,
-}
-
-static CATALOG_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
+static CATALOG_CACHE: OnceLock<Mutex<Option<FileCache<std::sync::Arc<serde_json::Value>>>>> =
+    OnceLock::new();
 
 fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
     let path = dex_catalog_cache_path()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
-    if let Some(hit) = CATALOG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
-    {
-        return Some(hit.value.clone());
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value: std::sync::Arc<serde_json::Value> =
-        std::sync::Arc::new(serde_json::from_str(&text).ok()?);
-    CATALOG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(CachedCatalog {
-            path,
-            mtime,
-            len,
-            value: value.clone(),
-        });
-    Some(value)
+    // A corrupt catalog file is not cached: the next `dex update --models`
+    // may fix it, and a stale-but-valid copy must never mask a rewrite.
+    cached_parse(&CATALOG_CACHE, &path, |text| {
+        serde_json::from_str(&text?).ok().map(std::sync::Arc::new)
+    })
 }
 
 /// models.dev catalog `limit.<key>` for `model` (`context` = window,
@@ -1110,6 +1083,28 @@ fn catalog_cost<'a>(
     None
 }
 
+/// Shared 3-tier model-cost lookup for `usage_cost` and
+/// `cache_write_read_ratio`: the entry whose `api` matches the configured
+/// endpoint wins, then any catalog entry of the configured provider, then
+/// any provider at all.
+fn resolve_model_cost<'a>(
+    catalog: &'a serde_json::Value,
+    model: &str,
+    provider_keys: &[String],
+    base_url: &str,
+) -> Option<&'a serde_json::Value> {
+    let needle = model.to_ascii_lowercase();
+    catalog_cost(catalog, &needle, |_, entry| {
+        entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
+    })
+    .or_else(|| {
+        catalog_cost(catalog, &needle, |key, _| {
+            provider_keys.iter().any(|k| k == key)
+        })
+    })
+    .or_else(|| catalog_cost(catalog, &needle, |_, _| true))
+}
+
 /// Cost for one LLM call, using models.dev pricing when available. The same
 /// model id is listed by many resellers at different prices, so the entry
 /// whose `api` matches the configured endpoint wins, then any catalog entry
@@ -1125,13 +1120,8 @@ pub(crate) fn usage_cost(
     usage: &crate::core::types::Usage,
 ) -> Option<f64> {
     let catalog = load_dex_catalog()?;
-    let needle = model.to_ascii_lowercase();
     let keys = provider.catalog_keys();
-    let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
-        entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
-    })
-    .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.iter().any(|k| k == key)))
-    .or_else(|| catalog_cost(&catalog, &needle, |_, _| true))?;
+    let cost_val = resolve_model_cost(&catalog, model, &keys, base_url)?;
     let input_rate = cost_val
         .get("input")
         .and_then(|v| v.as_f64())
@@ -1492,27 +1482,36 @@ fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml
 /// Custom headers from one config file key. Accepts a mapping,
 /// a text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as
 /// the env vars / `--header`), or a list mixing both. Later entries win.
+/// Parse a raw header string ("K: V" pairs or a JSON object) and merge it
+/// into `out` under the standard precedence rules. One funnel for every
+/// `parse_headers_str` call site.
+fn insert_parsed_headers(out: &mut BTreeMap<String, String>, raw: &str) {
+    for (k, v) in parse_headers_str(raw) {
+        insert_extra_header(out, &k, &v);
+    }
+}
+
+/// Merge one YAML header value — a mapping or a raw "K: V" text — into
+/// `out`. Other scalar shapes are ignored, as before.
+fn merge_one(out: &mut BTreeMap<String, String>, value: &serde_yaml::Value) {
+    if let Some(map) = value.as_mapping() {
+        merge_config_headers_map(out, map);
+    } else if let Some(text) = value.as_str() {
+        insert_parsed_headers(out, text);
+    }
+}
+
 fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<String, String> {
     let Some(value) = file.as_ref().and_then(|f| f.get(key)) else {
         return BTreeMap::new();
     };
     let mut out = BTreeMap::new();
-    if let Some(map) = value.as_mapping() {
-        merge_config_headers_map(&mut out, map);
-    } else if let Some(text) = value.as_str() {
-        for (k, v) in parse_headers_str(text) {
-            insert_extra_header(&mut out, &k, &v);
-        }
-    } else if let Some(items) = value.as_sequence() {
+    if let Some(items) = value.as_sequence() {
         for item in items {
-            if let Some(map) = item.as_mapping() {
-                merge_config_headers_map(&mut out, map);
-            } else if let Some(text) = item.as_str() {
-                for (k, v) in parse_headers_str(text) {
-                    insert_extra_header(&mut out, &k, &v);
-                }
-            }
+            merge_one(&mut out, item);
         }
+    } else {
+        merge_one(&mut out, value);
     }
     out
 }
@@ -1559,9 +1558,7 @@ pub(crate) fn custom_headers_from_env() -> BTreeMap<String, String> {
                     &format!("env var {key} is deprecated — use DEX_HEADERS (same syntax)"),
                 );
             }
-            for (k, v) in parse_headers_str(&raw) {
-                insert_extra_header(&mut out, &k, &v);
-            }
+            insert_parsed_headers(&mut out, &raw);
         }
     }
     out
@@ -1645,9 +1642,7 @@ impl LlmConfig {
             insert_extra_header(&mut extra_headers, &k, &v);
         }
         for raw in header_overrides {
-            for (k, v) in parse_headers_str(raw) {
-                insert_extra_header(&mut extra_headers, &k, &v);
-            }
+            insert_parsed_headers(&mut extra_headers, raw);
         }
         let provider_entries = load_provider_entries(&file);
         let known = known_providers(&provider_entries);
@@ -2037,14 +2032,9 @@ impl LlmConfig {
         let Some(catalog) = load_dex_catalog() else {
             return FALLBACK;
         };
-        let needle = self.model.to_ascii_lowercase();
         let keys = self.provider.catalog_keys();
-        let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
-            entry.get("api").and_then(|v| v.as_str()) == Some(self.base_url.as_str())
-        })
-        .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.iter().any(|k| k == key)))
-        .or_else(|| catalog_cost(&catalog, &needle, |_, _| true));
-        let Some(cost_val) = cost_val else {
+        let Some(cost_val) = resolve_model_cost(&catalog, &self.model, &keys, &self.base_url)
+        else {
             return FALLBACK;
         };
         let rate = |names: &[&str]| {
@@ -2557,9 +2547,7 @@ pub(crate) fn doctor(
             let env_headers = custom_headers_from_env();
             let mut cli_headers = BTreeMap::new();
             for raw in header_overrides {
-                for (k, v) in parse_headers_str(raw) {
-                    insert_extra_header(&mut cli_headers, &k, &v);
-                }
+                insert_parsed_headers(&mut cli_headers, raw);
             }
             for (headers, source) in [
                 (&http_headers, "config http_headers: (deprecated)"),
