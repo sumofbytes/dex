@@ -23,10 +23,10 @@ serde_yaml = "0.9"
 # connect failed behind it while they worked. socks: SOCKS proxies
 # (127.0.0.1:8081-style) that curl supports; without it dex ignores the
 # env proxy and tries direct connect.
-  reqwest = { version = "0.12", default-features = false, features = [
+  reqwest = { version = "0.13", default-features = false, features = [
       "json",
       "stream",
-      "rustls-tls-native-roots",
+      "rustls",
       "http2",
       "system-proxy",
       "socks",
@@ -67,8 +67,8 @@ ratatui-markdown = { version = "0.3.6", default-features = false, features = [
     "highlight-lang-swift",
     "highlight-lang-xml",
 ] }
-unicode-width = "0.1"
-similar = "2"
+unicode-width = "0.2"
+similar = "3"
 
 # Client-server architecture
 axum = "0.8"
@@ -78,8 +78,8 @@ uuid = { version = "1", features = ["v4"] }
 terminal-colorsaurus = "1.0.3"
 fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
 # MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
-base64 = "0.22"
-sha2 = "0.10"
+base64 = "0.23"
+sha2 = "0.11"
 
 [dev-dependencies]
 http = "1"
