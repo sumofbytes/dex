@@ -426,7 +426,16 @@ pub(crate) fn project(
                 // outputs from colliding into one id and tells the model
                 // which tool a placeholder came from.
                 let tool_name = message.name.as_deref().unwrap_or("tool");
-                if let Some(observation) = create_observation(tool_name, message.content_str()) {
+                // `obs_recall` output is the read-back of bytes that already
+                // live in the archive. Packing it would archive the archive
+                // and drop the model's active working set every two requests,
+                // forcing a recall-of-recall round trip; exempt it.
+                let observation = if tool_name == OBS_RECALL_NAME {
+                    None
+                } else {
+                    create_observation(tool_name, message.content_str())
+                };
+                if let Some(observation) = observation {
                     // Already-verified ids skip the storage check entirely:
                     // the object was written (or verified byte-for-byte)
                     // earlier this run, and content addressing means it
@@ -503,6 +512,10 @@ pub(crate) fn project(
     }
     projected
 }
+
+/// Name of the observation-archive read-back tool. Its output is a view of
+/// bytes that already live in the archive and must never be re-packed.
+pub(crate) const OBS_RECALL_NAME: &str = "obs_recall";
 
 /// Execute the `obs_recall` tool against the session's observation archive.
 pub(crate) fn tool_obs_recall(
@@ -789,6 +802,46 @@ mod tests {
         let projected = project(&state2, None, &request);
         let tool_msg = projected.iter().find(|m| m.role == Role::Tool).unwrap();
         assert_eq!(tool_msg.content_str(), big);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_results_are_exempt_from_packing() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = temp_session_dir("recall-exempt");
+        let session = dir.join("s.jsonl");
+        let mut chunk = String::new();
+        while chunk.len() <= THRESHOLD_BYTES {
+            chunk.push_str("recalled page line\n");
+        }
+
+        let mut named = ChatMessage::tool_result("call1", chunk.clone());
+        named.name = Some("obs_recall".into());
+        let mut request = vec![ChatMessage::system("sys"), ChatMessage::user("go"), named];
+        request.push(ChatMessage::assistant("ack1"));
+        request.push(ChatMessage::assistant("ack2"));
+        request.push(ChatMessage::assistant("ack3"));
+
+        let state = ProjectionState::new();
+        let projected = project(&state, Some(&session), &request);
+        let recalled = projected.iter().find(|m| m.role == Role::Tool).unwrap();
+        assert_eq!(
+            recalled.content_str(),
+            chunk,
+            "obs_recall output is never replaced by a placeholder"
+        );
+
+        // A large result without a tool name still packs (resumed sessions).
+        request[2] = ChatMessage::tool_result("call2", chunk.clone());
+        let state = ProjectionState::new();
+        let projected = project(&state, Some(&session), &request);
+        let packed = projected.iter().find(|m| m.role == Role::Tool).unwrap();
+        assert!(
+            packed.content_str().contains("obs_recall"),
+            "unnamed large results still pack"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
