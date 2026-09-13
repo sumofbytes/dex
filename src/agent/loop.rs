@@ -2156,7 +2156,7 @@ mod tests {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("child seed: explore only")];
         let mut state = ToolState::default();
-        let filter = ToolFilter::new("explorer", ["read", "ffgrep", "fffind"]);
+        let filter = ToolFilter::new("explorer", ["read", "grep", "find"]);
         let result = process_turn(AgentRuntime {
             config: &config,
             messages: &mut messages,
