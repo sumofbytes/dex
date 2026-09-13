@@ -142,6 +142,15 @@ fn handle_event_with(
         StreamEvent::AgentCompleted { agent_id, status } => {
             eprintln!("[agent …:{agent_id}] {status}");
         }
+        StreamEvent::AgentRecovered {
+            agent_id,
+            attempt,
+            mode,
+            reason,
+            ..
+        } => {
+            eprintln!("[agent …:{agent_id}] recovered (attempt {attempt}, {mode} after {reason})");
+        }
     }
     None
 }
@@ -374,6 +383,13 @@ mod tests {
             StreamEvent::AgentCompleted {
                 agent_id: "a-0".into(),
                 status: "complete".into(),
+            },
+            StreamEvent::AgentRecovered {
+                agent_id: "a-1".into(),
+                name: "explorer".into(),
+                attempt: 2,
+                mode: "resume".into(),
+                reason: "timed out".into(),
             },
         ];
         for event in events {

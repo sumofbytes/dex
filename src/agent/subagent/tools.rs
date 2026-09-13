@@ -34,9 +34,9 @@ use crate::tools::{Policy, ToolError, ToolFilter};
 
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
-use super::exit::{classify_body_error, ExitReason, ResumeHandle};
+use super::exit::{classify_body_error, ExitReason, ResumeHandle, ResumeRequest};
 use super::instance::{AgentId, AgentState};
-use super::manager::{AgentManager, ProgressReporter, WaitOutcome};
+use super::manager::{AgentManager, ChildFactory, ProgressReporter, WaitOutcome};
 use super::result::{AgentResult, AgentUsage};
 use super::SpawnMeta;
 
@@ -221,6 +221,13 @@ async fn delegate(
                     generation,
                     parent_session: Some(ctx.session_path.clone()),
                     parent_id: Some(handle.agent_id.clone()),
+                    // No auto-retry on a hand-steered generation: the
+                    // model just took ownership of recovery, so a
+                    // further death escalates back to it instead of
+                    // retrying behind its back. Factory-born lineages
+                    // keep recovering per spec below.
+                    retry: None,
+                    lineage: handle.history.clone(),
                 },
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
             )
@@ -248,6 +255,12 @@ async fn delegate(
                 generation: 0,
                 parent_session: Some(ctx.session_path.clone()),
                 parent_id: None,
+                // Auto-recovery factory: the definition's
+                // `supervision.recover` decides whether the manager
+                // ever calls it past generation 0 (`Never` escalates
+                // immediately — today's behavior).
+                retry: Some(child_factory(ctx.clone(), def.clone(), seed.clone())),
+                lineage: Vec::new(),
             },
             child_body(ctx.clone(), def.clone(), seed, None),
         )
@@ -430,8 +443,10 @@ async fn resolve_resume_handle(
             transcript: path,
             generation,
             // Spend died with the daemon: the resume runs the full cap.
+            // No lineage survives either — the daemon took it.
             remaining_budget: None,
             note: "interrupted (daemon restart or crash); prior spend unknown".to_string(),
+            history: Vec::new(),
         });
     }
     Err(ToolError::InvalidArgument(format!(
@@ -578,15 +593,26 @@ pub(crate) type ChildBody = Box<
         + Send,
 >;
 
-/// A manual resume (§24.3): replay `handle.transcript`, append the
-/// interruption nudge (+ `instruction`, + `file_hints`), run under
-/// `handle.remaining_budget`. Resume is spawn-with-history, not a new
-/// operation — the same body, one new `Option`.
-#[derive(Clone, Debug)]
-pub(crate) struct ResumeRequest {
-    pub(crate) handle: ResumeHandle,
-    pub(crate) instruction: Option<String>,
-    pub(crate) file_hints: Vec<PathBuf>,
+/// A re-entry factory (§24.3): the same body builder the manager calls
+/// per attempt, with the attempt's resume. `delegate` passes one always;
+/// the definition's `supervision.recover` decides whether the manager
+/// ever calls it past generation 0.
+pub(crate) fn child_factory(
+    ctx: Arc<AgentTurnContext>,
+    def: AgentDefinition,
+    seed: ContextSeed,
+) -> ChildFactory {
+    Arc::new(move |token, progress, id, resume| {
+        Box::pin(child_run(
+            ctx.clone(),
+            def.clone(),
+            seed.clone(),
+            token,
+            progress,
+            id,
+            resume,
+        )) as Pin<Box<dyn Future<Output = AgentResult> + Send>>
+    })
 }
 
 pub(crate) fn child_body(
@@ -1026,6 +1052,7 @@ mod tests {
                 remaining_budget: Some(5),
                 note: "turn budget exhausted after 50 tool calls; continue from the transcript"
                     .to_string(),
+                history: Vec::new(),
             },
             instruction: Some("skip the build".to_string()),
             file_hints: vec![PathBuf::from("src/main.rs")],
@@ -1103,6 +1130,7 @@ mod tests {
                                 remaining_budget: Some(46),
                                 note: "timed out after 4 tool calls; continue from the transcript"
                                     .to_string(),
+                                history: Vec::new(),
                             }),
                         }
                     }

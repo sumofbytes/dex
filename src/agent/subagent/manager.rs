@@ -25,8 +25,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
@@ -37,7 +38,8 @@ use crate::session::Session;
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
 use super::exit::{
-    on_exit, resume_note, transcript_holds_progress, ExhaustKind, ExitReason, OnExit, ResumeHandle,
+    decide, exit_reason_word, recover_mode_word, resume_note, transcript_holds_progress, Action,
+    ExhaustKind, ExitReason, RecoverMode, ResumeHandle, ResumeRequest, SupervisionSpec,
 };
 use super::instance::{AgentId, AgentInstance, AgentState};
 use super::result::{AgentResult, AgentUsage};
@@ -72,6 +74,10 @@ pub(crate) struct AgentNotice {
     /// `[agent …] finished …` prefix the TUI matches on (§24.1:
     /// resumability is notice prose only, zero wire change).
     pub(crate) resumable: bool,
+    /// Recovery lineage for escalation notices (§24.4): oldest-first
+    /// mode words ("resumed after timed out"). Empty for first attempts
+    /// — no suffix then.
+    pub(crate) history: Vec<String>,
 }
 
 impl AgentNotice {
@@ -102,6 +108,13 @@ impl AgentNotice {
                 self.agent_id
             ));
         }
+        if !self.history.is_empty() {
+            text.push_str(&format!(
+                " · after {} recoveries: {}",
+                self.history.len(),
+                self.history.join("; ")
+            ));
+        }
         text
     }
 }
@@ -117,11 +130,13 @@ pub(crate) struct ChildInfo {
     pub(crate) transcript: Option<PathBuf>,
 }
 
-/// Bounded-wait outcome for [`AgentManager::wait`].
+/// Bounded-wait outcome for [`AgentManager::wait`]. The result is boxed:
+/// it is by far the largest variant and would trip
+/// `clippy::large_enum_variant` against the byte-sized `Running`.
 #[derive(Debug, PartialEq)]
 pub(crate) enum WaitOutcome {
     /// Terminal result; also retained for later fetch after notice drain.
-    Finished(AgentResult),
+    Finished(Box<AgentResult>),
     /// Still live when `timeout` elapsed; carries the last-seen state.
     Running(AgentState),
     /// Unknown id: never spawned here, or its result aged out of retention.
@@ -236,6 +251,17 @@ pub(crate) enum AgentEvent {
         current_tool: Option<String>,
     },
     Completed(AgentNotice),
+    /// Phase 12 automatic recovery (§24.4): the supervisor re-entered a
+    /// recoverable child as `agent_id` (attempt number, 1-based). Fires
+    /// beside the superseded generation's `Completed` and the new one's
+    /// `Spawned` — never instead of them.
+    Recovered {
+        agent_id: AgentId,
+        name: String,
+        attempt: u32,
+        mode: RecoverMode,
+        reason: ExitReason,
+    },
 }
 
 /// The daemon-supplied lifecycle hook: typed events (§15 V1b) journaled and
@@ -265,6 +291,10 @@ struct Inner {
     notices: VecDeque<AgentNotice>,
     /// Completions dropped because `notices` was full.
     overflowed: usize,
+    /// Recovery-action timestamps for the intensity ledger (§24.5):
+    /// supervisor-scoped (all children share it), pruned by each
+    /// definition's window at decision time.
+    recoveries: VecDeque<Instant>,
 }
 
 struct RunningChild {
@@ -277,19 +307,56 @@ struct RunningChild {
     transcript: Option<PathBuf>,
     /// The generation this child runs as (0 = fresh). Resume spawns +1.
     generation: u32,
+    /// The parent session file, to derive the next generation's
+    /// transcript without the original spawn context (§24.3).
+    parent_session: Option<PathBuf>,
+    /// Phase 12 re-entry factory. `None` (tests, manual-only callers)
+    /// escalates immediately — today's behavior.
+    retry: Option<ChildFactory>,
+    /// Automatic-recovery lineage, oldest first (§24.4 escalation
+    /// record). Extended per recovery, read at escalation.
+    lineage: Vec<String>,
 }
 
-/// What `spawn` needs beyond definition + seed (§24.3): which generation
-/// this child is, and the parent session file its transcript derives
-/// from. Fresh spawns use `SpawnMeta::fresh()` (generation 0, no
-/// transcript tracking — unit tests never touch the filesystem).
-#[derive(Clone, Debug)]
+/// Builds one attempt's body (§24.3: re-entry is spawn). The factory —
+/// not the manager — owns parent-turn context; the manager owns when.
+/// `resume` is `None` for fresh attempts (generation 0 and `Fresh`
+/// recoveries).
+pub(crate) type ChildFactory = Arc<
+    dyn Fn(
+            CancellationToken,
+            ProgressReporter,
+            AgentId,
+            Option<ResumeRequest>,
+        ) -> Pin<Box<dyn Future<Output = AgentResult> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// One attempt's built future.
+type BodyFuture = Pin<Box<dyn Future<Output = AgentResult> + Send>>;
+
+/// Attempt-0 bodies (FnOnce) and recovery bodies (factory-built) funnel
+/// through the shared launch path in this shape.
+type BoxRun = Box<dyn FnOnce(CancellationToken, ProgressReporter, AgentId) -> BodyFuture + Send>;
+
+/// What `spawn` needs beyond definition + seed (§24.3 + §24.5): which
+/// generation this child is, where its transcript derives from, who it
+/// was resumed from, how it may re-enter, and the lineage so far.
+/// Fresh spawns use `SpawnMeta::fresh()`. `Clone`-only: the retry
+/// factory is a `dyn Fn` and deliberately opaque to `Debug`.
+#[derive(Clone)]
 pub(crate) struct SpawnMeta {
     pub(crate) generation: u32,
     pub(crate) parent_session: Option<PathBuf>,
     /// The original child id for resume generations (§24.3 lineage).
     /// `None` for fresh spawns.
     pub(crate) parent_id: Option<AgentId>,
+    /// Phase 12 re-entry factory. `None` escalates immediately.
+    pub(crate) retry: Option<ChildFactory>,
+    /// Recovery lineage inherited by the next generation (§24.4).
+    /// Empty for fresh spawns.
+    pub(crate) lineage: Vec<String>,
 }
 
 impl SpawnMeta {
@@ -298,6 +365,8 @@ impl SpawnMeta {
             generation: 0,
             parent_session: None,
             parent_id: None,
+            retry: None,
+            lineage: Vec::new(),
         }
     }
 }
@@ -316,6 +385,7 @@ impl AgentManager {
                 result_order: VecDeque::new(),
                 notices: VecDeque::new(),
                 overflowed: 0,
+                recoveries: VecDeque::new(),
             })),
         }
     }
@@ -378,6 +448,25 @@ impl AgentManager {
         F: FnOnce(CancellationToken, ProgressReporter, AgentId) -> Fut + Send + 'static,
         Fut: Future<Output = AgentResult> + Send + 'static,
     {
+        let run: BoxRun = Box::new(move |token, progress, id| {
+            let future: BodyFuture = Box::pin(run(token, progress, id));
+            future
+        });
+        self.launch(def, seed, meta, run)
+    }
+
+    /// Shared launch path (§24.3: re-entry is spawn): cap check, id
+    /// allocation, transcript derivation, registry insert, the
+    /// cancel/timeout wrapper, handle recording, and the `Spawned` hook.
+    /// Attempt 0 arrives via `run`, recoveries via the retry factory —
+    /// both funnel here, so there is exactly one spawn implementation.
+    fn launch(
+        &self,
+        def: &AgentDefinition,
+        seed: ContextSeed,
+        meta: SpawnMeta,
+        run: BoxRun,
+    ) -> Result<AgentId, SpawnError> {
         let (id, token, timeout) = {
             let mut inner = self.lock();
             if inner.closed {
@@ -420,6 +509,9 @@ impl AgentManager {
                     handle: None,
                     transcript,
                     generation: meta.generation,
+                    parent_session: meta.parent_session.clone(),
+                    retry: meta.retry.clone(),
+                    lineage: meta.lineage.clone(),
                 },
             );
             (id, token, def.timeout)
@@ -504,72 +596,313 @@ impl AgentManager {
     /// hook, and registry removal. Single choke point: completion, failure,
     /// cancel, timeout, and panic all land here, so no terminal path can
     /// orphan an entry or skip its lifecycle line.
+    ///
+    /// The outcome comes from [`decide`]: `Settle` retains + notifies as
+    /// today; `Escalate` additionally advertises the resume handle with
+    /// the recovery history; `Recover` retains silently — no parent
+    /// notice; the terminal notice fires only on policy exhaustion
+    /// (§24.4) — and re-enters the child as generation + 1 after this
+    /// returns. Recovery launches outside the lock (`launch` locks
+    /// internally); a cap race there falls back to escalation so the
+    /// child is never lost silently.
     fn finish(&self, id: &AgentId, name: &str, mut result: AgentResult) {
-        let mut inner = self.lock();
-        if inner.results.len() >= MAX_RESULTS {
-            if let Some(oldest) = inner.result_order.pop_front() {
-                inner.results.remove(&oldest);
-                inner.names.remove(&oldest);
-            }
+        // Everything a recovery needs, cloned out before the entry is
+        // removed: definition, seed, spawn coordinates, lineage, factory.
+        struct ReEntry {
+            def: AgentDefinition,
+            seed: ContextSeed,
+            meta: SpawnMeta,
+            factory: ChildFactory,
+            resume: Option<ResumeRequest>,
+            name: String,
+            attempt: u32,
+            mode: RecoverMode,
+            reason: ExitReason,
+            fallback: Fallback,
         }
-        // §24.1 + §24.4: the single decision point. Bodies arrive
-        // pre-classified (`result.reason`); wrapper-synthesized endings
-        // were classified at their arm. Nothing here reads prose.
-        // `remaining_budget` needs the definition's cap, which rides in
-        // the registry entry: a timeout keeps the full meter (spend
-        // unknown), a budget exhaustion keeps the honest remainder.
-        let record = inner.running.get(id).map(|child| {
-            (
-                child.generation,
-                child.transcript.clone(),
-                child.instance.definition.max_tool_iterations,
-            )
-        });
-        let progress_made = result.tool_calls > 0
-            || !result.summary.trim().is_empty()
-            || record
+        // Recomputed escalation inputs, in case the relaunch loses a cap
+        // race after the entry is gone.
+        struct Fallback {
+            transcript: Option<PathBuf>,
+            generation: u32,
+            budget: Option<u32>,
+            lineage: Vec<String>,
+            reason: ExitReason,
+            tool_calls: u32,
+        }
+        let mut reenter: Option<ReEntry> = None;
+        let mut hooks: Vec<AgentEvent> = Vec::new();
+        // Copy out before `result` moves into retention below.
+        let reason = result.reason;
+        let tool_calls = result.tool_calls;
+        {
+            let mut inner = self.lock();
+            if inner.results.len() >= MAX_RESULTS {
+                if let Some(oldest) = inner.result_order.pop_front() {
+                    inner.results.remove(&oldest);
+                    inner.names.remove(&oldest);
+                }
+            }
+            // §24.1: bodies arrive pre-classified (`result.reason`);
+            // wrapper-synthesized endings were classified at their arm.
+            // Nothing here reads prose. `remaining_budget` needs the
+            // definition's cap, which rides in the registry entry: a
+            // timeout keeps the full meter (spend unknown), a budget
+            // exhaustion keeps the honest remainder.
+            // Named snapshot of the registry entry. `None` only for an
+            // id that was never registered (defensive — wrappers always
+            // register first); then the result settles handle-free.
+            struct Record {
+                generation: u32,
+                transcript: Option<PathBuf>,
+                budget: Option<u32>,
+                spec: SupervisionSpec,
+                lineage: Vec<String>,
+                parent_session: Option<PathBuf>,
+                retry: Option<ChildFactory>,
+                seed: ContextSeed,
+                def: AgentDefinition,
+            }
+            let record: Option<Record> = inner.running.get(id).map(|child| Record {
+                generation: child.generation,
+                transcript: child.transcript.clone(),
+                budget: child.instance.definition.max_tool_iterations,
+                spec: child.instance.definition.supervision,
+                lineage: child.lineage.clone(),
+                parent_session: child.parent_session.clone(),
+                retry: child.retry.clone(),
+                seed: child.instance.context.clone(),
+                def: child.instance.definition.clone(),
+            });
+            let progress_made = result.tool_calls > 0
+                || !result.summary.trim().is_empty()
+                || record
+                    .as_ref()
+                    .and_then(|record| record.transcript.as_deref())
+                    .is_some_and(transcript_holds_progress);
+            let spec = record
                 .as_ref()
-                .and_then(|(_, transcript, _)| transcript.as_deref())
-                .is_some_and(transcript_holds_progress);
-        if on_exit(result.reason, progress_made) == OnExit::EscalateWithResume {
-            if let Some((generation, Some(transcript), budget)) = record {
-                let remaining =
-                    budget.map(|cap| (cap as usize).saturating_sub(result.tool_calls as usize));
-                result.resume = Some(ResumeHandle {
+                .map(|record| record.spec)
+                .unwrap_or_default();
+            // Intensity ledger (§24.5): supervisor-scoped, pruned by the
+            // definition's window at decision time.
+            let now = Instant::now();
+            while inner
+                .recoveries
+                .front()
+                .is_some_and(|first| now.duration_since(*first) > spec.window)
+            {
+                inner.recoveries.pop_front();
+            }
+            let mut action = decide(&spec, result.reason, inner.recoveries.len(), progress_made);
+            // Without a factory there is nothing to re-enter with:
+            // escalate exactly as the manual-only path would.
+            let retry = record.as_ref().and_then(|record| record.retry.clone());
+            if matches!(action, Action::Recover { .. }) && retry.is_none() {
+                action = Action::Escalate;
+            }
+            // Retain + queue + hook inputs, shared by the settle paths.
+            // Recovery retains silently and queues nothing.
+            let retain = |inner: &mut Inner,
+                          id: &AgentId,
+                          name: &str,
+                          result: AgentResult,
+                          history: Vec<String>|
+             -> AgentNotice {
+                let status = result.status;
+                let resumable = result.resume.is_some();
+                inner.result_order.push_back(id.clone());
+                inner.names.insert(id.clone(), name.to_string());
+                inner.results.insert(id.clone(), result);
+                AgentNotice {
                     agent_id: id.clone(),
-                    transcript,
-                    generation,
-                    remaining_budget: remaining,
-                    note: resume_note(result.reason, result.tool_calls),
-                });
+                    name: name.to_string(),
+                    status,
+                    // Copied from the retained result, so the notice can
+                    // never disagree with the record the parent later
+                    // fetches.
+                    usage: inner.results.get(id).and_then(|result| result.usage),
+                    resumable,
+                    history,
+                }
+            };
+            let queue = |inner: &mut Inner, notice: AgentNotice| {
+                if inner.notices.len() >= MAX_NOTICES {
+                    inner.overflowed += 1;
+                } else {
+                    inner.notices.push_back(notice);
+                }
+            };
+            match action {
+                Action::Settle | Action::Escalate => {
+                    let lineage = record
+                        .as_ref()
+                        .map(|record| record.lineage.clone())
+                        .unwrap_or_default();
+                    if action == Action::Escalate {
+                        // Transcript-gated, as in Phase 11: only a child
+                        // whose file is known can advertise a handle.
+                        let escalate = record.as_ref().and_then(|record| {
+                            record.transcript.clone().map(|transcript| {
+                                let remaining = record
+                                    .budget
+                                    .map(|cap| (cap as usize).saturating_sub(tool_calls as usize));
+                                (record.generation, transcript, remaining)
+                            })
+                        });
+                        if let Some((generation, transcript, remaining)) = escalate {
+                            result.resume = Some(ResumeHandle {
+                                agent_id: id.clone(),
+                                transcript,
+                                generation,
+                                remaining_budget: remaining,
+                                note: resume_note(reason, tool_calls),
+                                history: lineage.clone(),
+                            });
+                        }
+                    }
+                    let notice = retain(&mut inner, id, name, result, lineage);
+                    queue(&mut inner, notice.clone());
+                    inner.running.remove(id);
+                    hooks.push(AgentEvent::Completed(notice));
+                }
+                Action::Recover { mode } => {
+                    let record = record.expect("recoveries only fire for registered children");
+                    let factory = retry.expect("recoveries only fire with a factory");
+                    inner.recoveries.push_back(now);
+                    let line = format!(
+                        "{} after {}",
+                        recover_mode_word(mode),
+                        exit_reason_word(reason)
+                    );
+                    let mut next_lineage = record.lineage.clone();
+                    next_lineage.push(line);
+                    // Retain silently: no handle (the lineage continues in
+                    // the next generation), no queue entry. The hook still
+                    // gets a `Completed` so the journal keeps the lineage
+                    // line and the TUI drops the superseded chip.
+                    let notice = retain(&mut inner, id, name, result, Vec::new());
+                    inner.running.remove(id);
+                    hooks.push(AgentEvent::Completed(notice));
+                    let next_generation = record.generation + 1;
+                    let resume = match mode {
+                        // `Never` never reaches recovery (`decide` only
+                        // returns `Fresh`/`Resume`); treat it as fresh if
+                        // it ever does.
+                        RecoverMode::Fresh | RecoverMode::Never => None,
+                        RecoverMode::Resume => record.transcript.clone().map(|transcript| {
+                            let remaining = record
+                                .budget
+                                .map(|cap| (cap as usize).saturating_sub(tool_calls as usize));
+                            ResumeRequest {
+                                handle: ResumeHandle {
+                                    agent_id: id.clone(),
+                                    transcript,
+                                    generation: record.generation,
+                                    remaining_budget: remaining,
+                                    note: resume_note(reason, tool_calls),
+                                    history: next_lineage.clone(),
+                                },
+                                instruction: None,
+                                file_hints: record.seed.file_hints.clone(),
+                            }
+                        }),
+                    };
+                    // `Resume` without a transcript degrades to fresh: the
+                    // body falls back to a fresh transcript anyway.
+                    reenter = Some(ReEntry {
+                        meta: SpawnMeta {
+                            generation: next_generation,
+                            parent_session: record.parent_session.clone(),
+                            parent_id: Some(id.clone()),
+                            retry: Some(factory.clone()),
+                            lineage: next_lineage.clone(),
+                        },
+                        factory,
+                        resume,
+                        def: record.def.clone(),
+                        seed: record.seed.clone(),
+                        name: name.to_string(),
+                        attempt: next_generation + 1,
+                        mode,
+                        reason,
+                        fallback: Fallback {
+                            transcript: record.transcript.clone(),
+                            generation: record.generation,
+                            budget: record.budget,
+                            lineage: next_lineage,
+                            reason,
+                            tool_calls,
+                        },
+                    });
+                }
             }
         }
-        let status = result.status;
-        let resumable = result.resume.is_some();
-        inner.result_order.push_back(id.clone());
-        inner.names.insert(id.clone(), name.to_string());
-        inner.results.insert(id.clone(), result);
-        let notice = AgentNotice {
-            agent_id: id.clone(),
-            name: name.to_string(),
-            status,
-            // Copied from the retained result, so the notice can never
-            // disagree with the record the parent later fetches.
-            usage: inner.results.get(id).and_then(|result| result.usage),
-            resumable,
-        };
-        if inner.notices.len() >= MAX_NOTICES {
-            inner.overflowed += 1;
-        } else {
-            inner.notices.push_back(notice.clone());
+        if let Some(reenter) = reenter {
+            let build: BoxRun = Box::new(move |token, progress, new_id| {
+                (reenter.factory)(token, progress, new_id, reenter.resume)
+            });
+            match self.launch(&reenter.def, reenter.seed, reenter.meta, build) {
+                Ok(new_id) => hooks.push(AgentEvent::Recovered {
+                    agent_id: new_id,
+                    name: reenter.name,
+                    attempt: reenter.attempt,
+                    mode: reenter.mode,
+                    reason: reenter.reason,
+                }),
+                Err(_) => {
+                    // Cap race (or shutdown) between removal and relaunch:
+                    // escalate the retained result instead of losing the
+                    // child silently.
+                    let fallback = reenter.fallback;
+                    let mut inner = self.lock();
+                    if let Some(result) = inner.results.get_mut(id) {
+                        if let Some(transcript) = fallback.transcript {
+                            let remaining = fallback.budget.map(|cap| {
+                                (cap as usize).saturating_sub(fallback.tool_calls as usize)
+                            });
+                            result.resume = Some(ResumeHandle {
+                                agent_id: id.clone(),
+                                transcript,
+                                generation: fallback.generation,
+                                remaining_budget: remaining,
+                                note: resume_note(fallback.reason, fallback.tool_calls),
+                                history: fallback.lineage.clone(),
+                            });
+                        }
+                    }
+                    let notice = AgentNotice {
+                        agent_id: id.clone(),
+                        name: reenter.name,
+                        status: inner
+                            .results
+                            .get(id)
+                            .map(|result| result.status)
+                            .unwrap_or(AgentState::Failed),
+                        usage: inner.results.get(id).and_then(|result| result.usage),
+                        resumable: inner
+                            .results
+                            .get(id)
+                            .and_then(|result| result.resume.as_ref())
+                            .is_some(),
+                        history: fallback.lineage,
+                    };
+                    if inner.notices.len() >= MAX_NOTICES {
+                        inner.overflowed += 1;
+                    } else {
+                        inner.notices.push_back(notice.clone());
+                    }
+                    hooks.push(AgentEvent::Completed(notice));
+                }
+            }
         }
-        inner.running.remove(id);
         // Outside the lock: the hook journals through the daemon's own seq
         // mutex, and its file IO must never block registry access.
-        let hook = inner.events.clone();
-        drop(inner);
+        let hook = self.lock().events.clone();
         if let Some(hook) = hook {
-            hook(AgentEvent::Completed(notice));
+            for event in hooks {
+                hook(event);
+            }
         }
     }
 
@@ -582,7 +915,7 @@ impl AgentManager {
             {
                 let inner = self.lock();
                 if let Some(result) = inner.results.get(id) {
-                    return WaitOutcome::Finished(result.clone());
+                    return WaitOutcome::Finished(Box::new(result.clone()));
                 }
                 match inner.running.get(id) {
                     Some(child) => {
@@ -741,6 +1074,7 @@ mod tests {
             permissions: PermissionInherit::Inherit,
             max_tool_iterations: None,
             timeout: Duration::from_secs(60),
+            supervision: SupervisionSpec::default(),
         }
     }
 
@@ -813,6 +1147,11 @@ mod tests {
                         notice.agent_id,
                         super::super::status_word(notice.status)
                     )
+                }
+                AgentEvent::Recovered {
+                    agent_id, attempt, ..
+                } => {
+                    format!("recovered {agent_id} attempt {attempt}")
                 }
             };
             capture.lock().unwrap_or_else(|e| e.into_inner()).push(text);
@@ -919,6 +1258,7 @@ mod tests {
                 status: AgentState::Completed,
                 usage: None,
                 resumable: false,
+                history: Vec::new(),
             }]
         );
         assert_eq!(mgr.take_overflow(), 0);
@@ -1355,6 +1695,7 @@ mod tests {
                 cost_usd: 0.0312,
             }),
             resumable: false,
+            history: Vec::new(),
         };
         assert_eq!(
             notice.text(),
@@ -1371,6 +1712,7 @@ mod tests {
                 cost_usd: 0.0,
             }),
             resumable: false,
+            history: Vec::new(),
         };
         assert_eq!(
             unpriced.text(),
@@ -1383,6 +1725,7 @@ mod tests {
             status: AgentState::Completed,
             usage: None,
             resumable: false,
+            history: Vec::new(),
         };
         assert_eq!(bare.text(), "[agent explorer:sess-3] finished completed");
         // A resumable result advertises the re-entry — same prefix the TUI
@@ -1393,10 +1736,11 @@ mod tests {
             status: AgentState::TimedOut,
             usage: None,
             resumable: true,
+            history: vec!["resumed after timed out".to_string()],
         };
         assert_eq!(
             resumable.text(),
-            "[agent explorer:sess-3] finished timed out · resumable with delegate(resume_from = \"sess-3\")"
+            "[agent explorer:sess-3] finished timed out · resumable with delegate(resume_from = \"sess-3\") · after 1 recoveries: resumed after timed out"
         );
     }
 
@@ -1424,6 +1768,8 @@ mod tests {
                     generation: 0,
                     parent_session: Some(dir.join("sess.jsonl")),
                     parent_id: None,
+                    retry: None,
+                    lineage: Vec::new(),
                 },
                 |_, _, _| async { panic!("boom") },
             )
@@ -1495,6 +1841,8 @@ mod tests {
                     generation: 1,
                     parent_session: None,
                     parent_id: Some(first.clone()),
+                    retry: None,
+                    lineage: Vec::new(),
                 },
                 token_body,
             )
@@ -1548,6 +1896,275 @@ mod tests {
         assert_eq!(done_row.state, AgentState::Completed);
         assert_eq!(done_row.name, "tester");
         assert!(!done_row.resumable);
+        mgr.shutdown().await;
+    }
+
+    /// A body result with a definition's supervision fields set.
+    fn recover_def(mode: RecoverMode) -> AgentDefinition {
+        let mut def = test_def("tester");
+        def.supervision = SupervisionSpec {
+            recover: mode,
+            max: 2,
+            window: Duration::from_secs(60),
+        };
+        def
+    }
+
+    fn retry_meta(factory: ChildFactory) -> SpawnMeta {
+        SpawnMeta {
+            generation: 0,
+            parent_session: Some(PathBuf::from("/tmp/dex-p12")),
+            parent_id: None,
+            retry: Some(factory),
+            lineage: Vec::new(),
+        }
+    }
+
+    /// A terminal body result classified `Exhausted(Timeout)` with spend —
+    /// the shape a timed-out-then-synthesized child would carry, without
+    /// waiting out a real timeout.
+    fn exhausted_body() -> AgentResult {
+        AgentResult {
+            status: AgentState::TimedOut,
+            summary: "partial".to_string(),
+            error: Some("timed out".to_string()),
+            usage: None,
+            reason: ExitReason::Exhausted(ExhaustKind::Timeout),
+            tool_calls: 3,
+            resume: None,
+        }
+    }
+
+    /// Second-spawn ids observed through the event hook (Recovered carries
+    /// the new id; Spawned does too — either wakes the waiter).
+    async fn wait_for_generation(seen: &Arc<Mutex<Vec<AgentId>>>, skip: &AgentId) -> AgentId {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(id) = seen.lock().unwrap().iter().find(|id| *id != skip).cloned() {
+                return id;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("recovery generation never spawned");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_mode_reenters_transient_deaths_with_history() {
+        // §24.4 + §24.8: `recover: resume` re-enters after an
+        // Exhausted death within intensity. The superseded generation
+        // retains silently (no handle, no notice); the factory receives
+        // the replay request; the hook fires Recovered; the escalation
+        // record travels in the lineage.
+        let spawns: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
+        let recovered: Arc<Mutex<Vec<(AgentId, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_resume: Arc<Mutex<Vec<Option<ResumeRequest>>>> = Arc::new(Mutex::new(Vec::new()));
+        let hook_spawns = spawns.clone();
+        let hook_recovered = recovered.clone();
+        let mgr = AgentManager::new("sess").with_events(Arc::new(move |event| match event {
+            AgentEvent::Spawned { agent_id, .. } => {
+                hook_spawns.lock().unwrap().push(agent_id);
+            }
+            AgentEvent::Recovered {
+                agent_id, attempt, ..
+            } => {
+                hook_recovered.lock().unwrap().push((agent_id, attempt));
+            }
+            AgentEvent::Progress { .. } | AgentEvent::Completed(_) => {}
+        }));
+        let factory_seen = seen_resume.clone();
+        // The recovery body parks on this gate so the lineage assertion
+        // below observes it while still Running (an instantly-ready body
+        // would already be terminal — `parent_of` reads live children).
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let factory_gate = gate.clone();
+        let factory: ChildFactory = Arc::new(move |_, _, _, resume| {
+            factory_seen.lock().unwrap().push(resume.clone());
+            let gate = factory_gate.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                AgentResult {
+                    status: AgentState::Completed,
+                    summary: "recovered work".to_string(),
+                    error: None,
+                    usage: None,
+                    reason: ExitReason::Normal,
+                    tool_calls: 1,
+                    resume: None,
+                }
+            }) as Pin<Box<dyn Future<Output = AgentResult> + Send>>
+        });
+        let first = mgr
+            .spawn(
+                &recover_def(RecoverMode::Resume),
+                test_seed(),
+                retry_meta(factory),
+                |_, _, _| async { exhausted_body() },
+            )
+            .unwrap();
+        // The superseded generation settles silently: retained, but with
+        // no handle and no notice of its own.
+        match mgr.wait(&first, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert!(result.resume.is_none());
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let second = wait_for_generation(&spawns, &first).await;
+        // Lineage while the generation is still live (parked on the gate).
+        assert_eq!(mgr.parent_of(&second), Some(first.clone()));
+        // Release the parked body and let it complete.
+        gate.notify_one();
+        match mgr.wait(&second, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Completed);
+                assert!(result.resume.is_none());
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // The factory ran once, with a replay request: derived
+        // transcript, full meter (test defs are uncapped), and the
+        // lineage line describing this recovery.
+        let (count, transcript_ok, generation, history) = {
+            let calls = seen_resume.lock().unwrap();
+            (
+                calls.len(),
+                calls[0].as_ref().is_some_and(|request| {
+                    request
+                        .handle
+                        .transcript
+                        .ends_with("agents/sess-0-tester.jsonl")
+                }),
+                calls[0].as_ref().map(|request| request.handle.generation),
+                calls[0]
+                    .as_ref()
+                    .map(|request| request.handle.history.clone()),
+            )
+        };
+        assert_eq!(count, 1);
+        assert!(transcript_ok);
+        assert_eq!(generation, Some(0));
+        assert_eq!(history, Some(vec!["resumed after timed out".to_string()]));
+        // Exactly one parent notice — the new generation's completion.
+        // The Recovered hook fired with attempt 2.
+        let notices = mgr.drain_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].agent_id, second);
+        let (recovered_len, recovered_target, recovered_attempt) = {
+            let recovered = recovered.lock().unwrap();
+            (
+                recovered.len(),
+                recovered.first().map(|(id, _)| id.clone()),
+                recovered.first().map(|(_, attempt)| *attempt),
+            )
+        };
+        assert_eq!(recovered_len, 1);
+        assert_eq!(recovered_target, Some(second.clone()));
+        assert_eq!(recovered_attempt, Some(2));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_mode_reruns_with_an_empty_transcript() {
+        // `recover: fresh` re-enters with no replay: the factory sees
+        // `None` and the same seed runs again.
+        let seen_resume: Arc<Mutex<Vec<Option<ResumeRequest>>>> = Arc::new(Mutex::new(Vec::new()));
+        let factory_seen = seen_resume.clone();
+        let factory: ChildFactory = Arc::new(move |_, _, _, resume| {
+            factory_seen.lock().unwrap().push(resume.clone());
+            assert!(resume.is_none(), "fresh mode never replays");
+            Box::pin(async move { completed("redone") })
+                as Pin<Box<dyn Future<Output = AgentResult> + Send>>
+        });
+        let mgr = AgentManager::new("sess");
+        let first = mgr
+            .spawn(
+                &recover_def(RecoverMode::Fresh),
+                test_seed(),
+                retry_meta(factory),
+                |_, _, _| async { exhausted_body() },
+            )
+            .unwrap();
+        match mgr.wait(&first, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(_) => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert_eq!(seen_resume.lock().unwrap().len(), 1);
+        assert_eq!(mgr.drain_notices().len(), 1);
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn intensity_exhaustion_escalates_with_history() {
+        // max 1: the first death recovers, the second escalates with the
+        // lineage verbatim in the notice.
+        let mut def = test_def("tester");
+        def.supervision = SupervisionSpec {
+            recover: RecoverMode::Resume,
+            max: 1,
+            window: Duration::from_secs(60),
+        };
+        let calls = Arc::new(Mutex::new(0usize));
+        let factory_calls = calls.clone();
+        let factory: ChildFactory = Arc::new(move |_, _, _, _resume| {
+            *factory_calls.lock().unwrap() += 1;
+            Box::pin(async move { exhausted_body() })
+                as Pin<Box<dyn Future<Output = AgentResult> + Send>>
+        });
+        let mgr = AgentManager::new("sess");
+        let first = mgr
+            .spawn(&def, test_seed(), retry_meta(factory), |_, _, _| async {
+                exhausted_body()
+            })
+            .unwrap();
+        match mgr.wait(&first, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(_) => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // Only one factory call: the second death exhausted the ledger.
+        assert_eq!(*calls.lock().unwrap(), 1);
+        // The escalated generation advertises with history; it is the
+        // only notice in the queue.
+        let notices = mgr.drain_notices();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].resumable);
+        assert_eq!(
+            notices[0].history,
+            vec!["resumed after timed out".to_string()]
+        );
+        assert!(notices[0].text().contains("after 1 recoveries"));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn never_recovers_escalates_without_calling_the_factory() {
+        // `recover: never` (the default) never re-enters, even with a
+        // factory installed: today's behavior, byte-identical.
+        let calls = Arc::new(Mutex::new(0usize));
+        let factory_calls = calls.clone();
+        let factory: ChildFactory = Arc::new(move |_, _, _, _| {
+            *factory_calls.lock().unwrap() += 1;
+            Box::pin(async move { completed("unreachable") })
+                as Pin<Box<dyn Future<Output = AgentResult> + Send>>
+        });
+        let mgr = AgentManager::new("sess");
+        let id = mgr
+            .spawn(
+                &test_def("tester"),
+                test_seed(),
+                retry_meta(factory),
+                |_, _, _| async { exhausted_body() },
+            )
+            .unwrap();
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::TimedOut);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert_eq!(*calls.lock().unwrap(), 0);
+        assert_eq!(mgr.drain_notices().len(), 1);
         mgr.shutdown().await;
     }
 }
