@@ -45,14 +45,13 @@ use super::exit::{
 use super::instance::{AgentId, AgentInstance, AgentState};
 use super::result::{AgentResult, AgentUsage};
 
-/// Max live children per session (plan §7). The 5th concurrent spawn is
-/// rejected with the running list so the caller can wait on or cancel one
-/// instead of fanning out.
+/// Max live children per session (plan §7). The next concurrent spawn
+/// past this queues (§24.5) instead of rejecting; only queue overflow
+/// rejects, with the running list.
 pub(crate) const MAX_CHILDREN: usize = 4;
-/// Max queued spawn requests per session (§24.5). The 5th concurrent
-/// spawn no longer rejects — it queues FIFO and starts when a sibling
-/// goes terminal (or the breaker clears). Overflow beyond this bound
-/// rejects with the running list, as the cap used to.
+/// Max queued spawn requests per session (§24.5). Over-cap spawns queue
+/// FIFO and start when a sibling goes terminal (or the breaker clears);
+/// overflow beyond this bound rejects with the queue-full error.
 pub(crate) const MAX_PENDING: usize = 8;
 /// Completion notices retained per session; once full, further completions
 /// fold into the [`AgentManager::take_overflow`] counter instead of growing
@@ -171,6 +170,13 @@ pub(crate) enum SpawnError {
         limit: usize,
         running: Vec<(AgentId, String)>,
     },
+    /// The spawn QUEUE is full (`MAX_PENDING`), not the child cap: the
+    /// message names what is actually full, so the model can act (wait
+    /// for or cancel a queued child) instead of guessing.
+    QueueFull {
+        limit: usize,
+        running: Vec<(AgentId, String)>,
+    },
     Closed,
 }
 
@@ -187,6 +193,19 @@ impl fmt::Display for SpawnError {
                     f,
                     "at child capacity ({limit} running): {list}; \
                      wait for or cancel one before spawning"
+                )
+            }
+            Self::QueueFull { limit, running } => {
+                let list = running
+                    .iter()
+                    .map(|(id, name)| format!("{id} ({name})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "spawn queue full ({limit} queued, {} running): {list}; \
+                     wait for or cancel a queued child before spawning",
+                    running.len()
                 )
             }
             Self::Closed => {
@@ -421,18 +440,23 @@ impl Inner {
     /// recovery-fallback paths share the same overflow semantics.
     fn enqueue(&mut self, pending: PendingChild) -> Result<(), SpawnError> {
         if self.pending.len() >= MAX_PENDING {
-            let running = self
-                .running
-                .iter()
-                .map(|(id, child)| (id.clone(), child.instance.definition.name.clone()))
-                .collect();
-            return Err(SpawnError::AtCapacity {
-                limit: MAX_PENDING,
-                running,
-            });
+            return Err(self.queue_full());
         }
         self.pending.push_back(pending);
         Ok(())
+    }
+
+    /// The queue-overflow error: names the queue, not the child cap.
+    fn queue_full(&self) -> SpawnError {
+        let running = self
+            .running
+            .iter()
+            .map(|(id, child)| (id.clone(), child.instance.definition.name.clone()))
+            .collect();
+        SpawnError::QueueFull {
+            limit: MAX_PENDING,
+            running,
+        }
     }
 }
 
@@ -589,7 +613,10 @@ impl AgentManager {
     ///
     /// The instance starts `Running`: the task is spawned before this
     /// returns, so `Pending` is unobservable and would only race status
-    /// checks. (`Pending` stays for future queued spawns.)
+    /// checks. Over-cap spawns and spawns under an open breaker queue as
+    /// `Pending` (§24.5) — an observable state (`delegate` reports
+    /// "queued", `delegate_stop` cancels the queue entry) — and launch
+    /// when a slot frees.
     ///
     /// Never blocks: rejects synchronously when the manager is closed
     /// (post-`shutdown`) or already at [`MAX_CHILDREN`] live children.
@@ -638,15 +665,7 @@ impl AgentManager {
                 // Capacity is checked BEFORE the id is allocated (§24.5):
                 // an overflowed queue must not burn a counter slot.
                 if inner.pending.len() >= MAX_PENDING {
-                    let running = inner
-                        .running
-                        .iter()
-                        .map(|(id, child)| (id.clone(), child.instance.definition.name.clone()))
-                        .collect();
-                    return Err(SpawnError::AtCapacity {
-                        limit: MAX_PENDING,
-                        running,
-                    });
+                    return Err(inner.queue_full());
                 }
                 let id = Self::next_id(&mut inner);
                 inner.pending.push_back(PendingChild {
@@ -682,15 +701,24 @@ impl AgentManager {
                 return Err(SpawnError::Closed);
             }
             if inner.running.len() >= MAX_CHILDREN {
-                let running = inner
-                    .running
-                    .iter()
-                    .map(|(id, child)| (id.clone(), child.instance.definition.name.clone()))
-                    .collect();
-                return Err(SpawnError::AtCapacity {
-                    limit: MAX_CHILDREN,
-                    running,
-                });
+                // A racing sibling (or the drain) filled the last slot
+                // between `launch`'s check and this one. The queue exists
+                // to absorb exactly this, and the id is already
+                // allocated — requeue instead of reporting a spurious
+                // "at child capacity" to the model. A full queue (or an
+                // open breaker) still rejects; the burn of one counter
+                // slot is the cost of the rare race.
+                let pending = PendingChild {
+                    id: id.clone(),
+                    def: def.clone(),
+                    seed,
+                    meta,
+                    run,
+                };
+                inner.enqueue(pending)?;
+                drop(inner);
+                self.schedule_drain();
+                return Ok(id);
             }
             Self::register(&mut inner, def, seed, &meta, &id)
         };
@@ -1090,9 +1118,7 @@ impl AgentManager {
                         // trigger counts the same window `decide` just
                         // measured — the ledger is never pruned by
                         // whoever finished last.
-                        if spec.recover != RecoverMode::Never
-                            && in_window >= spec.max as usize
-                        {
+                        if spec.recover != RecoverMode::Never && in_window >= spec.max as usize {
                             let until = now + spec.window;
                             inner.open_until = Some(match inner.open_until {
                                 Some(existing) if existing > until => existing,
@@ -1319,10 +1345,8 @@ impl AgentManager {
             let mut inner = self.lock();
             if let Some(result) = inner.results.get_mut(id) {
                 if let Some(transcript) = fallback.transcript.clone() {
-                    let remaining = advertised_remaining(
-                        fallback.allowance,
-                        fallback.tool_calls as usize,
-                    );
+                    let remaining =
+                        advertised_remaining(fallback.allowance, fallback.tool_calls as usize);
                     result.resume = Some(ResumeHandle {
                         agent_id: id.clone(),
                         transcript,
@@ -1422,22 +1446,16 @@ impl AgentManager {
                 transcript: child.transcript.clone(),
             })
             .collect();
-        // Queued children (§24.5): visible with their derived transcript
-        // path so `delegate_list` explains what is waiting and why.
+        // Queued children (§24.5): visible so `delegate_list` explains
+        // what is waiting and why. No transcript: the child has not run —
+        // the file appears when the queue drains and it launches.
         out.extend(inner.pending.iter().map(|pending| ChildInfo {
             agent_id: pending.id.clone(),
             name: pending.def.name.clone(),
             state: AgentState::Pending,
             progress: None,
             resumable: false,
-            transcript: pending.meta.parent_session.as_deref().map(|parent| {
-                Session::child_path(
-                    parent,
-                    &pending.id.0,
-                    &pending.def.name,
-                    pending.meta.generation,
-                )
-            }),
+            transcript: None,
         }));
         out.extend(inner.results.iter().map(|(id, result)| {
             ChildInfo {
@@ -1512,6 +1530,15 @@ impl AgentManager {
                 resume: None,
             };
             let status = result.status;
+            // Retention bound, same discipline as `finish`: a queued-id
+            // cancel files a real result and must not inflate the cache
+            // past `MAX_RESULTS`.
+            if inner.results.len() >= MAX_RESULTS {
+                if let Some(oldest) = inner.result_order.pop_front() {
+                    inner.results.remove(&oldest);
+                    inner.names.remove(&oldest);
+                }
+            }
             inner.result_order.push_back(id.clone());
             inner.names.insert(id.clone(), pending.def.name.clone());
             inner.results.insert(id.clone(), result);
@@ -1534,7 +1561,12 @@ impl AgentManager {
             let event = AgentEvent::Completed(notice.clone());
             (notice, event)
         };
-        if let Some(hook) = self.lock().events.clone() {
+        // Hoisted like every other hook site: firing the hook inside the
+        // `if let` scrutinee would hold the registry guard through the
+        // hook's journal append + SSE broadcast (edition 2021 scrutinee
+        // temporaries outlive the block).
+        let hook = self.lock().events.clone();
+        if let Some(hook) = hook {
             hook(event);
         }
         Some(notice.status)
@@ -1593,20 +1625,71 @@ impl AgentManager {
     /// registry. Queued (never-started) children drop silently — no
     /// transcript, no task, no spend to report.
     pub(crate) async fn shutdown(&self) {
-        let handles: Vec<JoinHandle<AgentResult>> = {
+        let (handles, events) = {
             let mut inner = self.lock();
             inner.closed = true;
-            inner.pending.clear();
+            // Queued children never started, but the parent holds their
+            // ids: file a synthesized `Cancelled` result + notice per
+            // entry, so the final notice drain explains them instead of
+            // the ids reading `Unknown` forever (same shape as `cancel`
+            // on a queued id).
+            let mut events = Vec::new();
+            for pending in std::mem::take(&mut inner.pending) {
+                if inner.results.len() >= MAX_RESULTS {
+                    if let Some(oldest) = inner.result_order.pop_front() {
+                        inner.results.remove(&oldest);
+                        inner.names.remove(&oldest);
+                    }
+                }
+                let result = AgentResult {
+                    status: AgentState::Cancelled,
+                    summary: String::new(),
+                    error: Some("cancelled before start (manager shut down)".to_string()),
+                    usage: None,
+                    reason: ExitReason::ShutDown,
+                    tool_calls: 0,
+                    resume: None,
+                };
+                let notice = AgentNotice {
+                    agent_id: pending.id.clone(),
+                    name: pending.def.name.clone(),
+                    status: AgentState::Cancelled,
+                    usage: None,
+                    resumable: false,
+                    history: Vec::new(),
+                    queued: true,
+                };
+                inner.result_order.push_back(pending.id.clone());
+                inner
+                    .names
+                    .insert(pending.id.clone(), pending.def.name.clone());
+                inner.results.insert(pending.id.clone(), result);
+                if inner.notices.len() >= MAX_NOTICES {
+                    inner.overflowed += 1;
+                } else {
+                    inner.notices.push_back(notice.clone());
+                }
+                events.push(AgentEvent::Completed(notice));
+            }
             inner.open_until = None;
             for child in inner.running.values() {
                 child.token.cancel();
             }
-            inner
-                .running
-                .values_mut()
-                .filter_map(|child| child.handle.take())
-                .collect()
+            (
+                inner
+                    .running
+                    .values_mut()
+                    .filter_map(|child| child.handle.take())
+                    .collect::<Vec<JoinHandle<AgentResult>>>(),
+                events,
+            )
         };
+        let hook = self.lock().events.clone();
+        if let Some(hook) = hook {
+            for event in events {
+                hook(event);
+            }
+        }
         for handle in handles {
             let _ = handle.await;
         }
@@ -2608,12 +2691,272 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            SpawnError::AtCapacity {
+            SpawnError::QueueFull {
                 limit: MAX_PENDING,
                 ..
             }
         ));
+        // The message names the queue (8 queued, 4 running), not a false
+        // child-capacity claim.
+        assert!(
+            error
+                .to_string()
+                .contains("spawn queue full (8 queued, 4 running)"),
+            "{}",
+            error
+        );
         mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_drains_fifo_across_terminals() {
+        // §24.5: queued children launch in enqueue order, one per freed
+        // slot — a terminal sibling drains the OLDEST queued entry first.
+        let spawned: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
+        let hook_spawned = spawned.clone();
+        let mgr = AgentManager::new("sess").with_events(Arc::new(move |event| {
+            if let AgentEvent::Spawned { agent_id, .. } = event {
+                hook_spawned.lock().unwrap().push(agent_id);
+            }
+        }));
+        // Fill the cap with children that only end through their token.
+        let mut running = Vec::new();
+        for _ in 0..MAX_CHILDREN {
+            running.push(
+                mgr.spawn(
+                    &test_def("explorer"),
+                    test_seed(),
+                    SpawnMeta::fresh(),
+                    token_body,
+                )
+                .unwrap(),
+            );
+        }
+        let first_queued = mgr
+            .spawn(
+                &test_def("tester"),
+                test_seed(),
+                SpawnMeta::fresh(),
+                token_body,
+            )
+            .unwrap();
+        let second_queued = mgr
+            .spawn(
+                &test_def("reviewer"),
+                test_seed(),
+                SpawnMeta::fresh(),
+                token_body,
+            )
+            .unwrap();
+        assert!(mgr.is_queued(&first_queued));
+        assert!(mgr.is_queued(&second_queued));
+        // Free one slot: the FIRST queued entry launches.
+        mgr.cancel(&running[0]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !spawned.lock().unwrap().contains(&first_queued) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "first queued child never launched"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!spawned.lock().unwrap().contains(&second_queued));
+        // Free another: the SECOND queued entry launches, still in order.
+        mgr.cancel(&running[1]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !spawned.lock().unwrap().contains(&second_queued) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second queued child never launched"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_cancel_respects_the_retention_bound() {
+        // Filing a queued cancel's synthesized result must not grow the
+        // cache past `MAX_RESULTS` — the oldest retained result evicts,
+        // exactly like `finish`.
+        let mgr = AgentManager::new("sess");
+        for i in 0..MAX_RESULTS {
+            let id = mgr
+                .spawn(
+                    &test_def("explorer"),
+                    test_seed(),
+                    SpawnMeta::fresh(),
+                    |_, _, _| async move { completed("done") },
+                )
+                .unwrap();
+            match mgr.wait(&id, Duration::from_secs(5)).await {
+                WaitOutcome::Finished(_) => {}
+                other => panic!("expected Finished for {i}, got {other:?}"),
+            }
+        }
+        // Hold the cap and queue one child behind it.
+        let mut running = Vec::new();
+        for _ in 0..MAX_CHILDREN {
+            running.push(
+                mgr.spawn(
+                    &test_def("explorer"),
+                    test_seed(),
+                    SpawnMeta::fresh(),
+                    token_body,
+                )
+                .unwrap(),
+            );
+        }
+        let queued = mgr
+            .spawn(
+                &test_def("tester"),
+                test_seed(),
+                SpawnMeta::fresh(),
+                token_body,
+            )
+            .unwrap();
+        assert!(mgr.is_queued(&queued));
+        mgr.cancel(&queued);
+        // The cancel's result is present; the oldest result was evicted
+        // to make room, so the bound held.
+        match mgr.wait(&queued, Duration::ZERO).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Cancelled);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        match mgr.wait(&running[0], Duration::ZERO).await {
+            WaitOutcome::Running(state) => assert_eq!(state, AgentState::Running),
+            WaitOutcome::Finished(_) => panic!("running child must stay live"),
+            WaitOutcome::Unknown => panic!("running child must stay visible"),
+        }
+        let evicted = AgentId("sess-0".to_string());
+        assert_eq!(
+            mgr.wait(&evicted, Duration::ZERO).await,
+            WaitOutcome::Unknown
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_files_terminal_results_for_queued_children() {
+        // A queued id outlives the queue: shutdown files a synthesized
+        // `Cancelled` + notice per entry instead of leaving the ids to
+        // read `Unknown` forever.
+        let mgr = AgentManager::new("sess");
+        for _ in 0..MAX_CHILDREN {
+            mgr.spawn(
+                &test_def("explorer"),
+                test_seed(),
+                SpawnMeta::fresh(),
+                token_body,
+            )
+            .unwrap();
+        }
+        let queued = mgr
+            .spawn(
+                &test_def("tester"),
+                test_seed(),
+                SpawnMeta::fresh(),
+                token_body,
+            )
+            .unwrap();
+        assert!(mgr.is_queued(&queued));
+        mgr.shutdown().await;
+        match mgr.wait(&queued, Duration::ZERO).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Cancelled);
+                assert_eq!(result.reason, ExitReason::ShutDown);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let notices = mgr.drain_notices();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.agent_id == queued && notice.queued),
+            "{:?}",
+            notices
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn escalate_fallback_queues_its_notice() {
+        // Regression: the cap-race fallback marks its notice
+        // `queued: true` — it must actually enter the notice queue, or
+        // the idle wake it schedules no-ops at `has_notices()` and the
+        // escalation never reaches the model's context.
+        let dir = PathBuf::from("/tmp/dex-p13-fallback");
+        let mgr = AgentManager::new("sess");
+        let id = mgr
+            .spawn(
+                &test_def("explorer"),
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
+                    retry: None,
+                    lineage: Vec::new(),
+                    remaining_budget: Some(5),
+                },
+                |_, _, _| async { exhausted_body() },
+            )
+            .unwrap();
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(_) => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let _ = mgr.drain_notices();
+        let factory: ChildFactory =
+            Arc::new(|_, _, _, _| Box::pin(async { completed("x") }) as BodyFuture);
+        let reenter = ReEntry {
+            def: test_def("explorer"),
+            seed: test_seed(),
+            meta: SpawnMeta::fresh(),
+            factory,
+            resume: None,
+            name: "explorer".to_string(),
+            attempt: 2,
+            mode: RecoverMode::Resume,
+            reason: ExitReason::Exhausted(ExhaustKind::Timeout),
+            superseded_notice: AgentNotice {
+                agent_id: id.clone(),
+                name: "explorer".to_string(),
+                status: AgentState::TimedOut,
+                usage: None,
+                resumable: false,
+                history: Vec::new(),
+                queued: false,
+            },
+            fallback: Fallback {
+                transcript: Some(dir.join("agents").join("sess-0-explorer.jsonl")),
+                generation: 0,
+                allowance: Some(5),
+                lineage: Vec::new(),
+                reason: ExitReason::Exhausted(ExhaustKind::Timeout),
+                tool_calls: 3,
+            },
+        };
+        mgr.escalate_fallback(&id, &reenter);
+        assert!(mgr.has_notices(), "queued flag without a queue entry");
+        let notices = mgr.drain_notices();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].queued);
+        assert!(
+            notices[0].resumable,
+            "the retained result now carries a handle"
+        );
+        // The handle's meter is honest: allowance 5 − spend 3.
+        match mgr.wait(&id, Duration::ZERO).await {
+            WaitOutcome::Finished(result) => {
+                let handle = result.resume.expect("fallback attaches the handle");
+                assert_eq!(handle.remaining_budget, Some(2));
+                assert_eq!(handle.generation, 0);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
