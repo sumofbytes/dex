@@ -158,7 +158,7 @@ impl ToolState {
     /// the JoinHandle — a detached spawn would be dropped on teardown before
     /// it ever ran. Best-effort, never fails the turn.
     pub(crate) async fn load_async() -> Self {
-        tokio::task::spawn_blocking(|| Self::load())
+        tokio::task::spawn_blocking(Self::load)
             .await
             .unwrap_or_else(|_| Self::default())
     }
