@@ -588,7 +588,9 @@ budget-exhausted with progress on disk — is marked `resumable` in its result:
 generation (the supervisor re-enters automatically when the definition opts in
 with `recover: fresh|resume`; over-cap spawns queue and start when a slot
 frees, and an idle session's children are reaped after ten minutes without a
-client). Under `ask-*` modes a mutating call parks a labeled
+client; when recoveries fail faster than policy allows, the breaker queues
+new spawns until that window expires). Under `ask-*` modes a mutating call
+parks a labeled
 prompt in the session's approval queue — "explorer wants to run bash: …" —
 unanswered for five minutes it denies; session-level "allow" approvals apply to
 children too. `delegate_list` shows live, finished, and interrupted children.

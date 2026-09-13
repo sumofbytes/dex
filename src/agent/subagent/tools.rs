@@ -66,7 +66,10 @@ pub(crate) fn is_delegation(name: &str) -> bool {
 /// (`finished completed`, `finished timed out`).
 pub(crate) fn status_word(state: AgentState) -> &'static str {
     match state {
-        AgentState::Pending => "pending",
+        // One word for `Pending` everywhere (`delegate`/`delegate_output`
+        // say "queued" too) — the registry state and the queue state are
+        // the same fact.
+        AgentState::Pending => "queued",
         AgentState::Running => "running",
         AgentState::Completed => "completed",
         AgentState::Failed => "failed",
