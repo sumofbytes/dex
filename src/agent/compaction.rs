@@ -52,6 +52,33 @@ struct CutPoint {
     is_split_turn: bool,
 }
 
+/// Build the `CutPoint` for keeping from `idx`: a turn start cuts exactly
+/// there; otherwise record the turn start (searching back to `start`) and
+/// flag the split turn.
+fn cut_point_at(messages: &[ChatMessage], idx: usize, start: usize) -> CutPoint {
+    let starts_turn = is_turn_start_message(&messages[idx]);
+    let turn_start = if starts_turn {
+        None
+    } else {
+        find_turn_start_index(messages, idx, start)
+    };
+    CutPoint {
+        first_kept_index: idx,
+        turn_start_index: turn_start,
+        is_split_turn: !starts_turn && turn_start.is_some(),
+    }
+}
+
+/// Back `idx` up over tool messages so a cut never orphans a tool result
+/// from its request; never crosses `start`.
+fn back_up_over_tools(messages: &[ChatMessage], idx: usize, start: usize) -> usize {
+    let mut idx = idx;
+    while idx > start && messages[idx].role == Role::Tool {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Find the cut point — walk backwards until `keepRecentTokens`, cut at
 /// next valid user/assistant boundary, handle split turns.
 /// `start` is boundaryStart (after previous compaction), `end` is messages.len().
@@ -111,18 +138,7 @@ fn find_cut_point(
     }
 
     // Never orphan tool: if cut lands on tool, back up (shouldn't happen via cut_points)
-    while cut_index > start && messages[cut_index].role == Role::Tool {
-        cut_index -= 1;
-    }
-
-    // Split-turn detection: if cut does not start a turn, find its turn start
-    let starts_turn = is_turn_start_message(&messages[cut_index]);
-    let turn_start = if starts_turn {
-        None
-    } else {
-        find_turn_start_index(messages, cut_index, start)
-    };
-    let is_split = !starts_turn && turn_start.is_some();
+    let cut_index = back_up_over_tools(messages, cut_index, start);
 
     // ponytail: never evict the most recent real user prompt — compaction
     // inside a turn can push it out of the keep_recent window and the model
@@ -134,33 +150,16 @@ fn find_cut_point(
     {
         if cut_index > last_user {
             // Would evict last user — keep from last_user instead, or abort if too small.
-            let mut adjusted = last_user;
-            while adjusted > start && messages[adjusted].role == Role::Tool {
-                adjusted -= 1;
-            }
+            let adjusted = back_up_over_tools(messages, last_user, start);
             // If adjusting would make summarized span too small, skip compaction.
             if adjusted <= start + MIN_MESSAGES_TO_SUMMARIZE {
                 return None;
             }
-            let adj_starts_turn = is_turn_start_message(&messages[adjusted]);
-            let adj_turn_start = if adj_starts_turn {
-                None
-            } else {
-                find_turn_start_index(messages, adjusted, start)
-            };
-            return Some(CutPoint {
-                first_kept_index: adjusted,
-                turn_start_index: adj_turn_start,
-                is_split_turn: !adj_starts_turn && adj_turn_start.is_some(),
-            });
+            return Some(cut_point_at(messages, adjusted, start));
         }
     }
 
-    Some(CutPoint {
-        first_kept_index: cut_index,
-        turn_start_index: turn_start,
-        is_split_turn: is_split,
-    })
+    Some(cut_point_at(messages, cut_index, start))
 }
 
 // File tracking — read/written/edited sets extracted from tool calls
@@ -548,6 +547,91 @@ pub(crate) fn find_cutoff_by_tokens(
     }
 }
 
+/// File-operations section for the summary ("**Files read:** …"), empty
+/// when nothing was touched. Shared tail of both LLM-summary merge paths.
+fn attach_file_section(file_ops: &FileOps) -> String {
+    let (read_files, modified_files) = compute_file_lists(file_ops);
+    format_file_operations(&read_files, &modified_files)
+}
+
+/// LLM summarization path (`DEX_COMPACTION_LLM=1`): summarize the history
+/// and — for split turns — the turn prefix with the configured model,
+/// folding the summarizer spend into `usage_total`. Empty or failed replies
+/// fall back to the deterministic summary; a cancelled summarizer fails the
+/// compaction with the exact wording the turn loop matches
+/// (`e.contains("cancelled")`).
+#[allow(clippy::too_many_arguments)]
+async fn llm_summary(
+    config: &LlmConfig,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    messages_to_summarize: &[ChatMessage],
+    turn_prefix_messages: &[ChatMessage],
+    is_split_turn: bool,
+    previous_summary: Option<&str>,
+    file_ops: &FileOps,
+    usage_total: &mut Option<Usage>,
+) -> Result<String, String> {
+    let history_summary = if !messages_to_summarize.is_empty() {
+        match summarize_old_messages(config, messages_to_summarize, cancel).await {
+            Ok((s, u)) if !s.trim().is_empty() => {
+                merge_usage(usage_total, u);
+                s
+            }
+            Ok((_, u)) => {
+                merge_usage(usage_total, u);
+                deterministic_summary(messages_to_summarize, &[], previous_summary, file_ops)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("cancelled") || msg.contains("cancellation") {
+                    return Err(format!("history compaction cancelled: {msg}"));
+                }
+                deterministic_summary(messages_to_summarize, &[], previous_summary, file_ops)
+            }
+        }
+    } else {
+        "No prior history.".to_string()
+    };
+    if is_split_turn && !turn_prefix_messages.is_empty() {
+        // Turn prefix summary with smaller budget prompt
+        let prefix_conversation = serialize_conversation(turn_prefix_messages);
+        let prefix_prompt = vec![
+            ChatMessage::system(
+                "You are a context summarization assistant. ONLY output the structured summary.",
+            ),
+            ChatMessage::user(format!(
+                "<conversation>\n{}\n</conversation>\n\n{}",
+                prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
+            )),
+        ];
+        let (sink, rx) = mpsc::channel(16);
+        drop(rx);
+        let prefix_summary = match call_llm(config, &prefix_prompt, false, Some(sink), cancel).await
+        {
+            Ok(turn) => {
+                merge_usage(usage_total, turn.usage);
+                turn.message.content.unwrap_or_default()
+            }
+            Err(_) => deterministic_summary(&[], turn_prefix_messages, None, &FileOps::default()),
+        };
+        // Merge: history + "---" + turn context
+        let file_section = attach_file_section(file_ops);
+        Ok(format!(
+            "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}{}",
+            history_summary.trim(),
+            prefix_summary.trim(),
+            file_section
+        ))
+    } else {
+        let file_section = attach_file_section(file_ops);
+        if file_section.is_empty() {
+            Ok(history_summary)
+        } else {
+            Ok(format!("{}{}", history_summary.trim(), file_section))
+        }
+    }
+}
+
 pub(crate) async fn compact_history(
     _config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
@@ -614,10 +698,14 @@ pub(crate) async fn compact_history(
     }
 
     // File ops are cumulative — extracted from the previous compaction + messages
+    // Merge base is the LAST summary: each compaction folds the previous
+    // checkpoint into the new one, so the latest subsumes every earlier
+    // span. Merging from the first would drop spans only intermediate
+    // summaries cover when healing an already-stacked transcript.
     let previous_summary = messages
         .iter()
-        .find(|m| m.name.as_deref() == Some("summary"))
-        .and_then(|m| m.content.clone());
+        .rposition(|m| m.name.as_deref() == Some("summary"))
+        .and_then(|idx| messages[idx].content.clone());
     let mut file_ops = FileOps::default();
     // Previous compaction's file lists are embedded in previous summary's <read-files> etc,
     // but we parse naively: re-extract from old messages that are being summarized
@@ -632,80 +720,17 @@ pub(crate) async fn compact_history(
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
     let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
-        // Use LLM path: if split, generate history + turn prefix separately then merge
-        let history_summary = if !messages_to_summarize.is_empty() {
-            match summarize_old_messages(_config, &messages_to_summarize, _cancel).await {
-                Ok((s, u)) if !s.trim().is_empty() => {
-                    merge_usage(&mut usage_total, u);
-                    s
-                }
-                Ok((_, u)) => {
-                    merge_usage(&mut usage_total, u);
-                    deterministic_summary(
-                        &messages_to_summarize,
-                        &[],
-                        previous_summary.as_deref(),
-                        &file_ops,
-                    )
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("cancelled") || msg.contains("cancellation") {
-                        return Err(format!("history compaction cancelled: {msg}"));
-                    }
-                    deterministic_summary(
-                        &messages_to_summarize,
-                        &[],
-                        previous_summary.as_deref(),
-                        &file_ops,
-                    )
-                }
-            }
-        } else {
-            "No prior history.".to_string()
-        };
-        if cp.is_split_turn && !turn_prefix_messages.is_empty() {
-            // Turn prefix summary with smaller budget prompt
-            let prefix_conversation = serialize_conversation(&turn_prefix_messages);
-            let prefix_prompt = vec![
-                ChatMessage::system(
-                    "You are a context summarization assistant. ONLY output the structured summary.",
-                ),
-                ChatMessage::user(format!(
-                    "<conversation>\n{}\n</conversation>\n\n{}",
-                    prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
-                )),
-            ];
-            let (sink, rx) = mpsc::channel(16);
-            drop(rx);
-            let prefix_summary =
-                match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel).await {
-                    Ok(turn) => {
-                        merge_usage(&mut usage_total, turn.usage);
-                        turn.message.content.unwrap_or_default()
-                    }
-                    Err(_) => {
-                        deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
-                    }
-                };
-            // Merge: history + "---" + turn context
-            let (read_files, modified_files) = compute_file_lists(&file_ops);
-            let file_section = format_file_operations(&read_files, &modified_files);
-            format!(
-                "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}{}",
-                history_summary.trim(),
-                prefix_summary.trim(),
-                file_section
-            )
-        } else {
-            let (read_files, modified_files) = compute_file_lists(&file_ops);
-            let file_section = format_file_operations(&read_files, &modified_files);
-            if file_section.is_empty() {
-                history_summary
-            } else {
-                format!("{}{}", history_summary.trim(), file_section)
-            }
-        }
+        llm_summary(
+            _config,
+            _cancel,
+            &messages_to_summarize,
+            &turn_prefix_messages,
+            cp.is_split_turn,
+            previous_summary.as_deref(),
+            &file_ops,
+            &mut usage_total,
+        )
+        .await?
     } else {
         deterministic_summary(
             &messages_to_summarize,
@@ -1043,6 +1068,14 @@ mod tests {
         assert_eq!(summaries, 1, "stacked checkpoints must heal to one");
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].name.as_deref(), Some("summary"));
+        // The merge base is the LAST checkpoint (it subsumes the earlier
+        // spans): the surviving summary builds on the newest checkpoint,
+        // not the stale first one.
+        let text = messages[1].content.as_deref().unwrap_or_default();
+        assert!(
+            text.contains("stale checkpoint"),
+            "new summary must build on the latest checkpoint, got: {text}"
+        );
     }
 
     /// Emergency compaction must be able to cut below the comfort floor:

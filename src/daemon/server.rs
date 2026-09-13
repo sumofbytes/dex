@@ -30,7 +30,7 @@ use crate::protocol::{
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
 
-use super::{required_token, DaemonState, PendingApproval, SessionEntry};
+use super::{journal_event, lock_map, required_token, DaemonState, PendingApproval, SessionEntry};
 
 /// Bearer-token gate: every `/api/*` route requires `Authorization: Bearer
 /// <token>` when the daemon requires a token (non-loopback bind or an
@@ -147,20 +147,14 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
         dirty: bool,
     }
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Entry>>> = OnceLock::new();
-    if let Some(hit) = CACHE
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    if let Some(hit) = lock_map(CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())))
         .get(cwd)
         .filter(|e| e.at.elapsed() < Duration::from_secs(5))
     {
         return (hit.branch.clone(), hit.dirty);
     }
     let (branch, dirty) = crate::core::format::git_context_async(cwd).await;
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache = lock_map(CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())));
     if cache.len() > 32 {
         cache.clear();
     }
@@ -175,30 +169,56 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
     (branch, dirty)
 }
 
+impl DaemonInfo {
+    /// `/api/config` shape when the daemon has no usable config yet:
+    /// provider/model from env fallbacks, empty model list. The live-config
+    /// arm overwrites the derived fields on top of this.
+    fn default_for(
+        cwd: String,
+        git_branch: Option<String>,
+        git_dirty: bool,
+        permission: String,
+    ) -> Self {
+        Self {
+            provider: std::env::var("DEX_PROVIDER")
+                .ok()
+                .unwrap_or_else(|| "opencode".to_string()),
+            model: "unknown".to_string(),
+            api: "openai-responses".to_string(),
+            available_models: Vec::new(),
+            context_window: 128_000,
+            permission,
+            cwd,
+            git_branch,
+            git_dirty,
+            thinking_effort: None,
+            thinking_warning: None,
+        }
+    }
+}
+
 async fn resolve_daemon_info_async() -> DaemonInfo {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let (git_branch, git_dirty) = cached_git_context_async(&cwd).await;
     match LlmConfig::from_env_async(None, None, None, Vec::new()).await {
-        Ok(config) => DaemonInfo {
-            provider: config.provider.name().to_string(),
-            model: config.model.clone(),
-            api: config.api.name().to_string(),
-            available_models: config.available_models.clone(),
-            context_window: config.context_window,
-            permission: match config.permission {
-                crate::core::types::PermissionMode::ReadOnly => "read-only".into(),
-                crate::core::types::PermissionMode::AskWrites => "ask-writes".into(),
-                crate::core::types::PermissionMode::AskShell => "ask-shell".into(),
-                crate::core::types::PermissionMode::Trusted => "trusted".into(),
-            },
-            cwd,
-            git_branch,
-            git_dirty,
-            thinking_effort: config.thinking_effort.clone(),
-            thinking_warning: config.thinking_mismatch_warning(),
-        },
+        Ok(config) => {
+            let mut info = DaemonInfo::default_for(
+                cwd,
+                git_branch,
+                git_dirty,
+                config.permission.as_str().to_string(),
+            );
+            info.thinking_warning = config.thinking_mismatch_warning();
+            info.provider = config.provider.name().to_string();
+            info.api = config.api.name().to_string();
+            info.model = config.model;
+            info.available_models = config.available_models;
+            info.context_window = config.context_window;
+            info.thinking_effort = config.thinking_effort;
+            info
+        }
         Err(_) => {
             // Config is incomplete (e.g. no API key yet); report what we can
             // so the client still renders.
@@ -206,23 +226,7 @@ async fn resolve_daemon_info_async() -> DaemonInfo {
                 .ok()
                 .filter(|v| crate::core::types::PermissionMode::parse(v).is_ok())
                 .unwrap_or_else(|| "ask-writes".to_string());
-            let model = "unknown".to_string();
-            let provider_name = std::env::var("DEX_PROVIDER")
-                .ok()
-                .unwrap_or_else(|| "opencode".to_string());
-            DaemonInfo {
-                provider: provider_name,
-                model,
-                api: "openai-responses".to_string(),
-                available_models: Vec::new(),
-                context_window: 128_000,
-                permission,
-                cwd,
-                git_branch,
-                git_dirty,
-                thinking_effort: None,
-                thinking_warning: None,
-            }
+            DaemonInfo::default_for(cwd, git_branch, git_dirty, permission)
         }
     }
 }
@@ -301,7 +305,7 @@ async fn load_skill(
         return Err(StatusCode::BAD_REQUEST);
     }
     let entry = {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = lock_map(&state.sessions);
         sessions.get(&session_id).cloned()
     }
     .ok_or(StatusCode::NOT_FOUND)?;
@@ -375,11 +379,7 @@ async fn create_session(
         name: session.name().map(ToString::to_string),
         cwd,
     };
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(session_id.clone(), entry);
+    lock_map(&state.sessions).insert(session_id.clone(), entry);
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -390,8 +390,6 @@ async fn create_session(
 async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     // P10: disk-backed listing with JoinSet parallel per-session scans
     // (`spawn_blocking` per file, join, sort) — fixes the linear scan (S2).
-    let mut by_id: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
     let listed = session::Session::list_all_async().await.unwrap_or_default();
     // Per-session message_count + turn_state in parallel (spawn_blocking per file).
     let mut set = tokio::task::JoinSet::new();
@@ -429,29 +427,46 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
             scanned.push(v);
         }
     }
-    scanned.sort_by(|a, b| b.1.timestamp().cmp(a.1.timestamp()));
-    for (path, header, message_count, turn_state, child_agents, interrupted_children) in scanned {
-        let name = header.name().map(|n| n.to_string());
-        by_id.insert(
-            header.id().to_string(),
-            json!({
-                "session_id": header.id(),
-                "path": path.display().to_string(),
-                "name": name,
-                "cwd": header.cwd(),
-                "created_at": header.timestamp(),
-                "message_count": message_count,
-                "turn_state": turn_state,
-                "child_agents": child_agents,
-                "interrupted_children": interrupted_children,
-            }),
-        );
-    }
-    // Preserve in-memory sessions that have no file yet (shouldn't happen).
+    // One sort over typed rows: timestamp desc, session id tie-break so the
+    // order is deterministic. The in-memory no-file fallback (sort key ""
+    // sorts last) joins the same list before the single sort pass.
+    let mut rows: Vec<(String, String, serde_json::Value)> = scanned
+        .into_iter()
+        .map(
+            |(path, header, message_count, turn_state, child_agents, interrupted_children)| {
+                let name = header.name().map(|n| n.to_string());
+                (
+                    header.timestamp().to_string(),
+                    header.id().to_string(),
+                    json!({
+                        "session_id": header.id(),
+                        "path": path.display().to_string(),
+                        "name": name,
+                        "cwd": header.cwd(),
+                        "created_at": header.timestamp(),
+                        "message_count": message_count,
+                        "turn_state": turn_state,
+                        "child_agents": child_agents,
+                        "interrupted_children": interrupted_children,
+                    }),
+                )
+            },
+        )
+        .collect();
+    // Preserve in-memory sessions that have no file yet (shouldn't happen);
+    // disk rows win when an id is present in both.
     {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = lock_map(&state.sessions);
         for (id, entry) in sessions.iter() {
-            by_id.entry(id.clone()).or_insert_with(|| {
+            if rows
+                .iter()
+                .any(|(_, row_id, _)| row_id.as_str() == id.as_str())
+            {
+                continue;
+            }
+            rows.push((
+                String::new(),
+                id.clone(),
                 json!({
                     "session_id": id,
                     "path": entry.path.to_string_lossy(),
@@ -462,22 +477,12 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
                     "turn_state": "unknown",
                     "child_agents": 0,
                     "interrupted_children": 0,
-                })
-            });
+                }),
+            ));
         }
     }
-    let mut sessions: Vec<serde_json::Value> = by_id.into_values().collect();
-    sessions.sort_by(|a, b| {
-        let a = a
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let b = b
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        b.cmp(a)
-    });
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let sessions: Vec<serde_json::Value> = rows.into_iter().map(|(_, _, row)| row).collect();
     Json(json!({ "sessions": sessions }))
 }
 
@@ -510,12 +515,10 @@ async fn chat(
     // Idempotency replay is routed through the SAME channel/stream as a live
     // turn (single return type below): the recorded terminal envelope is just
     // pushed and the stream closes.
-    let mut replay_envelope: Option<StreamEnvelope> = None;
-    if let Some(key) = &idempotency_key {
-        if let Some(terminal) = state.idempotent_replay(key, &session_id, request_hash) {
-            replay_envelope = serde_json::from_str::<StreamEnvelope>(&terminal).ok();
-        }
-    }
+    let replay_envelope: Option<StreamEnvelope> = idempotency_key
+        .as_deref()
+        .and_then(|key| state.idempotent_replay(key, &session_id, request_hash))
+        .and_then(|terminal| serde_json::from_str::<StreamEnvelope>(&terminal).ok());
     // Reject concurrent turns on the same session up front so the
     // append-only session log stays consistent. A replay must not hold the
     // active-turn slot, so it is checked before registration.
@@ -542,27 +545,12 @@ async fn chat(
         // and the stream reader poll it; it never leaks across sessions or
         // later turns.
         let cancel = CancellationToken::new();
-        state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.clone(), cancel.clone());
+        lock_map(&state.cancel_tokens).insert(session_id.clone(), cancel.clone());
         cancel_for_turn = Some(cancel);
         // Steering / follow-up queues for this turn (mirrors old local
         // `event.rs` channels). Insert now so the HTTP handlers can push
         // immediately.
-        let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
-        let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
-        state
-            .steering_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.clone(), steering_tx);
-        state
-            .followup_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.clone(), followup_tx);
+        let (steering_rx, followup_rx) = create_queue_pair(&state, &session_id);
         steering_rx_opt = Some(steering_rx);
         followup_rx_opt = Some(followup_rx);
     }
@@ -632,6 +620,79 @@ impl Stream for ReceiverStream {
     }
 }
 
+/// Create a turn's steering/follow-up queue pair and register the senders
+/// so the HTTP handlers (`/steer`, `/followup`) can push immediately.
+fn create_queue_pair(
+    state: &DaemonState,
+    session_id: &str,
+) -> (mpsc::Receiver<QueueMsg>, mpsc::Receiver<QueueMsg>) {
+    let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
+    let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
+    lock_map(&state.steering_txs).insert(session_id.to_string(), steering_tx);
+    lock_map(&state.followup_txs).insert(session_id.to_string(), followup_tx);
+    (steering_rx, followup_rx)
+}
+
+/// Turn outcome from the chained loop: final response text plus the
+/// usage/cached token counts captured with it.
+type TurnOutcome =
+    Result<(String, Option<u64>, Option<u64>), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Per-turn queue plumbing: the steering/follow-up receivers the agent loop
+/// drains, the accepted-notification senders the loop replies on, and the
+/// bridge-drain signals the terminal event waits on.
+struct TurnChannels {
+    steering_rx: mpsc::Receiver<QueueMsg>,
+    followup_rx: mpsc::Receiver<QueueMsg>,
+    steering_accepted_tx: mpsc::Sender<String>,
+    followup_accepted_tx: mpsc::Sender<String>,
+    sink_done: tokio::sync::oneshot::Sender<()>,
+    approval_done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl TurnChannels {
+    /// Fresh queues with no live counterpart — for direct `run_turn_inner`
+    /// calls (tests) that never receive steering and never wait on bridges.
+    #[cfg(test)]
+    fn detached() -> Self {
+        let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
+        let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
+        let (steering_accepted_tx, _) = mpsc::channel::<String>(16);
+        let (followup_accepted_tx, _) = mpsc::channel::<String>(16);
+        let (sink_done, _) = tokio::sync::oneshot::channel::<()>();
+        let (approval_done, _) = tokio::sync::oneshot::channel::<()>();
+        drop((steering_tx, followup_tx));
+        TurnChannels {
+            steering_rx,
+            followup_rx,
+            steering_accepted_tx,
+            followup_accepted_tx,
+            sink_done,
+            approval_done,
+        }
+    }
+}
+
+/// Forward accepted steers/follow-ups onto the SSE stream so the remote TUI
+/// can clear its `pending_*` badge and render the prompt. Journaled so a
+/// reattach replay reconstructs the transcript.
+fn spawn_accepted_forwarder(
+    state: Arc<DaemonState>,
+    session_id: String,
+    tx: mpsc::Sender<StreamEnvelope>,
+    mut rx: mpsc::Receiver<String>,
+    event: fn(String) -> StreamEvent,
+) {
+    tokio::spawn(async move {
+        while let Some(content) = rx.recv().await {
+            let event = event(content);
+            let seq = state.next_seq(&session_id);
+            journal_event(&state, &session_id, seq, &event);
+            let _ = tx.send(StreamEnvelope { seq, event }).await;
+        }
+    });
+}
+
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Async:
 /// spawned via `tokio::spawn`, bridges are tasks with `send().await`.
 #[allow(clippy::too_many_arguments)]
@@ -668,11 +729,7 @@ async fn run_agent_turn(
             // stolen by a user chat POST must not remove the user turn's
             // fresh registration (identity-checked via the cancel token).
             let owned = {
-                let mut tokens = self
-                    .state
-                    .cancel_tokens
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut tokens = lock_map(&self.state.cancel_tokens);
                 let owned = tokens
                     .get(&self.session_id)
                     .is_some_and(|token| token.same_token(&self.cancel));
@@ -682,15 +739,9 @@ async fn run_agent_turn(
                 owned
             };
             if owned {
-                self.state
-                    .active_turns
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&self.session_id);
+                lock_map(&self.state.active_turns).remove(&self.session_id);
                 for map in [&self.state.steering_txs, &self.state.followup_txs] {
-                    map.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&self.session_id);
+                    lock_map(map).remove(&self.session_id);
                 }
                 self.state
                     .unregister_stream(&self.session_id, &self.stream_tx);
@@ -713,82 +764,24 @@ async fn run_agent_turn(
     // (direct `run_agent_turn` calls, e.g. tests) create them here.
     let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
         (Some(sr), Some(fr)) => (sr, fr),
-        _ => {
-            let (steering_tx, sr) = mpsc::channel::<QueueMsg>(16);
-            let (followup_tx, fr) = mpsc::channel::<QueueMsg>(16);
-            state
-                .steering_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), steering_tx);
-            state
-                .followup_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), followup_tx);
-            (sr, fr)
-        }
+        _ => create_queue_pair(&state, &session_id),
     };
-    let (steering_accepted_tx, mut steering_accepted_rx) = mpsc::channel::<String>(16);
-    let (followup_accepted_tx, mut followup_accepted_rx) = mpsc::channel::<String>(16);
-    // Forward accepted steers/follow-ups onto the SSE stream so the remote
-    // TUI can clear its `pending_*` badge and render the prompt. Journaled
-    // so a reattach replay reconstructs the transcript.
-    {
-        let tx_clone = tx.clone();
-        let state_clone = state.clone();
-        let sid = session_id.clone();
-        let entry_path = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&sid)
-            .map(|e| e.path.clone());
-        tokio::spawn(async move {
-            let mut journal = entry_path
-                .as_deref()
-                .and_then(|p| Session::from_path(p).ok());
-            while let Some(content) = steering_accepted_rx.recv().await {
-                let event = StreamEvent::SteeringAccepted {
-                    content: content.clone(),
-                };
-                let seq = state_clone.next_seq(&sid);
-                if let Some(j) = journal.as_mut() {
-                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
-                }
-                let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
-            }
-        });
-    }
-    {
-        let tx_clone = tx.clone();
-        let state_clone = state.clone();
-        let sid = session_id.clone();
-        let entry_path = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&sid)
-            .map(|e| e.path.clone());
-        tokio::spawn(async move {
-            let mut journal = entry_path
-                .as_deref()
-                .and_then(|p| Session::from_path(p).ok());
-            while let Some(content) = followup_accepted_rx.recv().await {
-                let event = StreamEvent::FollowupAccepted {
-                    content: content.clone(),
-                };
-                let seq = state_clone.next_seq(&sid);
-                if let Some(j) = journal.as_mut() {
-                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
-                }
-                let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
-            }
-        });
-    }
-    // Own receivers mutably for the async turn (tokio try_recv needs &mut).
-    let mut steering_rx = steering_rx;
-    let mut followup_rx = followup_rx;
+    let (steering_accepted_tx, steering_accepted_rx) = mpsc::channel::<String>(16);
+    let (followup_accepted_tx, followup_accepted_rx) = mpsc::channel::<String>(16);
+    spawn_accepted_forwarder(
+        state.clone(),
+        session_id.clone(),
+        tx.clone(),
+        steering_accepted_rx,
+        |content| StreamEvent::SteeringAccepted { content },
+    );
+    spawn_accepted_forwarder(
+        state.clone(),
+        session_id.clone(),
+        tx.clone(),
+        followup_accepted_rx,
+        |content| StreamEvent::FollowupAccepted { content },
+    );
     // Drain signals for the sink/approval bridges: both run concurrently
     // with this task and may still hold lines they received before the
     // console dropped. The terminal event must be the last one on the wire
@@ -796,6 +789,14 @@ async fn run_agent_turn(
     // while straggler AssistantText/ToolResult events still arrive.
     let (sink_done_tx, sink_done_rx) = tokio::sync::oneshot::channel::<()>();
     let (approval_done_tx, approval_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let channels = TurnChannels {
+        steering_rx,
+        followup_rx,
+        steering_accepted_tx,
+        followup_accepted_tx,
+        sink_done: sink_done_tx,
+        approval_done: approval_done_tx,
+    };
     let result: Result<(String, Option<u64>, Option<u64>), String> = match CatchUnwind::new(
         Box::pin(run_turn_inner(
             &state,
@@ -803,12 +804,7 @@ async fn run_agent_turn(
             &req,
             &cancel,
             &tx,
-            Some(&mut steering_rx),
-            Some(&steering_accepted_tx),
-            Some(&mut followup_rx),
-            Some(&followup_accepted_tx),
-            sink_done_tx,
-            approval_done_tx,
+            channels,
         )),
         "turn panicked",
     )
@@ -840,20 +836,19 @@ async fn run_agent_turn(
         event: terminal,
     };
     let serialized = serde_json::to_string(&env).unwrap_or_default();
-    if let Some(path) = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    // Clone the path first: the guard must die with this statement —
+    // `journal_event` re-locks `sessions`, and a guard held across the
+    // `if let` body would self-deadlock (std Mutex is not reentrant).
+    let turn_path = lock_map(&state.sessions)
         .get(&session_id)
-        .map(|e| e.path.clone())
-    {
-        if let Ok(mut journal) = Session::from_path(&path) {
-            let _ =
-                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
-            // Durable turn_failed marker for runs that did not finish normally.
-            if matches!(&env.event, StreamEvent::TurnFailed { .. })
-                && crate::session::Session::last_turn_state(&path) == "interrupted"
-            {
+        .map(|e| e.path.clone());
+    if let Some(path) = turn_path {
+        journal_event(&state, &session_id, seq, &env.event);
+        // Durable turn_failed marker for runs that did not finish normally.
+        if matches!(&env.event, StreamEvent::TurnFailed { .. })
+            && crate::session::Session::last_turn_state(&path) == "interrupted"
+        {
+            if let Ok(mut journal) = Session::from_path(&path) {
                 let _ = journal.turn_event("turn_failed");
             }
         }
@@ -864,22 +859,16 @@ async fn run_agent_turn(
     let _ = tx.send(env).await;
 }
 
-#[allow(clippy::too_many_arguments, unused_assignments)]
 async fn run_turn_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
-    steering_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
-    steering_accepted_tx: Option<&mpsc::Sender<String>>,
-    followup_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
-    followup_accepted_tx: Option<&mpsc::Sender<String>>,
-    sink_done: tokio::sync::oneshot::Sender<()>,
-    approval_done: tokio::sync::oneshot::Sender<()>,
+    mut channels: TurnChannels,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
-        let sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = lock_map(&state.sessions);
         sessions.get(session_id).cloned()
     }
     .ok_or_else(|| "session not found".to_string())?;
@@ -993,10 +982,7 @@ async fn run_turn_inner(
         let state = state.clone();
         let sid = session_id.to_string();
         Arc::new(move |key: &str| {
-            state
-                .session_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock_map(&state.session_approvals)
                 .get(&sid)
                 .is_some_and(|approved| approved.contains(key))
         })
@@ -1011,10 +997,7 @@ async fn run_turn_inner(
         cwd: entry.cwd.clone(),
         config: Arc::new(config.clone()),
         manager: state.manager_for(session_id),
-        session_approvals: state
-            .session_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        session_approvals: lock_map(&state.session_approvals)
             .get(session_id)
             .cloned()
             .unwrap_or_default(),
@@ -1070,13 +1053,7 @@ async fn run_turn_inner(
     let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
-    if let Some(set) = state
-        .session_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(session_id)
-        .cloned()
-    {
+    if let Some(set) = lock_map(&state.session_approvals).get(session_id).cloned() {
         console.seed_session_approvals(set);
     }
     // Fast-path daemon check before we even park the turn: if the session
@@ -1092,15 +1069,10 @@ async fn run_turn_inner(
     {
         let stream_tx = tx.clone();
         let state = state.clone();
-        let session_path = session.path().map(|p| p.to_path_buf());
         let sid = session_id.to_string();
         let cancel = cancel.clone();
+        let sink_done = channels.sink_done;
         tokio::spawn(async move {
-            // Reopen so journal writes never fight the agent loop's handle;
-            // events land in the separate `<id>.events.jsonl` file.
-            let mut journal = session_path
-                .as_deref()
-                .and_then(|p| Session::from_path(p).ok());
             let mut deferred: Option<SinkLine> = None;
             let mut sink_rx = sink_rx;
             loop {
@@ -1188,9 +1160,7 @@ async fn run_turn_inner(
                     },
                 };
                 let seq = state.next_seq(&sid);
-                if let Some(s) = journal.as_mut() {
-                    let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
-                }
+                journal_event(&state, &sid, seq, &event);
                 let _ = stream_tx.send(StreamEnvelope { seq, event }).await;
             }
             // Drained (or cancelled): run_agent_turn may now emit the
@@ -1207,6 +1177,7 @@ async fn run_turn_inner(
         let session_id = session_id.to_string();
         let stream_tx = tx.clone();
         let cancel = cancel.clone();
+        let approval_done = channels.approval_done;
         tokio::spawn(async move {
             let mut approval_rx = approval_rx;
             while let Some(request) = approval_rx.recv().await {
@@ -1226,11 +1197,8 @@ async fn run_turn_inner(
                     agent_id: request.agent_id,
                     agent: agent.clone(),
                 };
-                let replaced = state
-                    .pending_approvals
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(request_id.clone(), parked);
+                let replaced =
+                    lock_map(&state.pending_approvals).insert(request_id.clone(), parked);
                 if let Some(stale) = replaced {
                     // Should not happen (request_ids are unique); deny to
                     // avoid a deadlock in a stray agent thread.
@@ -1254,27 +1222,17 @@ async fn run_turn_inner(
     }
 
     let mut tool_state = ToolState::load_async().await;
-    #[allow(unused_assignments)]
     // Outer loop for follow-up chaining (mirrors old local `event.rs` loop):
     // `process_turn` consumes steering mid-turn; follow-ups are drained after
-    // each successful turn and chained without a new HTTP request.
-    let mut final_response = String::new();
-    let mut final_usage = None;
-    let mut final_cached = None;
-    let turn_result: Result<String, Box<dyn std::error::Error + Send + Sync>>;
-    // Own the option wrappers for the chained loop; reborrow inner `&mut`
-    // each iteration (tokio `try_recv` needs `&mut`).
-    let mut steering_opt = steering_rx;
-    let mut followup_opt = followup_rx;
-    loop {
-        // Reborrow `&mut Receiver` from `Option<&mut Receiver>` without moving.
-        let steering_reborrow = steering_opt.as_deref_mut();
+    // each successful turn and chained without a new HTTP request. The loop
+    // value IS the turn result — no assigned-then-broken bookkeeping.
+    let turn_result: TurnOutcome = loop {
         let result = process_turn(AgentRuntime {
             config: &config,
             messages: &mut messages,
             state: &mut tool_state,
-            steering_rx: steering_reborrow,
-            steering_accepted_tx,
+            steering_rx: Some(&mut channels.steering_rx),
+            steering_accepted_tx: Some(&channels.steering_accepted_tx),
             session: Some(&mut session),
             client: &config,
             cancel,
@@ -1288,9 +1246,6 @@ async fn run_turn_inner(
         .await;
         match result {
             Ok(resp) => {
-                final_response = resp;
-                final_usage = tool_state.last_usage;
-                final_cached = tool_state.last_cached;
                 // Mid-turn completions drain at this boundary too — the
                 // same seam follow-ups chain through (§10b V1a). With no
                 // follow-up to chain, the persisted notice message still
@@ -1299,24 +1254,15 @@ async fn run_turn_inner(
                 drain_agent_notices(state, session_id, &mut session, &mut messages).await?;
                 // Drain follow-ups queued while this turn ran (`Recall`
                 // cancels one that has not been chained yet).
-                let followups: Vec<String> = match followup_opt.as_mut() {
-                    Some(rx) => {
-                        let mut out: Vec<String> = Vec::new();
-                        while let Ok(msg) = rx.try_recv() {
-                            apply_queue_msg(&mut out, msg);
-                        }
-                        out
-                    }
-                    None => Vec::new(),
-                };
+                let mut followups: Vec<String> = Vec::new();
+                while let Ok(msg) = channels.followup_rx.try_recv() {
+                    apply_queue_msg(&mut followups, msg);
+                }
                 if followups.is_empty() {
-                    turn_result = Ok(final_response.clone());
-                    break;
+                    break Ok((resp, tool_state.last_usage, tool_state.last_cached));
                 }
                 for content in followups {
-                    if let Some(tx) = followup_accepted_tx {
-                        let _ = tx.send(content.clone()).await;
-                    }
+                    let _ = channels.followup_accepted_tx.send(content.clone()).await;
                     let msg = ChatMessage::user_named(content.clone(), "follow-up");
                     session
                         .append_message(&msg)
@@ -1324,22 +1270,15 @@ async fn run_turn_inner(
                     messages.push(msg);
                 }
                 if cancel.is_cancelled() {
-                    turn_result = Err("cancelled by user".into());
-                    break;
+                    break Err("cancelled by user".into());
                 }
                 // chained follow-up: loop and run another turn with the same
                 // session/messages/tool_state but without new turn_start marker
                 // (the followup is already persisted).
-                continue;
             }
-            Err(e) => {
-                turn_result = Err(e);
-                break;
-            }
+            Err(e) => break Err(e),
         }
-    }
-    let usage = final_usage;
-    let cached = final_cached;
+    };
     // Durable terminal marker (P8): a completed turn is recorded before the
     // event is relayed; a failed one gets `turn_failed` in run_agent_turn.
     match &turn_result {
@@ -1350,9 +1289,7 @@ async fn run_turn_inner(
             .turn_event("turn_failed")
             .map_err(|e| format!("failed to record turn_failed: {e}"))?,
     }
-    turn_result
-        .map_err(|e| e.to_string())
-        .map(|response| (response, usage, cached))
+    turn_result.map_err(|e| e.to_string())
 }
 
 /// Drain queued child completion notices into ONE user-role message
@@ -1436,12 +1373,7 @@ async fn child_approval_bridge(
     while let Some(request) = rx.recv().await {
         // The session's manager was dropped (deleted/reset): deny so the
         // child's blocked tool call unwinds instead of parking forever.
-        if !state
-            .agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&session_id)
-        {
+        if !lock_map(&state.agents).contains_key(&session_id) {
             let _ = request.response.try_send(ApprovalDecision::Deny);
             continue;
         }
@@ -1460,11 +1392,7 @@ async fn child_approval_bridge(
             agent_id: request.agent_id.clone(),
             agent: agent.clone(),
         };
-        let replaced = state
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id.clone(), parked);
+        let replaced = lock_map(&state.pending_approvals).insert(request_id.clone(), parked);
         if let Some(stale) = replaced {
             let _ = stale.response.try_send(ApprovalDecision::Deny);
         }
@@ -1479,20 +1407,7 @@ async fn child_approval_bridge(
                 agent: agent.clone(),
             },
         };
-        if let Some(path) = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&session_id)
-            .map(|e| e.path.clone())
-        {
-            if let Ok(mut journal) = Session::from_path(&path) {
-                let _ = journal.append_event(
-                    env.seq,
-                    &serde_json::to_string(&env.event).unwrap_or_default(),
-                );
-            }
-        }
+        journal_event(&state, &session_id, env.seq, &env.event);
         state.broadcast_event(&session_id, &env);
         // The five-minute denial timer. Resolution removes the entry first,
         // so an answered prompt never double-denies.
@@ -1532,10 +1447,7 @@ async fn child_approval_bridge(
 fn timeout_pending(
     state: &Arc<DaemonState>,
 ) -> std::sync::MutexGuard<'_, HashMap<String, PendingApproval>> {
-    state
-        .pending_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lock_map(&state.pending_approvals)
 }
 
 /// One audit row for an approval resolution (the same shape `approve`
@@ -1609,12 +1521,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             if !state.client_seen_fresh(&session_id, WAKE_PRESENCE_WINDOW) {
                 return;
             }
-            if state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&session_id)
-            {
+            if lock_map(&state.active_turns).contains(&session_id) {
                 // A user turn is live: it drains at its boundary. Re-check
                 // after it ends so a notice landing mid-turn still wakes.
                 tokio::time::sleep(WAKE_RETRY).await;
@@ -1628,33 +1535,17 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 return; // one wake at a time per session
             };
             // Re-check idle after claiming (the claim raced a user turn).
-            if state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&session_id)
-            {
+            if lock_map(&state.active_turns).contains(&session_id) {
                 state.cancel_wake(&session_id);
                 continue;
             }
             // The wake holds the session's turn slot, so the append-only log
             // stays serialized; the user chat POST steals instead of 409ing.
-            state
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone());
-            state
-                .cancel_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id.clone(), wake_cancel.clone());
+            lock_map(&state.active_turns).insert(session_id.clone());
+            lock_map(&state.cancel_tokens).insert(session_id.clone(), wake_cancel.clone());
             // Same model the session's last turn used (stored per session);
             // permission resolves from the daemon's own ceiling.
-            let model = state
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let model = lock_map(&state.sessions)
                 .get(&session_id)
                 .and_then(|entry| {
                     crate::session::load_session_state(&entry.path)
@@ -1701,28 +1592,15 @@ async fn approve(
     Path(session_id): Path<String>,
     Json(req): Json<ApprovalResponse>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let pending = state
-        .pending_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&req.request_id);
+    let pending = lock_map(&state.pending_approvals).remove(&req.request_id);
 
     match pending {
         Some(pending) if pending.session_id == session_id => {
-            let decision = match req.decision {
-                crate::protocol::ApprovalDecision::AllowOnce => ApprovalDecision::Once,
-                crate::protocol::ApprovalDecision::AllowSession => {
-                    // Persist for the whole session so next turns skip the overlay
-                    state.record_session_approval(&session_id, &pending.name, &pending.input);
-                    ApprovalDecision::Session
-                }
-                crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
-            };
-            let decision_str = match decision {
-                ApprovalDecision::Once => "once",
-                ApprovalDecision::Session => "session",
-                ApprovalDecision::Deny => "deny",
-            };
+            let decision = ApprovalDecision::from(req.decision);
+            if decision == ApprovalDecision::Session {
+                // Persist for the whole session so next turns skip the overlay
+                state.record_session_approval(&session_id, &pending.name, &pending.input);
+            }
             // Audit: best-effort, redacted input hash, actor, request_id.
             // A child-agent prompt records its label so the trail names the
             // requester (§12 V1b).
@@ -1731,7 +1609,7 @@ async fn approve(
                 &req.request_id,
                 &pending.name,
                 &pending.input,
-                decision_str,
+                decision.as_str(),
                 "remote",
                 pending.agent.as_deref(),
             );
@@ -1741,11 +1619,7 @@ async fn approve(
         Some(pending) => {
             // Restore on cross-session attempt so the legitimate session can
             // still resolve it.
-            state
-                .pending_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(req.request_id, pending);
+            lock_map(&state.pending_approvals).insert(req.request_id, pending);
             Err(StatusCode::NOT_FOUND)
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -1760,25 +1634,13 @@ async fn cancel(
     // loop poll this token between steps. A missing entry means no turn is
     // running for the session, so there is nothing to cancel. Cloned under
     // the lock, cancelled outside it — never hold the mutex across the call.
-    if let Some(token) = state
-        .cancel_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&session_id)
-        .cloned()
-    {
+    if let Some(token) = lock_map(&state.cancel_tokens).get(&session_id).cloned() {
         token.cancel();
     }
     // Same for an in-flight `!` shell run (Esc cancels it).
     // One Esc cancels whatever is running; a turn and a shell overlap only
     // when the user explicitly started both.
-    if let Some(token) = state
-        .shell_tokens
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&session_id)
-        .cloned()
-    {
+    if let Some(token) = lock_map(&state.shell_tokens).get(&session_id).cloned() {
         token.cancel();
     }
 
@@ -1790,6 +1652,22 @@ async fn cancel(
     }
 
     Json(json!({ "status": "ok" }))
+}
+
+/// Select the per-turn queue for `session_id`: steering unless `followup`.
+/// `None` when the live turn holds no queue yet — the caller surfaces that
+/// as a 409 (nothing to steer/follow/recall against).
+fn queue_tx(
+    state: &DaemonState,
+    session_id: &str,
+    followup: bool,
+) -> Option<mpsc::Sender<QueueMsg>> {
+    let map = if followup {
+        lock_map(&state.followup_txs)
+    } else {
+        lock_map(&state.steering_txs)
+    };
+    map.get(session_id).cloned()
 }
 
 async fn steer(
@@ -1806,11 +1684,7 @@ async fn steer(
     if lookup_entry(&state, &session_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let tx = {
-        let map = state.steering_txs.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::CONFLICT)?;
+    let tx = queue_tx(&state, &session_id, false).ok_or(StatusCode::CONFLICT)?;
     tx.send(QueueMsg::Content(content))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;
@@ -1830,11 +1704,7 @@ async fn followup(
     if lookup_entry(&state, &session_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let tx = {
-        let map = state.followup_txs.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::CONFLICT)?;
+    let tx = queue_tx(&state, &session_id, true).ok_or(StatusCode::CONFLICT)?;
     tx.send(QueueMsg::Content(content))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;
@@ -1858,15 +1728,7 @@ async fn recall(
     if lookup_entry(&state, &session_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let tx = {
-        let map = if req.followup {
-            state.followup_txs.lock().unwrap_or_else(|e| e.into_inner())
-        } else {
-            state.steering_txs.lock().unwrap_or_else(|e| e.into_inner())
-        };
-        map.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::CONFLICT)?;
+    let tx = queue_tx(&state, &session_id, req.followup).ok_or(StatusCode::CONFLICT)?;
     tx.send(QueueMsg::Recall(content))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;
@@ -1878,13 +1740,7 @@ async fn recall(
 /// been scanned yet. A disk hit is registered (live entries win over the
 /// later rebuild merge via `or_insert`) so subsequent lookups stay in-memory.
 fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
-    if let Some(entry) = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(session_id)
-        .cloned()
-    {
+    if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
     let (path, header) = session::Session::list_all()
@@ -1896,11 +1752,7 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
         name: header.name().map(ToOwned::to_owned),
         cwd: header.cwd().to_string(),
     };
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(session_id.to_string(), entry.clone());
+    lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
     Some(entry)
 }
 
@@ -1915,30 +1767,30 @@ fn session_path(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `GET /api/sessions/{id}/events?since=<seq>` — replay journaled stream
-/// events after a cursor (P10). Missing journal file replays nothing.
+/// Take the session's active-turn slot; `false` when a live turn holds it.
+/// The registry guard dies inside this fn — it never spans an await.
+fn try_claim_slot(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    let mut active = lock_map(&state.active_turns);
+    if active.contains(session_id) {
+        return false;
+    }
+    active.insert(session_id.to_string());
+    true
+}
+
+// Chat wins over an idle wake (§10b V1b): cancel the wake, then take the
+// turn slot. Without a wake, a second chat 409s immediately. With one, the
+// wake may still hold the slot while it unwinds; poll instead of blocking
+// the handler on a condvar.
 async fn steal_wake_and_claim(state: &Arc<DaemonState>, session_id: &str) -> bool {
     let had_wake = state.cancel_wake(session_id).is_some();
     for _ in 0..250 {
-        // The guard dies inside this block, before the poll sleep below —
-        // a std::sync guard must never span an await.
-        let claimed = {
-            let mut active = state.active_turns.lock().unwrap_or_else(|e| e.into_inner());
-            if active.contains(session_id) {
-                false
-            } else {
-                active.insert(session_id.to_string());
-                true
-            }
-        };
-        if claimed {
+        if try_claim_slot(state, session_id) {
             return true;
         }
         if !had_wake {
             return false;
         }
-        // The wake holds the slot only while it unwinds; poll instead of
-        // blocking the handler on a condvar.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     false
@@ -2117,7 +1969,7 @@ async fn session_shell(
     let session_file = session_path(&state, &session_id)?;
     let shell_cancel = CancellationToken::new();
     {
-        let mut running = state.shell_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = lock_map(&state.shell_tokens);
         if running.contains_key(&session_id) {
             return Err(StatusCode::CONFLICT);
         }
@@ -2131,11 +1983,7 @@ async fn session_shell(
     }
     impl Drop for ShellGuard {
         fn drop(&mut self) {
-            self.state
-                .shell_tokens
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.session_id);
+            lock_map(&self.state.shell_tokens).remove(&self.session_id);
         }
     }
     let _guard = ShellGuard {
@@ -2810,9 +2658,7 @@ mod handler_tests {
     async fn create_session_registers_and_lists_from_disk() {
         // Redirects where ALL sessions live; serialize against other tests
         // that read/write the sessions dir.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-srv-create-{}", std::process::id()));
         let _env =
             crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
@@ -2941,9 +2787,7 @@ mod handler_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     async fn approve_allow_session_records_approval_and_writes_audit() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-srv-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
@@ -3178,9 +3022,7 @@ this line is torn and not json
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     async fn lookup_entry_disk_fallback_and_reattach_seed_from_disk() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir =
             std::env::temp_dir().join(format!("dex-srv-fallback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -3514,9 +3356,7 @@ mod permission_gate_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
 
         // Hermetic session storage.
         let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
@@ -3580,12 +3420,7 @@ mod permission_gate_tests {
             &mk_req(Some("trusted"), None),
             &cancel,
             &tx,
-            None,
-            None,
-            None,
-            None,
-            tokio::sync::oneshot::channel::<()>().0,
-            tokio::sync::oneshot::channel::<()>().0,
+            TurnChannels::detached(),
         )
         .await
         .unwrap_err();
@@ -3605,12 +3440,7 @@ mod permission_gate_tests {
             &mk_req(Some("read-only"), None),
             &cancel,
             &tx,
-            None,
-            None,
-            None,
-            None,
-            tokio::sync::oneshot::channel::<()>().0,
-            tokio::sync::oneshot::channel::<()>().0,
+            TurnChannels::detached(),
         )
         .await
         .unwrap_err();
@@ -3626,12 +3456,7 @@ mod permission_gate_tests {
             &mk_req(Some("read-only"), Some("{not json")),
             &cancel,
             &tx,
-            None,
-            None,
-            None,
-            None,
-            tokio::sync::oneshot::channel::<()>().0,
-            tokio::sync::oneshot::channel::<()>().0,
+            TurnChannels::detached(),
         )
         .await
         .unwrap_err();
@@ -3673,9 +3498,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn client_denies_write_then_turn_completes() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
 
         // Fake provider: request 0 asks for a write; later requests finish.
         const TOOL_SSE: &str = concat!(
@@ -3834,9 +3657,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn delegate_runs_child_and_notice_drains_next_turn() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
 
         const DELEGATE_SSE: &str = concat!(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"delegate","arguments":"{\"agent\":\"explorer\",\"task\":\"find where the gate lives\"}"}}]}}]}"#,
@@ -3867,9 +3688,7 @@ mod e2e_tests {
                     async move {
                         let parsed: serde_json::Value =
                             serde_json::from_str(&body).unwrap_or_default();
-                        seen.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(parsed.clone());
+                        lock_map(&seen).push(parsed.clone());
                         let system = parsed["messages"][0]["content"]
                             .as_str()
                             .unwrap_or_default();
@@ -4039,7 +3858,7 @@ mod e2e_tests {
 
         // The second chat's LLM request carried the notice: the status line
         // plus the child's summary (what the parent consumes, §6).
-        let bodies = requests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let bodies = lock_map(&requests).clone();
         let last = bodies.last().unwrap();
         let notice_messages: Vec<&serde_json::Value> = last["messages"]
             .as_array()
@@ -4113,9 +3932,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env + token global must stay pinned
     async fn bearer_gate_blocks_api_routes_and_config_reports_info() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-e2e-bearer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -4241,9 +4058,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn idempotent_chat_replays_the_recorded_terminal_event() {
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         const DONE_SSE: &str =
             "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\ndata: [DONE]\n\n";
         let calls = Arc::new(AtomicUsize::new(0));
@@ -4383,9 +4198,7 @@ mod async_parallel_tests {
     #[allow(clippy::await_holding_lock)]
     async fn list_sessions_joins_parallel_and_sorts() {
         // TDD Phase 4 (S2): JoinSet per-file scans, join, sort — same as sequential, ~50ms not ~500ms.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-list-par-{}", std::process::id()));
         let saved = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &data_dir);

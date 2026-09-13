@@ -193,16 +193,13 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
                 session: args.rest[1].clone(),
             }
         }
-        Some(prompt) if !prompt.starts_with('-') => Mode::OneShot {
+        None => Mode::Default,
+        // The bare prompt and unknown flags (e.g. `-x`) both take the
+        // one-shot path: unknown flags are treated as part of the prompt
+        // for backwards compat.
+        Some(_) => Mode::OneShot {
             prompt: args.rest.join(" "),
         },
-        None => Mode::Default,
-        Some(_unknown) => {
-            // Treat unknown flags as part of the prompt for backwards compat.
-            Mode::OneShot {
-                prompt: args.rest.join(" "),
-            }
-        }
     }
 }
 

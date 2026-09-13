@@ -14,6 +14,14 @@ use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 
+/// Poison-recovery lock for every daemon state mutex: a panicking thread
+/// must not take the daemon down — grab the (possibly poisoned) guard and
+/// carry on, same as the previous inline
+/// `.lock().unwrap_or_else(|e| e.into_inner())` spelling at every former site.
+pub(crate) fn lock_map<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // Daemon bearer token
 // ---------------------------------------------------------------------------
@@ -95,23 +103,19 @@ pub(crate) fn prepare_daemon_token(addr: &std::net::SocketAddr) {
             eprintln!("daemon: clients connect with DEX_DAEMON_TOKEN=<token>");
             Some(token)
         });
-    *REQUIRED_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+    *lock_map(&REQUIRED_TOKEN) = Some(token);
 }
 
 /// The credential this daemon process requires (`None` → unauthenticated).
 /// Cloned (not `&'static`) so tests can re-resolve per case without
 /// poisoning a process-global `OnceLock`.
 pub(crate) fn required_token() -> Option<String> {
-    REQUIRED_TOKEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .flatten()
+    lock_map(&REQUIRED_TOKEN).clone().flatten()
 }
 
 #[cfg(test)]
 pub(crate) fn reset_daemon_token_for_tests() {
-    *REQUIRED_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *lock_map(&REQUIRED_TOKEN) = None;
 }
 
 /// A pending tool execution awaiting the client's approval decision.
@@ -242,9 +246,7 @@ impl DaemonState {
     /// Register a live SSE stream for a session (V1b): journaled agent
     /// events are pushed to it while it lasts.
     pub(crate) fn register_stream(&self, session_id: &str, tx: &mpsc::Sender<StreamEnvelope>) {
-        self.active_streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_map(&self.active_streams)
             .entry(session_id.to_string())
             .or_default()
             .push(tx.clone());
@@ -253,9 +255,7 @@ impl DaemonState {
     /// Drop one stream registration (identity-matched, so a turn's teardown
     /// cannot remove a newer turn's registration).
     pub(crate) fn unregister_stream(&self, session_id: &str, tx: &mpsc::Sender<StreamEnvelope>) {
-        self.active_streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_map(&self.active_streams)
             .entry(session_id.to_string())
             .or_default()
             .retain(|existing| !existing.same_channel(tx));
@@ -265,10 +265,7 @@ impl DaemonState {
     /// journal is the source of truth; the push is a latency nicety and a
     /// full/closed channel is harmless.
     pub(crate) fn broadcast_event(&self, session_id: &str, env: &StreamEnvelope) {
-        let senders = self
-            .active_streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let senders = lock_map(&self.active_streams)
             .get(session_id)
             .cloned()
             .unwrap_or_default();
@@ -279,17 +276,12 @@ impl DaemonState {
 
     /// Presence heartbeat (V1b): a client read this session's journal now.
     pub(crate) fn touch_client_seen(&self, session_id: &str) {
-        self.last_client_seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id.to_string(), Instant::now());
+        lock_map(&self.last_client_seen).insert(session_id.to_string(), Instant::now());
     }
 
     /// A client read the journal within `window` — plausibly an audience.
     pub(crate) fn client_seen_fresh(&self, session_id: &str, window: Duration) -> bool {
-        self.last_client_seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_map(&self.last_client_seen)
             .get(session_id)
             .is_some_and(|seen| seen.elapsed() < window)
     }
@@ -298,7 +290,7 @@ impl DaemonState {
     /// already live — one at a time per session (plan §10b).
     pub(crate) fn claim_wake(&self, session_id: &str) -> Option<CancellationToken> {
         let token = CancellationToken::new();
-        let mut wakes = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wakes = lock_map(&self.wakes);
         if wakes.contains_key(session_id) {
             return None;
         }
@@ -308,11 +300,7 @@ impl DaemonState {
 
     /// Steal (cancel) a session's idle wake — the user chat POST wins.
     pub(crate) fn cancel_wake(&self, session_id: &str) -> Option<CancellationToken> {
-        let token = self
-            .wakes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id)?;
+        let token = lock_map(&self.wakes).remove(session_id)?;
         token.cancel();
         Some(token)
     }
@@ -325,17 +313,14 @@ impl DaemonState {
         session_id: Option<&str>,
     ) -> Vec<tokio::sync::mpsc::Sender<ApprovalDecision>> {
         let mut out = Vec::new();
-        self.pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, p| {
-                if p.agent_id.is_some() && session_id.is_none_or(|sid| p.session_id == sid) {
-                    out.push(p.response.clone());
-                    false
-                } else {
-                    true
-                }
-            });
+        lock_map(&self.pending_approvals).retain(|_, p| {
+            if p.agent_id.is_some() && session_id.is_none_or(|sid| p.session_id == sid) {
+                out.push(p.response.clone());
+                false
+            } else {
+                true
+            }
+        });
         out
     }
 
@@ -349,17 +334,14 @@ impl DaemonState {
         session_id: &str,
     ) -> Vec<tokio::sync::mpsc::Sender<ApprovalDecision>> {
         let mut out = Vec::new();
-        self.pending_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, p| {
-                if p.agent_id.is_none() && p.session_id == session_id {
-                    out.push(p.response.clone());
-                    false
-                } else {
-                    true
-                }
-            });
+        lock_map(&self.pending_approvals).retain(|_, p| {
+            if p.agent_id.is_none() && p.session_id == session_id {
+                out.push(p.response.clone());
+                false
+            } else {
+                true
+            }
+        });
         out
     }
 
@@ -371,7 +353,7 @@ impl DaemonState {
     /// drops the hooks and breaks it — nothing leaks.
     /// Phase 5's delegate tool is the first caller.
     pub(crate) fn manager_for(self: &Arc<Self>, session_id: &str) -> AgentManager {
-        let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut agents = lock_map(&self.agents);
         agents
             .entry(session_id.to_string())
             .or_insert_with(|| {
@@ -397,11 +379,7 @@ impl DaemonState {
         for sender in self.take_agent_pendings(Some(session_id)) {
             let _ = sender.send(ApprovalDecision::Deny).await;
         }
-        let manager = self
-            .agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
+        let manager = lock_map(&self.agents).remove(session_id);
         if let Some(manager) = manager {
             manager.shutdown().await;
         }
@@ -412,7 +390,7 @@ impl DaemonState {
     /// after this returns no child task is live and every manager is closed.
     pub(crate) async fn shutdown_agents(&self) {
         let managers: Vec<AgentManager> = {
-            let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+            let mut agents = lock_map(&self.agents);
             std::mem::take(&mut *agents).into_values().collect()
         };
         for manager in managers {
@@ -429,18 +407,14 @@ impl DaemonState {
     /// command, else full input hash.
     pub(crate) fn is_session_approved(&self, session_id: &str, name: &str, input: &str) -> bool {
         let key = crate::core::console::Console::approval_key(name, input);
-        self.session_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_map(&self.session_approvals)
             .get(session_id)
             .is_some_and(|set| set.contains(&key))
     }
 
     pub(crate) fn record_session_approval(&self, session_id: &str, name: &str, input: &str) {
         let key = crate::core::console::Console::approval_key(name, input);
-        self.session_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_map(&self.session_approvals)
             .entry(session_id.to_string())
             .or_default()
             .insert(key);
@@ -450,7 +424,7 @@ impl DaemonState {
     /// (None) when the key is unknown, stale, or names a different session or
     /// request hash.
     fn idempotent_replay(&self, key: &str, session_id: &str, request_hash: u64) -> Option<String> {
-        let mut map = self.idempotency.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = lock_map(&self.idempotency);
         map.retain(|_, t| t.at.elapsed() < IDEMPOTENCY_WINDOW);
         let turn = map.get(key)?;
         if turn.session_id != session_id || turn.request_hash != request_hash {
@@ -461,23 +435,20 @@ impl DaemonState {
 
     /// Record a completed turn for `Idempotency-Key` dedup.
     fn idempotency_record(&self, key: &str, session_id: &str, request_hash: u64, terminal: String) {
-        self.idempotency
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                key.to_string(),
-                IdempotentTurn {
-                    session_id: session_id.to_string(),
-                    request_hash,
-                    terminal,
-                    at: Instant::now(),
-                },
-            );
+        lock_map(&self.idempotency).insert(
+            key.to_string(),
+            IdempotentTurn {
+                session_id: session_id.to_string(),
+                request_hash,
+                terminal,
+                at: Instant::now(),
+            },
+        );
     }
 
     /// Allocate the next event seq for a session.
     fn next_seq(&self, session_id: &str) -> u64 {
-        let mut map = self.event_seqs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = lock_map(&self.event_seqs);
         let next = map.entry(session_id.to_string()).or_insert(0);
         let seq = *next;
         *next += 1;
@@ -488,7 +459,7 @@ impl DaemonState {
     /// concurrent turn can land between the two (shell tool-block replay
     /// stays adjacent).
     fn next_seq_pair(&self, session_id: &str) -> (u64, u64) {
-        let mut map = self.event_seqs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = lock_map(&self.event_seqs);
         let next = map.entry(session_id.to_string()).or_insert(0);
         let first = *next;
         *next += 2;
@@ -502,9 +473,7 @@ impl DaemonState {
     /// the background, so a turn may have allocated seqs before this seeds.
     fn seed_seq(&self, session_id: &str, path: &std::path::Path) {
         let next = crate::session::Session::max_event_seq(path).map_or(0, |max| max + 1);
-        self.event_seqs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lock_map(&self.event_seqs)
             .entry(session_id.to_string())
             .and_modify(|seq| *seq = (*seq).max(next))
             .or_insert(next);
@@ -552,9 +521,7 @@ impl DaemonState {
         let mut entries = Vec::new();
         let mut interrupted = Vec::new();
         for (id, path, name, cwd, seq_next, is_interrupted) in scanned {
-            self.event_seqs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock_map(&self.event_seqs)
                 .entry(id.clone())
                 .and_modify(|s| *s = (*s).max(seq_next))
                 .or_insert(seq_next);
@@ -564,11 +531,7 @@ impl DaemonState {
             entries.push((id, SessionEntry { path, name, cwd }));
         }
         for (id, path) in &interrupted {
-            let live = self
-                .active_turns
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(id);
+            let live = lock_map(&self.active_turns).contains(id);
             if live {
                 continue;
             }
@@ -581,11 +544,28 @@ impl DaemonState {
                 });
             }
         }
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = lock_map(&self.sessions);
         for (id, entry) in entries {
             sessions.entry(id).or_insert(entry);
         }
         self.rebuild_complete.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Append one numbered stream event to the session's `.events.jsonl`
+/// journal (P10). Best effort like every journal write here: a missing
+/// registry entry or unreadable session file silently skips the append —
+/// the live SSE stream is the primary delivery path, the journal only
+/// feeds `?since=` replay.
+pub(crate) fn journal_event(state: &DaemonState, session_id: &str, seq: u64, event: &StreamEvent) {
+    let path = lock_map(&state.sessions)
+        .get(session_id)
+        .map(|entry| entry.path.clone());
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut journal) = crate::session::Session::from_path(&path) {
+        let _ = journal.append_event(seq, &serde_json::to_string(event).unwrap_or_default());
     }
 }
 
@@ -601,10 +581,7 @@ impl DaemonState {
 /// sees child lifecycle live. A completion also schedules the idle wake
 /// turn (§10b V1b).
 fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentEvent) {
-    let path = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let path = lock_map(&state.sessions)
         .get(session_id)
         .map(|entry| entry.path.clone());
     let Some(path) = path else {
@@ -910,11 +887,7 @@ mod tests {
     fn fresh_state_has_no_agent_managers() {
         // Restart-empty: no child registries until first delegate.
         let state = std::sync::Arc::new(DaemonState::new());
-        assert!(state
-            .agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(lock_map(&state.agents).is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -979,19 +952,13 @@ mod tests {
         state.shutdown_agents().await;
         assert_eq!(first.active_count(), 0);
         assert_eq!(second.active_count(), 0);
-        assert!(state
-            .agents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(lock_map(&state.agents).is_empty());
     }
 
     #[test]
     fn event_seq_is_seeded_from_disk_after_restart() {
         // Touches the shared sessions dir; serialize against env-redirecting tests.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         // Simulate a prior run: a session with events already journaled.
         let mut s = crate::session::Session::new("/tmp/dex-seq-test".into(), None).unwrap();
         s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
@@ -1006,14 +973,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Redirect `XDG_DATA_HOME` to a pid-unique dir for the guard's lifetime.
+    /// `rebuild_async` scans the whole sessions dir; without this, concurrent
+    /// test binaries (same fixed /tmp session names) mark each other's live
+    /// sessions as failed. Additive test infra — no assertion changes.
+    /// Caller MUST hold `TEST_SESSIONS_ENV_LOCK` (env is process-global);
+    /// every user of this helper does.
+    struct HermeticXdg(Option<std::ffi::OsString>, std::path::PathBuf);
+    impl Drop for HermeticXdg {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    fn hermetic_xdg() -> HermeticXdg {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dex-daemon-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        HermeticXdg(prev, dir)
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
-        // Depends on where the sessions dir resolves; serialize against tests
-        // that redirect XDG_DATA_HOME.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Hermetic sessions dir: rebuild_async scans everything under
+        // XDG_DATA_HOME, so concurrent test binaries must not see each other.
+        let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _xdg_guard = hermetic_xdg();
         // A session killed mid-turn: turn_start with no terminal entry.
         let mut s = crate::session::Session::new("/tmp/dex-rebuild-test".into(), None).unwrap();
         let id = s.id().to_string();
@@ -1045,9 +1042,7 @@ mod tests {
     fn event_seq_seed_advances_past_a_single_seq_zero() {
         // `max_event_seq` is None when empty but Some(0) for a journal
         // holding exactly seq 0; the seed must not reuse seq 0.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let mut s = crate::session::Session::new("/tmp/dex-seq-zero-test".into(), None).unwrap();
         s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
             .unwrap();
@@ -1064,9 +1059,9 @@ mod tests {
     async fn rebuild_skips_failed_marking_for_live_turns() {
         // A reattach + chat racing the background rebuild owns the journal:
         // stamping `turn_failed` under its live `turn_start` would corrupt it.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
+        let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _xdg_guard = hermetic_xdg();
         let mut s =
             crate::session::Session::new("/tmp/dex-rebuild-live-test".into(), None).unwrap();
         let id = s.id().to_string();
@@ -1091,9 +1086,9 @@ mod tests {
     async fn rebuild_registry_merge_keeps_live_entries() {
         // Sessions claimed (reattached/created) mid-rebuild win over disk via
         // `or_insert` — the rebuild must not clobber them.
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
+        let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _xdg_guard = hermetic_xdg();
         let s = crate::session::Session::new("/tmp/dex-rebuild-wins-test".into(), None).unwrap();
         let id = s.id().to_string();
         let path = s.path().unwrap().to_path_buf();
@@ -1139,9 +1134,7 @@ mod tests {
                 reset_daemon_token_for_tests();
             }
         }
-        let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _restore = Restore {
             xdg: std::env::var_os("XDG_DATA_HOME"),
             token: std::env::var_os("DEX_DAEMON_TOKEN"),

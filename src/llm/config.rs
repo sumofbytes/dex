@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -9,16 +10,142 @@ use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
 use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
 
+/// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
+/// unset or unparseable. Single-sources the
+/// `env::var(..).ok().and_then(|v| v.parse().ok()).unwrap_or(..)` ladder
+/// repeated through `from_env`.
+fn env_parse<T: FromStr>(name: &str, default: T) -> T {
+    env_parse_opt(name).unwrap_or(default)
+}
+
+/// Same env read + parse, but the caller keeps the fallback chain — used
+/// where the default is reached only after catalog lookups
+/// (`DEX_CONTEXT_WINDOW`).
+fn env_parse_opt<T: FromStr>(name: &str) -> Option<T> {
+    env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// Shared XDG-vs-HOME directory resolution: `$<env_var>/dex/<rel>` when the
+/// XDG variable is set, else `$HOME/<home_sub>/dex/<rel>`, else `None` (no
+/// `HOME`). Pure re-expression of the layout every config/cache path below
+/// uses; the env var is a parameter because the sites use three different
+/// ones (`DEX_CONFIG` overrides the whole config path, so its check stays
+/// at that call site).
+fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathBuf> {
+    if let Some(dir) = env::var_os(env_var) {
+        return Some(std::path::PathBuf::from(dir).join(rel));
+    }
+    env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(home_sub).join(rel))
+}
+
+/// File-identity cache entry shared by the config file, learned-apis map,
+/// and models.dev catalog: the parse is served while (path, mtime, len) is
+/// unchanged.
+struct FileCache<T> {
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    value: T,
+}
+
+/// Stat `path` and serve `cache`'s stored parse while (path, mtime, len) is
+/// unchanged; on a miss, read the file and hand the text to `parse`, storing
+/// the result. `parse` gets `None` when the read failed and returns `None`
+/// when nothing should be cached (stat/read/parse failure) — the caller
+/// decides what that means (empty default vs hard failure).
+/// Poisoned-mutex recovery matches the rest of the daemon: keep the value.
+fn cached_parse<T: Clone>(
+    cache: &OnceLock<Mutex<Option<FileCache<T>>>>,
+    path: &std::path::Path,
+    parse: impl FnOnce(Option<String>) -> Option<T>,
+) -> Option<T> {
+    let meta = std::fs::metadata(path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    if let Some(hit) = cache
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+    {
+        return Some(hit.value.clone());
+    }
+    let value = parse(std::fs::read_to_string(path).ok())?;
+    cache
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(FileCache {
+            path: path.to_path_buf(),
+            mtime,
+            len,
+            value: value.clone(),
+        });
+    Some(value)
+}
+
+/// One resolved knob: the value that `from_env` applies and the origin
+/// that `doctor` reports. Both sides consume the same resolution, so the
+/// precedence rule exists once and `doctor` cannot drift from runtime
+/// routing.
+struct Resolved<T> {
+    value: T,
+    origin: &'static str,
+}
+
+/// The single selection knob — `--model` > `DEX_MODEL` > file `model:` >
+/// builtin default. The flag is pre-filtered by the caller: `from_env`
+/// keeps an empty `--model` as a literal selection (historical behavior),
+/// `doctor` treats it as unset.
+fn resolve_selection(flag: Option<String>, file: &Option<serde_yaml::Value>) -> Resolved<String> {
+    let dex_model = env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty());
+    let file_model = load_config_str(file, "model");
+    let value = flag
+        .clone()
+        .or(dex_model.clone())
+        .or(file_model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let origin = if flag.is_some() {
+        "--model"
+    } else if dex_model.is_some() {
+        "DEX_MODEL"
+    } else if file_model.is_some() {
+        "config model:"
+    } else {
+        "built-in default"
+    };
+    Resolved { value, origin }
+}
+
+/// Provider fallback when the selection carries no prefix: `DEX_PROVIDER`
+/// (deprecated) > file `active_provider:` (deprecated) > "opencode".
+/// Returns doctor's origin wording alongside the name; `from_env` ignores
+/// it. The `warn_once` fires here (deduped) so both entry points warn.
+fn provider_fallback_with_origin(
+    file: &Option<serde_yaml::Value>,
+) -> (String, Option<&'static str>) {
+    if let Ok(name) = env::var("DEX_PROVIDER") {
+        if !name.trim().is_empty() {
+            warn_once(
+                "env:DEX_PROVIDER",
+                "env var DEX_PROVIDER is deprecated — use DEX_MODEL=<provider>/<model> (e.g. DEX_MODEL=openai-codex)",
+            );
+            return (name, Some("DEX_PROVIDER (deprecated)"));
+        }
+    }
+    match load_provider_name(file) {
+        Some(name) => (name, Some("config active_provider: (deprecated)")),
+        None => ("opencode".to_string(), Some("built-in default")),
+    }
+}
+
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
 /// > `~/.config/dex/config.yaml`.
 fn config_file_path() -> Option<std::path::PathBuf> {
     if let Some(p) = env::var_os("DEX_CONFIG") {
         return Some(std::path::PathBuf::from(p));
     }
-    let dir = env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-    Some(dir.join("dex/config.yaml"))
+    xdg_path("XDG_CONFIG_HOME", ".config", "dex/config.yaml")
 }
 
 /// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
@@ -26,77 +153,54 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 /// Cached process-wide and invalidated by file identity (path + mtime +
 /// length): `from_env` runs per chat turn on the daemon, and each call was
 /// re-reading + re-parsing the file.
-struct CachedConfigFile {
-    path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
-    value: Option<serde_yaml::Value>,
-}
-
-static CONFIG_CACHE: OnceLock<Mutex<Option<CachedConfigFile>>> = OnceLock::new();
+static CONFIG_CACHE: OnceLock<Mutex<Option<FileCache<Option<serde_yaml::Value>>>>> =
+    OnceLock::new();
 
 fn load_config_file() -> Option<serde_yaml::Value> {
     let path = config_file_path()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
-    if let Some(hit) = CONFIG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
-    {
-        return hit.value.clone();
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value = match serde_yaml::from_str::<serde_yaml::Value>(&text) {
-        Ok(value) => {
-            // Unknown keys are almost always typos; name them instead of
-            // letting a misspelled setting silently do nothing.
-            if let Some(map) = value.as_mapping() {
-                let unknown: Vec<&str> = map
-                    .keys()
-                    .filter_map(|k| k.as_str())
-                    .filter(|k| !KNOWN_FILE_KEYS.contains(k))
-                    .collect();
-                if !unknown.is_empty() {
-                    warn_once(
-                        "config:unknown-keys",
-                        &format!(
-                            "unknown config key(s) {} in {} — valid keys: {}",
-                            unknown.join(", "),
-                            path.display(),
-                            KNOWN_FILE_KEYS.join(", ")
-                        ),
-                    );
+    cached_parse(&CONFIG_CACHE, &path, |text| {
+        // Unknown keys are almost always typos; name them instead of
+        // letting a misspelled setting silently do nothing. A typo'd file
+        // must not silently disable every user setting — the parse failure
+        // is cached as `None` so `warn_once` stays the only report. A read
+        // failure caches nothing.
+        let text = text?;
+        Some(match serde_yaml::from_str::<serde_yaml::Value>(&text) {
+            Ok(value) => {
+                if let Some(map) = value.as_mapping() {
+                    let unknown: Vec<&str> = map
+                        .keys()
+                        .filter_map(|k| k.as_str())
+                        .filter(|k| !KNOWN_FILE_KEYS.contains(k))
+                        .collect();
+                    if !unknown.is_empty() {
+                        warn_once(
+                            "config:unknown-keys",
+                            &format!(
+                                "unknown config key(s) {} in {} — valid keys: {}",
+                                unknown.join(", "),
+                                path.display(),
+                                KNOWN_FILE_KEYS.join(", ")
+                            ),
+                        );
+                    }
                 }
+                Some(value)
             }
-            Some(value)
-        }
-        Err(e) => {
-            // A typo'd file must not silently disable every user setting.
-            warn_once(
-                "config:invalid",
-                &format!(
-                    "ignoring invalid config {}: {e}\n     valid top-level keys: {}",
-                    path.display(),
-                    KNOWN_FILE_KEYS.join(", ")
-                ),
-            );
-            None
-        }
-    };
-    CONFIG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(CachedConfigFile {
-            path,
-            mtime,
-            len,
-            value: value.clone(),
-        });
-    value
+            Err(e) => {
+                warn_once(
+                    "config:invalid",
+                    &format!(
+                        "ignoring invalid config {}: {e}\n     valid top-level keys: {}",
+                        path.display(),
+                        KNOWN_FILE_KEYS.join(", ")
+                    ),
+                );
+                None
+            }
+        })
+    })
+    .flatten()
 }
 
 fn invalidate_config_cache() {
@@ -253,6 +357,37 @@ fn known_providers(entries: &BTreeMap<String, ProviderEntry>) -> BTreeSet<String
     entries.keys().cloned().collect()
 }
 
+/// How a selection string routes: which known-provider prefix it carries
+/// and what remains. `split_selection`, `strip_routing_prefixes`, and
+/// `apply_model` classify the same `provider/` grammar with different
+/// outcomes; this enum is the shared classification. Endpoint prefixes
+/// (`go/…`) are deliberately not classified here — endpoints are instance
+/// state, so each consumer keeps its own endpoint step.
+enum SelectionRoute {
+    /// `provider/rest` — a known provider prefix; `rest` may be empty.
+    ProviderQualified { provider: String, rest: String },
+    /// The whole selection is a bare known provider name (no `/`).
+    BareProvider { provider: String },
+    /// No known-provider prefix: the whole selection is the model id.
+    Model(String),
+}
+
+/// Classify one selection string against the known provider names.
+fn classify_selection(selection: &str, known: &BTreeSet<String>) -> SelectionRoute {
+    match selection.split_once('/') {
+        Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => {
+            SelectionRoute::ProviderQualified {
+                provider: prefix.trim().to_ascii_lowercase(),
+                rest: rest.trim().to_string(),
+            }
+        }
+        _ if Provider::parse_known(selection, known).is_some() => SelectionRoute::BareProvider {
+            provider: selection.trim().to_ascii_lowercase(),
+        },
+        _ => SelectionRoute::Model(selection.to_string()),
+    }
+}
+
 /// Split a model selection into `(provider, model)`. A leading
 /// `provider/` prefix — or the whole selection being a bare provider name —
 /// selects the provider; the remainder is the model id (a bare provider
@@ -268,36 +403,20 @@ fn split_selection(selection: &str, known: &BTreeSet<String>) -> (Option<String>
             .map(|provider| provider.default_model().to_string())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     };
-    match selection.split_once('/') {
-        Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => (
-            Some(prefix.trim().to_ascii_lowercase()),
+    match classify_selection(selection, known) {
+        SelectionRoute::ProviderQualified { provider, rest } => (
+            Some(provider.clone()),
             if rest.is_empty() {
-                default_model(prefix)
+                default_model(&provider)
             } else {
-                rest.to_string()
+                rest
             },
         ),
-        _ if Provider::parse_known(selection, known).is_some() => (
-            Some(selection.trim().to_ascii_lowercase()),
-            default_model(selection),
-        ),
-        _ => (None, selection.to_string()),
-    }
-}
-
-/// Provider fallback when the model selection names none: `DEX_PROVIDER`
-/// (deprecated) > `active_provider:` (deprecated) > builtin default.
-fn env_provider_fallback(file: &Option<serde_yaml::Value>) -> String {
-    if let Ok(name) = env::var("DEX_PROVIDER") {
-        if !name.trim().is_empty() {
-            warn_once(
-                "env:DEX_PROVIDER",
-                "env var DEX_PROVIDER is deprecated — use DEX_MODEL=<provider>/<model> (e.g. DEX_MODEL=openai-codex)",
-            );
-            return name;
+        SelectionRoute::BareProvider { provider } => {
+            (Some(provider.clone()), default_model(&provider))
         }
+        SelectionRoute::Model(model) => (None, model),
     }
-    load_provider_name(file).unwrap_or_else(|| "opencode".to_string())
 }
 
 /// Catalog `api` URL for a provider key ("zai" → its serving endpoint).
@@ -556,59 +675,31 @@ pub(crate) fn resolve_credentials(
 /// protocol. ponytail: no expiry — a model that speaks completions keeps
 /// working even after the provider adds responses support.
 fn learned_apis_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/learned-apis.json"));
-    }
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/dex/learned-apis.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/learned-apis.json")
 }
 
 /// Learned wire protocols, cached process-wide and invalidated by file
 /// identity. `from_env` consulted this file on every turn (one read + parse
 /// per turn); hits are now a mutex bump.
-struct CachedLearnedApis {
-    path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
-    map: serde_json::Map<String, serde_json::Value>,
-}
+type LearnedApiMap = serde_json::Map<String, serde_json::Value>;
 
-static LEARNED_CACHE: OnceLock<Mutex<Option<CachedLearnedApis>>> = OnceLock::new();
+static LEARNED_CACHE: OnceLock<Mutex<Option<FileCache<LearnedApiMap>>>> = OnceLock::new();
 
 fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
     let Some(path) = learned_apis_path() else {
         return Default::default();
     };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return Default::default();
-    };
-    let (Ok(mtime), len) = (meta.modified(), meta.len()) else {
-        return Default::default();
-    };
-    if let Some(hit) = LEARNED_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
-    {
-        return hit.map.clone();
-    }
-    let map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    LEARNED_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(CachedLearnedApis {
-            path,
-            mtime,
-            len,
-            map: map.clone(),
-        });
-    map
+    // A missing or unparseable file is an empty map (and gets cached as
+    // one): learning simply starts over.
+    cached_parse(&LEARNED_CACHE, &path, |text| {
+        Some(
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                &text.unwrap_or_default(),
+            )
+            .unwrap_or_default(),
+        )
+    })
+    .unwrap_or_default()
 }
 
 fn learned_api(base_url: &str, model: &str) -> Option<ApiProtocol> {
@@ -680,11 +771,7 @@ pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
 /// ponytail: read-through, no process cache — the file holds a handful of
 /// entries; add file-identity caching like `learned-apis.json` if it grows.
 fn thinking_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/thinking-effort.json"));
-    }
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/dex/thinking-effort.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/thinking-effort.json")
 }
 
 fn thinking_map() -> serde_json::Map<String, serde_json::Value> {
@@ -794,10 +881,7 @@ fn persist_selection(
 }
 
 fn dex_catalog_cache_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/models.dev.json"));
-    }
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.dev.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.dev.json")
 }
 
 /// True when no cached models.dev catalog exists yet (fresh install). The
@@ -816,10 +900,7 @@ pub(crate) fn catalog_cache_missing() -> bool {
 /// Written by `refresh_models_cache` and lazily rebuilt whenever the catalog
 /// is newer than the index.
 fn dex_ctx_index_path() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(std::path::PathBuf::from(dir).join("dex/models.ctx.json"));
-    }
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/dex/models.ctx.json"))
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.ctx.json")
 }
 
 fn ctx_from_index(model: &str) -> Option<u64> {
@@ -930,42 +1011,16 @@ fn ensure_ctx_index(catalog: &serde_json::Value) {
 /// re-parsed on every `LlmConfig::from_env` — i.e. on each TUI launch (via
 /// `/api/config`) and each chat turn (~180ms a pop). Shared through an `Arc`
 /// so cache hits are an atomic bump, not a deep clone of the whole tree.
-struct CachedCatalog {
-    path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
-    value: std::sync::Arc<serde_json::Value>,
-}
-
-static CATALOG_CACHE: OnceLock<Mutex<Option<CachedCatalog>>> = OnceLock::new();
+static CATALOG_CACHE: OnceLock<Mutex<Option<FileCache<std::sync::Arc<serde_json::Value>>>>> =
+    OnceLock::new();
 
 fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
     let path = dex_catalog_cache_path()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
-    if let Some(hit) = CATALOG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
-    {
-        return Some(hit.value.clone());
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let value: std::sync::Arc<serde_json::Value> =
-        std::sync::Arc::new(serde_json::from_str(&text).ok()?);
-    CATALOG_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(CachedCatalog {
-            path,
-            mtime,
-            len,
-            value: value.clone(),
-        });
-    Some(value)
+    // A corrupt catalog file is not cached: the next `dex update --models`
+    // may fix it, and a stale-but-valid copy must never mask a rewrite.
+    cached_parse(&CATALOG_CACHE, &path, |text| {
+        serde_json::from_str(&text?).ok().map(std::sync::Arc::new)
+    })
 }
 
 /// models.dev catalog `limit.<key>` for `model` (`context` = window,
@@ -1098,6 +1153,32 @@ fn catalog_cost<'a>(
     None
 }
 
+/// Shared 3-tier model-cost lookup for `usage_cost` and
+/// `cache_write_read_ratio`: the entry whose `api` matches the configured
+/// endpoint wins, then any catalog entry of the configured provider, then
+/// any provider at all.
+fn resolve_model_cost<'a>(
+    catalog: &'a serde_json::Value,
+    model: &str,
+    provider_keys: &[String],
+    base_url: &str,
+) -> Option<&'a serde_json::Value> {
+    let needle = model.to_ascii_lowercase();
+    let base = base_url.trim_end_matches('/');
+    catalog_cost(catalog, &needle, |_, entry| {
+        entry
+            .get("api")
+            .and_then(|v| v.as_str())
+            .is_some_and(|api| api.trim_end_matches('/') == base)
+    })
+    .or_else(|| {
+        catalog_cost(catalog, &needle, |key, _| {
+            provider_keys.iter().any(|k| k == key)
+        })
+    })
+    .or_else(|| catalog_cost(catalog, &needle, |_, _| true))
+}
+
 /// Cost for one LLM call, using models.dev pricing when available. The same
 /// model id is listed by many resellers at different prices, so the entry
 /// whose `api` matches the configured endpoint wins, then any catalog entry
@@ -1113,13 +1194,8 @@ pub(crate) fn usage_cost(
     usage: &crate::core::types::Usage,
 ) -> Option<f64> {
     let catalog = load_dex_catalog()?;
-    let needle = model.to_ascii_lowercase();
     let keys = provider.catalog_keys();
-    let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
-        entry.get("api").and_then(|v| v.as_str()) == Some(base_url)
-    })
-    .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.iter().any(|k| k == key)))
-    .or_else(|| catalog_cost(&catalog, &needle, |_, _| true))?;
+    let cost_val = resolve_model_cost(&catalog, model, &keys, base_url)?;
     let input_rate = cost_val
         .get("input")
         .and_then(|v| v.as_f64())
@@ -1480,27 +1556,36 @@ fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml
 /// Custom headers from one config file key. Accepts a mapping,
 /// a text-header block (`"X-Foo: bar\nX-Baz: qux"`, same syntax as
 /// the env vars / `--header`), or a list mixing both. Later entries win.
+/// Parse a raw header string ("K: V" pairs or a JSON object) and merge it
+/// into `out` under the standard precedence rules. One funnel for every
+/// `parse_headers_str` call site.
+fn insert_parsed_headers(out: &mut BTreeMap<String, String>, raw: &str) {
+    for (k, v) in parse_headers_str(raw) {
+        insert_extra_header(out, &k, &v);
+    }
+}
+
+/// Merge one YAML header value — a mapping or a raw "K: V" text — into
+/// `out`. Other scalar shapes are ignored, as before.
+fn merge_one(out: &mut BTreeMap<String, String>, value: &serde_yaml::Value) {
+    if let Some(map) = value.as_mapping() {
+        merge_config_headers_map(out, map);
+    } else if let Some(text) = value.as_str() {
+        insert_parsed_headers(out, text);
+    }
+}
+
 fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeMap<String, String> {
     let Some(value) = file.as_ref().and_then(|f| f.get(key)) else {
         return BTreeMap::new();
     };
     let mut out = BTreeMap::new();
-    if let Some(map) = value.as_mapping() {
-        merge_config_headers_map(&mut out, map);
-    } else if let Some(text) = value.as_str() {
-        for (k, v) in parse_headers_str(text) {
-            insert_extra_header(&mut out, &k, &v);
-        }
-    } else if let Some(items) = value.as_sequence() {
+    if let Some(items) = value.as_sequence() {
         for item in items {
-            if let Some(map) = item.as_mapping() {
-                merge_config_headers_map(&mut out, map);
-            } else if let Some(text) = item.as_str() {
-                for (k, v) in parse_headers_str(text) {
-                    insert_extra_header(&mut out, &k, &v);
-                }
-            }
+            merge_one(&mut out, item);
         }
+    } else {
+        merge_one(&mut out, value);
     }
     out
 }
@@ -1547,9 +1632,7 @@ pub(crate) fn custom_headers_from_env() -> BTreeMap<String, String> {
                     &format!("env var {key} is deprecated — use DEX_HEADERS (same syntax)"),
                 );
             }
-            for (k, v) in parse_headers_str(&raw) {
-                insert_extra_header(&mut out, &k, &v);
-            }
+            insert_parsed_headers(&mut out, &raw);
         }
     }
     out
@@ -1621,12 +1704,7 @@ impl LlmConfig {
         permission_override: Option<PermissionMode>,
         header_overrides: &[String],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        crate::tools::set_output_limit(
-            env::var("DEX_TOOL_OUTPUT_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_048_576),
-        );
+        crate::tools::set_output_limit(env_parse("DEX_TOOL_OUTPUT_BYTES", 1_048_576));
         let permission = match permission_override {
             Some(mode) => mode,
             None => permission_from_env()?,
@@ -1638,9 +1716,7 @@ impl LlmConfig {
             insert_extra_header(&mut extra_headers, &k, &v);
         }
         for raw in header_overrides {
-            for (k, v) in parse_headers_str(raw) {
-                insert_extra_header(&mut extra_headers, &k, &v);
-            }
+            insert_parsed_headers(&mut extra_headers, raw);
         }
         let provider_entries = load_provider_entries(&file);
         let known = known_providers(&provider_entries);
@@ -1667,14 +1743,11 @@ impl LlmConfig {
         // `--model` > `DEX_MODEL` > file `model:` > builtin default. When
         // the selection carries no provider, `DEX_PROVIDER` /
         // `active_provider:` (both deprecated) still pick one.
-        let selection = model_override
-            .or_else(|| env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty()))
-            .or_else(|| load_config_str(&file, "model"))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let selection = resolve_selection(model_override, &file).value;
         let (selection_provider, mut model) = split_selection(&selection, &known);
         let provider_name = match selection_provider.as_deref() {
             Some(name) => name.to_string(),
-            None => env_provider_fallback(&file),
+            None => provider_fallback_with_origin(&file).0,
         };
         let provider = Provider::parse_known(&provider_name, &known).ok_or_else(|| {
             format!(
@@ -1752,11 +1825,10 @@ impl LlmConfig {
                     e
                 }
             })?;
-        let context_window = env::var("DEX_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            // Slim cross-process index first (KBs); the 4MB catalog parse
-            // is the cold-path fallback, which then refreshes the index.
+        // DEX_CONTEXT_WINDOW first; else the slim cross-process index
+        // (KBs); the 4MB catalog parse is the cold-path fallback, which
+        // then refreshes the index.
+        let context_window = env_parse_opt("DEX_CONTEXT_WINDOW")
             .or_else(|| ctx_from_index(&model))
             .or_else(|| {
                 load_dex_catalog().and_then(|c| {
@@ -1767,22 +1839,10 @@ impl LlmConfig {
             })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         // Reserve 16384, keep 20000 tokens recent (not 12 messages)
-        let reserve_tokens = env::var("DEX_RESERVE_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16_384);
-        let keep_recent_tokens = env::var("DEX_KEEP_RECENT_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20_000);
-        let connect_secs: u64 = env::var("DEX_HTTP_CONNECT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        let request_secs: u64 = env::var("DEX_HTTP_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let reserve_tokens = env_parse("DEX_RESERVE_TOKENS", 16_384);
+        let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
+        let connect_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
+        let request_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
         // Streaming generations must not have a total request timeout:
         // reqwest's `.timeout()` covers the whole SSE body, killing long
         // generations with `error decoding response body`. The default path
@@ -1909,11 +1969,10 @@ impl LlmConfig {
     /// move the pinned URL. Unknown prefixes stay part of the model id.
     fn strip_routing_prefixes(&mut self) {
         let mut sel = self.model.clone();
-        if let Some((prefix, rest)) = sel.split_once('/') {
-            let known = known_providers(&self.provider_entries);
-            if Provider::parse_known(prefix, &known).is_some() {
-                sel = rest.to_string();
-            }
+        if let SelectionRoute::ProviderQualified { rest, .. } =
+            classify_selection(&sel, &known_providers(&self.provider_entries))
+        {
+            sel = rest;
         }
         if let Some((name, rest)) = sel.split_once('/') {
             if self.endpoints.contains_key(name) {
@@ -1941,14 +2000,34 @@ impl LlmConfig {
         // switches provider (and its base_url) without env. A bare provider
         // name ("/model opencode") switches provider and keeps the model —
         // it names a provider, not a model id.
-        let mut sel = selection;
+        let sel: String;
         let mut keep_model = false;
         let known = known_providers(&self.provider_entries);
-        let prefix_provider = match selection.split_once('/') {
-            Some((prefix, _)) => Provider::parse_known(prefix, &known),
-            None => Provider::parse_known(selection, &known),
+        let route_provider = match classify_selection(selection, &known) {
+            SelectionRoute::ProviderQualified { provider, rest } => {
+                if rest.is_empty() {
+                    // Original kept the full selection visible to the
+                    // endpoint-routing step below.
+                    keep_model = true;
+                    sel = selection.to_string();
+                } else {
+                    sel = rest;
+                }
+                Some(provider)
+            }
+            SelectionRoute::BareProvider { provider } => {
+                // A bare provider keeps the current model.
+                keep_model = true;
+                sel = self.model.clone();
+                Some(provider)
+            }
+            SelectionRoute::Model(model) => {
+                sel = model;
+                None
+            }
         };
-        if let Some(new_provider) = prefix_provider {
+        let new_provider = route_provider.and_then(|name| Provider::parse_known(&name, &known));
+        if let Some(new_provider) = new_provider {
             if new_provider != self.provider {
                 // Resolve everything before mutating: a half-switched
                 // config (new provider, old key/URL/headers) is worse
@@ -1958,10 +2037,6 @@ impl LlmConfig {
                     .map_err(|e| e.to_string())?;
                 let resolved = resolve_provider(&new_provider, &self.provider_entries);
                 self.set_provider(new_provider, key, account, resolved)?;
-            }
-            match selection.split_once('/') {
-                Some((_, rest)) if !rest.is_empty() => sel = rest,
-                _ => keep_model = true,
             }
         }
         let mut result = None;
@@ -1979,7 +2054,7 @@ impl LlmConfig {
             // `moonshotai/kimi-k2.6`): stay unless the catalog shows the
             // model lives on another known endpoint.
             self.model = sel.to_string();
-            warn_provider_like_selection(sel, self.provider.name(), &self.available_models);
+            warn_provider_like_selection(&sel, self.provider.name(), &self.available_models);
             if let Some(catalog) = load_dex_catalog() {
                 if let Some(url) = catalog_endpoint_for_model(
                     &catalog,
@@ -2043,14 +2118,9 @@ impl LlmConfig {
         let Some(catalog) = load_dex_catalog() else {
             return FALLBACK;
         };
-        let needle = self.model.to_ascii_lowercase();
         let keys = self.provider.catalog_keys();
-        let cost_val = catalog_cost(&catalog, &needle, |_, entry| {
-            entry.get("api").and_then(|v| v.as_str()) == Some(self.base_url.as_str())
-        })
-        .or_else(|| catalog_cost(&catalog, &needle, |key, _| keys.iter().any(|k| k == key)))
-        .or_else(|| catalog_cost(&catalog, &needle, |_, _| true));
-        let Some(cost_val) = cost_val else {
+        let Some(cost_val) = resolve_model_cost(&catalog, &self.model, &keys, &self.base_url)
+        else {
             return FALLBACK;
         };
         let rate = |names: &[&str]| {
@@ -2262,37 +2332,17 @@ pub(crate) fn doctor(
     // `--model` > `DEX_MODEL` > file `model:` > builtin default.
     let flag_model = model_override.clone().filter(|m| !m.trim().is_empty());
     let flag_base_url = base_url_override.clone().filter(|u| !u.trim().is_empty());
-    let dex_model = env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty());
-    let file_model = load_config_str(&file, "model");
-    let selection = flag_model
-        .clone()
-        .or(dex_model.clone())
-        .or(file_model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let selection_source = if flag_model.is_some() {
-        "--model"
-    } else if dex_model.is_some() {
-        "DEX_MODEL"
-    } else if file_model.is_some() {
-        "config model:"
-    } else {
-        "built-in default"
-    };
+    let selection_resolved = resolve_selection(flag_model.clone(), &file);
+    let selection = selection_resolved.value;
+    let selection_source = selection_resolved.origin;
     let (selection_provider, pre_model) = split_selection(&selection, &known);
-    let file_provider = load_provider_name(&file);
-    let env_provider = env::var("DEX_PROVIDER")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let provider_name = selection_provider
-        .clone()
-        .or(env_provider.clone())
-        .or(file_provider.clone())
-        .unwrap_or_else(|| "opencode".to_string());
+    // Provider fallback shares `from_env`'s chain (and its deprecation
+    // warning, deduped) so the origin row cannot drift from routing.
+    let (fallback_provider, fallback_origin) = provider_fallback_with_origin(&file);
+    let provider_name = selection_provider.clone().unwrap_or(fallback_provider);
     let provider_source = match selection_provider {
         Some(_) => format!("{selection_source} prefix"),
-        None if env_provider.is_some() => "DEX_PROVIDER (deprecated)".to_string(),
-        None if file_provider.is_some() => "config active_provider: (deprecated)".to_string(),
-        None => "built-in default".to_string(),
+        None => fallback_origin.unwrap_or("built-in default").to_string(),
     };
     // The real build, once: rows below take values from it so `doctor`
     // agrees with runtime routing (catalog endpoint moves, prefix
@@ -2563,9 +2613,7 @@ pub(crate) fn doctor(
             let env_headers = custom_headers_from_env();
             let mut cli_headers = BTreeMap::new();
             for raw in header_overrides {
-                for (k, v) in parse_headers_str(raw) {
-                    insert_extra_header(&mut cli_headers, &k, &v);
-                }
+                insert_parsed_headers(&mut cli_headers, raw);
             }
             for (headers, source) in [
                 (&http_headers, "config http_headers: (deprecated)"),
@@ -2772,6 +2820,28 @@ pub(crate) mod tests {
             None => env::remove_var("XDG_CACHE_HOME"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_model_cost_ignores_trailing_slash() {
+        let catalog = serde_json::json!({
+            "go": {
+                "api": "https://go.example/v1",
+                "models": {"m-1": {"cost": {"input": 1.0}}}
+            }
+        });
+        // A pinned `base_url` with a trailing slash still hits the
+        // endpoint-exact tier instead of falling through to reseller pricing.
+        let cost = super::resolve_model_cost(
+            &catalog,
+            "m-1",
+            &["go".to_string()],
+            "https://go.example/v1/",
+        );
+        assert_eq!(
+            cost.and_then(|c| c.get("input")).and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
     }
 
     /// Cache-write/read ratio resolution feeding the online compaction
@@ -3051,6 +3121,21 @@ pub(crate) mod tests {
         assert_eq!(
             Provider::OpenAiCodex.default_base_url(),
             Some("https://chatgpt.com/backend-api/codex")
+        );
+    }
+
+    #[test]
+    fn selection_trims_whitespace_around_provider_and_model() {
+        let known: BTreeSet<String> = ["zai".to_string()].into_iter().collect();
+        // The provider side already trims via `parse_known`; a stray space
+        // on the model side must not survive into the catalog lookup.
+        assert_eq!(
+            super::split_selection("zai/ glm-x", &known),
+            (Some("zai".to_string()), "glm-x".to_string())
+        );
+        assert_eq!(
+            super::split_selection(" zai / glm-x ", &known),
+            (Some("zai".to_string()), "glm-x".to_string())
         );
     }
 
@@ -4882,5 +4967,68 @@ pub(crate) mod tests {
             11 + 46,
             "origin starts at display column 57: {line:?}"
         );
+    }
+
+    /// Byte-for-byte `doctor` output under a fully hermetic scenario: no
+    /// config file, no catalog caches, no dex env vars, one provider key.
+    /// This is the PR-18 motion gate — any refactor of the shared
+    /// resolution must reproduce this output exactly. Fixed paths (no pid)
+    /// keep the snapshot stable across runs and machines.
+    #[test]
+    fn doctor_output_is_byte_stable() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_RESERVE_TOKENS",
+            "DEX_KEEP_RECENT_TOKENS",
+            "DEX_THINKING_EFFORT",
+            "DEX_PERMISSION",
+            "DEX_HEADERS",
+            "DEX_ONLINE_COMPACTION",
+            "DEX_OBSERVATION_PACK",
+            "DEX_EVIDENCE_REDUCER",
+            "DEX_REDUCER_MODEL",
+            "DEX_AGENT_WAKE",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "OPENAI_HEADERS",
+            "OPENCODE_API_KEY",
+        ]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
+        std::env::set_var("XDG_DATA_HOME", "/tmp/dex-doctor-snapshot/data");
+        let out = doctor(None, None, None, &[]);
+        let expected = concat!(
+            "dex 0.6.0\n",
+            "\n",
+            "config     /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
+            "catalog    /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
+            "                                                         missing — run `dex update --models`\n",
+            "\n",
+            "provider   opencode                                      built-in default\n",
+            "model      gpt-5.6-luna                                  built-in default\n",
+            "base_url   https://opencode.ai/zen/v1                    built-in default\n",
+            "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
+            "protocol   openai-responses                              default (auto-fallback to completions)\n",
+            "context    128000 tokens                                 built-in default\n",
+            "obs pack   off                                           built-in default (off)\n",
+            "thinking   (unset)                                       model default\n",
+            "permission trusted                                       built-in default\n",
+            "agent wake on                                            built-in default\n",
+            "headers    0                                             none\n",
+            "endpoints  go, zen                                       available to /model routing\n",
+            "\n",
+            "resolve    OK                                            config builds cleanly\n",
+        );
+        assert_eq!(out, expected, "doctor output drifted");
     }
 }
