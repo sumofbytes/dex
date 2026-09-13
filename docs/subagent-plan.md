@@ -1125,11 +1125,13 @@ enum ExhaustKind { Budget, Timeout }
 events keep their words) and gains:
 
 ```rust
-turns_used: u32,               // recorded by the child body's own loop counter
+tool_calls: u32,               // sink-counted invocations (one process_turn;
+                               // calls, not rounds — conservative under fan-out)
 resume: Option<ResumeHandle>,  // Some ⇔ reason ∈ {Transient, Exhausted}
-                               //   and the transcript holds ≥1 completed turn
+                               //   and progress was made (calls, summary, or transcript)
 struct ResumeHandle { agent_id: AgentId, transcript: PathBuf,
-                      turns_used: u32, budget: Budget }
+                      generation: u32, remaining_budget: Option<usize>,
+                      note: String }
 ```
 
 `Partial` is derived prose in the notice, not a new `AgentState` — the
@@ -1154,7 +1156,7 @@ supervision:
 - `resume` — replay the child's last transcript, append the interruption
   note (reason, remaining turn budget), run the same loop. A resume
   grants a fresh wall-clock timeout (bounded by intensity) and carries
-  the *remaining* turn budget (original − `turns_used`).
+  the *remaining* turn budget (original − `tool_calls`).
 - Recovery mode is a property of the spec, not of the failure. No
   `recover-for-timeout-but-not-for-panics` branches anywhere.
 
@@ -1246,12 +1248,12 @@ throughout, so each phase ships behind green, unchanged suites.
 
 ### Phase 11 — taxonomy + resumable results + listing
 
-- [ ] Every terminal path classifies through `on_exit`; no terminal branch bypasses it.
-- [ ] `Transient`/`Exhausted` endings with ≥1 completed turn carry `ResumeHandle`; `Normal`/`ShutDown`/`Permanent` never do.
-- [ ] `delegate(resume_from=…)` continues from the child transcript: prior turns replayed, interruption note + refined instruction appended, remaining turn budget honored, fresh wall-clock timeout, new generation JSONL linked via `parent_id`.
-- [ ] Resume resolves for a child killed by a daemon restart (live registry miss → `Session::list_children`).
-- [ ] `delegate_list` reports live, retained, and terminal children with ids and states, including interrupted-by-restart ones.
-- [ ] Wire stability: existing lifecycle lines and typed events unchanged; resumability surfaces as notice prose only.
+- [x] Every terminal path classifies through `on_exit`; no terminal branch bypasses it.
+- [x] `Transient`/`Exhausted` endings with ≥1 completed turn carry `ResumeHandle`; `Normal`/`ShutDown`/`Permanent` never do.
+- [x] `delegate(resume_from=…)` continues from the child transcript: prior turns replayed, interruption note + refined instruction appended, remaining turn budget honored, fresh wall-clock timeout, new generation JSONL linked via `parent_id`.
+- [x] Resume resolves for a child killed by a daemon restart (live registry miss → `Session::list_children`).
+- [x] `delegate_list` reports live, retained, and terminal children with ids and states, including interrupted-by-restart ones.
+- [x] Wire stability: existing lifecycle lines and typed events unchanged; resumability surfaces as notice prose only.
 
 ### Phase 12 — `ChildSpec` + recovery
 
