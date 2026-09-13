@@ -984,21 +984,14 @@ where
             }
             // Write-through persist (best-effort, tiny JSON): awaited so a
             // process exit right after the turn can't lose it — a detached
-            // spawn would be dropped on shutdown before it ever ran.
+            // spawn would be dropped on shutdown before it ever ran. Clone
+            // keeps the saved field list compiler-enforced (state.rs disables
+            // dead_code lints, so a hand-written literal could forget one);
+            // the projection is reset because a resume re-derives it from
+            // scratch.
             if state.dirty {
-                let to_save = ToolState {
-                    cache: state.cache.clone(),
-                    dirty: true,
-                    online: state.online.clone(),
-                    last_usage: state.last_usage,
-                    last_cached: state.last_cached,
-                    total_usage: state.total_usage,
-                    total_output: state.total_output,
-                    total_cost: state.total_cost,
-                    last_tok_s: state.last_tok_s,
-                    verify_dirty: state.verify_dirty,
-                    obs_projection: crate::agent::obs_pack::ProjectionState::new(),
-                };
+                let mut to_save = state.clone();
+                to_save.obs_projection = crate::agent::obs_pack::ProjectionState::new();
                 to_save.save_async().await;
                 state.dirty = false;
             }
