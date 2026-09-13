@@ -112,6 +112,19 @@ pub(crate) fn resume_note(reason: ExitReason, tool_calls: u32) -> String {
     }
 }
 
+/// Leftover tool rounds a resume handle may advertise: `cap - spent`, or
+/// `None` when nothing is left (or the definition had no cap — unknown
+/// spend resumes under the definition's full meter, like interrupted
+/// runs). A `Some(0)` handle would promise "write your final summary
+/// without tools" while the turn loop still runs one post-hoc round and
+/// then hard-fails on "turn budget exhausted" — advertising `None` keeps
+/// the nudge honest.
+pub(crate) fn advertised_remaining(cap: Option<u32>, spent: u32) -> Option<usize> {
+    cap.and_then(|cap| cap.checked_sub(spent))
+        .filter(|left| *left > 0)
+        .map(|left| left as usize)
+}
+
 /// Best-effort progress check for wrapper-synthesized endings (panic,
 /// timeout) whose in-memory counters died with the body: the transcript
 /// holds more than its header line, so the child got past creation.
