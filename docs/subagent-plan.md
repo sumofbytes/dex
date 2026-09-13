@@ -1265,8 +1265,8 @@ throughout, so each phase ships behind green, unchanged suites.
 
 ### Phase 13 — supervisor
 
-- [ ] The ledger counts recoveries across children per window; exhaustion opens the breaker.
-- [ ] Breaker open: new spawns queue FIFO as `Pending`; a terminal sibling starts the next; a user chat turn preempts; the breaker clears on window expiry.
-- [ ] Session close cancels + joins all children and retains results and notices — no orphans (extends the §22.E lifecycle tests).
-- [ ] The idle reaper is `ShutDown` on client-absence TTL: notices retained for the next boundary, no wake turn spawned by the reaper itself.
-- [ ] No new dependency; `AgentManager` stays a struct.
+- [x] The ledger counts recoveries across children per window; exhaustion opens the breaker.
+- [x] Breaker open: new spawns queue FIFO as `Pending`; a terminal sibling starts the next; a user chat turn preempts; the breaker clears on window expiry.
+- [x] Session close cancels + joins all children and retains results and notices — no orphans (extends the §22.E lifecycle tests).
+- [x] The idle reaper is `ShutDown` on client-absence TTL: notices retained for the next boundary, no wake turn spawned by the reaper itself.
+- [x] No new dependency; `AgentManager` stays a struct.
