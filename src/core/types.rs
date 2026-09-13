@@ -140,6 +140,31 @@ pub(crate) enum ApprovalDecision {
     Deny,
 }
 
+impl ApprovalDecision {
+    /// Audit/wire spelling for an approval decision ("once"/"session"/
+    /// "deny"). Single source so audit rows never drift from the wire.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Session => "session",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// Bridge the protocol (wire) decision into the core decision the agent
+/// loop consumes. `AllowSession`'s side effect (recording the approval)
+/// stays at the handler, not here.
+impl From<crate::protocol::ApprovalDecision> for ApprovalDecision {
+    fn from(decision: crate::protocol::ApprovalDecision) -> Self {
+        match decision {
+            crate::protocol::ApprovalDecision::AllowOnce => Self::Once,
+            crate::protocol::ApprovalDecision::AllowSession => Self::Session,
+            crate::protocol::ApprovalDecision::Deny => Self::Deny,
+        }
+    }
+}
+
 pub(crate) struct ApprovalRequest {
     pub name: String,
     pub input: String,

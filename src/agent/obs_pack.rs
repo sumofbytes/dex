@@ -358,6 +358,31 @@ impl ProjectionState {
     }
 }
 
+/// Manual `Clone` — derive cannot: `std::sync::Mutex` is not `Clone`. Each
+/// clone owns fresh mutexes holding a snapshot of the inner data, so a clone
+/// never aliases the live projection counts; poison recovery matches the
+/// other accessors.
+impl Clone for ProjectionState {
+    fn clone(&self) -> Self {
+        Self {
+            sends: Mutex::new(self.sends.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            verified: Mutex::new(
+                self.verified
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            reported: Mutex::new(
+                self.reported
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            notes: Mutex::new(self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
+    }
+}
+
 impl Default for ProjectionState {
     fn default() -> Self {
         Self::new()

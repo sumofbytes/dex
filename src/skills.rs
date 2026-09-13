@@ -8,6 +8,21 @@ use crate::core::types::Skill;
 
 pub(crate) fn parse_skill(path: &Path) -> Option<Skill> {
     let content = fs::read_to_string(path).ok()?;
+    let (name, description) = parse_frontmatter(&content)?;
+    if !skill_name_ok(&name, path) {
+        return None;
+    }
+    Some(Skill {
+        name,
+        description,
+        path: path.to_path_buf(),
+    })
+}
+
+/// Parse a SKILL.md frontmatter block into `(name, description)`; `None`
+/// when the file doesn't start with `---` or has no `name:` key. Shared by
+/// the sync and async discovery paths so the frontmatter rules can't drift.
+fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     let mut lines = content.lines();
     let first = lines.next()?;
     if first.trim() != "---" {
@@ -27,23 +42,25 @@ pub(crate) fn parse_skill(path: &Path) -> Option<Skill> {
         }
     }
     let name = name?;
-    if name.is_empty()
-        || !name
+    Some((name, description.unwrap_or_default()))
+}
+
+/// Name validity shared by both parse paths; an invalid name warns to stderr
+/// with the sync path's exact wording (the async path used to drop it) and
+/// rejects the skill.
+fn skill_name_ok(name: &str, path: &Path) -> bool {
+    let ok = !name.is_empty()
+        && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
         eprintln!(
             "[skills] ignoring invalid skill name '{}' in {}",
             name,
             path.display()
         );
-        return None;
     }
-    Some(Skill {
-        name,
-        description: description.unwrap_or_default(),
-        path: path.to_path_buf(),
-    })
+    ok
 }
 
 /// Strip a single layer of surrounding quotes (single or double) from a YAML
@@ -159,39 +176,17 @@ pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> 
             // Fast existence check without extra stat storm: attempt read directly.
             set.spawn(async move {
                 let content = tokio::fs::read_to_string(&skill_path).await.ok()?;
-                // Parse without blocking: frontmatter is tiny, parse inline.
-                // Reuse sync parser by writing to temp? Instead parse here (duplicate tiny logic).
-                // To reuse helpers and avoid duplication, parse via blocking task for CPU? Frontmatter parse is trivial (<1ms), inline.
-                let mut lines = content.lines();
-                if lines.next()?.trim() != "---" {
-                    return None;
-                }
-                let mut name = None;
-                let mut description = None;
-                for line in lines {
-                    if line.trim() == "---" {
-                        break;
-                    }
-                    let line = line.trim();
-                    if let Some(val) = line.strip_prefix("name:") {
-                        name = Some(unquote(val.trim()));
-                    } else if let Some(val) = line.strip_prefix("description:") {
-                        description = Some(unquote(val.trim()));
-                    }
-                }
-                let name = name?;
-                if name.is_empty()
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
+                // Frontmatter parse shared with the sync path (skill_name_ok
+                // warns on invalid names, same wording as sync).
+                let (name, description) = parse_frontmatter(&content)?;
+                if !skill_name_ok(&name, &skill_path) {
                     return None;
                 }
                 Some((
                     dir_idx,
-                    crate::core::types::Skill {
+                    Skill {
                         name,
-                        description: description.unwrap_or_default(),
+                        description,
                         path: skill_path,
                     },
                 ))
