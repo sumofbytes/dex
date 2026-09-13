@@ -287,6 +287,9 @@ struct RunningChild {
 pub(crate) struct SpawnMeta {
     pub(crate) generation: u32,
     pub(crate) parent_session: Option<PathBuf>,
+    /// The original child id for resume generations (§24.3 lineage).
+    /// `None` for fresh spawns.
+    pub(crate) parent_id: Option<AgentId>,
 }
 
 impl SpawnMeta {
@@ -294,6 +297,7 @@ impl SpawnMeta {
         Self {
             generation: 0,
             parent_session: None,
+            parent_id: None,
         }
     }
 }
@@ -407,7 +411,7 @@ impl AgentManager {
                     instance: AgentInstance {
                         id: id.clone(),
                         definition: def.clone(),
-                        parent_id: None,
+                        parent_id: meta.parent_id.clone(),
                         context: seed,
                         state: AgentState::Running,
                         progress: None,
@@ -628,6 +632,16 @@ impl AgentManager {
         }));
         out.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
         out
+    }
+
+    /// The registry parent of a live child (§24.3 generations): the
+    /// original id for resume generations, `None` for fresh children —
+    /// and for unknown or finished ids, which carry no live lineage.
+    pub(crate) fn parent_of(&self, id: &AgentId) -> Option<AgentId> {
+        self.lock()
+            .running
+            .get(id)
+            .and_then(|child| child.instance.parent_id.clone())
     }
 
     pub(crate) fn status(&self, id: &AgentId) -> Option<AgentState> {
@@ -1409,6 +1423,7 @@ mod tests {
                 SpawnMeta {
                     generation: 0,
                     parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
                 },
                 |_, _, _| async { panic!("boom") },
             )
@@ -1456,6 +1471,37 @@ mod tests {
             WaitOutcome::Finished(result) => assert!(result.resume.is_none()),
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_generation_links_parent() {
+        // §24.3 lineage: a resume generation names its original; fresh
+        // spawns have no parent.
+        let mgr = AgentManager::new("sess");
+        let first = mgr
+            .spawn(
+                &test_def("explorer"),
+                test_seed(),
+                SpawnMeta::fresh(),
+                token_body,
+            )
+            .unwrap();
+        assert_eq!(mgr.parent_of(&first), None);
+        let second = mgr
+            .spawn(
+                &test_def("explorer"),
+                test_seed(),
+                SpawnMeta {
+                    generation: 1,
+                    parent_session: None,
+                    parent_id: Some(first.clone()),
+                },
+                token_body,
+            )
+            .unwrap();
+        assert_eq!(mgr.parent_of(&second), Some(first));
+        assert_eq!(mgr.parent_of(&AgentId("sess-9".to_string())), None);
+        mgr.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
