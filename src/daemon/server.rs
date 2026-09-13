@@ -550,10 +550,7 @@ async fn chat(
         // Steering / follow-up queues for this turn (mirrors old local
         // `event.rs` channels). Insert now so the HTTP handlers can push
         // immediately.
-        let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
-        let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
-        lock_map(&state.steering_txs).insert(session_id.clone(), steering_tx);
-        lock_map(&state.followup_txs).insert(session_id.clone(), followup_tx);
+        let (steering_rx, followup_rx) = create_queue_pair(&state, &session_id);
         steering_rx_opt = Some(steering_rx);
         followup_rx_opt = Some(followup_rx);
     }
@@ -621,6 +618,79 @@ impl Stream for ReceiverStream {
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
+}
+
+/// Create a turn's steering/follow-up queue pair and register the senders
+/// so the HTTP handlers (`/steer`, `/followup`) can push immediately.
+fn create_queue_pair(
+    state: &DaemonState,
+    session_id: &str,
+) -> (mpsc::Receiver<QueueMsg>, mpsc::Receiver<QueueMsg>) {
+    let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
+    let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
+    lock_map(&state.steering_txs).insert(session_id.to_string(), steering_tx);
+    lock_map(&state.followup_txs).insert(session_id.to_string(), followup_tx);
+    (steering_rx, followup_rx)
+}
+
+/// Turn outcome from the chained loop: final response text plus the
+/// usage/cached token counts captured with it.
+type TurnOutcome =
+    Result<(String, Option<u64>, Option<u64>), Box<dyn std::error::Error + Send + Sync>>;
+
+/// Per-turn queue plumbing: the steering/follow-up receivers the agent loop
+/// drains, the accepted-notification senders the loop replies on, and the
+/// bridge-drain signals the terminal event waits on.
+struct TurnChannels {
+    steering_rx: mpsc::Receiver<QueueMsg>,
+    followup_rx: mpsc::Receiver<QueueMsg>,
+    steering_accepted_tx: mpsc::Sender<String>,
+    followup_accepted_tx: mpsc::Sender<String>,
+    sink_done: tokio::sync::oneshot::Sender<()>,
+    approval_done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl TurnChannels {
+    /// Fresh queues with no live counterpart — for direct `run_turn_inner`
+    /// calls (tests) that never receive steering and never wait on bridges.
+    #[cfg(test)]
+    fn detached() -> Self {
+        let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
+        let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
+        let (steering_accepted_tx, _) = mpsc::channel::<String>(16);
+        let (followup_accepted_tx, _) = mpsc::channel::<String>(16);
+        let (sink_done, _) = tokio::sync::oneshot::channel::<()>();
+        let (approval_done, _) = tokio::sync::oneshot::channel::<()>();
+        drop((steering_tx, followup_tx));
+        TurnChannels {
+            steering_rx,
+            followup_rx,
+            steering_accepted_tx,
+            followup_accepted_tx,
+            sink_done,
+            approval_done,
+        }
+    }
+}
+
+/// Forward accepted steers/follow-ups onto the SSE stream so the remote TUI
+/// can clear its `pending_*` badge and render the prompt. Journaled so a
+/// reattach replay reconstructs the transcript.
+fn spawn_accepted_forwarder(
+    state: Arc<DaemonState>,
+    session_id: String,
+    tx: mpsc::Sender<StreamEnvelope>,
+    mut rx: mpsc::Receiver<String>,
+    event: fn(String) -> StreamEvent,
+) {
+    tokio::spawn(async move {
+        while let Some(content) = rx.recv().await {
+            let event = event(content);
+            let seq = state.next_seq(&session_id);
+            journal_event(&state, &session_id, seq, &event);
+            let _ = tx.send(StreamEnvelope { seq, event }).await;
+        }
+    });
 }
 
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Async:
@@ -694,52 +764,24 @@ async fn run_agent_turn(
     // (direct `run_agent_turn` calls, e.g. tests) create them here.
     let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
         (Some(sr), Some(fr)) => (sr, fr),
-        _ => {
-            let (steering_tx, sr) = mpsc::channel::<QueueMsg>(16);
-            let (followup_tx, fr) = mpsc::channel::<QueueMsg>(16);
-            lock_map(&state.steering_txs).insert(session_id.clone(), steering_tx);
-            lock_map(&state.followup_txs).insert(session_id.clone(), followup_tx);
-            (sr, fr)
-        }
+        _ => create_queue_pair(&state, &session_id),
     };
-    let (steering_accepted_tx, mut steering_accepted_rx) = mpsc::channel::<String>(16);
-    let (followup_accepted_tx, mut followup_accepted_rx) = mpsc::channel::<String>(16);
-    // Forward accepted steers/follow-ups onto the SSE stream so the remote
-    // TUI can clear its `pending_*` badge and render the prompt. Journaled
-    // so a reattach replay reconstructs the transcript.
-    {
-        let tx_clone = tx.clone();
-        let state_clone = state.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            while let Some(content) = steering_accepted_rx.recv().await {
-                let event = StreamEvent::SteeringAccepted {
-                    content: content.clone(),
-                };
-                let seq = state_clone.next_seq(&sid);
-                journal_event(&state_clone, &sid, seq, &event);
-                let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
-            }
-        });
-    }
-    {
-        let tx_clone = tx.clone();
-        let state_clone = state.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            while let Some(content) = followup_accepted_rx.recv().await {
-                let event = StreamEvent::FollowupAccepted {
-                    content: content.clone(),
-                };
-                let seq = state_clone.next_seq(&sid);
-                journal_event(&state_clone, &sid, seq, &event);
-                let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
-            }
-        });
-    }
-    // Own receivers mutably for the async turn (tokio try_recv needs &mut).
-    let mut steering_rx = steering_rx;
-    let mut followup_rx = followup_rx;
+    let (steering_accepted_tx, steering_accepted_rx) = mpsc::channel::<String>(16);
+    let (followup_accepted_tx, followup_accepted_rx) = mpsc::channel::<String>(16);
+    spawn_accepted_forwarder(
+        state.clone(),
+        session_id.clone(),
+        tx.clone(),
+        steering_accepted_rx,
+        |content| StreamEvent::SteeringAccepted { content },
+    );
+    spawn_accepted_forwarder(
+        state.clone(),
+        session_id.clone(),
+        tx.clone(),
+        followup_accepted_rx,
+        |content| StreamEvent::FollowupAccepted { content },
+    );
     // Drain signals for the sink/approval bridges: both run concurrently
     // with this task and may still hold lines they received before the
     // console dropped. The terminal event must be the last one on the wire
@@ -747,6 +789,14 @@ async fn run_agent_turn(
     // while straggler AssistantText/ToolResult events still arrive.
     let (sink_done_tx, sink_done_rx) = tokio::sync::oneshot::channel::<()>();
     let (approval_done_tx, approval_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let channels = TurnChannels {
+        steering_rx,
+        followup_rx,
+        steering_accepted_tx,
+        followup_accepted_tx,
+        sink_done: sink_done_tx,
+        approval_done: approval_done_tx,
+    };
     let result: Result<(String, Option<u64>, Option<u64>), String> = match CatchUnwind::new(
         Box::pin(run_turn_inner(
             &state,
@@ -754,12 +804,7 @@ async fn run_agent_turn(
             &req,
             &cancel,
             &tx,
-            Some(&mut steering_rx),
-            Some(&steering_accepted_tx),
-            Some(&mut followup_rx),
-            Some(&followup_accepted_tx),
-            sink_done_tx,
-            approval_done_tx,
+            channels,
         )),
         "turn panicked",
     )
@@ -814,19 +859,13 @@ async fn run_agent_turn(
     let _ = tx.send(env).await;
 }
 
-#[allow(clippy::too_many_arguments, unused_assignments)]
 async fn run_turn_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
     req: &ChatRequest,
     cancel: &CancellationToken,
     tx: &mpsc::Sender<StreamEnvelope>,
-    steering_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
-    steering_accepted_tx: Option<&mpsc::Sender<String>>,
-    followup_rx: Option<&mut mpsc::Receiver<QueueMsg>>,
-    followup_accepted_tx: Option<&mpsc::Sender<String>>,
-    sink_done: tokio::sync::oneshot::Sender<()>,
-    approval_done: tokio::sync::oneshot::Sender<()>,
+    mut channels: TurnChannels,
 ) -> Result<(String, Option<u64>, Option<u64>), String> {
     let entry = {
         let sessions = lock_map(&state.sessions);
@@ -1032,6 +1071,7 @@ async fn run_turn_inner(
         let state = state.clone();
         let sid = session_id.to_string();
         let cancel = cancel.clone();
+        let sink_done = channels.sink_done;
         tokio::spawn(async move {
             let mut deferred: Option<SinkLine> = None;
             let mut sink_rx = sink_rx;
@@ -1137,6 +1177,7 @@ async fn run_turn_inner(
         let session_id = session_id.to_string();
         let stream_tx = tx.clone();
         let cancel = cancel.clone();
+        let approval_done = channels.approval_done;
         tokio::spawn(async move {
             let mut approval_rx = approval_rx;
             while let Some(request) = approval_rx.recv().await {
@@ -1181,27 +1222,17 @@ async fn run_turn_inner(
     }
 
     let mut tool_state = ToolState::load_async().await;
-    #[allow(unused_assignments)]
     // Outer loop for follow-up chaining (mirrors old local `event.rs` loop):
     // `process_turn` consumes steering mid-turn; follow-ups are drained after
-    // each successful turn and chained without a new HTTP request.
-    let mut final_response = String::new();
-    let mut final_usage = None;
-    let mut final_cached = None;
-    let turn_result: Result<String, Box<dyn std::error::Error + Send + Sync>>;
-    // Own the option wrappers for the chained loop; reborrow inner `&mut`
-    // each iteration (tokio `try_recv` needs `&mut`).
-    let mut steering_opt = steering_rx;
-    let mut followup_opt = followup_rx;
-    loop {
-        // Reborrow `&mut Receiver` from `Option<&mut Receiver>` without moving.
-        let steering_reborrow = steering_opt.as_deref_mut();
+    // each successful turn and chained without a new HTTP request. The loop
+    // value IS the turn result — no assigned-then-broken bookkeeping.
+    let turn_result: TurnOutcome = loop {
         let result = process_turn(AgentRuntime {
             config: &config,
             messages: &mut messages,
             state: &mut tool_state,
-            steering_rx: steering_reborrow,
-            steering_accepted_tx,
+            steering_rx: Some(&mut channels.steering_rx),
+            steering_accepted_tx: Some(&channels.steering_accepted_tx),
             session: Some(&mut session),
             client: &config,
             cancel,
@@ -1215,9 +1246,6 @@ async fn run_turn_inner(
         .await;
         match result {
             Ok(resp) => {
-                final_response = resp;
-                final_usage = tool_state.last_usage;
-                final_cached = tool_state.last_cached;
                 // Mid-turn completions drain at this boundary too — the
                 // same seam follow-ups chain through (§10b V1a). With no
                 // follow-up to chain, the persisted notice message still
@@ -1226,24 +1254,15 @@ async fn run_turn_inner(
                 drain_agent_notices(state, session_id, &mut session, &mut messages).await?;
                 // Drain follow-ups queued while this turn ran (`Recall`
                 // cancels one that has not been chained yet).
-                let followups: Vec<String> = match followup_opt.as_mut() {
-                    Some(rx) => {
-                        let mut out: Vec<String> = Vec::new();
-                        while let Ok(msg) = rx.try_recv() {
-                            apply_queue_msg(&mut out, msg);
-                        }
-                        out
-                    }
-                    None => Vec::new(),
-                };
+                let mut followups: Vec<String> = Vec::new();
+                while let Ok(msg) = channels.followup_rx.try_recv() {
+                    apply_queue_msg(&mut followups, msg);
+                }
                 if followups.is_empty() {
-                    turn_result = Ok(final_response.clone());
-                    break;
+                    break Ok((resp, tool_state.last_usage, tool_state.last_cached));
                 }
                 for content in followups {
-                    if let Some(tx) = followup_accepted_tx {
-                        let _ = tx.send(content.clone()).await;
-                    }
+                    let _ = channels.followup_accepted_tx.send(content.clone()).await;
                     let msg = ChatMessage::user_named(content.clone(), "follow-up");
                     session
                         .append_message(&msg)
@@ -1251,22 +1270,15 @@ async fn run_turn_inner(
                     messages.push(msg);
                 }
                 if cancel.is_cancelled() {
-                    turn_result = Err("cancelled by user".into());
-                    break;
+                    break Err("cancelled by user".into());
                 }
                 // chained follow-up: loop and run another turn with the same
                 // session/messages/tool_state but without new turn_start marker
                 // (the followup is already persisted).
-                continue;
             }
-            Err(e) => {
-                turn_result = Err(e);
-                break;
-            }
+            Err(e) => break Err(e),
         }
-    }
-    let usage = final_usage;
-    let cached = final_cached;
+    };
     // Durable terminal marker (P8): a completed turn is recorded before the
     // event is relayed; a failed one gets `turn_failed` in run_agent_turn.
     match &turn_result {
@@ -1277,9 +1289,7 @@ async fn run_turn_inner(
             .turn_event("turn_failed")
             .map_err(|e| format!("failed to record turn_failed: {e}"))?,
     }
-    turn_result
-        .map_err(|e| e.to_string())
-        .map(|response| (response, usage, cached))
+    turn_result.map_err(|e| e.to_string())
 }
 
 /// Drain queued child completion notices into ONE user-role message
@@ -3410,12 +3420,7 @@ mod permission_gate_tests {
             &mk_req(Some("trusted"), None),
             &cancel,
             &tx,
-            None,
-            None,
-            None,
-            None,
-            tokio::sync::oneshot::channel::<()>().0,
-            tokio::sync::oneshot::channel::<()>().0,
+            TurnChannels::detached(),
         )
         .await
         .unwrap_err();
@@ -3435,12 +3440,7 @@ mod permission_gate_tests {
             &mk_req(Some("read-only"), None),
             &cancel,
             &tx,
-            None,
-            None,
-            None,
-            None,
-            tokio::sync::oneshot::channel::<()>().0,
-            tokio::sync::oneshot::channel::<()>().0,
+            TurnChannels::detached(),
         )
         .await
         .unwrap_err();
@@ -3456,12 +3456,7 @@ mod permission_gate_tests {
             &mk_req(Some("read-only"), Some("{not json")),
             &cancel,
             &tx,
-            None,
-            None,
-            None,
-            None,
-            tokio::sync::oneshot::channel::<()>().0,
-            tokio::sync::oneshot::channel::<()>().0,
+            TurnChannels::detached(),
         )
         .await
         .unwrap_err();
