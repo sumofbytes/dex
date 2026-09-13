@@ -80,9 +80,15 @@ pub(crate) struct AgentNotice {
     /// resumability is notice prose only, zero wire change).
     pub(crate) resumable: bool,
     /// Recovery lineage for escalation notices (§24.4): oldest-first
-    /// mode words ("resumed after timed out"). Empty for first attempts
-    /// — no suffix then.
+    /// mode words ("resumed after timed out"), oldest first — the
+    /// escalation record. Empty for first attempts — no suffix then.
     pub(crate) history: Vec<String>,
+    /// True when this notice was queued for the parent (§24.5): the
+    /// idle wake's fire condition keys on it, so a silent recovery's
+    /// `Completed` hook does not spawn a wake task that would find an
+    /// empty notice queue. Not serialized — journaling renders the same
+    /// `text()` either way.
+    pub(crate) queued: bool,
 }
 
 impl AgentNotice {
@@ -199,10 +205,14 @@ impl ProgressReporter {
     /// Record the tool the child is currently running (e.g. `"bash"`).
     /// Fires the lifecycle hook (§15 V1b) when the tool actually changes,
     /// so one tool call's set/clear pair emits at most one progress event.
+    /// Also bumps the registry's spend meter: the body's own sink counter
+    /// dies with the body, so a wrapper-synthesized ending (panic, timeout)
+    /// reads the meter back for its resume budget (§24.1).
     pub(crate) fn set(&self, tool: &str) {
         let mut inner = self.manager.lock().unwrap_or_else(|e| e.into_inner());
         let mut fire = false;
         if let Some(child) = inner.running.get_mut(&self.id) {
+            child.calls += 1;
             if child.instance.progress.as_deref() != Some(tool) {
                 child.instance.progress = Some(tool.to_string());
                 fire = true;
@@ -352,6 +362,46 @@ struct Fallback {
     tool_calls: u32,
 }
 
+/// Named snapshot of the registry entry at `finish` time. `None` only
+/// for an id that was never registered (defensive — wrappers always
+/// register first); then the result settles handle-free.
+struct Record {
+    generation: u32,
+    transcript: Option<PathBuf>,
+    budget: Option<u32>,
+    spec: SupervisionSpec,
+    lineage: Vec<String>,
+    parent_session: Option<PathBuf>,
+    retry: Option<ChildFactory>,
+    seed: ContextSeed,
+    def: AgentDefinition,
+    /// Registry-side spend meter (§24.1), surviving body death.
+    calls: u32,
+}
+
+/// The escalation handle for a recorded child, transcript-gated (§24.1):
+/// only a child whose file is known can advertise a re-entry. Shared by
+/// the settle escalation arm and the cap-race fallback.
+fn escalate_handle(
+    record: &Record,
+    id: &AgentId,
+    reason: ExitReason,
+    tool_calls: u32,
+) -> Option<ResumeHandle> {
+    let transcript = record.transcript.clone()?;
+    let remaining = record
+        .budget
+        .map(|cap| (cap as usize).saturating_sub(tool_calls as usize));
+    Some(ResumeHandle {
+        agent_id: id.clone(),
+        transcript,
+        generation: record.generation,
+        remaining_budget: remaining,
+        note: resume_note(reason, tool_calls),
+        history: record.lineage.clone(),
+    })
+}
+
 impl Inner {
     /// Queue a spawn request. Capacity is checked here so the spawn and
     /// recovery-fallback paths share the same overflow semantics.
@@ -391,6 +441,12 @@ struct RunningChild {
     /// Automatic-recovery lineage, oldest first (§24.4 escalation
     /// record). Extended per recovery, read at escalation.
     lineage: Vec<String>,
+    /// Registry-side spend meter (§24.1): bumped by `ProgressReporter::set`
+    /// per tool call, so a wrapper-synthesized ending (panic, timeout)
+    /// still reports the spend its body made. Reconciled against the
+    /// body's own count at `finish` (`max` — both count the same events,
+    /// the registry meter just survives the body's death).
+    calls: u32,
 }
 
 /// Builds one attempt's body (§24.3: re-entry is spawn). The factory —
@@ -554,14 +610,27 @@ impl AgentManager {
             // queue FIFO instead of rejecting; only queue overflow still
             // rejects (with the running list, as the cap used to).
             if inner.running.len() >= MAX_CHILDREN || inner.open_until.is_some() {
+                // Capacity is checked BEFORE the id is allocated (§24.5):
+                // an overflowed queue must not burn a counter slot.
+                if inner.pending.len() >= MAX_PENDING {
+                    let running = inner
+                        .running
+                        .iter()
+                        .map(|(id, child)| (id.clone(), child.instance.definition.name.clone()))
+                        .collect();
+                    return Err(SpawnError::AtCapacity {
+                        limit: MAX_PENDING,
+                        running,
+                    });
+                }
                 let id = Self::next_id(&mut inner);
-                inner.enqueue(PendingChild {
+                inner.pending.push_back(PendingChild {
                     id: id.clone(),
                     def: def.clone(),
                     seed,
                     meta,
                     run,
-                })?;
+                });
                 drop(inner);
                 self.schedule_drain();
                 return Ok(id);
@@ -652,6 +721,7 @@ impl AgentManager {
                 parent_session: meta.parent_session.clone(),
                 retry: meta.retry.clone(),
                 lineage: meta.lineage.clone(),
+                calls: 0,
             },
         );
         (token, def.timeout)
@@ -847,7 +917,6 @@ impl AgentManager {
         let mut hooks: Vec<AgentEvent> = Vec::new();
         // Copy out before `result` moves into retention below.
         let reason = result.reason;
-        let tool_calls = result.tool_calls;
         {
             let mut inner = self.lock();
             if inner.results.len() >= MAX_RESULTS {
@@ -865,17 +934,6 @@ impl AgentManager {
             // Named snapshot of the registry entry. `None` only for an
             // id that was never registered (defensive — wrappers always
             // register first); then the result settles handle-free.
-            struct Record {
-                generation: u32,
-                transcript: Option<PathBuf>,
-                budget: Option<u32>,
-                spec: SupervisionSpec,
-                lineage: Vec<String>,
-                parent_session: Option<PathBuf>,
-                retry: Option<ChildFactory>,
-                seed: ContextSeed,
-                def: AgentDefinition,
-            }
             let record: Option<Record> = inner.running.get(id).map(|child| Record {
                 generation: child.generation,
                 transcript: child.transcript.clone(),
@@ -886,8 +944,16 @@ impl AgentManager {
                 retry: child.retry.clone(),
                 seed: child.instance.context.clone(),
                 def: child.instance.definition.clone(),
+                calls: child.calls,
             });
-            let progress_made = result.tool_calls > 0
+            // Spend reconciliation (§24.1): the body's own count is
+            // authoritative while it lives; the registry meter survives a
+            // panicking or timed-out body. Both count the same `set()`
+            // events, so `max` is exact either way.
+            let tool_calls = result
+                .tool_calls
+                .max(record.as_ref().map(|record| record.calls).unwrap_or(0));
+            let progress_made = tool_calls > 0
                 || !result.summary.trim().is_empty()
                 || record
                     .as_ref()
@@ -937,9 +1003,13 @@ impl AgentManager {
                     usage: inner.results.get(id).and_then(|result| result.usage),
                     resumable,
                     history,
+                    // Set by the queue step below: only a queued notice
+                    // may wake the session.
+                    queued: false,
                 }
             };
-            let queue = |inner: &mut Inner, notice: AgentNotice| {
+            let queue = |inner: &mut Inner, mut notice: AgentNotice| {
+                notice.queued = true;
                 if inner.notices.len() >= MAX_NOTICES {
                     inner.overflowed += 1;
                 } else {
@@ -953,25 +1023,11 @@ impl AgentManager {
                         .map(|record| record.lineage.clone())
                         .unwrap_or_default();
                     if action == Action::Escalate {
-                        // Transcript-gated, as in Phase 11: only a child
-                        // whose file is known can advertise a handle.
-                        let escalate = record.as_ref().and_then(|record| {
-                            record.transcript.clone().map(|transcript| {
-                                let remaining = record
-                                    .budget
-                                    .map(|cap| (cap as usize).saturating_sub(tool_calls as usize));
-                                (record.generation, transcript, remaining)
-                            })
-                        });
-                        if let Some((generation, transcript, remaining)) = escalate {
-                            result.resume = Some(ResumeHandle {
-                                agent_id: id.clone(),
-                                transcript,
-                                generation,
-                                remaining_budget: remaining,
-                                note: resume_note(reason, tool_calls),
-                                history: lineage.clone(),
-                            });
+                        let handle = record
+                            .as_ref()
+                            .and_then(|record| escalate_handle(record, id, reason, tool_calls));
+                        if let Some(handle) = handle {
+                            result.resume = Some(handle);
                         }
                         // §24.5 breaker: an intensity-exhausted *recovery*
                         // escalation means the environment is failing
@@ -1106,21 +1162,25 @@ impl AgentManager {
                 Err(SpawnError::AtCapacity { .. }) => {
                     // Cap race between removal and relaunch: queue the
                     // recovery like any spawn (§24.5) — it launches when a
-                    // sibling frees its slot. Breaker open → escalate:
-                    // recovery is exactly what the breaker gates.
-                    let breaker_open = self.lock().open_until.is_some();
-                    if breaker_open {
-                        self.escalate_fallback(id, &reenter);
-                    } else {
-                        let new_id = {
-                            let mut inner = self.lock();
-                            Self::next_id(&mut inner)
-                        };
-                        let retry_factory = reenter.factory.clone();
-                        let retry_resume = reenter.resume.clone();
-                        let (queued, fired) = {
-                            let mut inner = self.lock();
-                            let queued = PendingChild {
+                    // sibling frees its slot. Breaker open or queue full →
+                    // escalate: recovery is exactly what the breaker gates,
+                    // and an overflowed queue must not lose the child
+                    // silently either. One lock scope does probe + allocate
+                    // + enqueue, so no other actor can slip between the
+                    // check and the push.
+                    // (The race itself is not deterministically testable —
+                    // the dying child frees its own slot first, so hitting
+                    // AtCapacity here needs a racing spawn between the
+                    // lock scopes.)
+                    let outcome = {
+                        let mut inner = self.lock();
+                        if inner.open_until.is_some() || inner.pending.len() >= MAX_PENDING {
+                            None
+                        } else {
+                            let new_id = Self::next_id(&mut inner);
+                            let retry_factory = reenter.factory.clone();
+                            let retry_resume = reenter.resume.clone();
+                            inner.pending.push_back(PendingChild {
                                 id: new_id.clone(),
                                 def: reenter.def.clone(),
                                 seed: reenter.seed.clone(),
@@ -1135,27 +1195,29 @@ impl AgentManager {
                                 run: Box::new(move |token, progress, new_id| {
                                     (retry_factory)(token, progress, new_id, retry_resume)
                                 }),
-                            };
-                            let fired = inner.enqueue(queued).is_ok();
-                            let event = fired.then(|| AgentEvent::Recovered {
-                                agent_id: new_id.clone(),
-                                name: reenter.name.clone(),
-                                attempt: reenter.attempt,
-                                mode: reenter.mode,
-                                reason: reenter.reason,
                             });
-                            (fired, event)
-                        };
-                        if let Some(event) = fired {
+                            Some((
+                                new_id.clone(),
+                                AgentEvent::Recovered {
+                                    agent_id: new_id,
+                                    name: reenter.name.clone(),
+                                    attempt: reenter.attempt,
+                                    mode: reenter.mode,
+                                    reason: reenter.reason,
+                                },
+                            ))
+                        }
+                    };
+                    match outcome {
+                        Some((_new_id, event)) => {
                             let hook = self.lock().events.clone();
                             if let Some(hook) = hook {
                                 hook(event);
                             }
-                        }
-                        if queued {
                             self.schedule_drain();
+                            requeued = true;
                         }
-                        requeued = queued;
+                        None => self.escalate_fallback(id, &reenter),
                     }
                 }
                 Err(_) => {
@@ -1193,6 +1255,8 @@ impl AgentManager {
                     });
                 }
             }
+            // Reconcile the meter here too: the fallback can fire for a
+            // body that spent calls before its relaunch lost the race.
             AgentNotice {
                 agent_id: id.clone(),
                 name: reenter.name.clone(),
@@ -1208,6 +1272,9 @@ impl AgentManager {
                     .and_then(|result| result.resume.as_ref())
                     .is_some(),
                 history: fallback.lineage.clone(),
+                // The parent is being notified of a lost recovery — it may
+                // act on it, so the wake is legitimate.
+                queued: true,
             }
         };
         let hook = self.lock().events.clone();
@@ -1365,6 +1432,9 @@ impl AgentManager {
                 usage: None,
                 resumable: false,
                 history: Vec::new(),
+                // A never-started child's cancel is a real parent-visible
+                // event (delegate_stop or the reaper did it).
+                queued: true,
             };
             if inner.notices.len() >= MAX_NOTICES {
                 inner.overflowed += 1;
@@ -1655,6 +1725,7 @@ mod tests {
                 usage: None,
                 resumable: false,
                 history: Vec::new(),
+                queued: true,
             }]
         );
         assert_eq!(mgr.take_overflow(), 0);
@@ -2089,6 +2160,7 @@ mod tests {
             }),
             resumable: false,
             history: Vec::new(),
+            queued: true,
         };
         assert_eq!(
             notice.text(),
@@ -2106,6 +2178,7 @@ mod tests {
             }),
             resumable: false,
             history: Vec::new(),
+            queued: false,
         };
         assert_eq!(
             unpriced.text(),
@@ -2119,6 +2192,7 @@ mod tests {
             usage: None,
             resumable: false,
             history: Vec::new(),
+            queued: false,
         };
         assert_eq!(bare.text(), "[agent explorer:sess-3] finished completed");
         // A resumable result advertises the re-entry — same prefix the TUI
@@ -2130,6 +2204,7 @@ mod tests {
             usage: None,
             resumable: true,
             history: vec!["resumed after timed out".to_string()],
+            queued: true,
         };
         assert_eq!(
             resumable.text(),
@@ -2426,6 +2501,58 @@ mod tests {
             other => panic!("expected Finished, got {other:?}"),
         }
         mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapper_synthesized_ending_reconciles_the_spend_meter() {
+        // §24.1 (review fix): a body that panics mid-turn loses its own
+        // sink counter, but the registry meter (`ProgressReporter::set`)
+        // survives it — the resume budget must reconcile to cap − spend,
+        // not the full cap.
+        let dir = PathBuf::from("/tmp/dex-supervision-meter");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("sess-0-tester.jsonl"),
+            "{\"entry_type\":\"session\"}\n{\"entry_type\":\"turn_start\"}\n",
+        )
+        .unwrap();
+        let mut def = test_def("tester");
+        def.max_tool_iterations = Some(10);
+        let mgr = AgentManager::new("sess");
+        let id = mgr
+            .spawn(
+                &def,
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
+                    retry: None,
+                    lineage: Vec::new(),
+                },
+                |token, progress, _| async move {
+                    progress.set("read");
+                    progress.set("bash");
+                    // Body reports no count — it never got to synthesize.
+                    assert!(!token.is_cancelled());
+                    panic!("boom mid-turn");
+                },
+            )
+            .unwrap();
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                assert_eq!(result.status, AgentState::Failed);
+                assert_eq!(result.reason, ExitReason::Transient);
+                // The advertised budget reconciles against the registry
+                // meter: 10 − 2, not the full 10.
+                let handle = result.resume.expect("transient + progress advertises");
+                assert_eq!(handle.remaining_budget, Some(8));
+                assert!(handle.note.contains("2 tool calls"), "{}", handle.note);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
