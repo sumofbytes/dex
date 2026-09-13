@@ -1,6 +1,6 @@
 # AGENTS.md — dex
 
-Terminal coding agent in Rust (`dex`): OpenAI-compatible Chat Completions / Responses, tool use (`read`/`bash`/`write`/`edit`/`ffgrep`/`fffind`), ratatui TUI, client↔daemon over HTTP+SSE, JSONL sessions.
+Terminal coding agent in Rust (`dex`): OpenAI-compatible Chat Completions / Responses, tool use (`read`/`bash`/`write`/`edit`/`grep`/`find`), ratatui TUI, client↔daemon over HTTP+SSE, JSONL sessions.
 
 ## Build & check
 
@@ -39,10 +39,10 @@ All of this lives in `src/llm/config.rs` — don't add a second way to express a
 
 ## Working rules
 
-- Batch independent `read`/`ffgrep`/`fffind` into one parallel call; don't do one file per turn.
+- Batch independent `read`/`grep`/`find` into one parallel call; don't do one file per turn.
 - `read` before `edit`; `edit` needs exact `oldText` (unique match, or `replaceAll: true`). `write` overwrites.
 - Tools are workspace-confined (`resolve_workspace_path`); symlinks can't escape. Verify with `bash` + tests, show file paths clearly.
-- `write`/`edit` on distinct `path` run in parallel; same `path` or any `bash` serializes. `read`/`ffgrep`/`fffind` are read-only/idempotent.
+- `write`/`edit` on distinct `path` run in parallel; same `path` or any `bash` serializes. `read`/`grep`/`find` are read-only/idempotent.
 - Tool output is truncated for the model: bash ~400 lines/32 KiB, read 2000 lines/256 KiB, fan-out caps 10 files. Use `$DEX_BIN run <tool>` inside `bash` to stitch pipelines without flooding context.
 - Sessions journal incrementally; `turn_start`/`turn_complete`/`turn_failed` markers — crash loses at most the in-flight event.
 
