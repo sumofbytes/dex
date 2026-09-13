@@ -747,10 +747,12 @@ async fn process_tool_result(
     // The tool result lands before any boundary reminder so the
     // transcript stays assistant → tool_result → reminder (see
     // the boundary note above).
-    messages.push(ChatMessage::tool_result(
-        call.id.clone(),
-        model_tool_result(&result),
-    ));
+    let mut result_message = ChatMessage::tool_result(call.id.clone(), model_tool_result(&result));
+    // Internal-only metadata (`chat_completions_messages` strips `name`
+    // from the wire): lets the observation pack label placeholders with the
+    // producing tool and exempt `obs_recall` read-backs from re-packing.
+    result_message.name = Some(name.to_string());
+    messages.push(result_message);
     persist_pending(session, messages, persisted_cursor)?;
     if let Some(steps) = boundary {
         state.online.record_boundary(steps);

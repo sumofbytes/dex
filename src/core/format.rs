@@ -28,16 +28,35 @@ pub(crate) fn clip_chars(s: &str, max_chars: usize) -> String {
 /// the model always knows how much it did not see. Long lines are clipped to
 /// [`MAX_LINE_CHARS`].
 pub(crate) fn clamp_lines(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    clamp_lines_checked(text, max_lines, max_bytes).0
+}
+
+/// `clamp_lines` plus an explicit "the clamp cut bytes" flag. Trailing
+/// newline normalization is not a cut — the capture path must not archive a
+/// result, and hang a marker on it, merely because its raw form ends in a
+/// newline and the join drops that newline.
+pub(crate) fn clamp_lines_checked(
+    text: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> (String, bool) {
     let clipped: Vec<String> = text
         .lines()
         .map(|line| clip_chars(line, MAX_LINE_CHARS))
         .collect();
+    // Byte length lies here: `clip_chars` output can be a few bytes longer
+    // than the input (an exactly-max_chars line gains `…`), so compare the
+    // strings themselves.
+    let clipped_any = text
+        .lines()
+        .zip(clipped.iter())
+        .any(|(line, out)| out.as_str() != line);
     let total = clipped.len();
     let width = |lines: &[String]| -> usize { lines.iter().map(|l| l.len() + 1).sum::<usize>() };
 
     let fits = width(&clipped) <= max_bytes.saturating_add(total);
     if total <= max_lines && fits {
-        return clipped.join("\n");
+        return (clipped.join("\n"), clipped_any);
     }
 
     let head_budget = max_lines / 2;
@@ -67,7 +86,7 @@ pub(crate) fn clamp_lines(text: &str, max_lines: usize, max_bytes: usize) -> Str
     let mut out = head;
     out.push(format!("[... {omitted} of {total} lines truncated ...]"));
     out.extend(tail);
-    out.join("\n")
+    (out.join("\n"), true)
 }
 
 pub(crate) fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
@@ -1609,6 +1628,30 @@ mod tests {
         let clamped = clamp_lines(text.trim_end(), 100, 4096);
         assert!(clamped.contains("lines truncated"), "{clamped}");
         assert!(clamped.len() < 8192, "{}", clamped.len());
+    }
+
+    #[test]
+    fn clamp_checked_flags_real_cuts_not_newline_normalization() {
+        // Trailing newline is normalization, not a cut: the capture path
+        // must not archive-and-mark a result for it.
+        let (out, cut) = clamp_lines_checked("a\nb\nc\n", 10, 1024);
+        assert_eq!(out, "a\nb\nc");
+        assert!(!cut);
+        assert_eq!(
+            clamp_lines_checked("no newline", 10, 1024),
+            ("no newline".to_string(), false)
+        );
+
+        // Line-budget cut.
+        let text: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let (_, cut) = clamp_lines_checked(&text, 10, 1 << 20);
+        assert!(cut);
+
+        // Per-line clip is a cut even where the output can gain bytes (`…`).
+        let (_, cut) = clamp_lines_checked(&format!("{}\n", "x".repeat(5000)), 10, 1 << 20);
+        assert!(cut);
+        let (_, cut) = clamp_lines_checked("x".repeat(2001).as_str(), 10, 1 << 20);
+        assert!(cut);
     }
 
     #[test]

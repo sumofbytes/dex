@@ -49,6 +49,7 @@ All of this lives in `src/llm/config.rs` — don't add a second way to express a
 ## Conventions
 
 - No new dependencies without clear need — check `Cargo.toml` first, prefer stdlib/native.
+- Worktrees live outside this repo (`git worktree add ../dex-<name> <branch>`), not in `.worktrees/` — in-repo worktrees are gitignored, so `ffgrep`/`fffind` never index them and they'd show duplicate hits if un-ignored. When working in a worktree, remember: only the main checkout's `grep`/`find` cover the main checkout.
 - Keep `src/llm/prompt.rs` minimal; tool behavior belongs in `src/llm/protocol.rs` tool descriptions, not the prompt.
 - Skills: directory with `SKILL.md` frontmatter (`name`, `description`). Discovered via `skill_dirs()` — cwd `.dex/skills`, `.agents/skills`, then `$XDG_CONFIG_HOME/dex/skills`. Sorted, first `name` wins, duplicates warned.
 - Permissions default `trusted` (`read-only`/`ask-writes`/`ask-shell`/`trusted`); `bash` is mutating. `DEX_EXTRA_TOOLS=1` adds `git`/`chain`.

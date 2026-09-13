@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::agent::online::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::console::Console;
-use crate::core::format::{clamp_lines, clip_chars};
+use crate::core::format::{clamp_lines, clamp_lines_checked, clip_chars};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, PermissionMode};
 use tokio::io::AsyncReadExt as _;
 
@@ -818,8 +818,7 @@ async fn append_then_run(
         "\n\n[then_run:{marker}] {}\n",
         clip_command(command)
     ));
-    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
-    let was_clamped = output.len() != clamped.len();
+    let (clamped, was_clamped) = clamp_lines_checked(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
     let (clamped, archive_id) =
         crate::agent::evidence_reducer::capture(session, "then_run", &output, clamped, was_clamped);
     *shell_out = Some(ShellEvidence {
@@ -854,8 +853,7 @@ async fn tool_bash(
     shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
     let (output, code) = run_bash(&arg_str(args, "command")?, cancel).await?;
-    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
-    let was_clamped = output.len() != clamped.len();
+    let (clamped, was_clamped) = clamp_lines_checked(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
     let (clamped, archive_id) =
         crate::agent::evidence_reducer::capture(session, "bash", &output, clamped, was_clamped);
     *shell_out = Some(ShellEvidence {
