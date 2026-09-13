@@ -232,10 +232,21 @@ async fn delegate(
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
             )
             .map_err(|error| ToolError::Denied(error.to_string()))?;
-        emit_started(policy, &def.name, &id).await;
+        // §24.5: under the cap or an open breaker the spawn queues — the
+        // lifecycle line and the tool result say so instead of "started".
+        let queued = ctx.manager.is_queued(&id);
+        if let Some(console) = policy.console.as_ref() {
+            let line = if queued {
+                format!("[agent {}:{id}] queued (waiting for a slot)", def.name)
+            } else {
+                format!("[agent {}:{id}] started", def.name)
+            };
+            console.emit_async(SinkLine::System(line)).await;
+        }
+        let state = if queued { "queued" } else { "running" };
         return Ok(json!({
             "agent_id": id.to_string(),
-            "state": "running",
+            "state": state,
             "resumed_from": handle.agent_id.to_string(),
             "generation": generation,
         })
@@ -265,19 +276,19 @@ async fn delegate(
             child_body(ctx.clone(), def.clone(), seed, None),
         )
         .map_err(|error| ToolError::Denied(error.to_string()))?;
-    emit_started(policy, &def.name, &id).await;
-    Ok(json!({ "agent_id": id.to_string(), "state": "running" }).to_string())
-}
-
-/// The §15 V1a started line rides the parent turn's journal (already
-/// streaming); the finished line is journaled by the manager's hook on
-/// every terminal path, whenever the child actually ends.
-async fn emit_started(policy: &Policy, name: &str, id: &AgentId) {
+    // §24.5: under the cap or an open breaker the spawn queues — the
+    // lifecycle line and the tool result say so instead of "started".
+    let queued = ctx.manager.is_queued(&id);
     if let Some(console) = policy.console.as_ref() {
-        console
-            .emit_async(SinkLine::System(format!("[agent {name}:{id}] started")))
-            .await;
+        let line = if queued {
+            format!("[agent {}:{id}] queued (waiting for a slot)", def.name)
+        } else {
+            format!("[agent {}:{id}] started", def.name)
+        };
+        console.emit_async(SinkLine::System(line)).await;
     }
+    let state = if queued { "queued" } else { "running" };
+    Ok(json!({ "agent_id": id.to_string(), "state": state }).to_string())
 }
 
 /// `delegate_output(agent_id, wait_seconds?)` — bounded poll-wait (§10.2):
@@ -305,9 +316,9 @@ async fn delegate_output(
                      or its result aged out of retention"
                 )));
             }
-            WaitOutcome::Running(_) => {
+            WaitOutcome::Running(state) => {
                 if cancel.is_cancelled() || Instant::now() >= deadline {
-                    return Ok(running_json(&id, ctx.manager.progress(&id)));
+                    return Ok(running_json(&id, state, ctx.manager.progress(&id)));
                 }
             }
         }
@@ -520,10 +531,16 @@ fn result_json(id: &AgentId, result: &AgentResult) -> String {
     .to_string()
 }
 
-fn running_json(id: &AgentId, progress: Option<String>) -> String {
+fn running_json(id: &AgentId, state: AgentState, progress: Option<String>) -> String {
+    // Tool-JSON wording (not the SSE wire): a queued child (§24.5) reads
+    // "queued" — it has an id and a slot request, but no live process.
+    let state = match state {
+        AgentState::Pending => "queued",
+        _ => "running",
+    };
     match progress {
-        Some(tool) => json!({ "agent_id": id.to_string(), "state": "running", "progress": tool }),
-        None => json!({ "agent_id": id.to_string(), "state": "running" }),
+        Some(tool) => json!({ "agent_id": id.to_string(), "state": state, "progress": tool }),
+        None => json!({ "agent_id": id.to_string(), "state": state }),
     }
     .to_string()
 }
