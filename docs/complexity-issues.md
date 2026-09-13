@@ -10,54 +10,60 @@ Legend: Risk = chance of behavior drift (Low / Med / Hi). Effort = S (<1h) / M (
 
 ## Index
 
-| ID | Issue | Area | Risk | Effort | Est. win |
-|---|---|---|---|---|---|
-| LLM-1 | `env_parse` helper for 7+ repeated env-var parse chains | llm/config.rs | Low | S | ~20 branch pts |
-| LLM-2 | `xdg_path` helper for 5 duplicated XDG-vs-HOME resolutions | llm/config.rs | Low | S | ~15 branch pts |
-| LLM-3 | Shared `resolve_model_cost` for `usage_cost` + `cache_write_read_ratio` | llm/config.rs | Low | S | ~10 branch pts |
-| LLM-4 | Generic `cached_parse` for 3 file-identity caches | llm/config.rs | Low | M | ~25 branch pts |
-| LLM-5 | `catalog_models` iterator for 6 dual-shape scans | llm/config.rs | Med | M | ~30 branch pts |
-| LLM-6 | Delete test-only sync SSE driver; or single `feed_event` match | llm/stream.rs | Low-Med | M | ~80 branch pts |
-| LLM-7 | `handle_function_call_item` for added/done duplicates | llm/stream.rs | Low | S | ~20 lines |
-| LLM-8 | Shared resolution-with-origin for `from_env` + `doctor` | llm/config.rs | Med-Hi | L | ~440 lines, whole file's core |
-| LLM-9 | `classify_selection` routing classifier (3 sites) | llm/config.rs | Med-Hi | L | ~90 lines |
-| LLM-10 | Header merge funnels (modest) | llm/config.rs | Low | S | ~15 lines |
-| AGT-1 | `OVERFLOW_PHRASES` const for 13 chained `contains` | agent/loop.rs | Low | S | ~10 branch pts |
-| AGT-2 | Dead `for _iteration in 0..1_000_000` backstop cleanup | agent/loop.rs | Low | S | clarity |
-| AGT-3 | Derive `Clone` on `ToolState` (save-path struct literal) | agent/loop.rs | Low | S | 12-field hazard |
-| AGT-4 | `ToolState` load/save sync-async dedup via `spawn_blocking` | agent/state.rs | Low | S | ~80 lines |
-| AGT-5 | Decompose `process_turn` (~700 lines) into ~5 helpers | agent/loop.rs | Med | L | biggest single win |
-| AGT-6 | `compact_history`: extract `llm_summary` + `attach_file_section` | agent/compaction.rs | Med-Low | M | ~60 lines |
-| AGT-7 | `find_cut_point`: `cut_point_at` + `back_up_over_tools` | agent/compaction.rs | Low | M | dedup of semantic core |
-| CLI-1 | `clip_chars` helper replacing 7+ copies | core/format.rs, tools/mod.rs | Low | S-M | ~120 lines |
-| CLI-2 | Single-audit `execute_with_shell` via `dispatch_tool` | tools/mod.rs | Med-Low | M | ~10 exit pts → 1 |
-| CLI-3 | `metadata()` const table | tools/mod.rs | Low | S | ~45 lines |
-| CLI-4 | `content_lines` classifier for 4 summary loops | core/format.rs | Low-Med | M | optional |
-| CLI-5 | `skills.rs`: shared `parse_frontmatter` + optional `TimedCache` | skills.rs | Low | S | ~50 lines, fixes warning drift |
-| CLI-6 | `main.rs`: `open_session`, `run_serve`, `run_or_exit` | main.rs | Low | S | ~90 lines |
-| CLI-7 | `cli.rs` one-arm merge | cli.rs | Low | S | tiny, optional |
-| SES-1 | `scan_jsonl_dir` + `sort_newest_first` (4 scans) | session.rs | Low | S | ~80 lines |
-| SES-2 | `for_each_line` scanner loop (4 scanners) | session.rs | Low | M | ~60 lines |
-| SRV-1 | `lock_map` mutex helper (~45× boilerplate) | daemon/server.rs, mod.rs | Near-zero | S | −45 branch pts, −90 lines |
-| SRV-2 | `run_agent_turn`/`run_turn_inner` mechanical cleanup | daemon/server.rs | Med | M | forwarders, dead Options, TurnCtx |
-| SRV-3 | `queue_tx` for steer/followup/recall triplication | daemon/server.rs | Very low | S | −10 branch pts, −45 lines |
-| SRV-4 | `journal_event` helper (5 sites) | daemon/ | Low | S | −35 lines |
-| SRV-5 | `chat` replay-chain flatten + `steal_wake_and_claim` restructure | daemon/server.rs | Low | S | −5 branch pts |
-| SRV-6 | `list_sessions` single sort, drop `by_id` map | daemon/server.rs | Low | S | −15 lines, deterministic ties |
-| SRV-7 | `as_str()`/`From` impls + `DaemonInfo::default_for` | daemon/, core/types.rs | Low | S | −8 branch pts |
-| SRV-8 | `client/http.rs`: `session_url`/`post_json`/`boxed_err`/`lenient_array` | client/http.rs | Low | M | −150 lines |
-| MCP-1 | `post_token_form` for exchange_code + refresh_access_token | mcp/oauth.rs | Low | S | ~30 lines |
-| MCP-2 | Single `initialize_params()` (3 hand-built payloads) | mcp.rs, oauth.rs | Low | S | drift hazard |
-| MCP-3 | `def_belongs_to` + `resource_reader_name` (3 filters, 4 name builds) | mcp.rs | Low | S | grammar single-source |
-| MCP-4 | `rpc_error`/`json_arr`/`clamp_output` for McpClient | mcp.rs | Low | S | sentinel-safety |
-| MCP-5 | `refresh_and_retry` + `extract_reply` in HttpTransport | mcp.rs | Low | S-M | CC 10-13 → small |
-| MCP-6 | Shared `insert_server` for JSON/YAML config paths | mcp.rs | Low | S | dedup loop |
-| MCP-7 | `login` decomposition (CC 15 → ~5) | mcp/oauth.rs | Low | M | ~60 lines |
-| MCP-8 | `try_snapshot` for ephemeral_line/cached_statuses | mcp.rs | Low | S | dedup |
-| MCP-9 | `redact_line`: extract `secret_value_start` (CC 15 → ~4) | mcp.rs | Low | S | + bug fix |
-| MCP-10 | `expand_env`: `resolve` closure (CC 12 → ~5) | mcp.rs | Low | S | + bug fix |
-| BUG-1 | `redact_line` to_lowercase byte-offset desync | mcp.rs:431 | bug fix | S | correctness |
-| BUG-2 | `expand_env` non-ASCII mojibake (`bytes[i] as char`) | mcp.rs:142 | bug fix | S | correctness |
+| ID | Issue | Area | Risk | Effort | Est. win | Status |
+|---|---|---|---|---|---|---|
+| LLM-1 | `env_parse` helper for 7+ repeated env-var parse chains | llm/config.rs | Low | S | ~20 branch pts | done (PR-2) |
+| LLM-2 | `xdg_path` helper for 5 duplicated XDG-vs-HOME resolutions | llm/config.rs | Low | S | ~15 branch pts | done (PR-2) |
+| LLM-3 | Shared `resolve_model_cost` for `usage_cost` + `cache_write_read_ratio` | llm/config.rs | Low | S | ~10 branch pts | done (PR-16) |
+| LLM-4 | Generic `cached_parse` for 3 file-identity caches | llm/config.rs | Low | M | ~25 branch pts | done (PR-16) |
+| LLM-5 | `catalog_models` iterator for 6 dual-shape scans | llm/config.rs | Med | M | ~30 branch pts | skipped (default skip; Phase 8 gate did not demand it) |
+| LLM-6 | Delete test-only sync SSE driver; or single `feed_event` match | llm/stream.rs | Low-Med | M | ~80 branch pts | done (PR-17) |
+| LLM-7 | `handle_function_call_item` for added/done duplicates | llm/stream.rs | Low | S | ~20 lines | done (PR-17) |
+| LLM-8 | Shared resolution-with-origin for `from_env` + `doctor` | llm/config.rs | Med-Hi | L | ~440 lines, whole file's core | done (PR-18) |
+| LLM-9 | `classify_selection` routing classifier (3 sites) | llm/config.rs | Med-Hi | L | ~90 lines | done (PR-19) |
+| LLM-10 | Header merge funnels (modest) | llm/config.rs | Low | S | ~15 lines | done (PR-16) |
+| AGT-1 | `OVERFLOW_PHRASES` const for 13 chained `contains` | agent/loop.rs | Low | S | ~10 branch pts | done (PR-2) |
+| AGT-2 | Dead `for _iteration in 0..1_000_000` backstop cleanup | agent/loop.rs | Low | S | clarity | done (PR-2) |
+| AGT-3 | Derive `Clone` on `ToolState` (save-path struct literal) | agent/loop.rs | Low | S | 12-field hazard | done (PR-11, reworked per rev 2) |
+| AGT-4 | `ToolState` load/save sync-async dedup via `spawn_blocking` | agent/state.rs | Low | S | ~80 lines | done (PR-11) |
+| AGT-5 | Decompose `process_turn` (~700 lines) into ~5 helpers | agent/loop.rs | Med | L | biggest single win | done (PR-12) |
+| AGT-6 | `compact_history`: extract `llm_summary` + `attach_file_section` | agent/compaction.rs | Med-Low | M | ~60 lines | done (PR-13) |
+| AGT-7 | `find_cut_point`: `cut_point_at` + `back_up_over_tools` | agent/compaction.rs | Low | M | dedup of semantic core | done (PR-11) |
+| CLI-1 | `clip_chars` helper replacing 7+ copies | core/format.rs, tools/mod.rs | Low | S-M | ~120 lines | done (PR-6, narrowed per review) |
+| CLI-2 | Single-audit `execute_with_shell` via `dispatch_tool` | tools/mod.rs | Med-Low | M | ~10 exit pts → 1 | done (PR-7) |
+| CLI-3 | `metadata()` const table | tools/mod.rs | Low | S | ~45 lines | done (PR-6) |
+| CLI-4 | `content_lines` classifier for 4 summary loops | core/format.rs | Low-Med | M | optional | skipped (default skip; optional item) |
+| CLI-5 | `skills.rs`: shared `parse_frontmatter` + optional `TimedCache` | skills.rs | Low | S | ~50 lines, fixes warning drift | done (PR-8) |
+| CLI-6 | `main.rs`: `open_session`, `run_serve`, `run_or_exit` | main.rs | Low | S | ~90 lines | done (PR-8) |
+| CLI-7 | `cli.rs` one-arm merge | cli.rs | Low | S | tiny, optional | done (PR-2) |
+| SES-1 | `scan_jsonl_dir` + `sort_newest_first` (4 scans) | session.rs | Low | S | ~80 lines | done (PR-10) |
+| SES-2 | `for_each_line` scanner loop (4 scanners) | session.rs | Low | M | ~60 lines | done (PR-10) |
+| SRV-1 | `lock_map` mutex helper (~45× boilerplate) | daemon/server.rs, mod.rs | Near-zero | S | −45 branch pts, −90 lines | done (PR-3) |
+| SRV-2 | `run_agent_turn`/`run_turn_inner` mechanical cleanup | daemon/server.rs | Med | M | forwarders, dead Options, TurnCtx | done (PR-5) |
+| SRV-3 | `queue_tx` for steer/followup/recall triplication | daemon/server.rs | Very low | S | −10 branch pts, −45 lines | done (PR-4) |
+| SRV-4 | `journal_event` helper (5 sites) | daemon/ | Low | S | −35 lines | done (PR-4) |
+| SRV-5 | `chat` replay-chain flatten + `steal_wake_and_claim` restructure | daemon/server.rs | Low | S | −5 branch pts | done (PR-4) |
+| SRV-6 | `list_sessions` single sort, drop `by_id` map | daemon/server.rs | Low | S | −15 lines, deterministic ties | done (PR-4; declared exemption) |
+| SRV-7 | `as_str()`/`From` impls + `DaemonInfo::default_for` | daemon/, core/types.rs | Low | S | −8 branch pts | done (PR-4) |
+| SRV-8 | `client/http.rs`: `session_url`/`post_json`/`boxed_err`/`lenient_array` | client/http.rs | Low | M | −150 lines | done (PR-9; declared exemption) |
+| MCP-1 | `post_token_form` for exchange_code + refresh_access_token | mcp/oauth.rs | Low | S | ~30 lines | done (PR-15) |
+| MCP-2 | Single `initialize_params()` (3 hand-built payloads) | mcp.rs, oauth.rs | Low | S | drift hazard | done (PR-14) |
+| MCP-3 | `def_belongs_to` + `resource_reader_name` (3 filters, 4 name builds) | mcp.rs | Low | S | grammar single-source | done (PR-14) |
+| MCP-4 | `rpc_error`/`json_arr`/`clamp_output` for McpClient | mcp.rs | Low | S | sentinel-safety | done (PR-14) |
+| MCP-5 | `refresh_and_retry` + `extract_reply` in HttpTransport | mcp.rs | Low | S-M | CC 10-13 → small | skipped (never pulled into a PR; retry sites stay inline) |
+| MCP-6 | Shared `insert_server` for JSON/YAML config paths | mcp.rs | Low | S | dedup loop | done (PR-14) |
+| MCP-7 | `login` decomposition (CC 15 → ~5) | mcp/oauth.rs | Low | M | ~60 lines | done (PR-15) |
+| MCP-8 | `try_snapshot` for ephemeral_line/cached_statuses | mcp.rs | Low | S | dedup | done (PR-14) |
+| MCP-9 | `redact_line`: extract `secret_value_start` (CC 15 → ~4) | mcp.rs | Low | S | + bug fix | done (PR-14; BUG-1 in PR-1) |
+| MCP-10 | `expand_env`: `resolve` closure (CC 12 → ~5) | mcp.rs | Low | S | + bug fix | skipped (BUG-2 fixed in PR-1; closure dedup not pulled into a PR) |
+| BUG-1 | `redact_line` to_lowercase byte-offset desync | mcp.rs:431 | bug fix | S | correctness | done (PR-1) |
+| BUG-2 | `expand_env` non-ASCII mojibake (`bytes[i] as char`) | mcp.rs:142 | bug fix | S | correctness | done (PR-1) |
+
+Status at Phase 8 closure (`sweep/main` = `c6520e4`): 42 of 46 items done;
+4 skipped with reason (LLM-5, CLI-4 — the plan's default skips; MCP-5, MCP-10 —
+never pulled into a PR, see complexity-plan.md § Closure record). LLM-10, listed
+here as optional, landed in PR-16 anyway. Zero capability or wire changes; the
+six declared behavior exemptions are each named in their PR body.
 
 ## Issue details
 
