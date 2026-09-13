@@ -403,7 +403,29 @@ impl Session {
         })
     }
 
-    /// Child-agent JSONL (plan §16): `agents/<agent_id>-<name>.jsonl`
+    /// Derive a child run's transcript path without touching the disk
+    /// (§24.3): generation 0 keeps the V1 `agents/<agent_id>-<name>.jsonl`
+    /// scheme; resume generations append `.g<N>` so a resume never
+    /// clobbers its parent. The manager and the child body both derive
+    /// through here, so registry and file agree by construction.
+    pub(crate) fn child_path(
+        parent_path: &Path,
+        agent_id: &str,
+        name: &str,
+        generation: u32,
+    ) -> PathBuf {
+        let dir = parent_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("agents");
+        if generation == 0 {
+            dir.join(format!("{agent_id}-{name}.jsonl"))
+        } else {
+            dir.join(format!("{agent_id}-{name}.g{generation}.jsonl"))
+        }
+    }
+
+    /// Child-agent JSONL (plan §16): `agents/<agent_id>-<name>[.g<N>].jsonl`
     /// beside the parent session file, with the same header and marker
     /// discipline (`turn_start`/`turn_complete`/`turn_failed` — a crash
     /// loses at most the in-flight event). The file lives outside the
@@ -415,17 +437,20 @@ impl Session {
         cwd: &str,
         agent_id: &str,
         name: &str,
+        generation: u32,
     ) -> io::Result<Self> {
-        let dir = parent_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("agents");
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{agent_id}-{name}.jsonl"));
+        let path = Self::child_path(parent_path, agent_id, name, generation);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
         let header = SessionHeader {
             entry_type: "session".to_string(),
             version: SESSION_VERSION,
-            id: format!("{agent_id}-{name}"),
+            id: if generation == 0 {
+                format!("{agent_id}-{name}")
+            } else {
+                format!("{agent_id}-{name}.g{generation}")
+            },
             timestamp: Self::now_iso(),
             cwd: cwd.to_string(),
             name: Some(format!(
@@ -1680,7 +1705,7 @@ mod tests {
         let parent = Session::new("/tmp/dex-child-parent".into(), None).unwrap();
         let parent_path = parent.path().unwrap().to_path_buf();
         let mut child =
-            Session::child(&parent_path, "/tmp/dex-child-parent", "p-0", "explorer").unwrap();
+            Session::child(&parent_path, "/tmp/dex-child-parent", "p-0", "explorer", 0).unwrap();
         let child_path = child.path().unwrap().to_path_buf();
         assert_eq!(
             child_path.parent().unwrap(),
@@ -1716,11 +1741,11 @@ mod tests {
         let parent_path = parent.path().unwrap().to_path_buf();
         drop(parent);
         let mut done =
-            Session::child(&parent_path, "/tmp/dex-children-list", "c-0", "explorer").unwrap();
+            Session::child(&parent_path, "/tmp/dex-children-list", "c-0", "explorer", 0).unwrap();
         done.turn_event("turn_start").unwrap();
         done.turn_event("turn_complete").unwrap();
         let mut hung =
-            Session::child(&parent_path, "/tmp/dex-children-list", "c-1", "tester").unwrap();
+            Session::child(&parent_path, "/tmp/dex-children-list", "c-1", "tester", 0).unwrap();
         hung.turn_event("turn_start").unwrap();
         // A crash before a terminal marker leaves the run interrupted.
         drop(done);
@@ -1742,6 +1767,52 @@ mod tests {
     }
 
     #[test]
+    fn child_generations_never_collide() {
+        // §24.3: generation 0 keeps the V1 filename; resume generations
+        // append `.g<N>` so a resume never clobbers its parent.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let parent = Session::new("/tmp/dex-supervision-gen".into(), None).unwrap();
+        let parent_path = parent.path().unwrap().to_path_buf();
+        drop(parent);
+        let first = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-gen",
+            "s-0",
+            "explorer",
+            0,
+        )
+        .unwrap();
+        let second = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-gen",
+            "s-0",
+            "explorer",
+            1,
+        )
+        .unwrap();
+        let first_path = first.path().unwrap().to_path_buf();
+        let second_path = second.path().unwrap().to_path_buf();
+        assert_ne!(first_path, second_path);
+        assert!(first_path.ends_with("agents/s-0-explorer.jsonl"));
+        assert!(second_path.ends_with("agents/s-0-explorer.g1.jsonl"));
+        assert_eq!(first.id(), "s-0-explorer");
+        assert_eq!(second.id(), "s-0-explorer.g1");
+        drop(first);
+        drop(second);
+        assert_eq!(
+            Session::child_path(&parent_path, "s-0", "explorer", 0),
+            first_path
+        );
+        assert_eq!(
+            Session::child_path(&parent_path, "s-0", "explorer", 1),
+            second_path
+        );
+        let _ = std::fs::remove_dir_all(parent_path.parent().unwrap());
+    }
+
+    #[test]
     fn parent_listing_and_loader_ignore_child_sessions() {
         // §16 hard rule: `agents/*` never enters the parent transcript or
         // the session registry. Serialization: Session::new writes into the
@@ -1752,7 +1823,7 @@ mod tests {
         let parent = Session::new("/tmp/dex-ignore-child".into(), None).unwrap();
         let parent_path = parent.path().unwrap().to_path_buf();
         let mut child =
-            Session::child(&parent_path, "/tmp/dex-ignore-child", "p-1", "tester").unwrap();
+            Session::child(&parent_path, "/tmp/dex-ignore-child", "p-1", "tester", 0).unwrap();
         let child_path = child.path().unwrap().to_path_buf();
         child
             .append_message(&ChatMessage::user("child-only content"))

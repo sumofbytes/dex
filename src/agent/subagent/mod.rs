@@ -1,17 +1,17 @@
 //! Sub-agent domain types (plan §4): definitions, instances, results,
 //! manager, and the delegation tools.
 //!
-//! Phases 0–8 are wired: manager, delegate tools, child body, and the
-//! Phase 6 turn-boundary drains all have non-test callers. What stays
-//! deliberately dormant under one `dead_code` allow is the post-V1 surface
-//! (`AgentInstance::parent_id`, `AgentState::Pending`) that Phase 9's final
-//! pass trims or keeps with the contract — zero *unintended* allows must
-//! remain. Unused imports, by contrast, are allowed per-item on the
-//! re-exports that need them.
+//! Phases 0–13 are wired: manager, delegate tools, child body, the Phase 6
+//! turn-boundary drains, and the §24 supervision regime (taxonomy,
+//! recovery, queue/breaker/reaper) all have non-test callers. The blanket
+//! `dead_code` allow stays only for genuinely optional surface (e.g.
+//! `AgentInstance::parent_id` probes kept for tests); everything else is
+//! dead-code free.
 #![allow(dead_code)]
 
 mod context;
 mod definition;
+mod exit;
 mod instance;
 pub(crate) mod manager;
 mod result;
@@ -24,10 +24,17 @@ pub(crate) use definition::{
     AgentDefinition, PermissionInherit, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS,
 };
 #[allow(unused_imports)]
+pub(crate) use exit::{
+    classify_body_error, decide, exit_reason_word, recover_mode_word, resume_note,
+    transcript_holds_progress, Action, ExhaustKind, ExitReason, RecoverMode, ResumeHandle,
+    ResumeRequest, SupervisionSpec,
+};
+#[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
 #[allow(unused_imports)]
 pub(crate) use manager::{
-    AgentEvent, AgentManager, AgentNotice, ProgressReporter, SpawnError, WaitOutcome,
+    AgentEvent, AgentManager, AgentNotice, ChildInfo, ProgressReporter, SpawnError, SpawnMeta,
+    WaitOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use result::AgentResult;
