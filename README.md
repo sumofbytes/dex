@@ -545,9 +545,10 @@ schema):
 | `fffind`           | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
 | `git`*             | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.                                                                                                                                                                                                           |
 | `chain`*           | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`.                                                                                                                                                                                             |
-| `delegate`*        | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`) and return its id immediately. Daemon sessions only.                                                                                                                                                       |
+| `delegate`*        | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`) and return its id immediately; pass `resume_from` to continue a resumable child from its transcript. Daemon sessions only.                                                                                                                                                  |
 | `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result.                                                                                                                                                                                                            |
 | `delegate_stop`*   | Cancel a running child and return its terminal result.                                                                                                                                                                                                                   |
+| `delegate_list`*   | List this session's children — live, finished, and interrupted on-disk runs — with resumability. Read-only.                                                                                                                                                              |
 | `update_plan`†     | Replace the complete working plan (`steps`, optional `progress`). A completed step is a compaction boundary. Behind `DEX_ONLINE_COMPACTION=1`.                                                                                                                           |
 | `obs_recall`‡      | Read one page of an archived large tool result (`id`, optional byte `offset`); continue with the returned `next_offset`. Behind `DEX_OBSERVATION_PACK=1`.                                                                                                                |
 
@@ -581,10 +582,17 @@ context, tool allowlist, and JSONL transcript
 at the next turn boundary and, while the session is idle with a client attached,
 a wake turn surfaces them immediately (off with `agent_wake: false` /
 `DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children
-cannot delegate (depth 1). Under `ask-*` modes a mutating call parks a labeled
+cannot delegate (depth 1). A recoverable ending — interrupted, timed out, or
+budget-exhausted with progress on disk — is marked `resumable` in its result:
+`delegate(resume_from: …)` continues that child from its transcript as a new
+generation (the supervisor re-enters automatically when the definition opts in
+with `recover: fresh|resume`; over-cap spawns queue and start when a slot
+frees, and an idle session's children are reaped after ten minutes without a
+client). Under `ask-*` modes a mutating call parks a labeled
 prompt in the session's approval queue — "explorer wants to run bash: …" —
 unanswered for five minutes it denies; session-level "allow" approvals apply to
-children too. Set `DEX_SUBAGENTS=0` to unregister the tools.
+children too. `delegate_list` shows live, finished, and interrupted children.
+Set `DEX_SUBAGENTS=0` to unregister the tools.
 
 ### MCP servers
 
@@ -653,7 +661,7 @@ login retries once without it.
 | `DEX_DURABLE`                                                 | `1` to `fsync` every session line (default only `turn_*`/`effect_*`).                                                                                                                                                                                                                                                                                                                                           |
 | `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
 | `DEX_EXTRA_TOOLS`                                             | `1` to expose `git`+`chain` to the model (default 6 tools).                                                                                                                                                                                                                                                                                                                                                     |
-| `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate`/`delegate_output`/`delegate_stop` tools (default on in daemon sessions).                                                                                                                                                                                                                                                                                                       |
+| `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate`/`delegate_output`/`delegate_stop`/`delegate_list` tools (default on in daemon sessions).                                                                                                                                                                                                                                                                                                       |
 | `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
 | `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
 | `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
