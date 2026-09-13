@@ -30,7 +30,7 @@ use crate::protocol::{
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
 
-use super::{lock_map, required_token, DaemonState, PendingApproval, SessionEntry};
+use super::{journal_event, lock_map, required_token, DaemonState, PendingApproval, SessionEntry};
 
 /// Bearer-token gate: every `/api/*` route requires `Authorization: Bearer
 /// <token>` when the daemon requires a token (non-loopback bind or an
@@ -169,30 +169,56 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
     (branch, dirty)
 }
 
+impl DaemonInfo {
+    /// `/api/config` shape when the daemon has no usable config yet:
+    /// provider/model from env fallbacks, empty model list. The live-config
+    /// arm overwrites the derived fields on top of this.
+    fn default_for(
+        cwd: String,
+        git_branch: Option<String>,
+        git_dirty: bool,
+        permission: String,
+    ) -> Self {
+        Self {
+            provider: std::env::var("DEX_PROVIDER")
+                .ok()
+                .unwrap_or_else(|| "opencode".to_string()),
+            model: "unknown".to_string(),
+            api: "openai-responses".to_string(),
+            available_models: Vec::new(),
+            context_window: 128_000,
+            permission,
+            cwd,
+            git_branch,
+            git_dirty,
+            thinking_effort: None,
+            thinking_warning: None,
+        }
+    }
+}
+
 async fn resolve_daemon_info_async() -> DaemonInfo {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let (git_branch, git_dirty) = cached_git_context_async(&cwd).await;
     match LlmConfig::from_env_async(None, None, None, Vec::new()).await {
-        Ok(config) => DaemonInfo {
-            provider: config.provider.name().to_string(),
-            model: config.model.clone(),
-            api: config.api.name().to_string(),
-            available_models: config.available_models.clone(),
-            context_window: config.context_window,
-            permission: match config.permission {
-                crate::core::types::PermissionMode::ReadOnly => "read-only".into(),
-                crate::core::types::PermissionMode::AskWrites => "ask-writes".into(),
-                crate::core::types::PermissionMode::AskShell => "ask-shell".into(),
-                crate::core::types::PermissionMode::Trusted => "trusted".into(),
-            },
-            cwd,
-            git_branch,
-            git_dirty,
-            thinking_effort: config.thinking_effort.clone(),
-            thinking_warning: config.thinking_mismatch_warning(),
-        },
+        Ok(config) => {
+            let mut info = DaemonInfo::default_for(
+                cwd,
+                git_branch,
+                git_dirty,
+                config.permission.as_str().to_string(),
+            );
+            info.thinking_warning = config.thinking_mismatch_warning();
+            info.provider = config.provider.name().to_string();
+            info.api = config.api.name().to_string();
+            info.model = config.model;
+            info.available_models = config.available_models;
+            info.context_window = config.context_window;
+            info.thinking_effort = config.thinking_effort;
+            info
+        }
         Err(_) => {
             // Config is incomplete (e.g. no API key yet); report what we can
             // so the client still renders.
@@ -200,23 +226,7 @@ async fn resolve_daemon_info_async() -> DaemonInfo {
                 .ok()
                 .filter(|v| crate::core::types::PermissionMode::parse(v).is_ok())
                 .unwrap_or_else(|| "ask-writes".to_string());
-            let model = "unknown".to_string();
-            let provider_name = std::env::var("DEX_PROVIDER")
-                .ok()
-                .unwrap_or_else(|| "opencode".to_string());
-            DaemonInfo {
-                provider: provider_name,
-                model,
-                api: "openai-responses".to_string(),
-                available_models: Vec::new(),
-                context_window: 128_000,
-                permission,
-                cwd,
-                git_branch,
-                git_dirty,
-                thinking_effort: None,
-                thinking_warning: None,
-            }
+            DaemonInfo::default_for(cwd, git_branch, git_dirty, permission)
         }
     }
 }
@@ -380,8 +390,6 @@ async fn create_session(
 async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json::Value> {
     // P10: disk-backed listing with JoinSet parallel per-session scans
     // (`spawn_blocking` per file, join, sort) — fixes the linear scan (S2).
-    let mut by_id: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
     let listed = session::Session::list_all_async().await.unwrap_or_default();
     // Per-session message_count + turn_state in parallel (spawn_blocking per file).
     let mut set = tokio::task::JoinSet::new();
@@ -419,29 +427,46 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
             scanned.push(v);
         }
     }
-    scanned.sort_by(|a, b| b.1.timestamp().cmp(a.1.timestamp()));
-    for (path, header, message_count, turn_state, child_agents, interrupted_children) in scanned {
-        let name = header.name().map(|n| n.to_string());
-        by_id.insert(
-            header.id().to_string(),
-            json!({
-                "session_id": header.id(),
-                "path": path.display().to_string(),
-                "name": name,
-                "cwd": header.cwd(),
-                "created_at": header.timestamp(),
-                "message_count": message_count,
-                "turn_state": turn_state,
-                "child_agents": child_agents,
-                "interrupted_children": interrupted_children,
-            }),
-        );
-    }
-    // Preserve in-memory sessions that have no file yet (shouldn't happen).
+    // One sort over typed rows: timestamp desc, session id tie-break so the
+    // order is deterministic. The in-memory no-file fallback (sort key ""
+    // sorts last) joins the same list before the single sort pass.
+    let mut rows: Vec<(String, String, serde_json::Value)> = scanned
+        .into_iter()
+        .map(
+            |(path, header, message_count, turn_state, child_agents, interrupted_children)| {
+                let name = header.name().map(|n| n.to_string());
+                (
+                    header.timestamp().to_string(),
+                    header.id().to_string(),
+                    json!({
+                        "session_id": header.id(),
+                        "path": path.display().to_string(),
+                        "name": name,
+                        "cwd": header.cwd(),
+                        "created_at": header.timestamp(),
+                        "message_count": message_count,
+                        "turn_state": turn_state,
+                        "child_agents": child_agents,
+                        "interrupted_children": interrupted_children,
+                    }),
+                )
+            },
+        )
+        .collect();
+    // Preserve in-memory sessions that have no file yet (shouldn't happen);
+    // disk rows win when an id is present in both.
     {
         let sessions = lock_map(&state.sessions);
         for (id, entry) in sessions.iter() {
-            by_id.entry(id.clone()).or_insert_with(|| {
+            if rows
+                .iter()
+                .any(|(_, row_id, _)| row_id.as_str() == id.as_str())
+            {
+                continue;
+            }
+            rows.push((
+                String::new(),
+                id.clone(),
                 json!({
                     "session_id": id,
                     "path": entry.path.to_string_lossy(),
@@ -452,22 +477,12 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
                     "turn_state": "unknown",
                     "child_agents": 0,
                     "interrupted_children": 0,
-                })
-            });
+                }),
+            ));
         }
     }
-    let mut sessions: Vec<serde_json::Value> = by_id.into_values().collect();
-    sessions.sort_by(|a, b| {
-        let a = a
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let b = b
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        b.cmp(a)
-    });
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let sessions: Vec<serde_json::Value> = rows.into_iter().map(|(_, _, row)| row).collect();
     Json(json!({ "sessions": sessions }))
 }
 
@@ -500,12 +515,10 @@ async fn chat(
     // Idempotency replay is routed through the SAME channel/stream as a live
     // turn (single return type below): the recorded terminal envelope is just
     // pushed and the stream closes.
-    let mut replay_envelope: Option<StreamEnvelope> = None;
-    if let Some(key) = &idempotency_key {
-        if let Some(terminal) = state.idempotent_replay(key, &session_id, request_hash) {
-            replay_envelope = serde_json::from_str::<StreamEnvelope>(&terminal).ok();
-        }
-    }
+    let replay_envelope: Option<StreamEnvelope> = idempotency_key
+        .as_deref()
+        .and_then(|key| state.idempotent_replay(key, &session_id, request_hash))
+        .and_then(|terminal| serde_json::from_str::<StreamEnvelope>(&terminal).ok());
     // Reject concurrent turns on the same session up front so the
     // append-only session log stays consistent. A replay must not hold the
     // active-turn slot, so it is checked before registration.
@@ -698,19 +711,13 @@ async fn run_agent_turn(
         let tx_clone = tx.clone();
         let state_clone = state.clone();
         let sid = session_id.clone();
-        let entry_path = lock_map(&state.sessions).get(&sid).map(|e| e.path.clone());
         tokio::spawn(async move {
-            let mut journal = entry_path
-                .as_deref()
-                .and_then(|p| Session::from_path(p).ok());
             while let Some(content) = steering_accepted_rx.recv().await {
                 let event = StreamEvent::SteeringAccepted {
                     content: content.clone(),
                 };
                 let seq = state_clone.next_seq(&sid);
-                if let Some(j) = journal.as_mut() {
-                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
-                }
+                journal_event(&state_clone, &sid, seq, &event);
                 let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
             }
         });
@@ -719,19 +726,13 @@ async fn run_agent_turn(
         let tx_clone = tx.clone();
         let state_clone = state.clone();
         let sid = session_id.clone();
-        let entry_path = lock_map(&state.sessions).get(&sid).map(|e| e.path.clone());
         tokio::spawn(async move {
-            let mut journal = entry_path
-                .as_deref()
-                .and_then(|p| Session::from_path(p).ok());
             while let Some(content) = followup_accepted_rx.recv().await {
                 let event = StreamEvent::FollowupAccepted {
                     content: content.clone(),
                 };
                 let seq = state_clone.next_seq(&sid);
-                if let Some(j) = journal.as_mut() {
-                    let _ = j.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
-                }
+                journal_event(&state_clone, &sid, seq, &event);
                 let _ = tx_clone.send(StreamEnvelope { seq, event }).await;
             }
         });
@@ -790,17 +791,19 @@ async fn run_agent_turn(
         event: terminal,
     };
     let serialized = serde_json::to_string(&env).unwrap_or_default();
-    if let Some(path) = lock_map(&state.sessions)
+    // Clone the path first: the guard must die with this statement —
+    // `journal_event` re-locks `sessions`, and a guard held across the
+    // `if let` body would self-deadlock (std Mutex is not reentrant).
+    let turn_path = lock_map(&state.sessions)
         .get(&session_id)
-        .map(|e| e.path.clone())
-    {
-        if let Ok(mut journal) = Session::from_path(&path) {
-            let _ =
-                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
-            // Durable turn_failed marker for runs that did not finish normally.
-            if matches!(&env.event, StreamEvent::TurnFailed { .. })
-                && crate::session::Session::last_turn_state(&path) == "interrupted"
-            {
+        .map(|e| e.path.clone());
+    if let Some(path) = turn_path {
+        journal_event(&state, &session_id, seq, &env.event);
+        // Durable turn_failed marker for runs that did not finish normally.
+        if matches!(&env.event, StreamEvent::TurnFailed { .. })
+            && crate::session::Session::last_turn_state(&path) == "interrupted"
+        {
+            if let Ok(mut journal) = Session::from_path(&path) {
                 let _ = journal.turn_event("turn_failed");
             }
         }
@@ -1027,15 +1030,9 @@ async fn run_turn_inner(
     {
         let stream_tx = tx.clone();
         let state = state.clone();
-        let session_path = session.path().map(|p| p.to_path_buf());
         let sid = session_id.to_string();
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            // Reopen so journal writes never fight the agent loop's handle;
-            // events land in the separate `<id>.events.jsonl` file.
-            let mut journal = session_path
-                .as_deref()
-                .and_then(|p| Session::from_path(p).ok());
             let mut deferred: Option<SinkLine> = None;
             let mut sink_rx = sink_rx;
             loop {
@@ -1123,9 +1120,7 @@ async fn run_turn_inner(
                     },
                 };
                 let seq = state.next_seq(&sid);
-                if let Some(s) = journal.as_mut() {
-                    let _ = s.append_event(seq, &serde_json::to_string(&event).unwrap_or_default());
-                }
+                journal_event(&state, &sid, seq, &event);
                 let _ = stream_tx.send(StreamEnvelope { seq, event }).await;
             }
             // Drained (or cancelled): run_agent_turn may now emit the
@@ -1402,17 +1397,7 @@ async fn child_approval_bridge(
                 agent: agent.clone(),
             },
         };
-        if let Some(path) = lock_map(&state.sessions)
-            .get(&session_id)
-            .map(|e| e.path.clone())
-        {
-            if let Ok(mut journal) = Session::from_path(&path) {
-                let _ = journal.append_event(
-                    env.seq,
-                    &serde_json::to_string(&env.event).unwrap_or_default(),
-                );
-            }
-        }
+        journal_event(&state, &session_id, env.seq, &env.event);
         state.broadcast_event(&session_id, &env);
         // The five-minute denial timer. Resolution removes the entry first,
         // so an answered prompt never double-denies.
@@ -1601,20 +1586,11 @@ async fn approve(
 
     match pending {
         Some(pending) if pending.session_id == session_id => {
-            let decision = match req.decision {
-                crate::protocol::ApprovalDecision::AllowOnce => ApprovalDecision::Once,
-                crate::protocol::ApprovalDecision::AllowSession => {
-                    // Persist for the whole session so next turns skip the overlay
-                    state.record_session_approval(&session_id, &pending.name, &pending.input);
-                    ApprovalDecision::Session
-                }
-                crate::protocol::ApprovalDecision::Deny => ApprovalDecision::Deny,
-            };
-            let decision_str = match decision {
-                ApprovalDecision::Once => "once",
-                ApprovalDecision::Session => "session",
-                ApprovalDecision::Deny => "deny",
-            };
+            let decision = ApprovalDecision::from(req.decision);
+            if decision == ApprovalDecision::Session {
+                // Persist for the whole session so next turns skip the overlay
+                state.record_session_approval(&session_id, &pending.name, &pending.input);
+            }
             // Audit: best-effort, redacted input hash, actor, request_id.
             // A child-agent prompt records its label so the trail names the
             // requester (§12 V1b).
@@ -1623,7 +1599,7 @@ async fn approve(
                 &req.request_id,
                 &pending.name,
                 &pending.input,
-                decision_str,
+                decision.as_str(),
                 "remote",
                 pending.agent.as_deref(),
             );
@@ -1668,6 +1644,22 @@ async fn cancel(
     Json(json!({ "status": "ok" }))
 }
 
+/// Select the per-turn queue for `session_id`: steering unless `followup`.
+/// `None` when the live turn holds no queue yet — the caller surfaces that
+/// as a 409 (nothing to steer/follow/recall against).
+fn queue_tx(
+    state: &DaemonState,
+    session_id: &str,
+    followup: bool,
+) -> Option<mpsc::Sender<QueueMsg>> {
+    let map = if followup {
+        lock_map(&state.followup_txs)
+    } else {
+        lock_map(&state.steering_txs)
+    };
+    map.get(session_id).cloned()
+}
+
 async fn steer(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
@@ -1682,11 +1674,7 @@ async fn steer(
     if lookup_entry(&state, &session_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let tx = {
-        let map = lock_map(&state.steering_txs);
-        map.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::CONFLICT)?;
+    let tx = queue_tx(&state, &session_id, false).ok_or(StatusCode::CONFLICT)?;
     tx.send(QueueMsg::Content(content))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;
@@ -1706,11 +1694,7 @@ async fn followup(
     if lookup_entry(&state, &session_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let tx = {
-        let map = lock_map(&state.followup_txs);
-        map.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::CONFLICT)?;
+    let tx = queue_tx(&state, &session_id, true).ok_or(StatusCode::CONFLICT)?;
     tx.send(QueueMsg::Content(content))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;
@@ -1734,15 +1718,7 @@ async fn recall(
     if lookup_entry(&state, &session_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
-    let tx = {
-        let map = if req.followup {
-            lock_map(&state.followup_txs)
-        } else {
-            lock_map(&state.steering_txs)
-        };
-        map.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::CONFLICT)?;
+    let tx = queue_tx(&state, &session_id, req.followup).ok_or(StatusCode::CONFLICT)?;
     tx.send(QueueMsg::Recall(content))
         .await
         .map_err(|_| StatusCode::CONFLICT)?;
@@ -1781,30 +1757,30 @@ fn session_path(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `GET /api/sessions/{id}/events?since=<seq>` — replay journaled stream
-/// events after a cursor (P10). Missing journal file replays nothing.
+/// Take the session's active-turn slot; `false` when a live turn holds it.
+/// The registry guard dies inside this fn — it never spans an await.
+fn try_claim_slot(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    let mut active = lock_map(&state.active_turns);
+    if active.contains(session_id) {
+        return false;
+    }
+    active.insert(session_id.to_string());
+    true
+}
+
+// Chat wins over an idle wake (§10b V1b): cancel the wake, then take the
+// turn slot. Without a wake, a second chat 409s immediately. With one, the
+// wake may still hold the slot while it unwinds; poll instead of blocking
+// the handler on a condvar.
 async fn steal_wake_and_claim(state: &Arc<DaemonState>, session_id: &str) -> bool {
     let had_wake = state.cancel_wake(session_id).is_some();
     for _ in 0..250 {
-        // The guard dies inside this block, before the poll sleep below —
-        // a std::sync guard must never span an await.
-        let claimed = {
-            let mut active = lock_map(&state.active_turns);
-            if active.contains(session_id) {
-                false
-            } else {
-                active.insert(session_id.to_string());
-                true
-            }
-        };
-        if claimed {
+        if try_claim_slot(state, session_id) {
             return true;
         }
         if !had_wake {
             return false;
         }
-        // The wake holds the slot only while it unwinds; poll instead of
-        // blocking the handler on a condvar.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     false
