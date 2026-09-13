@@ -4865,4 +4865,67 @@ pub(crate) mod tests {
             "origin starts at display column 57: {line:?}"
         );
     }
+
+    /// Byte-for-byte `doctor` output under a fully hermetic scenario: no
+    /// config file, no catalog caches, no dex env vars, one provider key.
+    /// This is the PR-18 motion gate — any refactor of the shared
+    /// resolution must reproduce this output exactly. Fixed paths (no pid)
+    /// keep the snapshot stable across runs and machines.
+    #[test]
+    fn doctor_output_is_byte_stable() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_RESERVE_TOKENS",
+            "DEX_KEEP_RECENT_TOKENS",
+            "DEX_THINKING_EFFORT",
+            "DEX_PERMISSION",
+            "DEX_HEADERS",
+            "DEX_ONLINE_COMPACTION",
+            "DEX_OBSERVATION_PACK",
+            "DEX_EVIDENCE_REDUCER",
+            "DEX_REDUCER_MODEL",
+            "DEX_AGENT_WAKE",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "OPENAI_HEADERS",
+            "OPENCODE_API_KEY",
+        ]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
+        std::env::set_var("XDG_DATA_HOME", "/tmp/dex-doctor-snapshot/data");
+        let out = doctor(None, None, None, &[]);
+        let expected = concat!(
+            "dex 0.6.0\n",
+            "\n",
+            "config     /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
+            "catalog    /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
+            "                                                         missing — run `dex update --models`\n",
+            "\n",
+            "provider   opencode                                      built-in default\n",
+            "model      gpt-5.6-luna                                  built-in default\n",
+            "base_url   https://opencode.ai/zen/v1                    built-in default\n",
+            "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
+            "protocol   openai-responses                              default (auto-fallback to completions)\n",
+            "context    128000 tokens                                 built-in default\n",
+            "obs pack   off                                           built-in default (off)\n",
+            "thinking   (unset)                                       model default\n",
+            "permission trusted                                       built-in default\n",
+            "agent wake on                                            built-in default\n",
+            "headers    0                                             none\n",
+            "endpoints  go, zen                                       available to /model routing\n",
+            "\n",
+            "resolve    OK                                            config builds cleanly\n",
+        );
+        assert_eq!(out, expected, "doctor output drifted");
+    }
 }
