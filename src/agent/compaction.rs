@@ -698,10 +698,14 @@ pub(crate) async fn compact_history(
     }
 
     // File ops are cumulative — extracted from the previous compaction + messages
+    // Merge base is the LAST summary: each compaction folds the previous
+    // checkpoint into the new one, so the latest subsumes every earlier
+    // span. Merging from the first would drop spans only intermediate
+    // summaries cover when healing an already-stacked transcript.
     let previous_summary = messages
         .iter()
-        .find(|m| m.name.as_deref() == Some("summary"))
-        .and_then(|m| m.content.clone());
+        .rposition(|m| m.name.as_deref() == Some("summary"))
+        .and_then(|idx| messages[idx].content.clone());
     let mut file_ops = FileOps::default();
     // Previous compaction's file lists are embedded in previous summary's <read-files> etc,
     // but we parse naively: re-extract from old messages that are being summarized
@@ -1064,6 +1068,14 @@ mod tests {
         assert_eq!(summaries, 1, "stacked checkpoints must heal to one");
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].name.as_deref(), Some("summary"));
+        // The merge base is the LAST checkpoint (it subsumes the earlier
+        // spans): the surviving summary builds on the newest checkpoint,
+        // not the stale first one.
+        let text = messages[1].content.as_deref().unwrap_or_default();
+        assert!(
+            text.contains("stale checkpoint"),
+            "new summary must build on the latest checkpoint, got: {text}"
+        );
     }
 
     /// Emergency compaction must be able to cut below the comfort floor:
