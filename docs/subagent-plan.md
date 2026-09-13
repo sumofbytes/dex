@@ -1,6 +1,6 @@
 # Dex Sub-Agent Architecture — Implementation Plan
 
-Status: built (rev 5) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 2 revised after a design review against prior art —
+Status: built (rev 5) — phases 0–10 (V1a + V1b) landed; §21 records the pass. Rev 6 (§24) plans phases 11–13 — the generic supervision regime and partial-work recovery; designed, not yet implemented. Rev 2 revised after a design review against prior art —
 pi's subagent design, Claude Code's task/agent system, Amp's oracle, and
 Codex's sandbox-boundary model — and a source audit of dex's actual
 integration points. Rev 3 verified the prior-art claims against primary
@@ -915,6 +915,9 @@ labeled child approvals with timeout deny + audit, idle wake with
 presence gating and chat-steals-wake, idle events poller, and the §10
 protocol/presence endpoint).
 
+Rev 6 (§24) adds phases 11–13 — the generic supervision regime and
+partial-work recovery. Designed below; not yet implemented.
+
 | Phase | Content | Exit condition |
 |---|---|---|
 | 0 | **Approval gate (prerequisite):** dispatch consults policy, parks + emits `ApprovalRequired`, blocks for verdict | `write` under `ask-writes` parks one prompt and blocks; deny/allow honored; §17 Phase 0 tests green |
@@ -928,6 +931,9 @@ protocol/presence endpoint).
 | 8 | V1a events (System lines) + child sessions (§16: explicit-path constructor, listing, loader exclusion) + observability (§18) | child JSONL written with markers; resume shows children/interrupted; `seq` replay dedupes |
 | 9 | Full V1a test pass + docs | §22 V1a boxes ticked; three checks green |
 | 10 | **V1b:** presence-gated wake task, labeled approval prompts + turn-end guard fix + 5-min timeout, first-class event variants as an explicit wire bump | §22 V1b boxes ticked; no user-visible 409 from a wake race, old clients keep cursors moving |
+| 11 | **Rev 6:** exit taxonomy + `ResumeHandle` + `delegate_list` (§24.1, §24.3) | §24.8 phase-11 boxes ticked |
+| 12 | **Rev 6:** `ChildSpec` frontmatter + one spawn path (generation/resume/budget) + auto-recovery + events (§24.2–§24.4) | §24.8 phase-12 boxes ticked |
+| 13 | **Rev 6:** supervisor ledger + circuit breaker + `Pending` queue + root ownership/reaper (§24.5) | §24.8 phase-13 boxes ticked |
 
 ---
 
@@ -1041,3 +1047,224 @@ completions announced at real turn boundaries without polling, and one
 obvious extension point (the manager + definition files) where user-defined
 agents, labeled prompts, wake turns, and eventually deeper orchestration
 can land without rework.
+
+---
+
+# 24. Rev 6 — Generic Supervision Regime and Partial-Work Recovery
+
+Origin: a design review of the built V1 (phases 0–10) against the failure
+modes children actually hit. Three seams handle child death case by case
+today: the stream retry gate (`src/llm/stream.rs`) retries transport and
+protocol failures *before any output* and deliberately not after; timeout
+and turn-budget exhaustion synthesize a partial summary into a dead child
+(§6); a daemon restart marks children interrupted
+(`Session::list_children`, `src/session.rs`) but nothing resumes them.
+Each case has its own seam and none shares a decision. This revision
+replaces the case-by-case shape with one regime — evaluated against
+adopting the `ractor` actor framework and rejected for now (§24.6).
+
+### One decision function
+
+`on_exit(spec, reason, ledger) -> Drop | Recover | Escalate` decides every
+terminal child exit. No per-failure branches at failure sites:
+classification is mechanical (§24.1), policy is declarative (§24.2),
+re-entry is spawn (§24.3), the intensity ledger lives at the supervisor
+(§24.5). The stream retry gate stays untouched — it governs *within one
+LLM call* (retry iff no output has flowed); the regime governs *between*
+calls and turns and never re-runs a call whose output already flowed.
+
+### Re-entry is spawn
+
+Restart and resume are not new operations. They are `spawn` again with
+`generation + 1`, an optionally replayed transcript, and remaining budget.
+One code path owns child creation — that is what removes the case-by-case
+shape, not a table of recovery modes.
+
+### The checkpoint already exists
+
+A child's incremental JSONL with turn markers is its last-known state;
+recovery replays it (`load_llm_messages_from_session`) and appends an
+interruption nudge. No new state store; crash loses at most the in-flight
+event, per the journaling convention.
+
+### Intensity is the supervisor's, not the child's
+
+OTP counts restarts across siblings in a window; so does the session
+manager's ledger. Exhaustion trips a circuit breaker — new spawns queue,
+running recoveries cancel, the parent escalates once (§24.5).
+
+### Failure is information; the model is the outermost tier
+
+Escalation carries the recovery history and the partial findings. The one
+axis code cannot decide — rewriting the seed — stays with the parent
+model, expressed as `delegate(resume_from = …, refined instruction)`.
+
+### Conservative defaults
+
+`recover: never` everywhere: phases 11–13 change no V1a/V1b behavior
+until a definition opts in (§24.7).
+
+## 24.1 Exit taxonomy
+
+```rust
+enum ExitReason { Normal, ShutDown, Transient, Exhausted(ExhaustKind), Permanent }
+enum ExhaustKind { Budget, Timeout }
+```
+
+| Terminal path today | Classifies as |
+|---|---|
+| Child emitted its final assistant message | `Normal` |
+| `delegate_stop`, parent-turn cancel, session close, daemon shutdown, idle reaper | `ShutDown` |
+| `CatchUnwind` panic (manager wrapper, `manager.rs`) | `Transient` |
+| Mid-LLM transport/protocol death after output flowed (pre-output is already retried by the stream gate) | `Transient` |
+| Timeout (`timeout_secs`, default 600 s) | `Exhausted(Timeout)` |
+| Turn-budget exhaustion (`max_tool_iterations`) | `Exhausted(Budget)` |
+| Definition/seed/config rejection (unknown agent, invalid args) | `Permanent` |
+
+`AgentResult` keeps `status` (wire-stable — lifecycle lines and typed
+events keep their words) and gains:
+
+```rust
+turns_used: u32,               // recorded by the child body's own loop counter
+resume: Option<ResumeHandle>,  // Some ⇔ reason ∈ {Transient, Exhausted}
+                               //   and the transcript holds ≥1 completed turn
+struct ResumeHandle { agent_id: AgentId, transcript: PathBuf,
+                      turns_used: u32, budget: Budget }
+```
+
+`Partial` is derived prose in the notice, not a new `AgentState` — the
+result's terminal status stays `Failed`/`TimedOut`/`Cancelled`; what
+changes is that a resumable handle rides along.
+
+## 24.2 `ChildSpec` — declarative, reason-keyed
+
+Frontmatter next to `permissions` (the one-variant enum already
+anticipates extension); unknown subkeys reject at parse, mirroring the
+`permissions: escalate` clean-rejection rule:
+
+```yaml
+supervision:
+  recover: never | fresh | resume     # default: never (= OTP `temporary`; zero change)
+  intensity: { max: 2, window: 60s }  # default: built-in constant; supervisor-scoped
+```
+
+- `fresh` — re-spawn with the same seed, empty transcript. Well-defined
+  for agents exactly because a child is a pure function of
+  `(definition, ContextSeed)`, which the registry already retains.
+- `resume` — replay the child's last transcript, append the interruption
+  note (reason, remaining turn budget), run the same loop. A resume
+  grants a fresh wall-clock timeout (bounded by intensity) and carries
+  the *remaining* turn budget (original − `turns_used`).
+- Recovery mode is a property of the spec, not of the failure. No
+  `recover-for-timeout-but-not-for-panics` branches anywhere.
+
+## 24.3 One spawn path
+
+`AgentManager::spawn` grows internal-only args — `generation: u32`,
+`resume_from: Option<(PathBuf, ExitReason)>`, `budget: Duration`. No
+second entry point: the parent's `delegate` call and a supervisor's
+re-entry share it.
+
+- Child JSONL per generation: `<agent>.g<N>.jsonl` beside the parent
+  session (§16), linked by `AgentInstance::parent_id` — the dormant
+  field earns its keep. `AgentState::Pending` stays dormant until
+  §24.5's queue.
+- Model-facing surface stays small: `delegate` gains an optional
+  `resume_from: <agent_id>` (+ optional extra instruction folded into
+  the nudge) — resume is "spawn with history", not a new verb. One new
+  read-only tool, **`delegate_list`**, joins `DELEGATION_TOOLS`: live
+  registry states + [`Session::list_children`] for everything on disk
+  (including interrupted-by-restart children). This closes the
+  post-compaction introspection hole — spawn-result lines summarized
+  away today leave the parent holding ids it cannot query. Schema,
+  description, and the `DEX_SUBAGENTS=0` kill switch cover all four.
+
+## 24.4 Sequencing and observability
+
+- **Recover first, notify last.** The supervisor re-enters internally;
+  the terminal notice fires only when the policy is exhausted. The
+  parent never sees a failure that was silently retried — no race
+  between the model acting on a failure and a child on attempt 2.
+- Every recovery emits a typed event (§15's wire-bump pattern)
+  `AgentRecovered { agent_id, attempt, mode, reason }` plus a
+  §15-style lifecycle line. Escalation notices carry the full history:
+  "attempt 3: resumed once, fresh-restarted once, ended
+  Exhausted(budget); partial findings follow."
+
+## 24.5 Supervisor-level reliability
+
+- **Ledger + circuit breaker.** The session manager counts recovery
+  actions across all its children in the window. Exhaustion opens the
+  breaker: new spawns queue as `Pending` (the dormant state wakes up)
+  instead of the hard cap rejection; a queued spawn starts when a
+  sibling goes terminal; a real user chat turn always preempts. The
+  open breaker also cancels pending recoveries and escalates once:
+  "environment unhealthy: N recoveries in M s across K children."
+- **Root ownership.** Session close = `ShutDown` for every child: cancel,
+  join, retain results and notices. The idle reaper (V1b presence
+  window) becomes the same thing on a timer: client absent past TTL →
+  `ShutDown`, notices retained for the next real turn. This replaces the
+  flat `DaemonState.agents` map's implicit assumption that sessions live
+  for the daemon's lifetime, and gives §14's cleanup one owner instead
+  of three bespoke token maps.
+
+## 24.6 What Rev 6 explicitly does not do
+
+```text
+ractor / actor runtime        evaluated against these failure modes, rejected for now (below)
+mid-run steering of a child   a2a messaging stays excluded (§20); cancel-or-stop only
+DAGs, recursion beyond depth 1  unchanged (§20)
+agent memory / cross-spawn state  unchanged (§20)
+user definition files         separate follow-up (parser is live; discovery is not)
+permission-axis clamping      `PermissionInherit` stays `Inherit`-only
+OS-sandbox enforcement        out of scope (§1)
+```
+
+**The ractor verdict, on record.** Evaluated as adopt → harvest → strip;
+rejected because (1) supervision strategies — restart semantics,
+intensity limits, escalation — are not first-class in ractor; they are
+implemented by the user inside `handle_supervisor_evt`, so the regime
+(the actual hypothesis) is hand-written either way; (2) children here are
+*turn loops*, not message-loop actors — the actor wrapper adds a
+`'static`-typed message boundary around a closure `spawn` already builds,
+and push-delivery mailboxes pull against §10b's drain-at-boundary
+discipline; (3) strip-later accretes call sites and removes nothing the
+regime needs. Revisit triggers: (a) children become long-lived
+message-receiving services (real a2a messaging), (b) actor-level
+federation — not daemon-node federation, which the existing HTTP+SSE wire
+covers. If either fires, this regime ports over unchanged: it is a pure
+function and never touches the transport.
+
+## 24.7 Phases 11–13
+
+Phases land independently, in order; 11 first (introspection +
+resumability — the highest-value pair), 12 depends on 11's taxonomy, 13
+depends on 12's recovery hook. Defaults keep behavior byte-identical
+throughout, so each phase ships behind green, unchanged suites.
+
+## 24.8 Rev 6 acceptance criteria
+
+### Phase 11 — taxonomy + resumable results + listing
+
+- [ ] Every terminal path classifies through `on_exit`; no terminal branch bypasses it.
+- [ ] `Transient`/`Exhausted` endings with ≥1 completed turn carry `ResumeHandle`; `Normal`/`ShutDown`/`Permanent` never do.
+- [ ] `delegate(resume_from=…)` continues from the child transcript: prior turns replayed, interruption note + refined instruction appended, remaining turn budget honored, fresh wall-clock timeout, new generation JSONL linked via `parent_id`.
+- [ ] Resume resolves for a child killed by a daemon restart (live registry miss → `Session::list_children`).
+- [ ] `delegate_list` reports live, retained, and terminal children with ids and states, including interrupted-by-restart ones.
+- [ ] Wire stability: existing lifecycle lines and typed events unchanged; resumability surfaces as notice prose only.
+
+### Phase 12 — `ChildSpec` + recovery
+
+- [ ] `supervision.recover` parses (`never | fresh | resume`); unknown values reject cleanly with the available set.
+- [ ] `recover: resume` auto-continues after `Transient`/`Exhausted` deaths within intensity; `fresh` re-runs with an empty transcript; `never` escalates immediately (today's behavior).
+- [ ] Recovery emits `AgentRecovered` (typed, wire-bumped like V1b) + a §15-style lifecycle line; terminal notice only on policy exhaustion.
+- [ ] Escalation notices carry the recovery history verbatim.
+- [ ] `recover: never` everywhere leaves V1a/V1b behavior byte-identical (existing suite green, unchanged).
+
+### Phase 13 — supervisor
+
+- [ ] The ledger counts recoveries across children per window; exhaustion opens the breaker.
+- [ ] Breaker open: new spawns queue FIFO as `Pending`; a terminal sibling starts the next; a user chat turn preempts; the breaker clears on window expiry.
+- [ ] Session close cancels + joins all children and retains results and notices — no orphans (extends the §22.E lifecycle tests).
+- [ ] The idle reaper is `ShutDown` on client-absence TTL: notices retained for the next boundary, no wake turn spawned by the reaper itself.
+- [ ] No new dependency; `AgentManager` stays a struct.
