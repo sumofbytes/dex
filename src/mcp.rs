@@ -238,6 +238,18 @@ pub(crate) fn split_mcp_name(name: &str) -> Option<(String, String)> {
     None
 }
 
+/// Synthetic P1 reader tool name: `mcp__<server>_read_resource` (single
+/// underscore, outside the `__` separator grammar). Single source.
+fn resource_reader_name(server: &str) -> String {
+    format!("mcp__{server}_read_resource")
+}
+
+/// Does a cached definition's name belong to `server`? Either the synthetic
+/// reader or one of its real tools under `mcp__<server>__`.
+fn def_belongs_to(def_name: &str, server: &str) -> bool {
+    def_name == resource_reader_name(server) || def_name.starts_with(&format!("mcp__{server}__"))
+}
+
 fn yaml_str(map: &serde_yaml::Mapping, key: &str) -> Result<Option<String>, String> {
     map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(|v| v.as_str())
@@ -347,16 +359,28 @@ pub(crate) fn parse_mcp_servers(root: &serde_yaml::Value) -> BTreeMap<String, Mc
             eprintln!("dex: mcp server '{name}' ignored: '__' is reserved");
             continue;
         }
-        let sanitized = sanitize_server_name(name);
-        match parse_server_config(cfg) {
-            Ok(cfg) if active_config(&cfg) => {
-                out.insert(sanitized, cfg);
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("dex: mcp server '{sanitized}' ignored: {e}"),
-        }
+        // YAML warnings carry the sanitized name; `insert_server` derives the
+        // key from `display`, so pass it already-sanitized here.
+        insert_server(&mut out, &sanitize_server_name(name), cfg);
     }
     out
+}
+
+/// Parse one `mcp_servers:` entry into `out`, keyed by the sanitized name.
+/// Warnings use `display` verbatim — the YAML path passes the sanitized name,
+/// the JSON env path the raw one (the warning text is the only difference).
+fn insert_server(
+    out: &mut BTreeMap<String, McpServerConfig>,
+    display: &str,
+    raw: &serde_yaml::Value,
+) {
+    match parse_server_config(raw) {
+        Ok(cfg) if active_config(&cfg) => {
+            out.insert(sanitize_server_name(display), cfg);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("dex: mcp server '{display}' ignored: {e}"),
+    }
 }
 
 fn config_file_value() -> Option<serde_yaml::Value> {
@@ -390,13 +414,8 @@ pub(crate) fn load_server_configs() -> BTreeMap<String, McpServerConfig> {
                     }
                     let yaml: serde_yaml::Value =
                         serde_yaml::from_str(&cfg.to_string()).unwrap_or(serde_yaml::Value::Null);
-                    match parse_server_config(&yaml) {
-                        Ok(c) if active_config(&c) => {
-                            out.insert(sanitize_server_name(name), c);
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("dex: mcp server '{name}' ignored: {e}"),
-                    }
+                    // JSON warnings carry the raw name (differs from YAML).
+                    insert_server(&mut out, name, &yaml);
                 }
                 return out;
             }
@@ -436,40 +455,47 @@ pub(crate) fn redact_secrets(text: &str) -> String {
     out
 }
 
-fn redact_line(line: &str) -> String {
-    // `to_ascii_lowercase` preserves byte offsets; `to_lowercase` can expand
-    // non-ASCII (e.g. `İ` -> i + U+0307) and desync `lower` indexes from the
-    // `line`/`as_bytes` indexes below. Same fix as mcp/oauth.rs.
+/// Byte offset where the value of `marker` starts in `line`, if `marker` is
+/// actually followed by `:`/`=` (or is a bare `Bearer <value>`). Offsets are
+/// valid in `line`: the scan runs on an ASCII-lowercased copy
+/// (`to_ascii_lowercase` preserves byte offsets; `to_lowercase` can expand
+/// non-ASCII, e.g. `İ` -> i + U+0307, and desync the indexes — same fix as
+/// mcp/oauth.rs).
+fn secret_value_start(line: &str, marker: &str) -> Option<usize> {
     let lower = line.to_ascii_lowercase();
-    let mut start: Option<usize> = None;
-    for marker in SECRET_MARKERS {
-        let mut search = 0;
-        while let Some(rel) = lower[search..].find(marker) {
-            let abs = search + rel;
-            search = abs + marker.len();
-            let mut rest = abs + marker.len();
-            while matches!(line.as_bytes().get(rest), Some(b' ' | b'\t' | b'\r')) {
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find(marker) {
+        let abs = search + rel;
+        search = abs + marker.len();
+        let mut rest = abs + marker.len();
+        while matches!(line.as_bytes().get(rest), Some(b' ' | b'\t' | b'\r')) {
+            rest += 1;
+        }
+        // `Authorization: Bearer x`, `api_key=abc`, or a bare `Bearer x`.
+        let is_bearer = marker == "bearer"
+            && line
+                .as_bytes()
+                .get(rest)
+                .is_some_and(|b| !b.is_ascii_whitespace());
+        if matches!(line.as_bytes().get(rest), Some(b':') | Some(b'=')) || is_bearer {
+            if !is_bearer {
                 rest += 1;
-            }
-            // `Authorization: Bearer x`, `api_key=abc`, or a bare `Bearer x`.
-            let is_bearer = *marker == "bearer"
-                && line
-                    .as_bytes()
-                    .get(rest)
-                    .is_some_and(|b| !b.is_ascii_whitespace());
-            if matches!(line.as_bytes().get(rest), Some(b':') | Some(b'=')) || is_bearer {
-                if !is_bearer {
+                while matches!(line.as_bytes().get(rest), Some(b' ' | b'\t' | b'\r')) {
                     rest += 1;
-                    while matches!(line.as_bytes().get(rest), Some(b' ' | b'\t' | b'\r')) {
-                        rest += 1;
-                    }
                 }
-                start = Some(start.map_or(rest, |prev: usize| prev.min(rest)));
-                break;
             }
+            return Some(rest);
         }
     }
-    match start {
+    None
+}
+
+fn redact_line(line: &str) -> String {
+    match SECRET_MARKERS
+        .iter()
+        .filter_map(|marker| secret_value_start(line, marker))
+        .min()
+    {
         Some(s) => {
             let end = line.find('\n').unwrap_or(line.len());
             format!("{}[redacted]{}", &line[..s], &line[end..])
@@ -517,7 +543,7 @@ pub(crate) fn resource_reader_definition(server: &str) -> ToolDefinition {
     ToolDefinition {
         tool_type: "function".to_string(),
         function: crate::core::types::FunctionDef {
-            name: format!("mcp__{server}_read_resource"),
+            name: resource_reader_name(server),
             description: format!(
                 "[{server}] Read a resource served by this MCP server (file, doc, schema). Prefer this over shelling out when the server hosts the data."
             ),
@@ -530,15 +556,30 @@ pub(crate) fn resource_reader_definition(server: &str) -> ToolDefinition {
     }
 }
 
+/// `v[key]` as a slice, empty when missing or not an array — the
+/// `.and_then(as_array).unwrap_or(&[])` ladder needs a local empty to borrow;
+/// this does not.
+fn json_arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+    match v.get(key).and_then(Value::as_array) {
+        Some(items) => items.as_slice(),
+        None => &[],
+    }
+}
+
+/// Bound any server-produced text to [`MCP_OUTPUT_BYTES`] with a marker.
+fn clamp_output(mut text: String) -> String {
+    if text.len() > MCP_OUTPUT_BYTES {
+        text.truncate(MCP_OUTPUT_BYTES);
+        text.push_str("\n[truncated]");
+    }
+    text
+}
+
 /// Map a `tools/call` result's `content[]` to display text. Text wins;
 /// images/resources degrade to placeholders so the model still sees shape.
 pub(crate) fn content_to_text(result: &Value) -> String {
     let mut parts = Vec::new();
-    let empty = Vec::new();
-    let content = result
-        .get("content")
-        .and_then(Value::as_array)
-        .unwrap_or(&empty);
+    let content = json_arr(result, "content");
     for item in content {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
@@ -586,11 +627,7 @@ pub(crate) fn content_to_text(result: &Value) -> String {
     {
         text = format!("Error: {text}");
     }
-    if text.len() > MCP_OUTPUT_BYTES {
-        text.truncate(MCP_OUTPUT_BYTES);
-        text.push_str("\n[truncated]");
-    }
-    text
+    clamp_output(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,6 +636,17 @@ pub(crate) fn content_to_text(result: &Value) -> String {
 
 fn rpc_request(id: u64, method: &str, params: Value) -> Value {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+/// The `initialize` handshake payload: one source for the protocol version
+/// and client info so the stdio and HTTP paths cannot drift apart.
+/// (oauth.rs `probe_challenge` still builds its own envelope; that lane owns it.)
+fn initialize_params() -> Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "dex", "version": env!("CARGO_PKG_VERSION")},
+    })
 }
 
 /// Minimal transport surface the manager needs. Real transports speak
@@ -675,16 +723,7 @@ impl StdioTransport {
     }
 
     async fn initialize(&self) -> Result<(), String> {
-        let result = self
-            .request(
-                "initialize",
-                serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "dex", "version": env!("CARGO_PKG_VERSION")},
-                }),
-            )
-            .await?;
+        let result = self.request("initialize", initialize_params()).await?;
         let _ = result;
         // Fire-and-forget per spec; the server must not reply.
         let notif = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
@@ -801,16 +840,7 @@ impl HttpTransport {
                 // Server restarted and forgot the session: drop it,
                 // re-handshake per the Streamable HTTP spec, retry once.
                 *self.session.lock().await = None;
-                let _ = self
-                    .roundtrip(
-                        "initialize",
-                        serde_json::json!({
-                            "protocolVersion": "2024-11-05",
-                            "capabilities": {},
-                            "clientInfo": {"name": "dex", "version": env!("CARGO_PKG_VERSION")},
-                        }),
-                    )
-                    .await;
+                let _ = self.roundtrip("initialize", initialize_params()).await;
                 self.roundtrip(method, params).await.map_err(|e| e.msg)
             }
             Err(e) if e.unauthorized => {
@@ -944,6 +974,12 @@ fn extract_rpc_result(v: &Value) -> Option<Value> {
     v.get("result").cloned()
 }
 
+/// The [`extract_rpc_result`] error sentinel: the server's message when the
+/// reply was a JSON-RPC error. One check so a reply path can't dodge it.
+fn rpc_error(v: &Value) -> Option<String> {
+    v.get("__mcp_error").map(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Client + manager
 // ---------------------------------------------------------------------------
@@ -997,16 +1033,11 @@ impl McpClient {
         let v = self
             .call("tools/list", serde_json::json!({}), cancel)
             .await?;
-        if let Some(err) = v.get("__mcp_error") {
+        if let Some(err) = rpc_error(&v) {
             return Err(format!("tools/list: {err}"));
         }
         let mut out = Vec::new();
-        for t in v
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-        {
+        for t in json_arr(&v, "tools") {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
             if name.is_empty() {
                 continue;
@@ -1040,8 +1071,8 @@ impl McpClient {
                 cancel,
             )
             .await?;
-        if let Some(err) = v.get("__mcp_error") {
-            return Err(format!("{err}"));
+        if let Some(err) = rpc_error(&v) {
+            return Err(err);
         }
         Ok(v)
     }
@@ -1064,18 +1095,13 @@ impl McpClient {
         let v = self
             .call("resources/read", serde_json::json!({"uri": uri}), cancel)
             .await?;
-        if let Some(err) = v.get("__mcp_error") {
-            return Err(format!("{err}"));
+        if let Some(err) = rpc_error(&v) {
+            return Err(err);
         }
         // `resources/read` returns `contents[]` with inline `text`/`blob`
         // (no `type` discriminator), unlike `tools/call` `content[]`.
         let mut parts = Vec::new();
-        for item in v
-            .get("contents")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-        {
+        for item in json_arr(&v, "contents") {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
                 parts.push(text.to_string());
             } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
@@ -1090,11 +1116,7 @@ impl McpClient {
         if text.is_empty() {
             text = "(empty resource)".to_string();
         }
-        if text.len() > MCP_OUTPUT_BYTES {
-            text.truncate(MCP_OUTPUT_BYTES);
-            text.push_str("\n[truncated]");
-        }
-        Ok(text)
+        Ok(clamp_output(text))
     }
 }
 
@@ -1262,10 +1284,7 @@ impl McpManager {
         };
         let mut tools = self.cached_tools.write().await;
         let mut names = self.cached_names.write().await;
-        tools.retain(|d| {
-            d.function.name != format!("mcp__{name}_read_resource")
-                && !d.function.name.starts_with(&format!("mcp__{name}__"))
-        });
+        tools.retain(|d| !def_belongs_to(&d.function.name, name));
         names.retain(|_, (server, _)| server != name);
         Self::cache_server_into(name, cfg, client, &mut tools, &mut names).await;
         self.enforce_cap(&mut tools, &mut names, mcp_max_tools())
@@ -1285,13 +1304,9 @@ impl McpManager {
         self.connect_and_cache(server, &cfg).await;
         if self.clients.read().await.contains_key(server) {
             let tools = self.cached_tools.read().await;
-            let prefix = format!("mcp__{server}");
             Ok(tools
                 .iter()
-                .filter(|d| {
-                    d.function.name == format!("{prefix}_read_resource")
-                        || d.function.name.starts_with(&format!("{prefix}__"))
-                })
+                .filter(|d| def_belongs_to(&d.function.name, server))
                 .count())
         } else {
             Err(self
@@ -1346,13 +1361,9 @@ impl McpManager {
         let mut out: Vec<ServerStatus> = configs
             .keys()
             .map(|name| {
-                let prefix = format!("mcp__{name}");
                 let count = tools
                     .iter()
-                    .filter(|d| {
-                        d.function.name == format!("{prefix}_read_resource")
-                            || d.function.name.starts_with(&format!("{prefix}__"))
-                    })
+                    .filter(|d| def_belongs_to(&d.function.name, name))
                     .count();
                 let state = if clients.contains_key(name) {
                     "up"
@@ -1508,18 +1519,12 @@ pub(crate) fn cached_truncated() -> usize {
 /// probe must never block the loop or spawn the background refresh.
 pub(crate) fn ephemeral_line() -> Option<String> {
     let mgr = GLOBAL.get()?;
+    // Zero-config managers have no line to print (the cached-status path
+    // below still yields `Some(vec![])` there); keep this gate here only.
     if mgr.configs.is_empty() {
         return None;
     }
-    let clients = mgr.clients.try_read().ok()?;
-    let tools = mgr.cached_tools.try_read().ok()?;
-    let down = mgr.down.try_read().ok()?;
-    crate::core::format::mcp_status_line(&McpManager::status_list(
-        &mgr.configs,
-        &clients,
-        &tools,
-        &down,
-    ))
+    try_snapshot(mgr).and_then(|st| crate::core::format::mcp_status_line(&st))
 }
 
 pub(crate) async fn call_global(
@@ -1537,6 +1542,13 @@ pub(crate) async fn call_global(
 /// which would wrongly imply no MCP is configured.
 pub(crate) fn cached_statuses() -> Option<Vec<ServerStatus>> {
     let mgr = GLOBAL.get()?;
+    try_snapshot(mgr)
+}
+
+/// Lock-free snapshot of `status_list` via `try_read`: `None` when a lock is
+/// contended — callers must treat that as "unavailable", never as an empty
+/// server list (which would wrongly imply no MCP is configured).
+fn try_snapshot(mgr: &McpManager) -> Option<Vec<ServerStatus>> {
     let clients = mgr.clients.try_read().ok()?;
     let tools = mgr.cached_tools.try_read().ok()?;
     let down = mgr.down.try_read().ok()?;
