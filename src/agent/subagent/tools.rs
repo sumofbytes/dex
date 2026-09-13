@@ -29,18 +29,25 @@ use crate::agent::state::{CancellationSource, ToolState};
 use crate::core::console::{CancellationToken, Console};
 use crate::core::types::{ApprovalRequest, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
-use crate::session::Session;
+use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::{Policy, ToolError, ToolFilter};
 
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
+use super::exit::{classify_body_error, ExitReason, ResumeHandle};
 use super::instance::{AgentId, AgentState};
 use super::manager::{AgentManager, ProgressReporter, WaitOutcome};
 use super::result::{AgentResult, AgentUsage};
+use super::SpawnMeta;
 
-/// The three model-facing delegation tools (§10). Background is the only
-/// spawn mode — no `run_in_background` flag to forget.
-pub(crate) const DELEGATION_TOOLS: [&str; 3] = ["delegate", "delegate_output", "delegate_stop"];
+/// The four model-facing delegation tools (§10, §24.3). Background is the
+/// only spawn mode — no `run_in_background` flag to forget.
+pub(crate) const DELEGATION_TOOLS: [&str; 4] = [
+    "delegate",
+    "delegate_output",
+    "delegate_stop",
+    "delegate_list",
+];
 
 /// `delegate_output`'s wait ceiling (§10.2): a bounded poll-wait, never an
 /// unbounded block.
@@ -136,6 +143,7 @@ pub(crate) async fn execute_delegation(
         "delegate" => delegate(&ctx, args, policy).await,
         "delegate_output" => delegate_output(&ctx, args, cancel).await,
         "delegate_stop" => delegate_stop(&ctx, args).await,
+        "delegate_list" => delegate_list(&ctx).await,
         _ => unreachable!("is_delegation and dispatch stay in sync"),
     }
 }
@@ -153,17 +161,26 @@ fn agent_id_arg(args: &Map<String, Value>) -> Result<AgentId, ToolError> {
         .ok_or(ToolError::Missing("agent_id"))
 }
 
-/// `delegate(agent, task, file_hints?)` — resolve the definition, build the
-/// isolated seed from the tool arguments (the parent model writes the task
-/// itself; dex never auto-copies transcript, §5), spawn, return immediately.
+/// `delegate(agent, task?, file_hints?, resume_from?, instruction?)` —
+/// fresh: resolve the definition, build the isolated seed from the tool
+/// arguments (the parent model writes the task itself; dex never
+/// auto-copies transcript, §5), spawn, return immediately. Resume:
+/// `resume_from` names a terminal child whose transcript replays as
+/// generation + 1 with an interruption nudge (§24.1–§24.3); `task` is
+/// then unneeded, and `instruction` (plus `file_hints`) folds into the
+/// nudge instead of replacing the original task.
 async fn delegate(
     ctx: &Arc<AgentTurnContext>,
     args: &Map<String, Value>,
     policy: &Policy,
 ) -> Result<String, ToolError> {
     let agent_name = string_arg(args, "agent").ok_or(ToolError::Missing("agent"))?;
-    let task = string_arg(args, "task").ok_or(ToolError::Missing("task"))?;
     let def = super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
+    let resume_from = string_arg(args, "resume_from");
+    let task = string_arg(args, "task");
+    if resume_from.is_none() && task.is_none() {
+        return Err(ToolError::Missing("task"));
+    }
     let file_hints = args
         .get("file_hints")
         .and_then(Value::as_array)
@@ -175,8 +192,49 @@ async fn delegate(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if let Some(resume_id) = resume_from {
+        let handle = resolve_resume_handle(ctx, &AgentId(resume_id)).await?;
+        let instruction = string_arg(args, "instruction");
+        let seed = ContextSeed {
+            // Unused on the resume path (messages replay from the
+            // transcript), but the spawn still files one: record why.
+            task: format!(
+                "resume {} generation {}",
+                handle.agent_id,
+                handle.generation + 1
+            ),
+            file_hints: file_hints.clone(),
+            parent_summary: None,
+        };
+        let generation = handle.generation + 1;
+        let resume = ResumeRequest {
+            handle: handle.clone(),
+            instruction,
+            file_hints,
+        };
+        let id = ctx
+            .manager
+            .spawn(
+                &def,
+                seed.clone(),
+                SpawnMeta {
+                    generation,
+                    parent_session: Some(ctx.session_path.clone()),
+                },
+                child_body(ctx.clone(), def.clone(), seed, Some(resume)),
+            )
+            .map_err(|error| ToolError::Denied(error.to_string()))?;
+        emit_started(policy, &def.name, &id).await;
+        return Ok(json!({
+            "agent_id": id.to_string(),
+            "state": "running",
+            "resumed_from": handle.agent_id.to_string(),
+            "generation": generation,
+        })
+        .to_string());
+    }
     let seed = ContextSeed {
-        task,
+        task: task.ok_or(ToolError::Missing("task"))?,
         file_hints,
         parent_summary: None,
     };
@@ -185,21 +243,26 @@ async fn delegate(
         .spawn(
             &def,
             seed.clone(),
-            child_body(ctx.clone(), def.clone(), seed),
+            SpawnMeta {
+                generation: 0,
+                parent_session: Some(ctx.session_path.clone()),
+            },
+            child_body(ctx.clone(), def.clone(), seed, None),
         )
         .map_err(|error| ToolError::Denied(error.to_string()))?;
-    // §15 V1a: the started line rides the parent turn's journal (already
-    // streaming); the finished line is journaled by the manager's hook on
-    // every terminal path, whenever the child actually ends.
+    emit_started(policy, &def.name, &id).await;
+    Ok(json!({ "agent_id": id.to_string(), "state": "running" }).to_string())
+}
+
+/// The §15 V1a started line rides the parent turn's journal (already
+/// streaming); the finished line is journaled by the manager's hook on
+/// every terminal path, whenever the child actually ends.
+async fn emit_started(policy: &Policy, name: &str, id: &AgentId) {
     if let Some(console) = policy.console.as_ref() {
         console
-            .emit_async(SinkLine::System(format!(
-                "[agent {}:{}] started",
-                def.name, id
-            )))
+            .emit_async(SinkLine::System(format!("[agent {name}:{id}] started")))
             .await;
     }
-    Ok(json!({ "agent_id": id.to_string(), "state": "running" }).to_string())
 }
 
 /// `delegate_output(agent_id, wait_seconds?)` — bounded poll-wait (§10.2):
@@ -263,12 +326,178 @@ async fn delegate_stop(
     }
 }
 
+/// The interruption nudge appended to a replayed transcript (§24.3):
+/// why the prior generation stopped, what changed, and the meter left.
+fn resume_nudge(request: &ResumeRequest) -> String {
+    let mut nudge = format!(
+        "You were interrupted: {}. Continue from the transcript above — \
+         do not redo completed work, pick up where it stopped.",
+        request.handle.note
+    );
+    if let Some(instruction) = request
+        .instruction
+        .as_deref()
+        .filter(|instruction| !instruction.trim().is_empty())
+    {
+        nudge.push_str(&format!("\n\nAdditional instruction: {instruction}"));
+    }
+    if !request.file_hints.is_empty() {
+        let hints = request
+            .file_hints
+            .iter()
+            .map(|hint| hint.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        nudge.push_str(&format!("\n\nFile hints: {hints}"));
+    }
+    match request.handle.remaining_budget {
+        Some(0) => nudge.push_str(
+            "\n\nNo further tool calls remain: write your final summary now without tools.",
+        ),
+        Some(left) => nudge.push_str(&format!(
+            "\n\nYou have at most {left} further tool calls before the turn ends."
+        )),
+        None => {}
+    }
+    nudge
+}
+
+/// Generation suffix of a child transcript file name
+/// (`<id>-<name>[.g<N>].jsonl`): the trailing `.g<N>` when the remainder
+/// still holds an id (which always contains `-`), else 0. Greedy on the
+/// last `.g<digits>` — a definition literally named `*.g1` at generation
+/// 0 is indistinguishable from generation 1, and the `-` guard keeps
+/// id-less stems at 0.
+fn parse_generation(file_name: &str) -> u32 {
+    let stem = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+    let Some((base, digits)) = stem.rsplit_once(".g") else {
+        return 0;
+    };
+    if !base.contains('-') || digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return 0;
+    }
+    digits.parse().unwrap_or(0)
+}
+
+/// Resolve `delegate(resume_from = <id>)` to a [`ResumeHandle`] (§24.3):
+/// a retained terminal result that advertised one, else an interrupted
+/// on-disk run from a daemon-restart-killed child
+/// (`Session::list_children`). A live child is rejected — it needs
+/// `delegate_output`, not a second generation.
+async fn resolve_resume_handle(
+    ctx: &Arc<AgentTurnContext>,
+    id: &AgentId,
+) -> Result<ResumeHandle, ToolError> {
+    match ctx.manager.wait(id, Duration::ZERO).await {
+        WaitOutcome::Finished(result) => {
+            if let Some(handle) = result.resume {
+                return Ok(handle);
+            }
+            return Err(ToolError::InvalidArgument(format!(
+                "agent '{id}' ended {} and is not resumable; delegate_list shows resumable children",
+                status_word(result.status)
+            )));
+        }
+        WaitOutcome::Running(_) => {
+            return Err(ToolError::InvalidArgument(format!(
+                "agent '{id}' is still running: use delegate_output to wait for it, \
+                 or delegate_stop first and then resume the terminal result"
+            )));
+        }
+        WaitOutcome::Unknown => {}
+    }
+    let children = Session::list_children(&ctx.session_path)
+        .map_err(|error| ToolError::InvalidArgument(format!("unknown agent id '{id}': {error}")))?;
+    let prefix = format!("{id}-");
+    for (path, _header, turn_state) in children {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".jsonl") {
+            continue;
+        }
+        if turn_state != "interrupted" {
+            return Err(ToolError::InvalidArgument(format!(
+                "agent '{id}' has a transcript but its last turn is '{turn_state}', not interrupted"
+            )));
+        }
+        let generation = parse_generation(name);
+        return Ok(ResumeHandle {
+            agent_id: id.clone(),
+            transcript: path,
+            generation,
+            // Spend died with the daemon: the resume runs the full cap.
+            remaining_budget: None,
+            note: "interrupted (daemon restart or crash); prior spend unknown".to_string(),
+        });
+    }
+    Err(ToolError::InvalidArgument(format!(
+        "unknown agent id '{id}': never spawned in this session, \
+         or its result aged out of retention"
+    )))
+}
+
+/// `delegate_list()` — the introspection tool (§24.3): live children with
+/// their progress label, retained terminal results with resumability, and
+/// interrupted on-disk runs a daemon restart left behind. Read-only and
+/// idempotent; the post-compaction answer to "what children do I have?".
+async fn delegate_list(ctx: &Arc<AgentTurnContext>) -> Result<String, ToolError> {
+    let snapshot = ctx.manager.snapshot();
+    let mut known: HashSet<String> = snapshot
+        .iter()
+        .filter_map(|child| child.transcript.as_ref())
+        .map(|path| path.display().to_string())
+        .collect();
+    let mut children: Vec<Value> = snapshot
+        .iter()
+        .map(|child| {
+            json!({
+                "agent_id": child.agent_id.to_string(),
+                "name": child.name,
+                "state": status_word(child.state),
+                "progress": child.progress,
+                "resumable": child.resumable,
+            })
+        })
+        .collect();
+    // On-disk runs the registry no longer knows: anything already listed
+    // (same transcript) skips, the rest report with their turn state.
+    if let Ok(disk) = Session::list_children(&ctx.session_path) {
+        for (path, header, turn_state) in disk {
+            if !known.insert(path.display().to_string()) {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            children.push(json!({
+                "agent_id": stem,
+                "name": header.name().unwrap_or_default(),
+                "state": turn_state,
+                "progress": Value::Null,
+                "resumable": turn_state == "interrupted",
+                "transcript": path.display().to_string(),
+            }));
+        }
+    }
+    children.sort_by(|a, b| {
+        a.get("agent_id")
+            .and_then(Value::as_str)
+            .cmp(&b.get("agent_id").and_then(Value::as_str))
+    });
+    Ok(json!({ "children": children }).to_string())
+}
+
 fn result_json(id: &AgentId, result: &AgentResult) -> String {
     json!({
         "agent_id": id.to_string(),
         "status": status_word(result.status),
         "summary": result.summary,
         "error": result.error,
+        "resumable": result.resume.is_some(),
     })
     .to_string()
 }
@@ -346,12 +575,26 @@ pub(crate) type ChildBody = Box<
         + Send,
 >;
 
+/// A manual resume (§24.3): replay `handle.transcript`, append the
+/// interruption nudge (+ `instruction`, + `file_hints`), run under
+/// `handle.remaining_budget`. Resume is spawn-with-history, not a new
+/// operation — the same body, one new `Option`.
+#[derive(Clone, Debug)]
+pub(crate) struct ResumeRequest {
+    pub(crate) handle: ResumeHandle,
+    pub(crate) instruction: Option<String>,
+    pub(crate) file_hints: Vec<PathBuf>,
+}
+
 pub(crate) fn child_body(
     ctx: Arc<AgentTurnContext>,
     def: AgentDefinition,
     seed: ContextSeed,
+    resume: Option<ResumeRequest>,
 ) -> ChildBody {
-    Box::new(move |token, progress, id| Box::pin(child_run(ctx, def, seed, token, progress, id)))
+    Box::new(move |token, progress, id| {
+        Box::pin(child_run(ctx, def, seed, token, progress, id, resume))
+    })
 }
 
 async fn child_run(
@@ -361,6 +604,7 @@ async fn child_run(
     token: CancellationToken,
     progress: ProgressReporter,
     id: AgentId,
+    resume: Option<ResumeRequest>,
 ) -> AgentResult {
     // §13: the definition's model override resolves through the existing
     // one-knob path; `None` inherits the parent's resolved model.
@@ -372,28 +616,70 @@ async fn child_run(
                 summary: String::new(),
                 error: Some(format!("agent model '{model}' failed to resolve: {error}")),
                 usage: None,
+                reason: ExitReason::Permanent,
+                tool_calls: 0,
+                resume: None,
             };
         }
     }
     // Child JSONL (§16): its own file beside the parent's, same marker
     // discipline (`turn_start`/`turn_complete`/`turn_failed`), so a crash
-    // loses at most the in-flight event. A disk failure fails the child,
-    // never the parent turn.
-    let mut session = match Session::child(&ctx.session_path, &ctx.cwd, &id.0, &def.name) {
-        Ok(session) => session,
-        Err(error) => {
-            return AgentResult {
-                status: AgentState::Failed,
-                summary: String::new(),
-                error: Some(format!("child session could not be created: {error}")),
-                usage: None,
-            };
+    // loses at most the in-flight event. Resume generations append `.g<N>`
+    // (§24.3) so a resume never clobbers its parent. A disk failure fails
+    // the child, never the parent turn.
+    let generation = resume
+        .as_ref()
+        .map(|request| request.handle.generation + 1)
+        .unwrap_or(0);
+    let mut session =
+        match Session::child(&ctx.session_path, &ctx.cwd, &id.0, &def.name, generation) {
+            Ok(session) => session,
+            Err(error) => {
+                return AgentResult {
+                    status: AgentState::Failed,
+                    summary: String::new(),
+                    error: Some(format!("child session could not be created: {error}")),
+                    usage: None,
+                    reason: ExitReason::Permanent,
+                    tool_calls: 0,
+                    resume: None,
+                };
+            }
+        };
+    // Fresh: system prompt + the parent-written task. Resume: replay the
+    // prior generation's transcript verbatim — its first message is the
+    // persona prompt it actually ran under, so no drift — then append the
+    // interruption nudge as a named user message. An unreadable or empty
+    // transcript falls back to fresh: a resume must never fail for
+    // journal reasons.
+    let mut messages: Vec<ChatMessage> = match &resume {
+        Some(request) => {
+            let replayed =
+                load_llm_messages_from_session(&request.handle.transcript).unwrap_or_default();
+            if replayed.is_empty() {
+                let user_message = ChatMessage::user(seed_task_text(&seed));
+                let _ = session.turn_event("turn_start");
+                let _ = session.append_message(&user_message);
+                vec![ChatMessage::system(child_system_prompt(&def)), user_message]
+            } else {
+                let mut replayed = replayed;
+                let _ = session.turn_event("turn_start");
+                for message in &replayed {
+                    let _ = session.append_message(message);
+                }
+                let nudge = ChatMessage::user_named(resume_nudge(request), "resume");
+                let _ = session.append_message(&nudge);
+                replayed.push(nudge);
+                replayed
+            }
+        }
+        None => {
+            let user_message = ChatMessage::user(seed_task_text(&seed));
+            let _ = session.turn_event("turn_start");
+            let _ = session.append_message(&user_message);
+            vec![ChatMessage::system(child_system_prompt(&def)), user_message]
         }
     };
-    let user_message = ChatMessage::user(seed_task_text(&seed));
-    let _ = session.turn_event("turn_start");
-    let _ = session.append_message(&user_message);
-    let mut messages = vec![ChatMessage::system(child_system_prompt(&def)), user_message];
 
     // Child console: a child-local sink that captures the last assistant
     // text (the §6 synthesized partial summary) and, under the daemon, a
@@ -423,6 +709,11 @@ async fn child_run(
     let usage = Arc::new(Mutex::new(AgentUsage::default()));
     let capture = last_assistant.clone();
     let tally = usage.clone();
+    // §24.1 spend meter: the body runs a single `process_turn`, so
+    // sink-counted tool invocations are the budget resume carries over
+    // (calls, not rounds — conservative when the child fanned out).
+    let calls = Arc::new(Mutex::new(0u32));
+    let tally_calls = calls.clone();
     // The child's sink lines drive three things: the §6 partial-summary
     // capture (last assistant text), the §15 progress label (the tool the
     // child is currently running, read by `delegate_output`), and the §18
@@ -437,6 +728,7 @@ async fn child_run(
                     // Preview is "<name> <short-args>" (loop.rs emit shape).
                     let name = preview.split(' ').next().unwrap_or_default();
                     progress.set(name);
+                    *tally_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 }
                 SinkLine::ToolOutput { .. } => progress.clear(),
                 SinkLine::Usage {
@@ -482,7 +774,12 @@ async fn child_run(
         // Depth 1 at dispatch: children carry no daemon context, so every
         // delegation tool call from a child is rejected (§11/§20).
         agent_ctx: None,
-        tool_budget: def.max_tool_iterations.map(|n| n as usize),
+        // Resume honors the remaining meter (§24.2). `None` (unlimited
+        // or unknown spend) falls back to the definition's cap.
+        tool_budget: resume
+            .as_ref()
+            .and_then(|request| request.handle.remaining_budget)
+            .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
     })
     .await;
     // Dropping the console closes the child sink, so the consumer drains
@@ -503,6 +800,7 @@ async fn child_run(
         .clone()
         .unwrap_or_default();
     let usage = usage.lock().unwrap_or_else(|e| e.into_inner()).reported();
+    let tool_calls = *calls.lock().unwrap_or_else(|e| e.into_inner());
     match result {
         // Completed guarantees a non-empty summary (§6): an empty final
         // message is not a usable result.
@@ -511,19 +809,33 @@ async fn child_run(
             summary: text,
             error: None,
             usage,
+            // The body classifies; only the manager's `finish` advertises
+            // (§24.1: one decision point, via `on_exit`).
+            reason: ExitReason::Normal,
+            tool_calls,
+            resume: None,
         },
         Ok(_) => AgentResult {
             status: AgentState::Failed,
             summary: partial,
             error: Some("child ended without a final message".to_string()),
             usage,
+            reason: ExitReason::Permanent,
+            tool_calls,
+            resume: None,
         },
-        Err(error) => AgentResult {
-            status: AgentState::Failed,
-            summary: partial,
-            error: Some(error.to_string()),
-            usage,
-        },
+        Err(error) => {
+            let message = error.to_string();
+            AgentResult {
+                status: AgentState::Failed,
+                summary: partial,
+                error: Some(message.clone()),
+                usage,
+                reason: classify_body_error(&message),
+                tool_calls,
+                resume: None,
+            }
+        }
     }
 }
 
@@ -649,6 +961,7 @@ mod tests {
                     file_hints: Vec::new(),
                     parent_summary: None,
                 },
+                SpawnMeta::fresh(),
                 // Ends only through its own token: parent cancel must not
                 // reach it.
                 |token, _progress, _id| async move {
@@ -658,6 +971,9 @@ mod tests {
                         summary: String::new(),
                         error: Some("child saw cancel".to_string()),
                         usage: None,
+                        reason: ExitReason::ShutDown,
+                        tool_calls: 0,
+                        resume: None,
                     }
                 },
             )
@@ -682,5 +998,287 @@ mod tests {
         // Cleanup: cancel + join so no task outlives the test.
         manager.shutdown().await;
         assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
+    fn parse_generation_reads_trailing_suffix_only() {
+        assert_eq!(parse_generation("sess-0-explorer.jsonl"), 0);
+        assert_eq!(parse_generation("sess-0-explorer.g1.jsonl"), 1);
+        assert_eq!(parse_generation("sess-0-explorer.g12.jsonl"), 12);
+        // No id guard (`-`): an id-less `.g1`-shaped stem stays gen 0.
+        assert_eq!(parse_generation("my.g1.jsonl"), 0);
+        // Greedy on the last suffix: a definition literally named `my.g1`
+        // at generation 0 is indistinguishable from generation 1.
+        assert_eq!(parse_generation("sess-0-my.g1.jsonl"), 1);
+        assert_eq!(parse_generation("sess-0-explorer.gx.jsonl"), 0);
+    }
+
+    #[test]
+    fn resume_nudge_carries_reason_instruction_and_budget() {
+        let request = ResumeRequest {
+            handle: ResumeHandle {
+                agent_id: AgentId("sess-0".to_string()),
+                transcript: PathBuf::from("/tmp/x.jsonl"),
+                generation: 2,
+                remaining_budget: Some(5),
+                note: "turn budget exhausted after 50 tool calls; continue from the transcript"
+                    .to_string(),
+            },
+            instruction: Some("skip the build".to_string()),
+            file_hints: vec![PathBuf::from("src/main.rs")],
+        };
+        let nudge = resume_nudge(&request);
+        assert!(nudge.contains("turn budget exhausted"), "{nudge}");
+        assert!(nudge.contains("skip the build"), "{nudge}");
+        assert!(nudge.contains("src/main.rs"), "{nudge}");
+        assert!(nudge.contains("at most 5 further tool calls"), "{nudge}");
+        let spent = ResumeRequest {
+            handle: ResumeHandle {
+                remaining_budget: Some(0),
+                ..request.handle.clone()
+            },
+            instruction: None,
+            file_hints: Vec::new(),
+        };
+        assert!(
+            resume_nudge(&spent).contains("No further tool calls remain"),
+            "{}",
+            resume_nudge(&spent)
+        );
+    }
+
+    fn resume_test_ctx(manager: AgentManager, session_path: PathBuf) -> Arc<AgentTurnContext> {
+        Arc::new(AgentTurnContext {
+            session_id: "sess".to_string(),
+            session_path,
+            cwd: String::new(),
+            config: Arc::new(crate::llm::config::tests::test_cfg()),
+            manager,
+            session_approvals: HashSet::new(),
+            child_approvals: None,
+            live_approvals: None,
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
+        // A retained terminal result that advertised a handle wins without
+        // touching the disk.
+        let manager = AgentManager::new("sess");
+        let dir = PathBuf::from("/tmp/dex-supervision-resolve");
+        let ctx = resume_test_ctx(manager.clone(), dir.join("sess.jsonl"));
+        let transcript = dir.join("agents").join("sess-0-tester.jsonl");
+        let held = transcript.clone();
+        let id = manager
+            .spawn(
+                &super::super::builtin_definitions()
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ContextSeed {
+                    task: "do the thing".to_string(),
+                    file_hints: Vec::new(),
+                    parent_summary: None,
+                },
+                SpawnMeta::fresh(),
+                move |_, _, _| {
+                    let transcript = held.clone();
+                    async move {
+                        AgentResult {
+                            status: AgentState::TimedOut,
+                            summary: "partial".to_string(),
+                            error: Some("timed out after 600s".to_string()),
+                            usage: None,
+                            reason: ExitReason::Exhausted(
+                                crate::agent::subagent::ExhaustKind::Timeout,
+                            ),
+                            tool_calls: 4,
+                            resume: Some(ResumeHandle {
+                                agent_id: AgentId("sess-0".to_string()),
+                                transcript,
+                                generation: 0,
+                                remaining_budget: Some(46),
+                                note: "timed out after 4 tool calls; continue from the transcript"
+                                    .to_string(),
+                            }),
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        let handle = resolve_resume_handle(&ctx, &id).await.unwrap();
+        assert_eq!(handle.remaining_budget, Some(46));
+        assert_eq!(handle.generation, 0);
+        // A live child rejects: it needs output/wait, not a new generation.
+        let live = manager
+            .spawn(
+                &super::super::builtin_definitions()
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ContextSeed {
+                    task: "hang".to_string(),
+                    file_hints: Vec::new(),
+                    parent_summary: None,
+                },
+                SpawnMeta::fresh(),
+                |token, _, _| async move {
+                    token.cancelled().await;
+                    AgentResult {
+                        status: AgentState::Cancelled,
+                        summary: String::new(),
+                        error: None,
+                        usage: None,
+                        reason: ExitReason::ShutDown,
+                        tool_calls: 0,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        let error = resolve_resume_handle(&ctx, &live).await.unwrap_err();
+        assert!(error.to_string().contains("still running"), "{error}");
+        // Unknown id with no disk: clean rejection pointing at the list.
+        let error = resolve_resume_handle(&ctx, &AgentId("sess-9".to_string()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("delegate_list"), "{error}");
+        manager.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_resume_handle_finds_interrupted_runs_on_disk() {
+        // A daemon-restart-killed child: header + turn_start, no terminal
+        // marker. The registry never saw this manager, so resolution is
+        // purely the on-disk scan.
+        let dir = PathBuf::from("/tmp/dex-supervision-resolve-disk");
+        let parent_path = dir.join("sess.jsonl");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        let mut child = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-resolve-disk",
+            "sess-4",
+            "explorer",
+            0,
+        )
+        .unwrap();
+        let _ = child.turn_event("turn_start");
+        drop(child);
+        let mut gen2 = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-resolve-disk",
+            "sess-5",
+            "tester",
+            2,
+        )
+        .unwrap();
+        let _ = gen2.turn_event("turn_start");
+        drop(gen2);
+        let manager = AgentManager::new("sess");
+        let ctx = resume_test_ctx(manager, parent_path);
+        let handle = resolve_resume_handle(&ctx, &AgentId("sess-4".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.generation, 0);
+        assert_eq!(handle.remaining_budget, None);
+        assert!(handle.transcript.ends_with("agents/sess-4-explorer.jsonl"));
+        let handle = resolve_resume_handle(&ctx, &AgentId("sess-5".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.generation, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delegate_list_reports_live_retained_and_disk() {
+        let dir = PathBuf::from("/tmp/dex-supervision-list");
+        let parent_path = dir.join("sess.jsonl");
+        std::fs::create_dir_all(dir.join("agents")).unwrap();
+        let manager = AgentManager::new("sess");
+        let ctx = resume_test_ctx(manager.clone(), parent_path.clone());
+        let live = manager
+            .spawn(
+                &super::super::builtin_definitions()
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ContextSeed {
+                    task: "hang".to_string(),
+                    file_hints: Vec::new(),
+                    parent_summary: None,
+                },
+                SpawnMeta::fresh(),
+                |token, _, _| async move {
+                    token.cancelled().await;
+                    AgentResult {
+                        status: AgentState::Cancelled,
+                        summary: String::new(),
+                        error: None,
+                        usage: None,
+                        reason: ExitReason::ShutDown,
+                        tool_calls: 0,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        let done = manager
+            .spawn(
+                &super::super::builtin_definitions()
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ContextSeed {
+                    task: "finish".to_string(),
+                    file_hints: Vec::new(),
+                    parent_summary: None,
+                },
+                SpawnMeta::fresh(),
+                |_, _, _| async {
+                    AgentResult {
+                        status: AgentState::Completed,
+                        summary: "ok".to_string(),
+                        error: None,
+                        usage: None,
+                        reason: ExitReason::Normal,
+                        tool_calls: 1,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        match manager.wait(&done, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(_) => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let mut disk = Session::child(
+            &parent_path,
+            "/tmp/dex-supervision-list",
+            "sess-9",
+            "explorer",
+            0,
+        )
+        .unwrap();
+        let _ = disk.turn_event("turn_start");
+        drop(disk);
+        let out = delegate_list(&ctx).await.unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        let children = value["children"].as_array().unwrap();
+        assert_eq!(children.len(), 3, "{out}");
+        let row = |agent_id: &str| {
+            children
+                .iter()
+                .find(|row| row["agent_id"] == agent_id)
+                .unwrap_or_else(|| panic!("missing row {agent_id}: {out}"))
+        };
+        assert_eq!(row(&live.to_string())["state"], "running");
+        assert_eq!(row(&live.to_string())["resumable"], false);
+        assert_eq!(row(&done.to_string())["state"], "completed");
+        assert_eq!(row(&done.to_string())["resumable"], false);
+        assert_eq!(row("sess-9-explorer")["state"], "interrupted");
+        assert_eq!(row("sess-9-explorer")["resumable"], true);
+        manager.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
