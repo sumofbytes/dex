@@ -38,8 +38,9 @@ use crate::session::Session;
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
 use super::exit::{
-    decide, exit_reason_word, recover_mode_word, resume_note, transcript_holds_progress, Action,
-    ExhaustKind, ExitReason, RecoverMode, ResumeHandle, ResumeRequest, SupervisionSpec,
+    advertised_remaining, decide, exit_reason_word, recover_mode_word, resume_note,
+    transcript_holds_progress, Action, ExhaustKind, ExitReason, Intensity, RecoverMode,
+    ResumeHandle, ResumeRequest, SupervisionSpec,
 };
 use super::instance::{AgentId, AgentInstance, AgentState};
 use super::result::{AgentResult, AgentUsage};
@@ -57,6 +58,13 @@ pub(crate) const MAX_PENDING: usize = 8;
 /// fold into the [`AgentManager::take_overflow`] counter instead of growing
 /// without bound.
 pub(crate) const MAX_NOTICES: usize = 32;
+
+/// Recovery-ledger memory bound (§24.5): entries are never pruned by
+/// whoever finished last (each definition counts its own window at
+/// decision time), so the deque is only capped. Recoveries are
+/// window-rate-limited; the cap exists for pathological catalog-scale
+/// churn, not for correctness.
+pub(crate) const MAX_RECOVERY_LEDGER: usize = 4096;
 /// Terminal results retained per session, so `wait` (and Phase 5's
 /// `delegate_output`) can fetch them after the notice is drained.
 const MAX_RESULTS: usize = 64;
@@ -348,6 +356,10 @@ struct ReEntry {
     attempt: u32,
     mode: RecoverMode,
     reason: ExitReason,
+    /// The superseded generation's silent notice, fired only once the
+    /// relaunch succeeds (a cap-race failure escalates with its own
+    /// notice instead — one completion per id).
+    superseded_notice: AgentNotice,
     fallback: Fallback,
 }
 
@@ -356,7 +368,7 @@ struct ReEntry {
 struct Fallback {
     transcript: Option<PathBuf>,
     generation: u32,
-    budget: Option<u32>,
+    allowance: Option<usize>,
     lineage: Vec<String>,
     reason: ExitReason,
     tool_calls: u32,
@@ -368,7 +380,6 @@ struct Fallback {
 struct Record {
     generation: u32,
     transcript: Option<PathBuf>,
-    budget: Option<u32>,
     spec: SupervisionSpec,
     lineage: Vec<String>,
     parent_session: Option<PathBuf>,
@@ -377,6 +388,11 @@ struct Record {
     def: AgentDefinition,
     /// Registry-side spend meter (§24.1), surviving body death.
     calls: u32,
+    /// The tool-round budget the child was launched under (§24.5):
+    /// the resume's remaining budget, else the definition's cap;
+    /// `None` = uncapped. Recoveries subtract the reconciled spend
+    /// so the meter carries across the lineage.
+    allowance: Option<usize>,
 }
 
 /// The escalation handle for a recorded child, transcript-gated (§24.1):
@@ -389,9 +405,7 @@ fn escalate_handle(
     tool_calls: u32,
 ) -> Option<ResumeHandle> {
     let transcript = record.transcript.clone()?;
-    let remaining = record
-        .budget
-        .map(|cap| (cap as usize).saturating_sub(tool_calls as usize));
+    let remaining = advertised_remaining(record.allowance, tool_calls as usize);
     Some(ResumeHandle {
         agent_id: id.clone(),
         transcript,
@@ -447,6 +461,11 @@ struct RunningChild {
     /// body's own count at `finish` (`max` — both count the same events,
     /// the registry meter just survives the body's death).
     calls: u32,
+    /// The tool-round budget this child was launched under (§24.5 spend
+    /// meter): the resume's remaining budget, else the definition's cap;
+    /// `None` = uncapped. Recoveries subtract the dying generation's
+    /// spend so the meter carries across the lineage.
+    allowance: Option<usize>,
 }
 
 /// Builds one attempt's body (§24.3: re-entry is spawn). The factory —
@@ -488,6 +507,11 @@ pub(crate) struct SpawnMeta {
     /// Recovery lineage inherited by the next generation (§24.4).
     /// Empty for fresh spawns.
     pub(crate) lineage: Vec<String>,
+    /// The tool-round budget the body runs under: the resume's remaining
+    /// budget, else the definition's cap (§24.5). `None` for uncapped
+    /// definitions. Mirrored into `RunningChild::allowance` so
+    /// recoveries can carry spend across generations.
+    pub(crate) remaining_budget: Option<usize>,
 }
 
 impl SpawnMeta {
@@ -498,6 +522,7 @@ impl SpawnMeta {
             parent_id: None,
             retry: None,
             lineage: Vec::new(),
+            remaining_budget: None,
         }
     }
 }
@@ -722,6 +747,9 @@ impl AgentManager {
                 retry: meta.retry.clone(),
                 lineage: meta.lineage.clone(),
                 calls: 0,
+                allowance: meta
+                    .remaining_budget
+                    .or(def.max_tool_iterations.map(|cap| cap as usize)),
             },
         );
         (token, def.timeout)
@@ -937,7 +965,7 @@ impl AgentManager {
             let record: Option<Record> = inner.running.get(id).map(|child| Record {
                 generation: child.generation,
                 transcript: child.transcript.clone(),
-                budget: child.instance.definition.max_tool_iterations,
+                allowance: child.allowance,
                 spec: child.instance.definition.supervision,
                 lineage: child.lineage.clone(),
                 parent_session: child.parent_session.clone(),
@@ -963,20 +991,43 @@ impl AgentManager {
                 .as_ref()
                 .map(|record| record.spec)
                 .unwrap_or_default();
-            // Intensity ledger (§24.5): supervisor-scoped, pruned by the
-            // definition's window at decision time.
+            // Intensity ledger (§24.5): supervisor-scoped. Each
+            // definition counts its own window at decision time —
+            // entries are never pruned by whoever finished last, so a
+            // long-window definition's history survives its
+            // short-window siblings (the deque cap is only a memory
+            // bound).
             let now = Instant::now();
-            while inner
+            let in_window = inner
                 .recoveries
-                .front()
-                .is_some_and(|first| now.duration_since(*first) > spec.window)
-            {
-                inner.recoveries.pop_front();
-            }
-            let mut action = decide(&spec, result.reason, inner.recoveries.len(), progress_made);
+                .iter()
+                .filter(|at| now.duration_since(**at) <= spec.window)
+                .count();
             // Without a factory there is nothing to re-enter with:
             // escalate exactly as the manual-only path would.
             let retry = record.as_ref().and_then(|record| record.retry.clone());
+            // The lineage's leftover tool rounds: what this generation
+            // was launched with minus what it spent — spend carries
+            // across generations, so a budget-exhausted lineage cannot
+            // reset its meter by dying and re-entering. `None` =
+            // uncapped.
+            let next_allowance = record
+                .as_ref()
+                .and_then(|record| record.allowance)
+                .map(|allowance| allowance.saturating_sub(tool_calls as usize));
+            let mut action = decide(
+                &spec,
+                result.reason,
+                Intensity {
+                    in_window,
+                    lineage_recoveries: record
+                        .as_ref()
+                        .map(|record| record.lineage.len())
+                        .unwrap_or(0),
+                    lineage_budget: next_allowance,
+                },
+                progress_made,
+            );
             if matches!(action, Action::Recover { .. }) && retry.is_none() {
                 action = Action::Escalate;
             }
@@ -1031,12 +1082,16 @@ impl AgentManager {
                         }
                         // §24.5 breaker: an intensity-exhausted *recovery*
                         // escalation means the environment is failing
-                        // faster than policy allows re-entry — queue new
-                        // spawns until this window expires. `never`-mode
-                        // escalations are ordinary endings, not breaker
-                        // material.
+                        // faster than policy allows re-entry — further
+                        // spawns queue until this window expires
+                        // (`launch`), and a recovery that finds no room
+                        // escalates. `never`-mode escalations are
+                        // ordinary endings, not breaker material. The
+                        // trigger counts the same window `decide` just
+                        // measured — the ledger is never pruned by
+                        // whoever finished last.
                         if spec.recover != RecoverMode::Never
-                            && inner.recoveries.len() >= spec.max as usize
+                            && in_window >= spec.max as usize
                         {
                             let until = now + spec.window;
                             inner.open_until = Some(match inner.open_until {
@@ -1054,6 +1109,9 @@ impl AgentManager {
                     let record = record.expect("recoveries only fire for registered children");
                     let factory = retry.expect("recoveries only fire with a factory");
                     inner.recoveries.push_back(now);
+                    while inner.recoveries.len() > MAX_RECOVERY_LEDGER {
+                        inner.recoveries.pop_front();
+                    }
                     let line = format!(
                         "{} after {}",
                         recover_mode_word(mode),
@@ -1062,38 +1120,43 @@ impl AgentManager {
                     let mut next_lineage = record.lineage.clone();
                     next_lineage.push(line);
                     // Retain silently: no handle (the lineage continues in
-                    // the next generation), no queue entry. The hook still
-                    // gets a `Completed` so the journal keeps the lineage
-                    // line and the TUI drops the superseded chip.
+                    // the next generation), no queue entry. The superseded
+                    // generation's `Completed` fires only once the
+                    // relaunch succeeds — on a cap-race failure the
+                    // escalated notice is the generation's sole
+                    // completion, not a duplicate.
                     let notice = retain(&mut inner, id, name, result, Vec::new());
                     inner.running.remove(id);
-                    hooks.push(AgentEvent::Completed(notice));
                     let next_generation = record.generation + 1;
-                    let resume = match mode {
-                        // `Never` never reaches recovery (`decide` only
-                        // returns `Fresh`/`Resume`); treat it as fresh if
-                        // it ever does.
-                        RecoverMode::Fresh | RecoverMode::Never => None,
-                        RecoverMode::Resume => record.transcript.clone().map(|transcript| {
-                            let remaining = record
-                                .budget
-                                .map(|cap| (cap as usize).saturating_sub(tool_calls as usize));
-                            ResumeRequest {
-                                handle: ResumeHandle {
-                                    agent_id: id.clone(),
-                                    transcript,
-                                    generation: record.generation,
-                                    remaining_budget: remaining,
-                                    note: resume_note(reason, tool_calls),
-                                    history: next_lineage.clone(),
-                                },
-                                instruction: None,
-                                file_hints: record.seed.file_hints.clone(),
-                            }
-                        }),
-                    };
-                    // `Resume` without a transcript degrades to fresh: the
-                    // body falls back to a fresh transcript anyway.
+                    // Both modes re-enter through the same resume
+                    // plumbing; the mode tells the body whether to replay
+                    // (`Resume`) or run the original seed with a full
+                    // meter under the generation-suffixed file the
+                    // registry already points at (`Fresh`).
+                    let resume = Some(ResumeRequest {
+                        mode,
+                        handle: ResumeHandle {
+                            agent_id: id.clone(),
+                            transcript: record.transcript.clone().unwrap_or_default(),
+                            generation: record.generation,
+                            remaining_budget: if mode == RecoverMode::Resume {
+                                next_allowance
+                            } else {
+                                // Fresh runs the definition's full meter.
+                                None
+                            },
+                            note: if mode == RecoverMode::Resume {
+                                resume_note(reason, tool_calls)
+                            } else {
+                                String::new()
+                            },
+                            history: next_lineage.clone(),
+                        },
+                        instruction: None,
+                        // The seed task already carries the hints; the
+                        // nudge would only duplicate them.
+                        file_hints: Vec::new(),
+                    });
                     reenter = Some(ReEntry {
                         meta: SpawnMeta {
                             generation: next_generation,
@@ -1101,6 +1164,7 @@ impl AgentManager {
                             parent_id: Some(id.clone()),
                             retry: Some(factory.clone()),
                             lineage: next_lineage.clone(),
+                            remaining_budget: next_allowance,
                         },
                         factory,
                         resume,
@@ -1110,11 +1174,12 @@ impl AgentManager {
                         attempt: next_generation + 1,
                         mode,
                         reason,
+                        superseded_notice: notice,
                         fallback: Fallback {
                             transcript: record.transcript.clone(),
                             generation: record.generation,
-                            budget: record.budget,
-                            lineage: next_lineage,
+                            allowance: record.allowance,
+                            lineage: record.lineage.clone(),
                             reason,
                             tool_calls,
                         },
@@ -1124,7 +1189,9 @@ impl AgentManager {
         }
         // Settle hooks fire BEFORE the relaunch, so the journal order is
         // old-`Completed` → `Recovered`/new-`Spawned` — the lifecycle
-        // reads forward in time (§24.4).
+        // reads forward in time (§24.4). The superseded generation's
+        // silent notice is not in here: it fires with the relaunch
+        // outcome below, so a failed relaunch never double-completes.
         {
             let hook = self.lock().events.clone();
             if let Some(hook) = hook {
@@ -1148,8 +1215,13 @@ impl AgentManager {
                 build,
             ) {
                 Ok(new_id) => {
+                    // The superseded generation completes before the
+                    // `Recovered` event so the journal reads forward in
+                    // time; a failed relaunch escalates instead and
+                    // never double-completes the id.
                     let hook = self.lock().events.clone();
                     if let Some(hook) = hook {
+                        hook(AgentEvent::Completed(reenter.superseded_notice));
                         hook(AgentEvent::Recovered {
                             agent_id: new_id,
                             name: reenter.name,
@@ -1191,6 +1263,7 @@ impl AgentManager {
                                     parent_id: Some(id.clone()),
                                     retry: reenter.meta.retry.clone(),
                                     lineage: reenter.meta.lineage.clone(),
+                                    remaining_budget: reenter.meta.remaining_budget,
                                 },
                                 run: Box::new(move |token, progress, new_id| {
                                     (retry_factory)(token, progress, new_id, retry_resume)
@@ -1212,6 +1285,10 @@ impl AgentManager {
                         Some((_new_id, event)) => {
                             let hook = self.lock().events.clone();
                             if let Some(hook) = hook {
+                                // The superseded generation's completion
+                                // rides the requeue: its chip drops now,
+                                // the queued recovery spawns later.
+                                hook(AgentEvent::Completed(reenter.superseded_notice.clone()));
                                 hook(event);
                             }
                             self.schedule_drain();
@@ -1242,9 +1319,10 @@ impl AgentManager {
             let mut inner = self.lock();
             if let Some(result) = inner.results.get_mut(id) {
                 if let Some(transcript) = fallback.transcript.clone() {
-                    let remaining = fallback
-                        .budget
-                        .map(|cap| (cap as usize).saturating_sub(fallback.tool_calls as usize));
+                    let remaining = advertised_remaining(
+                        fallback.allowance,
+                        fallback.tool_calls as usize,
+                    );
                     result.resume = Some(ResumeHandle {
                         agent_id: id.clone(),
                         transcript,
@@ -1273,10 +1351,22 @@ impl AgentManager {
                     .is_some(),
                 history: fallback.lineage.clone(),
                 // The parent is being notified of a lost recovery — it may
-                // act on it, so the wake is legitimate.
+                // act on it, so the wake is legitimate. The notice is
+                // QUEUED, not journal-only: a `queued: true` notice that
+                // never enters the queue schedules a wake that no-ops at
+                // `has_notices()` and the escalation never reaches the
+                // model's context.
                 queued: true,
             }
         };
+        {
+            let mut inner = self.lock();
+            if inner.notices.len() >= MAX_NOTICES {
+                inner.overflowed += 1;
+            } else {
+                inner.notices.push_back(notice.clone());
+            }
+        }
         let hook = self.lock().events.clone();
         if let Some(hook) = hook {
             hook(AgentEvent::Completed(notice));
@@ -2238,6 +2328,7 @@ mod tests {
                     parent_id: None,
                     retry: None,
                     lineage: Vec::new(),
+                    remaining_budget: None,
                 },
                 |_, _, _| async { panic!("boom") },
             )
@@ -2256,6 +2347,79 @@ mod tests {
         let notices = mgr.drain_notices();
         assert!(notices.iter().any(|notice| notice.resumable));
         assert!(notices[0].text().contains("resume_from"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn escalate_clamps_exhausted_meter_to_full_cap() {
+        // tool_calls == cap: a Some(0) handle would promise "write your
+        // final summary without tools" while the loop still runs one
+        // post-hoc round and then hard-fails — the handle advertises None
+        // (the definition's full cap) instead; partial spend keeps the
+        // honest remainder.
+        let dir = PathBuf::from("/tmp/dex-supervision-clamp");
+        let mgr = AgentManager::new("sess");
+        let mut def = test_def("explorer");
+        def.max_tool_iterations = Some(2);
+        let spent_all = mgr
+            .spawn(
+                &def,
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
+                    retry: None,
+                    lineage: Vec::new(),
+                    remaining_budget: None,
+                },
+                |_, _, _| async {
+                    AgentResult {
+                        status: AgentState::TimedOut,
+                        summary: "partial".to_string(),
+                        error: Some("timed out after 600s".to_string()),
+                        usage: None,
+                        reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                        tool_calls: 2,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        let spent_one = mgr
+            .spawn(
+                &def,
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    parent_id: None,
+                    retry: None,
+                    lineage: Vec::new(),
+                    remaining_budget: None,
+                },
+                |_, _, _| async {
+                    AgentResult {
+                        status: AgentState::TimedOut,
+                        summary: "partial".to_string(),
+                        error: Some("timed out after 600s".to_string()),
+                        usage: None,
+                        reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                        tool_calls: 1,
+                        resume: None,
+                    }
+                },
+            )
+            .unwrap();
+        for (id, expected) in [(&spent_all, None), (&spent_one, Some(1))] {
+            match mgr.wait(id, Duration::from_secs(5)).await {
+                WaitOutcome::Finished(result) => {
+                    let handle = result.resume.expect("escalated with progress");
+                    assert_eq!(handle.remaining_budget, expected);
+                }
+                other => panic!("expected Finished, got {other:?}"),
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2311,6 +2475,7 @@ mod tests {
                     parent_id: Some(first.clone()),
                     retry: None,
                     lineage: Vec::new(),
+                    remaining_budget: None,
                 },
                 token_body,
             )
@@ -2530,6 +2695,7 @@ mod tests {
                     parent_id: None,
                     retry: None,
                     lineage: Vec::new(),
+                    remaining_budget: None,
                 },
                 |token, progress, _| async move {
                     progress.set("read");
@@ -2620,6 +2786,7 @@ mod tests {
             parent_id: None,
             retry: Some(factory),
             lineage: Vec::new(),
+            remaining_budget: None,
         }
     }
 
@@ -2770,13 +2937,19 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fresh_mode_reruns_with_an_empty_transcript() {
-        // `recover: fresh` re-enters with no replay: the factory sees
-        // `None` and the same seed runs again.
+        // `recover: fresh` re-enters through the resume plumbing without
+        // replaying: a generation-only request (the body then writes the
+        // `.g<N>` file the registry derived at spawn time — registry and
+        // file can never disagree), full meter, no nudge.
         let seen_resume: Arc<Mutex<Vec<Option<ResumeRequest>>>> = Arc::new(Mutex::new(Vec::new()));
         let factory_seen = seen_resume.clone();
         let factory: ChildFactory = Arc::new(move |_, _, _, resume| {
             factory_seen.lock().unwrap().push(resume.clone());
-            assert!(resume.is_none(), "fresh mode never replays");
+            let request = resume.expect("fresh mode rides the spawn path");
+            assert_eq!(request.mode, RecoverMode::Fresh);
+            assert_eq!(request.instruction, None);
+            assert!(request.file_hints.is_empty());
+            assert_eq!(request.handle.remaining_budget, None);
             Box::pin(async move { completed("redone") })
                 as Pin<Box<dyn Future<Output = AgentResult> + Send>>
         });
@@ -2793,8 +2966,71 @@ mod tests {
             WaitOutcome::Finished(_) => {}
             other => panic!("expected Finished, got {other:?}"),
         }
-        assert_eq!(seen_resume.lock().unwrap().len(), 1);
+        // The request names the generation the registry points at: the
+        // body derives `.g1` from it (`handle.generation + 1`).
+        {
+            let calls = seen_resume.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].as_ref().map(|request| request.handle.generation),
+                Some(0)
+            );
+        }
         assert_eq!(mgr.drain_notices().len(), 1);
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_lineage_stops_at_the_recovery_cap() {
+        // A lineage that exhausts on every attempt must stop: the window
+        // never binds here (max 100, all deaths land inside it), so the
+        // per-lineage cap is what ends the treadmill —
+        // MAX_LINEAGE_RECOVERIES re-entries, then escalate.
+        let calls = Arc::new(Mutex::new(0usize));
+        let factory_calls = calls.clone();
+        let factory: ChildFactory = Arc::new(move |_, _, _, _resume| {
+            *factory_calls.lock().unwrap() += 1;
+            Box::pin(async move { exhausted_body() })
+                as Pin<Box<dyn Future<Output = AgentResult> + Send>>
+        });
+        let mut def = recover_def(RecoverMode::Fresh);
+        def.supervision.max = 100;
+        def.max_tool_iterations = Some(4);
+        let mgr = AgentManager::new("sess");
+        let first = mgr
+            .spawn(&def, test_seed(), retry_meta(factory), |_, _, _| async {
+                exhausted_body()
+            })
+            .unwrap();
+        match mgr.wait(&first, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(_) => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        // The chain settles: poll until the escalated notice lands.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let notices = loop {
+            let notices = mgr.drain_notices();
+            if !notices.is_empty() {
+                break notices;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "lineage never escalated at the cap"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].resumable, "escalation advertises a handle");
+        assert_eq!(
+            notices[0].history.len(),
+            crate::agent::subagent::exit::MAX_LINEAGE_RECOVERIES,
+            "{:?}",
+            notices[0].history
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            crate::agent::subagent::exit::MAX_LINEAGE_RECOVERIES
+        );
         mgr.shutdown().await;
     }
 
