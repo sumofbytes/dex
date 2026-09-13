@@ -552,6 +552,23 @@ impl DaemonState {
     }
 }
 
+/// Append one numbered stream event to the session's `.events.jsonl`
+/// journal (P10). Best effort like every journal write here: a missing
+/// registry entry or unreadable session file silently skips the append —
+/// the live SSE stream is the primary delivery path, the journal only
+/// feeds `?since=` replay.
+pub(crate) fn journal_event(state: &DaemonState, session_id: &str, seq: u64, event: &StreamEvent) {
+    let path = lock_map(&state.sessions)
+        .get(session_id)
+        .map(|entry| entry.path.clone());
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut journal) = crate::session::Session::from_path(&path) {
+        let _ = journal.append_event(seq, &serde_json::to_string(event).unwrap_or_default());
+    }
+}
+
 /// Journal one child lifecycle line (§15 V1a): a `System` event with the
 /// stable `[agent <name>:<id>]` prefix the TUI matches on. Called from the
 /// manager's terminal path — every ending (completed/failed/cancelled/
@@ -956,12 +973,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Redirect `XDG_DATA_HOME` to a pid-unique dir for the guard's lifetime.
+    /// `rebuild_async` scans the whole sessions dir; without this, concurrent
+    /// test binaries (same fixed /tmp session names) mark each other's live
+    /// sessions as failed. Additive test infra — no assertion changes.
+    /// Caller MUST hold `TEST_SESSIONS_ENV_LOCK` (env is process-global);
+    /// every user of this helper does.
+    struct HermeticXdg(Option<std::ffi::OsString>, std::path::PathBuf);
+    impl Drop for HermeticXdg {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    fn hermetic_xdg() -> HermeticXdg {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "dex-daemon-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        HermeticXdg(prev, dir)
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
-        // Depends on where the sessions dir resolves; serialize against tests
-        // that redirect XDG_DATA_HOME.
+        // Hermetic sessions dir: rebuild_async scans everything under
+        // XDG_DATA_HOME, so concurrent test binaries must not see each other.
         let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = hermetic_xdg();
         // A session killed mid-turn: turn_start with no terminal entry.
         let mut s = crate::session::Session::new("/tmp/dex-rebuild-test".into(), None).unwrap();
         let id = s.id().to_string();
@@ -1010,7 +1059,9 @@ mod tests {
     async fn rebuild_skips_failed_marking_for_live_turns() {
         // A reattach + chat racing the background rebuild owns the journal:
         // stamping `turn_failed` under its live `turn_start` would corrupt it.
+        // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
         let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = hermetic_xdg();
         let mut s =
             crate::session::Session::new("/tmp/dex-rebuild-live-test".into(), None).unwrap();
         let id = s.id().to_string();
@@ -1035,7 +1086,9 @@ mod tests {
     async fn rebuild_registry_merge_keeps_live_entries() {
         // Sessions claimed (reattached/created) mid-rebuild win over disk via
         // `or_insert` — the rebuild must not clobber them.
+        // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
         let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = hermetic_xdg();
         let s = crate::session::Session::new("/tmp/dex-rebuild-wins-test".into(), None).unwrap();
         let id = s.id().to_string();
         let path = s.path().unwrap().to_path_buf();
