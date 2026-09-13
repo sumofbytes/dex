@@ -163,7 +163,7 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                     "type": "object",
                     "properties": {
                         "agent": { "type": "string", "description": "agent name: explorer | reviewer | tester" },
-                        "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation (unneeded with resume_from)" },
+                        "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation; required unless resume_from is set" },
                         "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" },
                         "resume_from": { "type": "string", "description": "prior agent_id to resume from its transcript as a new generation" },
                         "instruction": { "type": "string", "description": "refined instruction folded into the resume continuation note" }
