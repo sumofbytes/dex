@@ -547,6 +547,91 @@ pub(crate) fn find_cutoff_by_tokens(
     }
 }
 
+/// File-operations section for the summary ("**Files read:** …"), empty
+/// when nothing was touched. Shared tail of both LLM-summary merge paths.
+fn attach_file_section(file_ops: &FileOps) -> String {
+    let (read_files, modified_files) = compute_file_lists(file_ops);
+    format_file_operations(&read_files, &modified_files)
+}
+
+/// LLM summarization path (`DEX_COMPACTION_LLM=1`): summarize the history
+/// and — for split turns — the turn prefix with the configured model,
+/// folding the summarizer spend into `usage_total`. Empty or failed replies
+/// fall back to the deterministic summary; a cancelled summarizer fails the
+/// compaction with the exact wording the turn loop matches
+/// (`e.contains("cancelled")`).
+#[allow(clippy::too_many_arguments)]
+async fn llm_summary(
+    config: &LlmConfig,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    messages_to_summarize: &[ChatMessage],
+    turn_prefix_messages: &[ChatMessage],
+    is_split_turn: bool,
+    previous_summary: Option<&str>,
+    file_ops: &FileOps,
+    usage_total: &mut Option<Usage>,
+) -> Result<String, String> {
+    let history_summary = if !messages_to_summarize.is_empty() {
+        match summarize_old_messages(config, messages_to_summarize, cancel).await {
+            Ok((s, u)) if !s.trim().is_empty() => {
+                merge_usage(usage_total, u);
+                s
+            }
+            Ok((_, u)) => {
+                merge_usage(usage_total, u);
+                deterministic_summary(messages_to_summarize, &[], previous_summary, file_ops)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("cancelled") || msg.contains("cancellation") {
+                    return Err(format!("history compaction cancelled: {msg}"));
+                }
+                deterministic_summary(messages_to_summarize, &[], previous_summary, file_ops)
+            }
+        }
+    } else {
+        "No prior history.".to_string()
+    };
+    if is_split_turn && !turn_prefix_messages.is_empty() {
+        // Turn prefix summary with smaller budget prompt
+        let prefix_conversation = serialize_conversation(turn_prefix_messages);
+        let prefix_prompt = vec![
+            ChatMessage::system(
+                "You are a context summarization assistant. ONLY output the structured summary.",
+            ),
+            ChatMessage::user(format!(
+                "<conversation>\n{}\n</conversation>\n\n{}",
+                prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
+            )),
+        ];
+        let (sink, rx) = mpsc::channel(16);
+        drop(rx);
+        let prefix_summary = match call_llm(config, &prefix_prompt, false, Some(sink), cancel).await
+        {
+            Ok(turn) => {
+                merge_usage(usage_total, turn.usage);
+                turn.message.content.unwrap_or_default()
+            }
+            Err(_) => deterministic_summary(&[], turn_prefix_messages, None, &FileOps::default()),
+        };
+        // Merge: history + "---" + turn context
+        let file_section = attach_file_section(file_ops);
+        Ok(format!(
+            "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}{}",
+            history_summary.trim(),
+            prefix_summary.trim(),
+            file_section
+        ))
+    } else {
+        let file_section = attach_file_section(file_ops);
+        if file_section.is_empty() {
+            Ok(history_summary)
+        } else {
+            Ok(format!("{}{}", history_summary.trim(), file_section))
+        }
+    }
+}
+
 pub(crate) async fn compact_history(
     _config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
@@ -631,80 +716,17 @@ pub(crate) async fn compact_history(
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
     let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
-        // Use LLM path: if split, generate history + turn prefix separately then merge
-        let history_summary = if !messages_to_summarize.is_empty() {
-            match summarize_old_messages(_config, &messages_to_summarize, _cancel).await {
-                Ok((s, u)) if !s.trim().is_empty() => {
-                    merge_usage(&mut usage_total, u);
-                    s
-                }
-                Ok((_, u)) => {
-                    merge_usage(&mut usage_total, u);
-                    deterministic_summary(
-                        &messages_to_summarize,
-                        &[],
-                        previous_summary.as_deref(),
-                        &file_ops,
-                    )
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("cancelled") || msg.contains("cancellation") {
-                        return Err(format!("history compaction cancelled: {msg}"));
-                    }
-                    deterministic_summary(
-                        &messages_to_summarize,
-                        &[],
-                        previous_summary.as_deref(),
-                        &file_ops,
-                    )
-                }
-            }
-        } else {
-            "No prior history.".to_string()
-        };
-        if cp.is_split_turn && !turn_prefix_messages.is_empty() {
-            // Turn prefix summary with smaller budget prompt
-            let prefix_conversation = serialize_conversation(&turn_prefix_messages);
-            let prefix_prompt = vec![
-                ChatMessage::system(
-                    "You are a context summarization assistant. ONLY output the structured summary.",
-                ),
-                ChatMessage::user(format!(
-                    "<conversation>\n{}\n</conversation>\n\n{}",
-                    prefix_conversation, TURN_PREFIX_SUMMARIZATION_PROMPT
-                )),
-            ];
-            let (sink, rx) = mpsc::channel(16);
-            drop(rx);
-            let prefix_summary =
-                match call_llm(_config, &prefix_prompt, false, Some(sink), _cancel).await {
-                    Ok(turn) => {
-                        merge_usage(&mut usage_total, turn.usage);
-                        turn.message.content.unwrap_or_default()
-                    }
-                    Err(_) => {
-                        deterministic_summary(&[], &turn_prefix_messages, None, &FileOps::default())
-                    }
-                };
-            // Merge: history + "---" + turn context
-            let (read_files, modified_files) = compute_file_lists(&file_ops);
-            let file_section = format_file_operations(&read_files, &modified_files);
-            format!(
-                "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}{}",
-                history_summary.trim(),
-                prefix_summary.trim(),
-                file_section
-            )
-        } else {
-            let (read_files, modified_files) = compute_file_lists(&file_ops);
-            let file_section = format_file_operations(&read_files, &modified_files);
-            if file_section.is_empty() {
-                history_summary
-            } else {
-                format!("{}{}", history_summary.trim(), file_section)
-            }
-        }
+        llm_summary(
+            _config,
+            _cancel,
+            &messages_to_summarize,
+            &turn_prefix_messages,
+            cp.is_split_turn,
+            previous_summary.as_deref(),
+            &file_ops,
+            &mut usage_total,
+        )
+        .await?
     } else {
         deterministic_summary(
             &messages_to_summarize,
