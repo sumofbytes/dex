@@ -26,8 +26,9 @@ pub(crate) use definition::{
 };
 #[allow(unused_imports)]
 pub(crate) use exit::{
-    classify_body_error, on_exit, resume_note, transcript_holds_progress, ExhaustKind, ExitReason,
-    OnExit, ResumeHandle,
+    classify_body_error, decide, exit_reason_word, recover_mode_word, resume_note,
+    transcript_holds_progress, Action, ExhaustKind, ExitReason, RecoverMode, ResumeHandle,
+    ResumeRequest, SupervisionSpec,
 };
 #[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};

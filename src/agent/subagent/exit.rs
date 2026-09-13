@@ -11,6 +11,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::instance::AgentId;
 
@@ -42,6 +43,48 @@ pub(crate) enum ExhaustKind {
     Timeout,
 }
 
+/// How a definition re-enters a recoverable child (§24.2). A property of
+/// the spec, never of the failure — no recover-for-timeout branches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum RecoverMode {
+    /// No automatic re-entry: escalate immediately (OTP `temporary`).
+    /// The default — V1a/V1b behavior is byte-identical under it.
+    #[default]
+    Never,
+    /// Re-spawn the same seed with an empty transcript (true OTP restart:
+    /// a child is a pure function of definition + seed, both retained).
+    Fresh,
+    /// Replay the transcript, append the interruption nudge, run under
+    /// the remaining turn budget with a fresh wall-clock timeout.
+    Resume,
+}
+
+/// Declarative supervision per definition (§24.2): frontmatter keys
+/// `recover` / `recover_max` / `recover_window_secs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SupervisionSpec {
+    pub(crate) recover: RecoverMode,
+    /// Recovery actions allowed per window, supervisor-scoped (OTP
+    /// intensity: siblings share the ledger). Parsed ≥ 1.
+    pub(crate) max: u32,
+    pub(crate) window: Duration,
+}
+
+/// Built-in intensity: two recoveries per minute per session before the
+/// breaker opens (§24.5).
+pub(crate) const DEFAULT_RECOVER_MAX: u32 = 2;
+pub(crate) const DEFAULT_RECOVER_WINDOW: Duration = Duration::from_secs(60);
+
+impl Default for SupervisionSpec {
+    fn default() -> Self {
+        Self {
+            recover: RecoverMode::Never,
+            max: DEFAULT_RECOVER_MAX,
+            window: DEFAULT_RECOVER_WINDOW,
+        }
+    }
+}
+
 /// Classify a child-body `Err` string (§24.1 table). The turn-budget
 /// message is matched by prefix — it is built in exactly one place
 /// (`process_turn`, "turn budget exhausted after …"), pinned by the test
@@ -58,22 +101,37 @@ pub(crate) fn classify_body_error(message: &str) -> ExitReason {
     }
 }
 
-/// The Phase-11 decision: `Drop` keeps today's behavior (terminal result
-/// and notice, child gone); `EscalateWithResume` additionally advertises
-/// a resume handle.
-///
-/// Recovery itself stays manual — the model calls
-/// `delegate(resume_from = …)`.
+/// The single decision (§24): `Settle` keeps the terminal result and its
+/// notice; `Recover` re-enters the child as generation + 1 without
+/// notifying the parent; `Escalate` settles *and* advertises the resume
+/// handle, carrying the recovery history for the model's rectification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OnExit {
-    Drop,
-    EscalateWithResume,
+pub(crate) enum Action {
+    Settle,
+    Recover { mode: RecoverMode },
+    Escalate,
 }
 
-pub(crate) fn on_exit(reason: ExitReason, progress_made: bool) -> OnExit {
-    match (reason, progress_made) {
-        (ExitReason::Transient | ExitReason::Exhausted(_), true) => OnExit::EscalateWithResume,
-        _ => OnExit::Drop,
+pub(crate) fn decide(
+    spec: &SupervisionSpec,
+    reason: ExitReason,
+    recoveries_in_window: usize,
+    progress_made: bool,
+) -> Action {
+    let resumable =
+        matches!(reason, ExitReason::Transient | ExitReason::Exhausted(_)) && progress_made;
+    if !resumable {
+        return Action::Settle;
+    }
+    match spec.recover {
+        RecoverMode::Never => Action::Escalate,
+        RecoverMode::Fresh | RecoverMode::Resume => {
+            if recoveries_in_window >= spec.max as usize {
+                Action::Escalate
+            } else {
+                Action::Recover { mode: spec.recover }
+            }
+        }
     }
 }
 
@@ -92,6 +150,20 @@ pub(crate) struct ResumeHandle {
     pub(crate) remaining_budget: Option<usize>,
     /// Why it died, in one line — becomes the interruption nudge.
     pub(crate) note: String,
+    /// Lineage of automatic recoveries ("resumed after timed out"),
+    /// oldest first — the escalation record. Empty for first attempts.
+    pub(crate) history: Vec<String>,
+}
+
+/// A re-entry, manual or automatic (§24.3): replay `handle.transcript`,
+/// append the interruption nudge (+ `instruction`, + `file_hints`), run
+/// under `handle.remaining_budget`. Resume is spawn-with-history, not a
+/// new operation — the same body, one new `Option`.
+#[derive(Clone, Debug)]
+pub(crate) struct ResumeRequest {
+    pub(crate) handle: ResumeHandle,
+    pub(crate) instruction: Option<String>,
+    pub(crate) file_hints: Vec<PathBuf>,
 }
 
 /// One-line death note for a reason + spend pair.
@@ -109,6 +181,27 @@ pub(crate) fn resume_note(reason: ExitReason, tool_calls: u32) -> String {
             format!("timed out after {calls}; continue from the transcript")
         }
         _ => format!("ended after {calls}"),
+    }
+}
+
+/// One-word mode for §15-style lifecycle lines.
+pub(crate) fn recover_mode_word(mode: RecoverMode) -> &'static str {
+    match mode {
+        RecoverMode::Never => "never",
+        RecoverMode::Fresh => "restarted",
+        RecoverMode::Resume => "resumed",
+    }
+}
+
+/// One-word reason for §15-style lifecycle lines.
+pub(crate) fn exit_reason_word(reason: ExitReason) -> &'static str {
+    match reason {
+        ExitReason::Normal => "finished",
+        ExitReason::ShutDown => "cancelled",
+        ExitReason::Transient => "interrupted",
+        ExitReason::Exhausted(ExhaustKind::Budget) => "budget exhausted",
+        ExitReason::Exhausted(ExhaustKind::Timeout) => "timed out",
+        ExitReason::Permanent => "failed",
     }
 }
 
@@ -144,35 +237,77 @@ mod tests {
     }
 
     #[test]
-    fn on_exit_advertises_only_recoverable_progress() {
-        // Recoverable reasons with progress: advertise.
+    fn decide_routes_recoverable_progress_by_spec_and_intensity() {
+        let never = SupervisionSpec::default();
+        assert_eq!(never.recover, RecoverMode::Never);
+        let resume = SupervisionSpec {
+            recover: RecoverMode::Resume,
+            ..SupervisionSpec::default()
+        };
+        let fresh = SupervisionSpec {
+            recover: RecoverMode::Fresh,
+            ..SupervisionSpec::default()
+        };
+        // Recoverable reasons with progress: escalate under `never`,
+        // recover within intensity, escalate once exhausted.
         for reason in [
             ExitReason::Transient,
             ExitReason::Exhausted(ExhaustKind::Budget),
             ExitReason::Exhausted(ExhaustKind::Timeout),
         ] {
             assert_eq!(
-                on_exit(reason, true),
-                OnExit::EscalateWithResume,
+                decide(&never, reason, 0, true),
+                Action::Escalate,
                 "{reason:?}"
             );
+            assert_eq!(
+                decide(&resume, reason, 0, true),
+                Action::Recover {
+                    mode: RecoverMode::Resume
+                },
+                "{reason:?}"
+            );
+            assert_eq!(
+                decide(&fresh, reason, 1, true),
+                Action::Recover {
+                    mode: RecoverMode::Fresh
+                },
+                "{reason:?}"
+            );
+            assert_eq!(
+                decide(&resume, reason, DEFAULT_RECOVER_MAX as usize, true),
+                Action::Escalate,
+                "{reason:?} at intensity"
+            );
         }
-        // Recoverable reasons without progress: nothing to resume from.
+        // Recoverable reasons without progress: nothing to re-enter from.
         for reason in [
             ExitReason::Transient,
             ExitReason::Exhausted(ExhaustKind::Budget),
             ExitReason::Exhausted(ExhaustKind::Timeout),
         ] {
-            assert_eq!(on_exit(reason, false), OnExit::Drop, "{reason:?}");
+            assert_eq!(
+                decide(&resume, reason, 0, false),
+                Action::Settle,
+                "{reason:?}"
+            );
         }
-        // Terminal-by-intent reasons never advertise, progress or not.
+        // Terminal-by-intent reasons settle, progress or not.
         for reason in [
             ExitReason::Normal,
             ExitReason::ShutDown,
             ExitReason::Permanent,
         ] {
-            assert_eq!(on_exit(reason, true), OnExit::Drop, "{reason:?}");
-            assert_eq!(on_exit(reason, false), OnExit::Drop, "{reason:?}");
+            assert_eq!(
+                decide(&resume, reason, 0, true),
+                Action::Settle,
+                "{reason:?}"
+            );
+            assert_eq!(
+                decide(&never, reason, 0, false),
+                Action::Settle,
+                "{reason:?}"
+            );
         }
     }
 }
