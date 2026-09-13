@@ -702,7 +702,7 @@ fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentE
     let env = StreamEnvelope { seq, event: typed };
     let _ = journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
     state.broadcast_event(session_id, &env);
-    if matches!(event, AgentEvent::Completed(_)) {
+    if matches!(&event, AgentEvent::Completed(notice) if notice.queued) {
         crate::daemon::server::schedule_idle_wake(state.clone(), session_id.to_string());
     }
 }
