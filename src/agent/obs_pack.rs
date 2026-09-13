@@ -430,7 +430,7 @@ pub(crate) fn project(
                 // live in the archive. Packing it would archive the archive
                 // and drop the model's active working set every two requests,
                 // forcing a recall-of-recall round trip; exempt it.
-                let observation = if tool_name == "obs_recall" {
+                let observation = if tool_name == OBS_RECALL_NAME {
                     None
                 } else {
                     create_observation(tool_name, message.content_str())
@@ -512,6 +512,10 @@ pub(crate) fn project(
     }
     projected
 }
+
+/// Name of the observation-archive read-back tool. Its output is a view of
+/// bytes that already live in the archive and must never be re-packed.
+pub(crate) const OBS_RECALL_NAME: &str = "obs_recall";
 
 /// Execute the `obs_recall` tool against the session's observation archive.
 pub(crate) fn tool_obs_recall(
