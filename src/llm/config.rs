@@ -357,6 +357,37 @@ fn known_providers(entries: &BTreeMap<String, ProviderEntry>) -> BTreeSet<String
     entries.keys().cloned().collect()
 }
 
+/// How a selection string routes: which known-provider prefix it carries
+/// and what remains. `split_selection`, `strip_routing_prefixes`, and
+/// `apply_model` classify the same `provider/` grammar with different
+/// outcomes; this enum is the shared classification. Endpoint prefixes
+/// (`go/…`) are deliberately not classified here — endpoints are instance
+/// state, so each consumer keeps its own endpoint step.
+enum SelectionRoute {
+    /// `provider/rest` — a known provider prefix; `rest` may be empty.
+    ProviderQualified { provider: String, rest: String },
+    /// The whole selection is a bare known provider name (no `/`).
+    BareProvider { provider: String },
+    /// No known-provider prefix: the whole selection is the model id.
+    Model(String),
+}
+
+/// Classify one selection string against the known provider names.
+fn classify_selection(selection: &str, known: &BTreeSet<String>) -> SelectionRoute {
+    match selection.split_once('/') {
+        Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => {
+            SelectionRoute::ProviderQualified {
+                provider: prefix.trim().to_ascii_lowercase(),
+                rest: rest.to_string(),
+            }
+        }
+        _ if Provider::parse_known(selection, known).is_some() => SelectionRoute::BareProvider {
+            provider: selection.trim().to_ascii_lowercase(),
+        },
+        _ => SelectionRoute::Model(selection.to_string()),
+    }
+}
+
 /// Split a model selection into `(provider, model)`. A leading
 /// `provider/` prefix — or the whole selection being a bare provider name —
 /// selects the provider; the remainder is the model id (a bare provider
@@ -372,20 +403,19 @@ fn split_selection(selection: &str, known: &BTreeSet<String>) -> (Option<String>
             .map(|provider| provider.default_model().to_string())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     };
-    match selection.split_once('/') {
-        Some((prefix, rest)) if Provider::parse_known(prefix, known).is_some() => (
-            Some(prefix.trim().to_ascii_lowercase()),
+    match classify_selection(selection, known) {
+        SelectionRoute::ProviderQualified { provider, rest } => (
+            Some(provider.clone()),
             if rest.is_empty() {
-                default_model(prefix)
+                default_model(&provider)
             } else {
-                rest.to_string()
+                rest
             },
         ),
-        _ if Provider::parse_known(selection, known).is_some() => (
-            Some(selection.trim().to_ascii_lowercase()),
-            default_model(selection),
-        ),
-        _ => (None, selection.to_string()),
+        SelectionRoute::BareProvider { provider } => {
+            (Some(provider.clone()), default_model(&provider))
+        }
+        SelectionRoute::Model(model) => (None, model),
     }
 }
 
@@ -1935,11 +1965,10 @@ impl LlmConfig {
     /// move the pinned URL. Unknown prefixes stay part of the model id.
     fn strip_routing_prefixes(&mut self) {
         let mut sel = self.model.clone();
-        if let Some((prefix, rest)) = sel.split_once('/') {
-            let known = known_providers(&self.provider_entries);
-            if Provider::parse_known(prefix, &known).is_some() {
-                sel = rest.to_string();
-            }
+        if let SelectionRoute::ProviderQualified { rest, .. } =
+            classify_selection(&sel, &known_providers(&self.provider_entries))
+        {
+            sel = rest;
         }
         if let Some((name, rest)) = sel.split_once('/') {
             if self.endpoints.contains_key(name) {
@@ -1967,14 +1996,34 @@ impl LlmConfig {
         // switches provider (and its base_url) without env. A bare provider
         // name ("/model opencode") switches provider and keeps the model —
         // it names a provider, not a model id.
-        let mut sel = selection;
+        let sel: String;
         let mut keep_model = false;
         let known = known_providers(&self.provider_entries);
-        let prefix_provider = match selection.split_once('/') {
-            Some((prefix, _)) => Provider::parse_known(prefix, &known),
-            None => Provider::parse_known(selection, &known),
+        let route_provider = match classify_selection(selection, &known) {
+            SelectionRoute::ProviderQualified { provider, rest } => {
+                if rest.is_empty() {
+                    // Original kept the full selection visible to the
+                    // endpoint-routing step below.
+                    keep_model = true;
+                    sel = selection.to_string();
+                } else {
+                    sel = rest;
+                }
+                Some(provider)
+            }
+            SelectionRoute::BareProvider { provider } => {
+                // A bare provider keeps the current model.
+                keep_model = true;
+                sel = self.model.clone();
+                Some(provider)
+            }
+            SelectionRoute::Model(model) => {
+                sel = model;
+                None
+            }
         };
-        if let Some(new_provider) = prefix_provider {
+        let new_provider = route_provider.and_then(|name| Provider::parse_known(&name, &known));
+        if let Some(new_provider) = new_provider {
             if new_provider != self.provider {
                 // Resolve everything before mutating: a half-switched
                 // config (new provider, old key/URL/headers) is worse
@@ -1984,10 +2033,6 @@ impl LlmConfig {
                     .map_err(|e| e.to_string())?;
                 let resolved = resolve_provider(&new_provider, &self.provider_entries);
                 self.set_provider(new_provider, key, account, resolved)?;
-            }
-            match selection.split_once('/') {
-                Some((_, rest)) if !rest.is_empty() => sel = rest,
-                _ => keep_model = true,
             }
         }
         let mut result = None;
@@ -2005,7 +2050,7 @@ impl LlmConfig {
             // `moonshotai/kimi-k2.6`): stay unless the catalog shows the
             // model lives on another known endpoint.
             self.model = sel.to_string();
-            warn_provider_like_selection(sel, self.provider.name(), &self.available_models);
+            warn_provider_like_selection(&sel, self.provider.name(), &self.available_models);
             if let Some(catalog) = load_dex_catalog() {
                 if let Some(url) = catalog_endpoint_for_model(
                     &catalog,
