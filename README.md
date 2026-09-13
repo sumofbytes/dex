@@ -708,7 +708,7 @@ dex/
     ├── core/             # console sinks, formatting, highlighting, types
     ├── llm/              # provider clients, streaming parsers, auth, config
     ├── session.rs        # JSONL session persistence
-    ├── tools/            # builtin tools: read, ls, bash, write, edit, grep, find (fff engine; aliases ffgrep/fffind)
+    ├── tools/            # builtin tools: read, bash, write, edit, grep, find, ls (fff engine; aliases ffgrep/fffind)
     ├── mcp.rs + mcp/     # MCP client: stdio/HTTP/SSE servers, OAuth login
     ├── skills.rs         # skill discovery
     └── ui.rs + ui/       # ratatui TUI (local event loop + remote client UI)
