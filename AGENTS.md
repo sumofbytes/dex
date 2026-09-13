@@ -1,6 +1,6 @@
 # AGENTS.md — dex
 
-Terminal coding agent in Rust (`dex`): OpenAI-compatible Chat Completions / Responses, tool use (`read`/`bash`/`write`/`edit`/`grep`/`find`), ratatui TUI, client↔daemon over HTTP+SSE, JSONL sessions.
+Terminal coding agent in Rust (`dex`): OpenAI-compatible Chat Completions / Responses, tool use (`read`/`bash`/`write`/`edit`/`grep`/`find`/`ls`), ratatui TUI, client↔daemon over HTTP+SSE, JSONL sessions.
 
 ## Build & check
 
