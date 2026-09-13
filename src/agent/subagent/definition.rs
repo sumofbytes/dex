@@ -24,7 +24,9 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "find"];
 /// Alias frontmatter entries → canonical registry names. `ToolFilter::allows`
 /// matches exactly and the schema exposes only canonical names, so an alias
 /// left in an allowlist would deny every call. Pre-rename user files keep
-/// parsing; they canonicalize here.
+/// parsing; they canonicalize here. If `KNOWN_TOOLS` ever drops the legacy
+/// names, the unknown-tool check runs before this mapping — keep both in
+/// sync or old definitions start failing validation.
 fn canonical_tool(entry: &str) -> &str {
     match entry {
         "ffgrep" => "grep",
