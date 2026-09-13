@@ -276,6 +276,20 @@ pub enum StreamEvent {
     /// V1a lifecycle line uses ("completed"/"failed"/"cancelled"/"timed out").
     #[serde(rename = "agent_completed")]
     AgentCompleted { agent_id: String, status: String },
+
+    /// A recoverable child was automatically re-entered (§24.4): the
+    /// supervisor's `Recover` action fires this beside the superseded
+    /// generation's `agent_completed` and the new one's `agent_spawned`.
+    /// An explicit wire bump like V1b — old clients skip it and still
+    /// advance their seq cursor.
+    #[serde(rename = "agent_recovered")]
+    AgentRecovered {
+        agent_id: String,
+        name: String,
+        attempt: u32,
+        mode: String,
+        reason: String,
+    },
 }
 
 /// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session
