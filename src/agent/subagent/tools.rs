@@ -34,7 +34,7 @@ use crate::tools::{Policy, ToolError, ToolFilter};
 
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
-use super::exit::{classify_body_error, ExitReason, ResumeHandle, ResumeRequest};
+use super::exit::{classify_body_error, ExitReason, RecoverMode, ResumeHandle, ResumeRequest};
 use super::instance::{AgentId, AgentState};
 use super::manager::{AgentManager, ChildFactory, ProgressReporter, WaitOutcome};
 use super::result::{AgentResult, AgentUsage};
@@ -208,6 +208,7 @@ async fn delegate(
         };
         let generation = handle.generation + 1;
         let resume = ResumeRequest {
+            mode: RecoverMode::Resume,
             handle: handle.clone(),
             instruction,
             file_hints,
@@ -224,10 +225,10 @@ async fn delegate(
                     // No auto-retry on a hand-steered generation: the
                     // model just took ownership of recovery, so a
                     // further death escalates back to it instead of
-                    // retrying behind its back. Factory-born lineages
-                    // keep recovering per spec below.
+                    // retrying behind its back.
                     retry: None,
                     lineage: handle.history.clone(),
+                    remaining_budget: handle.remaining_budget,
                 },
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
             )
@@ -272,6 +273,7 @@ async fn delegate(
                 // immediately — today's behavior).
                 retry: Some(child_factory(ctx.clone(), def.clone(), seed.clone())),
                 lineage: Vec::new(),
+                remaining_budget: None,
             },
             child_body(ctx.clone(), def.clone(), seed, None),
         )
@@ -350,6 +352,27 @@ async fn delegate_stop(
         })
         .to_string()),
     }
+}
+
+/// Assemble a resume generation's conversation (§24.3): the definition's
+/// system prompt first (re-derived — the transcript never journals it and
+/// the loader drops `Role::System` lines), the prior generation's
+/// messages verbatim, then the interruption nudge. Returns what the LLM
+/// sees and what the journal records; the journal mirrors the fresh path
+/// (no system line), so re-resuming a resumed generation re-derives the
+/// prompt again instead of duplicating it.
+fn resume_conversation(
+    def: &AgentDefinition,
+    replayed: Vec<ChatMessage>,
+    request: &ResumeRequest,
+) -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+    let mut in_memory = vec![ChatMessage::system(child_system_prompt(def))];
+    in_memory.extend(replayed);
+    let nudge = ChatMessage::user_named(resume_nudge(request), "resume");
+    in_memory.push(nudge.clone());
+    let journal = in_memory[1..].to_vec();
+    debug_assert!(!journal.is_empty());
+    (in_memory, journal)
 }
 
 /// The interruption nudge appended to a replayed transcript (§24.3):
@@ -440,7 +463,14 @@ async fn resolve_resume_handle(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.starts_with(&prefix) || !name.ends_with(".jsonl") {
+        // `resume_from` takes either the bare agent id (`sess-9`, what
+        // live and retained rows advertise) or what `delegate_list` prints
+        // for on-disk rows — the transcript file stem (`sess-9-explorer`,
+        // `sess-9-explorer.g2`), which has no live registry to translate
+        // it back.
+        let by_id = name.starts_with(&prefix);
+        let by_stem = name.strip_suffix(".jsonl") == Some(id.0.as_str());
+        if !by_id && !by_stem {
             continue;
         }
         if turn_state != "interrupted" {
@@ -697,8 +727,10 @@ async fn child_run(
     // Child JSONL (§16): its own file beside the parent's, same marker
     // discipline (`turn_start`/`turn_complete`/`turn_failed`), so a crash
     // loses at most the in-flight event. Resume generations append `.g<N>`
-    // (§24.3) so a resume never clobbers its parent. A disk failure fails
-    // the child, never the parent turn.
+    // (§24.3) so a resume never clobbers its parent — including `Fresh`
+    // recoveries, which re-enter through the same plumbing so the file
+    // they write is the file the registry points at. A disk failure
+    // fails the child, never the parent turn.
     let generation = resume
         .as_ref()
         .map(|request| request.handle.generation + 1)
@@ -727,9 +759,11 @@ async fn child_run(
     // and the first `append_message`, or an unreadable journal) is a
     // Permanent failure: a resume with no history would run the degenerate
     // seed task ("resume <id> generation N"), which is worse than failing
-    // loudly — the parent can re-delegate with a fresh task instead.
+    // loudly — the parent can re-delegate with a fresh task instead. A
+    // `Fresh` recovery rides the same request but replays nothing: same
+    // seed, full meter, generation-suffixed file the registry points at.
     let mut messages: Vec<ChatMessage> = match &resume {
-        Some(request) => {
+        Some(request) if request.mode == RecoverMode::Resume => {
             let messages = match resume_messages(&def, request) {
                 Ok(messages) => messages,
                 Err(error) => {
@@ -754,7 +788,7 @@ async fn child_run(
             }
             messages
         }
-        None => {
+        _ => {
             let user_message = ChatMessage::user(seed_task_text(&seed));
             let _ = session.turn_event("turn_start");
             let _ = session.append_message(&user_message);
@@ -1126,6 +1160,7 @@ mod tests {
             .find(|def| def.name == "tester")
             .unwrap();
         let request = ResumeRequest {
+            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-2".to_string()),
                 transcript: Session::child_path(&parent_path, "sess-2", "tester", 0),
@@ -1197,6 +1232,7 @@ mod tests {
             .find(|def| def.name == "tester")
             .unwrap();
         let request = ResumeRequest {
+            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-3".to_string()),
                 transcript: Session::child_path(&parent_path, "sess-3", "tester", 0),
@@ -1217,6 +1253,7 @@ mod tests {
     #[test]
     fn resume_nudge_carries_reason_instruction_and_budget() {
         let request = ResumeRequest {
+            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-0".to_string()),
                 transcript: PathBuf::from("/tmp/x.jsonl"),
@@ -1235,6 +1272,7 @@ mod tests {
         assert!(nudge.contains("src/main.rs"), "{nudge}");
         assert!(nudge.contains("at most 5 further tool calls"), "{nudge}");
         let spent = ResumeRequest {
+            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 remaining_budget: Some(0),
                 ..request.handle.clone()
@@ -1247,6 +1285,58 @@ mod tests {
             "{}",
             resume_nudge(&spent)
         );
+    }
+
+    #[test]
+    fn resume_conversation_prepends_system_prompt_and_journals_without_it() {
+        // The transcript never journals the system prompt and the loader
+        // drops `Role::System` lines — the resume must re-derive it, or
+        // the generation runs with no persona and no tool rules.
+        let def = super::super::builtin_definitions()
+            .into_iter()
+            .next()
+            .unwrap();
+        let replayed = vec![
+            ChatMessage::user("do the thing"),
+            ChatMessage::assistant("on it"),
+        ];
+        let request = ResumeRequest {
+            mode: RecoverMode::Resume,
+            handle: ResumeHandle {
+                agent_id: AgentId("sess-0".to_string()),
+                transcript: PathBuf::from("/tmp/x.jsonl"),
+                generation: 0,
+                remaining_budget: Some(5),
+                note: "timed out".to_string(),
+                history: Vec::new(),
+            },
+            instruction: Some("skip the build".to_string()),
+            file_hints: Vec::new(),
+        };
+        let (in_memory, journal) = resume_conversation(&def, replayed, &request);
+        assert_eq!(in_memory.len(), 4);
+        assert_eq!(in_memory[0].role, crate::core::types::Role::System);
+        assert!(!in_memory[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+        assert_eq!(in_memory[1].content.as_deref(), Some("do the thing"));
+        assert_eq!(in_memory[2].content.as_deref(), Some("on it"));
+        assert_eq!(in_memory[3].name.as_deref(), Some("resume"));
+        assert!(
+            in_memory[3]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("skip the build"),
+            "{}",
+            in_memory[3].content.as_deref().unwrap_or_default()
+        );
+        // The journal mirrors the fresh path: no system line, nudge last.
+        assert_eq!(journal.len(), 3);
+        assert_ne!(journal[0].role, crate::core::types::Role::System);
+        assert_eq!(journal[2].name.as_deref(), Some("resume"));
     }
 
     fn resume_test_ctx(manager: AgentManager, session_path: PathBuf) -> Arc<AgentTurnContext> {
@@ -1393,6 +1483,17 @@ mod tests {
         assert_eq!(handle.remaining_budget, None);
         assert!(handle.transcript.ends_with("agents/sess-4-explorer.jsonl"));
         let handle = resolve_resume_handle(&ctx, &AgentId("sess-5".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.generation, 2);
+        // `delegate_list` prints on-disk rows under their transcript stem;
+        // the advertised id must round-trip back into a handle.
+        let handle = resolve_resume_handle(&ctx, &AgentId("sess-4-explorer".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(handle.generation, 0);
+        assert!(handle.transcript.ends_with("agents/sess-4-explorer.jsonl"));
+        let handle = resolve_resume_handle(&ctx, &AgentId("sess-5-tester.g2".to_string()))
             .await
             .unwrap();
         assert_eq!(handle.generation, 2);
