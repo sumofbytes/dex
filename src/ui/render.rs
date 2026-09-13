@@ -873,10 +873,10 @@ struct TranscriptView;
 /// time, keeping `wrap_line_display`'s indent logic intact); each wrapped
 /// row is painted and padded out to the full width, with blank band rows
 /// above and below the content.
-fn paint_user_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'static> {
-    for span in &mut row.spans {
-        span.style.bg = Some(bg);
-    }
+fn paint_surface_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'static> {
+    // `Line` renders each span as `line.style.patch(span.style)`, so one
+    // line-level bg covers every span that doesn't set its own — no need to
+    // stomp span styles (which would clobber future span-level bgs).
     row.style.bg = Some(bg);
     let w = row.width();
     if w < width {
@@ -886,7 +886,7 @@ fn paint_user_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'stat
     row
 }
 
-fn user_pad_row(width: usize, bg: Color) -> Line<'static> {
+fn surface_pad_row(width: usize, bg: Color) -> Line<'static> {
     let style = Style::default().bg(bg);
     let mut pad = Line::from(Span::styled(" ".repeat(width), style));
     pad.style = style;
@@ -906,13 +906,29 @@ fn wrap_block(
             let mut rows: Vec<Line<'static>> = lines
                 .iter()
                 .flat_map(|l| wrap_line_display(l, width))
-                .map(|r| paint_user_row(r, w, bg))
+                .map(|r| paint_surface_row(r, w, bg))
                 .collect();
             let pad_n = super::INPUT_PAD_Y as usize;
             for _ in 0..pad_n {
-                rows.insert(0, user_pad_row(w, bg));
-                rows.push(user_pad_row(w, bg));
+                rows.insert(0, surface_pad_row(w, bg));
+                rows.push(surface_pad_row(w, bg));
             }
+            rows
+        }
+        super::TranscriptBlock::Tool { .. } => {
+            // Reversed from the old gap-band look: each tool step carries
+            // the contrast band itself, gaps stay terminal bg. One air row
+            // top/bottom inside the band so text clears the band edge.
+            let bg = theme::surface_bg();
+            let w = width.max(1) as usize;
+            let mut rows: Vec<Line<'static>> = block
+                .lines()
+                .into_iter()
+                .flat_map(|l| wrap_line_display(l, width))
+                .map(|r| paint_surface_row(r, w, bg))
+                .collect();
+            rows.insert(0, surface_pad_row(w, bg));
+            rows.push(surface_pad_row(w, bg));
             rows
         }
         super::TranscriptBlock::Thinking { text, elapsed, .. } => {
@@ -991,6 +1007,8 @@ impl TranscriptView {
         if changed {
             // Re-concatenate the already-wrapped rows (no re-wrapping); this
             // runs only on content or width changes, never for scroll.
+            // Tool steps carry the `surface_bg()` band themselves, so every
+            // gap between blocks stays blank terminal bg.
             let mut display: Vec<Line<'static>> = Vec::new();
             for (idx, wb) in app.wrapped_cache.iter().enumerate() {
                 if idx > 0 && !wb.rows.is_empty() {
@@ -3281,8 +3299,14 @@ mod tests {
                     w as usize,
                     "user band row must fill the full width like the composer at w {w}: {s:?}"
                 );
+                // Line-level bg is the band carrier (`Line` renders each
+                // span as `line.style.patch(span.style)`); spans either
+                // inherit it (`None`) or carry it explicitly (trailing
+                // fill). Either way the rendered row must be all-`bg`.
                 assert!(
-                    row.spans.iter().all(|sp| sp.style.bg == Some(bg)),
+                    row.spans
+                        .iter()
+                        .all(|sp| sp.style.bg.is_none() || sp.style.bg == Some(bg)),
                     "user band row must carry the composer background at w {w}: {s:?}"
                 );
                 assert_eq!(row.style.bg, Some(bg), "user band line bg at w {w}");
@@ -3327,6 +3351,21 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal.draw(|f| view(f, &mut app)).unwrap();
             assert_eq!(terminal.backend().buffer().area.width, w);
+            // Rendered contract: every cell of the band paints `bg`,
+            // whatever the struct-level split between line and span style.
+            let band_backend = TestBackend::new(w, rows.len() as u16);
+            let mut band_terminal = ratatui::Terminal::new(band_backend).unwrap();
+            band_terminal
+                .draw(|f| {
+                    f.render_widget(Paragraph::new(rows.clone()), f.area());
+                })
+                .unwrap();
+            for cell in band_terminal.backend().buffer().content.iter() {
+                assert_eq!(
+                    cell.bg, bg,
+                    "band cell must paint the composer background at w {w}: {cell:?}"
+                );
+            }
         }
     }
 
@@ -3539,10 +3578,10 @@ mod tests {
         let text_row = row_of("can you check pillar").expect("prompt text rendered");
         let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
         // Composer echo: content row, one band-air row, the inter-block gap
-        // row, then the tool block.
+        // row, the tool band's own top-air row, then the tool content.
         assert_eq!(
             tool_row,
-            text_row + 3,
+            text_row + 4,
             "a phantom row from Paragraph::wrap shifts the tool block down"
         );
         // On the shared transcript margin — the prompt row starts one gutter
@@ -3589,6 +3628,27 @@ mod tests {
             gap.trim().is_empty(),
             "inter-block gap after the band must be blank: {gap:?}"
         );
+        // The tool band carries its own top-air row: blank, but wearing the
+        // band background so the content clears the band edge.
+        let tool_air: String = (0..area.width)
+            .map(|x| buffer.cell((x, tool_row - 1)).unwrap().symbol())
+            .collect();
+        assert!(
+            tool_air.trim().is_empty(),
+            "tool band air above the content must be blank: {tool_air:?}"
+        );
+        for x in 0..area.width {
+            assert_eq!(
+                buffer.cell((x, tool_row - 1)).unwrap().bg,
+                bg,
+                "tool band air must wear the band background"
+            );
+            assert_eq!(
+                buffer.cell((x, text_row + 2)).unwrap().bg,
+                ratatui::style::Color::Reset,
+                "inter-block gap must stay terminal background"
+            );
+        }
     }
 
     #[test]

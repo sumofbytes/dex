@@ -3,9 +3,10 @@
 //! Fixed palette slots bypass the terminal's theme (the 256-color gray ramp
 //! is never remapped), so neutral grays clash with tinted backgrounds. Surface
 //! colors here are instead derived from the terminal's real background and
-//! foreground colors, queried once at startup (OSC 11): a surface is the
-//! background blended a step toward the foreground, so it keeps the theme's
-//! hue and always contrasts with text on it.
+//! foreground colors, queried once at startup (OSC 11): raised surfaces
+//! (popups) blend the background a step toward the foreground, while the
+//! composer/transcript band (`surface_bg`) shades it a step darker, so both
+//! keep the theme's hue and always contrast with text on them.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -37,12 +38,37 @@ fn raised(amount: f32) -> Color {
     }
 }
 
-/// BG for overlays: a "raised" surface.
+/// Minimum per-channel drop the darkened band must show against the raw
+/// background before it reads as visible; less is indistinguishable.
+const MIN_BAND_STEP: u8 = 8;
+
+/// BG for the composer band: the terminal's actual background shaded a
+/// step darker, so the input reads as a subtle inset strip rather than a
+/// raised card. Scaling toward black keeps the theme's hue (tinted themes
+/// stay tinted). Backgrounds that can't drop visibly — near-black,
+/// mid-gray, or already-deep dark themes — fall back to a slight raise
+/// toward the foreground so the band still reads as distinct.
 pub(crate) fn surface_bg() -> Color {
-    match background() {
-        Background::Dark => raised(0.05),
-        Background::Light => raised(0.03),
-        Background::Unknown => Color::Reset,
+    match term_palette() {
+        Some(p) => {
+            let amount = if p.dark { 0.15 } else { 0.05 };
+            let (r, g, b) = blend(p.background, (0, 0, 0), amount);
+            // Blending toward black only shrinks channels, so original
+            // minus blend is the per-channel drop; take the largest.
+            let (orig_r, orig_g, orig_b) = p.background;
+            let step = orig_r
+                .saturating_sub(r)
+                .max(orig_g.saturating_sub(g))
+                .max(orig_b.saturating_sub(b));
+            if step >= MIN_BAND_STEP {
+                Color::Rgb(r, g, b)
+            } else {
+                raised(0.075)
+            }
+        }
+        // No theme information at all: leave the background untouched so the
+        // surface always blends with whatever the terminal paints.
+        None => Color::Reset,
     }
 }
 
