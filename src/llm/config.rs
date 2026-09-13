@@ -84,6 +84,61 @@ fn cached_parse<T: Clone>(
     Some(value)
 }
 
+/// One resolved knob: the value that `from_env` applies and the origin
+/// that `doctor` reports. Both sides consume the same resolution, so the
+/// precedence rule exists once and `doctor` cannot drift from runtime
+/// routing.
+struct Resolved<T> {
+    value: T,
+    origin: &'static str,
+}
+
+/// The single selection knob — `--model` > `DEX_MODEL` > file `model:` >
+/// builtin default. The flag is pre-filtered by the caller: `from_env`
+/// keeps an empty `--model` as a literal selection (historical behavior),
+/// `doctor` treats it as unset.
+fn resolve_selection(flag: Option<String>, file: &Option<serde_yaml::Value>) -> Resolved<String> {
+    let dex_model = env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty());
+    let file_model = load_config_str(file, "model");
+    let value = flag
+        .clone()
+        .or(dex_model.clone())
+        .or(file_model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let origin = if flag.is_some() {
+        "--model"
+    } else if dex_model.is_some() {
+        "DEX_MODEL"
+    } else if file_model.is_some() {
+        "config model:"
+    } else {
+        "built-in default"
+    };
+    Resolved { value, origin }
+}
+
+/// Provider fallback when the selection carries no prefix: `DEX_PROVIDER`
+/// (deprecated) > file `active_provider:` (deprecated) > "opencode".
+/// Returns doctor's origin wording alongside the name; `from_env` ignores
+/// it. The `warn_once` fires here (deduped) so both entry points warn.
+fn provider_fallback_with_origin(
+    file: &Option<serde_yaml::Value>,
+) -> (String, Option<&'static str>) {
+    if let Ok(name) = env::var("DEX_PROVIDER") {
+        if !name.trim().is_empty() {
+            warn_once(
+                "env:DEX_PROVIDER",
+                "env var DEX_PROVIDER is deprecated — use DEX_MODEL=<provider>/<model> (e.g. DEX_MODEL=openai-codex)",
+            );
+            return (name, Some("DEX_PROVIDER (deprecated)"));
+        }
+    }
+    match load_provider_name(file) {
+        Some(name) => (name, Some("config active_provider: (deprecated)")),
+        None => ("opencode".to_string(), Some("built-in default")),
+    }
+}
+
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
 /// > `~/.config/dex/config.yaml`.
 fn config_file_path() -> Option<std::path::PathBuf> {
@@ -332,21 +387,6 @@ fn split_selection(selection: &str, known: &BTreeSet<String>) -> (Option<String>
         ),
         _ => (None, selection.to_string()),
     }
-}
-
-/// Provider fallback when the model selection names none: `DEX_PROVIDER`
-/// (deprecated) > `active_provider:` (deprecated) > builtin default.
-fn env_provider_fallback(file: &Option<serde_yaml::Value>) -> String {
-    if let Ok(name) = env::var("DEX_PROVIDER") {
-        if !name.trim().is_empty() {
-            warn_once(
-                "env:DEX_PROVIDER",
-                "env var DEX_PROVIDER is deprecated — use DEX_MODEL=<provider>/<model> (e.g. DEX_MODEL=openai-codex)",
-            );
-            return name;
-        }
-    }
-    load_provider_name(file).unwrap_or_else(|| "opencode".to_string())
 }
 
 /// Catalog `api` URL for a provider key ("zai" → its serving endpoint).
@@ -1669,14 +1709,11 @@ impl LlmConfig {
         // `--model` > `DEX_MODEL` > file `model:` > builtin default. When
         // the selection carries no provider, `DEX_PROVIDER` /
         // `active_provider:` (both deprecated) still pick one.
-        let selection = model_override
-            .or_else(|| env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty()))
-            .or_else(|| load_config_str(&file, "model"))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let selection = resolve_selection(model_override, &file).value;
         let (selection_provider, mut model) = split_selection(&selection, &known);
         let provider_name = match selection_provider.as_deref() {
             Some(name) => name.to_string(),
-            None => env_provider_fallback(&file),
+            None => provider_fallback_with_origin(&file).0,
         };
         let provider = Provider::parse_known(&provider_name, &known).ok_or_else(|| {
             format!(
@@ -2246,37 +2283,17 @@ pub(crate) fn doctor(
     // `--model` > `DEX_MODEL` > file `model:` > builtin default.
     let flag_model = model_override.clone().filter(|m| !m.trim().is_empty());
     let flag_base_url = base_url_override.clone().filter(|u| !u.trim().is_empty());
-    let dex_model = env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty());
-    let file_model = load_config_str(&file, "model");
-    let selection = flag_model
-        .clone()
-        .or(dex_model.clone())
-        .or(file_model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let selection_source = if flag_model.is_some() {
-        "--model"
-    } else if dex_model.is_some() {
-        "DEX_MODEL"
-    } else if file_model.is_some() {
-        "config model:"
-    } else {
-        "built-in default"
-    };
+    let selection_resolved = resolve_selection(flag_model.clone(), &file);
+    let selection = selection_resolved.value;
+    let selection_source = selection_resolved.origin;
     let (selection_provider, pre_model) = split_selection(&selection, &known);
-    let file_provider = load_provider_name(&file);
-    let env_provider = env::var("DEX_PROVIDER")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let provider_name = selection_provider
-        .clone()
-        .or(env_provider.clone())
-        .or(file_provider.clone())
-        .unwrap_or_else(|| "opencode".to_string());
+    // Provider fallback shares `from_env`'s chain (and its deprecation
+    // warning, deduped) so the origin row cannot drift from routing.
+    let (fallback_provider, fallback_origin) = provider_fallback_with_origin(&file);
+    let provider_name = selection_provider.clone().unwrap_or(fallback_provider);
     let provider_source = match selection_provider {
         Some(_) => format!("{selection_source} prefix"),
-        None if env_provider.is_some() => "DEX_PROVIDER (deprecated)".to_string(),
-        None if file_provider.is_some() => "config active_provider: (deprecated)".to_string(),
-        None => "built-in default".to_string(),
+        None => fallback_origin.unwrap_or("built-in default").to_string(),
     };
     // The real build, once: rows below take values from it so `doctor`
     // agrees with runtime routing (catalog endpoint moves, prefix
@@ -4864,5 +4881,68 @@ pub(crate) mod tests {
             11 + 46,
             "origin starts at display column 57: {line:?}"
         );
+    }
+
+    /// Byte-for-byte `doctor` output under a fully hermetic scenario: no
+    /// config file, no catalog caches, no dex env vars, one provider key.
+    /// This is the PR-18 motion gate — any refactor of the shared
+    /// resolution must reproduce this output exactly. Fixed paths (no pid)
+    /// keep the snapshot stable across runs and machines.
+    #[test]
+    fn doctor_output_is_byte_stable() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "DEX_MODELS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_RESERVE_TOKENS",
+            "DEX_KEEP_RECENT_TOKENS",
+            "DEX_THINKING_EFFORT",
+            "DEX_PERMISSION",
+            "DEX_HEADERS",
+            "DEX_ONLINE_COMPACTION",
+            "DEX_OBSERVATION_PACK",
+            "DEX_EVIDENCE_REDUCER",
+            "DEX_REDUCER_MODEL",
+            "DEX_AGENT_WAKE",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "OPENAI_HEADERS",
+            "OPENCODE_API_KEY",
+        ]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
+        std::env::set_var("XDG_DATA_HOME", "/tmp/dex-doctor-snapshot/data");
+        let out = doctor(None, None, None, &[]);
+        let expected = concat!(
+            "dex 0.6.0\n",
+            "\n",
+            "config     /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
+            "catalog    /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
+            "                                                         missing — run `dex update --models`\n",
+            "\n",
+            "provider   opencode                                      built-in default\n",
+            "model      gpt-5.6-luna                                  built-in default\n",
+            "base_url   https://opencode.ai/zen/v1                    built-in default\n",
+            "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
+            "protocol   openai-responses                              default (auto-fallback to completions)\n",
+            "context    128000 tokens                                 built-in default\n",
+            "obs pack   off                                           built-in default (off)\n",
+            "thinking   (unset)                                       model default\n",
+            "permission trusted                                       built-in default\n",
+            "agent wake on                                            built-in default\n",
+            "headers    0                                             none\n",
+            "endpoints  go, zen                                       available to /model routing\n",
+            "\n",
+            "resolve    OK                                            config builds cleanly\n",
+        );
+        assert_eq!(out, expected, "doctor output drifted");
     }
 }
