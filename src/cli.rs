@@ -13,6 +13,8 @@ pub(crate) struct Args {
     pub new_session: bool,
     pub session_name: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
+    /// Extra extension search dirs (`--extensions-dir`, repeatable).
+    pub extension_dirs: Vec<PathBuf>,
     pub permission: Option<PermissionMode>,
     /// Extra HTTP headers for provider requests (`--header "X-Foo: bar"`,
     /// repeatable). Same `Name: Value` / `Name=Value` / JSON-object syntax as
@@ -58,6 +60,14 @@ pub(crate) enum Mode {
         /// Server name for `login`/`logout`.
         server: Option<String>,
     },
+    /// Lua extensions (`dex extensions [list|enable <id>|disable <id>|
+    /// install <dir>|remove <id>]`).
+    Extensions {
+        /// Subcommand (`list` when omitted).
+        action: String,
+        /// Extension id (enable/disable/remove) or source dir (install).
+        name: Option<String>,
+    },
     /// Plot per-call token usage from a session (`dex usage <id|path>`).
     Usage {
         /// Session id or session/events file path.
@@ -73,6 +83,7 @@ pub(crate) fn parse_args() -> Args {
     let mut new_session = false;
     let mut session_name = None;
     let mut skill_dirs = Vec::new();
+    let mut extension_dirs = Vec::new();
     let mut permission = None;
     let mut headers = Vec::new();
     let mut reattach = None;
@@ -107,6 +118,9 @@ pub(crate) fn parse_args() -> Args {
                 );
             }
             "--skill" => skill_dirs.push(PathBuf::from(required(&mut input, "--skill"))),
+            "--extensions-dir" => {
+                extension_dirs.push(PathBuf::from(required(&mut input, "--extensions-dir")));
+            }
             "--header" | "-H" => headers.push(required(&mut input, "--header")),
             _ => rest.push(arg),
         }
@@ -119,6 +133,7 @@ pub(crate) fn parse_args() -> Args {
         new_session,
         session_name,
         skill_dirs,
+        extension_dirs,
         permission,
         headers,
         reattach,
@@ -142,6 +157,14 @@ pub(crate) fn resolve_mode(args: &Args) -> Mode {
             Mode::Update { models, all }
         }
         Some("doctor") => Mode::Doctor,
+        Some("extensions") => Mode::Extensions {
+            action: args
+                .rest
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "list".to_string()),
+            name: args.rest.get(2).cloned(),
+        },
         Some("serve") => {
             let bind = args
                 .rest
@@ -317,6 +340,7 @@ mod tests {
             new_session: false,
             session_name: None,
             skill_dirs: Vec::new(),
+            extension_dirs: Vec::new(),
             permission: None,
             headers: Vec::new(),
             reattach: None,
