@@ -1052,6 +1052,11 @@ fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
+                if !entry.is_object() {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "edits[{index}] must be an object with oldText and newText"
+                    )));
+                }
                 let old = entry
                     .get("oldText")
                     .and_then(Value::as_str)
@@ -1064,7 +1069,9 @@ fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
                     .ok_or_else(|| {
                         ToolError::InvalidArgument(format!("edits[{index}] is missing newText"))
                     })?;
-                check_edit_texts(old, new)?;
+                check_edit_texts(old, new).map_err(|error| {
+                    ToolError::InvalidArgument(format!("edits[{index}]: {error}"))
+                })?;
                 Ok((old.to_string(), new.to_string()))
             })
             .collect();
@@ -1223,7 +1230,12 @@ fn apply_edit_batch(
             .map(|replacement| replacement.span.clone())
             .collect::<Vec<_>>()
             .join("; ");
-        format!(" ({} edits: {spans})", ops.len())
+        let suffix = if pending.len() == ops.len() {
+            String::new()
+        } else {
+            format!(", {} sites", pending.len())
+        };
+        format!(" ({} edits{suffix}: {spans})", ops.len())
     };
     Ok((updated, note))
 }
@@ -2722,6 +2734,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_batch_note_counts_fan_out_sites() {
+        // replaceAll inside a batch: the note must not claim "2 edits" while
+        // listing three spans — the site count is stated separately.
+        let content = "a\nb\nb\n";
+        let ops = vec![
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string()),
+        ];
+        let (updated, note) = apply_edit_batch(content, &ops, true).unwrap();
+        assert_eq!(updated, "A\nB\nB\n", "{updated:?}");
+        assert!(note.contains("2 edits, 3 sites"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn edit_batch_rejects_non_object_entries_by_name() {
+        // `edits: ["foo"]` used to report "missing oldText"; name the actual
+        // shape problem so the model can self-correct.
+        let mut args = Map::new();
+        args.insert(
+            "edits".into(),
+            Value::Array(vec![Value::String("foo".into())]),
+        );
+        let error = parse_edit_ops(&args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("edits[0] must be an object with oldText and newText"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_batch_noop_error_names_the_entry() {
+        let mut args = Map::new();
+        args.insert(
+            "edits".into(),
+            Value::Array(vec![
+                serde_json::json!({"oldText": "a", "newText": "A"}),
+                serde_json::json!({"oldText": "same", "newText": "same"}),
+            ]),
+        );
+        let error = parse_edit_ops(&args).unwrap_err();
+        assert!(
+            error.to_string().contains("edits[1]") && error.to_string().contains("identical"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn edit_batch_rejects_overlapping_entries() {
         let content = "one\ntwo\nthree\n";
         let ops = vec![
@@ -3082,6 +3143,16 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             .join(format!("dex-chain-fx-{}", std::process::id()));
+        // A previous run that panicked mid-assert leaked its fixture dir
+        // (cleanup below only runs on the happy path); sweep those first.
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("dex-chain-fx-") {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.rs"), format!("{needle} in one\n")).unwrap();
         fs::write(root.join("two.rs"), "nothing here\n").unwrap();
