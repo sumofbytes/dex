@@ -856,6 +856,7 @@ where
     // gated exactly like a model-issued one.
     let turn_policy = Policy::turn(rt.config.permission, rt.console);
     let cancel = rt.cancel.clone();
+    let filter = rt.filter;
     crate::extensions::fire_event_global(
         "turn.start",
         serde_json::json!({}),
@@ -869,7 +870,7 @@ where
         Ok(_) => serde_json::json!({ "ok": true }),
         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
     };
-    crate::extensions::fire_event_global("turn.end", payload, &cancel, &turn_policy, None).await;
+    crate::extensions::fire_event_global("turn.end", payload, &cancel, &turn_policy, filter).await;
     result
 }
 
@@ -1292,6 +1293,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn turn_lifecycle_hooks_fire_around_the_turn() {
         let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
         // Workspace-confined: the hook writes a relative path in the test
         // process's cwd (the crate root).
         let marker = std::path::PathBuf::from(format!(
@@ -1337,6 +1341,10 @@ pub(crate) mod tests {
         );
         std::fs::remove_file(&marker).ok();
         std::fs::remove_dir_all(&root).ok();
+        // Drop the fixture: the process-global manager would otherwise keep
+        // the turn.end hook writing a marker file on every later turn in
+        // this test process.
+        crate::extensions::global_manager().reset_for_tests().await;
     }
 
     #[tokio::test]

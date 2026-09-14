@@ -1111,6 +1111,11 @@ mod tests {
         // process_turn tests (their emergency compactions would see this
         // hook otherwise).
         let _turn_lock = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        // Same lock the extensions tests use: two concurrent global-manager
+        // fixtures would unload each other via `reset_for_tests`.
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
         let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
         std::env::remove_var("DEX_COMPACTION_LLM");
         let config = crate::llm::config::tests::test_cfg();
@@ -1129,6 +1134,7 @@ mod tests {
         crate::extensions::global_manager()
             .refresh_with(std::slice::from_ref(&root))
             .await;
+        std::fs::remove_dir_all(&root).ok();
         let err = compact_history(
             &config,
             &mut messages.clone(),
@@ -1154,6 +1160,11 @@ mod tests {
             .find(|m| m.name.as_deref() == Some("summary"))
             .unwrap();
         assert_eq!(summary.content.as_deref(), Some("HOOK CHECKPOINT"));
+        // Drop the fixture before the lock releases: the process-global
+        // manager would otherwise keep the `session.before_compact` hook
+        // (its `ev.messages == 42` cancel matches unrelated tests' 42-message
+        // histories) loaded for every later compaction in this process.
+        crate::extensions::global_manager().reset_for_tests().await;
     }
 
     /// Emergency compaction must be able to cut below the comfort floor:

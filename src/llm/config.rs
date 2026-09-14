@@ -2691,34 +2691,25 @@ pub(crate) fn doctor(
         }
     }
     // Extra dirs from config/env (origin per the precedence rules).
-    if std::env::var("DEX_EXTENSIONS_PATHS")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-    {
+    let ext_paths = crate::extensions::config_extension_paths();
+    if !ext_paths.is_empty() {
+        let origin = if std::env::var("DEX_EXTENSIONS_PATHS")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            "DEX_EXTENSIONS_PATHS (environment)"
+        } else {
+            "extensions.paths (config)"
+        };
         row(
             &mut out,
             "ext paths",
-            &crate::extensions::config_extension_paths()
+            &ext_paths
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            "DEX_EXTENSIONS_PATHS (environment)",
-        );
-    } else if !crate::extensions::parse_config_paths(
-        &crate::llm::config::config_file_value().unwrap_or_default(),
-    )
-    .is_empty()
-    {
-        row(
-            &mut out,
-            "ext paths",
-            &crate::extensions::config_extension_paths()
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            "extensions.paths (config)",
+            origin,
         );
     }
     out.push('\n');
@@ -5068,6 +5059,13 @@ pub(crate) mod tests {
             "DEX_EXTENSIONS_PATHS",
         ]);
         std::env::remove_var("DEX_EXTENSIONS_PATHS");
+        // `EnvRestore::take` saves-and-restores; the toggles that flip doctor
+        // rows must be cleared outright, so a developer shell with
+        // DEX_ONLINE_COMPACTION=1 etc. does not drift the byte-stable output.
+        std::env::remove_var("DEX_ONLINE_COMPACTION");
+        std::env::remove_var("DEX_OBSERVATION_PACK");
+        std::env::remove_var("DEX_EVIDENCE_REDUCER");
+        std::env::remove_var("DEX_REDUCER_MODEL");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
