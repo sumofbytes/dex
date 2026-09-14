@@ -62,19 +62,22 @@ pub(crate) fn parse_before(envelope: &Map<String, Json>) -> Result<BeforeDirecti
 }
 
 /// Read one extension's `tool.after` envelope: optional `content` rewrite
-/// and `is_error` flip. Absent keys keep the host result.
+/// and error escalation. Absent keys keep the host result.
 pub(crate) fn parse_after(envelope: &Map<String, Json>, text: &str, ok: bool) -> (String, bool) {
     let content = envelope
         .get("content")
         .and_then(|c| c.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| text.to_string());
-    // is_error=true means the result IS an error, so ok=false.
-    let ok = envelope
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .map(|is_error| !is_error)
-        .unwrap_or(ok);
+    // A hook may flag a result as an error (escalate), never clear one:
+    // `is_error=false` on a failed result is ignored — an extension must not
+    // be able to rewrite a host-reported failure into a success the model
+    // would trust.
+    let ok = if envelope.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+        false
+    } else {
+        ok
+    };
     (content, ok)
 }
 
@@ -126,6 +129,12 @@ mod tests {
         assert_eq!(
             parse_after(env.as_object().unwrap(), "old", true),
             ("old".to_string(), true)
+        );
+        // Escalation only: a hook cannot clear a host-reported failure.
+        let env = json!({"is_error": false});
+        assert_eq!(
+            parse_after(env.as_object().unwrap(), "old", false),
+            ("old".to_string(), false)
         );
     }
 

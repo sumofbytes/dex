@@ -16,13 +16,55 @@ pub(crate) use engine::{CallKind, ExtensionEngine, HostCtx, ShadowCtx, HOOK_TIME
 pub(crate) const HOOK_TIMEOUT_SECS_DURATION: std::time::Duration =
     std::time::Duration::from_secs(HOOK_TIMEOUT_SECS);
 pub(crate) use hooks::{AfterOutcome, BeforeOutcome, CompactAction};
-pub(crate) use manifest::{parse_manifest, Manifest};
+pub(crate) use manifest::Manifest;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::core::types::{FunctionDef, ToolDefinition};
+
+/// Walk the discovery dirs and collect consent-passing (dir, manifest)
+/// pairs. Pure disk read — the load/reload paths share it.
+fn discover_scoped() -> Vec<(PathBuf, Manifest)> {
+    let mut found: Vec<(PathBuf, Manifest)> = Vec::new();
+    for (dir, scope) in scoped_extension_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let ext_dir = entry.path();
+            if !ext_dir.is_dir() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(ext_dir.join("manifest.yaml")) else {
+                continue;
+            };
+            let Ok(m) = manifest::parse_manifest(&text) else {
+                continue;
+            };
+            match scope {
+                Scope::Project if !is_enabled(&m.id) => {
+                    eprintln!(
+                        "dex: [extensions] skip {}: project extension not enabled (run `dex extensions enable {}`)",
+                        ext_dir.display(),
+                        m.id
+                    );
+                    continue;
+                }
+                Scope::User if is_disabled(&m.id) => {
+                    eprintln!("dex: [extensions] skip {}: disabled", ext_dir.display());
+                    continue;
+                }
+                _ => {}
+            }
+            found.push((ext_dir, m));
+        }
+    }
+    found
+}
 
 /// Extra extension dirs from `--extensions-dir` (mirrors `--skill-dir`).
 /// Set once from CLI args before the manager initializes; the daemon reads
@@ -83,9 +125,18 @@ pub(crate) fn scoped_extension_dirs() -> Vec<(PathBuf, Scope)> {
     if let Some(extra) = EXTRA_DIRS.get() {
         dirs.extend(extra.iter().cloned().map(|d| (d, Scope::User)));
     }
-    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    // Project scope first, then path: a duplicate id across scopes resolves
+    // project-first (the consent-gated one wins), not by path accident.
+    dirs.sort_by_key(|(path, scope)| (scope_rank(*scope), path.clone()));
     dirs.dedup_by(|a, b| a.0 == b.0);
     dirs
+}
+
+fn scope_rank(scope: Scope) -> u8 {
+    match scope {
+        Scope::Project => 0,
+        Scope::User => 1,
+    }
 }
 
 /// The user-scope install target: `$XDG_CONFIG_HOME/dex/extensions`.
@@ -134,6 +185,14 @@ pub(crate) fn is_enabled(id: &str) -> bool {
 /// `dex extensions enable|disable <id>`: write/remove the marker files.
 /// Enabling a project-scope extension IS the trust consent.
 pub(crate) fn set_enabled(id: &str, enabled: bool) -> std::io::Result<()> {
+    // CLI-supplied id: reject traversal/shapes that would escape the marker
+    // or data dirs (the manifest validator guarantees stored ids are safe).
+    if !manifest::valid_segment(id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars"),
+        ));
+    }
     let enabled_path = marker_path("enabled", id);
     let disabled_path = marker_path("disabled", id);
     if enabled {
@@ -304,46 +363,31 @@ impl ExtensionManager {
 
     /// Load from the default discovery dirs, honoring scope consent: a
     /// project-scope extension loads only when enabled (trust gate), a
-    /// user-scope one unless disabled.
+    /// user-scope one unless disabled. Add-only: never unloads (the
+    /// bootstrap/one-shot path — a fresh process has nothing stale, and a
+    /// racing background refresh must not wipe a concurrent loader).
     pub(crate) async fn refresh(&self) {
+        self.refresh_found(discover_scoped()).await;
+    }
+
+    /// Explicit reload (`/extensions reload`): like [`refresh`], plus the
+    /// reconcile — extensions that vanished from disk or lost consent
+    /// unload, so disable/remove takes effect in the running process
+    /// without a restart.
+    pub(crate) async fn reload(&self) {
+        let found = discover_scoped();
+        let discovered: HashSet<String> = found.iter().map(|(_, m)| m.id.clone()).collect();
+        self.refresh_found(found).await;
+        // Anything still loaded but not on disk/consented now unloads.
+        self.unload_missing(&discovered).await;
+        self.rebuild_cache().await;
+    }
+
+    /// The shared load core: discovery happens in the caller, the loop is
+    /// refresh-serialized, new ids load, the cache rebuilds.
+    async fn refresh_found(&self, found: Vec<(PathBuf, Manifest)>) {
         let _guard = self.refresh_lock.lock().await;
-        let dirs = scoped_extension_dirs();
-        let mut found: Vec<(PathBuf, Manifest)> = Vec::new();
-        for (dir, scope) in dirs {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            entries.sort_by_key(|e| e.file_name());
-            for entry in entries {
-                let ext_dir = entry.path();
-                if !ext_dir.is_dir() {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(ext_dir.join("manifest.yaml")) else {
-                    continue;
-                };
-                let Ok(m) = manifest::parse_manifest(&text) else {
-                    continue;
-                };
-                match scope {
-                    Scope::Project if !is_enabled(&m.id) => {
-                        eprintln!(
-                            "dex: [extensions] skip {}: project extension not enabled (run `dex extensions enable {}`)",
-                            ext_dir.display(),
-                            m.id
-                        );
-                        continue;
-                    }
-                    Scope::User if is_disabled(&m.id) => {
-                        eprintln!("dex: [extensions] skip {}: disabled", ext_dir.display());
-                        continue;
-                    }
-                    _ => {}
-                }
-                found.push((ext_dir, m));
-            }
-        }
+        let mut found = found;
         found.sort_by(|a, b| a.1.id.cmp(&b.1.id));
         for (dir, m) in found {
             if self.engines.read().await.contains_key(&m.id) {
@@ -354,6 +398,23 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+    }
+
+    /// Unload engines whose id is not in `keep`, dropping their prompt
+    /// appendix entries. The reload reconcile half of `refresh`.
+    async fn unload_missing(&self, keep: &HashSet<String>) {
+        let stale: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .keys()
+                .filter(|id| !keep.contains(*id))
+                .cloned()
+                .collect()
+        };
+        for id in &stale {
+            self.engines.write().await.remove(id);
+            remove_prompt_appendix(id);
+        }
     }
 
     async fn rebuild_cache(&self) {
@@ -730,6 +791,14 @@ pub(crate) fn push_prompt_appendix(ext_id: &str, text: String) {
     }
 }
 
+/// Drop one extension's appendix entry (unload on reload).
+pub(crate) fn remove_prompt_appendix(ext_id: &str) {
+    PROMPT_APPENDIX
+        .lock()
+        .expect("prompt appendix lock")
+        .retain(|(id, _)| id != ext_id);
+}
+
 /// The composed appendix for `system_prompt()`: each extension's text in
 /// load order, separated by blank lines.
 pub(crate) fn prompt_appendix() -> String {
@@ -1014,14 +1083,18 @@ fn state_file(ext_id: &str) -> PathBuf {
 /// One JSON file per extension, loaded lazily, written through on every
 /// mutation. Values are JSON — small state only (flags, counters), not
 /// documents.
+fn load_state_file(ext_id: &str) -> BTreeMap<String, serde_json::Value> {
+    std::fs::read_to_string(state_file(ext_id))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 fn with_state<R>(ext_id: &str, f: impl FnOnce(&mut BTreeMap<String, serde_json::Value>) -> R) -> R {
     let mut guard = STATE.lock().expect("state lock");
-    let map = guard.entry(ext_id.to_string()).or_insert_with(|| {
-        std::fs::read_to_string(state_file(ext_id))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
-    });
+    let map = guard
+        .entry(ext_id.to_string())
+        .or_insert_with(|| load_state_file(ext_id));
     let result = f(map);
     let _ = std::fs::create_dir_all(state_file(ext_id).parent().expect("parent"));
     let _ = std::fs::write(
@@ -1031,9 +1104,21 @@ fn with_state<R>(ext_id: &str, f: impl FnOnce(&mut BTreeMap<String, serde_json::
     result
 }
 
+/// Read-only variant: no file rewrite on a pure `get`.
+fn with_state_read<R>(
+    ext_id: &str,
+    f: impl FnOnce(&BTreeMap<String, serde_json::Value>) -> R,
+) -> R {
+    let mut guard = STATE.lock().expect("state lock");
+    let map = guard
+        .entry(ext_id.to_string())
+        .or_insert_with(|| load_state_file(ext_id));
+    f(map)
+}
+
 /// `dex.state.get(key)` — JSON value or nil.
 pub(crate) fn state_get(ext_id: &str, key: &str) -> Option<serde_json::Value> {
-    with_state(ext_id, |map| map.get(key).cloned())
+    with_state_read(ext_id, |map| map.get(key).cloned())
 }
 
 /// `dex.state.set(key, value)` — write-through to the extension's state file.
@@ -1106,6 +1191,13 @@ pub(crate) fn install(src: &str) -> Result<String, String> {
 /// `dex extensions remove <id>`: delete the extension directory wherever it
 /// was discovered (user or project scope — removing is always a user act).
 pub(crate) fn remove(id: &str) -> Result<(), String> {
+    // `dir.join(id)` below must never traverse: reject anything outside the
+    // same [a-z0-9_-]+ shape the manifest validator enforces.
+    if !manifest::valid_segment(id) {
+        return Err(format!(
+            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars"
+        ));
+    }
     for (dir, _) in scoped_extension_dirs() {
         let ext_dir = dir.join(id);
         if ext_dir.join("manifest.yaml").is_file() {
@@ -1121,6 +1213,15 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> 
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        // Symlinks are skipped: a cyclic one would recurse to stack
+        // overflow, and an escaping one would copy outside the extension.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            eprintln!(
+                "dex: [extensions] install: skipping symlink {}",
+                entry.path().display()
+            );
+            continue;
+        }
         let path = entry.path();
         let target = dst.join(entry.file_name());
         if path.is_dir() {
@@ -1195,6 +1296,67 @@ pub(crate) fn loaded_summaries() -> Vec<(String, String, Vec<String>, Vec<String
         .unwrap_or_default()
 }
 
+/// One-line summary for `dex extensions list` / `/extensions` (shared so
+/// the two surfaces never drift).
+pub(crate) fn summary_line(id: &str, version: &str, tools: &[String], events: &[String]) -> String {
+    format!(
+        "{id} {version} — {} tool(s), events: {}",
+        tools.len(),
+        if events.is_empty() {
+            "-".to_string()
+        } else {
+            events.join(",")
+        }
+    )
+}
+
+/// `dex extensions list`: discovery walk + consent state + loaded summary.
+/// The caller refreshes the manager first (one-shot blocks on it).
+pub(crate) fn list_command() {
+    for (dir, scope) in scoped_extension_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let ext_dir = entry.path();
+            let text = match std::fs::read_to_string(ext_dir.join("manifest.yaml")) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let m = match manifest::parse_manifest(&text) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let scope = match scope {
+                Scope::Project => "project",
+                Scope::User => "user",
+            };
+            let state = if is_disabled(&m.id) {
+                "disabled"
+            } else if scope == "project" && !is_enabled(&m.id) {
+                "not enabled (trust gate)"
+            } else {
+                "enabled"
+            };
+            let loaded = loaded_summaries()
+                .into_iter()
+                .find(|(id, _, _, _)| *id == m.id)
+                .map(|(_, _, tools, events)| {
+                    format!(
+                        "loaded, {}",
+                        summary_line(&m.id, &m.version, &tools, &events)
+                    )
+                })
+                .unwrap_or_else(|| "not loaded".to_string());
+            println!(
+                "{:<14} {:<8} {:<6} {:<28} {}",
+                m.id, m.version, scope, state, loaded
+            );
+            println!("  {}", ext_dir.display());
+        }
+    }
+}
+
 /// Sync shadow check for `metadata()`: a shadowed built-in is Shell-gated.
 /// Never blocks — empty until the first refresh lands (same as the schema).
 pub(crate) fn is_shadowed(name: &str) -> bool {
@@ -1221,6 +1383,49 @@ pub(crate) fn has_event_handlers(event: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Serializes tests that load fixtures into the process-global manager:
+    /// two concurrent fixtures would unload each other's extensions via
+    /// `reset_for_tests` (and their hooks would interleave mid-test).
+    pub(crate) static TEST_GLOBAL_MANAGER_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    impl ExtensionManager {
+        /// Test isolation: the manager is process-global, so a fixture
+        /// loaded by one test leaks its hooks into every later turn in the
+        /// same process. Drops all engines and caches (prompt appendix
+        /// included).
+        pub(crate) async fn reset_for_tests(&self) {
+            self.engines.write().await.clear();
+            *self.cached.write().await = Vec::new();
+            *self.shadowed.write().await = HashSet::new();
+            *self.active.write().expect("active lock") = None;
+            PROMPT_APPENDIX
+                .lock()
+                .expect("prompt appendix lock")
+                .clear();
+        }
+    }
+
+    /// Restore env vars on drop: the tests below set XDG/DEX vars and must
+    /// not leak them into other tests in the process (single-threaded runs
+    /// especially — env is global and never restored otherwise).
+    struct EnvRestore(Vec<(&'static str, Option<String>)>);
+    impl EnvRestore {
+        fn take(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var(k).ok())).collect())
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn split_names() {
@@ -1544,6 +1749,57 @@ end
     }
 
     #[tokio::test]
+    async fn reload_unloads_vanished_extensions_and_their_prompt_appendix() {
+        let manifest = "manifest_version: 1\nid: fleeting\nversion: 0.1.0\ncapabilities: []\n";
+        let root = fixture_ext(
+            manifest,
+            "return function(dex)\n  dex.prompt.append(\"hello\")\nend\n",
+        );
+        let mgr = ExtensionManager::fresh();
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        assert_eq!(mgr.engines.read().await.len(), 1);
+        assert!(prompt_appendix().contains("hello"));
+        // The reload reconcile drops what is no longer discovered (here:
+        // nothing) and its prompt appendix with it.
+        mgr.unload_missing(&std::collections::HashSet::new()).await;
+        assert!(mgr.engines.read().await.is_empty());
+        assert!(!prompt_appendix().contains("hello"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn memory_blowup_fails_the_load_not_the_process() {
+        // The per-VM memory ceiling turns a 512 MiB `string.rep` into a Lua
+        // error caught at load — not an OOM kill of the whole process.
+        let manifest = "manifest_version: 1\nid: hog\nversion: 0.1.0\ncapabilities: []\n";
+        let root = fixture_ext(
+            manifest,
+            "return function(dex)\n  local s = string.rep(\"x\", 512 * 1024 * 1024)\n  return s\nend\n",
+        );
+        let mgr = ExtensionManager::fresh();
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        assert!(
+            mgr.engines.read().await.is_empty(),
+            "over-limit setup must fail the whole extension"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn consent_and_remove_reject_non_segment_ids() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::take(&["XDG_DATA_HOME"]);
+        // Traversal shapes must never reach the marker or data dirs.
+        assert!(set_enabled("../../tmp/evil", true).is_err());
+        assert!(set_enabled("", true).is_err());
+        assert!(set_enabled("Bad Id!", true).is_err());
+        assert!(remove("../../some-other-dir").is_err());
+        assert!(remove("ok_id-but/with-slash").is_err());
+        // Nothing was written.
+        assert!(!data_extensions_dir().join("enabled").exists());
+    }
+
+    #[tokio::test]
     async fn bad_hook_registration_skips_the_extension_whole() {
         // Unknown event fails legibly at load.
         let unknown_event = (
@@ -1638,6 +1894,7 @@ end
   end })
 end
 "#;
+        let _lock = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let root = fixture_exts(&[("shadowls", manifest, lua)]);
         global_manager()
             .refresh_with(std::slice::from_ref(&root))
@@ -1669,6 +1926,9 @@ end
             Err(e) => panic!("shadow should pass args through: {e}"),
         }
         std::fs::remove_dir_all(&root).ok();
+        // Drop the fixture: the `ls` shadow must not intercept every later
+        // `ls` call (and re-gate it) in this test process.
+        global_manager().reset_for_tests().await;
     }
 
     #[test]
@@ -1690,6 +1950,7 @@ end
     #[test]
     fn config_paths_reach_discovery_as_user_scope() {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::take(&["XDG_CONFIG_HOME", "XDG_DATA_HOME", "DEX_EXTENSIONS_PATHS"]);
         let root = std::env::temp_dir().join(format!("dex-ext-cfgpaths-{}", std::process::id()));
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
         std::env::set_var("XDG_DATA_HOME", root.join("data"));
@@ -1731,6 +1992,7 @@ end
     #[test]
     fn markers_gate_scopes_and_doctor_discovery() {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::take(&["XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
         let root = std::env::temp_dir().join(format!("dex-ext-markers-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &root);
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
@@ -1924,6 +2186,7 @@ end
   end)
 end
 "#;
+        let _lock = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let root = fixture_exts(&[("gatehook", manifest.as_str(), lua)]);
         global_manager()
             .refresh_with(std::slice::from_ref(&root))
@@ -1948,6 +2211,9 @@ end
         .unwrap();
         assert!(out.contains("rewritten"), "got: {out}");
         std::fs::remove_dir_all(&root).ok();
+        // Drop the fixture: the `echo original` rewriter must not see later
+        // tests' bash calls.
+        global_manager().reset_for_tests().await;
     }
 
     #[tokio::test]
@@ -1961,6 +2227,7 @@ end
   end)
 end
 "#;
+        let _lock = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let root = fixture_exts(&[("denyhook", manifest.as_str(), lua)]);
         global_manager()
             .refresh_with(std::slice::from_ref(&root))
@@ -1979,6 +2246,9 @@ end
         assert!(err.contains("denyhook"), "got: {err}");
         assert!(err.contains("dangerous command"), "got: {err}");
         std::fs::remove_dir_all(&root).ok();
+        // Drop the fixture: the `rm -rf` denier must not see later tests'
+        // bash calls.
+        global_manager().reset_for_tests().await;
     }
 
     #[tokio::test]

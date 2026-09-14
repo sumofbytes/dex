@@ -363,7 +363,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                     Err(e) => eprintln!("dex: [extensions] /{name} failed: {e}"),
                 }
             });
-            push_info(app, format!("command '{label}' dispatched"));
+            push_info(app, format!("command '{label}' dispatched (output → log)"));
         }
         _ if line.starts_with("/mcp ") => match line["/mcp ".len()..].trim() {
             "help" => {
@@ -381,7 +381,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 // Fire-and-forget rescan in the client process; the daemon's
                 // manager is separate (plan §9 — reload is per-process).
                 crate::client::http::spawn_task(async move {
-                    crate::extensions::global_manager().refresh().await;
+                    crate::extensions::global_manager().reload().await;
                     eprintln!("dex: [extensions] reload complete");
                 });
                 push_info(app, "extension reload started".to_string());
@@ -395,15 +395,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
                 for (id, version, tools, events) in summaries {
                     push_info(
                         app,
-                        format!(
-                            "{id} {version} — {} tool(s), events: {}",
-                            tools.len(),
-                            if events.is_empty() {
-                                "-".to_string()
-                            } else {
-                                events.join(",")
-                            }
-                        ),
+                        crate::extensions::summary_line(&id, &version, &tools, &events),
                     );
                 }
             }

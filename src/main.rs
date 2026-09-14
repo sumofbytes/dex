@@ -536,53 +536,7 @@ fn main() {
         Mode::Extensions { action, name } => match action.as_str() {
             "list" => {
                 crate::client::http::block_on(crate::extensions::global_manager().refresh());
-                for (dir, scope) in crate::extensions::scoped_extension_dirs() {
-                    let Ok(entries) = std::fs::read_dir(&dir) else {
-                        continue;
-                    };
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let ext_dir = entry.path();
-                        let text = match std::fs::read_to_string(ext_dir.join("manifest.yaml")) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        };
-                        let m = match crate::extensions::parse_manifest(&text) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        let scope = match scope {
-                            crate::extensions::Scope::Project => "project",
-                            crate::extensions::Scope::User => "user",
-                        };
-                        let state = if crate::extensions::is_disabled(&m.id) {
-                            "disabled"
-                        } else if scope == "project" && !crate::extensions::is_enabled(&m.id) {
-                            "not enabled (trust gate)"
-                        } else {
-                            "enabled"
-                        };
-                        let loaded = crate::extensions::loaded_summaries()
-                            .into_iter()
-                            .find(|(id, _, _, _)| *id == m.id)
-                            .map(|(_, _, tools, events)| {
-                                format!(
-                                    "loaded, {} tool(s), events: {}",
-                                    tools.len(),
-                                    if events.is_empty() {
-                                        "-".to_string()
-                                    } else {
-                                        events.join(",")
-                                    }
-                                )
-                            })
-                            .unwrap_or_else(|| "not loaded".to_string());
-                        println!(
-                            "{:<14} {:<8} {:<6} {:<28} {}",
-                            m.id, m.version, scope, state, loaded
-                        );
-                        println!("  {}", ext_dir.display());
-                    }
-                }
+                crate::extensions::list_command();
             }
             "enable" | "disable" => {
                 let Some(id) = name.as_deref() else {

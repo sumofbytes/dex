@@ -51,7 +51,7 @@ pub(crate) struct Manifest {
     pub(crate) strict: bool,
 }
 
-fn valid_segment(s: &str) -> bool {
+pub(crate) fn valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.chars()
