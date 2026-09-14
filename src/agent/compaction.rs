@@ -302,6 +302,7 @@ pub(crate) async fn summarize_old_messages(
     config: &LlmConfig,
     old: &[ChatMessage],
     cancel: &(dyn CancellationSource + Send + Sync),
+    hook_instructions: &[String],
 ) -> Result<(String, Option<Usage>), Box<dyn std::error::Error + Send + Sync>> {
     // Serialize via `serialize_conversation`,
     // handle previousSummary iterative, file ops via prompt, and custom instructions.
@@ -325,6 +326,14 @@ pub(crate) async fn summarize_old_messages(
     let mut prompt_text = base_prompt.to_string();
     if !extra.is_empty() {
         prompt_text.push_str(extra);
+    }
+    // `session.before_compact` instructions: extension guidance rides the
+    // summarizer prompt verbatim.
+    if !hook_instructions.is_empty() {
+        prompt_text.push_str(&format!(
+            "\n\nAdditional instructions from session hooks: {}",
+            hook_instructions.join(" ")
+        ));
     }
     let conversation_text = serialize_conversation(old);
     let full_prompt = if let Some(prev) = &previous_summary {
@@ -570,9 +579,11 @@ async fn llm_summary(
     previous_summary: Option<&str>,
     file_ops: &FileOps,
     usage_total: &mut Option<Usage>,
+    hook_instructions: &[String],
 ) -> Result<String, String> {
     let history_summary = if !messages_to_summarize.is_empty() {
-        match summarize_old_messages(config, messages_to_summarize, cancel).await {
+        match summarize_old_messages(config, messages_to_summarize, cancel, hook_instructions).await
+        {
             Ok((s, u)) if !s.trim().is_empty() => {
                 merge_usage(usage_total, u);
                 s
@@ -641,6 +652,16 @@ pub(crate) async fn compact_history(
     let total = messages.len();
     if total <= 1 {
         return Ok((false, None));
+    }
+    // `session.before_compact` (plan §7): hooks may cancel the compaction
+    // (same wording the turn loop matches), hand the summarizer extra
+    // instructions, or replace the summary outright (P3 surface, wired
+    // here because the envelope key already exists).
+    let hook = crate::extensions::apply_before_compact(emergency, total, _cancel).await;
+    if hook.cancel {
+        return Err(
+            "history compaction cancelled: cancelled by session.before_compact hook".to_string(),
+        );
     }
     let boundary_start = messages
         .iter()
@@ -719,7 +740,9 @@ pub(crate) async fn compact_history(
 
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
-    let summarized = if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
+    let summarized = if let Some(summary) = &hook.summary {
+        summary.clone()
+    } else if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
         llm_summary(
             _config,
             _cancel,
@@ -729,6 +752,7 @@ pub(crate) async fn compact_history(
             previous_summary.as_deref(),
             &file_ops,
             &mut usage_total,
+            &hook.instructions,
         )
         .await?
     } else {
@@ -1076,6 +1100,71 @@ mod tests {
             text.contains("stale checkpoint"),
             "new summary must build on the latest checkpoint, got: {text}"
         );
+    }
+
+    /// `session.before_compact`: a hook can cancel the compaction (exact
+    /// wording the turn loop matches) or replace the summary outright.
+    #[tokio::test]
+    async fn before_compact_hook_cancels_or_replaces() {
+        // The fixture loads into the process-global extension manager, which
+        // every concurrent compaction reads — serialize against the
+        // process_turn tests (their emergency compactions would see this
+        // hook otherwise).
+        let _turn_lock = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        // Same lock the extensions tests use: two concurrent global-manager
+        // fixtures would unload each other via `reset_for_tests`.
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
+        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
+        std::env::remove_var("DEX_COMPACTION_LLM");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..20 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        // One fixture, both behaviors: emergency compactions cancel, plain
+        // ones get their summary replaced. (The global manager keeps loaded
+        // extensions for the whole test process, so the two cases share it.)
+        let lua = "return function(dex)\n  dex.events.on(\"session.before_compact\", function(ctx, ev)\n    if ev.emergency and ev.messages == 42 then return { cancel = true } end\n    if not ev.emergency and ev.messages == 42 then return { summary = \"HOOK CHECKPOINT\" } end\n  end)\nend\n";
+        let manifest = "manifest_version: 1\nid: compact-hook\nversion: 0.1.0\ncapabilities: []\n";
+        let root = crate::extensions::tests::fixture_exts(&[("compact-hook", manifest, lua)]);
+        crate::extensions::global_manager()
+            .refresh_with(std::slice::from_ref(&root))
+            .await;
+        std::fs::remove_dir_all(&root).ok();
+        let err = compact_history(
+            &config,
+            &mut messages.clone(),
+            &crate::agent::state::GlobalCancellation,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("history compaction cancelled"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(compacted);
+        let summary = messages
+            .iter()
+            .find(|m| m.name.as_deref() == Some("summary"))
+            .unwrap();
+        assert_eq!(summary.content.as_deref(), Some("HOOK CHECKPOINT"));
+        // Drop the fixture before the lock releases: the process-global
+        // manager would otherwise keep the `session.before_compact` hook
+        // (its `ev.messages == 42` cancel matches unrelated tests' 42-message
+        // histories) loaded for every later compaction in this process.
+        crate::extensions::global_manager().reset_for_tests().await;
     }
 
     /// Emergency compaction must be able to cut below the comfort floor:

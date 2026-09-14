@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod core;
 mod daemon;
+mod extensions;
 mod llm;
 mod mcp;
 mod protocol;
@@ -152,6 +153,9 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     } // MCP bootstrap (background connect; schema merges whatever is cached).
       // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
     crate::mcp::global_manager();
+    // Extensions load synchronously here: the one-shot schema must include
+    // them (the daemon instead fills the cache in the background).
+    crate::client::http::block_on(crate::extensions::global_manager().refresh());
     let mut config = LlmConfig::from_env(
         args.base_url.clone(),
         args.model.clone(),
@@ -325,6 +329,7 @@ fn print_help() {
         --model <name>            --base-url <url>  --permission <mode>\n  \
         -H/--header <\"Name: Value\">  (repeatable) extra provider headers\n  \
         -s/--session <path>  --no-session  -n/--new  --name <name>  --skill <dir>\n  \
+        --extensions-dir <dir>  (repeatable) extra extension search dirs\n  \
         -h/--help  -V/--version",
         version = env!("CARGO_PKG_VERSION")
     );
@@ -402,6 +407,9 @@ fn main() {
     // one-shot run has no manager to spawn into, so the tools stay out of
     // its schema entirely. Dispatch rejects them there regardless (§11).
     crate::agent::subagent::set_daemon_linked(matches!(mode, Mode::Serve { .. } | Mode::Default));
+    // Extension search dirs: process-global, read by the manager at
+    // bootstrap (daemon) and before the in-process one-shot turn.
+    crate::extensions::set_extra_dirs(args.extension_dirs.clone());
 
     match mode {
         Mode::Help => {
@@ -511,6 +519,12 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            // Extension tools resolve from the manager cache: load
+            // synchronously so `dex run lua__...` sees them (MCP tools have
+            // the same race; out of scope here).
+            if name.starts_with("lua__") {
+                crate::client::http::block_on(crate::extensions::global_manager().refresh());
+            }
             match execute(&name, &parsed, &GlobalCancellation) {
                 Ok(out) => print!("{out}"),
                 Err(e) => {
@@ -519,6 +533,57 @@ fn main() {
                 }
             }
         }
+        Mode::Extensions { action, name } => match action.as_str() {
+            "list" => {
+                crate::client::http::block_on(crate::extensions::global_manager().refresh());
+                crate::extensions::list_command();
+            }
+            "enable" | "disable" => {
+                let Some(id) = name.as_deref() else {
+                    eprintln!("usage: dex extensions {action} <id>");
+                    std::process::exit(2);
+                };
+                match crate::extensions::set_enabled(id, action == "enable") {
+                    Ok(()) => println!("{action}d extension '{id}' (takes effect on next load)"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "install" => {
+                let Some(src) = name.as_deref() else {
+                    eprintln!("usage: dex extensions install <dir>");
+                    std::process::exit(2);
+                };
+                match crate::extensions::install(src) {
+                    Ok(id) => println!("installed '{id}' — run `dex extensions list`"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "remove" => {
+                let Some(id) = name.as_deref() else {
+                    eprintln!("usage: dex extensions remove <id>");
+                    std::process::exit(2);
+                };
+                match crate::extensions::remove(id) {
+                    Ok(()) => println!("removed '{id}'"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {
+                eprintln!(
+                    "usage: dex extensions [list|enable <id>|disable <id>|install <dir>|remove <id>]"
+                );
+                std::process::exit(2);
+            }
+        },
         Mode::Mcp { action, server } => match action.as_str() {
             "status" => {
                 let lines = crate::mcp::oauth::auth_lines();
