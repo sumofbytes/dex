@@ -242,6 +242,11 @@ pub(crate) struct App {
     /// loopback) or "[R] daemon.internal" (remote). Pinned to the right edge
     /// of the status bar; the only other session-start block is the DEX art.
     pub(crate) connection: Option<String>,
+    /// Base URL of the backing daemon, when this TUI is remote: extension
+    /// status/reload must reach the process that dispatches (`/extensions`
+    /// in a remote TUI goes to the daemon API, not the client's manager).
+    /// `None` for local/loopback turns, which own their manager.
+    pub(crate) daemon_url: Option<String>,
     /// Whether the tail `Assistant` block is still open for streaming
     /// coalescence. Tracked so an initial transcript block (e.g. in tests)
     /// does not merge with the first streamed assistant turn; gaps remain
@@ -343,6 +348,7 @@ impl App {
             history_draft: String::new(),
             slash_selected: 0,
             connection: None,
+            daemon_url: None,
             assistant_open: false,
             show_thinking: false,
             thinking_open: false,

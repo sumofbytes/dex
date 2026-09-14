@@ -83,10 +83,12 @@ pub(crate) fn effective_tokens(
     estimate_tokens(messages)
         + estimate_ephemeral_tokens(ephemeral)
         + if with_tools {
-            // Native schema is a flat estimate; the MCP slice is live —
-            // without it the compaction threshold ignores the per-request
-            // schema cost that actually fills the window.
-            TOOL_SCHEMA_TOKENS + crate::mcp::cached_schema_tokens()
+            // Native schema is a flat estimate; the MCP + extension slices
+            // are live — without them the compaction threshold ignores the
+            // per-request schema cost that actually fills the window.
+            TOOL_SCHEMA_TOKENS
+                + crate::mcp::cached_schema_tokens()
+                + crate::extensions::cached_schema_tokens()
         } else {
             0
         }
