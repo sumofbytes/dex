@@ -80,6 +80,12 @@ fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
 # MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
 base64 = "0.23"
 sha2 = "0.11"
+# Lua extension runtime: sandboxed scripting VM for harness extensions
+# (docs/lua-extensions-plan.md). Vendored: no system lua dependency.
+# lua54: battle-tested over lua55 (plan §13.2). async: host capabilities
+# awaited from Lua (P1+ hooks). No `send`: each VM is pinned to its own
+# worker thread (engine.rs), so Lua values never cross threads.
+mlua = { version = "0.12", features = ["lua54", "vendored", "async"] }
 
 [dev-dependencies]
 http = "1"
