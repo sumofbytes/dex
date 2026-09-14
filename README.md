@@ -181,7 +181,8 @@ the canonical spots:
 
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
 parse error lists the valid keys: `model`, `providers`, `thinking_effort`,
-`mcp_servers` (+ the deprecated ones above). Other keys are preserved untouched.
+`mcp_servers`, `agent_wake`, `extensions` (+ the deprecated ones above). Other
+keys are preserved untouched.
 
 ### Other OpenAI-compatible providers
 
@@ -636,6 +637,29 @@ http allowed); optional `oauth_client_id`/`oauth_client_secret`/`oauth_scope` in
 config skip registration. When an AS rejects `resource` with `invalid_target`,
 login retries once without it.
 
+### Lua extensions
+
+Harness extensions in sandboxed Lua: drop a directory with `manifest.yaml` +
+`extension.lua` into a discovery dir and it can register tools, shadow
+built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
+`turn.start`/`turn.end`, `session.before_compact`). Extension code runs in a
+stripped VM — no io/os/require — and every effect flows through the same
+permission gates as a model-issued call.
+
+```yaml
+extensions:
+  paths: # extra extension dirs (user scope)
+    - ~/work/dex-extensions
+```
+
+Discovery: cwd `.dex/extensions` + `.agents/extensions` (project scope — loads
+only after `dex extensions enable <id>`, the trust consent), then
+`$XDG_CONFIG_HOME/dex/extensions`, config `extensions.paths:`, and
+`--extensions-dir` flags (user scope — loads unless `dex extensions disable
+<id>`). `dex extensions list|install|remove` manages them; `/extensions` shows
+what is loaded and `/extensions reload` rescans. `dex doctor` lists every
+discovered extension with its consent state.
+
 ## Environment variables
 
 | Variable                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -673,6 +697,7 @@ login retries once without it.
 | `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
 | `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
 | `DEX_MCP_MAX_TOOLS`                                           | Cap on merged MCP schema tools (default 200; head kept sorted by name).                                                                                                                                                                                                                                                                                                                                         |
+| `DEX_EXTENSIONS_PATHS`                                        | Extra Lua-extension dirs (`:`-separated; user scope). Wins over `extensions.paths:` in config.                                                                                                                                                                                                                                                                                                                  |
 | `DEX_COST_PER_1K`                                             | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`).                                                                                                                                                                                                                                                                   |
 | `DEX_CONTEXT_WINDOW`                                          | Override model context window (per-model from catalog when unset).                                                                                                                                                                                                                                                                                                                                              |
 | `DEX_RESERVE_TOKENS`                                          | Tokens reserved for reply (default 16384).                                                                                                                                                                                                                                                                                                                                                                      |

@@ -46,6 +46,13 @@ pub(crate) fn system_prompt(skills: &[Skill]) -> String {
         prompt.push_str("\n\n--- Project instructions ---\n");
         prompt.push_str(&ctx);
     }
+    // Load-time extension contributions (`dex.prompt.append`): read-only
+    // influence, no gate interaction (plan §7).
+    let appendix = crate::extensions::prompt_appendix();
+    if !appendix.is_empty() {
+        prompt.push_str("\n\n--- Extensions ---\n");
+        prompt.push_str(&appendix);
+    }
     if !skills.is_empty() {
         prompt.push_str(&format_skills_for_prompt(skills));
     }

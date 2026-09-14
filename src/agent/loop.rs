@@ -849,6 +849,37 @@ where
     C: ModelClient + 'static,
     X: CancellationSource + Clone + 'static,
 {
+    // Lifecycle hooks (plan §7): `turn.start` before anything runs,
+    // `turn.end` on every exit path with the outcome. Fire-and-forget —
+    // these events carry no directive the host acts on. The hook host gets
+    // this turn's policy, so a nested `dex.tools.call` from a hook is
+    // gated exactly like a model-issued one.
+    let turn_policy = Policy::turn(rt.config.permission, rt.console);
+    let cancel = rt.cancel.clone();
+    crate::extensions::fire_event_global(
+        "turn.start",
+        serde_json::json!({}),
+        &cancel,
+        &turn_policy,
+        rt.filter,
+    )
+    .await;
+    let result = process_turn_inner(rt).await;
+    let payload = match &result {
+        Ok(_) => serde_json::json!({ "ok": true }),
+        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+    };
+    crate::extensions::fire_event_global("turn.end", payload, &cancel, &turn_policy, None).await;
+    result
+}
+
+async fn process_turn_inner<C, X>(
+    rt: AgentRuntime<'_, C, X>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: ModelClient + 'static,
+    X: CancellationSource + Clone + 'static,
+{
     // Unbundle so the body below stays the single-agent code it was —
     // byte-identical behavior for `filter: None`.
     let AgentRuntime {
@@ -1147,7 +1178,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Serializes tests that run `process_turn`: every turn reads
@@ -1155,7 +1186,8 @@ mod tests {
     /// var at "2" across its await — any concurrent `process_turn` would
     /// exhaust early. An async mutex because the guard must span awaits
     /// (clippy's `await_holding_lock` rejects the std one here).
-    static TEST_TURN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static TEST_TURN_ENV_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
     use crate::agent::state::{CancellationSource, ToolState};
     use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
     use crate::llm::client::ModelClient;
@@ -1253,6 +1285,58 @@ mod tests {
         assert_eq!(state.total_usage, 10);
         assert_eq!(state.total_output, 11);
         assert_eq!(state.last_usage, Some(0));
+    }
+
+    /// `turn.start`/`turn.end` fire around the turn; a `turn.end` hook can
+    /// act through the host (`dex.tools.call` runs gated, here trusted).
+    #[tokio::test]
+    async fn turn_lifecycle_hooks_fire_around_the_turn() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        // Workspace-confined: the hook writes a relative path in the test
+        // process's cwd (the crate root).
+        let marker = std::path::PathBuf::from(format!(
+            "dex-turn-end-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let marker_str = marker.display().to_string();
+        let lua = format!(
+            "return function(dex)\n  dex.events.on(\"turn.end\", function(ctx, ev)\n    if not ev.ok then return end\n    dex.tools.call(\"write\", {{ path = \"{}\", content = \"done\" }})\n  end)\nend\n",
+            marker_str
+        );
+        let manifest = "manifest_version: 1\nid: turn-hook\nversion: 0.1.0\ncapabilities: []\n";
+        let root = crate::extensions::tests::fixture_exts(&[("turn-hook", manifest, &lua)]);
+        crate::extensions::global_manager()
+            .refresh_with(std::slice::from_ref(&root))
+            .await;
+        let config = test_config();
+        let mut messages = vec![ChatMessage::system("sys")];
+        let mut state = ToolState::default();
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &MockModel,
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+            agent_ctx: None,
+            tool_budget: None,
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            marker.is_file(),
+            "turn.end hook must have written the marker"
+        );
+        std::fs::remove_file(&marker).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
