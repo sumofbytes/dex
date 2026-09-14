@@ -35,6 +35,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::agent::experiments::{DoctorCtx, DoctorRow};
+use crate::core::types::ToolDefinition;
 use crate::core::types::{ChatMessage, Usage};
 use crate::llm::config::LlmConfig;
 use crate::llm::streaming::complete as call_llm;
@@ -42,6 +44,48 @@ use crate::tools::ShellEvidence;
 
 pub(crate) const GATE_ENV: &str = "DEX_EVIDENCE_REDUCER";
 pub(crate) const MODEL_ENV: &str = "DEX_REDUCER_MODEL";
+
+/// The reducer registers no tools — it transforms results inline.
+pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
+    Vec::new()
+}
+
+/// `dex doctor` row: the delegation gate and where its model selection
+/// came from — the mechanism is invisible in a session otherwise. No row
+/// while the gate is off (the row is the only visible trace of the gate).
+pub(crate) fn doctor_row(ctx: &DoctorCtx<'_>) -> Option<DoctorRow> {
+    if !enabled() {
+        return None;
+    }
+    let (reducer_model, model_source) = match std::env::var(MODEL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(model) => (model, MODEL_ENV.to_string()),
+        None => (
+            format!("{} (main model)", ctx.model),
+            "built-in default — set DEX_REDUCER_MODEL for a cheap reducer".to_string(),
+        ),
+    };
+    // Reduction requires a recallable source archive; without the pack
+    // the receipts would have no readback path (declared dependency,
+    // resolved through the registry).
+    let mode =
+        if crate::agent::experiments::dependencies_met(crate::agent::experiments::EVIDENCE_REDUCER)
+        {
+            "on".to_string()
+        } else {
+            format!(
+                "off (needs {}=1)",
+                crate::agent::obs_pack::OBSERVATION_PACK_ENV
+            )
+        };
+    Some(DoctorRow {
+        label: "evidence reducer",
+        value: format!("{mode} · reducer model {reducer_model}"),
+        source: model_source,
+    })
+}
 
 pub(crate) const RECEIPT_SCHEMA: &str = "dex-evidence-receipt/1";
 
@@ -575,7 +619,7 @@ fn render_receipt(
         body.lines().count()
     ));
     out.push_str(&format!("source_archive: obs/{observation_id}.txt"));
-    if crate::agent::obs_pack::observation_pack_enabled() {
+    if crate::agent::experiments::is_enabled(crate::agent::experiments::OBS_PACK) {
         out.push_str(&format!(
             " — recall exact pages with obs_recall {{\"id\":\"{observation_id}\",\"offset\":0}}"
         ));
@@ -687,8 +731,9 @@ pub(crate) async fn process(
     }
     // A receipt omits everything it does not quote; without `obs_recall`
     // there is no way to read the omitted lines back, so reduction is
-    // meaningless without the observation pack.
-    if !crate::agent::obs_pack::observation_pack_enabled() {
+    // meaningless without the observation pack (declared dependency in the
+    // experiment registry).
+    if !crate::agent::experiments::dependencies_met(crate::agent::experiments::EVIDENCE_REDUCER) {
         return none();
     }
     let Some(session_path) = session_path else {

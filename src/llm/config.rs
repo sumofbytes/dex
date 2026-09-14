@@ -2228,7 +2228,7 @@ impl LlmConfig {
     /// cross-provider fallback only covers models the catalog doesn't
     /// price.
     pub(crate) fn cache_write_read_ratio(&self) -> f64 {
-        const FALLBACK: f64 = crate::agent::online::DEFAULT_CACHE_WRITE_READ_RATIO;
+        const FALLBACK: f64 = crate::agent::online_compaction::DEFAULT_CACHE_WRITE_READ_RATIO;
         let Some(catalog) = load_dex_catalog() else {
             return FALLBACK;
         };
@@ -2377,8 +2377,14 @@ pub(crate) fn doctor(
         // line up. A value that overflows its column wraps: the value
         // prints in full on its own line and the origin hangs at the origin
         // column, so long paths never run into the origin text.
-        const KEY_COLS: usize = 11;
+        const KEY_COLS: usize = 18;
         const VALUE_COLS: usize = 46;
+        // A key wider than its column would collapse the padding and
+        // shift every origin column: fail in debug builds instead.
+        debug_assert!(
+            UnicodeWidthStr::width(key) <= KEY_COLS,
+            "doctor key {key:?} exceeds its {KEY_COLS}-column field"
+        );
         let origin_indent = " ".repeat(KEY_COLS + VALUE_COLS);
         let fits = UnicodeWidthStr::width(value) <= VALUE_COLS;
         let mut origin_lines = source.split('\n');
@@ -2660,79 +2666,15 @@ pub(crate) fn doctor(
                 .unwrap_or(chain_ctx);
             row(&mut out, "context", &format!("{ctx} tokens"), &ctx_source);
 
-            // Online compaction economics: the cache re-write cost gate.
-            // Resolved live (same chain as `cache_write_read_ratio`), with
-            // the fallback spelled out so the origin is never a mystery.
-            // The row is printed unconditionally (snapshot byte-stability:
-            // a set/unset `DEX_ONLINE_COMPACTION` in the caller's shell
-            // must not change doctor output); when off, the value says so.
-            let online_on = crate::agent::online::online_compaction_enabled();
-            row(
-                &mut out,
-                "online",
-                if online_on {
-                    format!(
-                        "cache write/read ratio {:.2} (DEX_ONLINE_COMPACTION)",
-                        live.map(|c| c.cache_write_read_ratio())
-                            .unwrap_or(crate::agent::online::DEFAULT_CACHE_WRITE_READ_RATIO)
-                    )
-                } else {
-                    "off (set DEX_ONLINE_COMPACTION=1)".to_string()
-                }
-                .as_str(),
-                if online_on {
-                    "models.dev catalog / measured fallback"
-                } else {
-                    "built-in default (off)"
-                },
-            );
-            let (obs_pack, obs_pack_source) =
-                if env::var_os(crate::agent::obs_pack::OBSERVATION_PACK_ENV).is_some() {
-                    let enabled = crate::agent::obs_pack::observation_pack_enabled();
-                    (
-                        if enabled { "on" } else { "off" },
-                        crate::agent::obs_pack::OBSERVATION_PACK_ENV,
-                    )
-                } else {
-                    (
-                        if crate::agent::obs_pack::observation_pack_enabled() {
-                            "on"
-                        } else {
-                            "off"
-                        },
-                        "built-in default (off)",
-                    )
-                };
-            row(&mut out, "obs pack", obs_pack, obs_pack_source);
-
-            // Evidence-preserving reducer: the delegation gate and where its
-            // model selection came from — the mechanism is invisible in a
-            // session otherwise.
-            if crate::agent::evidence_reducer::enabled() {
-                let (reducer_model, model_source) =
-                    match env::var(crate::agent::evidence_reducer::MODEL_ENV)
-                        .ok()
-                        .filter(|value| !value.trim().is_empty())
-                    {
-                        Some(model) => (model, crate::agent::evidence_reducer::MODEL_ENV),
-                        None => (
-                            format!("{model} (main model)"),
-                            "built-in default — set DEX_REDUCER_MODEL for a cheap reducer",
-                        ),
-                    };
-                // Reduction requires a recallable source archive; without
-                // the pack the receipts would have no readback path.
-                let mode = if crate::agent::obs_pack::observation_pack_enabled() {
-                    "on"
-                } else {
-                    "off (needs DEX_OBSERVATION_PACK=1)"
-                };
-                row(
-                    &mut out,
-                    "evidence reducer",
-                    &format!("{mode} · reducer model {reducer_model}"),
-                    model_source,
-                );
+            // Experiment rows (online compaction, obs pack, evidence
+            // reducer): owned by each experiment module and rendered
+            // through the experiment registry — config.rs never names a
+            // gate or its env var. Order follows the registry.
+            for r in crate::agent::experiments::doctor_rows(crate::agent::experiments::DoctorCtx {
+                live,
+                model: &model,
+            }) {
+                row(&mut out, r.label, &r.value, &r.source);
             }
 
             let (chain_effort, effort_source) =
@@ -5157,10 +5099,10 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "DEX_MODEL",
             "OPENCODE_API_KEY",
-            "DEX_OBSERVATION_PACK",
+            crate::agent::obs_pack::OBSERVATION_PACK_ENV,
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        std::env::remove_var("DEX_OBSERVATION_PACK");
+        std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
         // Point at a missing file so the host config can't color the output.
         std::env::set_var(
             "DEX_CONFIG",
@@ -5212,8 +5154,8 @@ pub(crate) mod tests {
         assert!(!model.contains("anthropic"), "{model}");
     }
 
-    /// The obs pack row reflects `DEX_OBSERVATION_PACK=1` and names the env
-    /// var as its origin.
+    /// The obs pack row reflects the gate on and names the env var as its
+    /// origin.
     #[test]
     fn doctor_reports_obs_pack_env() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -5224,26 +5166,29 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "DEX_MODEL",
             "OPENCODE_API_KEY",
-            "DEX_OBSERVATION_PACK",
+            crate::agent::obs_pack::OBSERVATION_PACK_ENV,
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var(
             "DEX_CONFIG",
             std::env::temp_dir().join(format!("dex-obs-doctor-{}", std::process::id())),
         );
-        std::env::set_var("DEX_OBSERVATION_PACK", "1");
+        std::env::set_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV, "1");
         let out = doctor(None, None, None, &[]);
         let obs = out
             .lines()
             .find(|l| l.starts_with("obs pack "))
             .expect("obs pack row");
         assert!(obs.contains("on"), "{obs}");
-        assert!(obs.contains("DEX_OBSERVATION_PACK"), "{obs}");
+        assert!(
+            obs.contains(crate::agent::obs_pack::OBSERVATION_PACK_ENV),
+            "{obs}"
+        );
     }
 
     /// The evidence reducer row only appears behind its gate, reports the
-    /// pack gate it depends on, and names `DEX_REDUCER_MODEL` as the model
-    /// origin when it is set.
+    /// pack gate it depends on, and names the reducer model env var as the
+    /// model origin when it is set.
     #[test]
     fn doctor_reports_evidence_reducer_env() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -5254,9 +5199,9 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "DEX_MODEL",
             "OPENCODE_API_KEY",
-            "DEX_EVIDENCE_REDUCER",
-            "DEX_OBSERVATION_PACK",
-            "DEX_REDUCER_MODEL",
+            crate::agent::evidence_reducer::GATE_ENV,
+            crate::agent::obs_pack::OBSERVATION_PACK_ENV,
+            crate::agent::evidence_reducer::MODEL_ENV,
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var(
@@ -5264,27 +5209,36 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("dex-evidence-doctor-{}", std::process::id())),
         );
         // Gate off: no row at all.
-        std::env::remove_var("DEX_EVIDENCE_REDUCER");
-        std::env::remove_var("DEX_OBSERVATION_PACK");
-        std::env::remove_var("DEX_REDUCER_MODEL");
+        std::env::remove_var(crate::agent::evidence_reducer::GATE_ENV);
+        std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
+        std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
         let out = doctor(None, None, None, &[]);
         assert!(
             !out.lines().any(|l| l.starts_with("evidence reducer")),
             "gate off must not produce a row: {out}"
         );
         // Gate on but the pack off: the row explains what is missing.
-        std::env::set_var("DEX_EVIDENCE_REDUCER", "1");
+        std::env::set_var(crate::agent::evidence_reducer::GATE_ENV, "1");
         let out = doctor(None, None, None, &[]);
         let row = out
             .lines()
             .find(|l| l.starts_with("evidence reducer"))
             .expect("evidence reducer row");
-        assert!(row.contains("needs DEX_OBSERVATION_PACK=1"), "{row}");
+        assert!(
+            row.contains(&format!(
+                "needs {}=1",
+                crate::agent::obs_pack::OBSERVATION_PACK_ENV
+            )),
+            "{row}"
+        );
         assert!(row.contains("main model"), "{row}");
         // Pack on: fully enabled, and an explicit reducer model is named
         // with its env origin.
-        std::env::set_var("DEX_OBSERVATION_PACK", "1");
-        std::env::set_var("DEX_REDUCER_MODEL", "openrouter/z-ai/glm-4.5-air");
+        std::env::set_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV, "1");
+        std::env::set_var(
+            crate::agent::evidence_reducer::MODEL_ENV,
+            "openrouter/z-ai/glm-4.5-air",
+        );
         let out = doctor(None, None, None, &[]);
         let row = out
             .lines()
@@ -5292,12 +5246,15 @@ pub(crate) mod tests {
             .expect("evidence reducer row");
         assert!(row.contains("on ·"), "{row}");
         assert!(row.contains("openrouter/z-ai/glm-4.5-air"), "{row}");
-        assert!(row.contains("DEX_REDUCER_MODEL"), "{row}");
+        assert!(
+            row.contains(crate::agent::evidence_reducer::MODEL_ENV),
+            "{row}"
+        );
     }
 
     /// Rows whose value overflows the value column wrap instead of
     /// colliding with the origin text; the origin hangs at the origin
-    /// column (display columns 11+46 = 57).
+    /// column (display columns 18+46 = 64).
     #[test]
     fn doctor_wraps_overlong_value_and_hangs_origin() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -5332,7 +5289,7 @@ pub(crate) mod tests {
             let origin = lines.next().expect("origin line");
             assert_eq!(
                 origin.find("missing or invalid"),
-                Some(11 + 46),
+                Some(18 + 46),
                 "origin hangs at the origin column: {origin:?}"
             );
             return;
@@ -5341,7 +5298,7 @@ pub(crate) mod tests {
     }
 
     /// Padding counts display columns: a CJK path is 31 chars but only 45
-    /// columns wide, so the origin still lands on column 57.
+    /// columns wide, so the origin still lands on column 64.
     #[test]
     fn doctor_pads_by_display_width() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -5368,8 +5325,8 @@ pub(crate) mod tests {
             .expect("origin inline on the value line");
         assert_eq!(
             UnicodeWidthStr::width(&line[..at]),
-            11 + 46,
-            "origin starts at display column 57: {line:?}"
+            18 + 46,
+            "origin starts at display column 64: {line:?}"
         );
     }
 
@@ -5397,10 +5354,10 @@ pub(crate) mod tests {
             "DEX_THINKING_EFFORT",
             "DEX_PERMISSION",
             "DEX_HEADERS",
-            "DEX_ONLINE_COMPACTION",
-            "DEX_OBSERVATION_PACK",
-            "DEX_EVIDENCE_REDUCER",
-            "DEX_REDUCER_MODEL",
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+            crate::agent::obs_pack::OBSERVATION_PACK_ENV,
+            crate::agent::evidence_reducer::GATE_ENV,
+            crate::agent::evidence_reducer::MODEL_ENV,
             "DEX_AGENT_WAKE",
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
@@ -5410,12 +5367,12 @@ pub(crate) mod tests {
         ]);
         std::env::remove_var("DEX_EXTENSIONS_PATHS");
         // `EnvRestore::take` saves-and-restores; the toggles that flip doctor
-        // rows must be cleared outright, so a developer shell with
-        // DEX_ONLINE_COMPACTION=1 etc. does not drift the byte-stable output.
-        std::env::remove_var("DEX_ONLINE_COMPACTION");
-        std::env::remove_var("DEX_OBSERVATION_PACK");
-        std::env::remove_var("DEX_EVIDENCE_REDUCER");
-        std::env::remove_var("DEX_REDUCER_MODEL");
+        // rows must be cleared outright, so a developer shell with the
+        // experiment gates set does not drift the byte-stable output.
+        std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
+        std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
+        std::env::remove_var(crate::agent::evidence_reducer::GATE_ENV);
+        std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -5424,34 +5381,51 @@ pub(crate) mod tests {
         // XDG config dir, which must not see the developer's real installs.
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
         let out = doctor(None, None, None, &[]);
-        let expected = concat!(
-            "dex 0.7.0\n",
-            "\n",
-            "config     /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
-            "catalog    /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
-            "                                                         missing — run `dex update --models`\n",
-            "\n",
-            "provider   opencode                                      built-in default\n",
-            "model      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-            "base_url   https://opencode.ai/zen/v1                    built-in default\n",
-            "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
-            "protocol   openai-responses                              default (auto-fallback to completions)\n",
-            "context    UNKNOWN tokens                                no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW\n",
-              "online     off (set DEX_ONLINE_COMPACTION=1)             built-in default (off)\n",
-            "obs pack   off                                           built-in default (off)\n",
-            "thinking   (unset)                                       model default\n",
-            "permission trusted                                       built-in default\n",
-            "agent wake on                                            built-in default\n",
-            "headers    0                                             none\n",
-            "endpoints  go, zen                                       available to /model routing\n",
-            "extensions none                                          cwd/.dex, XDG config dirs\n",
-            "\n",
-            "resolve    ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
-            "                                                           opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n",
-            "                                                           anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
-            "                                                           custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
-            "                                                           codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
-            "                                                         config: /tmp/dex-doctor-snapshot/missing.yaml\n"
+        // The online row is built from the experiment module's own env
+        // const so config.rs never names the gate; the padding is derived
+        // from the value width (origin column = 18+46) instead of
+        // hand-counted spaces, so an env rename tracks cleanly.
+        let online_value = format!(
+            "off (set {}=1)",
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV
+        );
+        let online_row = format!(
+            "online compaction {online_value}{}built-in default (off)\n",
+            " ".repeat(46 - online_value.chars().count())
+        );
+        let expected = format!(
+            "{}{}{}",
+            concat!(
+                "dex 0.7.0\n",
+                "\n",
+                "config            /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
+                "catalog           /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
+                "                                                                missing — run `dex update --models`\n",
+                "\n",
+                "provider          opencode                                      built-in default\n",
+                "model             (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "base_url          https://opencode.ai/zen/v1                    built-in default\n",
+                "api key           (hidden)                                      OPENCODE_API_KEY (environment)\n",
+                "protocol          openai-responses                              default (auto-fallback to completions)\n",
+                "context           UNKNOWN tokens                                no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW\n",
+            ),
+            online_row,
+            concat!(
+                "obs pack          off                                           built-in default (off)\n",
+                "thinking          (unset)                                       model default\n",
+                "permission        trusted                                       built-in default\n",
+                "agent wake        on                                            built-in default\n",
+                "headers           0                                             none\n",
+                "endpoints         go, zen                                       available to /model routing\n",
+                "extensions        none                                          cwd/.dex, XDG config dirs\n",
+                "\n",
+                "resolve           ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
+                "                                                                  opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n",
+                "                                                                  anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
+                "                                                                  custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
+                "                                                                  codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
+                "                                                                config: /tmp/dex-doctor-snapshot/missing.yaml\n",
+            )
         );
         assert_eq!(out, expected, "doctor output drifted");
     }
