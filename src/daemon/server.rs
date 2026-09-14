@@ -105,6 +105,8 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/git", get(get_git))
         .route("/api/mcp", get(get_mcp))
         .route("/api/mcp/{server}/reconnect", post(mcp_reconnect))
+        .route("/api/extensions", get(get_extensions))
+        .route("/api/extensions/reload", post(extensions_reload))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
@@ -276,6 +278,34 @@ async fn mcp_reconnect(Path(server): Path<String>) -> Json<serde_json::Value> {
         Ok(tools) => Json(json!({ "server": server, "state": "up", "tools": tools })),
         Err(error) => Json(json!({ "server": server, "state": "down", "error": error })),
     }
+}
+
+/// Loaded extension summaries for remote clients (`/extensions` in a
+/// connected TUI reads this, never the client process's own manager — the
+/// daemon is the process that dispatches `lua__*` tools and hooks).
+async fn get_extensions() -> Json<serde_json::Value> {
+    let extensions: Vec<serde_json::Value> = crate::extensions::loaded_summaries()
+        .into_iter()
+        .map(|(id, version, tools, events)| {
+            json!({
+                "id": id,
+                "version": version,
+                "tools": tools.len(),
+                "tool_names": tools,
+                "events": events,
+            })
+        })
+        .collect();
+    Json(json!({ "extensions": extensions }))
+}
+
+/// Explicit reload (plan §9 P2): the daemon rescans, unloads extensions
+/// that vanished or lost consent, and reports the new set. The remote TUI's
+/// `/extensions reload` lands here — the client-side reload cannot reach
+/// the process that dispatches.
+async fn extensions_reload() -> Json<serde_json::Value> {
+    crate::extensions::global_manager().reload().await;
+    get_extensions().await
 }
 
 async fn list_skills() -> Json<serde_json::Value> {
@@ -2312,6 +2342,74 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected across the reloads
+    async fn extensions_endpoints_report_shape_and_reload() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
+        // Hermetic: the manager must not see the developer's real installs.
+        let keys: [(&'static str, bool); 2] = [("XDG_CONFIG_HOME", true), ("XDG_DATA_HOME", true)];
+        let saved = crate::session::EnvGuard(
+            keys.iter()
+                .map(|(k, _)| (*k, std::env::var_os(k)))
+                .collect(),
+        );
+        let root = std::env::temp_dir().join(format!("dex-ext-api-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+        std::env::set_var("XDG_DATA_HOME", root.join("data"));
+        // Fixture user-scope extension lands on disk via the XDG config dir.
+        let ext_dir = root.join("config/dex/extensions/apix");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("manifest.yaml"),
+            "manifest_version: 1\nid: apix\nversion: 0.1.0\ncapabilities: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("extension.lua"),
+            "return function(dex)\n  dex.events.on(\"turn.start\", function(ctx, ev) end)\nend\n",
+        )
+        .unwrap();
+
+        // Status before any load: shape present, fixture not loaded.
+        let body = get_extensions().await.0;
+        assert!(body.get("extensions").and_then(|v| v.as_array()).is_some());
+
+        // Reload picks the fixture up and reports it loaded.
+        let body = extensions_reload().await.0;
+        let loaded: Vec<&serde_json::Value> = body["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["id"] == "apix")
+            .collect();
+        assert_eq!(loaded.len(), 1, "reload must load the fixture: {body}");
+        assert_eq!(loaded[0]["tools"].as_u64(), Some(0));
+        assert_eq!(
+            loaded[0]["events"].as_array().and_then(|a| a.first()),
+            Some(&serde_json::json!("turn.start"))
+        );
+
+        // Remove the fixture from disk: reload unloads it (reconcile).
+        std::fs::remove_dir_all(&ext_dir).unwrap();
+        let body = extensions_reload().await.0;
+        assert!(
+            !body["extensions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == "apix"),
+            "vanished extension must unload on reload: {body}"
+        );
+        crate::extensions::global_manager().reset_for_tests().await;
+        std::fs::remove_dir_all(&root).ok();
+        drop(saved);
+    }
+
+    #[tokio::test]
     async fn steer_and_followup_validate_content_and_turn_state() {
         let state = Arc::new(DaemonState::new());
         // empty content -> 400
@@ -3654,6 +3752,172 @@ mod e2e_tests {
     /// system prompt, so response order never races), and the child's
     /// completion notice drains into the NEXT user chat's turn context
     /// (§10b V1a). The child JSONL lands under `agents/` (§16).
+    /// Agent lifecycle hooks fire around a real child run: the fixture
+    /// extension records `agent.start`/`agent.end` through `dex.state`
+    /// (policy-free) while a real delegation drives `child_run`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
+    async fn agent_lifecycle_hooks_fire_around_a_child_run() {
+        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
+
+        const DELEGATE_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"delegate","arguments":"{\"agent\":\"explorer\",\"task\":\"find the gate\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        const PARENT_DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"delegated\"}}]}\n\ndata: [DONE]\n\n";
+        const CHILD_DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"found it\"}}]}\n\ndata: [DONE]\n\n";
+
+        let parent_calls = Arc::new(AtomicUsize::new(0));
+        let fake_llm = Router::new()
+            .route(
+                "/chat/completions",
+                post(
+                    move |AxumState(state): AxumState<Arc<AtomicUsize>>, body: String| async move {
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        let system = parsed["messages"][0]["content"]
+                            .as_str()
+                            .unwrap_or_default();
+                        let sse = if system.contains("You are an explorer") {
+                            CHILD_DONE_SSE
+                        } else {
+                            let n = state.fetch_add(1, Ordering::SeqCst);
+                            if n == 0 {
+                                DELEGATE_SSE
+                            } else {
+                                PARENT_DONE_SSE
+                            }
+                        };
+                        axum::http::Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(sse.to_string()))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(parent_calls.clone());
+        let llm_base = spawn_app(fake_llm).await;
+        let daemon_state = Arc::new(DaemonState::new());
+        let daemon_base = spawn_app(router(daemon_state.clone())).await;
+
+        let data_dir = std::env::temp_dir().join(format!("dex-aghook-{}", std::process::id()));
+        let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "DEX_CONFIG",
+            "DEX_PERMISSION",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+            "DEX_VERIFY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        let _env = crate::session::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::env::set_var("XDG_CONFIG_HOME", data_dir.join("config"));
+        std::fs::create_dir_all(data_dir.join("config/dex/extensions/aghook")).unwrap();
+        std::fs::write(
+            data_dir.join("config/dex/extensions/aghook/manifest.yaml"),
+            "manifest_version: 1\nid: aghook\nversion: 0.1.0\ncapabilities: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("config/dex/extensions/aghook/extension.lua"),
+            concat!(
+                "return function(dex)\n",
+                "  dex.events.on(\"agent.start\", function(ctx, ev)\n",
+                "    dex.state.set(\"started\", ev.agent)\n",
+                "  end)\n",
+                "  dex.events.on(\"agent.end\", function(ctx, ev)\n",
+                "    dex.state.set(\"ended\", tostring(ev.ok))\n",
+                "  end)\n",
+                "end\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
+        std::env::set_var("DEX_PERMISSION", "trusted");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_VERIFY", "true");
+        for v in [
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ] {
+            std::env::remove_var(v);
+        }
+        // The fixture loads into the same process-global manager the daemon
+        // turns dispatch through.
+        crate::extensions::global_manager().reload().await;
+
+        let base = daemon_base.clone();
+        let (session_id, chat_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&base).unwrap();
+            client.wait_until_ready(Duration::from_secs(10)).unwrap();
+            let session_id = client
+                .create_session("/tmp/dex-aghook-cwd", Some("aghook"))
+                .unwrap()
+                .session_id;
+            let r = client
+                .chat(
+                    &session_id,
+                    "go explore",
+                    ChatOptions::default(),
+                    &mut |_event| None,
+                )
+                .map_err(|e| e.to_string());
+            (session_id, r)
+        })
+        .await
+        .unwrap();
+        chat_result.unwrap();
+
+        // Wait for the child's terminal state, then read the hook state file.
+        // (The child session dir is under agents/; the hook state file is the
+        // extension's own record — independent of journal timing.)
+        let state_file = data_dir.join("dex/extensions/state/aghook.json");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let state;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&state_file) {
+                if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&text) {
+                    if map.contains_key("ended") {
+                        state = map;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                Instant::now() < deadline,
+                "agent lifecycle state never written"
+            );
+        }
+        assert_eq!(state.get("started"), Some(&serde_json::json!("explorer")));
+        assert_eq!(state.get("ended"), Some(&serde_json::json!("true")));
+        let _ = session_id;
+        crate::extensions::global_manager().reset_for_tests().await;
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn delegate_runs_child_and_notice_drains_next_turn() {
