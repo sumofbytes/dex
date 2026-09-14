@@ -2566,6 +2566,10 @@ mod handler_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
     async fn approve_unknown_request_is_404_and_cross_session_is_restored() {
+        // Resolving the deny below writes an audit row from the ambient
+        // XDG_DATA_HOME; hold the env lock so the row can't land in a test
+        // that is concurrently redirecting it.
+        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let state = Arc::new(DaemonState::new());
         // no such request_id -> 404
         let r = approve(
