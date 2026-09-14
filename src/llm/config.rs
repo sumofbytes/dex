@@ -2379,6 +2379,12 @@ pub(crate) fn doctor(
         // column, so long paths never run into the origin text.
         const KEY_COLS: usize = 18;
         const VALUE_COLS: usize = 46;
+        // A key wider than its column would collapse the padding and
+        // shift every origin column: fail in debug builds instead.
+        debug_assert!(
+            UnicodeWidthStr::width(key) <= KEY_COLS,
+            "doctor key {key:?} exceeds its {KEY_COLS}-column field"
+        );
         let origin_indent = " ".repeat(KEY_COLS + VALUE_COLS);
         let fits = UnicodeWidthStr::width(value) <= VALUE_COLS;
         let mut origin_lines = source.split('\n');
@@ -5376,11 +5382,16 @@ pub(crate) mod tests {
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
         let out = doctor(None, None, None, &[]);
         // The online row is built from the experiment module's own env
-        // const so config.rs never names the gate, while the assertion
-        // stays byte-exact.
-        let online_row = format!(
-            "online compaction off (set {}=1)             built-in default (off)\n",
+        // const so config.rs never names the gate; the padding is derived
+        // from the value width (origin column = 18+46) instead of
+        // hand-counted spaces, so an env rename tracks cleanly.
+        let online_value = format!(
+            "off (set {}=1)",
             crate::agent::online_compaction::ONLINE_COMPACTION_ENV
+        );
+        let online_row = format!(
+            "online compaction {online_value}{}built-in default (off)\n",
+            " ".repeat(46 - online_value.chars().count())
         );
         let expected = format!(
             "{}{}{}",

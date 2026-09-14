@@ -42,13 +42,10 @@ pub(crate) fn observation_pack_enabled() -> bool {
     std::env::var(OBSERVATION_PACK_ENV).as_deref() == Ok("1")
 }
 
-/// Tool schema for the pull-back side of the projection. Gated like the
-/// other prompt-token-costing tools — only registered when the packer
-/// itself is on, so the schema cost tracks the feature.
+/// Tool schema for the pull-back side of the projection. Prompt-token
+/// costing, so the registry registers it only while the packer itself
+/// is on — the schema cost tracks the feature.
 pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
-    if !observation_pack_enabled() {
-        return Vec::new();
-    }
     vec![ToolDefinition {
         tool_type: "function".to_string(),
         function: FunctionDef {

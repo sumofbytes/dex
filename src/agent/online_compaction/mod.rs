@@ -24,12 +24,10 @@ pub(crate) fn online_compaction_enabled() -> bool {
 }
 
 /// Tool schema for the working-plan tool whose completed steps are
-/// compaction boundaries. Gated like the extra tools — it costs prompt
-/// tokens on every request and only pays off on long-horizon work.
+/// compaction boundaries. It costs prompt tokens on every request and
+/// only pays off on long-horizon work — the registry registers it only
+/// while the gate is on.
 pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
-    if !online_compaction_enabled() {
-        return Vec::new();
-    }
     vec![ToolDefinition {
         tool_type: "function".to_string(),
         function: FunctionDef {
