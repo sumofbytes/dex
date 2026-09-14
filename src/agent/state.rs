@@ -95,14 +95,13 @@ pub(crate) struct ToolState {
     /// the first timed call and reset by `/new`.
     pub(crate) last_tok_s: Option<f64>,
     pub(crate) verify_dirty: bool,
-    /// Online context compaction bookkeeping (`DEX_ONLINE_COMPACTION=1`):
-    /// working plan, request/boundary counts, context growth, cache debt.
-    /// In-memory like the spend totals; a restart relearns at the next
-    /// boundary.
-    pub(crate) online: crate::agent::online::OnlineState,
-    /// Observation pack send counts (`DEX_OBSERVATION_PACK=1`): per-id
-    /// provider-request counts for the projection. In-memory; a restart
-    /// re-derives the grace period from the next assistant boundary.
+    /// Online context compaction bookkeeping: working plan,
+    /// request/boundary counts, context growth, cache debt. In-memory
+    /// like the spend totals; a restart relearns at the next boundary.
+    pub(crate) online_compaction: crate::agent::online_compaction::OnlineState,
+    /// Observation pack send counts: per-id provider-request counts for
+    /// the projection. In-memory; a restart re-derives the grace period
+    /// from the next assistant boundary.
     pub(crate) obs_projection: crate::agent::obs_pack::ProjectionState,
 }
 

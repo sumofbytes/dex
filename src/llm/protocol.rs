@@ -215,67 +215,10 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
             },
         });
     }
-    // Online context compaction: the working-plan tool whose
-    // completed steps are compaction boundaries. Gated like the extra tools —
-    // it costs prompt tokens on every request and only pays off on
-    // long-horizon work.
-    if crate::agent::online::online_compaction_enabled() {
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "update_plan".to_string(),
-                description: "Replace the complete working plan. A newly completed step becomes a safe point where dex may compact context if doing so is economical. Send the complete plan on every call; keep at most one step in_progress and mark finished steps completed; when completing a step, include concise progress evidence when available.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "steps": {
-                            "type": "array",
-                            "maxItems": 128,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "string", "description": "stable step id; reuse only for the same goal" },
-                                    "goal": { "type": "string" },
-                                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
-                                },
-                                "required": ["id", "goal", "status"],
-                                "additionalProperties": false
-                            }
-                        },
-                        "progress": {
-                            "type": "object",
-                            "properties": {
-                                "files_changed": { "type": "array", "items": { "type": "string" } },
-                                "verification": { "type": "array", "items": { "type": "string" }, "description": "checks run and their outcome" },
-                                "decisions": { "type": "array", "items": { "type": "string" } }
-                            }
-                        }
-                    },
-                    "required": ["steps"]
-                }),
-            },
-        });
-    }
-    // Observation pack recall: the pull-back side of the projection.
-    // Gated like the other prompt-token-costing tools — only registered
-    // when the packer itself is on, so the schema cost tracks the feature.
-    if crate::agent::obs_pack::observation_pack_enabled() {
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "obs_recall".to_string(),
-                description: "Read a stored large tool result by observation id and byte offset. Older large tool results in this conversation were replaced with placeholders; recall a paged excerpt from the placeholder's id when you need the original content again. Continue with the returned next_offset.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string", "description": "observation id from a placeholder" },
-                        "offset": { "type": "integer", "description": "byte offset, default 0" }
-                    },
-                    "required": ["id"]
-                }),
-            },
-        });
-    }
+    // Experiment tools (the online compaction plan tool, the observation
+    // pack recall tool): owned by each experiment module and registered
+    // through the experiment registry — protocol.rs never names a gate.
+    tools.extend(crate::agent::experiments::tool_definitions());
     if extra {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
@@ -452,7 +395,7 @@ pub(crate) fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Va
 mod tests {
     use super::{
         chat_completions_messages, merge_chat_tool_call, response_call_index, response_tool_call,
-        responses_input, tools_schema, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
+        responses_input, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
     };
     use crate::core::types::StreamFunctionCall;
     use serde_json::json;
@@ -505,49 +448,6 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[2].id, "c");
         assert!(calls[0].id.is_empty());
-    }
-
-    #[test]
-    fn tools_schema_contains_all_tools() {
-        // Serializes against tests in other modules that flip the env vars
-        // these gates read (online compaction, extra tools).
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = crate::session::EnvGuard(vec![
-            (
-                crate::agent::online::ONLINE_COMPACTION_ENV,
-                std::env::var_os(crate::agent::online::ONLINE_COMPACTION_ENV),
-            ),
-            ("DEX_EXTRA_TOOLS", std::env::var_os("DEX_EXTRA_TOOLS")),
-            (
-                "DEX_OBSERVATION_PACK",
-                std::env::var_os("DEX_OBSERVATION_PACK"),
-            ),
-        ]);
-        std::env::remove_var("DEX_ONLINE_COMPACTION");
-        std::env::remove_var("DEX_EXTRA_TOOLS");
-        std::env::remove_var("DEX_OBSERVATION_PACK");
-        let schema = tools_schema();
-        let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
-        let expected: Vec<&str> = vec!["read", "bash", "write", "edit", "grep", "find", "ls"];
-        assert_eq!(names, expected);
-
-        // DEX_ONLINE_COMPACTION=1 adds the plan tool.
-        std::env::set_var("DEX_ONLINE_COMPACTION", "1");
-        let names: Vec<String> = tools_schema()
-            .iter()
-            .map(|t| t.function.name.clone())
-            .collect();
-        assert!(names.iter().any(|n| n == "update_plan"), "{names:?}");
-
-        // DEX_OBSERVATION_PACK=1 adds the recall tool.
-        std::env::set_var("DEX_OBSERVATION_PACK", "1");
-        let names: Vec<String> = tools_schema()
-            .iter()
-            .map(|t| t.function.name.clone())
-            .collect();
-        assert!(names.iter().any(|n| n == "obs_recall"), "{names:?}");
     }
 
     #[test]
