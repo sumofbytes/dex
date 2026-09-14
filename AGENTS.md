@@ -57,7 +57,7 @@ All of this lives in `src/llm/config.rs` — don't add a second way to express a
 
 ## Release
 
-- `scripts/release.sh [major|minor|patch|X.Y.Z]` — tags the release commit. `develop` is protected (no pushes, not even CI), so bump `version` in `Cargo.toml` + `cargo update -p dex` via a normal PR first, merge, pull, then tag its tip. Working tree must be clean and the default branch up to date.
+- `scripts/release.sh [major|minor|patch|X.Y.Z]` — tags the release commit. `develop` is protected (no pushes, not even CI), so bump `version` in `Cargo.toml` + `cargo update -p dex` via a normal PR first, merge, pull, then re-run to tag its tip. A bump word applies to the last tag, so the same command aborts with instructions before the bump lands and tags right after. Working tree must be clean and the default branch up to date; the bump touches only `Cargo.toml`/`Cargo.lock` — the doctor snapshot test takes its version from `CARGO_PKG_VERSION`.
 
 ## Before submitting
 
