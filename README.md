@@ -135,7 +135,12 @@ every resolved value with where it came from.
 | CLI flags             | `--model`, `--base-url`                               |
 | Environment variables | `DEX_MODEL`, `OPENCODE_API_KEY`, `DEX_HEADERS`        |
 | Config file           | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
-| Built-in defaults     | provider `opencode`, model `gpt-5.6-luna`             |
+
+Nothing hardcodes a model: if no layer selects one, `dex` refuses to start and
+prints a setup guide instead of guessing. (`dex doctor` shows the same.) Only
+the provider *landing URL* for a bare model id (`model: m` with no
+`provider/` prefix) has a built-in default: opencode's gateway, so a bare id
+has somewhere to ride.
 
 `model:` is the only selection knob and names provider _and_ model:
 `<provider>/<model>` (`<endpoint>/<model>` forces an endpoint; a bare provider
@@ -153,7 +158,9 @@ providers:
 model: zen/gpt-5.6-luna # endpoint-or-provider / model
 ```
 
-No file at all also works: export the provider's key and run `dex` — the daemon
+A file naming only a provider also works (`model: anthropic` plus
+`ANTHROPIC_API_KEY`) — but a bare provider pick names no model, so export the
+provider's key and pass an id: `DEX_MODEL=opencode/<model-id> dex`. The daemon
 bootstraps the models.dev catalog in the background, so a fresh install needs no
 manual `dex update --models`.
 
@@ -180,8 +187,8 @@ the canonical spots:
 | `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` env | `DEX_HEADERS` (same syntax)                                                       |
 
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
-parse error lists the valid keys: `model`, `providers`, `thinking_effort`,
-`mcp_servers` (+ the deprecated ones above). Other keys are preserved untouched.
+parse error lists the valid keys: `model`, `providers`, `context_window`,
+`thinking_effort`, `mcp_servers` (+ the deprecated ones above). Other keys are preserved untouched.
 
 ### Other OpenAI-compatible providers
 
@@ -674,7 +681,7 @@ login retries once without it.
 | `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
 | `DEX_MCP_MAX_TOOLS`                                           | Cap on merged MCP schema tools (default 200; head kept sorted by name).                                                                                                                                                                                                                                                                                                                                         |
 | `DEX_COST_PER_1K`                                             | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`).                                                                                                                                                                                                                                                                   |
-| `DEX_CONTEXT_WINDOW`                                          | Override model context window (per-model from catalog when unset).                                                                                                                                                                                                                                                                                                                                              |
+| `DEX_CONTEXT_WINDOW`                                          | Override model context window (file `context_window:` > catalog when unset; unknown models with neither are a startup error).                                                                                                                                                                                                                                                                                   |
 | `DEX_RESERVE_TOKENS`                                          | Tokens reserved for reply (default 16384).                                                                                                                                                                                                                                                                                                                                                                      |
 | `DEX_KEEP_RECENT_TOKENS`                                      | Recent tokens kept on compaction (default 20000).                                                                                                                                                                                                                                                                                                                                                               |
 | `DEX_TOOL_CACHE`                                              | `1` to cache tool results across runs (`dex-tool-cache.json`; default off).                                                                                                                                                                                                                                                                                                                                     |

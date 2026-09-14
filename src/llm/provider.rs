@@ -8,16 +8,6 @@ use std::collections::BTreeMap;
 
 use crate::core::types::{ApiProtocol, Provider};
 
-/// Model used when `--model` and config file `model:` are both unset.
-/// Hardcoded so a cache-less fresh install has a working default; the
-/// models.dev catalog carries no default-model marker to derive it from.
-/// `warn_stale_default_model` trips when a warm catalog stops serving it.
-pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
-
-/// Context-window fallback when `DEX_CONTEXT_WINDOW` is unset and the
-/// models.dev catalog has no entry for the model.
-pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
-
 impl Provider {
     /// Base URL when `--base-url` and config-file
     /// `base_url` are all unset. Bare model picks route themselves to the
@@ -33,16 +23,6 @@ impl Provider {
             // `/v1/messages` (see `anthropic::messages_url`).
             Self::Anthropic => Some("https://api.anthropic.com"),
             Self::Generic(_) => None,
-        }
-    }
-
-    /// Model used for a bare provider pick (`--model anthropic` with no
-    /// model id). Defaults to [`DEFAULT_MODEL`] for OpenAI-compatible
-    /// providers; native providers need one of their own family.
-    pub(crate) fn default_model(&self) -> &'static str {
-        match self {
-            Self::Anthropic => "claude-sonnet-4-5",
-            _ => DEFAULT_MODEL,
         }
     }
 
@@ -118,24 +98,6 @@ impl Provider {
             Self::Anthropic => AuthScheme::Anthropic,
             _ => AuthScheme::Bearer,
         }
-    }
-}
-
-/// Staleness tripwire for [`DEFAULT_MODEL`]: the constant is hardcoded
-/// because a cache-less fresh install must work with no network, but that
-/// means a gateway-side model retirement rots it silently. When the cached
-/// catalog is warm and no longer serves the id, warn once — the user's
-/// first failure names the fix instead of a cryptic 404. Cache-less or
-/// cold-cache starts stay silent (nothing to check against).
-pub(crate) fn warn_stale_default_model() {
-    use crate::llm::config::catalog_serves_model;
-    if !catalog_serves_model(DEFAULT_MODEL) {
-        crate::llm::config::warn_once(
-            "config:default-model-stale",
-            &format!(
-                "built-in default model '{DEFAULT_MODEL}' is not in the cached models.dev catalog (running `dex update --models` may help); set 'model: <provider>/<model>' in config to pin one"
-            ),
-        );
     }
 }
 
@@ -272,9 +234,6 @@ mod tests {
             Some("https://api.anthropic.com")
         );
         assert_eq!(Provider::Generic("zai".into()).default_base_url(), None);
-        // Bare provider picks get a model of their own family.
-        assert_eq!(Provider::Anthropic.default_model(), "claude-sonnet-4-5");
-        assert_eq!(Provider::OpenCode.default_model(), DEFAULT_MODEL);
         // Native providers pin their own wire; OpenAI-compatible ones keep
         // the responses default + completions fallback.
         assert_eq!(
