@@ -377,9 +377,66 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         },
         _ if line.starts_with("/extensions") => {
             let arg = line["/extensions".len()..].trim();
-            if arg == "reload" {
-                // Fire-and-forget rescan in the client process; the daemon's
-                // manager is separate (plan §9 — reload is per-process).
+            // A remote TUI's daemon is the process that dispatches `lua__*`
+            // tools and hooks, so its manager is the one that matters: both
+            // subcommands go to the daemon API (§9 — reload/status reach the
+            // dispatcher, never just the client's local copy).
+            if let Some(url) = app.daemon_url.clone() {
+                let reload = arg == "reload";
+                crate::client::http::spawn_task(async move {
+                    let client = match crate::client::http::DaemonClient::new(&url) {
+                        Ok(client) => client,
+                        Err(e) => {
+                            eprintln!("dex: [extensions] daemon client: {e}");
+                            return;
+                        }
+                    };
+                    let result = if reload {
+                        client.extensions_reload_async().await
+                    } else {
+                        client.extensions_status_async().await
+                    };
+                    match result {
+                        Ok(body) => {
+                            let exts = body["extensions"].as_array().cloned().unwrap_or_default();
+                            for ext in &exts {
+                                eprintln!(
+                                    "dex: [extensions] {} {} — {} tool(s), events: {}",
+                                    ext["id"].as_str().unwrap_or("?"),
+                                    ext["version"].as_str().unwrap_or("?"),
+                                    ext["tools"].as_u64().unwrap_or(0),
+                                    ext["events"]
+                                        .as_array()
+                                        .map(|a| a
+                                            .iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(","))
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                );
+                            }
+                            if exts.is_empty() {
+                                eprintln!("dex: [extensions] none loaded on the daemon");
+                            }
+                            if reload {
+                                eprintln!("dex: [extensions] daemon reload complete");
+                            }
+                        }
+                        Err(e) => eprintln!("dex: [extensions] daemon request failed: {e}"),
+                    }
+                });
+                push_info(
+                    app,
+                    if arg == "reload" {
+                        "daemon extension reload started (output → log)".to_string()
+                    } else {
+                        "daemon extension status requested (output → log)".to_string()
+                    },
+                );
+            } else if arg == "reload" {
+                // Fire-and-forget rescan in this process (local/loopback turn:
+                // it owns the manager that dispatches).
                 crate::client::http::spawn_task(async move {
                     crate::extensions::global_manager().reload().await;
                     eprintln!("dex: [extensions] reload complete");

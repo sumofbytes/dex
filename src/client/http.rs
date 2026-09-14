@@ -343,6 +343,38 @@ impl DaemonClient {
         block_on(self.get_config_async())
     }
 
+    /// Loaded extension summaries from the daemon (`GET /api/extensions`).
+    pub async fn extensions_status_async(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let body = self
+            .http
+            .get(format!("{}/api/extensions", self.base_url))
+            .headers(self.api_headers())
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok(body)
+    }
+
+    /// Ask the daemon to rescan its extensions (`POST /api/extensions/reload`).
+    pub async fn extensions_reload_async(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let body = self
+            .http
+            .post(format!("{}/api/extensions/reload", self.base_url))
+            .headers(self.api_headers())
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok(body)
+    }
+
     /// Poll the daemon workspace's branch/dirty for the status footer.
     /// Short timeout + best-effort: a slow daemon must not hitch the TUI,
     /// the next interval simply retries.
