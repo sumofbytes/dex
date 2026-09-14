@@ -2024,7 +2024,6 @@ impl LlmConfig {
             if let Some(api) = this.resolve_model_api(&selection) {
                 this.api = api;
             }
-            this.refresh_thinking_effort();
         }
         // Context window, resolved on the final (routed/stripped) model id:
         // DEX_CONTEXT_WINDOW > file `context_window:` > the slim
@@ -2455,9 +2454,25 @@ pub(crate) fn doctor(
         // Short form here: the resolve row prints the full setup guide.
         Err(_) => "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
     };
-    let (selection_provider, pre_model) = match &selection {
-        Some(selection) => split_selection(selection, &known).unwrap_or((None, selection.clone())),
-        None => (None, String::new()),
+    // A bare provider pick (`--model anthropic`) or provider-only prefix
+    // (`model: zai/`) is not a model id — `split_selection` rejects both,
+    // so surface the provider on the provider row and leave the model row
+    // unset instead of reading the provider name as a model id (the
+    // resolve row carries the fix).
+    let (selection_provider, pre_model, bare_pick) = match &selection {
+        Some(selection) => match split_selection(selection, &known) {
+            Ok((provider, model)) => (provider, model, false),
+            Err(_) => match classify_selection(selection, &known) {
+                SelectionRoute::BareProvider { provider } => (Some(provider), String::new(), true),
+                SelectionRoute::ProviderQualified { provider, .. } => {
+                    (Some(provider), String::new(), false)
+                }
+                // Not a provider shape: echo the raw selection as the model
+                // id (endpoint prefixes, gateway model ids).
+                SelectionRoute::Model(_) => (None, selection.clone(), false),
+            },
+        },
+        None => (None, String::new(), false),
     };
     // Provider fallback shares `from_env`'s chain (and its deprecation
     // warning, deduped) so the origin row cannot drift from routing.
@@ -2469,6 +2484,8 @@ pub(crate) fn doctor(
         )
     });
     let provider_source = match selection_provider {
+        // A bare pick carries no prefix; the selection origin says it all.
+        Some(_) if bare_pick => selection_source.clone(),
         Some(_) => format!("{selection_source} prefix"),
         // Same routing as `from_env`: an explicit --base-url with no
         // selection prefix lands on providers.custom, not the builtin.
@@ -2508,7 +2525,15 @@ pub(crate) fn doctor(
                     pre_model.clone()
                 }
             });
-            row(&mut out, "model", &model, &selection_source);
+            // An unset model despite a selection is a bare provider pick:
+            // name the selection as origin and why the row is empty (the
+            // resolve row carries the fix).
+            let model_source = if selection.is_some() && pre_model.is_empty() {
+                format!("{selection_source} (no model id)")
+            } else {
+                selection_source.clone()
+            };
+            row(&mut out, "model", &model, &model_source);
 
             let resolved = resolve_provider(&provider, &provider_entries);
             let entry = provider_entries.get(provider.name());
@@ -5154,6 +5179,37 @@ pub(crate) mod tests {
             .expect("obs pack row");
         assert!(obs.contains("off"), "{obs}");
         assert!(obs.contains("built-in default"), "{obs}");
+    }
+
+    /// A bare provider pick (`DEX_MODEL=anthropic`) surfaces as the provider
+    /// row, never as a model id: the model row is unset (the selection named
+    /// as its origin) and the resolve row carries the fix.
+    #[test]
+    fn doctor_shows_bare_provider_pick_as_provider() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_MODEL", "anthropic");
+        // Point at a missing file so the host config can't color the output.
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-bare-doctor-{}", std::process::id())),
+        );
+        let out = doctor(None, None, None, &[]);
+        let prov = out
+            .lines()
+            .find(|l| l.starts_with("provider "))
+            .expect("provider row");
+        assert!(prov.contains("anthropic"), "{prov}");
+        assert!(prov.contains("DEX_MODEL"), "{prov}");
+        let model = out
+            .lines()
+            .find(|l| l.starts_with("model "))
+            .expect("model row");
+        assert!(model.contains("(unset)"), "{model}");
+        assert!(!model.contains("anthropic"), "{model}");
     }
 
     /// The obs pack row reflects `DEX_OBSERVATION_PACK=1` and names the env
