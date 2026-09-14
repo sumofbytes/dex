@@ -8,7 +8,6 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
-use crate::llm::provider::{DEFAULT_CONTEXT_WINDOW, DEFAULT_MODEL};
 
 /// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
 /// unset or unparseable. Single-sources the
@@ -93,28 +92,28 @@ struct Resolved<T> {
     origin: &'static str,
 }
 
-/// The single selection knob — `--model` > `DEX_MODEL` > file `model:` >
-/// builtin default. The flag is pre-filtered by the caller: `from_env`
-/// keeps an empty `--model` as a literal selection (historical behavior),
-/// `doctor` treats it as unset.
-fn resolve_selection(flag: Option<String>, file: &Option<serde_yaml::Value>) -> Resolved<String> {
+/// The single selection knob — `--model` > `DEX_MODEL` > file `model:`.
+/// There is no built-in default model: nothing set anywhere is a setup
+/// error (the guide text), so the daemon never silently rides a hardcoded
+/// id that a catalog refresh can retire. The flag is pre-filtered by the
+/// caller: `from_env` keeps an empty `--model` as a literal selection
+/// (historical behavior), `doctor` treats it as unset.
+fn resolve_selection(
+    flag: Option<String>,
+    file: &Option<serde_yaml::Value>,
+) -> Result<Resolved<String>, String> {
     let dex_model = env::var("DEX_MODEL").ok().filter(|m| !m.trim().is_empty());
     let file_model = load_config_str(file, "model");
-    let value = flag
-        .clone()
-        .or(dex_model.clone())
-        .or(file_model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let origin = if flag.is_some() {
-        "--model"
-    } else if dex_model.is_some() {
-        "DEX_MODEL"
-    } else if file_model.is_some() {
-        "config model:"
+    let (value, origin) = if let Some(flag) = flag.clone() {
+        (flag, "--model")
+    } else if let Some(dex_model) = dex_model.clone() {
+        (dex_model, "DEX_MODEL")
+    } else if let Some(file_model) = file_model.clone() {
+        (file_model, "config model:")
     } else {
-        "built-in default"
+        return Err(setup_guide_error());
     };
-    Resolved { value, origin }
+    Ok(Resolved { value, origin })
 }
 
 /// Provider fallback when the selection carries no prefix: `DEX_PROVIDER`
@@ -135,7 +134,9 @@ fn provider_fallback_with_origin(
     }
     match load_provider_name(file) {
         Some(name) => (name, Some("config active_provider: (deprecated)")),
-        // `None` origin = the builtin default, i.e. nothing the user said.
+        // `None` origin = nothing the user said; the name only shapes the
+        // key-error text (`from_env` errors on the missing model id before
+        // any request is built).
         None => ("opencode".to_string(), None),
     }
 }
@@ -230,6 +231,45 @@ fn invalidate_config_cache() {
     }
 }
 
+/// Context-window resolution chain — `DEX_CONTEXT_WINDOW` > file
+/// `context_window:` > the slim cross-process index > the catalog (which
+/// then refreshes the index). No built-in default: a model the catalog
+/// doesn't size needs an explicit window, so the miss is an error.
+fn resolve_context_window(model: &str, file: &Option<serde_yaml::Value>) -> Result<u64, String> {
+    env_parse_opt("DEX_CONTEXT_WINDOW")
+        .or_else(|| load_config_num(file, "context_window"))
+        .or_else(|| ctx_from_index(model))
+        .or_else(|| {
+            load_dex_catalog().and_then(|c| {
+                let ctx = catalog_context_window(model, &c);
+                ensure_ctx_index(&c);
+                ctx
+            })
+        })
+        .ok_or_else(|| {
+            format!(
+                "no context window for model '{model}' — set 'context_window: <tokens>' in the config or DEX_CONTEXT_WINDOW (see `dex doctor`)"
+            )
+        })
+}
+
+/// Numeric config-file key (`context_window:`); positive integers only —
+/// a zero/negative/garbage value is a warning, not a silent miss.
+fn load_config_num(file: &Option<serde_yaml::Value>, key: &str) -> Option<u64> {
+    let value = file.as_ref()?.get(key)?;
+    let num = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    if num == 0 {
+        warn_once(
+            "config:context_window",
+            "config key 'context_window:' must be a positive token count — ignoring it",
+        );
+        return None;
+    }
+    Some(num)
+}
+
 fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String> {
     file.as_ref()
         .and_then(|f| f.get(key))
@@ -244,6 +284,7 @@ fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<String
 const KNOWN_FILE_KEYS: &[&str] = &[
     "model",
     "providers",
+    "context_window",
     "thinking_effort",
     "mcp_servers",
     "agent_wake",
@@ -415,28 +456,31 @@ fn classify_selection(selection: &str, known: &BTreeSet<String>) -> SelectionRou
 /// keeps the builtin default model). The provider is lowercased, matching
 /// `Provider::name()`. `None` provider means "selection names
 /// no known provider" (an endpoint prefix like `go/…` or a plain model id).
-fn split_selection(selection: &str, known: &BTreeSet<String>) -> (Option<String>, String) {
-    // A bare provider pick gets that provider's own default model
-    // (`anthropic` → a claude model; OpenAI-compatible providers share the
-    // builtin default).
-    let default_model = |name: &str| {
-        Provider::parse_known(name, known)
-            .map(|provider| provider.default_model().to_string())
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-    };
+/// The error for a bare provider pick with no model id (`--model
+/// anthropic`, file `model: opencode`) — there is no per-provider built-in
+/// default model to fall back to.
+fn bare_provider_needs_model(selection: &str, provider: &str) -> String {
+    format!(
+        "'{selection}' names a provider but no model — set 'model: {provider}/<model>' (see the provider's catalog entry, or `dex doctor`)"
+    )
+}
+
+fn split_selection(
+    selection: &str,
+    known: &BTreeSet<String>,
+) -> Result<(Option<String>, String), String> {
     match classify_selection(selection, known) {
-        SelectionRoute::ProviderQualified { provider, rest } => (
-            Some(provider.clone()),
+        SelectionRoute::ProviderQualified { provider, rest } => {
             if rest.is_empty() {
-                default_model(&provider)
+                Err(bare_provider_needs_model(selection, &provider))
             } else {
-                rest
-            },
-        ),
-        SelectionRoute::BareProvider { provider } => {
-            (Some(provider.clone()), default_model(&provider))
+                Ok((Some(provider.clone()), rest.to_string()))
+            }
         }
-        SelectionRoute::Model(model) => (None, model),
+        SelectionRoute::BareProvider { provider } => {
+            Err(bare_provider_needs_model(selection, &provider))
+        }
+        SelectionRoute::Model(model) => Ok((None, model)),
     }
 }
 
@@ -450,17 +494,6 @@ fn catalog_api(key: &str, catalog: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-}
-
-/// Whether the cached catalog (warm cache only) serves `model` — the
-/// staleness check behind `provider::warn_stale_default_model`. No cache
-/// (fresh install, no `dex update --models` yet) answers `true`: absence
-/// of evidence is not evidence of retirement.
-pub(crate) fn catalog_serves_model(model: &str) -> bool {
-    match load_dex_catalog() {
-        Some(catalog) => catalog_has_model(model, &catalog),
-        None => true,
-    }
 }
 
 /// Whether `model` names a known model id anywhere in the catalog (either
@@ -560,17 +593,23 @@ fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
     }
 }
 
-/// Landing base URL when nothing explicit is set: the builtin default, or
-/// for a generic provider its config entry override > catalog `api` URL.
+/// Landing base URL when nothing explicit (`--base-url`, top-level
+/// `base_url:`) is set: the provider's config entry override, then the
+/// builtin landing (native providers), then the catalog `api` URL
+/// (generic providers). The config entry beats the built-in landing —
+/// config-first, no exceptions.
 fn landing_base_url_for(
     provider: &Provider,
     entries: &BTreeMap<String, ProviderEntry>,
 ) -> Option<String> {
+    if let Some(url) = entries
+        .get(provider.name())
+        .and_then(|e| e.base_url.clone())
+    {
+        return Some(url);
+    }
     match provider {
-        Provider::Generic(name) => entries
-            .get(name)
-            .and_then(|e| e.base_url.clone())
-            .or_else(|| load_dex_catalog().and_then(|c| catalog_api(name, &c))),
+        Provider::Generic(name) => load_dex_catalog().and_then(|c| catalog_api(name, &c)),
         other => other.default_base_url().map(str::to_string),
     }
 }
@@ -627,23 +666,21 @@ fn resolve_provider(
     }
 }
 
-/// Neutral first-run hint when nothing selects a provider (no `--model`,
-/// `DEX_MODEL`, file `model:`, `DEX_PROVIDER`/`active_provider:`) and the
-/// builtin default has no key. Names no favorite — the user picks.
+/// Neutral first-run hint when nothing selects a provider+model (no
+/// `--model`, `DEX_MODEL`, file `model:`, `DEX_PROVIDER`/`active_provider:`
+/// with an id). Names no favorite and no model id — the user picks; model
+/// ids come from the provider's catalog entry (or `dex doctor`), not a
+/// hardcoded default that can rot.
 fn setup_guide_error() -> String {
     let path = config_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/dex/config.yaml".to_string());
-    // Model ids ride the providers' own defaults so the catalog can move
-    // without this text rotting; the gateway shape mirrors the README.
-    let anthropic_model = Provider::Anthropic.default_model();
-    let opencode_model = Provider::OpenCode.default_model();
     format!(
-        "no provider configured — pick one, then run `dex doctor`:\n\
-         \u{20}\u{20}opencode (built-in default): model: zen/{opencode_model} + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
-         \u{20}\u{20}anthropic: model: anthropic/{anthropic_model} + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
+        "no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n\
+         \u{20}\u{20}opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
+         \u{20}\u{20}anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
          \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
-         \u{20}\u{20}codex: model: openai-codex + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
+         \u{20}\u{20}codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"
     )
 }
@@ -1776,11 +1813,48 @@ impl LlmConfig {
             && base_url_override.is_none();
         // One selection knob names provider *and* model: `provider/model`
         // (`endpoint/model` or a bare provider name work too). Precedence:
-        // `--model` > `DEX_MODEL` > file `model:` > builtin default. When
-        // the selection carries no provider, `DEX_PROVIDER` /
-        // `active_provider:` (both deprecated) still pick one.
-        let selection = resolve_selection(model_override, &file).value;
-        let (selection_provider, mut model) = split_selection(&selection, &known);
+        // `--model` > `DEX_MODEL` > file `model:` — nothing set anywhere is
+        // a setup error, not a silent builtin default. When the selection
+        // carries no provider, `DEX_PROVIDER` / `active_provider:` (both
+        // deprecated) still pick one. Model resolution is deferred to just
+        // before the build: credential/endpoint problems are reported
+        // first, they are the more actionable fix.
+        let selection = resolve_selection(model_override, &file);
+        let (selection_provider, model) = match &selection {
+            Ok(r) => split_selection(&r.value, &known).map_err(|e| {
+                if using_builtin_default {
+                    e.clone()
+                } else {
+                    e
+                }
+            })?,
+            // No selection anywhere: keep building the provider/URL below so
+            // a misconfigured endpoint or key is named first; the missing
+            // model id is the last error before the build.
+            Err(guide) => {
+                // Nothing selected a model. Still resolve the provider the
+                // same way `from_env` would (deprecated pointer > the
+                // --base-url custom route > the opencode landing default)
+                // so the key/endpoint error names the right deposit; the
+                // missing-model guide comes last.
+                let (fallback, origin) = provider_fallback_with_origin(&file);
+                let name =
+                    provider_without_prefix((fallback, origin), base_url_override.as_deref());
+                let provider = Provider::parse_known(&name, &known)
+                    .or_else(|| (name == "custom").then(|| Provider::Generic("custom".into())))
+                    .ok_or_else(|| guide.clone())?;
+                let key_err = resolve_credentials(&provider, &provider_entries)
+                    .err()
+                    .map(|e| {
+                        if using_builtin_default {
+                            guide.clone()
+                        } else {
+                            e.to_string()
+                        }
+                    });
+                return Err(key_err.unwrap_or_else(|| guide.clone()).into());
+            }
+        };
         let provider_name = match selection_provider.as_deref() {
             Some(name) => name.to_string(),
             None => provider_without_prefix(
@@ -1801,13 +1875,6 @@ impl LlmConfig {
                     "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic, or add it under 'providers:' (e.g. providers.custom: {{base_url: ..., api_key: ...}})"
                 )
             })?;
-        // A provider from the deprecated fallback (`DEX_PROVIDER` /
-        // `active_provider:`) with the untouched builtin default model gets
-        // one of its own family — `active_provider: anthropic` must not send
-        // `gpt-5.6-luna` to the Messages API.
-        if selection_provider.is_none() && model == DEFAULT_MODEL {
-            model = provider.default_model().to_string();
-        }
         let mut available_models = env::var("DEX_MODELS")
             .ok()
             .map(|value| {
@@ -1872,25 +1939,7 @@ impl LlmConfig {
                     e
                 }
             })?;
-        // DEX_CONTEXT_WINDOW first; else the slim cross-process index
-        // (KBs); the 4MB catalog parse is the cold-path fallback, which
-        // then refreshes the index.
-        let context_window = env_parse_opt("DEX_CONTEXT_WINDOW")
-            .or_else(|| ctx_from_index(&model))
-            .or_else(|| {
-                load_dex_catalog().and_then(|c| {
-                    let ctx = catalog_context_window(&model, &c);
-                    ensure_ctx_index(&c);
-                    ctx
-                })
-            })
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        // The builtin default model is hardcoded (cache-less installs must
-        // work); a warm catalog that no longer serves it is the one silent
-        // rot path — name the fix once.
-        if model == DEFAULT_MODEL {
-            crate::llm::provider::warn_stale_default_model();
-        }
+
         // Reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env_parse("DEX_RESERVE_TOKENS", 16_384);
         let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
@@ -1938,7 +1987,7 @@ impl LlmConfig {
             api,
             account_id,
             thinking_effort: None, // resolved below once model+endpoint are final
-            context_window,
+            context_window: 0,     // resolved below once model+endpoint are final
             reserve_tokens,
             keep_recent_tokens,
             verify_command: env::var("DEX_VERIFY").ok(),
@@ -1970,6 +2019,12 @@ impl LlmConfig {
             }
             this.refresh_thinking_effort();
         }
+        // Context window, resolved on the final (routed/stripped) model id:
+        // DEX_CONTEXT_WINDOW > file `context_window:` > the slim
+        // cross-process index > the catalog. No built-in default — a model
+        // nothing sizes is a config error, not a silent 128k guess.
+        this.context_window = resolve_context_window(&this.model, &file)?;
+        this.refresh_thinking_effort();
         Ok(this)
     }
 
@@ -2131,16 +2186,16 @@ impl LlmConfig {
         if persist && (self.model != prev_model || self.provider != prev_provider) {
             persist_selection(&self.model, &self.provider, &self.base_url, &self.endpoints);
         }
-        // Dex standalone: contextWindow from models.dev catalog > provider default; refresh unless env pinned it.
-        if env::var("DEX_CONTEXT_WINDOW").is_err() {
+        // Refresh from the models.dev catalog unless the env or the file
+        // pinned the window; without a catalog hit the previous value (a
+        // configured key or the prior model's resolution) stands.
+        if env::var("DEX_CONTEXT_WINDOW").is_err()
+            && load_config_num(&load_config_file(), "context_window").is_none()
+        {
             if let Some(catalog) = load_dex_catalog() {
                 if let Some(ctx) = catalog_context_window(&self.model, &catalog) {
                     self.context_window = ctx;
-                } else {
-                    self.context_window = DEFAULT_CONTEXT_WINDOW;
                 }
-            } else {
-                self.context_window = DEFAULT_CONTEXT_WINDOW;
             }
         }
         // Effort follows the final model+endpoint: stored `/thinking`
@@ -2382,13 +2437,21 @@ pub(crate) fn doctor(
     let known = known_providers(&provider_entries);
 
     // Selection + origin, mirroring `from_env` precedence:
-    // `--model` > `DEX_MODEL` > file `model:` > builtin default.
+    // `--model` > `DEX_MODEL` > file `model:` — nothing set anywhere is
+    // reported as unconfigured, not silently defaulted.
     let flag_model = model_override.clone().filter(|m| !m.trim().is_empty());
     let flag_base_url = base_url_override.clone().filter(|u| !u.trim().is_empty());
     let selection_resolved = resolve_selection(flag_model.clone(), &file);
-    let selection = selection_resolved.value;
-    let selection_source = selection_resolved.origin;
-    let (selection_provider, pre_model) = split_selection(&selection, &known);
+    let selection = selection_resolved.as_ref().ok().map(|r| r.value.clone());
+    let selection_source = match &selection_resolved {
+        Ok(r) => r.origin.to_string(),
+        // Short form here: the resolve row prints the full setup guide.
+        Err(_) => "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
+    };
+    let (selection_provider, pre_model) = match &selection {
+        Some(selection) => split_selection(selection, &known).unwrap_or((None, selection.clone())),
+        None => (None, String::new()),
+    };
     // Provider fallback shares `from_env`'s chain (and its deprecation
     // warning, deduped) so the origin row cannot drift from routing.
     let (fallback_provider, fallback_origin) = provider_fallback_with_origin(&file);
@@ -2431,8 +2494,14 @@ pub(crate) fn doctor(
             // the derived values still explain the setup (e.g. missing key).
             let live = cfg_result.as_ref().ok().filter(|c| c.provider == provider);
             row(&mut out, "provider", provider.name(), &provider_source);
-            let model = live.map(|c| c.model.clone()).unwrap_or(pre_model.clone());
-            row(&mut out, "model", &model, selection_source);
+            let model = live.map(|c| c.model.clone()).unwrap_or_else(|| {
+                if pre_model.is_empty() {
+                    "(unset)".to_string()
+                } else {
+                    pre_model.clone()
+                }
+            });
+            row(&mut out, "model", &model, &selection_source);
 
             let resolved = resolve_provider(&provider, &provider_entries);
             let entry = provider_entries.get(provider.name());
@@ -2541,11 +2610,16 @@ pub(crate) fn doctor(
             } else if let Some(ctx) = ctx_from_index(&model) {
                 (ctx.to_string(), "cached context index".to_string())
             } else {
-                match load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)) {
-                    Some(ctx) => (ctx.to_string(), "models.dev catalog".to_string()),
-                    None => (
-                        DEFAULT_CONTEXT_WINDOW.to_string(),
-                        "built-in default".to_string(),
+                match (
+                    load_config_num(&file, "context_window"),
+                    load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)),
+                ) {
+                    (_, Some(ctx)) => (ctx.to_string(), "models.dev catalog".to_string()),
+                    (Some(ctx), None) => (ctx.to_string(), "config context_window:".to_string()),
+                    (None, None) => (
+                        "UNKNOWN".to_string(),
+                        "no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW"
+                            .to_string(),
                     ),
                 }
             };
@@ -3146,11 +3220,13 @@ pub(crate) mod tests {
             "DEX_MODEL",
             "OPENCODE_API_KEY",
             "XDG_CACHE_HOME",
+            "DEX_CONTEXT_WINDOW",
         ]);
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::remove_var("DEX_MODEL");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_CONTEXT_WINDOW", "1000");
         let cfg = LlmConfig::from_env(None, Some("aaa-reseller".to_string()), None, &[]).unwrap();
         assert_eq!(cfg.model, "aaa-reseller");
         assert_eq!(cfg.provider, Provider::OpenCode);
@@ -3207,11 +3283,11 @@ pub(crate) mod tests {
         // on the model side must not survive into the catalog lookup.
         assert_eq!(
             super::split_selection("zai/ glm-x", &known),
-            (Some("zai".to_string()), "glm-x".to_string())
+            Ok((Some("zai".to_string()), "glm-x".to_string()))
         );
         assert_eq!(
             super::split_selection(" zai / glm-x ", &known),
-            (Some("zai".to_string()), "glm-x".to_string())
+            Ok((Some("zai".to_string()), "glm-x".to_string()))
         );
     }
 
@@ -3275,10 +3351,14 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "DEX_MODELS",
             "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_CONTEXT_WINDOW",
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key2");
         std::env::remove_var("DEX_MODELS");
         std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("DEX_MODEL", "opencode/m");
+        std::env::set_var("DEX_CONTEXT_WINDOW", "1000");
         // No config file: point DEX_CONFIG at a missing path.
         std::env::set_var(
             "DEX_CONFIG",
@@ -3349,7 +3429,7 @@ pub(crate) mod tests {
         let cfg_path = dir.join("config.yaml");
         std::fs::write(
             &cfg_path,
-            "active_provider: opencode\nmodel: m-h\nhttp_headers:\n  X-File: file\n  X-Shared: http\nheaders:\n  X-Shared: file\n",
+            "active_provider: opencode\nmodel: m-h\ncontext_window: 1000\nhttp_headers:\n  X-File: file\n  X-Shared: http\nheaders:\n  X-Shared: file\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &cfg_path);
@@ -3651,15 +3731,14 @@ pub(crate) mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected setup-guide error"),
         };
-        assert!(err.contains("no provider configured"), "{err}");
+        assert!(err.contains("no model configured"), "{err}");
         assert!(err.contains("anthropic"), "{err}");
         assert!(err.contains("gateway"), "{err}");
         assert!(err.contains("openai-codex"), "{err}");
-        assert!(err.contains(crate::llm::provider::DEFAULT_MODEL), "{err}");
         assert!(!err.contains("no API key for provider"), "{err}");
         // The same guide surfaces in `dex doctor`'s resolve row.
         let report = doctor(None, None, None, &[]);
-        assert!(report.contains("no provider configured"), "{report}");
+        assert!(report.contains("no model configured"), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3718,16 +3797,18 @@ pub(crate) mod tests {
             "providers:\n  custom:\n    api_key: kk\n",
         )
         .unwrap();
-        let cfg = LlmConfig::from_env(
+        // No builtin default model exists: the build demands an explicit
+        // model even with the key and URL in place.
+        let err = match LlmConfig::from_env(
             Some("http://localhost:11434/v1".to_string()),
             None,
             None,
             &[],
-        )
-        .unwrap();
-        assert_eq!(cfg.provider, Provider::Generic("custom".to_string()));
-        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
-        assert_eq!(cfg.model, crate::llm::provider::DEFAULT_MODEL);
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected no-model-configured error"),
+        };
+        assert!(err.contains("no model configured"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3766,27 +3847,10 @@ pub(crate) mod tests {
     #[test]
     fn setup_guide_lists_builtin_default_first() {
         let guide = super::setup_guide_error();
-        let opencode = guide.find("opencode (built-in default)").unwrap();
+        let opencode = guide.find("opencode: model:").unwrap();
         let anthropic = guide.find("anthropic: model:").unwrap();
         let codex = guide.find("codex: model:").unwrap();
         assert!(opencode < anthropic && anthropic < codex, "{guide}");
-    }
-
-    #[test]
-    fn catalog_serves_model_true_without_cache() {
-        // Cold cache: absence of evidence is not evidence of retirement.
-        let dir = std::env::temp_dir().join(format!("dex-cold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
-        let serves = super::catalog_serves_model("any-model-id");
-        match prev {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
-        assert!(serves);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3810,6 +3874,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(dir.join("dex")).unwrap();
         std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\n",
+        )
+        .unwrap();
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::remove_var("OPENCODE_API_KEY");
         // The provider's own env var is the shell path.
@@ -3821,7 +3890,7 @@ pub(crate) mod tests {
         // The scoped deposit place wins over the env var.
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: opencode\nproviders:\n  opencode:\n    api_key: deposited\n",
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\nproviders:\n  opencode:\n    api_key: deposited\n",
         )
         .unwrap();
         assert_eq!(
@@ -3829,7 +3898,11 @@ pub(crate) mod tests {
             "deposited"
         );
         // Missing everywhere: the error points at the canonical names.
-        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\n",
+        )
+        .unwrap();
         std::env::remove_var("OPENCODE_API_KEY");
         let err = match LlmConfig::from_env(None, None, None, &[]) {
             Err(e) => e.to_string(),
@@ -3864,7 +3937,11 @@ pub(crate) mod tests {
         std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::fs::write(dir.join("config.yaml"), "active_provider: anthropic\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: anthropic\nmodel: anthropic/claude-sonnet-4-5\ncontext_window: 1000\n",
+        )
+        .unwrap();
         // Cache-less: the pinned var is the shell path; the bare provider
         // pick gets a model of its own family and the native wire.
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant");
@@ -3875,7 +3952,7 @@ pub(crate) mod tests {
         // The scoped deposit place wins over the env var.
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: anthropic\nproviders:\n  anthropic:\n    api_key: deposited\n",
+            "active_provider: anthropic\nmodel: anthropic/claude-sonnet-4-5\ncontext_window: 1000\nproviders:\n  anthropic:\n    api_key: deposited\n",
         )
         .unwrap();
         assert_eq!(
@@ -3883,13 +3960,21 @@ pub(crate) mod tests {
             "deposited"
         );
         // The primary knob (`model: anthropic`) picks the family default too.
-        std::fs::write(dir.join("config.yaml"), "model: anthropic\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: anthropic/claude-sonnet-4-5\ncontext_window: 1000\n",
+        )
+        .unwrap();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant");
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert_eq!(cfg.model, "claude-sonnet-4-5");
         assert_eq!(cfg.api, ApiProtocol::Anthropic);
         // Missing everywhere: the error points at the canonical names.
-        std::fs::write(dir.join("config.yaml"), "active_provider: anthropic\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: anthropic\nmodel: anthropic/claude-sonnet-4-5\ncontext_window: 1000\n",
+        )
+        .unwrap();
         std::env::remove_var("ANTHROPIC_API_KEY");
         let err = match LlmConfig::from_env(None, None, None, &[]) {
             Err(e) => e.to_string(),
@@ -3920,7 +4005,7 @@ pub(crate) mod tests {
         let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "active_provider: opencode\nbase_url: https://file.example/v1\nmodel: file-model\napi: openai-completions\ncustom_key: keep-me\n",
+            "active_provider: opencode\nbase_url: https://file.example/v1\nmodel: file-model\ncontext_window: 1000\napi: openai-completions\ncustom_key: keep-me\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", &path);
@@ -4046,7 +4131,11 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("dex-pin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write_routing_catalog(&dir);
-        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nmodel: opencode/m-zen\n",
+        )
+        .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
@@ -4108,7 +4197,7 @@ pub(crate) mod tests {
     fn generic_config(dir: &std::path::Path, providers_yaml: &str) {
         std::fs::write(
             dir.join("config.yaml"),
-            format!("active_provider: zai\n{providers_yaml}"),
+            format!("active_provider: zai\nmodel: zai/glm-x\n{providers_yaml}"),
         )
         .unwrap();
     }
@@ -4162,7 +4251,7 @@ pub(crate) mod tests {
         // Key falls back to the provider's own conventional env var.
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: zai\nproviders:\n  zai: {}\n",
+            "active_provider: zai\nmodel: zai/glm-x\nproviders:\n  zai: {}\n",
         )
         .unwrap();
         std::env::set_var("ZAI_TEST_KEY", "zsk-from-env");
@@ -4266,7 +4355,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(dir.join("dex")).unwrap();
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: opencode\nmodel: go/m-z9\n",
+            "active_provider: opencode\nmodel: go/m-z9\ncontext_window: 1000\n",
         )
         .unwrap();
         // Empty catalog dir: no routing interference, unknown model stays.
@@ -4320,7 +4409,11 @@ pub(crate) mod tests {
             .to_string(),
         )
         .unwrap();
-        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nmodel: opencode/m-zen\n",
+        )
+        .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
@@ -4377,7 +4470,7 @@ pub(crate) mod tests {
         // Persisted state after `/model go/m-go`: stripped id + pinned URL.
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: opencode\nbase_url: https://opencode.ai/zen/go/v1\nmodel: m-go\n",
+            "active_provider: opencode\nbase_url: https://opencode.ai/zen/go/v1\nmodel: m-go\ncontext_window: 1000\n",
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
@@ -4491,7 +4584,7 @@ pub(crate) mod tests {
         .unwrap();
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: zai\nproviders:\n  zai: {}\n",
+            "active_provider: zai\nmodel: zai/glm-x\nproviders:\n  zai: {}\n",
         )
         .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -4548,7 +4641,7 @@ pub(crate) mod tests {
         let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "provider: opencode\nproviders:\n  opencode:\n    api_key: deposited\n",
+            "provider: opencode\nmodel: opencode/m\ncontext_window: 1000\nproviders:\n  opencode:\n    api_key: deposited\n",
         )
         .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -4624,7 +4717,11 @@ pub(crate) mod tests {
         ] {
             std::env::remove_var(key);
         }
-        std::fs::write(dir.join("config.yaml"), "active_provider: opencode\n").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\n",
+        )
+        .unwrap();
         assert!(
             !LlmConfig::from_env(None, None, None, &[])
                 .unwrap()
@@ -4632,7 +4729,7 @@ pub(crate) mod tests {
         );
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: opencode\napi: openai-completions\n",
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\napi: openai-completions\n",
         )
         .unwrap();
         assert!(
@@ -4642,7 +4739,7 @@ pub(crate) mod tests {
         );
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: opencode\nproviders:\n  opencode:\n    api: openai-completions\n",
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\nproviders:\n  opencode:\n    api: openai-completions\n",
         )
         .unwrap();
         assert!(
@@ -4676,7 +4773,7 @@ pub(crate) mod tests {
         write_generic_catalog(&dir);
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: zai\nproviders:\n  zai:\n    api_key: zsk-deposit\n    base_url: https://custom.zai.example/v1\n    api: openai-completions\n    headers:\n      X-Prov: prov\n",
+            "active_provider: zai\nmodel: zai/glm-x\nproviders:\n  zai:\n    api_key: zsk-deposit\n    base_url: https://custom.zai.example/v1\n    api: openai-completions\n    headers:\n      X-Prov: prov\n",
         )
         .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -4895,7 +4992,7 @@ pub(crate) mod tests {
         std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
         std::fs::write(
             dir.join("config.yaml"),
-            "active_provider: opencode\nthinking_effort: low\n",
+            "active_provider: opencode\nmodel: opencode/m\ncontext_window: 1000\nthinking_effort: low\n",
         )
         .unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -4953,7 +5050,7 @@ pub(crate) mod tests {
         // File `model: zai/glm-5.3`
         std::fs::write(
             &path,
-            "providers:\n  zai:\n    api_key: zk\n    base_url: https://zai.example/v1\nmodel: zai/glm-5.3\n",
+            "providers:\n  zai:\n    api_key: zk\n    base_url: https://zai.example/v1\nmodel: zai/glm-5.3\ncontext_window: 1000\n",
         )
         .unwrap();
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
@@ -4962,17 +5059,22 @@ pub(crate) mod tests {
         assert_eq!(cfg.base_url, "https://zai.example/v1");
         assert_eq!(cfg.api_key, "zk");
 
-        // `DEX_MODEL` beats the file without touching it.
+        // `DEX_MODEL` beats the file without touching it (its window rides
+        // the env pin).
+        std::env::set_var("DEX_CONTEXT_WINDOW", "1000");
         std::env::set_var("DEX_MODEL", "zai/kimi-k2");
         let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
         assert!(matches!(cfg.provider, Provider::Generic(ref n) if n == "zai"));
         assert_eq!(cfg.model, "kimi-k2");
 
-        // A bare provider name selects the provider with the default model.
+        // A bare provider name no longer implies a default model: it is
+        // rejected, naming the `provider/<model>` form to use.
         std::env::set_var("DEX_MODEL", "zai");
-        let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
-        assert!(matches!(cfg.provider, Provider::Generic(ref n) if n == "zai"));
-        assert_eq!(cfg.model, "gpt-5.6-luna");
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("bare provider name must not resolve"),
+        };
+        assert!(err.contains("'zai' names a provider but no model"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5217,11 +5319,11 @@ pub(crate) mod tests {
             "                                                         missing — run `dex update --models`\n",
             "\n",
             "provider   opencode                                      built-in default\n",
-            "model      gpt-5.6-luna                                  built-in default\n",
+            "model      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
             "base_url   https://opencode.ai/zen/v1                    built-in default\n",
             "api key    (hidden)                                      OPENCODE_API_KEY (environment)\n",
             "protocol   openai-responses                              default (auto-fallback to completions)\n",
-            "context    128000 tokens                                 built-in default\n",
+            "context    UNKNOWN tokens                                no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW\n",
               "online     off (set DEX_ONLINE_COMPACTION=1)             built-in default (off)\n",
             "obs pack   off                                           built-in default (off)\n",
             "thinking   (unset)                                       model default\n",
@@ -5230,7 +5332,12 @@ pub(crate) mod tests {
             "headers    0                                             none\n",
             "endpoints  go, zen                                       available to /model routing\n",
             "\n",
-            "resolve    OK                                            config builds cleanly\n",
+            "resolve    ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
+            "                                                           opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n",
+            "                                                           anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
+            "                                                           custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
+            "                                                           codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
+            "                                                         config: /tmp/dex-doctor-snapshot/missing.yaml\n"
         );
         assert_eq!(out, expected, "doctor output drifted");
     }
