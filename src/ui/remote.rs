@@ -1669,6 +1669,18 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             let name = super::theme::cycle_voice();
             app.notice = Some((format!("voice: {name}"), Instant::now()));
         }
+        // Alt+Up while working: pull the newest queued message back into the
+        // composer to edit it. Hoisted above the slash-popup arm so the
+        // popup's highlight navigation can't swallow the "Alt+Up again for
+        // more" affordance. Best-effort — an item already accepted at a
+        // model boundary is gone from the queue and renders as a transcript
+        // block instead.
+        KeyCode::Up
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && (!app.pending_steering.is_empty() || !app.pending_followups.is_empty()) =>
+        {
+            recall_queued(remote);
+        }
         _ if popup_open(app) => match key.code {
             KeyCode::Esc => {
                 // Discard the drafted slash command and close the popup
@@ -1691,7 +1703,9 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
                 // Bare picker command (`/model`, `/provider`, `/resume`):
                 // first Enter expands to `"<cmd> "` and shows the popup
                 // instead of submitting the bare form (which would only
-                // print info into the transcript).
+                // print info into the transcript). Same expansion applies
+                // to a bare picker command recalled from history — the
+                // recalled line is the text, so expand it here too.
                 if expand_bare_command(app) {
                     return;
                 }
@@ -1736,16 +1750,6 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         }
         KeyCode::PageDown => {
             scroll_transcript(app, 20);
-        }
-        // Alt+Up while working: pull the newest queued message back into the
-        // composer to edit it. Best-effort — an item already accepted at a
-        // model boundary is gone from the queue and renders as a transcript
-        // block instead.
-        KeyCode::Up
-            if key.modifiers.contains(KeyModifiers::ALT)
-                && (!app.pending_steering.is_empty() || !app.pending_followups.is_empty()) =>
-        {
-            recall_queued(remote);
         }
         KeyCode::Up => {
             if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -3270,5 +3274,36 @@ mod tests {
         assert_eq!(remote.app.history.len(), 1, "no duplicate entry");
         assert!(remote.app.input.text().is_empty());
         assert_eq!(remote.app.history_index, None, "walk closed after submit");
+    }
+
+    #[test]
+    fn alt_up_reaches_recall_while_popup_is_open() {
+        // A queued slash command in the composer opens the popup; Alt+Up
+        // must still reach the recall arm instead of being swallowed by the
+        // popup's highlight navigation (plain Up keeps moving the popup).
+        let mut remote = test_remote();
+        remote.app.input = crate::ui::input::InputField::from_text("/cl");
+        remote.app.slash_selected = 1;
+        remote.app.pending_steering.push("queued steering".into());
+        assert!(popup_open(&remote.app), "slash draft opens the popup");
+
+        // The fixture's client points at a dead port, so the recall POST
+        // fails and reports it — reaching that report proves Alt+Up got
+        // past the popup to the recall arm; queue and highlight untouched.
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            remote.app.pending_steering,
+            vec!["queued steering".to_string()],
+            "Alt+Up reached the recall arm"
+        );
+        assert_eq!(remote.app.input.text(), "/cl");
+        assert_eq!(remote.app.slash_selected, 1, "popup did not move it");
+        assert!(
+            !remote.app.transcript.is_empty(),
+            "recall failure was reported"
+        );
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.slash_selected, 0, "plain Up moves the popup");
     }
 }
