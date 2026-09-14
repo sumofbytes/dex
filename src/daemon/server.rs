@@ -3557,7 +3557,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -3739,7 +3739,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -4105,7 +4105,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
