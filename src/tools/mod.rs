@@ -235,6 +235,16 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             permission: PermissionRequirement::Shell,
         });
     }
+    metadata_native(name)
+}
+
+/// Native gate for a built-in, ignoring extension shadows. `dispatch_tool`
+/// uses this when re-dispatching the original from inside a shadow
+/// (`dex.tools.call_original`): the shadow call already cleared its own
+/// Shell gate, and the native requirement is what the built-in itself needs
+/// — re-reading the shadow's row here would prompt twice for one wrapped
+/// call in `ask-shell` mode.
+fn metadata_native(name: &str) -> Option<ToolMetadata> {
     Some(match name {
         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "obs_recall" | "update_plan" => {
             READONLY
@@ -1776,12 +1786,14 @@ pub(crate) async fn execute_with_shell(
     // Delegation tools skip it — the child allowlist sees the call the
     // parent issued, unmodified by a third party.
     let owned_args: Map<String, Value>;
+    let mut hooks_ran = false;
     // Zero-cost when no extension subscribes: the args pass through uncloned.
     let args = if crate::agent::subagent::is_delegation(name)
         || !crate::extensions::has_event_handlers("tool.before")
     {
         args
     } else {
+        hooks_ran = true;
         match crate::extensions::apply_before_hooks(name, args, cancel, policy, filter).await {
             crate::extensions::BeforeOutcome::Proceed { args, mutated_by } => {
                 for ext in &mutated_by {
@@ -1810,6 +1822,18 @@ pub(crate) async fn execute_with_shell(
         name, args, then_run, cancel, policy, filter, shell_out, true,
     )
     .await;
+    // A tool.before hook already saw the args even when a later gate denies
+    // the call: record that observation, so the audit trail shows a third
+    // party witnessed a call it never got to influence.
+    if hooks_ran {
+        if let Err(ToolError::Denied(reason)) = &result {
+            audit(
+                &format!("{name}[tool.before]"),
+                args,
+                &format!("observed; call denied: {reason}"),
+            );
+        }
+    }
     // Run `then_run` in this same call so the mutation and its
     // verification arrive as one observation, instead of costing a second
     // provider round-trip that re-sends the whole prefix just to learn whether
@@ -1901,7 +1925,13 @@ async fn dispatch_tool(
         }
         return crate::agent::subagent::execute_delegation(name, args, cancel, policy).await;
     }
-    let requirement = match metadata(name) {
+    // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
+    // Shell row must not raise the gate again — use the native requirement.
+    let requirement = match if resolve_shadow {
+        metadata(name)
+    } else {
+        metadata_native(name)
+    } {
         // MCP tools are external processes: their `metadata()` row already
         // carries the most restrictive gate (same as shell), so the separate
         // `mcp__` requirement check is gone from here.

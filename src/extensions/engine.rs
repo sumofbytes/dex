@@ -34,6 +34,13 @@ pub(crate) const MAX_TOOL_TIMEOUT_SECS: u64 = 120;
 /// observing layer, so a wedged hook stalls dispatch at most this long
 /// before the fail-open default (§8) skips it.
 pub(crate) const HOOK_TIMEOUT_SECS: u64 = 10;
+/// Budget for the load-time setup run (chunk + registration): a looping
+/// setup function must not hang the refresh — and one-shot startup blocks
+/// on it (`main.rs`), so an unbounded load would hang the whole process.
+pub(crate) const LOAD_TIMEOUT: Duration = Duration::from_secs(HOOK_TIMEOUT_SECS);
+/// Per-VM memory ceiling: without it `string.rep`/table growth OOM-aborts
+/// the whole daemon instead of failing one extension call.
+const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// Grace for an aborted worker to unwind to `Done` after its in-flight host
 /// call is dropped: the worker may be stuck in a `pcall` loop swallowing the
 /// abort error, so the task never waits past this.
@@ -406,6 +413,11 @@ async fn abort_wait(rx: &mut mpsc::UnboundedReceiver<WorkerMsg>) {
 fn worker_loop(manifest: Manifest, dir: PathBuf, mut rx: mpsc::Receiver<Request>) {
     let lua = Lua::new();
 
+    // Cap the VM's memory: an allocation past the ceiling raises a Lua
+    // memory error (caught like any runtime error) instead of OOM-killing
+    // the whole process.
+    lua.set_memory_limit(LUA_MEMORY_LIMIT)
+        .expect("memory limit");
     strip_sandbox(&lua);
     let regs = Rc::new(RefCell::new(WorkerRegistrations::default()));
     let dex = build_dex_table(&lua, &manifest, &regs);
@@ -464,6 +476,32 @@ fn valid_segment(name: &str) -> bool {
 }
 
 fn run_load(
+    lua: &Lua,
+    dex: &Table,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+    source: &str,
+) -> Result<ChunkExports, String> {
+    // The load-time budget: same instruction-count hook as `run_call`, so a
+    // looping setup function fails the extension instead of hanging the
+    // refresh (and one-shot startup, which blocks on it).
+    let started = Instant::now();
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(10_000),
+        move |_, _| {
+            if started.elapsed() > LOAD_TIMEOUT {
+                return Err(LuaError::RuntimeError("extension load timed out".into()));
+            }
+            Ok(VmState::Continue)
+        },
+    )
+    .expect("hook arm");
+    let result = run_load_inner(lua, dex, manifest, regs, source);
+    lua.remove_hook();
+    result
+}
+
+fn run_load_inner(
     lua: &Lua,
     dex: &Table,
     manifest: &Manifest,
