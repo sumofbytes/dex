@@ -32,8 +32,8 @@ pub(crate) struct Experiment {
     /// `dependencies_met`.
     pub(crate) name: &'static str,
     pub(crate) enabled: fn() -> bool,
-    /// Tool schemas registered while enabled (empty when the experiment
-    /// adds no tools).
+    /// Tool schemas; the registry registers them only while the
+    /// experiment is enabled (empty when the experiment adds no tools).
     pub(crate) tool_defs: fn() -> Vec<ToolDefinition>,
     /// `dex doctor` row; `None` when the experiment prints no row (e.g. a
     /// gate-dependent row that is off).
@@ -89,11 +89,14 @@ pub(crate) fn dependencies_met(key: &str) -> bool {
         .is_none_or(|e| e.depends_on.iter().all(|d| is_enabled(d)))
 }
 
-/// Tool schemas for every enabled experiment, in registry order.
+/// Tool schemas for every enabled experiment, in registry order. The
+/// gate is checked once here; experiment `tool_defs` only build schemas.
 pub(crate) fn tool_definitions() -> Vec<ToolDefinition> {
     let mut out = Vec::new();
     for experiment in EXPERIMENTS {
-        out.extend((experiment.tool_defs)());
+        if (experiment.enabled)() {
+            out.extend((experiment.tool_defs)());
+        }
     }
     out
 }
