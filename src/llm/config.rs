@@ -5396,7 +5396,7 @@ pub(crate) mod tests {
         let expected = format!(
             "{}{}{}",
             concat!(
-                "dex 0.7.0\n",
+                "dex 0.8.0\n",
                 "\n",
                 "config            /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
                 "catalog           /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
