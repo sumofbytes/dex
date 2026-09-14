@@ -8,13 +8,6 @@ use std::collections::BTreeMap;
 
 use crate::core::types::{ApiProtocol, Provider};
 
-/// Model used when `--model` and config file `model:` are both unset.
-pub(crate) const DEFAULT_MODEL: &str = "gpt-5.6-luna";
-
-/// Context-window fallback when `DEX_CONTEXT_WINDOW` is unset and the
-/// models.dev catalog has no entry for the model.
-pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
-
 impl Provider {
     /// Base URL when `--base-url` and config-file
     /// `base_url` are all unset. Bare model picks route themselves to the
@@ -30,16 +23,6 @@ impl Provider {
             // `/v1/messages` (see `anthropic::messages_url`).
             Self::Anthropic => Some("https://api.anthropic.com"),
             Self::Generic(_) => None,
-        }
-    }
-
-    /// Model used for a bare provider pick (`--model anthropic` with no
-    /// model id). Defaults to [`DEFAULT_MODEL`] for OpenAI-compatible
-    /// providers; native providers need one of their own family.
-    pub(crate) fn default_model(&self) -> &'static str {
-        match self {
-            Self::Anthropic => "claude-sonnet-4-5",
-            _ => DEFAULT_MODEL,
         }
     }
 
@@ -251,9 +234,6 @@ mod tests {
             Some("https://api.anthropic.com")
         );
         assert_eq!(Provider::Generic("zai".into()).default_base_url(), None);
-        // Bare provider picks get a model of their own family.
-        assert_eq!(Provider::Anthropic.default_model(), "claude-sonnet-4-5");
-        assert_eq!(Provider::OpenCode.default_model(), DEFAULT_MODEL);
         // Native providers pin their own wire; OpenAI-compatible ones keep
         // the responses default + completions fallback.
         assert_eq!(
