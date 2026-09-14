@@ -2008,6 +2008,7 @@ mod tests {
             history_draft: String::new(),
             slash_selected: 0,
             connection: None,
+            daemon_url: None,
             assistant_open: false,
             show_thinking: false,
             thinking_open: false,

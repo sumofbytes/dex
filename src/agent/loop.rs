@@ -849,23 +849,87 @@ where
     C: ModelClient + 'static,
     X: CancellationSource + Clone + 'static,
 {
-    // Lifecycle hooks (plan §7): `turn.start` before anything runs,
-    // `turn.end` on every exit path with the outcome. Fire-and-forget —
-    // these events carry no directive the host acts on. The hook host gets
-    // this turn's policy, so a nested `dex.tools.call` from a hook is
-    // gated exactly like a model-issued one.
+    // Lifecycle hooks (plan §7): `before_agent_start` may append to the
+    // system prompt for this turn (read-only influence, Pi's prompt
+    // customizer); `turn.start` before anything runs; `turn.end` on every
+    // exit path with the outcome. Fire-and-forget — these events carry no
+    // directive the host acts on. The hook host gets this turn's policy, so
+    // a nested `dex.tools.call` from a hook is gated exactly like a
+    // model-issued one.
     let turn_policy = Policy::turn(rt.config.permission, rt.console);
     let cancel = rt.cancel.clone();
     let filter = rt.filter;
+    // `before_agent_start` system-prompt append (plan §7 P2): applied to the
+    // leading System message for the duration of the turn, restored before
+    // the result leaves — the journal never stores System role messages, so
+    // nothing persists into later turns.
+    let appends = crate::extensions::apply_before_agent_start(&cancel, &turn_policy, filter).await;
+    // Some(original) = the appendix was applied and must be restored.
+    let saved_system: Option<Option<String>> = if appends.is_empty() {
+        None
+    } else {
+        let appendix = appends.join("\n\n");
+        match rt.messages.first_mut() {
+            Some(first) if first.role == crate::core::types::Role::System => {
+                let original = first.content.clone();
+                first.content = Some(format!(
+                    "{}\n\n--- Extensions ---\n{}",
+                    original.clone().unwrap_or_default(),
+                    appendix
+                ));
+                Some(original)
+            }
+            _ => None,
+        }
+    };
     crate::extensions::fire_event_global(
         "turn.start",
         serde_json::json!({}),
         &cancel,
         &turn_policy,
-        rt.filter,
+        filter,
     )
     .await;
-    let result = process_turn_inner(rt).await;
+    // Destructure so `messages` survives the call: the appendix restore below
+    // needs it back, and inner's returns are many (a drop guard cannot hold a
+    // second &mut).
+    let AgentRuntime {
+        config,
+        messages,
+        state,
+        steering_rx,
+        steering_accepted_tx,
+        session,
+        client,
+        cancel: cancel_ref,
+        console,
+        filter,
+        agent_ctx,
+        tool_budget,
+    } = rt;
+    let result = process_turn_inner(ProcessTurnArgs {
+        config,
+        messages: &mut *messages,
+        state,
+        steering_rx,
+        steering_accepted_tx,
+        session,
+        client,
+        cancel: cancel_ref,
+        console,
+        filter,
+        agent_ctx,
+        tool_budget,
+    })
+    .await;
+    // Restore the System message the appendix rode on: per-turn scope.
+    if let Some(original) = saved_system {
+        if let Some(first) = messages.first_mut() {
+            if first.role == crate::core::types::Role::System {
+                first.content = original;
+            }
+        }
+    }
     let payload = match &result {
         Ok(_) => serde_json::json!({ "ok": true }),
         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
@@ -874,16 +938,28 @@ where
     result
 }
 
+/// The unbundled runtime `process_turn_inner` works on: same fields as
+/// [`AgentRuntime`], destructured once in `process_turn` so the turn wrapper
+/// keeps mutable access to `messages` after the call (lifecycle-hook
+/// restoration).
+struct ProcessTurnArgs<'a, C, X> {
+    config: &'a LlmConfig,
+    messages: &'a mut Vec<ChatMessage>,
+    state: &'a mut ToolState,
+    steering_rx: Option<&'a mut mpsc::Receiver<QueueMsg>>,
+    steering_accepted_tx: Option<&'a mpsc::Sender<String>>,
+    session: Option<&'a mut Session>,
+    client: &'a C,
+    cancel: &'a X,
+    console: &'a Console,
+    filter: Option<&'a ToolFilter>,
+    agent_ctx: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
+    tool_budget: Option<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn process_turn_inner<C, X>(
-    rt: AgentRuntime<'_, C, X>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
-where
-    C: ModelClient + 'static,
-    X: CancellationSource + Clone + 'static,
-{
-    // Unbundle so the body below stays the single-agent code it was —
-    // byte-identical behavior for `filter: None`.
-    let AgentRuntime {
+    ProcessTurnArgs {
         config,
         messages,
         state,
@@ -896,7 +972,12 @@ where
         filter,
         agent_ctx,
         tool_budget,
-    } = rt;
+    }: ProcessTurnArgs<'_, C, X>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: ModelClient + 'static,
+    X: CancellationSource + Clone + 'static,
+{
     let _working = SpinnerGuard::start(console, "Working");
     let mut last_tools: Vec<String> = Vec::new();
     let mut last_usage: Option<u64> = state.last_usage;
@@ -1344,6 +1425,83 @@ pub(crate) mod tests {
         // Drop the fixture: the process-global manager would otherwise keep
         // the turn.end hook writing a marker file on every later turn in
         // this test process.
+        crate::extensions::global_manager().reset_for_tests().await;
+    }
+
+    /// `before_agent_start` appends to the System prompt for the turn's
+    /// model requests and is restored when the turn ends (per-turn scope).
+    #[tokio::test]
+    async fn before_agent_start_appends_system_prompt_and_restores() {
+        let _lock = TEST_TURN_ENV_LOCK.lock().await;
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
+        let lua = "return function(dex)\n  dex.events.on(\"before_agent_start\", function(ctx, ev)\n    return { append = \"PROMPT-MARKER\" }\n  end)\nend\n";
+        let manifest = "manifest_version: 1\nid: promptmark\nversion: 0.1.0\ncapabilities: []\n";
+        let root = crate::extensions::tests::fixture_exts(&[("promptmark", manifest, lua)]);
+        crate::extensions::global_manager()
+            .refresh_with(std::slice::from_ref(&root))
+            .await;
+
+        // Recording client: capture the first request's system message.
+        #[derive(Clone)]
+        struct CaptureModel(Arc<std::sync::Mutex<Option<String>>>);
+        impl ModelClient for CaptureModel {
+            async fn complete(
+                &self,
+                messages: &[ChatMessage],
+                _with_tools: bool,
+                _sink: Option<mpsc::Sender<SinkLine>>,
+                _cancel: &(dyn CancellationSource + Send + Sync),
+            ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+                let first = messages.first().map(|m| m.content.clone());
+                *self.0.lock().unwrap() = first.flatten();
+                Ok(Turn {
+                    message: ChatMessage::assistant("done"),
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 0,
+                        cached_tokens: None,
+                    }),
+                    stop_reason: None,
+                })
+            }
+        }
+
+        let config = test_config();
+        let system_text = "base persona".to_string();
+        let mut messages = vec![ChatMessage::system(&system_text)];
+        let captured = Arc::new(std::sync::Mutex::new(None::<String>));
+        let mut state = ToolState::default();
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: None,
+            client: &CaptureModel(captured.clone()),
+            cancel: &NeverCancel,
+            console: &crate::core::console::Console::none(),
+            filter: None,
+            agent_ctx: None,
+            tool_budget: None,
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        // The request the model saw carried the appendix...
+        let seen = captured.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            seen.contains("PROMPT-MARKER") && seen.contains("base persona"),
+            "system prompt must carry the appendix during the turn: {seen:?}"
+        );
+        // ...and the session's System message is restored afterwards.
+        assert_eq!(
+            messages.first().and_then(|m| m.content.clone()).as_deref(),
+            Some("base persona"),
+            "appendix must not persist past the turn"
+        );
+        std::fs::remove_dir_all(&root).ok();
         crate::extensions::global_manager().reset_for_tests().await;
     }
 

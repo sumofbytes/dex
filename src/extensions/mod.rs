@@ -701,6 +701,44 @@ impl ExtensionManager {
         }
     }
 
+    /// `before_agent_start` chain: each handler may return `{ append = text }`
+    /// (or set `ev.append`); strings concatenate in load order. Fail-open: a
+    /// handler error is logged and skipped — a broken hook must not stall the
+    /// turn before it starts. Read-only influence: no gate interaction (the
+    /// hook host still gets the turn's policy for nested `dex.tools.call`).
+    pub(crate) async fn apply_before_agent_start(&self, host: &HostCtx<'_>) -> Vec<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"before_agent_start".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        let mut appends = Vec::new();
+        for id in subs {
+            let envelope = match self
+                .run_event(&id, "before_agent_start", serde_json::json!({}), host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' before_agent_start failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(append) = envelope.get("append").and_then(|v| v.as_str()) {
+                if !append.trim().is_empty() {
+                    appends.push(append.to_string());
+                }
+            }
+        }
+        appends
+    }
+
     /// `session.before_compact` chain: merged across handlers — any cancel
     /// wins, instruction strings concatenate in load order, the first
     /// summary replacement wins. Fail-open: a handler error is logged and
@@ -974,6 +1012,24 @@ pub(crate) async fn fire_event_global(
         filter,
     };
     global_manager().fire_event(event, payload, &host).await;
+}
+
+/// `before_agent_start` for `process_turn`: appends to the system prompt
+/// for this turn (see the manager method for merge/fail-open semantics).
+pub(crate) async fn apply_before_agent_start(
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+) -> Vec<String> {
+    if !has_event_handlers("before_agent_start") {
+        return Vec::new();
+    }
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager().apply_before_agent_start(&host).await
 }
 
 /// `session.before_compact` for `compact_history`. The host runs without a
