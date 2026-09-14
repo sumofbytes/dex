@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::online::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
+use crate::agent::online_compaction::{
+    format_plan_snapshot, parse_plan_progress, parse_plan_steps,
+};
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::console::Console;
 use crate::core::format::{clamp_lines, clamp_lines_checked, clip_chars};
@@ -304,7 +306,7 @@ fn metadata_native(name: &str) -> Option<ToolMetadata> {
 
 /// `update_plan`: validate the full plan replacement and echo the snapshot.
 /// Pure — the boundary bookkeeping and the compaction decision live in the
-/// agent loop ([`crate::agent::online`]).
+/// agent loop ([`crate::agent::online_compaction`]).
 fn tool_update_plan(args: &Map<String, Value>) -> Result<String, ToolError> {
     let steps = args.get("steps").ok_or(ToolError::Missing("steps"))?;
     let steps = parse_plan_steps(steps).map_err(ToolError::InvalidArgument)?;
