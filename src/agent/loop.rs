@@ -6,10 +6,9 @@ use tokio::sync::mpsc;
 use crate::agent::compaction::{
     compact_history, effective_tokens, estimate_tokens, KEEP_RECENT_MESSAGES,
 };
-use crate::agent::online::{
-    analyze_plan_transition, cache_debt_for_ratio, decide_compaction, online_compaction_enabled,
-    parse_plan_progress, parse_plan_steps, post_compaction_reminder, CompactionEconomics, PlanStep,
-    DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
+use crate::agent::online_compaction::{
+    cache_debt_for_ratio, decide_compaction, online_compaction_enabled, post_compaction_reminder,
+    CompactionEconomics, DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
 };
 use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::core::console::{
@@ -401,10 +400,10 @@ async fn compaction_gate(
         let eff = effective_tokens(projected, ephemerals, true);
         let need_by_tokens = eff > config.compaction_threshold();
         // The message-count fallback is a global cap — exactly what the
-        // online compaction economics replace. With
-        // `DEX_ONLINE_COMPACTION=1` the count cap is dropped: short
-        // turns compact at plan boundaries when economical, and the
-        // token threshold stays as window protection.
+        // online compaction economics replace. With the experiment on,
+        // the count cap is dropped: short turns compact at plan
+        // boundaries when economical, and the token threshold stays as
+        // window protection.
         let need_by_count =
             !online_compaction_enabled() && messages.len() > 1 + KEEP_RECENT_MESSAGES;
         if !need_by_tokens && !need_by_count {
@@ -431,7 +430,9 @@ async fn compaction_gate(
                     // survives (the model was not asked to re-plan).
                     let (debt, repayment) =
                         cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()));
-                    state.online.record_threshold_compaction(debt, repayment);
+                    state
+                        .online_compaction
+                        .record_threshold_compaction(debt, repayment);
                 }
                 continue;
             }
@@ -620,12 +621,12 @@ async fn process_tool_result(
         }
         outcome.text
     };
-    // Evidence-preserving reducer (`DEX_EVIDENCE_REDUCER=1`):
-    // delegate the first read of a large build/test log to the
-    // configured reducer model and verify every quoted line
-    // byte for byte against the archived raw output. Any
-    // uncheckable receipt falls open: the raw (clamped) result
-    // is kept untouched and the observation pack handles it.
+    // Evidence-preserving reducer: delegate the first read of a
+    // large build/test log to the configured reducer model and
+    // verify every quoted line byte for byte against the archived
+    // raw output. Any uncheckable receipt falls open: the raw
+    // (clamped) result is kept untouched and the observation pack
+    // handles it.
     let processed = crate::agent::evidence_reducer::process(
         config,
         policy
@@ -675,45 +676,23 @@ async fn process_tool_result(
         )
         .await;
     }
-    // Online context compaction (`DEX_ONLINE_COMPACTION=1`):
-    // a completed plan step is a boundary — a safe point where
-    // history can be compacted if the economics say the cache
-    // re-write pays for itself before the work ends. The
-    // boundary bookkeeping runs *before* the sink emit so
-    // plan-hygiene advice is part of the `result` the user sees;
-    // the compaction decision itself runs after the tool result
-    // is appended so the transcript keeps assistant →
-    // tool_result → reminder order (pi's reference aborts the
-    // turn instead; dex compacts inline, and the ordering must
-    // stay wire-valid). At most one boundary per turn is
+    // Online context compaction: a completed plan step is a boundary —
+    // a safe point where history can be compacted if the economics say
+    // the cache re-write pays for itself before the work ends. The
+    // boundary bookkeeping runs *before* the sink emit so plan-hygiene
+    // advice is part of the `result` the user sees; the compaction
+    // decision itself runs after the tool result is appended so the
+    // transcript keeps assistant → tool_result → reminder order (pi's
+    // reference aborts the turn instead; dex compacts inline, and the
+    // ordering must stay wire-valid). At most one boundary per turn is
     // evaluated.
-    let mut boundary: Option<Vec<PlanStep>> = None;
-    if online_compaction_enabled() && name == "update_plan" && ok {
-        // Parse once: the tool layer validated `steps`, so a
-        // parse failure here would be a state bug — fall back to
-        // ignoring the update rather than failing the turn.
-        let parsed = serde_json::from_str::<Value>(input).ok().and_then(|args| {
-            let steps = args.get("steps")?.clone();
-            let progress = parse_plan_progress(args.get("progress")).ok()?;
-            parse_plan_steps(&steps).ok().map(|steps| (steps, progress))
-        });
-        if let Some((steps, progress)) = parsed {
-            let transition = analyze_plan_transition(&state.online.plan, &steps);
-            if !transition.advice.is_empty() {
-                result.push('\n');
-                result.push_str(&transition.advice.join("\n"));
-            }
-            if transition.completed.is_empty() {
-                if state.online.plan != steps || state.online.progress != progress {
-                    state.online.plan = steps;
-                    state.online.progress = progress;
-                }
-            } else {
-                state.online.progress = progress;
-                boundary = Some(steps);
-            }
-        }
-    }
+    let boundary = crate::agent::online_compaction::capture_plan_update(
+        &mut state.online_compaction,
+        name,
+        ok,
+        input,
+        &mut result,
+    );
     note_sink(
         console,
         || {
@@ -755,7 +734,7 @@ async fn process_tool_result(
     messages.push(result_message);
     persist_pending(session, messages, persisted_cursor)?;
     if let Some(steps) = boundary {
-        state.online.record_boundary(steps);
+        state.online_compaction.record_boundary(steps);
         if !*online_boundary_handled {
             *online_boundary_handled = true;
             let context_tokens = effective_tokens(messages, ephemerals, true);
@@ -779,7 +758,7 @@ async fn process_tool_result(
                 archivable_tokens(messages, config),
                 NATIVE_SUMMARY_TOKEN_ESTIMATE,
                 context_tokens,
-                &state.online,
+                &state.online_compaction,
                 Some(config.context_window),
                 Some(config.cache_write_read_ratio()),
                 &economics,
@@ -806,9 +785,11 @@ async fn process_tool_result(
                         let (debt, repayment) = decision.cache_debt();
                         // The reminder lists the remaining goals — build
                         // it before record_compaction clears the plan.
-                        let reminder =
-                            post_compaction_reminder(&state.online.plan, &state.online.progress);
-                        state.online.record_compaction(debt, repayment);
+                        let reminder = post_compaction_reminder(
+                            &state.online_compaction.plan,
+                            &state.online_compaction.progress,
+                        );
+                        state.online_compaction.record_compaction(debt, repayment);
                         messages.push(ChatMessage::user_named(reminder, "compact"));
                         persist_pending(session, messages, persisted_cursor)?;
                         // The boundary fired silently before; a
@@ -1013,7 +994,7 @@ where
             // boundaries no longer describes the remaining effort.
             let injected = inject_steering(rx, steering_accepted_tx, messages).await;
             if injected {
-                state.online.record_correction();
+                state.online_compaction.record_correction();
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
             }
         }
@@ -1026,17 +1007,17 @@ where
         // and a budget probe never spawns the background refresh.
         let ephemerals = [crate::mcp::ephemeral_line()];
         // Observation pack projection: the provider-bound view replaces
-        // stale large tool results with placeholders. Built fresh from the
-        // intact history on every request; the stored session never changes.
-        // Token accounting (compaction threshold, online sampling) reads
-        // this view too — archived payloads must not pressure the window
-        // estimate after their grace period expires.
-        let projected = if crate::agent::obs_pack::observation_pack_enabled() {
-            let obs_session = policy.agent.as_ref().map(|ctx| ctx.session_path.clone());
-            crate::agent::obs_pack::project(&state.obs_projection, obs_session.as_deref(), messages)
-        } else {
-            messages.clone()
-        };
+        // stale large tool results with placeholders. Built fresh from
+        // the intact history on every request; the stored session never
+        // changes. Token accounting (compaction threshold, online
+        // sampling) reads this view too — archived payloads must not
+        // pressure the window estimate after their grace period expires.
+        let obs_session = policy.agent.as_ref().map(|ctx| ctx.session_path.clone());
+        let projected = crate::agent::obs_pack::project_messages(
+            &state.obs_projection,
+            obs_session.as_deref(),
+            messages,
+        );
         // Placeholder takeovers are otherwise invisible — the stored history
         // never changes — so surface each first takeover to the user.
         for note in state.obs_projection.take_notes() {
@@ -1055,15 +1036,14 @@ where
         )
         .await?;
 
-        // Online compaction bookkeeping (`DEX_ONLINE_COMPACTION=1`): sample
-        // the context size of every provider request — the growth rate and
-        // the per-boundary request counts feed the compaction economics.
+        // Online compaction bookkeeping: sample the context size of
+        // every provider request — the growth rate and the
+        // per-boundary request counts feed the compaction economics.
         // Sampled on the projected view: only bytes actually sent count.
-        if online_compaction_enabled() {
-            state
-                .online
-                .record_request(effective_tokens(&projected, &ephemerals, true));
-        }
+        crate::agent::online_compaction::sample_request(
+            &mut state.online_compaction,
+            effective_tokens(&projected, &ephemerals, true),
+        );
 
         // Async LLM call with prompt cancel: `select!(cancelled, complete)`
         // wakes within ~10ms. No message `to_vec` clone beyond what the call
@@ -1242,7 +1222,7 @@ where
             if let Some(rx) = steering_rx.as_mut() {
                 let injected = inject_steering(rx, steering_accepted_tx, messages).await;
                 if injected {
-                    state.online.record_correction();
+                    state.online_compaction.record_correction();
                     state.last_usage = last_usage;
                     continue;
                 }
@@ -1690,10 +1670,10 @@ pub(crate) mod tests {
         // unsynchronized set/remove flakes those assertions.
         let _lock = TEST_TURN_ENV_LOCK.lock().await;
         let _env = crate::session::EnvGuard(vec![(
-            crate::agent::online::ONLINE_COMPACTION_ENV,
-            std::env::var_os(crate::agent::online::ONLINE_COMPACTION_ENV),
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+            std::env::var_os(crate::agent::online_compaction::ONLINE_COMPACTION_ENV),
         )]);
-        std::env::set_var("DEX_ONLINE_COMPACTION", "1");
+        std::env::set_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV, "1");
         // The read tool clamps a single file to ~64 KiB (~16k tokens), so
         // shrink keep_recent below that: the archive then clears the
         // breakeven at the first demonstrated boundary (31 requests, 2
@@ -1743,7 +1723,7 @@ pub(crate) mod tests {
         // The boundary compacted: exactly one compaction recorded, the
         // re-plan reminder is in the transcript, and the big read output is
         // gone from the context.
-        assert_eq!(state.online.native_compaction_count(), 1);
+        assert_eq!(state.online_compaction.native_compaction_count(), 1);
         assert!(messages.iter().any(|m| {
             m.name.as_deref() == Some("compact")
                 && m.content
