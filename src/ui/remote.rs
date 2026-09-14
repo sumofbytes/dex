@@ -31,8 +31,8 @@ use crate::protocol::{
 use crate::session::Session;
 
 use super::slash::{
-    complete_slash, dismiss_slash, expand_bare_command, handle_slash, reset_session_state,
-    slash_suggestions, EXPAND_ON_ENTER,
+    complete_slash, dismiss_slash, expand_bare_command, handle_slash, popup_open,
+    reset_session_state, slash_suggestions, EXPAND_ON_ENTER,
 };
 use super::{
     append_sink_line, bump_thinking_stamps, close_thinking, deny_all_approvals, flush_assistant,
@@ -1669,7 +1669,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
             let name = super::theme::cycle_voice();
             app.notice = Some((format!("voice: {name}"), Instant::now()));
         }
-        _ if !app.busy && !slash_suggestions(app).is_empty() => match key.code {
+        _ if popup_open(app) => match key.code {
             KeyCode::Esc => {
                 // Discard the drafted slash command and close the popup
                 // without completing anything (busy+Esc still cancels).
@@ -3213,5 +3213,62 @@ mod tests {
         remote.app.busy = true;
         handle_key(&mut remote, ctrl_d());
         assert!(!remote.app.quit, "busy Ctrl+D must not quit the turn");
+    }
+
+    #[test]
+    fn up_arrow_walks_history_through_recalled_slash_entries() {
+        // A recalled "/clear" must not resurrect the slash popup and trap
+        // Up/Down: the walk continues to older entries, Esc keeps the
+        // recalled line instead of discarding it, and Down returns to the
+        // newest entry and then the live draft.
+        let mut remote = test_remote();
+        remote.app.history_push("/clear".into());
+        remote.app.history_push("plain draft".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "plain draft");
+        assert!(!popup_open(&remote.app), "no popup while walking");
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "/clear");
+        assert!(
+            !popup_open(&remote.app),
+            "recalled slash entry must not trap Up in the popup"
+        );
+
+        handle_key(&mut remote, esc_key());
+        assert_eq!(
+            remote.app.input.text(),
+            "/clear",
+            "Esc mid-walk keeps the recalled line"
+        );
+
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "plain draft");
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.input.text(),
+            "",
+            "Down past newest restores draft"
+        );
+        assert_eq!(remote.app.history_index, None);
+    }
+
+    #[test]
+    fn enter_on_recalled_slash_entry_submits_it() {
+        // Enter on a recalled "/clear" executes it exactly like typed input
+        // (no popup completion in the way): one history entry, no duplicate,
+        // walk closed, composer emptied.
+        let mut remote = test_remote();
+        remote.app.history_push("/clear".into());
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.history.last().map(String::as_str),
+            Some("/clear")
+        );
+        assert_eq!(remote.app.history.len(), 1, "no duplicate entry");
+        assert!(remote.app.input.text().is_empty());
+        assert_eq!(remote.app.history_index, None, "walk closed after submit");
     }
 }
