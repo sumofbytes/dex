@@ -371,6 +371,7 @@ impl App {
         if self.history.is_empty() {
             return;
         }
+        self.slash_selected = 0;
         if self.history_index.is_none() {
             self.history_draft = self.input.text();
         }
@@ -383,6 +384,7 @@ impl App {
     }
 
     pub(crate) fn history_down(&mut self) {
+        self.slash_selected = 0;
         match self.history_index {
             None => {}
             Some(0) => {
@@ -2478,5 +2480,20 @@ mod tests {
             assert!(!crate::ui::slash::dismiss_slash(&mut app));
             assert_eq!(app.input.text(), input);
         }
+    }
+
+    #[test]
+    fn history_walk_resets_slash_selection() {
+        // A walk replaces the composer wholesale; a stale popup highlight
+        // would strand past filtered results once the user types again.
+        let mut app = test_app();
+        app.history.push("/clear".into());
+        app.history.push("plain".into());
+        app.slash_selected = 3;
+        app.history_up();
+        assert_eq!(app.slash_selected, 0);
+        app.slash_selected = 3;
+        app.history_down();
+        assert_eq!(app.slash_selected, 0);
     }
 }
