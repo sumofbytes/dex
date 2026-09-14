@@ -11,6 +11,7 @@
 //! request, so the stored session stays untouched and recall keeps working
 //! across compaction and resume.
 
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +19,9 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use crate::agent::experiments::{DoctorCtx, DoctorRow};
+use crate::core::types::{ChatMessage, FunctionDef, ToolDefinition};
 
 /// Only tool results larger than this participate.
 pub(crate) const THRESHOLD_BYTES: usize = 10 * 1024;
@@ -36,6 +40,64 @@ pub(crate) const OBSERVATION_PACK_ENV: &str = "DEX_OBSERVATION_PACK";
 
 pub(crate) fn observation_pack_enabled() -> bool {
     std::env::var(OBSERVATION_PACK_ENV).as_deref() == Ok("1")
+}
+
+/// Tool schema for the pull-back side of the projection. Gated like the
+/// other prompt-token-costing tools — only registered when the packer
+/// itself is on, so the schema cost tracks the feature.
+pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
+    if !observation_pack_enabled() {
+        return Vec::new();
+    }
+    vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: FunctionDef {
+            name: "obs_recall".to_string(),
+            description: "Read a stored large tool result by observation id and byte offset. Older large tool results in this conversation were replaced with placeholders; recall a paged excerpt from the placeholder's id when you need the original content again. Continue with the returned next_offset.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "observation id from a placeholder" },
+                    "offset": { "type": "integer", "description": "byte offset, default 0" }
+                },
+                "required": ["id"]
+            }),
+        },
+    }]
+}
+
+/// Host-facing projection seam: the provider-bound message list, or the
+/// history unchanged when the experiment is off. `loop.rs` calls this
+/// instead of naming the gate.
+pub(crate) fn project_messages(
+    projection: &ProjectionState,
+    session_path: Option<&Path>,
+    messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    if !observation_pack_enabled() {
+        return messages.to_vec();
+    }
+    project(projection, session_path, messages)
+}
+
+/// `dex doctor` row: printed unconditionally (snapshot byte-stability),
+/// naming the env var as origin only when the caller set it.
+pub(crate) fn doctor_row(_ctx: &DoctorCtx<'_>) -> Option<DoctorRow> {
+    let on = observation_pack_enabled();
+    let source = if std::env::var_os(OBSERVATION_PACK_ENV).is_some() {
+        OBSERVATION_PACK_ENV.to_string()
+    } else {
+        "built-in default (off)".to_string()
+    };
+    Some(DoctorRow {
+        label: "obs pack",
+        value: if on {
+            "on".to_string()
+        } else {
+            "off".to_string()
+        },
+        source,
+    })
 }
 
 /// `obs_<32 hex>` — validated before any path is built from it, so an id is
