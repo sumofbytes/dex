@@ -11,6 +11,9 @@
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+use crate::agent::experiments::{DoctorCtx, DoctorRow};
+use crate::core::types::{FunctionDef, ToolDefinition};
+
 /// Opt-in switch: `DEX_ONLINE_COMPACTION=1` registers `update_plan` and
 /// enables boundary economics. Off by default — the tool costs prompt tokens
 /// every request and only pays off on long-horizon work.
@@ -18,6 +21,130 @@ pub(crate) const ONLINE_COMPACTION_ENV: &str = "DEX_ONLINE_COMPACTION";
 
 pub(crate) fn online_compaction_enabled() -> bool {
     std::env::var(ONLINE_COMPACTION_ENV).as_deref() == Ok("1")
+}
+
+/// Tool schema for the working-plan tool whose completed steps are
+/// compaction boundaries. Gated like the extra tools — it costs prompt
+/// tokens on every request and only pays off on long-horizon work.
+pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
+    if !online_compaction_enabled() {
+        return Vec::new();
+    }
+    vec![ToolDefinition {
+        tool_type: "function".to_string(),
+        function: FunctionDef {
+            name: "update_plan".to_string(),
+            description: "Replace the complete working plan. A newly completed step becomes a safe point where dex may compact context if doing so is economical. Send the complete plan on every call; keep at most one step in_progress and mark finished steps completed; when completing a step, include concise progress evidence when available.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "maxItems": 128,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "stable step id; reuse only for the same goal" },
+                                "goal": { "type": "string" },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                            },
+                            "required": ["id", "goal", "status"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "progress": {
+                        "type": "object",
+                        "properties": {
+                            "files_changed": { "type": "array", "items": { "type": "string" } },
+                            "verification": { "type": "array", "items": { "type": "string" }, "description": "checks run and their outcome" },
+                            "decisions": { "type": "array", "items": { "type": "string" } }
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        },
+    }]
+}
+
+/// Host-facing sampling seam: record the context size of a provider
+/// request (the growth rate and per-boundary request counts feed the
+/// compaction economics). No-op unless the experiment is on.
+pub(crate) fn sample_request(state: &mut OnlineState, context_tokens: u64) {
+    if !online_compaction_enabled() {
+        return;
+    }
+    state.record_request(context_tokens);
+}
+
+/// Host-facing capture seam for an `update_plan` tool result: appends plan
+/// hygiene advice to the result text and returns the completed steps as a
+/// boundary candidate. `None` unless the experiment is on and this is a
+/// successful plan update.
+pub(crate) fn capture_plan_update(
+    state: &mut OnlineState,
+    tool_name: &str,
+    ok: bool,
+    input: &str,
+    result: &mut String,
+) -> Option<Vec<PlanStep>> {
+    if !online_compaction_enabled() || tool_name != "update_plan" || !ok {
+        return None;
+    }
+    // Parse once: the tool layer validated `steps`, so a parse failure
+    // here would be a state bug — fall back to ignoring the update rather
+    // than failing the turn.
+    let parsed = serde_json::from_str::<Value>(input).ok().and_then(|args| {
+        let steps = args.get("steps")?.clone();
+        let progress = parse_plan_progress(args.get("progress")).ok()?;
+        parse_plan_steps(&steps).ok().map(|steps| (steps, progress))
+    });
+    let (steps, progress) = parsed?;
+    let transition = analyze_plan_transition(&state.plan, &steps);
+    if !transition.advice.is_empty() {
+        result.push('\n');
+        result.push_str(&transition.advice.join("\n"));
+    }
+    if transition.completed.is_empty() {
+        if state.plan != steps || state.progress != progress {
+            state.plan = steps;
+            state.progress = progress;
+        }
+        None
+    } else {
+        state.progress = progress;
+        Some(steps)
+    }
+}
+
+/// `dex doctor` row: the cache re-write cost gate, resolved live (same
+/// chain as `cache_write_read_ratio`) with the fallback spelled out so the
+/// origin is never a mystery. Printed unconditionally (snapshot
+/// byte-stability: a set/unset gate in the caller's shell must not change
+/// doctor output); when off, the value says so.
+pub(crate) fn doctor_row(ctx: &DoctorCtx<'_>) -> Option<DoctorRow> {
+    let on = online_compaction_enabled();
+    let (value, source) = if on {
+        (
+            format!(
+                "cache write/read ratio {:.2} ({ONLINE_COMPACTION_ENV})",
+                ctx.live
+                    .map(|c| c.cache_write_read_ratio())
+                    .unwrap_or(DEFAULT_CACHE_WRITE_READ_RATIO)
+            ),
+            "models.dev catalog / measured fallback".to_string(),
+        )
+    } else {
+        (
+            format!("off (set {ONLINE_COMPACTION_ENV}=1)"),
+            "built-in default (off)".to_string(),
+        )
+    };
+    Some(DoctorRow {
+        label: "online compaction",
+        value,
+        source,
+    })
 }
 
 /// Rough token estimate for the summary a compaction leaves behind.
