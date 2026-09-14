@@ -18,6 +18,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "List or resume a session"),
     ("/permissions", "Show permission mode and workspace"),
     ("/mcp", "Show MCP server status and auth"),
+    (
+        "/extensions",
+        "Show loaded Lua extensions (`/extensions reload` rescans)",
+    ),
     ("/mcp help", "MCP OAuth help (login/logout run in the CLI)"),
     ("/name", "Rename the current session"),
     ("/model", "Show or switch the model"),
@@ -27,6 +31,27 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/undo", "Undo the last recorded file change"),
     ("/help", "Show available commands"),
 ];
+
+/// Does the line name a registered extension command? `/name` or
+/// `/name args...`.
+fn is_extension_command(line: &str) -> bool {
+    let word = line[1..].split_whitespace().next().unwrap_or_default();
+    crate::extensions::command_list()
+        .iter()
+        .any(|(_, name, _)| name == word)
+}
+
+/// Split `/name args...` into (extension, name, rest).
+fn split_extension_command(line: &str) -> (String, String, String) {
+    let mut parts = line[1..].splitn(2, ' ');
+    let name = parts.next().unwrap_or_default().to_string();
+    let arg = parts.next().unwrap_or_default().trim().to_string();
+    crate::extensions::command_list()
+        .into_iter()
+        .find(|(_, n, _)| *n == name)
+        .map(|(ext, _, _)| (ext, name, arg))
+        .unwrap_or_default()
+}
 
 fn save_plan(app: &mut App) -> std::io::Result<()> {
     let json = app.plan.to_json();
@@ -326,6 +351,20 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             push_info(app, format!("permission mode: {:?}", app.config.permission));
             push_info(app, format!("workspace: {}", app.cwd));
         }
+        _ if line.starts_with('/') && is_extension_command(line) => {
+            // Extension command (plan §7 P3): dispatch fire-and-forget with
+            // a read-only policy — a slash command is not a permission gate.
+            let (ext_id, name, arg) = split_extension_command(line);
+            let label = format!("{name}@{ext_id}");
+            let cancel = crate::agent::state::GlobalCancellation;
+            crate::client::http::spawn_task(async move {
+                match crate::extensions::run_command_global(&ext_id, &name, &arg, &cancel).await {
+                    Ok(out) => eprintln!("dex: [extensions] /{name}: {out}"),
+                    Err(e) => eprintln!("dex: [extensions] /{name} failed: {e}"),
+                }
+            });
+            push_info(app, format!("command '{label}' dispatched (output → log)"));
+        }
         _ if line.starts_with("/mcp ") => match line["/mcp ".len()..].trim() {
             "help" => {
                 push_info(app, "/mcp shows server status including auth.".to_string());
@@ -336,6 +375,88 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             }
             _ => push_info(app, "usage: /mcp [help]".to_string()),
         },
+        _ if line.starts_with("/extensions") => {
+            let arg = line["/extensions".len()..].trim();
+            // A remote TUI's daemon is the process that dispatches `lua__*`
+            // tools and hooks, so its manager is the one that matters: both
+            // subcommands go to the daemon API (§9 — reload/status reach the
+            // dispatcher, never just the client's local copy).
+            if let Some(url) = app.daemon_url.clone() {
+                let reload = arg == "reload";
+                crate::client::http::spawn_task(async move {
+                    let client = match crate::client::http::DaemonClient::new(&url) {
+                        Ok(client) => client,
+                        Err(e) => {
+                            eprintln!("dex: [extensions] daemon client: {e}");
+                            return;
+                        }
+                    };
+                    let result = if reload {
+                        client.extensions_reload_async().await
+                    } else {
+                        client.extensions_status_async().await
+                    };
+                    match result {
+                        Ok(body) => {
+                            let exts = body["extensions"].as_array().cloned().unwrap_or_default();
+                            for ext in &exts {
+                                eprintln!(
+                                    "dex: [extensions] {} {} — {} tool(s), events: {}",
+                                    ext["id"].as_str().unwrap_or("?"),
+                                    ext["version"].as_str().unwrap_or("?"),
+                                    ext["tools"].as_u64().unwrap_or(0),
+                                    ext["events"]
+                                        .as_array()
+                                        .map(|a| a
+                                            .iter()
+                                            .filter_map(|v| v.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(","))
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                );
+                            }
+                            if exts.is_empty() {
+                                eprintln!("dex: [extensions] none loaded on the daemon");
+                            }
+                            if reload {
+                                eprintln!("dex: [extensions] daemon reload complete");
+                            }
+                        }
+                        Err(e) => eprintln!("dex: [extensions] daemon request failed: {e}"),
+                    }
+                });
+                push_info(
+                    app,
+                    if arg == "reload" {
+                        "daemon extension reload started (output → log)".to_string()
+                    } else {
+                        "daemon extension status requested (output → log)".to_string()
+                    },
+                );
+            } else if arg == "reload" {
+                // Fire-and-forget rescan in this process (local/loopback turn:
+                // it owns the manager that dispatches).
+                crate::client::http::spawn_task(async move {
+                    crate::extensions::global_manager().reload().await;
+                    eprintln!("dex: [extensions] reload complete");
+                });
+                push_info(app, "extension reload started".to_string());
+            } else if !arg.is_empty() {
+                push_info(app, "usage: /extensions [reload]".to_string());
+            } else {
+                let summaries = crate::extensions::loaded_summaries();
+                if summaries.is_empty() {
+                    push_info(app, "no extensions loaded".to_string());
+                }
+                for (id, version, tools, events) in summaries {
+                    push_info(
+                        app,
+                        crate::extensions::summary_line(&id, &version, &tools, &events),
+                    );
+                }
+            }
+        }
         "/mcp" => {
             // Sync snapshot only: a slash handler must not initialize the
             // manager (that would spawn background connects from the TUI

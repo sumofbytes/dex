@@ -178,6 +178,12 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 static CONFIG_CACHE: OnceLock<Mutex<Option<FileCache<Option<serde_yaml::Value>>>>> =
     OnceLock::new();
 
+/// The parsed config file for other subsystems (MCP servers, extension
+/// paths). Cached — same contract as `load_config_file`.
+pub(crate) fn config_file_value() -> Option<serde_yaml::Value> {
+    load_config_file()
+}
+
 fn load_config_file() -> Option<serde_yaml::Value> {
     let path = config_file_path()?;
     cached_parse(&CONFIG_CACHE, &path, |text| {
@@ -288,6 +294,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "thinking_effort",
     "mcp_servers",
     "agent_wake",
+    "extensions",
     // Deprecated but still honored for old files:
     "active_provider",
     "provider",
@@ -2808,6 +2815,43 @@ pub(crate) fn doctor(
             }
         }
     }
+    // Lua extensions: disk discovery + consent state (deterministic — the
+    // load-state detail lives in `dex extensions list`).
+    let discovered = crate::extensions::discovered_extensions();
+    if discovered.is_empty() {
+        row(&mut out, "extensions", "none", "cwd/.dex, XDG config dirs");
+    } else {
+        for (id, version, scope, state) in &discovered {
+            row(
+                &mut out,
+                "extensions",
+                &format!("{id} {version}"),
+                &format!("{scope}, {state}"),
+            );
+        }
+    }
+    // Extra dirs from config/env (origin per the precedence rules).
+    let ext_paths = crate::extensions::config_extension_paths();
+    if !ext_paths.is_empty() {
+        let origin = if std::env::var("DEX_EXTENSIONS_PATHS")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            "DEX_EXTENSIONS_PATHS (environment)"
+        } else {
+            "extensions.paths (config)"
+        };
+        row(
+            &mut out,
+            "ext paths",
+            &ext_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            origin,
+        );
+    }
     out.push('\n');
     match &cfg_result {
         Ok(_) => row(&mut out, "resolve", "OK", "config builds cleanly"),
@@ -5305,11 +5349,24 @@ pub(crate) mod tests {
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
             "OPENCODE_API_KEY",
+            "XDG_CONFIG_HOME",
+            "DEX_EXTENSIONS_PATHS",
         ]);
+        std::env::remove_var("DEX_EXTENSIONS_PATHS");
+        // `EnvRestore::take` saves-and-restores; the toggles that flip doctor
+        // rows must be cleared outright, so a developer shell with
+        // DEX_ONLINE_COMPACTION=1 etc. does not drift the byte-stable output.
+        std::env::remove_var("DEX_ONLINE_COMPACTION");
+        std::env::remove_var("DEX_OBSERVATION_PACK");
+        std::env::remove_var("DEX_EVIDENCE_REDUCER");
+        std::env::remove_var("DEX_REDUCER_MODEL");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
         std::env::set_var("XDG_DATA_HOME", "/tmp/dex-doctor-snapshot/data");
+        // Hermetic extension discovery too: the extensions row reads the
+        // XDG config dir, which must not see the developer's real installs.
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
         let out = doctor(None, None, None, &[]);
         let expected = concat!(
             "dex 0.7.0\n",
@@ -5331,6 +5388,7 @@ pub(crate) mod tests {
             "agent wake on                                            built-in default\n",
             "headers    0                                             none\n",
             "endpoints  go, zen                                       available to /model routing\n",
+            "extensions none                                          cwd/.dex, XDG config dirs\n",
             "\n",
             "resolve    ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
             "                                                           opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n",

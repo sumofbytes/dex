@@ -50,7 +50,7 @@ pub(crate) fn set_output_limit(limit: usize) {
     }
 }
 
-fn workspace_root() -> Result<PathBuf, ToolError> {
+pub(crate) fn workspace_root() -> Result<PathBuf, ToolError> {
     env::current_dir().map_err(ToolError::Io)
 }
 
@@ -62,7 +62,7 @@ fn workspace_path(raw: &str) -> Result<PathBuf, ToolError> {
     resolve_workspace_path(&root, raw)
 }
 
-fn resolve_workspace_path(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn resolve_workspace_path(root: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     let candidate = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
@@ -226,6 +226,25 @@ const READONLY: ToolMetadata = ToolMetadata {
 };
 
 pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
+    if crate::extensions::is_shadowed(name) {
+        return Some(ToolMetadata {
+            read_only: false,
+            mutating: true,
+            idempotent: false,
+            requires_shell: true,
+            permission: PermissionRequirement::Shell,
+        });
+    }
+    metadata_native(name)
+}
+
+/// Native gate for a built-in, ignoring extension shadows. `dispatch_tool`
+/// uses this when re-dispatching the original from inside a shadow
+/// (`dex.tools.call_original`): the shadow call already cleared its own
+/// Shell gate, and the native requirement is what the built-in itself needs
+/// — re-reading the shadow's row here would prompt twice for one wrapped
+/// call in `ask-shell` mode.
+fn metadata_native(name: &str) -> Option<ToolMetadata> {
     Some(match name {
         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "obs_recall" | "update_plan" => {
             READONLY
@@ -257,6 +276,17 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
             idempotent: false,
             requires_shell: false,
             permission: PermissionRequirement::Write,
+        },
+        // Extension tools are untrusted third-party code in a sandbox:
+        // most restrictive gate (`ask` unless trusted), same as shell/MCP.
+        // Resolved dynamically so loaded extensions don't need a static
+        // entry each.
+        _ if name.starts_with("lua__") => ToolMetadata {
+            read_only: false,
+            mutating: true,
+            idempotent: false,
+            requires_shell: true,
+            permission: PermissionRequirement::Shell,
         },
         // MCP tools are external processes: most restrictive gate (`ask`
         // unless trusted), same as shell. Resolved dynamically so cached
@@ -1022,6 +1052,11 @@ fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
+                if !entry.is_object() {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "edits[{index}] must be an object with oldText and newText"
+                    )));
+                }
                 let old = entry
                     .get("oldText")
                     .and_then(Value::as_str)
@@ -1034,7 +1069,9 @@ fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
                     .ok_or_else(|| {
                         ToolError::InvalidArgument(format!("edits[{index}] is missing newText"))
                     })?;
-                check_edit_texts(old, new)?;
+                check_edit_texts(old, new).map_err(|error| {
+                    ToolError::InvalidArgument(format!("edits[{index}]: {error}"))
+                })?;
                 Ok((old.to_string(), new.to_string()))
             })
             .collect();
@@ -1193,7 +1230,12 @@ fn apply_edit_batch(
             .map(|replacement| replacement.span.clone())
             .collect::<Vec<_>>()
             .join("; ");
-        format!(" ({} edits: {spans})", ops.len())
+        let suffix = if pending.len() == ops.len() {
+            String::new()
+        } else {
+            format!(", {} sites", pending.len())
+        };
+        format!(" ({} edits{suffix}: {spans})", ops.len())
     };
     Ok((updated, note))
 }
@@ -1752,6 +1794,33 @@ pub(crate) async fn execute_with_shell(
     filter: Option<&ToolFilter>,
     shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
+    // H1 (`tool.before`, plan §8): mutate/deny seam before every gate.
+    // Delegation tools skip it — the child allowlist sees the call the
+    // parent issued, unmodified by a third party.
+    let owned_args: Map<String, Value>;
+    let mut hooks_ran = false;
+    // Zero-cost when no extension subscribes: the args pass through uncloned.
+    let args = if crate::agent::subagent::is_delegation(name)
+        || !crate::extensions::has_event_handlers("tool.before")
+    {
+        args
+    } else {
+        hooks_ran = true;
+        match crate::extensions::apply_before_hooks(name, args, cancel, policy, filter).await {
+            crate::extensions::BeforeOutcome::Proceed { args, mutated_by } => {
+                for ext in &mutated_by {
+                    audit(&format!("{name}[tool.before:{ext}]"), &args, "mutated");
+                }
+                owned_args = args;
+                &owned_args
+            }
+            crate::extensions::BeforeOutcome::Denied { by, reason } => {
+                return Err(ToolError::Denied(format!(
+                    "tool.before hook from extension '{by}' denied the call: {reason}"
+                )));
+            }
+        }
+    };
     // Resolve `then_run` once — it decides both the permission requirement
     // inside `dispatch_tool` and the follow-up run below, and a malformed
     // value must fail before anything else happens. Only `write`/`edit`
@@ -1761,7 +1830,22 @@ pub(crate) async fn execute_with_shell(
         Ok(command) => command,
         Err(error) => return Err(error),
     };
-    let result = dispatch_tool(name, args, then_run, cancel, policy, filter, shell_out).await;
+    let result = dispatch_tool(
+        name, args, then_run, cancel, policy, filter, shell_out, true,
+    )
+    .await;
+    // A tool.before hook already saw the args even when a later gate denies
+    // the call: record that observation, so the audit trail shows a third
+    // party witnessed a call it never got to influence.
+    if hooks_ran {
+        if let Err(ToolError::Denied(reason)) = &result {
+            audit(
+                &format!("{name}[tool.before]"),
+                args,
+                &format!("observed; call denied: {reason}"),
+            );
+        }
+    }
     // Run `then_run` in this same call so the mutation and its
     // verification arrive as one observation, instead of costing a second
     // provider round-trip that re-sends the whole prefix just to learn whether
@@ -1807,12 +1891,27 @@ pub(crate) async fn execute_with_shell(
     result
 }
 
+/// Re-dispatch the shadowed built-in for `dex.tools.call_original`: the
+/// same gates as any call (approval included), but never the shadow itself.
+/// `then_run` stays with the outer shadow call, which resolves and audits it.
+pub(crate) async fn dispatch_original(
+    name: &str,
+    args: &Map<String, Value>,
+    cancel: &(dyn CancellationSource + Send + Sync),
+    policy: &Policy,
+    filter: Option<&ToolFilter>,
+    shell_out: &mut Option<ShellEvidence>,
+) -> Result<String, ToolError> {
+    dispatch_tool(name, args, None, cancel, policy, filter, shell_out, false).await
+}
+
 /// The tool-selection core behind `execute_with_shell`: routes and gates a
 /// call, then runs it — with no `audit` calls (the single audit row lives in
 /// the caller). The gate order is load-bearing (§11): delegation route first,
 /// then the permission requirement, then the child allowlist (a sharper,
 /// cheaper rejection than a prompt), then `enforce_policy` — so a denial
 /// never triggers a prompt — and only then dispatch.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_tool(
     name: &str,
     args: &Map<String, Value>,
@@ -1821,6 +1920,7 @@ async fn dispatch_tool(
     policy: &Policy,
     filter: Option<&ToolFilter>,
     shell_out: &mut Option<ShellEvidence>,
+    resolve_shadow: bool,
 ) -> Result<String, ToolError> {
     // Delegation tools route first (Phase 5): they are not workspace tools
     // and have no static registry entry. The child allowlist never contains
@@ -1837,7 +1937,13 @@ async fn dispatch_tool(
         }
         return crate::agent::subagent::execute_delegation(name, args, cancel, policy).await;
     }
-    let requirement = match metadata(name) {
+    // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
+    // Shell row must not raise the gate again — use the native requirement.
+    let requirement = match if resolve_shadow {
+        metadata(name)
+    } else {
+        metadata_native(name)
+    } {
         // MCP tools are external processes: their `metadata()` row already
         // carries the most restrictive gate (same as shell), so the separate
         // `mcp__` requirement check is gone from here.
@@ -1878,11 +1984,27 @@ async fn dispatch_tool(
             return Err(error);
         }
     }
+    if resolve_shadow && crate::extensions::is_shadowed(name) {
+        // Same gates as the lua__ row in metadata(): a shadow intercepts a
+        // built-in, so it can lie about what the built-in does.
+        enforce_policy(name, args, PermissionRequirement::Shell, cancel, policy).await?;
+        return crate::extensions::call_shadow_global(
+            name, args, cancel, policy, filter, shell_out,
+        )
+        .await
+        .map_err(ToolError::Internal);
+    }
     enforce_policy(name, args, requirement, cancel, policy).await?;
     if name.starts_with("mcp__") {
         // `ToolError::Internal` displays as the raw message, so the caller's
         // single audit row records exactly the string audited here before.
         return crate::mcp::call_global(name, args, cancel)
+            .await
+            .map_err(ToolError::Internal);
+    }
+    if name.starts_with("lua__") {
+        // Same audit contract as MCP: the raw string lands in the one row.
+        return crate::extensions::call_global(name, args, cancel, policy, filter)
             .await
             .map_err(ToolError::Internal);
     }
@@ -1952,19 +2074,22 @@ pub(crate) async fn execute_outcome(
         None
     };
     let mut shell = None;
-    match execute_with_shell(name, args, cancel, policy, filter, &mut shell).await {
-        Ok(out) => ToolOutcome {
-            text: out,
-            ok: true,
-            diff: pending_diff,
-            shell,
-        },
-        Err(e) => ToolOutcome {
-            text: format!("Error: {}", e),
-            ok: false,
-            diff: None,
-            shell,
-        },
+    let (mut text, mut ok) =
+        match execute_with_shell(name, args, cancel, policy, filter, &mut shell).await {
+            Ok(out) => (out, true),
+            Err(e) => (format!("Error: {}", e), false),
+        };
+    // H2 middleware: `tool.after` may rewrite the result. Fail-open — a hook
+    // error keeps the host result (the manager already logs it).
+    let after =
+        crate::extensions::apply_after_hooks(name, args, &text, ok, cancel, policy, filter).await;
+    text = after.text;
+    ok = after.ok;
+    ToolOutcome {
+        text,
+        ok,
+        diff: pending_diff,
+        shell,
     }
 }
 
@@ -2609,6 +2734,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_batch_note_counts_fan_out_sites() {
+        // replaceAll inside a batch: the note must not claim "2 edits" while
+        // listing three spans — the site count is stated separately.
+        let content = "a\nb\nb\n";
+        let ops = vec![
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string()),
+        ];
+        let (updated, note) = apply_edit_batch(content, &ops, true).unwrap();
+        assert_eq!(updated, "A\nB\nB\n", "{updated:?}");
+        assert!(note.contains("2 edits, 3 sites"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn edit_batch_rejects_non_object_entries_by_name() {
+        // `edits: ["foo"]` used to report "missing oldText"; name the actual
+        // shape problem so the model can self-correct.
+        let mut args = Map::new();
+        args.insert(
+            "edits".into(),
+            Value::Array(vec![Value::String("foo".into())]),
+        );
+        let error = parse_edit_ops(&args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("edits[0] must be an object with oldText and newText"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_batch_noop_error_names_the_entry() {
+        let mut args = Map::new();
+        args.insert(
+            "edits".into(),
+            Value::Array(vec![
+                serde_json::json!({"oldText": "a", "newText": "A"}),
+                serde_json::json!({"oldText": "same", "newText": "same"}),
+            ]),
+        );
+        let error = parse_edit_ops(&args).unwrap_err();
+        assert!(
+            error.to_string().contains("edits[1]") && error.to_string().contains("identical"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn edit_batch_rejects_overlapping_entries() {
         let content = "one\ntwo\nthree\n";
         let ops = vec![
@@ -2969,6 +3143,16 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             .join(format!("dex-chain-fx-{}", std::process::id()));
+        // A previous run that panicked mid-assert leaked its fixture dir
+        // (cleanup below only runs on the happy path); sweep those first.
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("dex-chain-fx-") {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.rs"), format!("{needle} in one\n")).unwrap();
         fs::write(root.join("two.rs"), "nothing here\n").unwrap();

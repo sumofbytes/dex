@@ -878,28 +878,65 @@ async fn child_run(
             .cloned()
             .collect(),
     };
-    let result = process_turn(AgentRuntime {
-        config: &config,
-        messages: &mut messages,
-        state: &mut tool_state,
-        steering_rx: None,
-        steering_accepted_tx: None,
-        session: Some(&mut session),
-        client: &config,
-        cancel: &token,
-        console: &console,
-        filter: Some(&filter),
-        // Depth 1 at dispatch: children carry no daemon context, so every
-        // delegation tool call from a child is rejected (§11/§20).
-        agent_ctx: None,
-        // Resume honors the remaining meter (§24.2). `None` (unlimited
-        // or unknown spend) falls back to the definition's cap.
-        tool_budget: resume
-            .as_ref()
-            .and_then(|request| request.handle.remaining_budget)
-            .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
-    })
-    .await;
+    // Agent lifecycle hooks (plan §7 P2): fired around the child's run with
+    // the child's own policy, so a nested `dex.tools.call` from a hook is
+    // gated exactly like a model-issued child call. A panicked or timed-out
+    // body never reaches the end event — the registry result is the record
+    // for those (spawn_wrapper owns the abnormal exits).
+    // Scoped so the hook-host policy (which clones the console, keeping the
+    // child sink open) drops before `drop(console)` below — otherwise the
+    // consumer await deadlocks on a channel that never closes.
+    let result = {
+        let agent_policy = Policy::turn(config.permission, &console);
+        crate::extensions::fire_event_global(
+            "agent.start",
+            serde_json::json!({ "agent": def.name, "id": id.0 }),
+            &token,
+            &agent_policy,
+            Some(&filter),
+        )
+        .await;
+        let result = process_turn(AgentRuntime {
+            config: &config,
+            messages: &mut messages,
+            state: &mut tool_state,
+            steering_rx: None,
+            steering_accepted_tx: None,
+            session: Some(&mut session),
+            client: &config,
+            cancel: &token,
+            console: &console,
+            filter: Some(&filter),
+            // Depth 1 at dispatch: children carry no daemon context, so every
+            // delegation tool call from a child is rejected (§11/§20).
+            agent_ctx: None,
+            // Resume honors the remaining meter (§24.2). `None` (unlimited
+            // or unknown spend) falls back to the definition's cap.
+            tool_budget: resume
+                .as_ref()
+                .and_then(|request| request.handle.remaining_budget)
+                .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
+        })
+        .await;
+        let payload = match &result {
+            Ok(_) => serde_json::json!({ "agent": def.name, "ok": true }),
+            Err(e) => {
+                serde_json::json!({ "agent": def.name, "ok": false, "error": e.to_string() })
+            }
+        };
+        // Fired while the child's console is still open: a hook prompt (ask
+        // modes) routes through the child's approval bridge like any tool
+        // call.
+        crate::extensions::fire_event_global(
+            "agent.end",
+            payload,
+            &token,
+            &agent_policy,
+            Some(&filter),
+        )
+        .await;
+        result
+    };
     // Dropping the console closes the child sink, so the consumer drains
     // every buffered line and exits — awaiting it makes the captured
     // summary and §18 usage deterministic instead of racing the last
