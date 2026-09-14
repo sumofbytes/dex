@@ -135,7 +135,28 @@ fn provider_fallback_with_origin(
     }
     match load_provider_name(file) {
         Some(name) => (name, Some("config active_provider: (deprecated)")),
-        None => ("opencode".to_string(), Some("built-in default")),
+        // `None` origin = the builtin default, i.e. nothing the user said.
+        None => ("opencode".to_string(), None),
+    }
+}
+
+/// Provider for a selection that names none: the fallback chain — unless
+/// that chain lands on the builtin default *and* an explicit `--base-url`
+/// names an endpoint. Then the URL, not the default provider, is what the
+/// user configured: it routes onto `providers.custom.*` so key errors name
+/// the right deposit and opencode-specific wiring (key requirement,
+/// session headers) never fires for a foreign endpoint. An explicit
+/// deprecated pointer (`DEX_PROVIDER` / `active_provider:`) still wins —
+/// the user named a provider.
+fn provider_without_prefix(
+    fallback: (String, Option<&'static str>),
+    base_url_override: Option<&str>,
+) -> String {
+    let custom = fallback.1.is_none() && base_url_override.is_some_and(|u| !u.trim().is_empty());
+    if custom {
+        "custom".to_string()
+    } else {
+        fallback.0
     }
 }
 
@@ -240,7 +261,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
 /// full text after the `dex: ` prefix. stderr only — stdout belongs to the
 /// client stream, and one line cannot corrupt a TUI the way a per-turn
 /// stream could.
-fn warn_once(id: &str, message: &str) {
+pub(crate) fn warn_once(id: &str, message: &str) {
     static WARNED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let seen = WARNED.get_or_init(Default::default);
     if seen
@@ -431,6 +452,17 @@ fn catalog_api(key: &str, catalog: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Whether the cached catalog (warm cache only) serves `model` — the
+/// staleness check behind `provider::warn_stale_default_model`. No cache
+/// (fresh install, no `dex update --models` yet) answers `true`: absence
+/// of evidence is not evidence of retirement.
+pub(crate) fn catalog_serves_model(model: &str) -> bool {
+    match load_dex_catalog() {
+        Some(catalog) => catalog_has_model(model, &catalog),
+        None => true,
+    }
+}
+
 /// Whether `model` names a known model id anywhere in the catalog (either
 /// shape). Guards the provider-like hint: native `org/model` ids share
 /// their prefix with a provider but are legit model ids.
@@ -608,9 +640,9 @@ fn setup_guide_error() -> String {
     let opencode_model = Provider::OpenCode.default_model();
     format!(
         "no provider configured — pick one, then run `dex doctor`:\n\
+         \u{20}\u{20}opencode (built-in default): model: zen/{opencode_model} + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
          \u{20}\u{20}anthropic: model: anthropic/{anthropic_model} + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
          \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
-         \u{20}\u{20}opencode: model: zen/{opencode_model} + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
          \u{20}\u{20}codex: model: openai-codex + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"
     )
@@ -1737,7 +1769,11 @@ impl LlmConfig {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .is_none()
-            && load_provider_name(&file).is_none();
+            && load_provider_name(&file).is_none()
+            // `--base-url` is a setup pointer too: the user configured an
+            // endpoint, so a missing key names providers.custom, not the
+            // generic "no provider configured" guide.
+            && base_url_override.is_none();
         // One selection knob names provider *and* model: `provider/model`
         // (`endpoint/model` or a bare provider name work too). Precedence:
         // `--model` > `DEX_MODEL` > file `model:` > builtin default. When
@@ -1747,13 +1783,24 @@ impl LlmConfig {
         let (selection_provider, mut model) = split_selection(&selection, &known);
         let provider_name = match selection_provider.as_deref() {
             Some(name) => name.to_string(),
-            None => provider_fallback_with_origin(&file).0,
+            None => provider_without_prefix(
+                provider_fallback_with_origin(&file),
+                base_url_override.as_deref(),
+            ),
         };
-        let provider = Provider::parse_known(&provider_name, &known).ok_or_else(|| {
-            format!(
-                "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic or a providers: entry"
-            )
-        })?;
+        // `custom` from `provider_without_prefix` is URL-backed even when
+        // no `providers.custom:` entry exists yet; parse_known already
+        // covers the configured case, this catches the bare `--base-url`
+        // route so the key error names the right deposit.
+        let provider = Provider::parse_known(&provider_name, &known)
+            .or_else(|| {
+                (provider_name == "custom").then(|| Provider::Generic("custom".to_string()))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic, or add it under 'providers:' (e.g. providers.custom: {{base_url: ..., api_key: ...}})"
+                )
+            })?;
         // A provider from the deprecated fallback (`DEX_PROVIDER` /
         // `active_provider:`) with the untouched builtin default model gets
         // one of its own family — `active_provider: anthropic` must not send
@@ -1838,6 +1885,12 @@ impl LlmConfig {
                 })
             })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        // The builtin default model is hardcoded (cache-less installs must
+        // work); a warm catalog that no longer serves it is the one silent
+        // rot path — name the fix once.
+        if model == DEFAULT_MODEL {
+            crate::llm::provider::warn_stale_default_model();
+        }
         // Reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env_parse("DEX_RESERVE_TOKENS", 16_384);
         let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
@@ -2339,9 +2392,17 @@ pub(crate) fn doctor(
     // Provider fallback shares `from_env`'s chain (and its deprecation
     // warning, deduped) so the origin row cannot drift from routing.
     let (fallback_provider, fallback_origin) = provider_fallback_with_origin(&file);
-    let provider_name = selection_provider.clone().unwrap_or(fallback_provider);
+    let provider_name = selection_provider.clone().unwrap_or_else(|| {
+        provider_without_prefix(
+            (fallback_provider.clone(), fallback_origin),
+            flag_base_url.as_deref(),
+        )
+    });
     let provider_source = match selection_provider {
         Some(_) => format!("{selection_source} prefix"),
+        // Same routing as `from_env`: an explicit --base-url with no
+        // selection prefix lands on providers.custom, not the builtin.
+        None if provider_name == "custom" => "--base-url (pins endpoint)".to_string(),
         None => fallback_origin.unwrap_or("built-in default").to_string(),
     };
     // The real build, once: rows below take values from it so `doctor`
@@ -2353,12 +2414,17 @@ pub(crate) fn doctor(
         permission_override,
         header_overrides,
     );
-    match Provider::parse_known(&provider_name, &known) {
+    // The `--base-url` route can land on `custom` before the entry exists;
+    // it is a real (user-URL-backed) provider then, not a typo.
+    let custom_route = selection_provider.is_none() && provider_name == "custom";
+    let provider_opt = Provider::parse_known(&provider_name, &known)
+        .or_else(|| custom_route.then(|| Provider::Generic("custom".to_string())));
+    match provider_opt {
         None => row(
             &mut out,
             "provider",
             &provider_name,
-            "UNSUPPORTED — use opencode, openai-codex, anthropic or a providers: entry",
+            "UNSUPPORTED — use opencode, openai-codex, anthropic, or add it under 'providers:'",
         ),
         Some(provider) => {
             // Values come from the live build when it succeeds; otherwise
@@ -3594,6 +3660,132 @@ pub(crate) mod tests {
         // The same guide surfaces in `dex doctor`'s resolve row.
         let report = doctor(None, None, None, &[]);
         assert!(report.contains("no provider configured"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_base_url_without_selection_routes_to_custom_provider() {
+        // `--base-url` + no provider pointer anywhere must NOT ride the
+        // builtin default: key errors name providers.custom.api_key, and
+        // no OPENCODE_API_KEY is demanded for a foreign endpoint.
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        for key in [
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "OPENCODE_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ] {
+            std::env::remove_var(key);
+        }
+        let err = match LlmConfig::from_env(
+            Some("http://localhost:11434/v1".to_string()),
+            None,
+            None,
+            &[],
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected missing-key error for providers.custom"),
+        };
+        assert!(err.contains("providers.custom.api_key"), "{err}");
+        assert!(!err.contains("opencode.api_key"), "{err}");
+        assert!(!err.contains("OPENCODE_API_KEY"), "{err}");
+        // An explicit deprecated provider pointer beats the custom route:
+        // the user named a provider.
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        let err = match LlmConfig::from_env(
+            Some("http://localhost:11434/v1".to_string()),
+            None,
+            None,
+            &[],
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected missing-key error for providers.opencode"),
+        };
+        assert!(err.contains("providers.opencode.api_key"), "{err}");
+        // With providers.custom.api_key set, resolution succeeds on the
+        // pinned URL with the default model.
+        std::env::remove_var("DEX_PROVIDER");
+        std::fs::write(
+            dir.join("config.yaml"),
+            "providers:\n  custom:\n    api_key: kk\n",
+        )
+        .unwrap();
+        let cfg = LlmConfig::from_env(
+            Some("http://localhost:11434/v1".to_string()),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, Provider::Generic("custom".to_string()));
+        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.model, crate::llm::provider::DEFAULT_MODEL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_names_custom_provider_for_base_url_only_setup() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_PROVIDER",
+            "DEX_MODEL",
+            "OPENCODE_API_KEY",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-doc-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        for key in ["DEX_PROVIDER", "OPENCODE_API_KEY", "DEX_MODEL"] {
+            std::env::remove_var(key);
+        }
+        let out = doctor(
+            Some("http://localhost:11434/v1".to_string()),
+            None,
+            None,
+            &[],
+        );
+        let prow = out.lines().find(|l| l.starts_with("provider ")).unwrap();
+        assert!(prow.contains("custom"), "{prow}");
+        assert!(prow.contains("--base-url"), "{prow}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_guide_lists_builtin_default_first() {
+        let guide = super::setup_guide_error();
+        let opencode = guide.find("opencode (built-in default)").unwrap();
+        let anthropic = guide.find("anthropic: model:").unwrap();
+        let codex = guide.find("codex: model:").unwrap();
+        assert!(opencode < anthropic && anthropic < codex, "{guide}");
+    }
+
+    #[test]
+    fn catalog_serves_model_true_without_cache() {
+        // Cold cache: absence of evidence is not evidence of retirement.
+        let dir = std::env::temp_dir().join(format!("dex-cold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let serves = super::catalog_serves_model("any-model-id");
+        match prev {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert!(serves);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
