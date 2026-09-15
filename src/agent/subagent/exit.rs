@@ -19,7 +19,7 @@ pub(crate) enum ExitReason {
     /// The child emitted its final assistant message.
     Normal,
     /// `delegate_stop`, parent-turn cancel, session close, daemon
-    /// shutdown, idle reaper. Never resumable: stopping was the intent.
+    /// shutdown. Never resumable: stopping was the intent.
     ShutDown,
     /// Environment flake a re-entry could survive: body panic, transport
     /// or protocol death after output flowed (pre-output failures are

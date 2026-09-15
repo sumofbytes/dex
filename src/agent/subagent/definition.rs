@@ -48,9 +48,11 @@ pub(crate) struct AgentDefinition {
     /// Resolved through the existing config path at spawn (Phase 7) — no
     /// aliases the catalog doesn't have, zero provider-specific logic here.
     pub(crate) model: Option<String>,
-    /// Allowlist against the real registry; clamped against the parent's
-    /// at spawn (§11). Never contains delegation tools in a child filter —
-    /// that exclusion is enforced at dispatch, not trusted from this set.
+    /// Allowlist against the real registry. The spawn filter strips
+    /// delegation tools out of this set, then re-adds them when the child
+    /// may delegate (depth + 1 under the cap) — so a child filter may name
+    /// tools the parent schema hides (e.g. reviewer `git` under a parent
+    /// without `DEX_EXTRA_TOOLS`).
     pub(crate) tools: BTreeSet<String>,
     /// Feeds the existing turn budget (`max_tool_iterations()`); `None`
     /// keeps the default. Same knob re-parameterized, not a second counter.

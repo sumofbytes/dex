@@ -34,15 +34,13 @@ impl AgentState {
 }
 
 /// One run of an [`AgentDefinition`]: what it is (`definition`), what it
-/// was asked (`context`), how it relates (`parent_id`), how it's doing
-/// (`state`). The Phase 4 manager owns the registry of these plus the
-/// task handles, tokens, and timeouts — the instance itself holds no
-/// runtime machinery.
+/// was asked (`context`), how it's doing (`state`). The Phase 4 manager
+/// owns the registry of these plus the task handles, tokens, and
+/// timeouts — the instance itself holds no runtime machinery.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentInstance {
     pub(crate) id: AgentId,
     pub(crate) definition: AgentDefinition,
-    pub(crate) parent_id: Option<AgentId>,
     pub(crate) context: ContextSeed,
     pub(crate) state: AgentState,
     /// Tool the child is currently running, as reported through its
