@@ -1041,6 +1041,19 @@ pub(crate) mod tests {
         assert_eq!(framer.last_seq, 7);
     }
 
+    /// The supervision removal deleted `StreamEvent::AgentRecovered`: an
+    /// old journal row carrying that type still advances the cursor
+    /// without yielding an event, so replay never stalls on it.
+    #[test]
+    fn sse_framer_skips_the_removed_agent_recovered_type() {
+        let mut framer = SseFramer::default();
+        framer.push_bytes(
+            b"data: {\"seq\":9,\"agent_recovered\":{\"agent_id\":\"sess-0\",\"status\":\"resumed\"}}\n",
+        );
+        assert_eq!(framer.last_seq, 9);
+        assert!(framer.pending.is_empty());
+    }
+
     #[test]
     fn sse_framer_reassembles_split_lines_and_trailing_terminal() {
         // One envelope split across TCP chunks reassembles; keep-alives and

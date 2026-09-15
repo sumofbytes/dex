@@ -272,9 +272,12 @@ pub enum StreamEvent {
 
     /// V1b typed child-agent lifecycle (plan §15): first-class variants so a
     /// consumer reads typed fields instead of parsing the V1a `System`
-    /// prefix. An explicit wire bump — the shipped client skips unknown
-    /// types but still advances its seq cursor, so replay never stalls;
-    /// the V1a `System` lines stay journaled beside them for old clients.
+    /// prefix. An explicit wire bump — the shipped client's
+    /// `SseFramer::ingest` and `lenient_array` skip unknown types but
+    /// still advance the seq cursor, so replay never stalls (a direct
+    /// `StreamEnvelope` parse still errors; leniency lives in those
+    /// callers). The V1a `System` lines stay journaled beside them for
+    /// old clients.
     #[serde(rename = "agent_spawned")]
     AgentSpawned { agent_id: String, name: String },
 
