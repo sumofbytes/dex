@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::state::ToolState;
-use crate::core::format::agent_lifecycle;
+use crate::core::format::{agent_lifecycle, short_arg};
 use crate::core::types::{Role, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
@@ -1451,7 +1451,11 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 }
                 if let Some(calls) = &msg.tool_calls {
                     for tc in calls {
-                        let input = format!("{} {}", tc.function.name, tc.function.arguments);
+                        let input = format!(
+                            "{} {}",
+                            tc.function.name,
+                            short_arg(&tc.function.name, &tc.function.arguments)
+                        );
                         append_sink_line(
                             app,
                             crate::core::types::SinkLine::ToolInput {
@@ -1469,20 +1473,29 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 let summary = lines.next().unwrap_or("").to_string();
                 let preview: Vec<String> = lines.take(6).map(|s| s.to_string()).collect();
                 // Replay has no ToolInput (args live in the assistant call,
-                // not the tool message); emit a bare one so the output
-                // attaches to a real tool block instead of the synthesized
-                // `▸ tool` fallback. Search previews highlight from the
-                // inline `path:line:` gutters, so they work without an arg.
-                // Both carry the stored call id so the output pairs with
-                // this block even when replayed messages interleave.
+                // not the tool message). When the assistant call above
+                // already opened this id's block, emit only the output so
+                // it pairs with that block; otherwise emit a bare input so
+                // the output attaches to a real tool block instead of the
+                // synthesized `▸ tool` fallback. Search previews highlight
+                // from the inline `path:line:` gutters, so they work
+                // without an arg. Both carry the stored call id so the
+                // output pairs with this block even when replayed messages
+                // interleave.
                 let tool_id = msg.tool_call_id.clone().unwrap_or_default();
-                append_sink_line(
-                    app,
-                    crate::core::types::SinkLine::ToolInput {
-                        id: tool_id.clone(),
-                        input: name.clone(),
-                    },
-                );
+                let already_open = !tool_id.is_empty()
+                      && app.transcript.iter().any(|b| {
+                          matches!(b, TranscriptBlock::Tool { tool_id: tid, output: None, .. } if tid == &tool_id)
+                      });
+                if !already_open {
+                    append_sink_line(
+                        app,
+                        crate::core::types::SinkLine::ToolInput {
+                            id: tool_id.clone(),
+                            input: name.clone(),
+                        },
+                    );
+                }
                 append_sink_line(
                     app,
                     crate::core::types::SinkLine::ToolOutput {
@@ -2180,6 +2193,54 @@ mod tests {
             let out = output.as_ref().expect("block completed");
             let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.contains(summary), "wrong summary on {arg}: {text}");
+        }
+    }
+
+    #[test]
+    fn rebuild_pairs_tool_results_with_assistant_calls_by_id() {
+        // Journal replay: the assistant message already opened one block
+        // per call, so each tool message must complete that block — not
+        // open a second bare one. Rebuilt inputs also use `short_arg`
+        // (`read a.rs`), matching the live path for highlighting.
+        use crate::core::types::{ChatMessage, FunctionCall, LlmToolCall};
+        let call = |id: &str, path: &str| LlmToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read".to_string(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+            },
+        };
+        let mut app = test_app();
+        app.messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant_calls(
+                None,
+                vec![call("call-A", "a.rs"), call("call-B", "b.rs")],
+            ),
+            ChatMessage::tool_result("call-B", "v 1 line"),
+            ChatMessage::tool_result("call-A", "v 2 lines"),
+        ];
+        rebuild_transcript(&mut app);
+        // Exactly two blocks — no duplicate bare inputs — both completed.
+        assert_eq!(app.transcript.len(), 2);
+        for (block, (arg, id)) in app
+            .transcript
+            .iter()
+            .zip([("a.rs", "call-A"), ("b.rs", "call-B")])
+        {
+            let TranscriptBlock::Tool {
+                tool_arg,
+                tool_id,
+                output,
+                ..
+            } = block
+            else {
+                panic!("expected Tool block");
+            };
+            assert_eq!(tool_arg, arg);
+            assert_eq!(tool_id, id);
+            assert!(output.is_some(), "rebuilt block left open for {arg}");
         }
     }
 
