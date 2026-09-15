@@ -71,9 +71,22 @@ fn resume_candidates(app: &App) -> Vec<(PathBuf, crate::session::SessionHeader)>
         .collect()
 }
 
+/// Whether the slash popup should intercept keys and render: composer is
+/// free (not busy, not mid history walk — the walk guard lives in
+/// slash_suggestions) and the input drafts a command. The remote key arm
+/// keys off this so a recalled "/clear" never traps Up/Down in the popup;
+/// while it is open, Esc only dismisses it.
+pub(super) fn popup_open(app: &App) -> bool {
+    !slash_suggestions(app).is_empty()
+}
+
 pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     let input = app.input.text();
-    if app.busy || !input.starts_with('/') || input.contains('\n') {
+    // The popup is a typing affordance, not a history companion: while the
+    // composer holds a line recalled by the history walk (history_index is
+    // Some), Up/Down must keep walking history instead of getting trapped
+    // over a recalled "/clear" — see popup_open().
+    if app.busy || app.history_index.is_some() || !input.starts_with('/') || input.contains('\n') {
         return Vec::new();
     }
 
@@ -977,6 +990,30 @@ mod tests {
         // Argument form without a known picker -> nothing.
         type_input(&mut app, "/nope arg");
         assert!(slash_suggestions(&app).is_empty());
+    }
+
+    #[test]
+    fn no_popup_while_walking_history() {
+        // Up/Down must keep walking history when the composer holds a line
+        // recalled from it: a "/clear" entry must not resurrect the popup
+        // and trap the walk (the remote key arms fall through when it's
+        // closed, so Up/Down reach the generic history handling).
+        let mut app = new_app();
+        type_input(&mut app, "/clear");
+        assert!(popup_open(&app), "popup while freshly typing");
+
+        app.history_index = Some(0);
+        assert!(
+            !popup_open(&app),
+            "recalled slash line must not open the popup"
+        );
+
+        // Even a fresh command draft stays popup-free mid-walk; resuming
+        // normal typing (walk closed) gets the popup back.
+        type_input(&mut app, "/mo");
+        assert!(slash_suggestions(&app).is_empty(), "no popup mid-walk");
+        app.history_index = None;
+        assert!(popup_open(&app), "fresh typing gets the popup back");
     }
 
     #[test]
