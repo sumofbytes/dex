@@ -173,6 +173,11 @@ enum Request {
         args: Json,
         timeout: Duration,
         call_id: String,
+        /// This turn's drive context (snapshot + routing headers), read from
+        /// the task-local at `drive()` time. The worker pins it for the
+        /// drive's duration so `dex.model.*` on the worker thread serves this
+        /// call's model even when another turn records a newer one mid-call.
+        model: Option<super::DriveModel>,
         tx: mpsc::UnboundedSender<WorkerMsg>,
     },
 }
@@ -263,12 +268,24 @@ impl ExtensionEngine {
     ) -> Result<String, String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMsg>();
         let call_id = uuid::Uuid::new_v4().to_string();
+        // Snapshot the turn's drive context now: by the time the worker runs
+        // this call, a concurrent turn may have recorded a newer snapshot
+        // into the process-wide fallback.
+        let drive_model = {
+            let model = crate::extensions::current_drive_model();
+            if model.snapshot.is_some() {
+                Some(model)
+            } else {
+                None
+            }
+        };
         self.tx
             .send(Request::Call {
                 kind,
                 args,
                 timeout,
                 call_id,
+                model: drive_model,
                 tx,
             })
             .await
@@ -455,10 +472,11 @@ fn worker_loop(manifest: Manifest, dir: PathBuf, mut rx: mpsc::Receiver<Request>
                 args,
                 timeout,
                 call_id,
+                model,
                 tx,
             } => {
                 run_call(
-                    &lua, &manifest, &regs, &dir, kind, args, timeout, &call_id, &tx,
+                    &lua, &manifest, &regs, &dir, kind, args, timeout, &call_id, model, &tx,
                 );
             }
         }
@@ -983,10 +1001,14 @@ fn build_dex_table(
                             "extension '{ext_id}' reads the model without the model capability"
                         )));
                     }
-                    // The served snapshot wins when a turn recorded one (a
-                    // per-request override the file never sees); otherwise
-                    // resolve from file+env.
-                    let current = match crate::extensions::served_model_snapshot() {
+                    // The drive's pinned model wins when this call carries one
+                    // (this turn's model, even under concurrent turns); then
+                    // the task-side fallback (a per-request override the file
+                    // never sees); otherwise resolve from file+env.
+                    let current = match worker_drive_model()
+                        .and_then(|drive| drive.snapshot)
+                        .or_else(crate::extensions::served_model_snapshot)
+                    {
                         Some(served) => served,
                         None => crate::llm::config::extension_model_snapshot()
                             .map_err(LuaError::RuntimeError)?,
@@ -1016,10 +1038,15 @@ fn build_dex_table(
                             "extension '{ext_id}' reads model auth without the model capability"
                         )));
                     }
-                    // The served snapshot wins when a turn recorded one (a
-                    // per-request override the file never sees); the key
-                    // still resolves from the configured deposits.
-                    let auth = match crate::extensions::served_model_snapshot() {
+                    // The drive's pinned model wins when this call carries one
+                    // (this turn's model, even under concurrent turns); then
+                    // the task-side fallback (a per-request override the file
+                    // never sees); the key still resolves from the configured
+                    // deposits.
+                    let auth = match worker_drive_model()
+                        .and_then(|drive| drive.snapshot)
+                        .or_else(crate::extensions::served_model_snapshot)
+                    {
                         Some(served) => crate::llm::config::extension_model_auth_for(
                             &served.provider,
                             &served.base_url,
@@ -1185,8 +1212,34 @@ fn host_upcall(lua: &Lua, ext_id: &str, op: HostOp) -> Result<String, LuaError> 
         .map_err(LuaError::RuntimeError)
 }
 
-/// Run one call on the worker: arm the deadline hook, dispatch by kind, and
-/// always terminate with exactly one `Done`.
+// The drive's model context on the worker thread: set by `run_call` for
+// the drive's duration, read by the sync `dex.model.*` closures (which
+// cannot reach the task-local — the worker is a plain OS thread). Drives
+// never interleave on a worker, so one slot is enough.
+std::thread_local! {
+    static DRIVE_WORKER: RefCell<Option<super::DriveModel>> = const { RefCell::new(None) };
+}
+
+/// This drive's model context, if the running call carries one.
+fn worker_drive_model() -> Option<super::DriveModel> {
+    DRIVE_WORKER.with(|slot| slot.borrow().clone())
+}
+
+/// Restores the worker's previous drive context when the drive ends
+/// (save/restore keeps nesting honest if a drive ever re-enters).
+struct WorkerDriveGuard {
+    prev: Option<super::DriveModel>,
+}
+
+impl Drop for WorkerDriveGuard {
+    fn drop(&mut self) {
+        DRIVE_WORKER.with(|slot| *slot.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Run one call on the worker: pin the drive's model context, arm the
+/// deadline hook, dispatch by kind, and always terminate with exactly one
+/// `Done`.
 #[allow(clippy::too_many_arguments)]
 fn run_call(
     lua: &Lua,
@@ -1197,8 +1250,16 @@ fn run_call(
     args: Json,
     timeout: Duration,
     call_id: &str,
+    model: Option<super::DriveModel>,
     tx: &mpsc::UnboundedSender<WorkerMsg>,
 ) {
+    // Pin this drive's model for `dex.model.*` below; the guard restores
+    // the previous slot (none, outside nesting) on every exit path.
+    let _drive_guard = DRIVE_WORKER.with(|slot| {
+        let prev = slot.borrow().clone();
+        *slot.borrow_mut() = model;
+        WorkerDriveGuard { prev }
+    });
     // Deadline + cancellation hook: the task sets `aborted` on timeout (via
     // reply-drop) — but the primary path is the task-side deadline in
     // `drive`, which abandons first. The hook still bounds pure-Lua runaway
