@@ -855,6 +855,22 @@ where
     C: ModelClient + 'static,
     X: CancellationSource + Clone + 'static,
 {
+    // Pin this turn's model drive context for the whole turn: extension
+    // drives read it instead of the process-wide fallback, so concurrent
+    // turns (daemon sessions) and nested child turns each serve their own
+    // model. The recorder below still updates the fallback for out-of-turn
+    // drives, and the `model_select` event still fires on change.
+    let drive = crate::extensions::drive_model_for(rt.config);
+    crate::extensions::with_drive_model(drive, process_turn_scoped(rt)).await
+}
+
+async fn process_turn_scoped<C, X>(
+    rt: AgentRuntime<'_, C, X>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: ModelClient + 'static,
+    X: CancellationSource + Clone + 'static,
+{
     // Lifecycle hooks (plan §7): `before_agent_start` may append to the
     // system prompt for this turn (read-only influence, Pi's prompt
     // customizer); `turn.start` before anything runs; `turn.end` on every
@@ -865,6 +881,12 @@ where
     let turn_policy = Policy::turn(rt.config.permission, rt.console);
     let cancel = rt.cancel.clone();
     let filter = rt.filter;
+    // Model-aware extensions (`dex.model`, provider-native tools) sync on
+    // `model_select`: fires when the served `provider/model` changed since
+    // the last turn (always on the first), and records the snapshot
+    // `dex.model` reads — including per-request daemon overrides the file
+    // never sees. Same fail-open contract as the hooks below.
+    crate::extensions::fire_model_select_if_changed(rt.config, &cancel, &turn_policy, filter).await;
     // `before_agent_start` system-prompt append (plan §7 P2): applied to the
     // leading System message for the duration of the turn, restored before
     // the result leaves — the journal never stores System role messages, so

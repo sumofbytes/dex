@@ -1,0 +1,33 @@
+manifest_version: 1
+id: web
+version: 0.1.0
+capabilities: [tools, tools.override, model, net]
+tools:
+    - name: search
+      description: Search the web with the current provider's native search API and return cited results.
+      parameters:
+        type: object
+        properties:
+          query:
+            type: string
+            description: The search query.
+          count:
+            type: integer
+            description: Max sources to list (default 5).
+        required: [query]
+      timeout: 120
+    - name: fetch
+      description: Fetch and summarize the given URLs (Gemini models only).
+      parameters:
+        type: object
+        properties:
+          urls:
+            type: array
+            items:
+              type: string
+            description: URLs to retrieve.
+          query:
+            type: string
+            description: Optional question to answer from the pages.
+        required: [urls]
+      timeout: 120
