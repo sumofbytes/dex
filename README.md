@@ -611,15 +611,13 @@ context, tool allowlist, and JSONL transcript
 (`$XDG_DATA_HOME/dex/sessions/<slug>/agents/*.jsonl`). Completions are announced
 at the next turn boundary and, while the session is idle with a client attached,
 a wake turn surfaces them immediately (off with `agent_wake: false` /
-`DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children
-cannot delegate (depth 1). A recoverable ending — interrupted, timed out, or
-budget-exhausted with progress on disk — is marked `resumable` in its result:
-`delegate(resume_from: …)` continues that child from its transcript as a new
-generation (the supervisor re-enters automatically when the definition opts in
-with `recover: fresh|resume`; over-cap spawns queue and start when a slot
-frees, and an idle session's children are reaped after ten minutes without a
-client; when recoveries fail faster than policy allows, the breaker queues
-new spawns until that window expires). Under `ask-*` modes a mutating call
+`DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children may delegate
+further up to a nesting depth of 3. A recoverable ending — interrupted, timed
+out, or budget-exhausted with progress on disk — is marked `resumable` in its
+result: `delegate(resume_from: …)` continues that child from its transcript as
+a new generation (re-entry is always manual — there is no automatic recovery,
+no spawn queue, and no idle reaper; over-cap spawns reject so the model waits
+for or cancels a child and retries). Under `ask-*` modes a mutating call
 parks a labeled
 prompt in the session's approval queue — "explorer wants to run bash: …" —
 unanswered for five minutes it denies; session-level "allow" approvals apply to
