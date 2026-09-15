@@ -194,13 +194,17 @@ ones above). Other keys are preserved untouched.
 
 ### System prompt
 
-`system_prompt:` (inline text) or `system_prompt_file:` (path to a file)
-replaces the built-in base prompt (identity + working rules). Project
-instructions (`AGENTS.md`/`CLAUDE.md`), extension appendix and skills are
-still appended. Precedence: `--system-prompt` > `--system-prompt-file` >
-`DEX_SYSTEM_PROMPT` > `DEX_SYSTEM_PROMPT_FILE` > file `system_prompt:` >
-file `system_prompt_file:` > built-in default. `dex doctor` shows the
-resolved source as `system prompt`.
+  `system_prompt:` (inline text) or `system_prompt_file:` (path to a file)
+  replaces the built-in base prompt (identity + working rules). Project
+  instructions (`AGENTS.md`/`CLAUDE.md`), extension appendix and skills are
+  still appended. Subagent children keep their own persona/rules (unaffected).
+  `dex serve` ignores CLI flags — the daemon falls back to its own env/file
+  layers unless the client forwards per-request text. Empty/whitespace-only
+  values count as unset at every layer and fall through. Precedence:
+  `--system-prompt` > `--system-prompt-file` >
+  `DEX_SYSTEM_PROMPT` > `DEX_SYSTEM_PROMPT_FILE` > file `system_prompt:` >
+  file `system_prompt_file:` > built-in default. `dex doctor` shows the
+  resolved source as `system prompt`.
 
 ### Other OpenAI-compatible providers
 
