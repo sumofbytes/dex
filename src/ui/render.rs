@@ -2742,6 +2742,7 @@ mod tests {
         super::super::append_sink_line(
             &mut app,
             super::super::SinkLine::ToolOutput {
+                id: String::new(),
                 name: "read".into(),
                 summary: "2 lines".into(),
                 success: true,
@@ -3089,11 +3090,15 @@ mod tests {
         let mut app = test_app();
         super::super::append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("bash grep foo src".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash grep foo src".into(),
+            },
         );
         super::super::append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolOutput {
+                id: String::new(),
                 name: "bash".into(),
                 summary: "v 1 match".into(),
                 success: true,
@@ -3397,11 +3402,15 @@ mod tests {
             ] {
                 super::super::append_sink_line(
                     &mut app,
-                    crate::core::types::SinkLine::ToolInput(format!("read /tmp/dex/src/ui/{name}")),
+                    crate::core::types::SinkLine::ToolInput {
+                        id: String::new(),
+                        input: format!("read /tmp/dex/src/ui/{name}"),
+                    },
                 );
                 super::super::append_sink_line(
                     &mut app,
                     crate::core::types::SinkLine::ToolOutput {
+                        id: String::new(),
                         name: "read".into(),
                         summary: "10 lines".into(),
                         success: true,
@@ -3553,11 +3562,15 @@ mod tests {
         super::super::render_user_prompt(&mut app, "can you check pillar 1 form harness.md");
         super::super::append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("read HARNESS.md".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "read HARNESS.md".into(),
+            },
         );
         super::super::append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolOutput {
+                id: String::new(),
                 name: "read".into(),
                 summary: "v 313 lines".into(),
                 success: true,
