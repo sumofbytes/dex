@@ -444,6 +444,36 @@ async fn compaction_gate(
     Ok(())
 }
 
+/// Announce one tool call the moment it starts executing — not when it
+/// finishes — so every surface shows the in-progress call: the TUI opens
+/// the tool block, the daemon forwards `tool_call` for remote TUIs,
+/// headless prints `[tool input]`, and child-agent progress labels update.
+/// The preview arg is the raw call JSON; `short_arg` reduces it the same
+/// way the completion path does once the normalized input is known, so
+/// the two lines agree. The matching `ToolOutput` (same `id`) completes
+/// the block later, even when parallel batches interleave.
+async fn note_tool_start(console: &Console, call: &LlmToolCall) {
+    let name = call.function.name.clone();
+    let args = call.function.arguments.clone();
+    note_sink(
+        console,
+        || SinkLine::ToolInput {
+            id: call.id.clone(),
+            input: format!("{} {}", name, short_arg(&name, &args)),
+        },
+        || {
+            format!(
+                "{}[tool input] {} {}{}",
+                TOOL_INPUT_COLOR,
+                name,
+                short_arg(&name, &args),
+                RESET
+            )
+        },
+    )
+    .await;
+}
+
 /// Execute one batch of tool calls: serialized under the mutation lock when
 /// the calls conflict, else fanned out on JoinSet tasks (input-ordered via
 /// indexed results + sort; panics surface as tool errors).
@@ -452,6 +482,7 @@ async fn run_tool_batch<X>(
     cancel: &X,
     policy: &Policy,
     filter: Option<&ToolFilter>,
+    console: &Console,
 ) -> Vec<(String, String, ToolOutcome, Duration)>
 where
     X: CancellationSource + Clone + 'static,
@@ -461,6 +492,7 @@ where
         let mut out = Vec::new();
         for call in calls {
             let started = Instant::now();
+            note_tool_start(console, call).await;
             let (name, input, outcome) = execute_tool_call(
                 call,
                 cancel as &(dyn CancellationSource + Send + Sync),
@@ -485,10 +517,16 @@ where
             // cannot hold the turn's borrowed filter — same shape
             // as the per-task policy clone above.
             let filter = filter.cloned();
+            // Same for the start-of-call announce below: each task emits
+            // its own `ToolInput` (paired later by call id), so the TUI
+            // opens every parallel block up front instead of only after
+            // the whole batch completes.
+            let task_console = console.clone();
             handles.push((
                 idx,
                 tokio::spawn(async move {
                     let started = Instant::now();
+                    note_tool_start(&task_console, &call).await;
                     let (name, input, outcome) =
                         execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
                     (name, input, outcome, started.elapsed())
@@ -586,20 +624,9 @@ async fn process_tool_result(
         last_tools.push(cache_key.clone());
     }
     let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
-    note_sink(
-        console,
-        || SinkLine::ToolInput(format!("{} {}", call.function.name, short_arg(name, input))),
-        || {
-            format!(
-                "{}[tool input] {} {}{}",
-                TOOL_INPUT_COLOR,
-                call.function.name,
-                short_arg(name, input),
-                RESET
-            )
-        },
-    )
-    .await;
+    // No `ToolInput` here: the start of the call was already announced by
+    // `note_tool_start` when execution began (serial and parallel paths),
+    // so the block is open long before this completion line lands.
 
     let cacheable = matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls");
     let mut cache_hit = false;
@@ -707,6 +734,10 @@ async fn process_tool_result(
             let skip_first = !counts_only || !ok;
             let preview = tool_preview(name, ok, diff.as_deref(), &result, skip_first);
             SinkLine::ToolOutput {
+                // Pairs with the `ToolInput` announced at execution start:
+                // UIs match by id so parallel-batch outputs land on their
+                // own open block instead of the transcript tail.
+                id: call.id.clone(),
                 name: name.to_string(),
                 summary,
                 success: ok,
@@ -1133,7 +1164,7 @@ where
                 reasoning_content: message.reasoning_content,
             });
 
-            let results = run_tool_batch(&calls, cancel, &policy, filter).await;
+            let results = run_tool_batch(&calls, cancel, &policy, filter, console).await;
 
             // Cancel landed during tool IO: the per-tool "cancelled"
             // errors above are shutdown noise, not model input. Suppress
@@ -1142,6 +1173,31 @@ where
             // a transcript the model never saw out of the session.
             if cancellation.is_cancelled() {
                 let _ = cancellation.take_cancelled();
+                // Every call already announced its start, so close each
+                // open block explicitly — otherwise the TUI spinner (and
+                // any remote transcript) lingers on calls that will never
+                // complete.
+                for call in &calls {
+                    let name = call.function.name.clone();
+                    note_sink(
+                        console,
+                        || SinkLine::ToolOutput {
+                            id: call.id.clone(),
+                            name: name.clone(),
+                            summary: "cancelled by user".to_string(),
+                            success: false,
+                            preview: Vec::new(),
+                            duration: 0.0,
+                        },
+                        || {
+                            format!(
+                                "{}[tool output] {}:\ncancelled by user{}",
+                                TOOL_OUTPUT_COLOR, name, RESET
+                            )
+                        },
+                    )
+                    .await;
+                }
                 return Err("cancelled by user".into());
             }
 
@@ -1589,10 +1645,37 @@ pub(crate) mod tests {
         while let Ok(e) = sink_rx.try_recv() {
             events.push(e);
         }
-        assert!(events.iter().any(|e| matches!(e, SinkLine::ToolInput(_))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SinkLine::ToolInput { .. })));
         assert!(events
             .iter()
             .any(|e| matches!(e, SinkLine::ToolOutput { .. })));
+        // The start announce precedes the completion line, and both carry
+        // the call id so the UI can pair them (the DEX-10 case: the input
+        // must be visible while the tool still runs, not after).
+        let input_pos = events
+            .iter()
+            .position(|e| matches!(e, SinkLine::ToolInput { .. }))
+            .expect("tool input announced");
+        let output_pos = events
+            .iter()
+            .position(|e| matches!(e, SinkLine::ToolOutput { .. }))
+            .expect("tool output emitted");
+        assert!(
+            input_pos < output_pos,
+            "tool input must precede its output: {events:?}"
+        );
+        let input_id = events.iter().find_map(|e| match e {
+            SinkLine::ToolInput { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        let output_id = events.iter().find_map(|e| match e {
+            SinkLine::ToolOutput { id, .. } => Some(id.clone()),
+            _ => None,
+        });
+        assert_eq!(input_id.as_deref(), Some("call-1"));
+        assert_eq!(input_id, output_id);
     }
 
     /// Online context compaction end-to-end: a completed plan step is a
@@ -1804,7 +1887,11 @@ pub(crate) mod tests {
             call("b", "definitely-not-here-b.rs"),
         ];
         assert!(!tool_calls_conflict(&calls));
-        let results = run_tool_batch(&calls, &NeverCancel, &Policy::trusted(), None).await;
+        let (sink_tx, mut sink_rx) = mpsc::channel(32);
+        let (approval_tx, _approval_rx) = mpsc::channel(16);
+        let console = crate::core::console::Console::daemon(sink_tx, approval_tx);
+        let results =
+            run_tool_batch(&calls, &NeverCancel, &Policy::trusted(), None, &console).await;
         assert_eq!(results.len(), 2);
         assert!(
             results[0].1.contains("definitely-not-here-a.rs"),
@@ -1814,6 +1901,16 @@ pub(crate) mod tests {
             results[1].1.contains("definitely-not-here-b.rs"),
             "second result keeps second call's input"
         );
+        // Parallel fan-out announces every call up front, each tagged with
+        // its own id so the UI can open both blocks before either finishes.
+        let mut announced = Vec::new();
+        while let Ok(e) = sink_rx.try_recv() {
+            if let SinkLine::ToolInput { id, .. } = e {
+                announced.push(id);
+            }
+        }
+        announced.sort();
+        assert_eq!(announced, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
