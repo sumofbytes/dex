@@ -664,9 +664,19 @@ login retries once without it.
 Harness extensions in sandboxed Lua: drop a directory with `manifest.yaml` +
 `extension.lua` into a discovery dir and it can register tools, shadow
 built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
-`turn.start`/`turn.end`, `session.before_compact`). Extension code runs in a
+`turn.start`/`turn.end`, `before_agent_start`, `model_select`,
+`session.before_compact`). Extension code runs in a
 stripped VM — no io/os/require — and every effect flows through the same
 permission gates as a model-issued call.
+
+Model-aware extensions declare the `model` capability (`dex.model.current()`
+for the served `provider/model`, `dex.model.auth()` for its key + endpoint)
+and the `net` capability (`dex.net.fetch()`, HTTP confined to that model's
+own endpoint); `dex.json` encodes/decodes request bodies. The host fires
+`model_select` when the served model changes so extensions can hide tools
+the model cannot serve (`dex.tools.set_active`). See
+`examples/extensions/web` — provider-native web search + URL fetch
+that reuses the current model's credentials — as the reference.
 
 ```yaml
 extensions:

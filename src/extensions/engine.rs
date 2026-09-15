@@ -63,6 +63,7 @@ pub(crate) const KNOWN_EVENTS: &[&str] = &[
     "agent.end",
     "session.before_compact",
     "before_agent_start",
+    "model_select",
 ];
 
 /// Host context a Lua call runs under: what cancellation, gates, and
@@ -136,7 +137,20 @@ pub(crate) enum HostOp {
     /// controls).
     ToolsList,
     /// `dex.tools.set_active(list)`: restrict the extension schema slice.
-    SetActive { tools: Vec<String> },
+    /// Carries the caller id so short (own-extension) names resolve to full
+    /// `lua__<ext>__<tool>` names host-side — extension code never spells the
+    /// prefix.
+    SetActive { ext: String, tools: Vec<String> },
+    /// `dex.net.fetch(spec)`: one HTTP request confined to the current
+    /// model's own endpoint (the task side checks the origin). The worker
+    /// never touches the network; the awaiting task performs the request.
+    NetFetch {
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+        timeout_ms: u64,
+    },
 }
 
 /// The chunk's exports: registered tool names, subscribed event names, and
@@ -369,10 +383,17 @@ async fn answer_hostcall(
             Ok(serde_json::to_string(&crate::extensions::tools_list())
                 .map_err(|e| e.to_string())?)
         }
-        HostOp::SetActive { tools } => {
-            crate::extensions::set_active_global(tools).await;
+        HostOp::SetActive { ext, tools } => {
+            crate::extensions::set_active_global(&ext, tools).await;
             Ok("null".to_string())
         }
+        HostOp::NetFetch {
+            url,
+            method,
+            headers,
+            body,
+            timeout_ms,
+        } => crate::extensions::net_fetch(url, method, headers, body, timeout_ms).await,
         HostOp::CallOriginal { target, args } => {
             let Some(slot) = shadow.as_mut() else {
                 return Err("call_original outside a shadow has no original".to_string());
@@ -695,7 +716,8 @@ fn build_dex_table(
             .expect("tools.list slot");
     }
 
-    // dex.tools.set_active(list): restrict the extension schema slice;
+    // dex.tools.set_active(list): restrict the extension schema slice
+    // (short own-tool names or full lua__ names — the host resolves);
     // requires the tools.override capability (plan §6.4).
     {
         let ext_id = ext_id.clone();
@@ -725,7 +747,14 @@ fn build_dex_table(
                             }
                         }
                     }
-                    host_upcall(lua, &ext_id, HostOp::SetActive { tools: names })
+                    host_upcall(
+                        lua,
+                        &ext_id,
+                        HostOp::SetActive {
+                            ext: ext_id.clone(),
+                            tools: names,
+                        },
+                    )
                 })
                 .expect("tools.set_active fn"),
             )
@@ -934,6 +963,203 @@ fn build_dex_table(
         )
         .expect("prompt.get slot");
     dex.set("prompt", prompt).expect("dex.prompt");
+
+    // dex.model.current()/auth(): the current model + its credentials, so a
+    // model-aware extension (provider-native search, …) can reuse the
+    // endpoint and key instead of configuring its own. Reads file+env on
+    // the worker (sync, no secrets cross into logs); the daemon records
+    // the served snapshot per turn, which wins when set. Gated on the
+    // `model` capability like `workspace.read`.
+    let model = lua.create_table().expect("dex.model table");
+    {
+        let ext_id = ext_id.clone();
+        let manifest = manifest.clone();
+        model
+            .set(
+                "current",
+                lua.create_function(move |lua, _: ()| {
+                    if !manifest.has_capability("model") {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' reads the model without the model capability"
+                        )));
+                    }
+                    // The served snapshot wins when a turn recorded one (a
+                    // per-request override the file never sees); otherwise
+                    // resolve from file+env.
+                    let current = match crate::extensions::served_model_snapshot() {
+                        Some(served) => served,
+                        None => crate::llm::config::extension_model_snapshot()
+                            .map_err(LuaError::RuntimeError)?,
+                    };
+                    let id = current.id();
+                    let table = lua.create_table()?;
+                    table.set("provider", current.provider)?;
+                    table.set("model", current.model)?;
+                    table.set("id", id)?;
+                    table.set("api", current.api)?;
+                    table.set("base_url", current.base_url)?;
+                    Ok(table)
+                })
+                .expect("model.current fn"),
+            )
+            .expect("model.current slot");
+    }
+    {
+        let ext_id = ext_id.clone();
+        let manifest = manifest.clone();
+        model
+            .set(
+                "auth",
+                lua.create_function(move |lua, _: ()| {
+                    if !manifest.has_capability("model") {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' reads model auth without the model capability"
+                        )));
+                    }
+                    // The served snapshot wins when a turn recorded one (a
+                    // per-request override the file never sees); the key
+                    // still resolves from the configured deposits.
+                    let auth = match crate::extensions::served_model_snapshot() {
+                        Some(served) => crate::llm::config::extension_model_auth_for(
+                            &served.provider,
+                            &served.base_url,
+                        ),
+                        None => crate::llm::config::extension_model_auth(),
+                    }
+                    .map_err(LuaError::RuntimeError)?;
+                    let table = lua.create_table()?;
+                    table.set("api_key", auth.api_key)?;
+                    table.set("base_url", auth.base_url)?;
+                    let headers = lua.create_table()?;
+                    for (name, value) in &auth.headers {
+                        headers.set(name.clone(), value.clone())?;
+                    }
+                    table.set("headers", headers)?;
+                    Ok(table)
+                })
+                .expect("model.auth fn"),
+            )
+            .expect("model.auth slot");
+    }
+    dex.set("model", model).expect("dex.model");
+
+    // dex.net.fetch(spec): one HTTP request confined to the model's own
+    // endpoint (scheme+host+port must match `dex.model.auth().base_url`).
+    // Non-2xx is a value (`{status, headers, body}`), not a Lua error.
+    // Gated on the `net` capability (which itself requires `model`).
+    let net = lua.create_table().expect("dex.net table");
+    {
+        let ext_id = ext_id.clone();
+        let manifest = manifest.clone();
+        net.set(
+            "fetch",
+            lua.create_function(move |lua, spec: Table| {
+                if !manifest.has_capability("net") {
+                    return Err(LuaError::RuntimeError(format!(
+                        "extension '{ext_id}' fetches without the net capability"
+                    )));
+                }
+                let url: String = spec.get("url").map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "extension '{ext_id}' dex.net.fetch needs a url"
+                    ))
+                })?;
+                let method = match spec.get::<Value>("method").unwrap_or(Value::Nil) {
+                    Value::Nil => "GET".to_string(),
+                    Value::String(s) => s
+                        .to_str()
+                        .map_err(|e| LuaError::RuntimeError(e.to_string()))?
+                        .to_string(),
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' dex.net.fetch method must be a string, got {}",
+                            lua_type_name(&other)
+                        )))
+                    }
+                };
+                let timeout_ms = match spec.get::<Value>("timeout_ms").unwrap_or(Value::Nil) {
+                    Value::Nil => 30_000,
+                    Value::Integer(n) if n > 0 => n as u64,
+                    Value::Number(n) if n > 0.0 => n as u64,
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' dex.net.fetch timeout_ms must be a positive number, got {}",
+                            lua_type_name(&other)
+                        )))
+                    }
+                };
+                let body: Option<String> = spec.get("body").map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "extension '{ext_id}' dex.net.fetch body must be a string"
+                    ))
+                })?;
+                let headers_value: Value = spec.get("headers").unwrap_or(Value::Nil);
+                let mut headers = Vec::new();
+                match headers_value {
+                    Value::Nil => {}
+                    Value::Table(heads) => {
+                        for pair in heads.pairs::<String, String>() {
+                            let (name, value) = pair.map_err(|e| {
+                                LuaError::RuntimeError(format!(
+                                    "extension '{ext_id}' dex.net.fetch headers must be string pairs: {e}"
+                                ))
+                            })?;
+                            headers.push((name, value));
+                        }
+                    }
+                    other => {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' dex.net.fetch headers must be a table, got {}",
+                            lua_type_name(&other)
+                        )))
+                    }
+                }
+                let json = host_upcall(
+                    lua,
+                    &ext_id,
+                    HostOp::NetFetch {
+                        url,
+                        method,
+                        headers,
+                        body,
+                        timeout_ms,
+                    },
+                )?;
+                let value: Json = serde_json::from_str(&json).map_err(|e| {
+                    LuaError::RuntimeError(format!("extension '{ext_id}' bad fetch reply: {e}"))
+                })?;
+                json_to_lua(lua, &value)
+            })
+            .expect("net.fetch fn"),
+        )
+        .expect("net.fetch slot");
+    }
+    dex.set("net", net).expect("dex.net");
+
+    // dex.json.encode/decode: table<->JSON string for request bodies and
+    // response parsing. Pure data transform, no capability gate.
+    let json = lua.create_table().expect("dex.json table");
+    json.set(
+        "encode",
+        lua.create_function(|_, value: Value| {
+            lua_to_json(value)
+                .map(|json| json.to_string())
+                .map_err(LuaError::RuntimeError)
+        })
+        .expect("json.encode fn"),
+    )
+    .expect("json.encode slot");
+    json.set(
+        "decode",
+        lua.create_function(|lua, text: String| {
+            let value: Json = serde_json::from_str(&text)
+                .map_err(|e| LuaError::RuntimeError(format!("dex.json.decode: {e}")))?;
+            json_to_lua(lua, &value)
+        })
+        .expect("json.decode fn"),
+    )
+    .expect("json.decode slot");
+    dex.set("json", json).expect("dex.json");
     dex.set("tools", tools).expect("dex.tools");
     dex.set("events", events).expect("dex.events");
     dex.set("log", log).expect("dex.log");
