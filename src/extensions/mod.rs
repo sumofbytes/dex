@@ -1050,10 +1050,70 @@ pub(crate) async fn apply_before_agent_start(
     global_manager().apply_before_agent_start(&host).await
 }
 
+/// Per-turn model drive context: the served snapshot + routing-affinity
+/// headers for THIS turn. `process_turn` scopes it over the whole turn (see
+/// `with_drive_model`); `drive()` snapshots it into each worker call and
+/// `served_model_snapshot()` / `net_fetch` prefer it over the globals below.
+/// Without it two concurrent turns (daemon sessions, or a subagent child
+/// turn nested in its parent) would serve each other's model through the
+/// process-wide fallback.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DriveModel {
+    pub(crate) snapshot: Option<ExtensionModelSnapshot>,
+    pub(crate) routing: BTreeMap<String, String>,
+}
+
+tokio::task_local! {
+    static DRIVE_MODEL: std::cell::RefCell<DriveModel>;
+}
+
+/// Build this turn's drive context from its served config (no event, no
+/// recording — `fire_model_select_if_changed` still owns those).
+pub(crate) fn drive_model_for(config: &crate::llm::config::LlmConfig) -> DriveModel {
+    DriveModel {
+        snapshot: Some(served_snapshot_for(config)),
+        routing: harvest_routing_headers(&config.extra_headers),
+    }
+}
+
+/// Run `fut` with this turn's drive context visible to extension drives.
+/// Nested scopes (a subagent child turn inside its parent) shadow and then
+/// restore the outer turn's context.
+pub(crate) async fn with_drive_model<Fut, T>(model: DriveModel, fut: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    DRIVE_MODEL.scope(std::cell::RefCell::new(model), fut).await
+}
+
+/// This turn's drive context, or an empty one outside any turn (one-shot
+/// `dex run`, load-time reads — those fall back to the globals / file+env).
+pub(crate) fn current_drive_model() -> DriveModel {
+    DRIVE_MODEL
+        .try_with(|slot| slot.borrow().clone())
+        .unwrap_or_default()
+}
+
+/// Snapshot + id for a served config. Shared by the per-turn drive context
+/// and the change-detection recorder below so the two never drift.
+pub(crate) fn served_snapshot_for(
+    config: &crate::llm::config::LlmConfig,
+) -> ExtensionModelSnapshot {
+    ExtensionModelSnapshot {
+        provider: config.provider.name().to_string(),
+        model: config.model.clone(),
+        api: config.api.name().to_string(),
+        base_url: config.base_url.clone(),
+    }
+}
+
 /// Served-model snapshot recorded per turn (see `fire_model_select_if_changed`):
 /// the daemon's per-request config — which the file never sees — wins over
 /// file+env for `dex.model.current()/auth()` once a turn has served. Secrets
 /// never land here (auth re-resolves the key from the deposits each call).
+/// Fallback only: inside a turn the task-local drive context (which also
+/// covers nested child turns) wins — this static exists for drives outside
+/// any turn, where file+env resolution is process-global anyway.
 static LAST_MODEL: Mutex<Option<ExtensionModelSnapshot>> = Mutex::new(None);
 
 /// Routing-affinity headers recorded per turn (see
@@ -1061,8 +1121,8 @@ static LAST_MODEL: Mutex<Option<ExtensionModelSnapshot>> = Mutex::new(None);
 /// injects into `extra_headers` for Console Go routing (the endpoint
 /// rejects requests without them: `MissingSessionID`). `dex.net.fetch`
 /// re-attaches them so extension calls to the same endpoint route like
-/// dex's own — Lua-explicit headers always win. Same last-turn-wins
-/// staleness as the snapshot above.
+/// dex's own — Lua-explicit headers always win. Fallback only, like
+/// [`LAST_MODEL`]: inside a turn the drive context carries them.
 static LAST_ROUTING_HEADERS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 /// The routing-affinity subset of a turn's resolved `extra_headers`: only
@@ -1100,9 +1160,33 @@ fn with_routing_headers(
     merged
 }
 
-/// The served snapshot, if any turn has recorded one yet.
+/// The served snapshot: this turn's drive context wins when inside a turn
+/// (per-turn scoping keeps concurrent sessions and nested child turns on
+/// their own model); outside any turn, the last recorded turn, if any.
 pub(crate) fn served_model_snapshot() -> Option<ExtensionModelSnapshot> {
-    LAST_MODEL.lock().ok().and_then(|guard| guard.clone())
+    let drive = current_drive_model();
+    if drive.snapshot.is_some() {
+        drive.snapshot
+    } else {
+        LAST_MODEL.lock().ok().and_then(|guard| guard.clone())
+    }
+}
+
+/// This turn's routing-affinity headers (empty when the turn carries none —
+/// a turn without affinity headers must not inherit a stale session id);
+/// outside any turn, the last recorded turn's.
+fn current_routing_headers() -> BTreeMap<String, String> {
+    let drive = current_drive_model();
+    if drive.snapshot.is_some() {
+        drive.routing
+    } else {
+        // Fail-open: a poisoned lock drops the affinity headers, never the call.
+        LAST_ROUTING_HEADERS
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// `model_select` for `process_turn`: record the served snapshot every turn
@@ -1117,12 +1201,7 @@ pub(crate) async fn fire_model_select_if_changed(
     policy: &crate::tools::Policy,
     filter: Option<&crate::tools::ToolFilter>,
 ) {
-    let snapshot = ExtensionModelSnapshot {
-        provider: config.provider.name().to_string(),
-        model: config.model.clone(),
-        api: config.api.name().to_string(),
-        base_url: config.base_url.clone(),
-    };
+    let snapshot = served_snapshot_for(config);
     let id = snapshot.id();
     let previous = {
         let mut guard = LAST_MODEL.lock().expect("served model lock");
@@ -1154,14 +1233,34 @@ pub(crate) async fn fire_model_select_if_changed(
         .await;
 }
 
+/// `dex.net.fetch` client: like the shared streaming client but never
+/// follows redirects. Confinement is checked against the requested URL, so
+/// a 302 to another origin must surface as a 3xx value — never a followed
+/// cross-origin fetch the check never saw.
+static NET_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn net_client() -> reqwest::Client {
+    NET_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(crate::client::http::USER_AGENT)
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 /// `dex.net.fetch` backing call (task side — the worker never touches the
 /// network). Confined to the served model's own endpoint: scheme+host+port
-/// must match its `base_url`, anything else is a loud error. The recorded
-/// routing-affinity headers ride along under Lua-explicit ones, so calls to
-/// a Console Go endpoint route like dex's own. Non-2xx is a
-/// value (`{status, headers, body}`), never an error. Errors never carry
-/// headers, bodies, or URL queries (a `?key=` parameter would leak the key
-/// into logs).
+/// must match its `base_url`, anything else is a loud error — and redirects
+/// are never followed, so a 3xx surfaces as a value instead of escaping the
+/// check. This turn's routing-affinity headers ride along under
+/// Lua-explicit ones, so calls to a Console Go endpoint route like dex's
+/// own. Non-2xx is a value (`{status, headers, body}`), never an error.
+/// Errors never carry headers, bodies, or URL queries (a `?key=` parameter
+/// would leak the key into logs).
 pub(crate) async fn net_fetch(
     url: String,
     method: String,
@@ -1201,16 +1300,11 @@ pub(crate) async fn net_fetch(
         return Err("dex.net.fetch: request body too large (max 1 MiB)".to_string());
     }
     let timeout = Duration::from_millis(timeout_ms.clamp(1_000, MAX_NET_TIMEOUT_MS));
-    let client = crate::client::http::shared_streaming_client();
+    let client = net_client();
     let http_method = reqwest::Method::from_bytes(method_name.as_bytes())
         .map_err(|_| format!("dex.net.fetch: unsupported method '{method}'"))?;
     let mut request = client.request(http_method, parsed.clone()).timeout(timeout);
-    // Fail-open: a poisoned lock drops the affinity headers, never the call.
-    let routing = LAST_ROUTING_HEADERS
-        .lock()
-        .ok()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let routing = current_routing_headers();
     for (name, value) in &with_routing_headers(&headers, &routing) {
         let lower = name.to_ascii_lowercase();
         if lower == "host" || lower == "content-length" {
@@ -2780,6 +2874,124 @@ end
         assert!(merged.contains(&("x-opencode-client".to_string(), "dex".to_string())));
     }
 
+    /// The task-local drive context shadows the process-wide fallback while
+    /// in scope, and the fallback returns afterwards (nested scopes restore
+    /// the outer turn — the subagent child pattern).
+    #[tokio::test]
+    async fn drive_model_scope_shadows_global_fallback() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        let global = crate::llm::config::ExtensionModelSnapshot {
+            provider: "gprov".to_string(),
+            model: "g-1".to_string(),
+            api: "openai-responses".to_string(),
+            base_url: "https://gprov.example/v1".to_string(),
+        };
+        let scoped = crate::llm::config::ExtensionModelSnapshot {
+            provider: "sprov".to_string(),
+            model: "s-2".to_string(),
+            api: "openai-responses".to_string(),
+            base_url: "https://sprov.example/v1".to_string(),
+        };
+        *LAST_MODEL.lock().expect("served model lock") = Some(global);
+        assert_eq!(
+            served_model_snapshot().map(|s| s.id()),
+            Some("gprov/g-1".to_string())
+        );
+        let drive = DriveModel {
+            snapshot: Some(scoped),
+            routing: BTreeMap::from([("x-opencode-session".to_string(), "sess-1".to_string())]),
+        };
+        with_drive_model(drive, async {
+            assert_eq!(
+                served_model_snapshot().map(|s| s.id()),
+                Some("sprov/s-2".to_string())
+            );
+            assert_eq!(
+                current_routing_headers()
+                    .get("x-opencode-session")
+                    .map(String::as_str),
+                Some("sess-1")
+            );
+            // A scoped turn without affinity headers serves none — never
+            // a stale session id from the fallback.
+            let bare = DriveModel {
+                snapshot: Some(crate::llm::config::ExtensionModelSnapshot {
+                    provider: "sprov".to_string(),
+                    model: "s-3".to_string(),
+                    api: "openai-responses".to_string(),
+                    base_url: "https://sprov.example/v1".to_string(),
+                }),
+                routing: BTreeMap::new(),
+            };
+            with_drive_model(bare, async {
+                assert_eq!(
+                    served_model_snapshot().map(|s| s.id()),
+                    Some("sprov/s-3".to_string())
+                );
+                assert!(current_routing_headers().is_empty());
+            })
+            .await;
+        })
+        .await;
+        assert_eq!(
+            served_model_snapshot().map(|s| s.id()),
+            Some("gprov/g-1".to_string())
+        );
+        mgr.reset_for_tests().await;
+    }
+
+    /// Concurrent drives keep their own model end to end: two overlapping
+    /// `dex.model.current()` reads through one worker each serve the
+    /// drive's own snapshot, never the process-wide fallback. (Pre-fix both
+    /// reads served whatever turn recorded last.)
+    #[tokio::test]
+    async fn concurrent_drives_keep_their_own_model() {
+        let root = fixture_ext(
+            "manifest_version: 1\nid: iso\nversion: 0.1.0\ncapabilities: [tools, model]\ntools:\n  - name: who\n    description: Who.\n    parameters: {\"type\": \"object\"}\n",
+            r#"return function(dex)
+  dex.tools.register({ name = "who", execute = function(ctx, args)
+    return (dex.model.current()).id
+  end })
+end
+"#,
+        );
+        let mgr = ExtensionManager::fresh();
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        let policy = crate::tools::Policy::trusted();
+        let cancel = crate::agent::state::GlobalCancellation;
+        let host = HostCtx {
+            cancel: &cancel,
+            policy: &policy,
+            filter: None,
+        };
+        let empty = serde_json::Map::new();
+        let drive_for = |provider: &str, model: &str| DriveModel {
+            snapshot: Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                api: "openai-responses".to_string(),
+                base_url: "https://example.invalid/v1".to_string(),
+            }),
+            routing: BTreeMap::new(),
+        };
+        let (left, right) = tokio::join!(
+            with_drive_model(
+                drive_for("prov-a", "m-a"),
+                mgr.call("lua__iso__who", &empty, &host)
+            ),
+            with_drive_model(
+                drive_for("prov-b", "m-b"),
+                mgr.call("lua__iso__who", &empty, &host)
+            ),
+        );
+        assert_eq!(left.unwrap(), "prov-a/m-a");
+        assert_eq!(right.unwrap(), "prov-b/m-b");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// `dex.json` round-trips tables through strings (the fetch body/parse
     /// primitive for model-endpoint calls).
     #[tokio::test]
@@ -3041,6 +3253,51 @@ end
         let seen = String::from_utf8_lossy(&seen_rx.await.unwrap()).to_lowercase();
         assert!(seen.contains("x-opencode-session: sess-9"), "got:\n{seen}");
         assert!(seen.contains("x-opencode-client: dex"), "got:\n{seen}");
+        mgr.reset_for_tests().await;
+    }
+
+    /// `dex.net.fetch` never follows redirects: a 302 to a closed port
+    /// surfaces as a 3xx value instead of a followed (failed) fetch.
+    /// Confinement is checked against the requested URL only.
+    #[tokio::test]
+    async fn net_fetch_does_not_follow_redirects() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        let _proxy = EnvRestore::take(&["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]);
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "loop".to_string(),
+                model: "m".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: format!("http://127.0.0.1:{port}"),
+            });
+        let out = net_fetch(
+            format!("http://127.0.0.1:{port}/old"),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], 302);
         mgr.reset_for_tests().await;
     }
 

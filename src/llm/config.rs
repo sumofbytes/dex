@@ -1015,8 +1015,7 @@ pub(crate) fn extension_model_auth_for(
     provider_name: &str,
     base_url: &str,
 ) -> Result<ExtensionModelAuth, String> {
-    let (cli_model, _, cli_headers) = cli_overrides();
-    let _ = cli_model;
+    let (_, _, cli_headers) = cli_overrides();
     let file = load_config_file();
     let entries = load_provider_entries(&file);
     let known = known_providers(&entries);

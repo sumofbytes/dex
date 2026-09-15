@@ -669,14 +669,29 @@ built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
 stripped VM — no io/os/require — and every effect flows through the same
 permission gates as a model-issued call.
 
-Model-aware extensions declare the `model` capability (`dex.model.current()`
-for the served `provider/model`, `dex.model.auth()` for its key + endpoint)
-and the `net` capability (`dex.net.fetch()`, HTTP confined to that model's
-own endpoint); `dex.json` encodes/decodes request bodies. The host fires
-`model_select` when the served model changes so extensions can hide tools
-the model cannot serve (`dex.tools.set_active`). See
-`examples/extensions/web` — provider-native web search + URL fetch
-that reuses the current model's credentials — as the reference.
+Model-aware extensions declare the `model` capability
+(`dex.model.current()` for the served `{provider, model, id, api, base_url}`,
+`dex.model.auth()` for its key + endpoint + merged extra headers) and the
+`net` capability (`dex.net.fetch({url, method, headers, body, timeout_ms})`,
+HTTP confined to that model's own endpoint — scheme+host+port must match;
+`net` requires `model`). `dex.json` encodes/decodes request bodies. Non-2xx
+is a `{status, headers, body}` value, not an error; redirects are never
+followed (a 3xx surfaces as a value instead of escaping the endpoint
+check); per-call `timeout_ms`
+defaults to 30 s and caps at 120 s, and must sit under the tool's manifest
+`timeout:` (default 30 s, cap 120 s) — provider-side search rounds run ~40 s
+non-streamed, so the reference uses `timeout: 120` with `timeout_ms = 100000`.
+The host re-attaches the turn's routing-affinity headers
+(`x-opencode-session`/`x-opencode-client`) under Lua-explicit ones, so calls
+to a gateway endpoint route like dex's own. The host fires `model_select`
+(first turn always, then on `provider/model` change; fail-open) so extensions
+can hide tools the model cannot serve (`dex.tools.set_active` accepts short
+own-tool names). The served model is scoped to the turn — concurrent sessions
+and nested subagent turns each see their own. See `examples/extensions/web` — provider-native web search
+(gemini / openai-responses / anthropic) + URL fetch (Gemini only) that reuses
+the current model's credentials and never switches the model silently — as
+the reference. Copy it to `$XDG_CONFIG_HOME/dex/extensions/web` (or
+`dex extensions install <dir>`) to use it.
 
 ```yaml
 extensions:
