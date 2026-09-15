@@ -434,6 +434,14 @@ fn main() {
     // Extension search dirs: process-global, read by the manager at
     // bootstrap (daemon) and before the in-process one-shot turn.
     crate::extensions::set_extra_dirs(args.extension_dirs.clone());
+    // CLI model overrides for the worker-thread `dex.model` view, which
+    // resolves from file+env and never sees flags (daemon per-request
+    // overrides instead flow through `process_turn`'s served snapshot).
+    crate::llm::config::set_cli_model_overrides(
+        args.model.clone(),
+        args.base_url.clone(),
+        args.headers.clone(),
+    );
 
     match mode {
         Mode::Help => {
