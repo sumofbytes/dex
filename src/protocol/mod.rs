@@ -120,6 +120,12 @@ pub struct ChatRequest {
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub plan: Option<String>,
+    /// Custom base system prompt text (client `--system-prompt` /
+    /// `--system-prompt-file`, already resolved client-side). Replaces the
+    /// built-in base; project/extensions/skills still append. Older clients
+    /// omit it and the daemon falls back to its own env/file layers.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 /// Response to approve/deny a tool execution. `request_id` must match the
