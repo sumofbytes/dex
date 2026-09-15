@@ -2084,13 +2084,15 @@ async fn session_shell(
         crate::core::format::tool_result_summary("bash", &input_json, &output, success, None);
     let preview = crate::core::format::tool_preview("bash", success, None, &output, true);
     let (call_seq, result_seq) = state.next_seq_pair(&session_id);
+    // Unique id shared by the pair so concurrent runs can't steal each
+    // other's half even if the two pairs interleave in the journal. The
+    // journal seq is already unique per session, so reuse it as the block
+    // id instead of minting a separate counter.
+    let block_id = format!("shell-{call_seq}");
     let call_event = serde_json::to_string(&StreamEvent::ToolCall {
         name: "bash".to_string(),
         args: serde_json::Value::String(short),
-        // Back-to-back journal pair (input then output): the empty id
-        // keeps legacy tail-order pairing, which holds here because no
-        // other event can interleave between the two appends.
-        id: String::new(),
+        id: block_id.clone(),
     })
     .unwrap_or_default();
     let result_event = serde_json::to_string(&StreamEvent::ToolResult {
@@ -2099,7 +2101,7 @@ async fn session_shell(
         success,
         preview,
         duration,
-        id: String::new(),
+        id: block_id,
     })
     .unwrap_or_default();
     // Best-effort history: a failed journal write must not fail a run whose
