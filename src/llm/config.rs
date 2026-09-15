@@ -843,6 +843,206 @@ pub(crate) fn resolve_credentials(
     .into())
 }
 
+/// CLI overrides for the extension snapshot below (`--model`, `--base-url`,
+/// `--header`): the worker-thread `dex.model` view resolves from
+/// file+env, which never sees CLI flags, so `main` deposits them here once
+/// at startup. Daemon per-request overrides instead flow through
+/// `process_turn`, which records the served snapshot directly.
+type CliOverrides = (Option<String>, Option<String>, Vec<String>);
+
+static CLI_OVERRIDES: OnceLock<Mutex<CliOverrides>> = OnceLock::new();
+
+/// Deposit the CLI overrides (idempotent: first call wins, later ones are
+/// ignored — startup parses args once).
+pub(crate) fn set_cli_model_overrides(
+    model: Option<String>,
+    base_url: Option<String>,
+    headers: Vec<String>,
+) {
+    let slot = CLI_OVERRIDES.get_or_init(Default::default);
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.0.is_none() && guard.1.is_none() && guard.2.is_empty() {
+        *guard = (model, base_url, headers);
+    }
+}
+
+fn cli_overrides() -> (Option<String>, Option<String>, Vec<String>) {
+    CLI_OVERRIDES
+        .get()
+        .map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .unwrap_or_default()
+}
+
+/// The current model as extensions see it: no secrets, safe to clone into
+/// Lua tables and the change-detection static. `api` is the wire-protocol
+/// name (`ApiProtocol::name`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExtensionModelSnapshot {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) api: String,
+    pub(crate) base_url: String,
+}
+
+impl ExtensionModelSnapshot {
+    /// `provider/model` selection id, as `model_select` payloads carry it.
+    pub(crate) fn id(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
+    }
+}
+
+/// The current model's credentials for `dex.model.auth()`: raw key plus the
+/// endpoint and the merged extra headers, so the extension can place auth
+/// per provider family (Bearer header, `x-api-key`, `?key=` query). Never
+/// logged — the key lives in Lua memory only.
+pub(crate) struct ExtensionModelAuth {
+    pub(crate) api_key: String,
+    pub(crate) base_url: String,
+    pub(crate) headers: BTreeMap<String, String>,
+}
+
+/// Shared resolution for the snapshot + auth views: provider, entries,
+/// endpoint, protocol, and bare model id. Mirrors `from_env`'s precedence
+/// (`--model` > `DEX_MODEL` > file `model:`, explicit base_url pins) and
+/// `apply_model`'s endpoint routing — without the reqwest client, context
+/// window, or any failure a bare model view must not have.
+type ExtensionModelParts = (
+    Provider,
+    BTreeMap<String, ProviderEntry>,
+    String,
+    ApiProtocol,
+    String,
+);
+
+fn extension_model_parts() -> Result<ExtensionModelParts, String> {
+    let (cli_model, cli_base_url, _) = cli_overrides();
+    let file = load_config_file();
+    let entries = load_provider_entries(&file);
+    let known = known_providers(&entries);
+    let raw_selection = resolve_selection(cli_model.filter(|m| !m.trim().is_empty()), &file)
+        .map(|r| r.value)
+        .map_err(|e| e.to_string())?;
+    let (selection_provider, mut model) =
+        split_selection(&raw_selection, &known).map_err(|e| e.to_string())?;
+    let provider_name = match selection_provider {
+        Some(name) => name,
+        None => provider_without_prefix(
+            provider_fallback_with_origin(&file),
+            cli_base_url.as_deref(),
+        ),
+    };
+    let provider = Provider::parse_known(&provider_name, &known)
+        .or_else(|| (provider_name == "custom").then(|| Provider::Generic("custom".to_string())))
+        .ok_or_else(|| {
+            format!(
+                "unsupported provider '{provider_name}'; add it under 'providers:' (e.g. providers.custom: {{base_url: ..., api_key: ...}})"
+            )
+        })?;
+    let resolved = resolve_provider(&provider, &entries);
+    let file_base_url = load_config_str(&file, "base_url");
+    let explicit = cli_base_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .map(str::to_string)
+        .or(file_base_url);
+    let mut base_url = explicit
+        .clone()
+        .or(resolved.landing.clone())
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "provider '{}' has no base_url: set base_url under providers: or run `dex update --models`",
+                provider.name()
+            )
+        })?;
+    if explicit.is_none() {
+        // Same routing as `apply_model` on the fallback endpoint: an
+        // `endpoint/id` prefix (or a bare id the catalog serves elsewhere)
+        // moves the base_url under the model.
+        if let Some((name, rest)) = model.split_once('/') {
+            if let Some(url) = resolved.endpoints.get(name) {
+                base_url = url.clone();
+                model = rest.to_string();
+            }
+        }
+        if let Some(catalog) = load_dex_catalog() {
+            if let Some(url) =
+                catalog_endpoint_for_model(&catalog, &model, &resolved.endpoints, &base_url)
+            {
+                base_url = url;
+            }
+        }
+    } else if let Some((name, rest)) = model.split_once('/') {
+        // Pinned endpoint: prefixes name the target but never move the URL.
+        if resolved.endpoints.contains_key(name) {
+            model = rest.to_string();
+        }
+    }
+    let (base_api, _) = base_protocol(&provider, resolved.api_pin, &file);
+    let api = model_api_from_env(&raw_selection, &model)
+        .or_else(|| learned_api(&base_url, &model))
+        .unwrap_or(base_api);
+    Ok((provider, entries, base_url, api, model))
+}
+
+/// `dex.model.current()`: provider, bare model id, wire protocol, endpoint.
+/// Fails only when nothing selects a model or the provider has no endpoint
+/// (same guidance as `from_env`, never a silent default).
+pub(crate) fn extension_model_snapshot() -> Result<ExtensionModelSnapshot, String> {
+    let (provider, _, base_url, api, model) = extension_model_parts()?;
+    Ok(ExtensionModelSnapshot {
+        provider: provider.name().to_string(),
+        model,
+        api: api.name().to_string(),
+        base_url,
+    })
+}
+
+/// `dex.model.auth()`: key + endpoint + merged extra headers (provider
+/// `headers:` under file < env < `--header`; `authorization` dropped — the
+/// key travels separately). Errors name the deposit places, never the key.
+pub(crate) fn extension_model_auth() -> Result<ExtensionModelAuth, String> {
+    let (provider, _, base_url, _, _) = extension_model_parts()?;
+    extension_model_auth_for(provider.name(), &base_url)
+}
+
+/// Auth for an explicit provider + endpoint: what the worker calls with the
+/// served snapshot when a turn recorded one (a per-request override the
+/// file never sees — the key still resolves from the configured deposits).
+/// Unknown names become generic providers so a served custom endpoint keeps
+/// working without a file entry.
+pub(crate) fn extension_model_auth_for(
+    provider_name: &str,
+    base_url: &str,
+) -> Result<ExtensionModelAuth, String> {
+    let (cli_model, _, cli_headers) = cli_overrides();
+    let _ = cli_model;
+    let file = load_config_file();
+    let entries = load_provider_entries(&file);
+    let known = known_providers(&entries);
+    let provider = Provider::parse_known(provider_name, &known)
+        .unwrap_or_else(|| Provider::Generic(provider_name.to_string()));
+    let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| e.to_string())?;
+    let mut headers = load_config_headers(&file);
+    if let Some(entry) = entries.get(provider.name()) {
+        for (name, value) in &entry.headers {
+            headers.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    for (name, value) in custom_headers_from_env() {
+        insert_extra_header(&mut headers, &name, &value);
+    }
+    for raw in &cli_headers {
+        insert_parsed_headers(&mut headers, raw);
+    }
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    Ok(ExtensionModelAuth {
+        api_key,
+        base_url: base_url.to_string(),
+        headers,
+    })
+}
+
 /// Persisted wire protocols learned empirically at runtime
 /// (`XDG_CACHE_HOME/dex/learned-apis.json`): models that rejected
 /// `/responses` and succeeded over `/chat/completions`. Keyed
@@ -5789,6 +5989,112 @@ pub(crate) mod tests {
         let (text, origin) = super::system_prompt_origin(None);
         assert_eq!(text, None);
         assert_eq!(origin, "built-in default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hermetic config for the extension snapshot tests: a generic provider
+    /// with its own endpoint + key, so resolution stays cache-less (no
+    /// catalog, no env keys).
+    fn write_extmodel_config(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn extension_model_snapshot_resolves_selection_and_endpoint() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-extmodel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_extmodel_config(&dir);
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_MODEL_APIS"] {
+            std::env::remove_var(key);
+        }
+        let snap = super::extension_model_snapshot().unwrap();
+        assert_eq!(snap.provider, "myprov");
+        assert_eq!(snap.model, "m-7");
+        assert_eq!(snap.base_url, "https://myprov.example/v1");
+        assert_eq!(snap.api, "openai-responses");
+        assert_eq!(snap.id(), "myprov/m-7");
+        let auth = super::extension_model_auth().unwrap();
+        assert_eq!(auth.api_key, "k-123");
+        assert_eq!(auth.base_url, "https://myprov.example/v1");
+        assert!(auth
+            .headers
+            .keys()
+            .all(|k| !k.eq_ignore_ascii_case("authorization")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extension_model_snapshot_errors_without_selection() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard =
+            EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "DEX_PROVIDER", "XDG_CACHE_HOME"]);
+        let dir = std::env::temp_dir().join(format!("dex-extmodel-no-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "context_window: 1000\n").unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_MODEL", "DEX_PROVIDER"] {
+            std::env::remove_var(key);
+        }
+        let err = super::extension_model_snapshot().unwrap_err();
+        assert!(err.contains("no model configured"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extension_model_auth_merges_headers_and_drops_authorization() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "DEX_HEADERS",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-extmodel-h-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nheaders:\n  X-A: global\n  authorization: Bearer file-key\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n    headers:\n      X-A: scoped\n      X-B: scoped\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_HEADERS"] {
+            std::env::remove_var(key);
+        }
+        let auth = super::extension_model_auth().unwrap();
+        // Global file headers win over provider-scoped ones; `authorization`
+        // never travels with the headers (the key goes separately).
+        assert_eq!(auth.headers.get("X-A").map(String::as_str), Some("global"));
+        assert_eq!(auth.headers.get("X-B").map(String::as_str), Some("scoped"));
+        assert!(auth
+            .headers
+            .keys()
+            .all(|k| !k.eq_ignore_ascii_case("authorization")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

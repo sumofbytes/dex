@@ -865,6 +865,12 @@ where
     let turn_policy = Policy::turn(rt.config.permission, rt.console);
     let cancel = rt.cancel.clone();
     let filter = rt.filter;
+    // Model-aware extensions (`dex.model`, provider-native tools) sync on
+    // `model_select`: fires when the served `provider/model` changed since
+    // the last turn (always on the first), and records the snapshot
+    // `dex.model` reads — including per-request daemon overrides the file
+    // never sees. Same fail-open contract as the hooks below.
+    crate::extensions::fire_model_select_if_changed(rt.config, &cancel, &turn_policy, filter).await;
     // `before_agent_start` system-prompt append (plan §7 P2): applied to the
     // leading System message for the duration of the turn, restored before
     // the result leaves — the journal never stores System role messages, so
