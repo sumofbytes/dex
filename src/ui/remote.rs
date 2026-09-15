@@ -938,11 +938,14 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
         StreamEvent::Thinking(text) => {
             append_sink_line(&mut remote.app, SinkLine::Thinking(text));
         }
-        StreamEvent::ToolCall { name, args } => {
+        StreamEvent::ToolCall { name, args, id } => {
             let preview = args.as_str().unwrap_or_default().to_string();
             append_sink_line(
                 &mut remote.app,
-                SinkLine::ToolInput(format!("{name} {preview}")),
+                SinkLine::ToolInput {
+                    id,
+                    input: format!("{name} {preview}"),
+                },
             );
         }
         StreamEvent::ToolResult {
@@ -951,10 +954,12 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             success,
             preview,
             duration,
+            id,
         } => {
             append_sink_line(
                 &mut remote.app,
                 SinkLine::ToolOutput {
+                    id,
                     name,
                     summary,
                     success,
@@ -1909,7 +1914,8 @@ fn run_shell_command(remote: &mut RemoteApp, line: String, command: String, excl
 
 /// Render a finished `!`/`!!` shell run as one self-contained `bash` tool
 /// block. Pushed back-to-back (input then output) so no open block lingers
-/// while the command runs and concurrent turns can't steal either half.
+/// while the command runs; the pair shares a unique id so concurrent runs
+/// can't steal each other's half even if the two pairs interleave.
 fn finish_shell_command(
     remote: &mut RemoteApp,
     command: &str,
@@ -1918,11 +1924,19 @@ fn finish_shell_command(
     duration: f64,
     excluded: bool,
 ) {
+    static SHELL_BLOCK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let block_id = format!(
+        "shell-{}",
+        SHELL_BLOCK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let input = serde_json::json!({"command": command}).to_string();
     let short = crate::core::format::short_arg("bash", &input);
     append_sink_line(
         &mut remote.app,
-        SinkLine::ToolInput(format!("bash {short}")),
+        SinkLine::ToolInput {
+            id: block_id.clone(),
+            input: format!("bash {short}"),
+        },
     );
     let mut summary =
         crate::core::format::tool_result_summary("bash", &input, output, success, None);
@@ -1933,6 +1947,7 @@ fn finish_shell_command(
     append_sink_line(
         &mut remote.app,
         SinkLine::ToolOutput {
+            id: block_id,
             name: "bash".into(),
             summary,
             success,

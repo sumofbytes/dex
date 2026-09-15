@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::state::ToolState;
-use crate::core::format::agent_lifecycle;
+use crate::core::format::{agent_lifecycle, short_arg};
 use crate::core::types::{Role, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
@@ -97,6 +97,11 @@ pub(crate) enum TranscriptBlock {
         input: Line<'static>,
         output: Option<Line<'static>>,
         preview: Vec<Line<'static>>,
+        /// The LLM tool-call id from `ToolInput`, pairing this block with
+        /// its `ToolOutput`. Empty for legacy inputs (session rebuild of
+        /// tool messages predates ids only when `tool_call_id` is absent);
+        /// empty-id outputs attach to the tail block as before.
+        tool_id: String,
         /// Short arg as emitted by `ToolInput` (e.g. `src/main.rs:1-20`).
         /// Stored — not parsed back out of the rendered `input` line — so
         /// `ToolOutput` can pick the preview language for syntax
@@ -1020,22 +1025,24 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             }
             app.thinking_open = true;
         }
-        SinkLine::ToolInput(s) => {
+        SinkLine::ToolInput { id, input } => {
             dim_intermediate_assistant_block(app);
             app.assistant_open = false;
-            let mut it = s.splitn(2, ' ');
+            let mut it = input.splitn(2, ' ');
             let name = it.next().unwrap_or("").to_string();
             let arg = it.next().unwrap_or("").to_string();
-            let input = render::render_tool_input(&name, &arg);
+            let line = render::render_tool_input(&name, &arg);
             app.transcript.push(TranscriptBlock::Tool {
                 stamp: 0,
-                input,
+                input: line,
                 output: None,
                 preview: Vec::new(),
                 tool_arg: arg,
+                tool_id: id,
             });
         }
         SinkLine::ToolOutput {
+            id,
             name,
             summary,
             success,
@@ -1066,6 +1073,25 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // previews keep the numbered gutter dim and highlight the code
             // by extension (one tree-sitter pass per file section);
             // anything unhighlightable stays dim.
+            // Pair with the open block for this call: parallel batches
+            // interleave inputs/outputs, so the tail is not necessarily
+            // ours. Empty id = legacy (session rebuild, old journals,
+            // shell blocks): keep the old tail behavior. (Content tail:
+            // the open Activity spinner may sit at the transcript tail
+            // while busy; Activity blocks never match the scan below, so
+            // they stay transparent in both paths.)
+            let open_idx = if id.is_empty() {
+                content_tail_idx(app).filter(|&i| {
+                    matches!(
+                        app.transcript.get(i),
+                        Some(TranscriptBlock::Tool { output: None, .. })
+                    )
+                })
+            } else {
+                app.transcript.iter().rposition(|b| {
+                    matches!(b, TranscriptBlock::Tool { tool_id, output: None, .. } if tool_id == &id)
+                })
+            };
             let preview_lines: Vec<Line<'static>> = if matches!(name.as_str(), "write" | "edit") {
                 preview
                     .iter()
@@ -1086,14 +1112,12 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 // Language from the stored `ToolInput` arg (first token is
                 // the path: `src/main.rs:1-20`, a glob, or `N files`).
                 // `==> file <==` fan-out headers inside re-target per
-                // section in `render_read_preview`.
-                let arg_path = content_tail(app)
-                    .and_then(|b| match b {
-                        TranscriptBlock::Tool {
-                            output: None,
-                            tool_arg,
-                            ..
-                        } => Some(tool_arg.clone()),
+                // section in `render_read_preview`. Read from the block this
+                // output will complete (not the tail: parallel batches
+                // interleave, so the tail may be another call's block).
+                let arg_path = open_idx
+                    .and_then(|i| match app.transcript.get(i) {
+                        Some(TranscriptBlock::Tool { tool_arg, .. }) => Some(tool_arg.clone()),
                         _ => None,
                     })
                     .unwrap_or_default();
@@ -1118,20 +1142,20 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             };
             app.assistant_open = false;
             // Complete the tool block started by ToolInput if it is still open.
-            // (Content tail: the open Activity spinner may sit at the
-            // transcript tail while busy.)
-            if let Some(TranscriptBlock::Tool {
-                output: out,
-                preview: prev,
-                stamp,
-                ..
-            }) = content_tail_mut(app)
-            {
-                if out.is_none() {
-                    *out = Some(output);
-                    *prev = preview_lines;
-                    *stamp = stamp.wrapping_add(1);
-                    return;
+            if let Some(i) = open_idx {
+                if let Some(TranscriptBlock::Tool {
+                    output: out,
+                    preview: prev,
+                    stamp,
+                    ..
+                }) = app.transcript.get_mut(i)
+                {
+                    if out.is_none() {
+                        *out = Some(output);
+                        *prev = preview_lines;
+                        *stamp = stamp.wrapping_add(1);
+                        return;
+                    }
                 }
             }
             // Fallback: no open ToolInput (e.g. replay); synthesize a block.
@@ -1147,6 +1171,7 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                 output: Some(output),
                 preview: preview_lines,
                 tool_arg: String::new(),
+                tool_id: id,
             });
         }
         SinkLine::System(s) => {
@@ -1426,8 +1451,18 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 }
                 if let Some(calls) = &msg.tool_calls {
                     for tc in calls {
-                        let input = format!("{} {}", tc.function.name, tc.function.arguments);
-                        append_sink_line(app, crate::core::types::SinkLine::ToolInput(input));
+                        let input = format!(
+                            "{} {}",
+                            tc.function.name,
+                            short_arg(&tc.function.name, &tc.function.arguments)
+                        );
+                        append_sink_line(
+                            app,
+                            crate::core::types::SinkLine::ToolInput {
+                                id: tc.id.clone(),
+                                input,
+                            },
+                        );
                     }
                 }
             }
@@ -1438,14 +1473,33 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 let summary = lines.next().unwrap_or("").to_string();
                 let preview: Vec<String> = lines.take(6).map(|s| s.to_string()).collect();
                 // Replay has no ToolInput (args live in the assistant call,
-                // not the tool message); emit a bare one so the output
-                // attaches to a real tool block instead of the synthesized
-                // `▸ tool` fallback. Search previews highlight from the
-                // inline `path:line:` gutters, so they work without an arg.
-                append_sink_line(app, crate::core::types::SinkLine::ToolInput(name.clone()));
+                // not the tool message). When the assistant call above
+                // already opened this id's block, emit only the output so
+                // it pairs with that block; otherwise emit a bare input so
+                // the output attaches to a real tool block instead of the
+                // synthesized `▸ tool` fallback. Search previews highlight
+                // from the inline `path:line:` gutters, so they work
+                // without an arg. Both carry the stored call id so the
+                // output pairs with this block even when replayed messages
+                // interleave.
+                let tool_id = msg.tool_call_id.clone().unwrap_or_default();
+                let already_open = !tool_id.is_empty()
+                      && app.transcript.iter().any(|b| {
+                          matches!(b, TranscriptBlock::Tool { tool_id: tid, output: None, .. } if tid == &tool_id)
+                      });
+                if !already_open {
+                    append_sink_line(
+                        app,
+                        crate::core::types::SinkLine::ToolInput {
+                            id: tool_id.clone(),
+                            input: name.clone(),
+                        },
+                    );
+                }
                 append_sink_line(
                     app,
                     crate::core::types::SinkLine::ToolOutput {
+                        id: tool_id,
                         name,
                         summary,
                         success: true,
@@ -1800,7 +1854,10 @@ mod tests {
         assert_eq!(app.assistant_pending, "tail\n");
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("bash echo".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash echo".into(),
+            },
         );
         assert!(app.assistant_pending.is_empty());
         assert_eq!(app.transcript.len(), 2);
@@ -1924,7 +1981,10 @@ mod tests {
         // A tool block lands after it: the indicator must move below it.
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("bash cargo test".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash cargo test".into(),
+            },
         );
         assert!(matches!(
             app.transcript.last(),
@@ -1976,6 +2036,7 @@ mod tests {
                     output: None,
                     preview: Vec::new(),
                     tool_arg: String::new(),
+                    tool_id: String::new(),
                 },
                 TranscriptBlock::Activity {
                     stamp: 0,
@@ -2035,7 +2096,10 @@ mod tests {
         // Non-thinking line settles the duration even with the spinner last.
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("bash x".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash x".into(),
+            },
         );
         assert!(matches!(
             &app.transcript[0],
@@ -2053,12 +2117,16 @@ mod tests {
         start_activity(&mut app);
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("bash cargo test".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash cargo test".into(),
+            },
         );
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolOutput {
                 name: "bash".into(),
+                id: String::new(),
                 summary: "ok".into(),
                 success: true,
                 preview: vec![],
@@ -2078,6 +2146,102 @@ mod tests {
             app.transcript.last(),
             Some(TranscriptBlock::Activity { settled: None, .. })
         ));
+    }
+
+    #[test]
+    fn tool_outputs_pair_by_id_when_interleaved() {
+        // Parallel batches announce all inputs up front, so outputs land
+        // out of order ([A B] [B A]): each output must complete its own
+        // open block (matched by call id), never the tail. The reverse
+        // completion order is deliberate — tail-pairing would attach B's
+        // summary to A's block.
+        let mut app = test_app();
+        let input = |id: &str, text: &str| crate::core::types::SinkLine::ToolInput {
+            id: id.to_string(),
+            input: text.to_string(),
+        };
+        let output = |id: &str, summary: &str| crate::core::types::SinkLine::ToolOutput {
+            id: id.to_string(),
+            name: "read".into(),
+            summary: summary.to_string(),
+            success: true,
+            preview: vec![],
+            duration: 0.0,
+        };
+        append_sink_line(&mut app, input("call-A", "read a.rs"));
+        append_sink_line(&mut app, input("call-B", "read b.rs"));
+        append_sink_line(&mut app, output("call-B", "v 1 line"));
+        append_sink_line(&mut app, output("call-A", "v 2 lines"));
+        // No synthesized `▸ tool` blocks: both outputs found their inputs.
+        assert_eq!(app.transcript.len(), 2);
+        for (block, (arg, summary)) in app
+            .transcript
+            .iter()
+            .zip([("a.rs", "v 2 lines"), ("b.rs", "v 1 line")])
+        {
+            let TranscriptBlock::Tool {
+                tool_arg,
+                tool_id,
+                output,
+                ..
+            } = block
+            else {
+                panic!("expected Tool block");
+            };
+            assert_eq!(tool_arg, arg);
+            assert!(tool_id == "call-A" || tool_id == "call-B");
+            let out = output.as_ref().expect("block completed");
+            let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.contains(summary), "wrong summary on {arg}: {text}");
+        }
+    }
+
+    #[test]
+    fn rebuild_pairs_tool_results_with_assistant_calls_by_id() {
+        // Journal replay: the assistant message already opened one block
+        // per call, so each tool message must complete that block — not
+        // open a second bare one. Rebuilt inputs also use `short_arg`
+        // (`read a.rs`), matching the live path for highlighting.
+        use crate::core::types::{ChatMessage, FunctionCall, LlmToolCall};
+        let call = |id: &str, path: &str| LlmToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read".to_string(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+            },
+        };
+        let mut app = test_app();
+        app.messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant_calls(
+                None,
+                vec![call("call-A", "a.rs"), call("call-B", "b.rs")],
+            ),
+            ChatMessage::tool_result("call-B", "v 1 line"),
+            ChatMessage::tool_result("call-A", "v 2 lines"),
+        ];
+        rebuild_transcript(&mut app);
+        // Exactly two blocks — no duplicate bare inputs — both completed.
+        assert_eq!(app.transcript.len(), 2);
+        for (block, (arg, id)) in app
+            .transcript
+            .iter()
+            .zip([("a.rs", "call-A"), ("b.rs", "call-B")])
+        {
+            let TranscriptBlock::Tool {
+                tool_arg,
+                tool_id,
+                output,
+                ..
+            } = block
+            else {
+                panic!("expected Tool block");
+            };
+            assert_eq!(tool_arg, arg);
+            assert_eq!(tool_id, id);
+            assert!(output.is_some(), "rebuilt block left open for {arg}");
+        }
     }
 
     #[test]
@@ -2156,12 +2320,16 @@ mod tests {
         let mut app = test_app();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("bash echo hi".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash echo hi".into(),
+            },
         );
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolOutput {
                 name: "bash".into(),
+                id: String::new(),
                 summary: "v ok".into(),
                 success: true,
                 preview: vec!["src/main.rs".into(), "… +3 more lines".into()],
@@ -2187,12 +2355,16 @@ mod tests {
         let mut app = test_app();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput("read src/main.rs:1-2".into()),
+            crate::core::types::SinkLine::ToolInput {
+                id: String::new(),
+                input: "read src/main.rs:1-2".into(),
+            },
         );
         append_sink_line(
             &mut app,
             crate::core::types::SinkLine::ToolOutput {
                 name: "read".into(),
+                id: String::new(),
                 summary: "v 2 lines".into(),
                 success: true,
                 preview: vec!["   1  fn main() {}".into(), "… +1 more lines".into()],
