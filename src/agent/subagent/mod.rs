@@ -6,9 +6,8 @@
 //! re-entry. There is no automatic recovery, no spawn queue, and no
 //! idle reaper: over-cap spawns reject, and the model re-enters dead
 //! children by hand with `delegate(resume_from)`. The blanket
-//! `dead_code` allow stays only for genuinely optional surface (e.g.
-//! `AgentInstance::parent_id` probes kept for tests); everything else is
-//! dead-code free.
+//! `dead_code` allow stays only for genuinely optional surface;
+//! everything else is dead-code free.
 #![allow(dead_code)]
 
 mod context;

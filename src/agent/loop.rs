@@ -354,9 +354,10 @@ pub(crate) struct AgentRuntime<'a, C, X> {
     pub(crate) cancel: &'a X,
     pub(crate) console: &'a Console,
     pub(crate) filter: Option<&'a ToolFilter>,
-    /// The daemon-backed turn context (Phase 5): `Some` only for parent
-    /// turns inside the daemon — it is what makes `delegate` spawnable.
-    /// Children and every non-daemon path pass `None` (no delegation, §11).
+    /// The daemon-backed turn context (Phase 5): `Some` for parent turns
+    /// inside the daemon — it is what makes `delegate` spawnable — and
+    /// for children under the depth cap (one level deeper). At-cap
+    /// children and every non-daemon path pass `None` (no delegation).
     pub(crate) agent_ctx: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
     /// Turn budget override (plan §4: a definition's `max_tool_iterations`
     /// feeds the existing budget knob; `None` = the default/env value).

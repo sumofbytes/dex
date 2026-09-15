@@ -184,7 +184,7 @@ async fn delegate(
 ) -> Result<String, ToolError> {
     if ctx.depth >= MAX_AGENT_DEPTH {
         return Err(ToolError::Denied(format!(
-            "delegation depth limit reached (depth {} of max {MAX_AGENT_DEPTH});              do the work in this turn instead of spawning",
+            "delegation depth limit reached (depth {} of max {MAX_AGENT_DEPTH}); do the work in this turn instead of spawning",
             ctx.depth
         )));
     }
@@ -234,7 +234,6 @@ async fn delegate(
                 SpawnMeta {
                     generation,
                     parent_session: Some(ctx.session_path.clone()),
-                    parent_id: Some(handle.agent_id.clone()),
                     remaining_budget: handle.remaining_budget,
                 },
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
@@ -269,7 +268,6 @@ async fn delegate(
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(ctx.session_path.clone()),
-                parent_id: None,
                 remaining_budget: None,
             },
             child_body(ctx.clone(), def.clone(), seed, None),
