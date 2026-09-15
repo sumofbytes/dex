@@ -103,8 +103,20 @@ pub enum SinkLine {
     /// Incremental model reasoning ("thinking") delta. UIs render a collapsed
     /// one-line preview and can expand the full text on demand.
     Thinking(String),
-    ToolInput(String),
+    /// A tool call started. Emitted when execution begins — not when it
+    /// finishes — so surfaces can show the call while it runs; the matching
+    /// `ToolOutput` carries the same `id`. `id` is empty when unknown
+    /// (session-file rebuild, old journals); outputs with an empty id
+    /// attach to the tail block as before.
+    ToolInput {
+        id: String,
+        input: String,
+    },
     ToolOutput {
+        /// Pairs with the `ToolInput` emitted when this call started.
+        /// Empty for legacy inputs (rebuild/old journals): the output then
+        /// attaches to the tail block as before.
+        id: String,
         name: String,
         summary: String,
         /// Whether the tool call succeeded; rendered as ✓/✗ by the UIs.

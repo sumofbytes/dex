@@ -57,7 +57,7 @@ fn handle_event_with(
             io::stdout().flush().ok();
         }
         StreamEvent::Thinking(_) => {}
-        StreamEvent::ToolCall { name, args } => {
+        StreamEvent::ToolCall { name, args, .. } => {
             // The daemon ships the same short-arg preview the local path
             // prints (`read src/main.rs`) — show it, not just the tool name.
             let arg = args.as_str().unwrap_or_default();
@@ -73,6 +73,7 @@ fn handle_event_with(
             success,
             preview,
             duration,
+            ..
         } => {
             let icon = if success { "✓" } else { "✗" };
             let timing = if duration > 0.0 {
@@ -347,6 +348,7 @@ mod tests {
             StreamEvent::ToolCall {
                 name: "bash".into(),
                 args: "echo".into(),
+                id: String::new(),
             },
             StreamEvent::ToolResult {
                 name: "bash".into(),
@@ -354,6 +356,7 @@ mod tests {
                 success: true,
                 preview: vec!["out".into()],
                 duration: 1.5,
+                id: String::new(),
             },
             StreamEvent::TurnFailed {
                 error: "boom".into(),
