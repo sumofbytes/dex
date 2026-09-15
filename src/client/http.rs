@@ -17,6 +17,9 @@ pub(crate) struct ChatOptions {
     pub(crate) permission: Option<String>,
     pub(crate) headers: Option<std::collections::BTreeMap<String, String>>,
     pub(crate) plan: Option<String>,
+    /// Custom base system prompt text (resolved client-side from
+    /// `--system-prompt` / `--system-prompt-file`).
+    pub(crate) system_prompt: Option<String>,
     /// P10: replay-safe submission key; the daemon dedups identical keys within 60s.
     pub(crate) idempotency_key: Option<String>,
 }
@@ -509,6 +512,7 @@ impl DaemonClient {
                 permission: options.permission,
                 headers: options.headers,
                 plan: options.plan,
+                system_prompt: options.system_prompt,
             })
             .send()
             .await
