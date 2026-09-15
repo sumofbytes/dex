@@ -370,14 +370,29 @@ fn read_prompt_file(path: &str, warn_id: &str) -> Option<String> {
 }
 
 /// Custom base system prompt (DEX-13): replaces the built-in identity/rules;
-/// project instructions, extensions and skills are still appended. Precedence
-/// mirrors every other knob — explicit per-request/CLI text > env inline >
-/// env file > file inline > file file > built-in default (`None`). Inline
-/// beats file within a layer; any CLI beats any env beats any file. Returns
-/// the text plus its origin for `doctor`.
+/// project instructions, extensions and skills are still appended. Subagent
+/// children keep their own persona/rules (`child_system_prompt`); `dex serve`
+/// ignores CLI flags and falls back to its own env/file layers unless the
+/// client forwards per-request text. Precedence mirrors every other knob —
+/// explicit per-request/CLI text > env inline > env file > file inline >
+/// file file > built-in default (`None`). Inline beats file within a layer;
+/// any CLI beats any env beats any file. Empty/whitespace-only values count
+/// as unset at every layer and fall through. Returns the text plus its
+/// origin for `doctor`.
 pub(crate) fn system_prompt_origin(explicit: Option<&str>) -> (Option<String>, &'static str) {
+    system_prompt_origin_with_label(explicit, "--system-prompt")
+}
+
+/// Same as [`system_prompt_origin`], with the caller-provided label for the
+/// explicit layer so `doctor` can report `--system-prompt-file` when the
+/// text came from the file flag (runtime callers forward text only and keep
+/// the default label — only the text matters there).
+pub(crate) fn system_prompt_origin_with_label(
+    explicit: Option<&str>,
+    explicit_label: &'static str,
+) -> (Option<String>, &'static str) {
     if let Some(text) = explicit.filter(|t| !t.trim().is_empty()) {
-        return (Some(text.to_string()), "--system-prompt");
+        return (Some(text.to_string()), explicit_label);
     }
     if let Ok(text) = env::var("DEX_SYSTEM_PROMPT") {
         if !text.trim().is_empty() {
@@ -392,10 +407,12 @@ pub(crate) fn system_prompt_origin(explicit: Option<&str>) -> (Option<String>, &
         }
     }
     let file = load_config_file();
-    if let Some(text) = load_config_str(&file, "system_prompt") {
+    if let Some(text) = load_config_str(&file, "system_prompt").filter(|t| !t.trim().is_empty()) {
         return (Some(text), "config system_prompt:");
     }
-    if let Some(path) = load_config_str(&file, "system_prompt_file") {
+    if let Some(path) =
+        load_config_str(&file, "system_prompt_file").filter(|p| !p.trim().is_empty())
+    {
         if let Some(text) = read_prompt_file(path.trim(), "config:system_prompt_file") {
             return (Some(text), "config system_prompt_file:");
         }
@@ -404,15 +421,17 @@ pub(crate) fn system_prompt_origin(explicit: Option<&str>) -> (Option<String>, &
 }
 
 /// Resolve the client-side CLI pair (`--system-prompt` > `--system-prompt-file`)
-/// into the single text override forwarded per-request. The file is read here
-/// so a remote daemon never has to see the client's local path; a miss is a
-/// hard error instead of a silent default.
+/// into the single text override forwarded per-request, plus the flag it came
+/// from for `doctor`. The file is read here so a remote daemon never has to
+/// see the client's local path; a miss is a hard error instead of a silent
+/// default. Whitespace-only inline/file content counts as unset (`None`) and
+/// falls through to the env/file layers.
 pub(crate) fn resolve_cli_system_prompt(
     inline: Option<String>,
     file: Option<String>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, &'static str)>, String> {
     if let Some(text) = inline.filter(|t| !t.trim().is_empty()) {
-        return Ok(Some(text));
+        return Ok(Some((text, "--system-prompt")));
     }
     if let Some(path) = file.filter(|p| !p.trim().is_empty()) {
         let path = path.trim().to_string();
@@ -421,7 +440,7 @@ pub(crate) fn resolve_cli_system_prompt(
                 if text.trim().is_empty() {
                     None
                 } else {
-                    Some(text)
+                    Some((text, "--system-prompt-file"))
                 }
             })
             .map_err(|e| format!("cannot read --system-prompt-file '{path}': {e}"));
@@ -2451,7 +2470,7 @@ pub(crate) fn doctor(
     model_override: Option<String>,
     permission_override: Option<PermissionMode>,
     header_overrides: &[String],
-    system_prompt_override: Option<String>,
+    system_prompt_override: Option<(String, &'static str)>,
 ) -> String {
     fn row(out: &mut String, key: &str, value: &str, source: &str) {
         // Three fixed columns — key (KEY_COLS), value (VALUE_COLS), origin. Widths count
@@ -2869,7 +2888,11 @@ pub(crate) fn doctor(
     // count — the full text would flood doctor — with the same origin
     // `system_prompt_origin` reports at runtime.
     {
-        let (custom, origin) = system_prompt_origin(system_prompt_override.as_deref());
+        let (text, label) = match &system_prompt_override {
+            Some((text, label)) => (Some(text.as_str()), *label),
+            None => (None, "--system-prompt"),
+        };
+        let (custom, origin) = system_prompt_origin_with_label(text, label);
         let value = match custom {
             Some(text) => format!("custom ({} chars)", text.chars().count()),
             None => "default".to_string(),
@@ -5642,16 +5665,24 @@ pub(crate) mod tests {
                 Some("inline".to_string()),
                 Some(prompt_file.display().to_string()),
             )
-            .unwrap()
-            .as_deref(),
-            Some("inline")
+            .unwrap(),
+            Some(("inline".to_string(), "--system-prompt"))
         );
-        // File content is returned verbatim.
+        // File content is returned verbatim with the file-flag origin.
         assert_eq!(
             super::resolve_cli_system_prompt(None, Some(prompt_file.display().to_string()))
-                .unwrap()
-                .as_deref(),
-            Some("cli file text")
+                .unwrap(),
+            Some(("cli file text".to_string(), "--system-prompt-file"))
+        );
+        // Whitespace-only file content counts as unset and falls through.
+        std::fs::write(dir.join("blank.md"), "   \n").unwrap();
+        assert_eq!(
+            super::resolve_cli_system_prompt(
+                None,
+                Some(dir.join("blank.md").display().to_string())
+            )
+            .unwrap(),
+            None
         );
         // Missing file is a hard error, never a silent default.
         assert!(super::resolve_cli_system_prompt(
@@ -5704,11 +5735,60 @@ pub(crate) mod tests {
         assert!(prow.contains("custom (11 chars)"), "{prow}");
         assert!(prow.contains("DEX_SYSTEM_PROMPT"), "{prow}");
         // Explicit CLI text wins and reports as a flag.
-        let out = doctor(None, None, None, &[], Some("cli".to_string()));
+        let out = doctor(
+            None,
+            None,
+            None,
+            &[],
+            Some(("cli".to_string(), "--system-prompt")),
+        );
         let prow = out
             .lines()
             .find(|l| l.starts_with("system prompt "))
             .expect("system prompt row");
         assert!(prow.contains("--system-prompt"), "{prow}");
+        // File-flag text reports its own origin.
+        let out = doctor(
+            None,
+            None,
+            None,
+            &[],
+            Some(("cli".to_string(), "--system-prompt-file")),
+        );
+        let prow = out
+            .lines()
+            .find(|l| l.starts_with("system prompt "))
+            .expect("system prompt row");
+        assert!(prow.contains("--system-prompt-file"), "{prow}");
+    }
+
+    #[test]
+    fn whitespace_file_inline_system_prompt_falls_through_to_default() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_SYSTEM_PROMPT",
+            "DEX_SYSTEM_PROMPT_FILE",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-spblank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: opencode/m\ncontext_window: 1000\nsystem_prompt: '   '\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_SYSTEM_PROMPT", "DEX_SYSTEM_PROMPT_FILE"] {
+            std::env::remove_var(key);
+        }
+        let (text, origin) = super::system_prompt_origin(None);
+        assert_eq!(text, None);
+        assert_eq!(origin, "built-in default");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

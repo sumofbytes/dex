@@ -124,12 +124,42 @@ mod tests {
 
     #[test]
     fn custom_base_replaces_builtin_but_keeps_skills_appendix() {
+        struct EnvRestore {
+            vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, prev) in self.vars.drain(..) {
+                    match prev {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Hermetic: ignore any developer shell override for this assertion.
-        let prev = std::env::var_os("DEX_SYSTEM_PROMPT");
-        let prev_file = std::env::var_os("DEX_SYSTEM_PROMPT_FILE");
+        // Hermetic: ignore any developer shell/config override for this assertion.
+        let _restore = EnvRestore {
+            vars: [
+                "DEX_CONFIG",
+                "DEX_SYSTEM_PROMPT",
+                "DEX_SYSTEM_PROMPT_FILE",
+                "XDG_CACHE_HOME",
+            ]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect(),
+        };
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-prompt-test-{}", std::process::id())),
+        );
+        std::env::set_var(
+            "XDG_CACHE_HOME",
+            std::env::temp_dir().join(format!("dex-prompt-cache-{}", std::process::id())),
+        );
         std::env::remove_var("DEX_SYSTEM_PROMPT");
         std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
         let custom = system_prompt_with_override(&[], Some("You are a pirate."));
@@ -146,13 +176,5 @@ mod tests {
             "{with_skills}"
         );
         assert!(with_skills.contains("s"), "{with_skills}");
-        match prev {
-            Some(v) => std::env::set_var("DEX_SYSTEM_PROMPT", v),
-            None => std::env::remove_var("DEX_SYSTEM_PROMPT"),
-        }
-        match prev_file {
-            Some(v) => std::env::set_var("DEX_SYSTEM_PROMPT_FILE", v),
-            None => std::env::remove_var("DEX_SYSTEM_PROMPT_FILE"),
-        }
     }
 }
