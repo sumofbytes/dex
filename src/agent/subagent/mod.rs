@@ -1,9 +1,11 @@
 //! Sub-agent domain types (plan §4): definitions, instances, results,
 //! manager, and the delegation tools.
 //!
-//! Phases 0–13 are wired: manager, delegate tools, child body, the Phase 6
-//! turn-boundary drains, and the §24 supervision regime (taxonomy,
-//! recovery, queue/breaker/reaper) all have non-test callers. The blanket
+//! The manager owns lifecycle mechanics only — registry, spawn cap,
+//! cancel, timeout, completion notices, and resume handles for manual
+//! re-entry. There is no automatic recovery, no spawn queue, and no
+//! idle reaper: over-cap spawns reject, and the model re-enters dead
+//! children by hand with `delegate(resume_from)`. The blanket
 //! `dead_code` allow stays only for genuinely optional surface (e.g.
 //! `AgentInstance::parent_id` probes kept for tests); everything else is
 //! dead-code free.
@@ -20,14 +22,11 @@ pub(crate) mod tools;
 #[allow(unused_imports)]
 pub(crate) use context::ContextSeed;
 #[allow(unused_imports)]
-pub(crate) use definition::{
-    AgentDefinition, PermissionInherit, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS,
-};
+pub(crate) use definition::{AgentDefinition, DEFAULT_AGENT_TIMEOUT, READ_ONLY_TOOLS};
 #[allow(unused_imports)]
 pub(crate) use exit::{
-    classify_body_error, decide, exit_reason_word, recover_mode_word, resume_note,
-    transcript_holds_progress, Action, ExhaustKind, ExitReason, RecoverMode, ResumeHandle,
-    ResumeRequest, SupervisionSpec,
+    classify_body_error, resume_note, transcript_holds_progress, ExhaustKind, ExitReason,
+    ResumeHandle, ResumeRequest,
 };
 #[allow(unused_imports)]
 pub(crate) use instance::{AgentId, AgentInstance, AgentState};
@@ -90,7 +89,6 @@ mod tests {
             assert!(!def.description.is_empty(), "{}", def.name);
             assert!(!def.prompt.is_empty(), "{}", def.name);
             assert_eq!(def.model, None, "{} inherits the model", def.name);
-            assert_eq!(def.permissions, PermissionInherit::Inherit);
         }
         let tools = |n: &str| {
             defs.iter()
@@ -120,7 +118,6 @@ mod tests {
 
     #[test]
     fn terminal_states_cover_every_ending() {
-        assert!(!AgentState::Pending.is_terminal());
         assert!(!AgentState::Running.is_terminal());
         for state in [
             AgentState::Completed,
