@@ -855,6 +855,22 @@ where
     C: ModelClient + 'static,
     X: CancellationSource + Clone + 'static,
 {
+    // Pin this turn's model drive context for the whole turn: extension
+    // drives read it instead of the process-wide fallback, so concurrent
+    // turns (daemon sessions) and nested child turns each serve their own
+    // model. The recorder below still updates the fallback for out-of-turn
+    // drives, and the `model_select` event still fires on change.
+    let drive = crate::extensions::drive_model_for(rt.config);
+    crate::extensions::with_drive_model(drive, process_turn_scoped(rt)).await
+}
+
+async fn process_turn_scoped<C, X>(
+    rt: AgentRuntime<'_, C, X>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: ModelClient + 'static,
+    X: CancellationSource + Clone + 'static,
+{
     // Lifecycle hooks (plan §7): `before_agent_start` may append to the
     // system prompt for this turn (read-only influence, Pi's prompt
     // customizer); `turn.start` before anything runs; `turn.end` on every

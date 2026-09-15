@@ -1,30 +1,32 @@
 -- web: provider-native web search + URL fetch for the current model.
 --
-  -- Reference extension for model-aware Lua extensions: it registers
-  -- provider-native tools (`search` everywhere, `fetch` on Gemini
-  -- only — the model sees them as `lua__web__search` / `lua__web__fetch`;
-  -- extension code uses the short names and the host resolves them),
-  -- reuses the *current* model's endpoint + key (`dex.model`), hides tools
-  -- the model cannot serve (`model_select` + `dex.tools.set_active`), and
-  -- never switches the model silently (cost safety — an optional
-  -- `override_model` in `dex.state` is the only override).
+-- Reference extension for model-aware Lua extensions: it registers
+-- provider-native tools (`search` everywhere, `fetch` on Gemini
+-- only — the model sees them as `lua__web__search` / `lua__web__fetch`;
+-- extension code uses the short names and the host resolves them),
+-- reuses the *current* model's endpoint + key (`dex.model`), hides tools
+-- the model cannot serve (`model_select` + `dex.tools.set_active`), and
+-- never switches the model silently (cost safety — switch with /model).
 --
 -- Copy this directory to `$XDG_CONFIG_HOME/dex/extensions/web`
 -- (or `dex extensions install <dir>`) to use it.
 
 return function(dex)
-    local SEARCH_TOOL = "search"
-    local FETCH_TOOL = "fetch"
-    local OVERRIDE_KEY = "override_model"
-    local MAX_TEXT = 8000
-    -- Provider-side search/grounding rounds run ~40s+ non-streamed; keep
-    -- this under the manifest per-tool `timeout` (120s).
-    local NET_TIMEOUT_MS = 100000
+  local SEARCH_TOOL = "search"
+  local FETCH_TOOL = "fetch"
+  local MAX_TEXT = 8000
+  -- Anthropic versions its server-side search tool (`web_search_YYYYMMDD`);
+  -- the server rejects unknown versions loudly, so bump this when they
+  -- publish a newer one.
+  local ANTHROPIC_WEB_SEARCH_TOOL = "web_search_20260209"
+  -- Provider-side search/grounding rounds run ~40s+ non-streamed; keep
+  -- this under the manifest per-tool `timeout` (120s).
+  local NET_TIMEOUT_MS = 100000
 
-    -- Which provider family serves this model. Gemini speaks its own search
-    -- + url_context tools; OpenAI-Responses and Anthropic-Messages wires
-    -- carry a web_search tool; anything else errors loudly at call time
-    -- (never a silent model switch).
+  -- Which provider family serves this model. Gemini speaks its own search
+  -- + url_context tools; OpenAI-Responses and Anthropic-Messages wires
+  -- carry a web_search tool; anything else errors loudly at call time
+  -- (never a silent model switch).
   local function provider_kind(provider, api)
     provider = string.lower(provider or "")
     api = api or ""
@@ -40,18 +42,14 @@ return function(dex)
     return "unsupported"
   end
 
-  -- Effective model: the `override_model` state wins, else the current
-  -- model. Returns id, is_override, snapshot (nil for overrides).
-  local function effective_model()
-    local override = dex.state.get(OVERRIDE_KEY)
-    if type(override) == "string" and override ~= "" then
-      return override, true, nil
-    end
+  -- Current model (never a silent switch: the extension serves whatever
+  -- dex serves — change it with /model).
+  local function current_model()
     local ok, current = pcall(dex.model.current)
     if not ok or type(current) ~= "table" then
       error("web: no model configured (set model: <provider>/<model>)")
     end
-    return current.id, false, current
+    return current.id, current
   end
 
   local function urlencode(text)
@@ -250,7 +248,7 @@ return function(dex)
       body = dex.json.encode({
         model = model,
         max_tokens = 2048,
-        tools = { { type = "web_search_20260209", name = "web_search" } },
+        tools = { { type = ANTHROPIC_WEB_SEARCH_TOOL, name = "web_search" } },
         messages = { { role = "user", content = query } },
       }),
     })
@@ -271,7 +269,7 @@ return function(dex)
   local function unsupported(id)
     error("web: model '" .. id .. "' has no search API "
       .. "(supported: gemini, openai-responses, anthropic-messages). "
-      .. "Set '" .. OVERRIDE_KEY .. "' in dex.state or /model to a supported one.")
+      .. "Switch with /model to a supported one.")
   end
 
   -- -- visibility --------------------------------------------------------
@@ -294,19 +292,19 @@ return function(dex)
 
   -- -- tools --------------------------------------------------------------
   dex.tools.register({
-      name = "search",
-      execute = function(ctx, args)
-        local query = args.query
-        if type(query) ~= "string" or query == "" then
-          error("search: query must be a non-empty string")
-        end
+    name = "search",
+    execute = function(ctx, args)
+      local query = args.query
+      if type(query) ~= "string" or query == "" then
+        error("search: query must be a non-empty string")
+      end
       local count = args.count or 5
       if type(count) ~= "number" or count < 1 then
         count = 5
       end
-      local id, _, current = effective_model()
-      local model = current and current.model or id
-      local kind = current and provider_kind(current.provider, current.api) or "unsupported"
+      local id, current = current_model()
+      local model = current.model
+      local kind = provider_kind(current.provider, current.api)
       local auth = dex.model.auth()
       local text, sources
       if kind == "gemini" then
@@ -326,16 +324,16 @@ return function(dex)
   })
 
   dex.tools.register({
-      name = "fetch",
-      execute = function(ctx, args)
-        if type(args.urls) ~= "table" or #args.urls == 0 then
-          error("fetch: urls must be a non-empty array of strings")
-        end
-        local query = args.query or ""
-        local id, _, current = effective_model()
-        if not current or provider_kind(current.provider, current.api) ~= "gemini" then
-          error("fetch: model '" .. id .. "' cannot fetch URLs (Gemini models only)")
-        end
+    name = "fetch",
+    execute = function(ctx, args)
+      if type(args.urls) ~= "table" or #args.urls == 0 then
+        error("fetch: urls must be a non-empty array of strings")
+      end
+      local query = args.query or ""
+      local id, current = current_model()
+      if provider_kind(current.provider, current.api) ~= "gemini" then
+        error("fetch: model '" .. id .. "' cannot fetch URLs (Gemini models only)")
+      end
       local auth = dex.model.auth()
       local texts, sources, failed = {}, {}, {}
       local seen = {}
