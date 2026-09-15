@@ -161,6 +161,11 @@ pub enum StreamEvent {
     ToolCall {
         name: String,
         args: serde_json::Value,
+        /// The LLM's tool-call id, pairing this event with its
+        /// `tool_result`. Optional with a serde default so older
+        /// daemons/journals parse unchanged (they pair by tail order).
+        #[serde(default)]
+        id: String,
     },
 
     /// A tool call completed.
@@ -175,6 +180,10 @@ pub enum StreamEvent {
         /// Wall-clock seconds the tool took; 0 when unknown.
         #[serde(default)]
         duration: f64,
+        /// Pairs with the `tool_call` that started this call; empty when
+        /// the starter predates ids (old journals, session rebuild).
+        #[serde(default)]
+        id: String,
     },
 
     /// The agent needs user approval for a tool. `agent` is set (V1b, plan
@@ -482,6 +491,7 @@ mod tests {
             StreamEvent::ToolCall {
                 name: "read".into(),
                 args: serde_json::json!({"path":"a.rs"}),
+                id: "call-1".into(),
             },
             StreamEvent::ToolResult {
                 name: "read".into(),
@@ -489,6 +499,7 @@ mod tests {
                 success: true,
                 preview: vec!["line".into()],
                 duration: 0.1,
+                id: "call-1".into(),
             },
             StreamEvent::TurnComplete {
                 response: "done".into(),
@@ -520,6 +531,22 @@ mod tests {
             // re-serializing should be stable
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+    }
+
+    #[test]
+    fn tool_events_without_ids_parse_as_legacy() {
+        // Journals written before ids existed omit the field; they must
+        // still parse (pairing falls back to tail order), and re-serializing
+        // must not corrupt the event.
+        let call: StreamEvent =
+            serde_json::from_str(r#"{"type":"tool_call","data":{"name":"read","args":"a.rs"}}"#)
+                .unwrap();
+        assert!(matches!(call, StreamEvent::ToolCall { ref id, .. } if id.is_empty()));
+        let result: StreamEvent = serde_json::from_str(
+            r#"{"type":"tool_result","data":{"name":"read","summary":"ok","success":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(result, StreamEvent::ToolResult { ref id, .. } if id.is_empty()));
     }
 
     #[test]

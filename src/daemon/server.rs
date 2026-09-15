@@ -1148,16 +1148,18 @@ async fn run_turn_inner(
                 let event = match batch {
                     SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
                     SinkLine::Thinking(text) => StreamEvent::Thinking(text),
-                    SinkLine::ToolInput(preview) => {
-                        let mut parts = preview.splitn(2, ' ');
+                    SinkLine::ToolInput { id, input } => {
+                        let mut parts = input.splitn(2, ' ');
                         let name = parts.next().unwrap_or_default().to_string();
                         let args = parts.next().unwrap_or_default().to_string();
                         StreamEvent::ToolCall {
                             name,
                             args: serde_json::Value::String(args),
+                            id,
                         }
                     }
                     SinkLine::ToolOutput {
+                        id,
                         name,
                         summary,
                         success,
@@ -1169,6 +1171,7 @@ async fn run_turn_inner(
                         success,
                         preview,
                         duration,
+                        id,
                     },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
@@ -2081,9 +2084,15 @@ async fn session_shell(
         crate::core::format::tool_result_summary("bash", &input_json, &output, success, None);
     let preview = crate::core::format::tool_preview("bash", success, None, &output, true);
     let (call_seq, result_seq) = state.next_seq_pair(&session_id);
+    // Unique id shared by the pair so concurrent runs can't steal each
+    // other's half even if the two pairs interleave in the journal. The
+    // journal seq is already unique per session, so reuse it as the block
+    // id instead of minting a separate counter.
+    let block_id = format!("shell-{call_seq}");
     let call_event = serde_json::to_string(&StreamEvent::ToolCall {
         name: "bash".to_string(),
         args: serde_json::Value::String(short),
+        id: block_id.clone(),
     })
     .unwrap_or_default();
     let result_event = serde_json::to_string(&StreamEvent::ToolResult {
@@ -2092,6 +2101,7 @@ async fn session_shell(
         success,
         preview,
         duration,
+        id: block_id,
     })
     .unwrap_or_default();
     // Best-effort history: a failed journal write must not fail a run whose
