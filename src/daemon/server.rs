@@ -1022,6 +1022,7 @@ async fn run_turn_inner(
     // manager handle, the parent session path/cwd, and the resolved config
     // the child inherits (cloning its own per definition, §13).
     let agent_ctx = Arc::new(AgentTurnContext {
+        depth: 0,
         session_id: session_id.to_string(),
         session_path: entry.path.clone(),
         cwd: entry.cwd.clone(),
