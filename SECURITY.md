@@ -11,7 +11,7 @@ Please run the latest release before reporting.
 
 Use GitHub's private vulnerability reporting for this repository:
 
-  https://github.com/arpitsr/dex/security/advisories/new
+  https://github.com/sumofbytes/dex/security/advisories/new
 
 (Repository → Security → Report a vulnerability.) If private reporting is
 unavailable for any reason, contact the maintainer directly and say the
