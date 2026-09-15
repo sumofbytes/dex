@@ -842,9 +842,9 @@ async fn child_run(
                 SinkLine::Assistant(text) => {
                     *capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
                 }
-                SinkLine::ToolInput(preview) => {
+                SinkLine::ToolInput { input, .. } => {
                     // Preview is "<name> <short-args>" (loop.rs emit shape).
-                    let name = preview.split(' ').next().unwrap_or_default();
+                    let name = input.split(' ').next().unwrap_or_default();
                     progress.set(name);
                     *tally_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 }
