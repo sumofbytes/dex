@@ -18,8 +18,11 @@ pub(crate) const MAX_TOOL_TIMEOUT_SECS: u64 = 120;
 pub(crate) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
 
 /// Capabilities the engine understands. Unknown entries are rejected so a
-/// typo fails loudly at load instead of silently granting nothing.
-const KNOWN_CAPABILITIES: &[&str] = &["tools", "tools.override", "workspace.read"];
+/// typo fails loudly at load instead of silently granting nothing. `model`
+/// exposes the current model + its credentials (`dex.model`); `net` allows
+/// HTTP confined to that model's own endpoint (`dex.net.fetch`) and
+/// requires `model` (confinement needs the endpoint).
+const KNOWN_CAPABILITIES: &[&str] = &["tools", "tools.override", "workspace.read", "model", "net"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ManifestTool {
@@ -121,6 +124,9 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if !manifest.capabilities.contains(&"tools".to_string()) && !manifest.tools.is_empty() {
         return Err("manifest declares tools without the 'tools' capability".to_string());
     }
+    if manifest.has_capability("net") && !manifest.has_capability("model") {
+        return Err("capability 'net' requires the 'model' capability (fetch is confined to the model's endpoint)".to_string());
+    }
     Ok(manifest)
 }
 
@@ -191,5 +197,20 @@ tools:
     fn tools_require_tools_capability() {
         let no_cap = base().replace("capabilities: [tools, workspace.read]", "capabilities: []");
         assert!(parse_manifest(&no_cap).is_err());
+    }
+
+    #[test]
+    fn net_requires_model_capability() {
+        let net_only = base().replace(
+            "capabilities: [tools, workspace.read]",
+            "capabilities: [tools, net]",
+        );
+        let err = parse_manifest(&net_only).unwrap_err();
+        assert!(err.contains("'net' requires the 'model'"), "got: {err}");
+        let both = base().replace(
+            "capabilities: [tools, workspace.read]",
+            "capabilities: [tools, model, net]",
+        );
+        assert!(parse_manifest(&both).is_ok());
     }
 }
