@@ -45,14 +45,6 @@ pub(crate) use tools::{
 
 use definition::parse_definition;
 
-/// Same env rule as the main schema (`tools_schema`): `git`/`chain` cost
-/// prompt tokens and stay hidden unless opted in. A definition never
-/// grants what the environment hides — the reviewer degrades to the
-/// read-only trio when the var is absent (§19).
-fn extra_tools_enabled() -> bool {
-    std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1")
-}
-
 const EXPLORER_MD: &str = "---\nname: explorer\ndescription: Understand code without modifying it. Give it a question about the codebase; it returns findings in prose with file paths. Read-only: never modifies files or runs commands.\ntools: read, grep, find\n---\nYou are an explorer. Answer the task with findings in prose: file paths, relevant snippets, risks. Never modify files or run shell commands — you do not have those tools. If the task needs something outside your tools, say so in your result instead of working around it.\n";
 
 const REVIEWER_MD: &str = "---\nname: reviewer\ndescription: Review a diff or change for correctness and regressions. Give it what changed; it returns findings in prose. Read-only.\ntools: read, grep, find, git\n---\nYou are a reviewer. Review the change for correctness, regressions, and missed edge cases; report findings in prose with file paths and line references. Never modify files or run shell commands outside your tools.\n";
@@ -61,20 +53,14 @@ const TESTER_MD: &str = "---\nname: tester\ndescription: Investigate and run rel
 
 /// V1a ships three built-ins, zero required configuration (§19). Parsed
 /// through the same frontmatter parser user files will use, so the parser
-/// stays live. The reviewer degrades to the read-only trio when
-/// `DEX_EXTRA_TOOLS` is absent.
+/// stays live. Child allowlists are independent of the parent prompt-token
+/// hiding (`DEX_EXTRA_TOOLS`): the reviewer keeps `git` even when the
+/// parent schema hides it.
 pub(crate) fn builtin_definitions() -> Vec<AgentDefinition> {
-    let mut defs = [EXPLORER_MD, REVIEWER_MD, TESTER_MD]
+    [EXPLORER_MD, REVIEWER_MD, TESTER_MD]
         .into_iter()
         .map(|md| parse_definition(md).expect("built-in agent must parse"))
-        .collect::<Vec<_>>();
-    if !extra_tools_enabled() {
-        for def in &mut defs {
-            def.tools.remove("git");
-            def.tools.remove("chain");
-        }
-    }
-    defs
+        .collect::<Vec<_>>()
 }
 
 /// Resolve a definition by name. Unknown names fail with the available
@@ -95,47 +81,8 @@ pub(crate) fn find_definition(name: &str) -> Result<AgentDefinition, String> {
 mod tests {
     use super::*;
 
-    /// The two env-touching tests below serialize on this: one sets
-    /// `DEX_EXTRA_TOOLS` while the other removes it, and parallel threads
-    /// would flake each other (same reason as `TEST_SESSIONS_ENV_LOCK`).
-    static EXTRA_TOOLS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Save/restore one env var (all `DEX_EXTRA_TOOLS` readers adapt to
-    /// either value, so no cross-test lock is needed — just hygiene).
-    struct EnvRestore {
-        key: &'static str,
-        saved: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let saved = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, saved }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let saved = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, saved }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.saved {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
     #[test]
     fn builtins_load_with_documented_tool_sets() {
-        let _lock = EXTRA_TOOLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::remove("DEX_EXTRA_TOOLS");
         let defs = builtin_definitions();
         let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["explorer", "reviewer", "tester"]);
@@ -155,18 +102,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(tools("explorer"), ["find", "grep", "read"]);
-        // Degraded: no git without the opt-in.
-        assert_eq!(tools("reviewer"), ["find", "grep", "read"]);
+        // The reviewer keeps `git` regardless of the parent's
+        // `DEX_EXTRA_TOOLS` prompt-token hiding (DEX-9).
+        assert_eq!(tools("reviewer"), ["find", "git", "grep", "read"]);
         assert_eq!(tools("tester"), ["bash", "find", "grep", "read"]);
-    }
-
-    #[test]
-    fn reviewer_keeps_git_when_extra_tools_opt_in() {
-        let _lock = EXTRA_TOOLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::set("DEX_EXTRA_TOOLS", "1");
-        let defs = builtin_definitions();
-        let reviewer = defs.iter().find(|d| d.name == "reviewer").unwrap();
-        assert!(reviewer.tools.contains("git"), "{:?}", reviewer.tools);
     }
 
     #[test]
