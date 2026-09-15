@@ -23,7 +23,7 @@ use crate::agent::state::{GlobalCancellation, ToolState};
 use crate::core::console::install_sigint_handler;
 use crate::core::types::ChatMessage;
 use crate::llm::config::LlmConfig;
-use crate::llm::prompt::system_prompt;
+use crate::llm::prompt::system_prompt_with_override;
 use crate::skills::{discover_skills, skill_dirs};
 
 use serde_json::{json, Map, Value};
@@ -73,7 +73,24 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
             Some(merged)
         },
         plan: None,
+        system_prompt: cli_system_prompt(args),
         idempotency_key: None,
+    }
+}
+
+/// Resolve `--system-prompt` / `--system-prompt-file` for client-side
+/// forwarding. The file is read here so remote daemons work; a miss fails
+/// fast instead of silently running the default.
+fn cli_system_prompt(args: &Args) -> Option<String> {
+    match crate::llm::config::resolve_cli_system_prompt(
+        args.system_prompt.clone(),
+        args.system_prompt_file.clone(),
+    ) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -184,7 +201,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             let _ = session.set_name(name.clone());
         }
     }
-    let mut messages = vec![ChatMessage::system(system_prompt(&skills))];
+    let mut messages = vec![ChatMessage::system(system_prompt_with_override(
+        &skills,
+        cli_system_prompt(args).as_deref(),
+    ))];
     if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
         // Model-bound load: `!!` shell runs stay out of the LLM context.
         messages.extend(load_llm_messages_from_session(existing).unwrap_or_default());
@@ -327,6 +347,7 @@ fn print_help() {
         \n\
         Options:\n  \
         --model <name>            --base-url <url>  --permission <mode>\n  \
+        --system-prompt <text>  --system-prompt-file <path>  custom base prompt\n  \
         -H/--header <\"Name: Value\">  (repeatable) extra provider headers\n  \
         -s/--session <path>  --no-session  -n/--new  --name <name>  --skill <dir>\n  \
         --extensions-dir <dir>  (repeatable) extra extension search dirs\n  \
@@ -450,13 +471,15 @@ fn main() {
             }
         }
         Mode::Doctor => {
+            let system_prompt = cli_system_prompt(&args);
             print!(
                 "{}",
                 crate::llm::config::doctor(
                     args.base_url.clone(),
                     args.model.clone(),
                     args.permission,
-                    &args.headers
+                    &args.headers,
+                    system_prompt,
                 )
             );
         }

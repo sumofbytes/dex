@@ -292,6 +292,8 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "providers",
     "context_window",
     "thinking_effort",
+    "system_prompt",
+    "system_prompt_file",
     "mcp_servers",
     "agent_wake",
     "extensions",
@@ -347,6 +349,84 @@ pub(crate) fn agent_wake_origin() -> (bool, &'static str) {
 /// The wake gate read by the scheduler: `true` unless disabled.
 pub(crate) fn agent_wake_enabled() -> bool {
     agent_wake_origin().0
+}
+
+/// Read a system-prompt file for the env/file layers: a miss warns once and
+/// falls through to the next layer (an explicit `--system-prompt-file` miss
+/// is instead a hard error at the CLI boundary, so remote daemons never
+/// silently run the default when the user named a file).
+fn read_prompt_file(path: &str, warn_id: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => None,
+        Err(e) => {
+            warn_once(
+                warn_id,
+                &format!("ignoring unreadable system prompt file '{path}': {e}"),
+            );
+            None
+        }
+    }
+}
+
+/// Custom base system prompt (DEX-13): replaces the built-in identity/rules;
+/// project instructions, extensions and skills are still appended. Precedence
+/// mirrors every other knob — explicit per-request/CLI text > env inline >
+/// env file > file inline > file file > built-in default (`None`). Inline
+/// beats file within a layer; any CLI beats any env beats any file. Returns
+/// the text plus its origin for `doctor`.
+pub(crate) fn system_prompt_origin(explicit: Option<&str>) -> (Option<String>, &'static str) {
+    if let Some(text) = explicit.filter(|t| !t.trim().is_empty()) {
+        return (Some(text.to_string()), "--system-prompt");
+    }
+    if let Ok(text) = env::var("DEX_SYSTEM_PROMPT") {
+        if !text.trim().is_empty() {
+            return (Some(text), "DEX_SYSTEM_PROMPT");
+        }
+    }
+    if let Ok(path) = env::var("DEX_SYSTEM_PROMPT_FILE") {
+        if !path.trim().is_empty() {
+            if let Some(text) = read_prompt_file(path.trim(), "env:DEX_SYSTEM_PROMPT_FILE") {
+                return (Some(text), "DEX_SYSTEM_PROMPT_FILE");
+            }
+        }
+    }
+    let file = load_config_file();
+    if let Some(text) = load_config_str(&file, "system_prompt") {
+        return (Some(text), "config system_prompt:");
+    }
+    if let Some(path) = load_config_str(&file, "system_prompt_file") {
+        if let Some(text) = read_prompt_file(path.trim(), "config:system_prompt_file") {
+            return (Some(text), "config system_prompt_file:");
+        }
+    }
+    (None, "built-in default")
+}
+
+/// Resolve the client-side CLI pair (`--system-prompt` > `--system-prompt-file`)
+/// into the single text override forwarded per-request. The file is read here
+/// so a remote daemon never has to see the client's local path; a miss is a
+/// hard error instead of a silent default.
+pub(crate) fn resolve_cli_system_prompt(
+    inline: Option<String>,
+    file: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(text) = inline.filter(|t| !t.trim().is_empty()) {
+        return Ok(Some(text));
+    }
+    if let Some(path) = file.filter(|p| !p.trim().is_empty()) {
+        let path = path.trim().to_string();
+        return std::fs::read_to_string(&path)
+            .map(|text| {
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            })
+            .map_err(|e| format!("cannot read --system-prompt-file '{path}': {e}"));
+    }
+    Ok(None)
 }
 
 /// Selection pointer fallback: `active_provider:` is deprecated — the
@@ -2364,12 +2444,14 @@ impl LlmConfig {
 /// --show-origin` for the LLM wiring. Read-only, no network, no daemon;
 /// answers "why is dex using X?" without archaeology. Takes the same
 /// overrides as `from_env` so flags (`--model`, `--base-url`,
-/// `--permission`, `--header`) are reflected, not silently dropped.
+/// `--permission`, `--header`, `--system-prompt` / `--system-prompt-file`
+/// resolved text) are reflected, not silently dropped.
 pub(crate) fn doctor(
     base_url_override: Option<String>,
     model_override: Option<String>,
     permission_override: Option<PermissionMode>,
     header_overrides: &[String],
+    system_prompt_override: Option<String>,
 ) -> String {
     fn row(out: &mut String, key: &str, value: &str, source: &str) {
         // Three fixed columns — key (KEY_COLS), value (VALUE_COLS), origin. Widths count
@@ -2781,6 +2863,18 @@ pub(crate) fn doctor(
                 );
             }
         }
+    }
+    // Base system prompt override (DEX-13): provider-independent, so it
+    // prints even when the provider row is unsupported. Value is a char
+    // count — the full text would flood doctor — with the same origin
+    // `system_prompt_origin` reports at runtime.
+    {
+        let (custom, origin) = system_prompt_origin(system_prompt_override.as_deref());
+        let value = match custom {
+            Some(text) => format!("custom ({} chars)", text.chars().count()),
+            None => "default".to_string(),
+        };
+        row(&mut out, "system prompt", &value, origin);
     }
     // Lua extensions: disk discovery + consent state (deterministic — the
     // load-state detail lives in `dex extensions list`).
@@ -3748,7 +3842,7 @@ pub(crate) mod tests {
         assert!(err.contains("openai-codex"), "{err}");
         assert!(!err.contains("no API key for provider"), "{err}");
         // The same guide surfaces in `dex doctor`'s resolve row.
-        let report = doctor(None, None, None, &[]);
+        let report = doctor(None, None, None, &[], None);
         assert!(report.contains("no model configured"), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3848,6 +3942,7 @@ pub(crate) mod tests {
             None,
             None,
             &[],
+            None,
         );
         let prow = out.lines().find(|l| l.starts_with("provider ")).unwrap();
         assert!(prow.contains("custom"), "{prow}");
@@ -5108,7 +5203,7 @@ pub(crate) mod tests {
             "DEX_CONFIG",
             std::env::temp_dir().join(format!("dex-missing-doctor-{}", std::process::id())),
         );
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         assert!(out.contains("provider"), "{out}");
         assert!(out.contains("model"), "{out}");
         assert!(out.contains("OPENCODE_API_KEY"), "{out}");
@@ -5139,7 +5234,7 @@ pub(crate) mod tests {
             "DEX_CONFIG",
             std::env::temp_dir().join(format!("dex-bare-doctor-{}", std::process::id())),
         );
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         let prov = out
             .lines()
             .find(|l| l.starts_with("provider "))
@@ -5174,7 +5269,7 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("dex-obs-doctor-{}", std::process::id())),
         );
         std::env::set_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV, "1");
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         let obs = out
             .lines()
             .find(|l| l.starts_with("obs pack "))
@@ -5212,14 +5307,14 @@ pub(crate) mod tests {
         std::env::remove_var(crate::agent::evidence_reducer::GATE_ENV);
         std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
         std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         assert!(
             !out.lines().any(|l| l.starts_with("evidence reducer")),
             "gate off must not produce a row: {out}"
         );
         // Gate on but the pack off: the row explains what is missing.
         std::env::set_var(crate::agent::evidence_reducer::GATE_ENV, "1");
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         let row = out
             .lines()
             .find(|l| l.starts_with("evidence reducer"))
@@ -5239,7 +5334,7 @@ pub(crate) mod tests {
             crate::agent::evidence_reducer::MODEL_ENV,
             "openrouter/z-ai/glm-4.5-air",
         );
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         let row = out
             .lines()
             .find(|l| l.starts_with("evidence reducer"))
@@ -5274,7 +5369,7 @@ pub(crate) mod tests {
                 std::env::temp_dir().display()
             ),
         );
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         let mut lines = out.lines();
         while let Some(line) = lines.next() {
             if !line.starts_with("config ") {
@@ -5315,7 +5410,7 @@ pub(crate) mod tests {
             "DEX_CONFIG",
             format!("/tmp/{}/config.yaml", "配置文件配置文件配置文件配置"),
         );
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         let line = out
             .lines()
             .find(|l| l.starts_with("config "))
@@ -5352,6 +5447,8 @@ pub(crate) mod tests {
             "DEX_RESERVE_TOKENS",
             "DEX_KEEP_RECENT_TOKENS",
             "DEX_THINKING_EFFORT",
+            "DEX_SYSTEM_PROMPT",
+            "DEX_SYSTEM_PROMPT_FILE",
             "DEX_PERMISSION",
             "DEX_HEADERS",
             crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
@@ -5373,6 +5470,8 @@ pub(crate) mod tests {
         std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
         std::env::remove_var(crate::agent::evidence_reducer::GATE_ENV);
         std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
+        std::env::remove_var("DEX_SYSTEM_PROMPT");
+        std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -5380,7 +5479,7 @@ pub(crate) mod tests {
         // Hermetic extension discovery too: the extensions row reads the
         // XDG config dir, which must not see the developer's real installs.
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
-        let out = doctor(None, None, None, &[]);
+        let out = doctor(None, None, None, &[], None);
         // The online row is built from the experiment module's own env
         // const so config.rs never names the gate; the padding is derived
         // from the value width (origin column = 18+46) instead of
@@ -5417,6 +5516,7 @@ pub(crate) mod tests {
                 "agent wake        on                                            built-in default\n",
                 "headers           0                                             none\n",
                 "endpoints         go, zen                                       available to /model routing\n",
+                "system prompt     default                                       built-in default\n",
                 "extensions        none                                          cwd/.dex, XDG config dirs\n",
                 "\n",
                 "resolve           ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
@@ -5428,5 +5528,187 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(out, expected, "doctor output drifted");
+    }
+
+    #[test]
+    fn system_prompt_precedence_is_cli_env_file_default() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_SYSTEM_PROMPT",
+            "DEX_SYSTEM_PROMPT_FILE",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-sprompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_file = dir.join("prompt.md");
+        std::fs::write(&prompt_file, "file prompt").unwrap();
+        let env_file = dir.join("env.md");
+        std::fs::write(&env_file, "env file prompt").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: opencode/m\ncontext_window: 1000\nsystem_prompt: file inline\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_SYSTEM_PROMPT", "DEX_SYSTEM_PROMPT_FILE"] {
+            std::env::remove_var(key);
+        }
+        // File inline wins over nothing.
+        let (text, origin) = super::system_prompt_origin(None);
+        assert_eq!(text.as_deref(), Some("file inline"));
+        assert_eq!(origin, "config system_prompt:");
+        // Env inline beats file.
+        std::env::set_var("DEX_SYSTEM_PROMPT", "env inline");
+        let (text, origin) = super::system_prompt_origin(None);
+        assert_eq!(text.as_deref(), Some("env inline"));
+        assert_eq!(origin, "DEX_SYSTEM_PROMPT");
+        // Explicit CLI text beats env.
+        let (text, origin) = super::system_prompt_origin(Some("cli text"));
+        assert_eq!(text.as_deref(), Some("cli text"));
+        assert_eq!(origin, "--system-prompt");
+        std::env::remove_var("DEX_SYSTEM_PROMPT");
+        // Env file beats file inline; file `system_prompt_file:` is the last
+        // layer before the default.
+        std::env::set_var("DEX_SYSTEM_PROMPT_FILE", &env_file);
+        let (text, origin) = super::system_prompt_origin(None);
+        assert_eq!(text.as_deref(), Some("env file prompt"));
+        assert_eq!(origin, "DEX_SYSTEM_PROMPT_FILE");
+        std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
+        // Within the file layer, inline beats file.
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "model: opencode/m\ncontext_window: 1000\nsystem_prompt: inline wins\nsystem_prompt_file: {}\n",
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        let (text, origin) = super::system_prompt_origin(None);
+        assert_eq!(text.as_deref(), Some("inline wins"));
+        assert_eq!(origin, "config system_prompt:");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_prompt_file_layer_reads_absolute_path() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_SYSTEM_PROMPT",
+            "DEX_SYSTEM_PROMPT_FILE",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-spfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_file = dir.join("prompt.md");
+        std::fs::write(&prompt_file, "from file layer").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "model: opencode/m\ncontext_window: 1000\nsystem_prompt_file: {}\n",
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_SYSTEM_PROMPT", "DEX_SYSTEM_PROMPT_FILE"] {
+            std::env::remove_var(key);
+        }
+        let (text, origin) = super::system_prompt_origin(None);
+        assert_eq!(text.as_deref(), Some("from file layer"));
+        assert_eq!(origin, "config system_prompt_file:");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_cli_system_prompt_prefers_inline_and_errors_on_missing_file() {
+        let dir = std::env::temp_dir().join(format!("dex-clicfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_file = dir.join("p.md");
+        std::fs::write(&prompt_file, "cli file text").unwrap();
+        // Inline wins when both are set.
+        assert_eq!(
+            super::resolve_cli_system_prompt(
+                Some("inline".to_string()),
+                Some(prompt_file.display().to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("inline")
+        );
+        // File content is returned verbatim.
+        assert_eq!(
+            super::resolve_cli_system_prompt(None, Some(prompt_file.display().to_string()))
+                .unwrap()
+                .as_deref(),
+            Some("cli file text")
+        );
+        // Missing file is a hard error, never a silent default.
+        assert!(super::resolve_cli_system_prompt(
+            None,
+            Some(dir.join("missing.md").display().to_string())
+        )
+        .is_err());
+        assert_eq!(super::resolve_cli_system_prompt(None, None).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_system_prompt_row_names_origin() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "OPENCODE_API_KEY",
+            "DEX_SYSTEM_PROMPT",
+            "DEX_SYSTEM_PROMPT_FILE",
+            "XDG_CACHE_HOME",
+        ]);
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-spdoc-{}", std::process::id())),
+        );
+        std::env::set_var(
+            "XDG_CACHE_HOME",
+            std::env::temp_dir().join(format!("dex-spdoc-cache-{}", std::process::id())),
+        );
+        for key in ["DEX_MODEL", "DEX_SYSTEM_PROMPT", "DEX_SYSTEM_PROMPT_FILE"] {
+            std::env::remove_var(key);
+        }
+        let out = doctor(None, None, None, &[], None);
+        let prow = out
+            .lines()
+            .find(|l| l.starts_with("system prompt "))
+            .expect("system prompt row");
+        assert!(prow.contains("default"), "{prow}");
+        assert!(prow.contains("built-in default"), "{prow}");
+        std::env::set_var("DEX_SYSTEM_PROMPT", "custom base");
+        let out = doctor(None, None, None, &[], None);
+        let prow = out
+            .lines()
+            .find(|l| l.starts_with("system prompt "))
+            .expect("system prompt row");
+        assert!(prow.contains("custom (11 chars)"), "{prow}");
+        assert!(prow.contains("DEX_SYSTEM_PROMPT"), "{prow}");
+        // Explicit CLI text wins and reports as a flag.
+        let out = doctor(None, None, None, &[], Some("cli".to_string()));
+        let prow = out
+            .lines()
+            .find(|l| l.starts_with("system prompt "))
+            .expect("system prompt row");
+        assert!(prow.contains("--system-prompt"), "{prow}");
     }
 }

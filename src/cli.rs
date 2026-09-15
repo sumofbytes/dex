@@ -20,6 +20,14 @@ pub(crate) struct Args {
     /// repeatable). Same `Name: Value` / `Name=Value` / JSON-object syntax as
     /// `DEX_HEADERS`.
     pub headers: Vec<String>,
+    /// Custom base system prompt (`--system-prompt <text>`). Replaces the
+    /// built-in identity/rules; project instructions, extensions and skills
+    /// are still appended.
+    pub system_prompt: Option<String>,
+    /// Read the custom base system prompt from a file
+    /// (`--system-prompt-file <path>`). `--system-prompt` wins when both are
+    /// set; the file is read client-side so remote daemons work.
+    pub system_prompt_file: Option<String>,
     /// Attach to an existing daemon session (replay its event journal) instead
     /// of creating a fresh one: `dex --reattach <id>` (this process owns the
     /// daemon) or `dex connect <url> --reattach <id>` (it does not).
@@ -86,6 +94,8 @@ pub(crate) fn parse_args() -> Args {
     let mut extension_dirs = Vec::new();
     let mut permission = None;
     let mut headers = Vec::new();
+    let mut system_prompt = None;
+    let mut system_prompt_file = None;
     let mut reattach = None;
     let mut rest = Vec::new();
     let mut input = env::args().skip(1);
@@ -93,6 +103,14 @@ pub(crate) fn parse_args() -> Args {
         // Attached forms (`--header=X: Y`, `-HX: Y`) for parity with curl.
         if let Some(value) = arg.strip_prefix("--header=") {
             headers.push(value.to_string());
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--system-prompt-file=") {
+            system_prompt_file = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--system-prompt=") {
+            system_prompt = Some(value.to_string());
             continue;
         }
         if let Some(value) = arg.strip_prefix("-H") {
@@ -104,6 +122,10 @@ pub(crate) fn parse_args() -> Args {
         match arg.as_str() {
             "--base-url" => base_url = Some(required(&mut input, "--base-url")),
             "--model" => model = Some(required(&mut input, "--model")),
+            "--system-prompt" => system_prompt = Some(required(&mut input, "--system-prompt")),
+            "--system-prompt-file" => {
+                system_prompt_file = Some(required(&mut input, "--system-prompt-file"))
+            }
             "--reattach" => reattach = Some(required(&mut input, "--reattach")),
             "--session" | "-s" => {
                 session_path = Some(PathBuf::from(required(&mut input, "--session")))
@@ -136,6 +158,8 @@ pub(crate) fn parse_args() -> Args {
         extension_dirs,
         permission,
         headers,
+        system_prompt,
+        system_prompt_file,
         reattach,
         rest,
     }
@@ -343,6 +367,8 @@ mod tests {
             extension_dirs: Vec::new(),
             permission: None,
             headers: Vec::new(),
+            system_prompt: None,
+            system_prompt_file: None,
             reattach: None,
             rest: rest.iter().map(|s| s.to_string()).collect(),
         }
