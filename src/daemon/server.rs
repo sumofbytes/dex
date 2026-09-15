@@ -1022,6 +1022,7 @@ async fn run_turn_inner(
     // manager handle, the parent session path/cwd, and the resolved config
     // the child inherits (cloning its own per definition, §13).
     let agent_ctx = Arc::new(AgentTurnContext {
+        depth: 0,
         session_id: session_id.to_string(),
         session_path: entry.path.clone(),
         cwd: entry.cwd.clone(),
@@ -3084,8 +3085,9 @@ mod handler_tests {
             dir.join(format!("{id}.events.jsonl")),
             r#"{"seq":0,"payload":{"type":"system","data":"one"}}
 {"seq":1,"payload":{"type":"yet_unknown_kind","data":"skip me"}}
+{"seq":2,"payload":{"type":"agent_recovered","agent_id":"sess-0","attempt":1,"mode":"resume","reason":"interrupted"}}
 this line is torn and not json
-{"seq":2,"payload":{"type":"system","data":"three"}}
+{"seq":3,"payload":{"type":"system","data":"three"}}
 "#,
         )
         .unwrap();
@@ -3098,11 +3100,13 @@ this line is torn and not json
             .unwrap();
         // Unknown event types are skipped for the payload but still advance
         // the cursor, and torn lines are dropped. (`since` is exclusive, so
-        // seq 0 is skipped here.)
+        // seq 0 is skipped here. `agent_recovered` is the wire type the
+        // supervision removal deleted — old journals carrying it replay
+        // cleanly.)
         assert_eq!(r.events.len(), 1, "{:?}", r.events);
-        assert_eq!(r.events[0].seq, 2);
+        assert_eq!(r.events[0].seq, 3);
         assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "three"));
-        assert_eq!(r.next_seq, 3);
+        assert_eq!(r.next_seq, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

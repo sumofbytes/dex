@@ -611,15 +611,13 @@ context, tool allowlist, and JSONL transcript
 (`$XDG_DATA_HOME/dex/sessions/<slug>/agents/*.jsonl`). Completions are announced
 at the next turn boundary and, while the session is idle with a client attached,
 a wake turn surfaces them immediately (off with `agent_wake: false` /
-`DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children
-cannot delegate (depth 1). A recoverable ending — interrupted, timed out, or
-budget-exhausted with progress on disk — is marked `resumable` in its result:
-`delegate(resume_from: …)` continues that child from its transcript as a new
-generation (the supervisor re-enters automatically when the definition opts in
-with `recover: fresh|resume`; over-cap spawns queue and start when a slot
-frees, and an idle session's children are reaped after ten minutes without a
-client; when recoveries fail faster than policy allows, the breaker queues
-new spawns until that window expires). Under `ask-*` modes a mutating call
+`DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children may delegate
+further up to a nesting depth of 3. A recoverable ending — interrupted, timed
+out, or budget-exhausted with progress on disk — is marked `resumable` in its
+result: `delegate(resume_from: …)` continues that child from its transcript as
+a new generation (re-entry is always manual — there is no automatic recovery,
+no spawn queue, and no idle reaper; over-cap spawns reject so the model waits
+for or cancels a child and retries). Under `ask-*` modes a mutating call
 parks a labeled
 prompt in the session's approval queue — "explorer wants to run bash: …" —
 unanswered for five minutes it denies; session-level "allow" approvals apply to
@@ -717,7 +715,7 @@ discovered extension with its consent state.
 | `DEX_REDUCER_MODEL`                                           | Model selection (`provider/model`, same syntax as `DEX_MODEL`) for the evidence reducer's cheap delegate call. Unset: the main model is used (still verified, just not cheap).                                                                                                                                                                                                                                  |
 | `DEX_DURABLE`                                                 | `1` to `fsync` every session line (default only `turn_*`/`effect_*`).                                                                                                                                                                                                                                                                                                                                           |
 | `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
-| `DEX_EXTRA_TOOLS`                                             | `1` to expose `git`+`chain` to the model (default 6 tools).                                                                                                                                                                                                                                                                                                                                                     |
+| `DEX_EXTRA_TOOLS`                                             | `1` to expose `git`+`chain` to the model (default 7 tools).                                                                                                                                                                                                                                                                                                                                                     |
 | `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate`/`delegate_output`/`delegate_stop`/`delegate_list` tools (default on in daemon sessions).                                                                                                                                                                                                                                                                                                       |
 | `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
 | `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
