@@ -31,17 +31,32 @@ pub(crate) fn project_context() -> Option<String> {
 /// Base system prompt: identity plus imperative working rules.
 /// Tool-behavior detail lives in the tool descriptions (src/llm/protocol.rs),
 /// where the model sees it at each tool decision — never duplicated here.
+///
+/// A custom `system_prompt:` / `DEX_SYSTEM_PROMPT` / `--system-prompt` (or its
+/// `*_file` variant) replaces only this base; project instructions,
+/// extensions and skills are still appended.
 pub(crate) fn system_prompt(skills: &[Skill]) -> String {
-    let mut prompt = concat!(
-        "You are a coding agent. Use read, ls, grep, find, edit, write, bash to get the job done and report the result.",
-        //
-        "\n\nWorking rules:\n",
-        "- Batch independent reads/searches into ONE parallel call. Don't do one file per turn.\n",
-        "- Read before edit; edit with exact oldText; verify with build/tests.\n",
-        "- Don't repeat tool calls — once you have enough context, act.\n",
-        "\n\nAnswering: be concise, lead with the result, show file paths clearly.",
-    )
-    .to_string();
+    system_prompt_with_override(skills, None)
+}
+
+/// Same as [`system_prompt`], with an explicit per-request/CLI text override
+/// (already resolved client-side, so remote daemons need no file access).
+/// `Some` replaces the built-in base; `None` falls back to the env/file
+/// layers via `system_prompt_origin`.
+pub(crate) fn system_prompt_with_override(skills: &[Skill], explicit: Option<&str>) -> String {
+    let (custom, _) = crate::llm::config::system_prompt_origin(explicit);
+    let mut prompt = custom.unwrap_or_else(|| {
+        concat!(
+            "You are a coding agent. Use read, ls, grep, find, edit, write, bash to get the job done and report the result.",
+            //
+            "\n\nWorking rules:\n",
+            "- Batch independent reads/searches into ONE parallel call. Don't do one file per turn.\n",
+            "- Read before edit; edit with exact oldText; verify with build/tests.\n",
+            "- Don't repeat tool calls — once you have enough context, act.\n",
+            "\n\nAnswering: be concise, lead with the result, show file paths clearly.",
+        )
+        .to_string()
+    });
     if let Some(ctx) = project_context() {
         prompt.push_str("\n\n--- Project instructions ---\n");
         prompt.push_str(&ctx);
@@ -105,5 +120,61 @@ mod tests {
                 "tool-schema detail leaked: {needle}"
             );
         }
+    }
+
+    #[test]
+    fn custom_base_replaces_builtin_but_keeps_skills_appendix() {
+        struct EnvRestore {
+            vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, prev) in self.vars.drain(..) {
+                    match prev {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Hermetic: ignore any developer shell/config override for this assertion.
+        let _restore = EnvRestore {
+            vars: [
+                "DEX_CONFIG",
+                "DEX_SYSTEM_PROMPT",
+                "DEX_SYSTEM_PROMPT_FILE",
+                "XDG_CACHE_HOME",
+            ]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect(),
+        };
+        std::env::set_var(
+            "DEX_CONFIG",
+            std::env::temp_dir().join(format!("dex-prompt-test-{}", std::process::id())),
+        );
+        std::env::set_var(
+            "XDG_CACHE_HOME",
+            std::env::temp_dir().join(format!("dex-prompt-cache-{}", std::process::id())),
+        );
+        std::env::remove_var("DEX_SYSTEM_PROMPT");
+        std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
+        let custom = system_prompt_with_override(&[], Some("You are a pirate."));
+        assert!(custom.starts_with("You are a pirate."), "{custom}");
+        assert!(!custom.contains("Batch independent reads"), "{custom}");
+        let skills = vec![crate::core::types::Skill {
+            name: "s".to_string(),
+            description: "d".to_string(),
+            path: std::path::PathBuf::from("/tmp/s/SKILL.md"),
+        }];
+        let with_skills = system_prompt_with_override(&skills, Some("You are a pirate."));
+        assert!(
+            with_skills.starts_with("You are a pirate."),
+            "{with_skills}"
+        );
+        assert!(with_skills.contains("s"), "{with_skills}");
     }
 }
