@@ -35,9 +35,9 @@ use crate::tools::{Policy, ToolError, ToolFilter};
 
 use super::context::ContextSeed;
 use super::definition::AgentDefinition;
-use super::exit::{classify_body_error, ExitReason, RecoverMode, ResumeHandle, ResumeRequest};
+use super::exit::{classify_body_error, ExitReason, ResumeHandle, ResumeRequest};
 use super::instance::{AgentId, AgentState};
-use super::manager::{AgentManager, ChildFactory, ProgressReporter, WaitOutcome};
+use super::manager::{AgentManager, ProgressReporter, WaitOutcome};
 use super::result::{AgentResult, AgentUsage};
 use super::SpawnMeta;
 
@@ -72,10 +72,6 @@ pub(crate) fn is_delegation(name: &str) -> bool {
 /// (`finished completed`, `finished timed out`).
 pub(crate) fn status_word(state: AgentState) -> &'static str {
     match state {
-        // One word for `Pending` everywhere (`delegate`/`delegate_output`
-        // say "queued" too) — the registry state and the queue state are
-        // the same fact.
-        AgentState::Pending => "queued",
         AgentState::Running => "running",
         AgentState::Completed => "completed",
         AgentState::Failed => "failed",
@@ -226,7 +222,6 @@ async fn delegate(
         };
         let generation = handle.generation + 1;
         let resume = ResumeRequest {
-            mode: RecoverMode::Resume,
             handle: handle.clone(),
             instruction,
             file_hints,
@@ -240,32 +235,22 @@ async fn delegate(
                     generation,
                     parent_session: Some(ctx.session_path.clone()),
                     parent_id: Some(handle.agent_id.clone()),
-                    // No auto-retry on a hand-steered generation: the
-                    // model just took ownership of recovery, so a
-                    // further death escalates back to it instead of
-                    // retrying behind its back.
-                    retry: None,
-                    lineage: handle.history.clone(),
                     remaining_budget: handle.remaining_budget,
                 },
                 child_body(ctx.clone(), def.clone(), seed, Some(resume)),
             )
             .map_err(|error| ToolError::Denied(error.to_string()))?;
-        // §24.5: under the cap or an open breaker the spawn queues — the
-        // lifecycle line and the tool result say so instead of "started".
-        let queued = ctx.manager.is_queued(&id);
         if let Some(console) = policy.console.as_ref() {
-            let line = if queued {
-                format!("[agent {}:{id}] queued (waiting for a slot)", def.name)
-            } else {
-                format!("[agent {}:{id}] started", def.name)
-            };
-            console.emit_async(SinkLine::System(line)).await;
+            console
+                .emit_async(SinkLine::System(format!(
+                    "[agent {}:{id}] started",
+                    def.name
+                )))
+                .await;
         }
-        let state = if queued { "queued" } else { "running" };
         return Ok(json!({
             "agent_id": id.to_string(),
-            "state": state,
+            "state": "running",
             "resumed_from": handle.agent_id.to_string(),
             "generation": generation,
         })
@@ -285,30 +270,20 @@ async fn delegate(
                 generation: 0,
                 parent_session: Some(ctx.session_path.clone()),
                 parent_id: None,
-                // Auto-recovery factory: the definition's
-                // `supervision.recover` decides whether the manager
-                // ever calls it past generation 0 (`Never` escalates
-                // immediately — today's behavior).
-                retry: Some(child_factory(ctx.clone(), def.clone(), seed.clone())),
-                lineage: Vec::new(),
                 remaining_budget: None,
             },
             child_body(ctx.clone(), def.clone(), seed, None),
         )
         .map_err(|error| ToolError::Denied(error.to_string()))?;
-    // §24.5: under the cap or an open breaker the spawn queues — the
-    // lifecycle line and the tool result say so instead of "started".
-    let queued = ctx.manager.is_queued(&id);
     if let Some(console) = policy.console.as_ref() {
-        let line = if queued {
-            format!("[agent {}:{id}] queued (waiting for a slot)", def.name)
-        } else {
-            format!("[agent {}:{id}] started", def.name)
-        };
-        console.emit_async(SinkLine::System(line)).await;
+        console
+            .emit_async(SinkLine::System(format!(
+                "[agent {}:{id}] started",
+                def.name
+            )))
+            .await;
     }
-    let state = if queued { "queued" } else { "running" };
-    Ok(json!({ "agent_id": id.to_string(), "state": state }).to_string())
+    Ok(json!({ "agent_id": id.to_string(), "state": "running" }).to_string())
 }
 
 /// `delegate_output(agent_id, wait_seconds?)` — bounded poll-wait (§10.2):
@@ -336,9 +311,9 @@ async fn delegate_output(
                      or its result aged out of retention"
                 )));
             }
-            WaitOutcome::Running(state) => {
+            WaitOutcome::Running(_) => {
                 if cancel.is_cancelled() || Instant::now() >= deadline {
-                    return Ok(running_json(&id, state, ctx.manager.progress(&id)));
+                    return Ok(running_json(&id, ctx.manager.progress(&id)));
                 }
             }
         }
@@ -502,10 +477,8 @@ async fn resolve_resume_handle(
             transcript: path,
             generation,
             // Spend died with the daemon: the resume runs the full cap.
-            // No lineage survives either — the daemon took it.
             remaining_budget: None,
             note: "interrupted (daemon restart or crash); prior spend unknown".to_string(),
-            history: Vec::new(),
         });
     }
     Err(ToolError::InvalidArgument(format!(
@@ -579,16 +552,10 @@ fn result_json(id: &AgentId, result: &AgentResult) -> String {
     .to_string()
 }
 
-fn running_json(id: &AgentId, state: AgentState, progress: Option<String>) -> String {
-    // Tool-JSON wording (not the SSE wire): a queued child (§24.5) reads
-    // "queued" — it has an id and a slot request, but no live process.
-    let state = match state {
-        AgentState::Pending => "queued",
-        _ => "running",
-    };
+fn running_json(id: &AgentId, progress: Option<String>) -> String {
     match progress {
-        Some(tool) => json!({ "agent_id": id.to_string(), "state": state, "progress": tool }),
-        None => json!({ "agent_id": id.to_string(), "state": state }),
+        Some(tool) => json!({ "agent_id": id.to_string(), "state": "running", "progress": tool }),
+        None => json!({ "agent_id": id.to_string(), "state": "running" }),
     }
     .to_string()
 }
@@ -684,28 +651,6 @@ pub(crate) type ChildBody = Box<
         + Send,
 >;
 
-/// A re-entry factory (§24.3): the same body builder the manager calls
-/// per attempt, with the attempt's resume. `delegate` passes one always;
-/// the definition's `supervision.recover` decides whether the manager
-/// ever calls it past generation 0.
-pub(crate) fn child_factory(
-    ctx: Arc<AgentTurnContext>,
-    def: AgentDefinition,
-    seed: ContextSeed,
-) -> ChildFactory {
-    Arc::new(move |token, progress, id, resume| {
-        Box::pin(child_run(
-            ctx.clone(),
-            def.clone(),
-            seed.clone(),
-            token,
-            progress,
-            id,
-            resume,
-        )) as Pin<Box<dyn Future<Output = AgentResult> + Send>>
-    })
-}
-
 pub(crate) fn child_body(
     ctx: Arc<AgentTurnContext>,
     def: AgentDefinition,
@@ -745,9 +690,7 @@ async fn child_run(
     // Child JSONL (§16): its own file beside the parent's, same marker
     // discipline (`turn_start`/`turn_complete`/`turn_failed`), so a crash
     // loses at most the in-flight event. Resume generations append `.g<N>`
-    // (§24.3) so a resume never clobbers its parent — including `Fresh`
-    // recoveries, which re-enter through the same plumbing so the file
-    // they write is the file the registry points at. A disk failure
+    // (§24.3) so a resume never clobbers its parent. A disk failure
     // fails the child, never the parent turn.
     let generation = resume
         .as_ref()
@@ -777,11 +720,9 @@ async fn child_run(
     // and the first `append_message`, or an unreadable journal) is a
     // Permanent failure: a resume with no history would run the degenerate
     // seed task ("resume <id> generation N"), which is worse than failing
-    // loudly — the parent can re-delegate with a fresh task instead. A
-    // `Fresh` recovery rides the same request but replays nothing: same
-    // seed, full meter, generation-suffixed file the registry points at.
+    // loudly — the parent can re-delegate with a fresh task instead.
     let mut messages: Vec<ChatMessage> = match &resume {
-        Some(request) if request.mode == RecoverMode::Resume => {
+        Some(request) => {
             let messages = match resume_messages(&def, request) {
                 Ok(messages) => messages,
                 Err(error) => {
@@ -1017,7 +958,7 @@ async fn child_run(
             error: None,
             usage,
             // The body classifies; only the manager's `finish` advertises
-            // (§24.1: one decision point, via `on_exit`).
+            // (§24.1: one choke point for resume handles).
             reason: ExitReason::Normal,
             tool_calls,
             resume: None,
@@ -1249,14 +1190,12 @@ mod tests {
             .find(|def| def.name == "tester")
             .unwrap();
         let request = ResumeRequest {
-            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-2".to_string()),
                 transcript: Session::child_path(&parent_path, "sess-2", "tester", 0),
                 generation: 0,
                 remaining_budget: Some(7),
                 note: "timed out after 3 tool calls; continue from the transcript".to_string(),
-                history: Vec::new(),
             },
             instruction: Some("skip the build".to_string()),
             file_hints: Vec::new(),
@@ -1321,14 +1260,12 @@ mod tests {
             .find(|def| def.name == "tester")
             .unwrap();
         let request = ResumeRequest {
-            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-3".to_string()),
                 transcript: Session::child_path(&parent_path, "sess-3", "tester", 0),
                 generation: 0,
                 remaining_budget: None,
                 note: "interrupted".to_string(),
-                history: Vec::new(),
             },
             instruction: None,
             file_hints: Vec::new(),
@@ -1342,7 +1279,6 @@ mod tests {
     #[test]
     fn resume_nudge_carries_reason_instruction_and_budget() {
         let request = ResumeRequest {
-            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-0".to_string()),
                 transcript: PathBuf::from("/tmp/x.jsonl"),
@@ -1350,7 +1286,6 @@ mod tests {
                 remaining_budget: Some(5),
                 note: "turn budget exhausted after 50 tool calls; continue from the transcript"
                     .to_string(),
-                history: Vec::new(),
             },
             instruction: Some("skip the build".to_string()),
             file_hints: vec![PathBuf::from("src/main.rs")],
@@ -1361,7 +1296,6 @@ mod tests {
         assert!(nudge.contains("src/main.rs"), "{nudge}");
         assert!(nudge.contains("at most 5 further tool calls"), "{nudge}");
         let spent = ResumeRequest {
-            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 remaining_budget: Some(0),
                 ..request.handle.clone()
@@ -1390,14 +1324,12 @@ mod tests {
             ChatMessage::assistant("on it"),
         ];
         let request = ResumeRequest {
-            mode: RecoverMode::Resume,
             handle: ResumeHandle {
                 agent_id: AgentId("sess-0".to_string()),
                 transcript: PathBuf::from("/tmp/x.jsonl"),
                 generation: 0,
                 remaining_budget: Some(5),
                 note: "timed out".to_string(),
-                history: Vec::new(),
             },
             instruction: Some("skip the build".to_string()),
             file_hints: Vec::new(),
@@ -1482,7 +1414,6 @@ mod tests {
                                 remaining_budget: Some(46),
                                 note: "timed out after 4 tool calls; continue from the transcript"
                                     .to_string(),
-                                history: Vec::new(),
                             }),
                         }
                     }
