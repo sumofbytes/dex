@@ -21,7 +21,7 @@ use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::core::unwind::CatchUnwind;
 use crate::llm::config::{agent_wake_enabled, LlmConfig};
-use crate::llm::prompt::system_prompt;
+use crate::llm::prompt::system_prompt_with_override;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
     FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, RecallRequest, SkillInfo,
@@ -1046,7 +1046,10 @@ async fn run_turn_inner(
     // The model-bound load drops `!!` shell runs (saved + shown, never sent
     // to the LLM); the transcript rebuild keeps them.
     let mut messages: Vec<ChatMessage> = Vec::new();
-    messages.push(ChatMessage::system(system_prompt(&skills)));
+    messages.push(ChatMessage::system(system_prompt_with_override(
+        &skills,
+        req.system_prompt.as_deref(),
+    )));
     if let Some(path) = session.path().map(|p| p.to_path_buf()) {
         let loaded = tokio::task::spawn_blocking(move || {
             session::load_llm_messages_from_session(&path).unwrap_or_default()
@@ -1591,6 +1594,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 permission: None,
                 headers: None,
                 plan: None,
+                system_prompt: None,
             };
             // The wake's stream has no attached client; the journal is the
             // delivery path and the terminal event's send is best effort.
@@ -2294,6 +2298,7 @@ mod handler_tests {
             permission: None,
             headers: None,
             plan: None,
+            system_prompt: None,
         };
         // unknown session -> 404
         let r = chat(
@@ -3513,6 +3518,7 @@ mod permission_gate_tests {
             permission: permission.map(String::from),
             headers: None,
             plan: plan.map(String::from),
+            system_prompt: None,
         };
 
         // 1. Client escalating to trusted against a read-only daemon: rejected.

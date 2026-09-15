@@ -188,8 +188,19 @@ the canonical spots:
 
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
 parse error lists the valid keys: `model`, `providers`, `context_window`,
-`thinking_effort`, `mcp_servers`, `agent_wake`, `extensions` (+ the deprecated
+`thinking_effort`, `system_prompt`, `system_prompt_file`, `mcp_servers`,
+`agent_wake`, `extensions` (+ the deprecated
 ones above). Other keys are preserved untouched.
+
+### System prompt
+
+`system_prompt:` (inline text) or `system_prompt_file:` (path to a file)
+replaces the built-in base prompt (identity + working rules). Project
+instructions (`AGENTS.md`/`CLAUDE.md`), extension appendix and skills are
+still appended. Precedence: `--system-prompt` > `--system-prompt-file` >
+`DEX_SYSTEM_PROMPT` > `DEX_SYSTEM_PROMPT_FILE` > file `system_prompt:` >
+file `system_prompt_file:` > built-in default. `dex doctor` shows the
+resolved source as `system prompt`.
 
 ### Other OpenAI-compatible providers
 
@@ -388,6 +399,8 @@ daemon's working directory.
 | `--base-url <url>`               | Override the API base URL for this run (pins the endpoint; routing prefixes become naming only).                  |
 | `-H`, `--header <"Name: Value">` | Extra provider header (repeatable; `Name=Value` or JSON object also accepted).                                    |
 | `--model <name>`                 | Override the model for this run: `<provider>/<model>`, `<endpoint>/<model>`, or a bare provider name.             |
+| `--system-prompt <text>`         | Replace the built-in base system prompt for this run (project/extensions/skills still append).                    |
+| `--system-prompt-file <path>`    | Read the replacement base system prompt from a file (client-side, so remote daemons work).                        |
 | `-s`, `--session <path>`         | Open/continue a specific session file.                                                                            |
 | `--no-session`                   | Disable session persistence for this run.                                                                         |
 | `-n`, `--new`                    | Start a new session (the default).                                                                                |
@@ -688,6 +701,8 @@ discovered extension with its consent state.
 | `DEX_DAEMON_TOKEN`                                            | Bearer token for the daemon API. Required by clients when `dex serve` binds a non-loopback address (auto-generated and written to `$XDG_DATA_HOME/dex/daemon.token`, 0600) or when the operator sets one. Loopback-only daemons need no token.                                                                                                                                                                  |
 | `DEX_MODEL_APIS`                                              | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id).                                                                                                                                                                                                                                                                                                                             |
 | `DEX_THINKING_EFFORT`                                         | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback).                                                                                                                                                                                                                                                                                                           |
+| `DEX_SYSTEM_PROMPT`                                           | Replace the built-in base system prompt (same knob as file `system_prompt:`; project/extensions/skills still append).                                                                                                                                                                                                                                                                                           |
+| `DEX_SYSTEM_PROMPT_FILE`                                      | Read the replacement base system prompt from a file (same knob as file `system_prompt_file:`).                                                                                                                                                                                                                                                                                                                  |
 | `DEX_PERMISSION`                                              | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`).                                                                                                                                                                                                                                                                                                                 |
 | `DEX_LOG`                                                     | Runtime log level: `off`, `error`, `warn` (default), `info`, `debug`, `trace` — works on release builds. Logs go to stderr, or to `$XDG_DATA_HOME/dex/dex.log` while the TUI runs. `debug` covers provider requests/responses and tool runs; `trace` adds raw provider SSE lines.                                                                                                                               |
 | `DEX_VERIFY`                                                  | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default.                                                                                                                                                                                                                                                                                                     |
