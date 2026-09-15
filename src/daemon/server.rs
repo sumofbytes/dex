@@ -1148,16 +1148,18 @@ async fn run_turn_inner(
                 let event = match batch {
                     SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
                     SinkLine::Thinking(text) => StreamEvent::Thinking(text),
-                    SinkLine::ToolInput(preview) => {
-                        let mut parts = preview.splitn(2, ' ');
+                    SinkLine::ToolInput { id, input } => {
+                        let mut parts = input.splitn(2, ' ');
                         let name = parts.next().unwrap_or_default().to_string();
                         let args = parts.next().unwrap_or_default().to_string();
                         StreamEvent::ToolCall {
                             name,
                             args: serde_json::Value::String(args),
+                            id,
                         }
                     }
                     SinkLine::ToolOutput {
+                        id,
                         name,
                         summary,
                         success,
@@ -1169,6 +1171,7 @@ async fn run_turn_inner(
                         success,
                         preview,
                         duration,
+                        id,
                     },
                     SinkLine::System(text) => StreamEvent::System(text),
                     SinkLine::Error(text) => StreamEvent::Error(text),
@@ -2084,6 +2087,10 @@ async fn session_shell(
     let call_event = serde_json::to_string(&StreamEvent::ToolCall {
         name: "bash".to_string(),
         args: serde_json::Value::String(short),
+        // Back-to-back journal pair (input then output): the empty id
+        // keeps legacy tail-order pairing, which holds here because no
+        // other event can interleave between the two appends.
+        id: String::new(),
     })
     .unwrap_or_default();
     let result_event = serde_json::to_string(&StreamEvent::ToolResult {
@@ -2092,6 +2099,7 @@ async fn session_shell(
         success,
         preview,
         duration,
+        id: String::new(),
     })
     .unwrap_or_default();
     // Best-effort history: a failed journal write must not fail a run whose
