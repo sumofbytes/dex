@@ -15,14 +15,21 @@ pub(crate) use engine::{CallKind, ExtensionEngine, HostCtx, ShadowCtx, HOOK_TIME
 /// [`HOOK_TIMEOUT_SECS`] as a `Duration` for the event drive loop.
 pub(crate) const HOOK_TIMEOUT_SECS_DURATION: std::time::Duration =
     std::time::Duration::from_secs(HOOK_TIMEOUT_SECS);
+/// `dex.net.fetch` ceilings: per-request timeout cap (matches the tool
+/// budget) and response-body cap (a runaway body fails the call, not the
+/// daemon).
+pub(crate) const MAX_NET_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const MAX_NET_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) use hooks::{AfterOutcome, BeforeOutcome, CompactAction};
 pub(crate) use manifest::Manifest;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::core::types::{FunctionDef, ToolDefinition};
+use crate::llm::config::ExtensionModelSnapshot;
 
 /// Walk the discovery dirs and collect consent-passing (dir, manifest)
 /// pairs. Pure disk read — the load/reload paths share it.
@@ -229,7 +236,11 @@ pub(crate) struct ExtensionManager {
     /// Built-in names currently shadowed (sync read for `metadata()`).
     shadowed: tokio::sync::RwLock<HashSet<String>>,
     /// `dex.tools.set_active` slice: `None` = all extension tools, `Some`
-    /// = exactly these full names. Sync read on the schema path.
+    /// = exactly these full names. Stored as-given and filtered against the
+    /// cache at read time, so a load-time call naming tools that enter the
+    /// cache in the same refresh still applies (short names resolve to full
+    /// in `set_active_global`, before they land here). Sync read on the
+    /// schema path.
     active: std::sync::RwLock<Option<Vec<String>>>,
     /// Serializes refreshes: without it the background load and an
     /// explicit one (one-shot / `run`) race, boot two workers per
@@ -789,15 +800,13 @@ impl ExtensionManager {
 }
 
 impl ExtensionManager {
-    /// `dex.tools.set_active` backing store. Unknown names are dropped: an
-    /// extension naming a not-yet-loaded tool must not wedge the schema.
+    /// `dex.tools.set_active` backing store (full names — the extension-facing
+    /// `set_active_global` resolves short names first). Stored as-given:
+    /// unknown names filter out at read time, once the tools they name enter
+    /// the cache (a load-time call races the cache rebuild, so dropping here
+    /// would wedge the schema to empty on a fresh process).
     pub(crate) async fn set_active(&self, tools: Vec<String>) {
-        let known: HashSet<String> = {
-            let cached = self.cached.read().await;
-            cached.iter().map(|d| d.function.name.clone()).collect()
-        };
-        *self.active.write().expect("active lock") =
-            Some(tools.into_iter().filter(|t| known.contains(t)).collect());
+        *self.active.write().expect("active lock") = Some(tools);
     }
 
     /// The schema slice after the `set_active` filter.
@@ -806,10 +815,14 @@ impl ExtensionManager {
         let all = self.cached.read().await.clone();
         match self.active.read().expect("active lock").clone() {
             None => all,
-            Some(active) => all
-                .into_iter()
-                .filter(|d| active.contains(&d.function.name))
-                .collect(),
+            Some(active) => {
+                let known: HashSet<String> = all.iter().map(|d| d.function.name.clone()).collect();
+                let wanted: HashSet<String> =
+                    active.into_iter().filter(|t| known.contains(t)).collect();
+                all.into_iter()
+                    .filter(|d| wanted.contains(&d.function.name))
+                    .collect()
+            }
         }
     }
 }
@@ -908,10 +921,15 @@ pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
         .unwrap_or_default();
     match m.active.read().expect("active lock").clone() {
         None => all,
-        Some(active) => all
-            .into_iter()
-            .filter(|d| active.contains(&d.function.name))
-            .collect(),
+        // Filtered here, not at set time: a load-time `set_active` races
+        // the cache rebuild, and dropping unknown names there would wedge
+        // a fresh process to an empty schema.
+        Some(active) => {
+            let wanted: HashSet<String> = active.into_iter().collect();
+            all.into_iter()
+                .filter(|d| wanted.contains(&d.function.name))
+                .collect()
+        }
     }
 }
 
@@ -1030,6 +1048,239 @@ pub(crate) async fn apply_before_agent_start(
         filter,
     };
     global_manager().apply_before_agent_start(&host).await
+}
+
+/// Served-model snapshot recorded per turn (see `fire_model_select_if_changed`):
+/// the daemon's per-request config — which the file never sees — wins over
+/// file+env for `dex.model.current()/auth()` once a turn has served. Secrets
+/// never land here (auth re-resolves the key from the deposits each call).
+static LAST_MODEL: Mutex<Option<ExtensionModelSnapshot>> = Mutex::new(None);
+
+/// Routing-affinity headers recorded per turn (see
+/// `fire_model_select_if_changed`): the `x-opencode-*` pair dex itself
+/// injects into `extra_headers` for Console Go routing (the endpoint
+/// rejects requests without them: `MissingSessionID`). `dex.net.fetch`
+/// re-attaches them so extension calls to the same endpoint route like
+/// dex's own — Lua-explicit headers always win. Same last-turn-wins
+/// staleness as the snapshot above.
+static LAST_ROUTING_HEADERS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// The routing-affinity subset of a turn's resolved `extra_headers`: only
+/// the `x-opencode-*` pair dex injects per turn (session id the file never
+/// sees), canonicalized to lowercase names. Everything else is already
+/// visible to Lua via `dex.model.auth()`.
+fn harvest_routing_headers(extra: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, value) in extra {
+        if name.eq_ignore_ascii_case("x-opencode-session") {
+            out.insert("x-opencode-session".to_string(), value.clone());
+        } else if name.eq_ignore_ascii_case("x-opencode-client") {
+            out.insert("x-opencode-client".to_string(), value.clone());
+        }
+    }
+    out
+}
+
+/// Merge the recorded routing headers under Lua-explicit ones
+/// (case-insensitive): an extension talking to its own model endpoint
+/// routes like dex's own requests, but any per-call header still wins.
+fn with_routing_headers(
+    headers: &[(String, String)],
+    routing: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = headers.to_vec();
+    'next: for (name, value) in routing {
+        for (existing, _) in headers {
+            if existing.eq_ignore_ascii_case(name) {
+                continue 'next;
+            }
+        }
+        merged.push((name.clone(), value.clone()));
+    }
+    merged
+}
+
+/// The served snapshot, if any turn has recorded one yet.
+pub(crate) fn served_model_snapshot() -> Option<ExtensionModelSnapshot> {
+    LAST_MODEL.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// `model_select` for `process_turn`: record the served snapshot every turn
+/// (even without subscribers — it backs `dex.model`), and fire the event
+/// only when the `provider/model` id changed since the last turn (first turn
+/// always fires, with `previous: null`). Fail-open like `fire_event` — a
+/// broken handler logs and the turn proceeds. Nested `dex.tools.call` from
+/// a handler inherits this turn's policy.
+pub(crate) async fn fire_model_select_if_changed(
+    config: &crate::llm::config::LlmConfig,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+) {
+    let snapshot = ExtensionModelSnapshot {
+        provider: config.provider.name().to_string(),
+        model: config.model.clone(),
+        api: config.api.name().to_string(),
+        base_url: config.base_url.clone(),
+    };
+    let id = snapshot.id();
+    let previous = {
+        let mut guard = LAST_MODEL.lock().expect("served model lock");
+        let prev = guard.clone().map(|s| s.id());
+        *guard = Some(snapshot);
+        prev
+    };
+    // Same turn, same routing: the affinity headers dex injected into this
+    // turn's `extra_headers` ride along so `dex.net.fetch` serves the same
+    // endpoint without tripping `MissingSessionID`.
+    {
+        let mut guard = LAST_ROUTING_HEADERS.lock().expect("routing headers lock");
+        *guard = harvest_routing_headers(&config.extra_headers);
+    }
+    if previous.as_deref() == Some(id.as_str()) || !has_event_handlers("model_select") {
+        return;
+    }
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager()
+        .fire_event(
+            "model_select",
+            serde_json::json!({ "model": id, "previous": previous }),
+            &host,
+        )
+        .await;
+}
+
+/// `dex.net.fetch` backing call (task side — the worker never touches the
+/// network). Confined to the served model's own endpoint: scheme+host+port
+/// must match its `base_url`, anything else is a loud error. The recorded
+/// routing-affinity headers ride along under Lua-explicit ones, so calls to
+/// a Console Go endpoint route like dex's own. Non-2xx is a
+/// value (`{status, headers, body}`), never an error. Errors never carry
+/// headers, bodies, or URL queries (a `?key=` parameter would leak the key
+/// into logs).
+pub(crate) async fn net_fetch(
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let snapshot = served_model_snapshot()
+        .or_else(|| crate::llm::config::extension_model_snapshot().ok())
+        .ok_or_else(|| "dex.net.fetch: no model configured".to_string())?;
+    let base = reqwest::Url::parse(&snapshot.base_url)
+        .map_err(|_| "dex.net.fetch: configured base_url is invalid".to_string())?;
+    let parsed =
+        reqwest::Url::parse(&url).map_err(|_| format!("dex.net.fetch: invalid url '{url}'"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "dex.net.fetch: only http(s) urls are allowed, got '{}'",
+            parsed.scheme()
+        ));
+    }
+    if parsed.scheme() != base.scheme()
+        || parsed.host_str() != base.host_str()
+        || parsed.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err(format!(
+            "dex.net.fetch: url '{}' is outside the model endpoint '{}'",
+            net_display_url(&parsed),
+            base.host_str().unwrap_or_default()
+        ));
+    }
+    let method_name = method.to_ascii_uppercase();
+    if !["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].contains(&method_name.as_str()) {
+        return Err(format!("dex.net.fetch: unsupported method '{method}'"));
+    }
+    if body.as_ref().is_some_and(|b| b.len() > 1024 * 1024) {
+        return Err("dex.net.fetch: request body too large (max 1 MiB)".to_string());
+    }
+    let timeout = Duration::from_millis(timeout_ms.clamp(1_000, MAX_NET_TIMEOUT_MS));
+    let client = crate::client::http::shared_streaming_client();
+    let http_method = reqwest::Method::from_bytes(method_name.as_bytes())
+        .map_err(|_| format!("dex.net.fetch: unsupported method '{method}'"))?;
+    let mut request = client.request(http_method, parsed.clone()).timeout(timeout);
+    // Fail-open: a poisoned lock drops the affinity headers, never the call.
+    let routing = LAST_ROUTING_HEADERS
+        .lock()
+        .ok()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    for (name, value) in &with_routing_headers(&headers, &routing) {
+        let lower = name.to_ascii_lowercase();
+        if lower == "host" || lower == "content-length" {
+            return Err(format!("dex.net.fetch: header '{name}' is host-controlled"));
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("dex.net.fetch: invalid header name '{name}'"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|_| format!("dex.net.fetch: invalid header value for '{name}'"))?;
+        request = request.header(header_name, header_value);
+    }
+    if let Some(text) = body {
+        request = request.body(text);
+    }
+    let display = net_display_url(&parsed);
+    let response = request.send().await.map_err(|e| {
+        format!(
+            "dex.net.fetch {display} failed: {}",
+            if e.is_timeout() {
+                "timed out"
+            } else if e.is_connect() {
+                "connection failed"
+            } else {
+                "request failed"
+            }
+        )
+    })?;
+    let status = response.status().as_u16();
+    let mut response_headers = BTreeMap::new();
+    for (name, value) in response.headers() {
+        let text = value.to_str().unwrap_or("<unprintable>").to_string();
+        response_headers
+            .entry(name.to_string())
+            .and_modify(|existing: &mut String| {
+                existing.push_str(", ");
+                existing.push_str(&text);
+            })
+            .or_insert(text);
+    }
+    let mut response_body = Vec::new();
+    let mut stream = response;
+    loop {
+        match stream.chunk().await {
+            Ok(None) => break,
+            Ok(Some(chunk)) => {
+                response_body.extend_from_slice(&chunk);
+                if response_body.len() > MAX_NET_RESPONSE_BYTES {
+                    return Err("dex.net.fetch: response too large (max 4 MiB)".to_string());
+                }
+            }
+            Err(_) => return Err("dex.net.fetch: failed reading response body".to_string()),
+        }
+    }
+    serde_json::to_string(&serde_json::json!({
+        "status": status,
+        "headers": response_headers,
+        "body": String::from_utf8_lossy(&response_body),
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// Error-safe URL display: origin + path only — the query may carry the
+/// provider key (`?key=…`), so it never reaches an error string.
+fn net_display_url(url: &reqwest::Url) -> String {
+    format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        url.path()
+    )
 }
 
 /// `session.before_compact` for `compact_history`. The host runs without a
@@ -1197,12 +1448,25 @@ pub(crate) fn tools_list() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `dex.tools.set_active(list)`: persist the schema slice. Unknown names are
-/// dropped (an extension naming a not-yet-loaded tool must not wedge the
-/// schema); an empty list means "no extension tools".
-pub(crate) async fn set_active_global(tools: Vec<String>) {
+/// `dex.tools.set_active(list)`: persist the schema slice; an empty list
+/// means "no extension tools". Short (own-extension) names resolve to full
+/// `lua__<ext>__<tool>` names here so extension code never spells the
+/// prefix; full names pass through, and unknown names filter out at read
+/// time (see `set_active`).
+pub(crate) async fn set_active_global(ext: &str, tools: Vec<String>) {
+    let tools = tools.iter().map(|t| resolve_active_name(ext, t)).collect();
     if let Some(m) = GLOBAL.get() {
         m.set_active(tools).await;
+    }
+}
+
+/// Resolve one `set_active` entry to its full name: already-full `lua__`
+/// names pass through, anything else names the caller's own tool.
+pub(crate) fn resolve_active_name(ext: &str, name: &str) -> String {
+    if name.starts_with("lua__") {
+        name.to_string()
+    } else {
+        full_tool_name(ext, name)
     }
 }
 
@@ -1456,6 +1720,8 @@ pub(crate) mod tests {
             *self.cached.write().await = Vec::new();
             *self.shadowed.write().await = HashSet::new();
             *self.active.write().expect("active lock") = None;
+            *LAST_MODEL.lock().expect("served model lock") = None;
+            *LAST_ROUTING_HEADERS.lock().expect("routing headers lock") = BTreeMap::new();
             PROMPT_APPENDIX
                 .lock()
                 .expect("prompt appendix lock")
@@ -1492,6 +1758,15 @@ pub(crate) mod tests {
         assert!(split_lua_name("lua__a").is_none());
         assert!(split_lua_name("lua____t").is_none());
         assert!(split_lua_name("lua__a__b__c").is_none());
+    }
+
+    #[test]
+    fn active_names_resolve() {
+        assert_eq!(resolve_active_name("web", "search"), "lua__web__search");
+        assert_eq!(
+            resolve_active_name("web", "lua__web__search"),
+            "lua__web__search"
+        );
     }
 
     /// Write a fixture extension dir; returns the parent temp dir.
@@ -2328,5 +2603,515 @@ end
         assert!(mgr.call("lua__hello__nope", &args, &host).await.is_err());
         assert!(mgr.call("read", &args, &host).await.is_err());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `LlmConfig` for the `model_select` tests (same shape as the turn
+    /// tests' mock config — no network, no catalog).
+    fn model_select_config(
+        provider: &str,
+        model: &str,
+        base_url: &str,
+    ) -> crate::llm::config::LlmConfig {
+        crate::llm::config::LlmConfig {
+            provider: crate::core::types::Provider::Generic(provider.to_string()),
+            api_key: String::new(),
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            available_models: vec![model.to_string()],
+            endpoints: Default::default(),
+            api: crate::core::types::ApiProtocol::Responses,
+            account_id: None,
+            thinking_effort: None,
+            context_window: 128_000,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+            permission: crate::core::types::PermissionMode::Trusted,
+            verify_command: None,
+            extra_headers: Default::default(),
+            client: reqwest::Client::new(),
+            provider_entries: Default::default(),
+            provider_headers: Default::default(),
+            api_pinned: false,
+        }
+    }
+
+    /// `model_select` fires once per `provider/model` change (first turn
+    /// always fires), records the served snapshot, and stays fail-open when
+    /// a handler errors. Holds both global locks: the snapshot static is
+    /// process-wide and every `process_turn` records into it.
+    #[tokio::test]
+    async fn model_select_fires_once_per_change_and_fails_open() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        let manifest_ok = "manifest_version: 1\nid: sel-ok\nversion: 0.1.0\ncapabilities: []\n";
+        let manifest_bad = "manifest_version: 1\nid: sel-bad\nversion: 0.1.0\ncapabilities: []\n";
+        let root = fixture_exts(&[
+            (
+                "sel-ok",
+                manifest_ok,
+                r#"return function(dex)
+  dex.events.on("model_select", function(ctx, ev)
+    dex.prompt.append(ev.model .. "|" .. tostring(ev.previous) .. ";")
+  end)
+end
+"#,
+            ),
+            (
+                "sel-bad",
+                manifest_bad,
+                r#"return function(dex)
+  dex.events.on("model_select", function(ctx, ev)
+    error("boom")
+  end)
+end
+"#,
+            ),
+        ]);
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        let policy = crate::tools::Policy::trusted();
+        let cancel = crate::agent::state::GlobalCancellation;
+        let first = model_select_config("myprov", "m-7", "https://myprov.example/v1");
+        fire_model_select_if_changed(&first, &cancel, &policy, None).await;
+        // Same id again: no second fire (deduped by change detection).
+        fire_model_select_if_changed(&first, &cancel, &policy, None).await;
+        let second = model_select_config("myprov", "m-8", "https://myprov.example/v1");
+        fire_model_select_if_changed(&second, &cancel, &policy, None).await;
+        let appendix = prompt_appendix();
+        assert_eq!(appendix, "myprov/m-7|nil;myprov/m-8|myprov/m-7;");
+        // The served snapshot follows the last turn (even with a failing
+        // subscriber in the mix — fail-open).
+        assert_eq!(
+            served_model_snapshot().map(|s| s.id()),
+            Some("myprov/m-8".to_string())
+        );
+        mgr.reset_for_tests().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Without subscribers the event is a snapshot record only: no fire,
+    /// no failure, current model still served.
+    #[tokio::test]
+    async fn model_select_is_zero_cost_without_subscribers() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        assert!(!has_event_handlers("model_select"));
+        let policy = crate::tools::Policy::trusted();
+        let cancel = crate::agent::state::GlobalCancellation;
+        let cfg = model_select_config("myprov", "m-7", "https://myprov.example/v1");
+        fire_model_select_if_changed(&cfg, &cancel, &policy, None).await;
+        assert_eq!(prompt_appendix(), "");
+        assert_eq!(
+            served_model_snapshot().map(|s| s.id()),
+            Some("myprov/m-7".to_string())
+        );
+        mgr.reset_for_tests().await;
+    }
+
+    /// The turn records dex's own routing-affinity headers for `dex.net.fetch`:
+    /// only the `x-opencode-*` pair (canonical lowercase), never user headers.
+    #[tokio::test]
+    async fn model_select_records_routing_headers() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        let policy = crate::tools::Policy::trusted();
+        let cancel = crate::agent::state::GlobalCancellation;
+        let mut cfg = model_select_config("myprov", "m-7", "https://myprov.example/v1");
+        cfg.extra_headers
+            .insert("X-Opencode-Session".to_string(), "sess-1".to_string());
+        cfg.extra_headers
+            .insert("x-opencode-client".to_string(), "dex".to_string());
+        cfg.extra_headers
+            .insert("X-Custom".to_string(), "mine".to_string());
+        fire_model_select_if_changed(&cfg, &cancel, &policy, None).await;
+        let routing = LAST_ROUTING_HEADERS
+            .lock()
+            .expect("routing headers lock")
+            .clone();
+        assert_eq!(
+            routing.get("x-opencode-session").map(String::as_str),
+            Some("sess-1")
+        );
+        assert_eq!(
+            routing.get("x-opencode-client").map(String::as_str),
+            Some("dex")
+        );
+        assert!(!routing.contains_key("X-Custom"));
+        // A turn without affinity headers clears the record (no stale id
+        // routes the next turn's extension calls).
+        let plain = model_select_config("myprov", "m-7", "https://myprov.example/v1");
+        fire_model_select_if_changed(&plain, &cancel, &policy, None).await;
+        assert!(LAST_ROUTING_HEADERS
+            .lock()
+            .expect("routing headers lock")
+            .is_empty());
+        mgr.reset_for_tests().await;
+    }
+
+    /// Harvest keeps just the affinity pair, case-insensitively.
+    #[test]
+    fn routing_harvest_keeps_only_affinity_pair() {
+        let extra = BTreeMap::from([
+            ("X-OPENCODE-SESSION".to_string(), "s".to_string()),
+            ("Authorization".to_string(), "Bearer k".to_string()),
+        ]);
+        let out = harvest_routing_headers(&extra);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("x-opencode-session").map(String::as_str), Some("s"));
+    }
+
+    /// Merge appends affinity headers but never overrides a per-call one
+    /// (any casing).
+    #[test]
+    fn routing_merge_prefers_lua_headers() {
+        let lua = vec![("X-Opencode-Session".to_string(), "call".to_string())];
+        let routing = BTreeMap::from([
+            ("x-opencode-session".to_string(), "turn".to_string()),
+            ("x-opencode-client".to_string(), "dex".to_string()),
+        ]);
+        let merged = with_routing_headers(&lua, &routing);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&("X-Opencode-Session".to_string(), "call".to_string())));
+        assert!(merged.contains(&("x-opencode-client".to_string(), "dex".to_string())));
+    }
+
+    /// `dex.json` round-trips tables through strings (the fetch body/parse
+    /// primitive for model-endpoint calls).
+    #[tokio::test]
+    async fn dex_json_round_trips_tables() {
+        let root = fixture_ext(
+            "manifest_version: 1\nid: jx\nversion: 0.1.0\ncapabilities: [tools]\ntools:\n  - name: rt\n    description: Echo.\n    parameters: {\"type\": \"object\"}\n",
+            r#"return function(dex)
+  dex.tools.register({ name = "rt", execute = function(ctx, args)
+    local back = dex.json.decode(dex.json.encode({ echo = args.x, n = 7 }))
+    return dex.json.encode({ echo = back.echo, n = back.n, list = { 1, 2 } })
+  end })
+end
+"#,
+        );
+        let mgr = ExtensionManager::fresh();
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        let policy = crate::tools::Policy::trusted();
+        let host = HostCtx {
+            cancel: &crate::agent::state::GlobalCancellation,
+            policy: &policy,
+            filter: None,
+        };
+        let mut args = serde_json::Map::new();
+        args.insert("x".to_string(), serde_json::Value::String("hi".to_string()));
+        let out = mgr.call("lua__jx__rt", &args, &host).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"echo": "hi", "n": 7, "list": [1, 2]})
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `dex.model.current()/auth()` serve the recorded snapshot through Lua,
+    /// and the capability gates read attempts without it. The snapshot is
+    /// set directly (no env): file+env resolution is covered by the
+    /// `llm::config` unit tests.
+    #[tokio::test]
+    async fn dex_model_tables_read_snapshot_and_gate_capability() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "myprov".to_string(),
+                model: "m-7".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: "https://myprov.example/v1".to_string(),
+            });
+        let root = fixture_exts(&[
+            (
+                "capped",
+                "manifest_version: 1\nid: capped\nversion: 0.1.0\ncapabilities: [tools, model]\ntools:\n  - name: who\n    description: Who.\n    parameters: {\"type\": \"object\"}\n  - name: key\n    description: Key.\n    parameters: {\"type\": \"object\"}\n",
+                r#"return function(dex)
+  dex.tools.register({ name = "who", execute = function(ctx, args)
+    return dex.json.encode(dex.model.current())
+  end })
+  dex.tools.register({ name = "key", execute = function(ctx, args)
+    return (dex.model.auth()).api_key
+  end })
+end
+"#,
+            ),
+            (
+                "nocap",
+                "manifest_version: 1\nid: nocap\nversion: 0.1.0\ncapabilities: [tools]\ntools:\n  - name: peek\n    description: Peek.\n    parameters: {\"type\": \"object\"}\n",
+                r#"return function(dex)
+  dex.tools.register({ name = "peek", execute = function(ctx, args)
+    return dex.json.encode(dex.model.current())
+  end })
+end
+"#,
+            ),
+        ]);
+        let mgr = ExtensionManager::fresh();
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        let policy = crate::tools::Policy::trusted();
+        let host = HostCtx {
+            cancel: &crate::agent::state::GlobalCancellation,
+            policy: &policy,
+            filter: None,
+        };
+        let empty = serde_json::Map::new();
+        let out = mgr.call("lua__capped__who", &empty, &host).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "provider": "myprov",
+                "model": "m-7",
+                "id": "myprov/m-7",
+                "api": "openai-responses",
+                "base_url": "https://myprov.example/v1",
+            })
+        );
+        let key = mgr
+            .call("lua__capped__key", &empty, &host)
+            .await
+            .unwrap_err();
+        // No deposits for `myprov` in this process: the error names the
+        // deposit places (key success is covered by the config unit tests).
+        assert!(
+            key.contains("no API key for provider 'myprov'"),
+            "got: {key}"
+        );
+        let err = mgr
+            .call("lua__nocap__peek", &empty, &host)
+            .await
+            .unwrap_err();
+        assert!(err.contains("without the model capability"), "got: {err}");
+        global_manager().reset_for_tests().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `dex.net.fetch` refuses anything outside the model endpoint before
+    /// touching the network — plus bad methods and host-controlled headers.
+    #[tokio::test]
+    async fn net_fetch_confines_to_model_endpoint() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "myprov".to_string(),
+                model: "m-7".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: "https://myprov.example/v1".to_string(),
+            });
+        let foreign = net_fetch(
+            "https://evil.example/x".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            foreign.contains("outside the model endpoint"),
+            "got: {foreign}"
+        );
+        // A lookalike host (prefix attack) is still outside the endpoint.
+        let prefix = net_fetch(
+            "https://myprov.example.evil.example/x".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            prefix.contains("outside the model endpoint"),
+            "got: {prefix}"
+        );
+        let scheme = net_fetch(
+            "ftp://myprov.example/x".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(scheme.contains("only http(s)"), "got: {scheme}");
+        let method = net_fetch(
+            "https://myprov.example/v1/x".to_string(),
+            "TRACE".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(method.contains("unsupported method"), "got: {method}");
+        let header = net_fetch(
+            "https://myprov.example/v1/x".to_string(),
+            "GET".to_string(),
+            vec![("Host".to_string(), "myprov.example".to_string())],
+            None,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(header.contains("host-controlled"), "got: {header}");
+        // The query never reaches the error: a key in `?key=` stays out of
+        // logs even when the request itself fails downstream (here: DNS for
+        // a nonexistent domain — confinement passes, the network does not).
+        let keyed = net_fetch(
+            "https://myprov.example/v1/x?key=secret".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(!keyed.contains("secret"), "got: {keyed}");
+        assert!(
+            keyed.contains("https://myprov.example/v1/x"),
+            "got: {keyed}"
+        );
+        mgr.reset_for_tests().await;
+    }
+
+    /// `dex.net.fetch` success path against a loopback stub: status +
+    /// headers + body come back as a value.
+    #[tokio::test]
+    async fn net_fetch_returns_values_against_loopback() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        // Loopback must not ride a proxy, wherever the suite runs.
+        let _proxy = EnvRestore::take(&["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]);
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let _ = seen_tx.send(buf[..n].to_vec());
+            let _ = stream
+                  .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-Mark: yes\r\nConnection: close\r\n\r\nhello world")
+                  .await;
+        });
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "loop".to_string(),
+                model: "m".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: format!("http://127.0.0.1:{port}"),
+            });
+        // Recorded routing headers ride along; a per-call header wins.
+        *LAST_ROUTING_HEADERS.lock().expect("routing headers lock") = BTreeMap::from([
+            ("x-opencode-session".to_string(), "sess-9".to_string()),
+            ("x-opencode-client".to_string(), "dex".to_string()),
+        ]);
+        let out = net_fetch(
+            format!("http://127.0.0.1:{port}/v1/search"),
+            "POST".to_string(),
+            vec![("X-Test".to_string(), "1".to_string())],
+            Some("{}".to_string()),
+            5_000,
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], 200);
+        assert_eq!(value["body"], "hello world");
+        assert_eq!(value["headers"]["x-mark"], "yes");
+        let seen = String::from_utf8_lossy(&seen_rx.await.unwrap()).to_lowercase();
+        assert!(seen.contains("x-opencode-session: sess-9"), "got:\n{seen}");
+        assert!(seen.contains("x-opencode-client: dex"), "got:\n{seen}");
+        mgr.reset_for_tests().await;
+    }
+
+    /// The shipped web example loads whole and gates its tools on the
+    /// served model: both tools on Gemini, search only elsewhere. The
+    /// snapshot is set directly (no env): file resolution is covered by the
+    /// `llm::config` unit tests. Visibility syncs through the `model_select`
+    /// event (load-time host calls don't exist), exactly like production.
+    #[tokio::test]
+    async fn web_example_loads_and_gates_tools() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let example =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions");
+        let policy = crate::tools::Policy::trusted();
+        let cancel = crate::agent::state::GlobalCancellation;
+        let host = HostCtx {
+            cancel: &cancel,
+            policy: &policy,
+            filter: None,
+        };
+        for (provider, base_url, want) in [
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com",
+                vec![
+                    "lua__web__fetch".to_string(),
+                    "lua__web__search".to_string(),
+                ],
+            ),
+            (
+                "myprov",
+                "https://myprov.example/v1",
+                vec!["lua__web__search".to_string()],
+            ),
+        ] {
+            let mgr = global_manager();
+            mgr.reset_for_tests().await;
+            mgr.refresh_with(std::slice::from_ref(&example)).await;
+            *LAST_MODEL.lock().expect("served model lock") =
+                Some(crate::llm::config::ExtensionModelSnapshot {
+                    provider: provider.to_string(),
+                    model: "m".to_string(),
+                    api: "openai-responses".to_string(),
+                    base_url: base_url.to_string(),
+                });
+            mgr.fire_event(
+                "model_select",
+                serde_json::json!({"model": format!("{provider}/m"), "previous": null}),
+                &host,
+            )
+            .await;
+            let mut names: Vec<String> = mgr
+                .active_cached()
+                .await
+                .iter()
+                .map(|d| d.function.name.clone())
+                .collect();
+            names.sort();
+            assert_eq!(names, want, "provider {provider}");
+            let events: Vec<String> = mgr
+                .engines
+                .try_read()
+                .ok()
+                .and_then(|e| e.get("web").map(|ext| ext.events.clone()))
+                .unwrap_or_default();
+            assert!(
+                events.contains(&"model_select".to_string()),
+                "got: {events:?}"
+            );
+        }
+        global_manager().reset_for_tests().await;
     }
 }
