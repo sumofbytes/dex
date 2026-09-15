@@ -832,6 +832,12 @@ async fn child_run(
     // (calls, not rounds — conservative when the child fanned out).
     let calls = Arc::new(Mutex::new(0u32));
     let tally_calls = calls.clone();
+    // Open-call depth for the §15 progress label: parallel batches overlap,
+    // so the label clears only when the last open call returns — clearing
+    // on the first completion would drop the label while siblings run.
+    let open_calls = Arc::new(Mutex::new(0u32));
+    let open_in = open_calls.clone();
+    let open_out = open_calls.clone();
     // The child's sink lines drive three things: the §6 partial-summary
     // capture (last assistant text), the §15 progress label (the tool the
     // child is currently running, read by `delegate_output`), and the §18
@@ -846,9 +852,16 @@ async fn child_run(
                     // Preview is "<name> <short-args>" (loop.rs emit shape).
                     let name = input.split(' ').next().unwrap_or_default();
                     progress.set(name);
+                    *open_in.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     *tally_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 }
-                SinkLine::ToolOutput { .. } => progress.clear(),
+                SinkLine::ToolOutput { .. } => {
+                    let mut open = open_out.lock().unwrap_or_else(|e| e.into_inner());
+                    *open = open.saturating_sub(1);
+                    if *open == 0 {
+                        progress.clear();
+                    }
+                }
                 SinkLine::Usage {
                     tokens,
                     output,

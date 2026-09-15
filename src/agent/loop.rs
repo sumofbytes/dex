@@ -455,21 +455,14 @@ async fn compaction_gate(
 async fn note_tool_start(console: &Console, call: &LlmToolCall) {
     let name = call.function.name.clone();
     let args = call.function.arguments.clone();
+    let short = short_arg(&name, &args);
     note_sink(
         console,
         || SinkLine::ToolInput {
             id: call.id.clone(),
-            input: format!("{} {}", name, short_arg(&name, &args)),
+            input: format!("{name} {short}"),
         },
-        || {
-            format!(
-                "{}[tool input] {} {}{}",
-                TOOL_INPUT_COLOR,
-                name,
-                short_arg(&name, &args),
-                RESET
-            )
-        },
+        || format!("{TOOL_INPUT_COLOR}[tool input] {name} {short}{RESET}",),
     )
     .await;
 }
