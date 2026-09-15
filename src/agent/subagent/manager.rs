@@ -75,11 +75,6 @@ pub(crate) struct AgentNotice {
     /// `[agent …] finished …` prefix the TUI matches on (§24.1:
     /// resumability is notice prose only, zero wire change).
     pub(crate) resumable: bool,
-    /// True when this notice was queued for the parent: the idle
-    /// wake's fire condition keys on it. Always true for terminal
-    /// notices. Not serialized — journaling renders the same `text()`
-    /// either way.
-    pub(crate) queued: bool,
 }
 
 impl AgentNotice {
@@ -343,16 +338,12 @@ type BodyFuture = Pin<Box<dyn Future<Output = AgentResult> + Send>>;
 type BoxRun = Box<dyn FnOnce(CancellationToken, ProgressReporter, AgentId) -> BodyFuture + Send>;
 
 /// What `spawn` needs beyond definition + seed (§24.3): which generation
-/// this child is, where its transcript derives from, who it was resumed
-/// from, and the tool-round budget the body runs under. Fresh spawns use
-/// `SpawnMeta::fresh()`.
+/// this child is, where its transcript derives from, and the tool-round
+/// budget the body runs under. Fresh spawns use `SpawnMeta::fresh()`.
 #[derive(Clone)]
 pub(crate) struct SpawnMeta {
     pub(crate) generation: u32,
     pub(crate) parent_session: Option<PathBuf>,
-    /// The original child id for resume generations (§24.3 lineage).
-    /// `None` for fresh spawns.
-    pub(crate) parent_id: Option<AgentId>,
     /// The tool-round budget the body runs under: the resume's remaining
     /// budget, else the definition's cap. `None` for uncapped
     /// definitions. Mirrored into `RunningChild::allowance` so the
@@ -365,7 +356,6 @@ impl SpawnMeta {
         Self {
             generation: 0,
             parent_session: None,
-            parent_id: None,
             remaining_budget: None,
         }
     }
@@ -539,7 +529,6 @@ impl AgentManager {
                 instance: AgentInstance {
                     id: id.clone(),
                     definition: def.clone(),
-                    parent_id: meta.parent_id.clone(),
                     context: seed,
                     state: AgentState::Running,
                     progress: None,
@@ -629,8 +618,7 @@ impl AgentManager {
         }
     }
 
-    /// Session-scoped monotonic id allocation (shared by the launch and
-    /// queue paths so ids stay ordered by request time).
+    /// Session-scoped monotonic id allocation, ordered by request time.
     fn next_id(inner: &mut Inner) -> AgentId {
         let id = AgentId(format!("{}-{}", inner.session, inner.next_counter));
         inner.next_counter += 1;
@@ -708,9 +696,6 @@ impl AgentManager {
                 // fetches.
                 usage: inner.results.get(id).and_then(|result| result.usage),
                 resumable,
-                // Every terminal notice is queued: only a queued notice
-                // may wake the session.
-                queued: true,
             };
             if inner.notices.len() >= MAX_NOTICES {
                 inner.overflowed += 1;
@@ -784,16 +769,6 @@ impl AgentManager {
         }));
         out.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
         out
-    }
-
-    /// The registry parent of a live child (§24.3 generations): the
-    /// original id for resume generations, `None` for fresh children —
-    /// and for unknown or finished ids, which carry no live lineage.
-    pub(crate) fn parent_of(&self, id: &AgentId) -> Option<AgentId> {
-        self.lock()
-            .running
-            .get(id)
-            .and_then(|child| child.instance.parent_id.clone())
     }
 
     pub(crate) fn status(&self, id: &AgentId) -> Option<AgentState> {
@@ -1067,7 +1042,6 @@ mod tests {
                 status: AgentState::Completed,
                 usage: None,
                 resumable: false,
-                queued: true,
             }]
         );
         assert_eq!(mgr.take_overflow(), 0);
@@ -1500,7 +1474,6 @@ mod tests {
                 cost_usd: 0.0312,
             }),
             resumable: false,
-            queued: true,
         };
         assert_eq!(
             notice.text(),
@@ -1517,7 +1490,6 @@ mod tests {
                 cost_usd: 0.0,
             }),
             resumable: false,
-            queued: false,
         };
         assert_eq!(
             unpriced.text(),
@@ -1530,7 +1502,6 @@ mod tests {
             status: AgentState::Completed,
             usage: None,
             resumable: false,
-            queued: false,
         };
         assert_eq!(bare.text(), "[agent explorer:sess-3] finished completed");
         // A resumable result advertises the re-entry — same prefix the TUI
@@ -1541,7 +1512,6 @@ mod tests {
             status: AgentState::TimedOut,
             usage: None,
             resumable: true,
-            queued: true,
         };
         assert_eq!(
             resumable.text(),
@@ -1572,7 +1542,6 @@ mod tests {
                 SpawnMeta {
                     generation: 0,
                     parent_session: Some(dir.join("sess.jsonl")),
-                    parent_id: None,
                     remaining_budget: None,
                 },
                 |_, _, _| async { panic!("boom") },
@@ -1613,7 +1582,6 @@ mod tests {
                 SpawnMeta {
                     generation: 0,
                     parent_session: Some(dir.join("sess.jsonl")),
-                    parent_id: None,
                     remaining_budget: None,
                 },
                 |_, _, _| async {
@@ -1636,7 +1604,6 @@ mod tests {
                 SpawnMeta {
                     generation: 0,
                     parent_session: Some(dir.join("sess.jsonl")),
-                    parent_id: None,
                     remaining_budget: None,
                 },
                 |_, _, _| async {
@@ -1666,7 +1633,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn normal_completion_advertises_no_handle() {
-        // `Normal` always drops through `on_exit`, even with progress.
+        // `Normal` never advertises a handle, even with progress.
         let mgr = AgentManager::new("sess");
         let id = mgr
             .spawn(
@@ -1693,9 +1660,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn resume_generation_links_parent() {
-        // §24.3 lineage: a resume generation names its original; fresh
-        // spawns have no parent.
+    async fn resume_shaped_spawn_completes() {
+        // The resume path in `tools.rs` re-spawns with generation + 1:
+        // the manager accepts that shape like any other spawn (lineage
+        // itself rides the `resumed_from` field of the `delegate`
+        // response, not the registry).
         let mgr = AgentManager::new("sess");
         let first = mgr
             .spawn(
@@ -1705,7 +1674,6 @@ mod tests {
                 token_body,
             )
             .unwrap();
-        assert_eq!(mgr.parent_of(&first), None);
         let second = mgr
             .spawn(
                 &test_def("explorer"),
@@ -1713,15 +1681,18 @@ mod tests {
                 SpawnMeta {
                     generation: 1,
                     parent_session: None,
-                    parent_id: Some(first.clone()),
                     remaining_budget: None,
                 },
                 token_body,
             )
             .unwrap();
-        assert_eq!(mgr.parent_of(&second), Some(first));
-        assert_eq!(mgr.parent_of(&AgentId("sess-9".to_string())), None);
+        assert_ne!(first, second);
+        assert_eq!(mgr.status(&second), Some(AgentState::Running));
         mgr.shutdown().await;
+        match mgr.wait(&second, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => assert_eq!(result.status, AgentState::Cancelled),
+            other => panic!("expected Finished, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1748,7 +1719,6 @@ mod tests {
                 SpawnMeta {
                     generation: 0,
                     parent_session: Some(dir.join("sess.jsonl")),
-                    parent_id: None,
                     remaining_budget: None,
                 },
                 |token, progress, _| async move {

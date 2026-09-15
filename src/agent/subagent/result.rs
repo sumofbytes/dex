@@ -56,12 +56,12 @@ pub(crate) struct AgentResult {
     pub(crate) usage: Option<AgentUsage>,
     /// §24.1 classification — never surfaced to the model; the policy
     /// machine's input, set by the body (or the wrapper arm) and read by
-    /// the manager's `finish` through `on_exit`.
+    /// the manager's `finish`.
     pub(crate) reason: ExitReason,
     /// Sink-counted tool invocations. The body runs a single
     /// `process_turn`, so this is the spend meter resume budgets from.
     pub(crate) tool_calls: u32,
-    /// Set only by the manager's `finish` via `on_exit` — never by the
-    /// child body. `Some` ⇔ Transient/Exhausted *and* progress made.
+    /// Set only by the manager's `finish` — never by the child body.
+    /// `Some` ⇔ Transient/Exhausted *and* progress made.
     pub(crate) resume: Option<ResumeHandle>,
 }
