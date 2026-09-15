@@ -10,8 +10,9 @@
 //! JSONL session (§16), its own console (a child-local sink; no approval
 //! channel — background children cannot prompt, §12 V1a detached auto-deny),
 //! the definition's tool allowlist enforced at dispatch (§11), and no
-//! steering. Depth 1 is enforced twice: the child filter never contains a
-//! delegation tool, and a child turn's bundle carries no daemon context.
+//! steering. Nesting is a depth counter (`MAX_AGENT_DEPTH`): a child whose
+//! depth is under the cap keeps a daemon context and may delegate further;
+//! at the cap the bundle carries none, so delegation rejects at dispatch.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -52,6 +53,11 @@ pub(crate) const DELEGATION_TOOLS: [&str; 4] = [
 /// `delegate_output`'s wait ceiling (§10.2): a bounded poll-wait, never an
 /// unbounded block.
 pub(crate) const MAX_WAIT_SECONDS: u64 = 120;
+
+/// Max delegation nesting (Codex `DEFAULT_AGENT_MAX_DEPTH` parity, CC nests
+/// to 3): a turn at this depth spawns no further children. Top-level runs
+/// at depth 0; each delegation runs at parent depth + 1.
+pub(crate) const MAX_AGENT_DEPTH: u32 = 3;
 
 /// Sleep quantum of the `delegate_output` wait loop: steering sent during a
 /// wait is acted on at most one interval after the wait returns (§10.2 — the
@@ -98,9 +104,12 @@ pub(crate) fn delegation_enabled() -> bool {
 /// The daemon-backed turn context a `delegate` call needs (the thin-client
 /// side of the manager, §10.1). Built once per parent turn in
 /// `run_turn_inner`; `None`-shaped absence is what makes delegation
-/// impossible in OneShot/direct tool runs. Children get no context of their
-/// own, so a child turn has nothing to delegate with (depth 1 at dispatch).
+/// impossible in OneShot/direct tool runs. Children under the depth cap get
+/// a context of their own at depth + 1; at the cap they get none, so a
+/// further `delegate` rejects at dispatch.
 pub(crate) struct AgentTurnContext {
+    /// Nesting depth: 0 for top-level turns, parent depth + 1 per delegation.
+    pub(crate) depth: u32,
     pub(crate) session_id: String,
     /// The parent session's JSONL — the child file lands beside it (§16).
     pub(crate) session_path: PathBuf,
@@ -177,6 +186,12 @@ async fn delegate(
     args: &Map<String, Value>,
     policy: &Policy,
 ) -> Result<String, ToolError> {
+    if ctx.depth >= MAX_AGENT_DEPTH {
+        return Err(ToolError::Denied(format!(
+            "delegation depth limit reached (depth {} of max {MAX_AGENT_DEPTH});              do the work in this turn instead of spawning",
+            ctx.depth
+        )));
+    }
     let agent_name = string_arg(args, "agent").ok_or(ToolError::Missing("agent"))?;
     let def = super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
     let resume_from = string_arg(args, "resume_from");
@@ -879,17 +894,43 @@ async fn child_run(
     });
 
     let mut tool_state = ToolState::load_async().await;
-    // §11: the allowlist is the definition's own set; delegation tool names
-    // are stripped defensively — dispatch rejects them regardless, but a
-    // filter entry can never grant them (the prompt is not a boundary).
+    // §11: the allowlist is the definition's own set, plus the delegation
+    // tools when this child may delegate further (depth + 1 under the cap).
+    // At the cap the filter strips them and the turn carries no daemon
+    // context, so a further `delegate` rejects twice — allowlist first,
+    // dispatch second.
+    let child_depth = ctx.depth + 1;
+    let may_delegate = child_depth < MAX_AGENT_DEPTH;
+    let mut allowed: std::collections::BTreeSet<String> = def
+        .tools
+        .iter()
+        .filter(|tool| !is_delegation(tool))
+        .cloned()
+        .collect();
+    if may_delegate {
+        allowed.extend(DELEGATION_TOOLS.iter().map(|t| t.to_string()));
+    }
     let filter = ToolFilter {
         owner: def.name.clone(),
-        allowed: def
-            .tools
-            .iter()
-            .filter(|tool| !is_delegation(tool))
-            .cloned()
-            .collect(),
+        allowed,
+    };
+    // The child's daemon context for one more level, when allowed. Shares
+    // the session coordinates, model config, manager, and approval bridges —
+    // only the depth advances.
+    let child_ctx: Option<Arc<AgentTurnContext>> = if may_delegate {
+        Some(Arc::new(AgentTurnContext {
+            depth: child_depth,
+            session_id: ctx.session_id.clone(),
+            session_path: ctx.session_path.clone(),
+            cwd: ctx.cwd.clone(),
+            config: ctx.config.clone(),
+            manager: ctx.manager.clone(),
+            session_approvals: ctx.session_approvals.clone(),
+            child_approvals: ctx.child_approvals.clone(),
+            live_approvals: ctx.live_approvals.clone(),
+        }))
+    } else {
+        None
     };
     // Agent lifecycle hooks (plan §7 P2): fired around the child's run with
     // the child's own policy, so a nested `dex.tools.call` from a hook is
@@ -920,9 +961,7 @@ async fn child_run(
             cancel: &token,
             console: &console,
             filter: Some(&filter),
-            // Depth 1 at dispatch: children carry no daemon context, so every
-            // delegation tool call from a child is rejected (§11/§20).
-            agent_ctx: None,
+            agent_ctx: child_ctx,
             // Resume honors the remaining meter (§24.2). `None` (unlimited
             // or unknown spend) falls back to the definition's cap.
             tool_budget: resume
@@ -1039,9 +1078,8 @@ mod tests {
 
     #[tokio::test]
     async fn children_cannot_delegate_at_the_filter() {
-        // §11 depth-1 rule at dispatch: the child allowlist never contains a
-        // delegation tool, so the standard availability gate rejects the
-        // call before any delegation logic runs.
+        // §11 at-cap rule: a child filter without delegation tools rejects
+        // before any delegation logic runs (the at-cap child shape).
         let filter = ToolFilter::new("explorer", ["read", "grep", "find"]);
         let policy = Policy::trusted();
         let mut args = Map::new();
@@ -1105,6 +1143,7 @@ mod tests {
         // the token drove it) — and the child keeps running untouched.
         let manager = AgentManager::new("sess");
         let ctx = Arc::new(AgentTurnContext {
+            depth: 0,
             session_id: "sess".to_string(),
             // No real child body runs here, so the parent path is never touched.
             session_path: PathBuf::new(),
@@ -1391,6 +1430,7 @@ mod tests {
 
     fn resume_test_ctx(manager: AgentManager, session_path: PathBuf) -> Arc<AgentTurnContext> {
         Arc::new(AgentTurnContext {
+            depth: 0,
             session_id: "sess".to_string(),
             session_path,
             cwd: String::new(),
