@@ -16,7 +16,6 @@ impl std::fmt::Display for AgentId {
 /// `context`) stays separate from runtime state (`state`) — never mixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentState {
-    Pending,
     Running,
     Completed,
     Failed,
@@ -26,9 +25,11 @@ pub(crate) enum AgentState {
 
 impl AgentState {
     /// Terminal states all yield an `AgentResult` and a completion notice;
-    /// only `Running`/`Pending` keep registry entries and tasks alive.
+    /// only `Running` keeps a registry entry and a task alive — spawns
+    /// reject at capacity instead of queueing, so there is no dormant
+    /// state to represent.
     pub(crate) fn is_terminal(self) -> bool {
-        !matches!(self, Self::Pending | Self::Running)
+        !matches!(self, Self::Running)
     }
 }
 
