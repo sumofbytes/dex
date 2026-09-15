@@ -16,7 +16,6 @@ impl std::fmt::Display for AgentId {
 /// `context`) stays separate from runtime state (`state`) — never mixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentState {
-    Pending,
     Running,
     Completed,
     Failed,
@@ -26,22 +25,22 @@ pub(crate) enum AgentState {
 
 impl AgentState {
     /// Terminal states all yield an `AgentResult` and a completion notice;
-    /// only `Running`/`Pending` keep registry entries and tasks alive.
+    /// only `Running` keeps a registry entry and a task alive — spawns
+    /// reject at capacity instead of queueing, so there is no dormant
+    /// state to represent.
     pub(crate) fn is_terminal(self) -> bool {
-        !matches!(self, Self::Pending | Self::Running)
+        !matches!(self, Self::Running)
     }
 }
 
 /// One run of an [`AgentDefinition`]: what it is (`definition`), what it
-/// was asked (`context`), how it relates (`parent_id`), how it's doing
-/// (`state`). The Phase 4 manager owns the registry of these plus the
-/// task handles, tokens, and timeouts — the instance itself holds no
-/// runtime machinery.
+/// was asked (`context`), how it's doing (`state`). The Phase 4 manager
+/// owns the registry of these plus the task handles, tokens, and
+/// timeouts — the instance itself holds no runtime machinery.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentInstance {
     pub(crate) id: AgentId,
     pub(crate) definition: AgentDefinition,
-    pub(crate) parent_id: Option<AgentId>,
     pub(crate) context: ContextSeed,
     pub(crate) state: AgentState,
     /// Tool the child is currently running, as reported through its

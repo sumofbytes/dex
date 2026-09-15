@@ -272,9 +272,12 @@ pub enum StreamEvent {
 
     /// V1b typed child-agent lifecycle (plan §15): first-class variants so a
     /// consumer reads typed fields instead of parsing the V1a `System`
-    /// prefix. An explicit wire bump — the shipped client skips unknown
-    /// types but still advances its seq cursor, so replay never stalls;
-    /// the V1a `System` lines stay journaled beside them for old clients.
+    /// prefix. An explicit wire bump — the shipped client's
+    /// `SseFramer::ingest` and `lenient_array` skip unknown types but
+    /// still advance the seq cursor, so replay never stalls (a direct
+    /// `StreamEnvelope` parse still errors; leniency lives in those
+    /// callers). The V1a `System` lines stay journaled beside them for
+    /// old clients.
     #[serde(rename = "agent_spawned")]
     AgentSpawned { agent_id: String, name: String },
 
@@ -291,20 +294,6 @@ pub enum StreamEvent {
     /// V1a lifecycle line uses ("completed"/"failed"/"cancelled"/"timed out").
     #[serde(rename = "agent_completed")]
     AgentCompleted { agent_id: String, status: String },
-
-    /// A recoverable child was automatically re-entered (§24.4): the
-    /// supervisor's `Recover` action fires this beside the superseded
-    /// generation's `agent_completed` and the new one's `agent_spawned`.
-    /// An explicit wire bump like V1b — old clients skip it and still
-    /// advance their seq cursor.
-    #[serde(rename = "agent_recovered")]
-    AgentRecovered {
-        agent_id: String,
-        name: String,
-        attempt: u32,
-        mode: String,
-        reason: String,
-    },
 }
 
 /// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session
