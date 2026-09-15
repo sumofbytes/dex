@@ -753,9 +753,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut remote, mouse),
                 Event::Paste(s) => {
-                    remote.app.input.insert_paste(&s);
-                    // A paste can narrow the popup list like typing does.
-                    remote.app.slash_selected = 0;
+                    handle_paste(&mut remote.app, &s);
                 }
                 Event::Resize(..) => {} // frame recomputed each draw
                 _ => {}
@@ -1542,6 +1540,51 @@ fn is_osc_prefix(body: &str) -> bool {
     matches!(body, "1" | "10" | "11" | "10;" | "11;")
 }
 
+fn composer_at_end(app: &App) -> bool {
+    let row = app.input.row.min(app.input.lines.len().saturating_sub(1));
+    row + 1 >= app.input.lines.len() && app.input.col >= app.input.lines[row].len()
+}
+
+/// Keys in the generic composer arm that mutate the buffer (and so close a
+/// history walk, turning the recalled line into a fresh draft). Cursor-only
+/// keys (`Left`/`Right`/`Home`/`End`/intra-`Up`/`Down`) return false so they
+/// keep walking. Mirrors `InputField::handle_key`'s mutation set: plain
+/// chars, `Ctrl+J` newline, `Enter` newline (`Shift+Enter` reaches the
+/// generic arm), `Backspace`/`Delete`/`Tab`. Alt/Ctrl-modified chars are
+/// dropped by input and must not detach.
+fn history_detaching_key(key: crossterm::event::KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            !c.is_control()
+        }
+        KeyCode::Char('j')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            true
+        }
+        KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab => true,
+        _ => false,
+    }
+}
+
+/// Bracketed paste shared by the event loop: a paste that changes the buffer
+/// detaches the history walk like typing does, so the pasted edit becomes
+/// the fresh draft instead of being discarded by the next `Up`.
+fn handle_paste(app: &mut App, s: &str) {
+    if app.history_index.is_some() {
+        let before = app.input.text();
+        app.input.insert_paste(s);
+        if app.input.text() != before {
+            app.history_index = None;
+        }
+    } else {
+        app.input.insert_paste(s);
+    }
+    // A paste can narrow the popup list like typing does.
+    app.slash_selected = 0;
+}
+
 fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     // Copied before the `app` borrow: a `!` shell run is independent of
     // `busy` but cancels the same way (Esc cancels it).
@@ -1754,8 +1797,8 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         KeyCode::Up => {
             if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
                 scroll_transcript(app, -1);
-            } else if app.history_index.is_some()
-                || app.input.lines.len() <= 1
+            } else if app.input.lines.len() <= 1
+                || (app.history_index.is_some() && composer_at_end(app))
                 || app.input.row == 0
             {
                 app.history_up();
@@ -1766,17 +1809,27 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         KeyCode::Down => {
             if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
                 scroll_transcript(app, 1);
-            } else if app.history_index.is_some()
-                || app.input.lines.len() <= 1
-                || app.input.row + 1 >= app.input.lines.len()
-            {
+            } else if app.input.lines.len() <= 1 || app.input.row + 1 >= app.input.lines.len() {
                 app.history_down();
             } else {
                 app.input.handle_key(key);
             }
         }
         _ => {
-            app.input.handle_key(key);
+            // A mutating keystroke turns the recalled line into a fresh
+            // draft (next `Up` saves the edited text); cursor-only keys keep
+            // the walk so `Left` + `Up` moves within the recalled prompt.
+            // The text comparison keeps no-op `Backspace`/`Delete` on the
+            // walk instead of detaching for an unchanged buffer.
+            if app.history_index.is_some() && history_detaching_key(key) {
+                let before = app.input.text();
+                app.input.handle_key(key);
+                if app.input.text() != before {
+                    app.history_index = None;
+                }
+            } else {
+                app.input.handle_key(key);
+            }
         }
     }
 }
@@ -3305,5 +3358,155 @@ mod tests {
 
         handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
         assert_eq!(remote.app.slash_selected, 0, "plain Up moves the popup");
+    }
+
+    #[test]
+    fn up_at_end_of_recalled_multiline_walks_older() {
+        // Browsing: the recall parks the cursor at the end, so a second `Up`
+        // without moving must keep walking instead of stepping intra-line.
+        let mut remote = test_remote();
+        remote.app.history_push("oldest".into());
+        remote.app.history_push("line1\nline2\nline3".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "line1\nline2\nline3");
+        assert_eq!(remote.app.history_index, Some(0));
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.input.text(),
+            "oldest",
+            "Up at end of recalled entry walks older"
+        );
+    }
+
+    #[test]
+    fn left_then_up_moves_within_recalled_multiline_prompt() {
+        // `Left` proves the user is editing the recalled prompt: the next
+        // `Up` must move within it, and the walk only resumes at row 0.
+        let mut remote = test_remote();
+        remote.app.history_push("oldest".into());
+        remote.app.history_push("line1\nline2\nline3".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Left, KeyModifiers::empty()));
+        assert_eq!(remote.app.history_index, Some(0), "cursor move keeps walk");
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.input.text(),
+            "line1\nline2\nline3",
+            "Left+Up stays inside the recalled prompt"
+        );
+        assert_eq!(remote.app.input.row, 1);
+        assert_eq!(remote.app.history_index, Some(0));
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.row, 0);
+        assert_eq!(remote.app.input.text(), "line1\nline2\nline3");
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.input.text(),
+            "oldest",
+            "Up at row 0 resumes the walk"
+        );
+    }
+
+    #[test]
+    fn down_moves_within_recalled_multiline_prompt() {
+        // `Down` from a middle row of a recalled entry steps intra-line
+        // instead of jumping to a newer entry; the last row walks.
+        let mut remote = test_remote();
+        remote.app.history_push("oldest".into());
+        remote.app.history_push("line1\nline2\nline3".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Left, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.row, 0);
+
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.row, 1);
+        assert_eq!(remote.app.input.text(), "line1\nline2\nline3");
+        assert_eq!(remote.app.history_index, Some(0));
+
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.row, 2);
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.input.text(),
+            "",
+            "Down on the last row leaves the walk to the draft"
+        );
+        assert_eq!(remote.app.history_index, None);
+    }
+
+    #[test]
+    fn typing_on_recalled_entry_detaches_into_fresh_draft() {
+        // Editing a recalled line closes the walk: the edit is preserved and
+        // the next `Up` saves it as the draft instead of discarding it.
+        let mut remote = test_remote();
+        remote.app.history_push("old".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "old");
+        handle_key(&mut remote, key(KeyCode::Char('!'), KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "old!");
+        assert_eq!(remote.app.history_index, None, "typing detaches the walk");
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "old");
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(
+            remote.app.input.text(),
+            "old!",
+            "edited recall is kept as the draft"
+        );
+    }
+
+    #[test]
+    fn noop_backspace_keeps_history_walk() {
+        // A `Backspace` that changes nothing (start of buffer) must not
+        // detach: the walk position survives.
+        let mut remote = test_remote();
+        remote.app.history_push("oldest".into());
+        remote.app.history_push("newer".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "oldest");
+        handle_key(&mut remote, key(KeyCode::Home, KeyModifiers::empty()));
+        handle_key(&mut remote, key(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(remote.app.input.text(), "oldest");
+        assert_eq!(
+            remote.app.history_index,
+            Some(1),
+            "no-op edit keeps the walk"
+        );
+    }
+
+    #[test]
+    fn paste_on_recalled_entry_detaches_walk() {
+        // A paste that changes the buffer detaches like typing; an empty
+        // paste leaves the walk alone.
+        let mut remote = test_remote();
+        remote.app.history_push("old".into());
+
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_paste(&mut remote.app, "!");
+        assert_eq!(remote.app.input.text(), "old!");
+        assert_eq!(remote.app.history_index, None);
+
+        let mut remote = test_remote();
+        remote.app.history_push("old".into());
+        handle_key(&mut remote, key(KeyCode::Up, KeyModifiers::empty()));
+        handle_paste(&mut remote.app, "");
+        assert_eq!(
+            remote.app.history_index,
+            Some(0),
+            "empty paste keeps the walk"
+        );
     }
 }
