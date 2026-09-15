@@ -1618,7 +1618,7 @@ pub(crate) struct Policy {
     /// turns inside the daemon. It is what makes the delegation tools
     /// spawnable; children and every non-daemon path carry `None`, so a
     /// `delegate` call from either is rejected at dispatch (§11, no
-    /// recursion — depth 1 in code, not in the prompt).
+    /// recursion — the depth cap in code, not in the prompt).
     pub(crate) agent: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
 }
 
@@ -1927,7 +1927,7 @@ async fn dispatch_tool(
     // Delegation tools route first (Phase 5): they are not workspace tools
     // and have no static registry entry. The child allowlist never contains
     // one, so the same availability gate rejects a child's call before any
-    // delegation logic runs (§11 — depth 1 at dispatch).
+    // delegation logic runs (§11 — at-cap children carry no delegation tools).
     if crate::agent::subagent::is_delegation(name) {
         if let Some(filter) = filter {
             if !filter.allows(name) {
