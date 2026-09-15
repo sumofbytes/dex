@@ -10,7 +10,7 @@ HTTP+SSE, and conversations persist as resumable JSONL sessions.
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to
 build, test, and submit changes. Please follow the
 [Code of Conduct](CODE_OF_CONDUCT.md), and file bugs or ideas in
-[GitHub issues](https://github.com/arpitsr/dex/issues).
+[GitHub issues](https://github.com/sumofbytes/dex/issues).
 
 ## Features
 
@@ -81,14 +81,14 @@ on any distro, no libssl or glibc constraints), `x86_64`/`aarch64` macOS, and
 `x86_64` Windows, and attaches them to the GitHub release.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install.sh | sh
 ```
 
 - Pin a version: `curl -fsSL .../install.sh | sh -s -- 0.2.0`
 - Custom directory:
   `DEX_INSTALL_DIR=/usr/local/bin curl -fsSL .../install.sh | sh`
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
-  [releases page](https://github.com/arpitsr/dex/releases).
+  [releases page](https://github.com/sumofbytes/dex/releases).
 
 No further setup: dex runs with no config (defaults build cleanly), and the
 daemon fetches the models.dev catalog in the background on first start
@@ -753,7 +753,7 @@ discovered extension with its consent state.
 | `DEX_KEEP_RECENT_TOKENS`                                      | Recent tokens kept on compaction (default 20000).                                                                                                                                                                                                                                                                                                                                                               |
 | `DEX_TOOL_CACHE`                                              | `1` to cache tool results across runs (`dex-tool-cache.json`; default off).                                                                                                                                                                                                                                                                                                                                     |
 | `DEX_CONFIG`                                                  | Override the config file path (default `$XDG_CONFIG_HOME/dex/config.yaml`).                                                                                                                                                                                                                                                                                                                                     |
-| `DEX_REPO`                                                    | GitHub repo `dex update` downloads releases from, `owner/name` (default `arpitsr/dex`).                                                                                                                                                                                                                                                                                                                         |
+| `DEX_REPO`                                                    | GitHub repo `dex update` downloads releases from, `owner/name` (default `sumofbytes/dex`).                                                                                                                                                                                                                                                                                                                         |
 | `DEX_VERSION`                                                 | Version pin for `dex update`: `vX.Y.Z` (bare or `V`-prefixed also accepted) installs that exact release, enabling downgrades; `latest` (default) follows the newest release. Both also honored by `scripts/install.sh`.                                                                                                                                                                                         |
 | `CODEX_HOME`                                                  | Directory holding Codex `auth.json` (default `~/.codex`).                                                                                                                                                                                                                                                                                                                                                       |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME`        | XDG base dirs for config/data/cache.                                                                                                                                                                                                                                                                                                                                                                            |
@@ -818,10 +818,10 @@ from the models.dev catalog.
 ## Support
 
 - Bugs: open an
-  [issue](https://github.com/arpitsr/dex/issues/new?template=bug_report.md) with
+  [issue](https://github.com/sumofbytes/dex/issues/new?template=bug_report.md) with
   `dex --version`, redacted config, and steps to reproduce.
 - Ideas: open a
-  [feature request](https://github.com/arpitsr/dex/issues/new?template=feature_request.md).
+  [feature request](https://github.com/sumofbytes/dex/issues/new?template=feature_request.md).
 - Security: do not open a public issue — see [SECURITY.md](SECURITY.md).
 - There is no chat or discussion forum; GitHub issues are the contact channel.
 
@@ -829,7 +829,7 @@ from the models.dev catalog.
 
 Contributions are welcome. There is no formal roadmap — open or pick up an issue
 labeled
-[`good first issue` or `help wanted`](https://github.com/arpitsr/dex/issues).
+[`good first issue` or `help wanted`](https://github.com/sumofbytes/dex/issues).
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) first and follow the
 [Code of Conduct](CODE_OF_CONDUCT.md). By contributing you agree your work is
 dual-licensed MIT/Apache-2.0 like the rest of the project.
@@ -839,7 +839,7 @@ Status: pre-`1.0` (`0.x`) — usable daily but expect breaking changes until a
 
 Note: the name `dex` collides with an unrelated `dex` crate on crates.io, so
 `dex` is distributed via
-[GitHub releases](https://github.com/arpitsr/dex/releases) and
+[GitHub releases](https://github.com/sumofbytes/dex/releases) and
 `scripts/install.sh`, not `cargo install`.
 
 ## License
