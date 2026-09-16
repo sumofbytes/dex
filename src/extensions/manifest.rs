@@ -57,6 +57,7 @@ pub(crate) struct Manifest {
 pub(crate) fn valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
+        && !s.contains("__")
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
@@ -74,7 +75,7 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
     }
     if !valid_segment(&manifest.id) {
         return Err(format!(
-            "invalid id '{}': use [a-z0-9_-]+, max 64 chars",
+            "invalid id '{}': use [a-z0-9_-]+, max 64 chars, no `__`",
             manifest.id
         ));
     }
@@ -93,7 +94,7 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
     for tool in &manifest.tools {
         if !valid_segment(&tool.name) {
             return Err(format!(
-                "invalid tool name '{}': use [a-z0-9_-]+, max 64 chars",
+                "invalid tool name '{}': use [a-z0-9_-]+, max 64 chars, no `__`",
                 tool.name
             ));
         }
@@ -184,6 +185,16 @@ tools:
             parse_manifest(&base().replace("manifest_version: 1", "manifest_version: 2")).is_err()
         );
         assert!(parse_manifest(&base().replace("id: my-ext", "id: Bad Name!")).is_err());
+    }
+
+    #[test]
+    fn rejects_double_underscore_segments() {
+        // `__` is the `ext__<ext>__<tool>` delimiter: allowing it would mint
+        // names `split_ext_name` cannot dispatch.
+        assert!(!valid_segment("my__ext"));
+        assert!(!valid_segment("my__tool"));
+        assert!(parse_manifest(&base().replace("id: my-ext", "id: my__ext")).is_err());
+        assert!(parse_manifest(&base().replace("name: create_issue", "name: bad__tool")).is_err());
     }
 
     #[test]
