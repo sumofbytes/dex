@@ -387,8 +387,9 @@ pub(crate) fn run_ratatui_repl_with_remote(
 
     // Boot fan-out: `get_config` (config + git), the session op (one small
     // write), and `list_skills` (daemon-side dir scan) are independent —
-    // except the default session name, which is minted from the daemon
-    // workspace in `info.cwd`. With `--name`/`--reattach` nothing is needed
+    // except a *remote* default session name, which is minted from the daemon
+    // workspace in `info.cwd`. With `--name`/`--reattach` — or a local
+    // default, where the spawned daemon inherits our cwd — nothing is needed
     // from `info`, so all three fly together; otherwise `get_config` still
     // overlaps the skills scan. (`create_session` carries a cwd the server
     // ignores in favor of its own, so a local placeholder is fine there.)
@@ -423,7 +424,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
             .map_err(|e| std::io::Error::other(format!("failed to reattach session: {e}")))?;
         let info = crate::client::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         (resp.session_id, true, info, None)
     } else if let Some(name) = explicit_name.as_deref() {
         let resp = client
@@ -431,14 +432,26 @@ pub(crate) fn run_ratatui_repl_with_remote(
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
         let info = crate::client::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         (resp.session_id, false, info, Some(name.to_string()))
+    } else if daemon_is_local && !local_cwd.is_empty() {
+        // Local default: the spawned daemon inherits our cwd, so mint the
+        // name locally and overlap all three (same as the explicit-name path
+        // above); the server ignores the carried cwd anyway.
+        let session_name = Session::default_session_name(&local_cwd);
+        let resp = client
+            .create_session(&local_cwd, Some(&session_name))
+            .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        let info = crate::client::http::block_on(info_handle)
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
+        (resp.session_id, false, info, Some(session_name))
     } else {
-        // Default name needs the daemon workspace first; the skills scan
+        // Remote default: needs the daemon workspace first; the skills scan
         // above still overlaps this fetch.
         let info = crate::client::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         let session_name = Session::default_session_name(&info.cwd);
         let resp = client
             .create_session(&info.cwd, Some(&session_name))
