@@ -85,5 +85,5 @@ git tag "v$NEW"
 git push origin "v$NEW"
 
 echo "tagged v$NEW."
-echo "follow the build: https://github.com/arpitsr/dex/actions"
+echo "follow the build: https://github.com/sumofbytes/dex/actions"
 echo "after it finishes: git pull"

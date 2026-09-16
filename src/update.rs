@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-pub(crate) const DEFAULT_REPO: &str = "arpitsr/dex";
+pub(crate) const DEFAULT_REPO: &str = "sumofbytes/dex";
 
 /// Sync entry point for `dex update`: blocks on the shared runtime.
 pub(crate) fn self_update() -> Result<String, String> {
@@ -193,7 +193,7 @@ fn check_install_source(exe: &Path) -> Result<(), String> {
     if cfg!(target_os = "windows") {
         return Err(
             "self-update is not supported on Windows — re-run the installer or download the .zip \
-             from https://github.com/arpitsr/dex/releases"
+             from https://github.com/sumofbytes/dex/releases"
                 .to_string(),
         );
     }
@@ -239,7 +239,7 @@ fn release_target() -> Result<&'static str, String> {
     } else {
         Err(
             "self-update is not available for this platform — build from source or download a \
-             release from https://github.com/arpitsr/dex/releases"
+             release from https://github.com/sumofbytes/dex/releases"
                 .to_string(),
         )
     }
