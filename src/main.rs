@@ -589,12 +589,30 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            // Extension tools resolve from the manager cache: load
-            // synchronously so `dex run ext__...` sees them (MCP tools have
-            // the same race; out of scope here). The deprecated `lua__`
-            // alias preloads too, so old one-liners keep working.
+            // Extension tools resolve from the manager cache: lazy-load just
+            // the addressed extension (§26) so `dex run ext__...` boots one
+            // Lua VM instead of every installed one (MCP tools have the same
+            // race; out of scope here). The deprecated `lua__` alias preloads
+            // too, so old one-liners keep working. A name that doesn't split
+            // keeps the old full refresh so the dispatch error below stays
+            // the authority on what exists.
             if crate::extensions::is_extension_tool(&name) {
-                crate::client::http::block_on(crate::extensions::global_manager().refresh());
+                let normalized = crate::extensions::normalize_tool_name(&name);
+                match crate::extensions::split_ext_name(&normalized) {
+                    Some((ext, _)) => {
+                        if let Err(e) = crate::client::http::block_on(
+                            crate::extensions::global_manager().ensure_loaded(ext),
+                        ) {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    None => {
+                        crate::client::http::block_on(
+                            crate::extensions::global_manager().refresh(),
+                        );
+                    }
+                }
             }
             match execute(&name, &parsed, &GlobalCancellation) {
                 Ok(out) => print!("{out}"),
