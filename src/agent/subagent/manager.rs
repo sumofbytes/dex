@@ -286,9 +286,13 @@ struct Record {
     transcript: Option<PathBuf>,
     /// Registry-side spend meter (§24.1), surviving body death.
     calls: u32,
-    /// The tool-round budget the child was launched under: the resume's
+    /// The tool-round budget this child was launched under: the resume's
     /// remaining budget, else the definition's cap; `None` = uncapped.
     allowance: Option<usize>,
+    /// Effective model override at spawn (`def.model`); carried into the
+    /// resume handle so a generation without its own `model` keeps the
+    /// complexity-chosen model instead of resetting to the parent.
+    model: Option<String>,
 }
 
 /// The resume handle for a recorded child, transcript-gated (§24.1):
@@ -306,6 +310,7 @@ fn escalate_handle(
         transcript,
         generation: record.generation,
         remaining_budget: remaining,
+        model: record.model.clone(),
         note: resume_note(reason, tool_calls),
     })
 }
@@ -656,6 +661,7 @@ impl AgentManager {
                 transcript: child.transcript.clone(),
                 allowance: child.allowance,
                 calls: child.calls,
+                model: child.instance.definition.model.clone(),
             });
             // Spend reconciliation (§24.1): the body's own count is
             // authoritative while it lives; the registry meter survives a
@@ -1739,6 +1745,44 @@ mod tests {
                 let handle = result.resume.expect("transient + progress advertises");
                 assert_eq!(handle.remaining_budget, Some(8));
                 assert!(handle.note.contains("2 tool calls"), "{}", handle.note);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn escalated_handle_carries_def_model_for_resume_inheritance() {
+        // A generation spawned with `def.model` advertises it on the handle,
+        // so a resume without its own `model` keeps the complexity-chosen
+        // model instead of resetting to the parent. `None` stays `None`.
+        let dir = PathBuf::from("/tmp/dex-supervision-handle-model");
+        let agents = dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("sess-0-tester.jsonl"),
+            "{\"entry_type\":\"session\"}\n{\"entry_type\":\"turn_start\"}\n",
+        )
+        .unwrap();
+        let mut with_model = test_def("tester");
+        with_model.model = Some("opencode/m-cheap".to_string());
+        let mgr = AgentManager::new("sess");
+        let id = mgr
+            .spawn(
+                &with_model,
+                test_seed(),
+                SpawnMeta {
+                    generation: 0,
+                    parent_session: Some(dir.join("sess.jsonl")),
+                    remaining_budget: None,
+                },
+                |_, _, _| async { panic!("boom") },
+            )
+            .unwrap();
+        match mgr.wait(&id, Duration::from_secs(5)).await {
+            WaitOutcome::Finished(result) => {
+                let handle = result.resume.expect("transient + progress advertises");
+                assert_eq!(handle.model.as_deref(), Some("opencode/m-cheap"));
             }
             other => panic!("expected Finished, got {other:?}"),
         }

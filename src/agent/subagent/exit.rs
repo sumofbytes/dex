@@ -67,6 +67,12 @@ pub(crate) struct ResumeHandle {
     /// Turn budget left (`max_tool_iterations − tool_calls`); `None` =
     /// unlimited or unknown (wrapper-synthesized and on-disk handles).
     pub(crate) remaining_budget: Option<usize>,
+    /// Effective model override of the finished generation (`def.model` at
+    /// spawn: per-spawn pick else frontmatter); `None` = inherited the
+    /// parent model. A resume without its own `model` re-applies this so a
+    /// complexity-chosen model survives generations; on-disk handles predate
+    /// it and resume under the definition.
+    pub(crate) model: Option<String>,
     /// Why it died, in one line — becomes the interruption nudge.
     pub(crate) note: String,
 }
