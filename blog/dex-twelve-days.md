@@ -328,7 +328,7 @@ The last day is release engineering, and it's a checklist you can steal:
    to the GitHub release with `SHA256SUMS`.
 2. **The installer**: `40ab888`, a curl-based `scripts/install.sh` —
    ```
-   curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install.sh | sh
    ```
    with version pinning and `DEX_INSTALL_DIR` support.
 3. **The first fire drill**: `81cd090` — *fix(release): zig install broke
@@ -428,7 +428,7 @@ The crate that began as `ak`, spent a day as `oye`, and landed as `dex` now
 installs like this:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/arpitsr/dex/HEAD/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install.sh | sh
 ```
 
 Twelve days. 140 commits. Two versions. One god file, cremated. The whole
