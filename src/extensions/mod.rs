@@ -197,7 +197,7 @@ pub(crate) fn set_enabled(id: &str, enabled: bool) -> std::io::Result<()> {
     if !manifest::valid_segment(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars"),
+            format!("invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"),
         ));
     }
     let enabled_path = marker_path("enabled", id);
@@ -869,9 +869,38 @@ pub(crate) fn full_tool_name(ext: &str, tool: &str) -> String {
     format!("ext__{ext}__{tool}")
 }
 
+/// True for extension tools under either the canonical `ext__` prefix or
+/// the pre-rename `lua__` alias (single place that knows both, so dispatch,
+/// gates, and preload stay in sync).
+pub(crate) fn is_extension_tool(name: &str) -> bool {
+    name.starts_with("ext__") || name.starts_with("lua__")
+}
+
+/// Map a legacy `lua__<ext>__<tool>` name to its canonical `ext__` form.
+/// Canonical names (and non-extension names) pass through untouched.
+pub(crate) fn normalize_tool_name(name: &str) -> String {
+    match split_ext_name(name) {
+        Some((ext, tool)) => full_tool_name(ext, tool),
+        None => name.to_string(),
+    }
+}
+
 /// Split `ext__<ext>__<tool>`; `None` for anything else (built-ins, MCP).
+/// The pre-rename `lua__` prefix still splits (deprecated alias) with a
+/// one-time pointer at the replacement, so old sessions and one-liners keep
+/// dispatching instead of hitting `unknown tool`.
 pub(crate) fn split_ext_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("ext__")?;
+    let rest = match name.strip_prefix("ext__") {
+        Some(rest) => rest,
+        None => {
+            let rest = name.strip_prefix("lua__")?;
+            crate::llm::config::warn_once(
+                "ext.lua-prefix",
+                "tool prefix `lua__` is deprecated, use `ext__` instead",
+            );
+            rest
+        }
+    };
     let (ext, tool) = rest.split_once("__")?;
     if ext.is_empty() || tool.is_empty() || tool.contains("__") {
         return None;
@@ -1555,10 +1584,14 @@ pub(crate) async fn set_active_global(ext: &str, tools: Vec<String>) {
 }
 
 /// Resolve one `set_active` entry to its full name: already-full `ext__`
-/// names pass through, anything else names the caller's own tool.
+/// names pass through, legacy `lua__` names normalize to `ext__` (so the
+/// read-time filter against canonical cache names still matches), and
+/// anything else names the caller's own tool.
 pub(crate) fn resolve_active_name(ext: &str, name: &str) -> String {
     if name.starts_with("ext__") {
         name.to_string()
+    } else if name.starts_with("lua__") {
+        normalize_tool_name(name)
     } else {
         full_tool_name(ext, name)
     }
@@ -1606,10 +1639,10 @@ pub(crate) fn install(src: &str) -> Result<String, String> {
 /// was discovered (user or project scope — removing is always a user act).
 pub(crate) fn remove(id: &str) -> Result<(), String> {
     // `dir.join(id)` below must never traverse: reject anything outside the
-    // same [a-z0-9_-]+ shape the manifest validator enforces.
+    // same [a-z0-9_-]+ (no `__`) shape the manifest validator enforces.
     if !manifest::valid_segment(id) {
         return Err(format!(
-            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars"
+            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
         ));
     }
     for (dir, _) in scoped_extension_dirs() {
@@ -1852,6 +1885,19 @@ pub(crate) mod tests {
         assert!(split_ext_name("ext__a").is_none());
         assert!(split_ext_name("ext____t").is_none());
         assert!(split_ext_name("ext__a__b__c").is_none());
+        // Deprecated pre-rename alias still dispatches.
+        assert_eq!(split_ext_name("lua__myext__tool"), Some(("myext", "tool")));
+        assert!(split_ext_name("lua__a__b__c").is_none());
+    }
+
+    #[test]
+    fn legacy_alias_names() {
+        assert!(is_extension_tool("ext__web__search"));
+        assert!(is_extension_tool("lua__web__search"));
+        assert!(!is_extension_tool("mcp__srv__tool"));
+        assert!(!is_extension_tool("read"));
+        assert_eq!(normalize_tool_name("lua__web__search"), "ext__web__search");
+        assert_eq!(normalize_tool_name("ext__web__search"), "ext__web__search");
     }
 
     #[test]
@@ -1859,6 +1905,11 @@ pub(crate) mod tests {
         assert_eq!(resolve_active_name("web", "search"), "ext__web__search");
         assert_eq!(
             resolve_active_name("web", "ext__web__search"),
+            "ext__web__search"
+        );
+        // Legacy alias normalizes so the read-time filter still matches.
+        assert_eq!(
+            resolve_active_name("web", "lua__web__search"),
             "ext__web__search"
         );
     }

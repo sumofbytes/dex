@@ -509,6 +509,7 @@ fn strip_sandbox(lua: &Lua) {
 fn valid_segment(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
+        && !name.contains("__")
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
@@ -610,7 +611,7 @@ fn build_dex_table(
                     })?;
                     if !valid_segment(&name) {
                         return Err(LuaError::RuntimeError(format!(
-                            "extension '{ext_id}' tool name '{name}': use [a-z0-9_-]+, max 64 chars"
+                            "extension '{ext_id}' tool name '{name}': use [a-z0-9_-]+, max 64 chars, no `__`"
                         )));
                     }
                     let execute: Function = spec.get("execute").map_err(|_| {

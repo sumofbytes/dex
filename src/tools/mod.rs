@@ -282,8 +282,8 @@ fn metadata_native(name: &str) -> Option<ToolMetadata> {
         // Extension tools are untrusted third-party code in a sandbox:
         // most restrictive gate (`ask` unless trusted), same as shell/MCP.
         // Resolved dynamically so loaded extensions don't need a static
-        // entry each.
-        _ if name.starts_with("ext__") => ToolMetadata {
+        // entry each (`lua__` is the deprecated alias for `ext__`).
+        _ if crate::extensions::is_extension_tool(name) => ToolMetadata {
             read_only: false,
             mutating: true,
             idempotent: false,
@@ -2004,8 +2004,9 @@ async fn dispatch_tool(
             .await
             .map_err(ToolError::Internal);
     }
-    if name.starts_with("ext__") {
+    if crate::extensions::is_extension_tool(name) {
         // Same audit contract as MCP: the raw string lands in the one row.
+        // (`call_global` normalizes the deprecated `lua__` alias.)
         return crate::extensions::call_global(name, args, cancel, policy, filter)
             .await
             .map_err(ToolError::Internal);
