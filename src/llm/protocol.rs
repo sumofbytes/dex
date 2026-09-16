@@ -157,20 +157,21 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
     if crate::agent::subagent::delegation_enabled() {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "delegate".to_string(),
-                description: "Delegate a task to a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing. Pass resume_from (a prior agent_id) to continue a resumable child from its transcript as a new generation — task is then optional and instruction plus file_hints fold into the continuation note; delegate_list shows resumable children.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "agent": { "type": "string", "description": "agent name: explorer | reviewer | tester" },
-                        "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation; required unless resume_from is set" },
-                        "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" },
-                        "resume_from": { "type": "string", "description": "prior agent_id to resume from its transcript as a new generation" },
-                        "instruction": { "type": "string", "description": "refined instruction folded into the resume continuation note" }
-                    },
-                    "required": ["agent"]
-                }),
+              function: FunctionDef {
+                  name: "delegate".to_string(),
+                  description: "Delegate a task to a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing. Pass resume_from (a prior agent_id) to continue a resumable child from its transcript as a new generation — task is then optional and instruction plus file_hints fold into the continuation note; delegate_list shows resumable children. Omit model to inherit this turn's model (on resume, to keep the prior generation's model); pass provider/model only when the task's complexity needs a different trade-off (stronger for hard reasoning, cheaper for simple lookups).".to_string(),
+                  parameters: json!({
+                      "type": "object",
+                      "properties": {
+                          "agent": { "type": "string", "description": "agent name: explorer | reviewer | tester" },
+                          "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation; required unless resume_from is set" },
+                          "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" },
+                          "model": { "type": "string", "description": "optional model override (provider/model, same knob as --model); omit to inherit this turn's model" },
+                          "resume_from": { "type": "string", "description": "prior agent_id to resume from its transcript as a new generation" },
+                          "instruction": { "type": "string", "description": "refined instruction folded into the resume continuation note" }
+                      },
+                      "required": ["agent"]
+                  }),
             },
         });
         tools.push(ToolDefinition {
