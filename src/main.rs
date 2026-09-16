@@ -554,9 +554,10 @@ fn main() {
                 }
             };
             // Extension tools resolve from the manager cache: load
-            // synchronously so `dex run lua__...` sees them (MCP tools have
-            // the same race; out of scope here).
-            if name.starts_with("lua__") {
+            // synchronously so `dex run ext__...` sees them (MCP tools have
+            // the same race; out of scope here). The deprecated `lua__`
+            // alias preloads too, so old one-liners keep working.
+            if crate::extensions::is_extension_tool(&name) {
                 crate::client::http::block_on(crate::extensions::global_manager().refresh());
             }
             match execute(&name, &parsed, &GlobalCancellation) {
