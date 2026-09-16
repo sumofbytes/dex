@@ -18,7 +18,15 @@ pub(crate) fn term_palette() -> Option<&'static TermPalette> {
     static PALETTE: OnceLock<Option<TermPalette>> = OnceLock::new();
     PALETTE
         .get_or_init(|| {
-            let p = color_palette(QueryOptions::default()).ok()?;
+            // Bounded for startup: the default 1s timeout parks TUI
+            // first paint on a dead terminal. Fast terminals answer in ms
+            // and unsupported ones are detected via DA1 before the timeout,
+            // so a slow-but-capable outlier just falls back to `Unknown`
+            // (Reset colors) instead of stalling launch. (`QueryOptions` is
+            // non-exhaustive, so the timeout is set on the default value.)
+            let mut query = QueryOptions::default();
+            query.timeout = std::time::Duration::from_millis(100);
+            let p = color_palette(query).ok()?;
             Some(TermPalette {
                 dark: p.theme_mode() == ThemeMode::Dark,
                 background: p.background.scale_to_8bit(),
