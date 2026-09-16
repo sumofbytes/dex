@@ -1110,12 +1110,17 @@ const SEL_BG: Color = Color::Indexed(24);
 
 /// Paint the mouse selection onto the visible window rows. Fully covered
 /// rows become a solid bar (style patch + padding to the area width); the
-/// anchor/end rows highlight only the selected cell range, end cell
-/// inclusive. Whole-line (triple-click) selections paint every covered row
-/// as a solid bar.
+/// anchor row of a multi-line drag highlights its text range plus the
+/// trailing margin out to the edge (continuation cue, no line-style patch
+/// so the prefix before the anchor stays plain); the end row — and any
+/// single-row selection — highlights only the selected cell range, end cell
+/// inclusive, never padding, so a drag ending on the last char stays
+/// distinct from a whole-line pick. Whole-line (triple-click) selections
+/// paint every covered row as a solid bar.
 fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, width: u16) {
     let ((r0, c0), (r1, c1)) = sel.norm();
     let hl = Style::default().bg(SEL_BG);
+    let single = r0 == r1;
     for (i, line) in window.iter_mut().enumerate() {
         let row = scroll + i;
         if row < r0 || row > r1 {
@@ -1128,18 +1133,24 @@ fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, 
             pad_row(line, width, hl);
             continue;
         }
-        let (from, to) = if row == r0 && row == r1 {
+        let (from, to) = if single {
             (c0, c1 + 1)
         } else if row == r0 {
             (c0, usize::MAX)
         } else {
             (0, c1 + 1)
         };
-        // Endpoint rows highlight only the text range: never pad to the
-        // area edge or patch the line style (that paints the whole row's
-        // margin, so a drag ending on the last char read as a full-line
-        // pick). Fully covered rows above stay a solid bar.
         style_row_range(line, from, to, hl);
+        if !single && row == r0 {
+            // Anchor row continues onto the next rows: extend the highlight
+            // through the trailing margin. No line-style patch — that would
+            // also paint the unselected prefix before the anchor.
+            pad_row(line, width, hl);
+        } else if !single && row == r1 && line.width() == 0 {
+            // A blank last row has no text range to highlight; pad so its
+            // inclusion in the selection stays visible.
+            pad_row(line, width, hl);
+        }
     }
 }
 
@@ -1950,6 +1961,85 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(plain, "hello ");
+    }
+
+    #[test]
+    fn apply_selection_multiline_anchor_pads_end_stays_text_only() {
+        // Multi-line drag: the anchor row extends through the trailing margin
+        // (continuation cue) while keeping the prefix before the anchor plain,
+        // inner rows are a solid bar, and the end row highlights only its
+        // text — even when the drag ends on the last char, so it stays
+        // distinct from a whole-line pick.
+        let mut window = vec![
+            Line::from("hello world"),
+            Line::from("middle"),
+            Line::from("second"),
+        ];
+        apply_selection(
+            &mut window,
+            0,
+            Selection {
+                anchor: (0, 6),
+                end: (2, 5),
+                sticky: false,
+                whole_line: false,
+            },
+            20,
+        );
+        // Anchor row: "world" plus margin fill highlighted, prefix plain.
+        let anchor_hl: String = window[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(SEL_BG))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            anchor_hl,
+            format!("world{}", " ".repeat(20 - "hello world".len()))
+        );
+        assert_eq!(window[0].width(), 20);
+        assert_eq!(window[0].style.bg, None);
+        let anchor_plain: String = window[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg.is_none())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(anchor_plain, "hello ");
+        // Inner row: solid bar via line-style patch + pad.
+        assert_eq!(window[1].style.bg, Some(SEL_BG));
+        assert_eq!(window[1].width(), 20);
+        // End row ending on the last char: text only, no pad or patch.
+        let end_hl: String = window[2]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(SEL_BG))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(end_hl, "second");
+        assert_eq!(window[2].width(), "second".len());
+        assert_eq!(window[2].style.bg, None);
+    }
+
+    #[test]
+    fn apply_selection_multiline_blank_last_row_stays_visible() {
+        // A blank last row has no text range to highlight; it still pads to
+        // a bar so its inclusion in the selection stays visible.
+        let mut window = vec![Line::from("hello"), Line::from("")];
+        apply_selection(
+            &mut window,
+            0,
+            Selection {
+                anchor: (0, 0),
+                end: (1, 0),
+                sticky: false,
+                whole_line: false,
+            },
+            20,
+        );
+        assert_eq!(window[0].width(), 20);
+        assert_eq!(window[1].width(), 20);
+        assert!(window[1].spans.iter().any(|s| s.style.bg == Some(SEL_BG)));
     }
 
     fn test_app() -> super::super::App {
