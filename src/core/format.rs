@@ -1230,30 +1230,32 @@ pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
 
 pub(crate) async fn git_context_async(cwd: &str) -> (Option<String>, bool) {
     use tokio::process::Command as AsyncCommand;
-    let branch = AsyncCommand::new("git")
+    // `branch` and `status` are independent spawns (~5-30ms each): run them
+    // together instead of serially. The `branch.is_some()` guard stays on the
+    // *result* — outside a repo `status` prints to stderr, so stdout is empty
+    // anyway — at the cost of one wasted spawn in non-repos.
+    let mut branch_cmd = AsyncCommand::new("git");
+    branch_cmd
         .args(["-C", cwd, "branch", "--show-current"])
         .stdin(std::process::Stdio::null())
         .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .output()
-        .await
+        .env("PAGER", "cat");
+    let mut status_cmd = AsyncCommand::new("git");
+    status_cmd
+        .args(["-C", cwd, "status", "--porcelain"])
+        .stdin(std::process::Stdio::null())
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat");
+    let (branch_out, status_out) = tokio::join!(branch_cmd.output(), status_cmd.output());
+    let branch = branch_out
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|branch| !branch.is_empty());
-    let dirty = if branch.is_some() {
-        AsyncCommand::new("git")
-            .args(["-C", cwd, "status", "--porcelain"])
-            .stdin(std::process::Stdio::null())
-            .env("GIT_PAGER", "cat")
-            .env("PAGER", "cat")
-            .output()
-            .await
+    let dirty = branch.is_some()
+        && status_out
             .ok()
-            .is_some_and(|output| !output.stdout.is_empty())
-    } else {
-        false
-    };
+            .is_some_and(|output| !output.stdout.is_empty());
     (branch, dirty)
 }
 
