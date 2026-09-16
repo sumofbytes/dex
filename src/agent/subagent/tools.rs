@@ -169,11 +169,14 @@ fn agent_id_arg(args: &Map<String, Value>) -> Result<AgentId, ToolError> {
         .ok_or(ToolError::Missing("agent_id"))
 }
 
-/// `delegate(agent, task?, file_hints?, resume_from?, instruction?)` —
+/// `delegate(agent, task?, file_hints?, model?, resume_from?, instruction?)` —
 /// fresh: resolve the definition, build the isolated seed from the tool
 /// arguments (the parent model writes the task itself; dex never
-/// auto-copies transcript, §5), spawn, return immediately. Resume:
-/// `resume_from` names a terminal child whose transcript replays as
+/// auto-copies transcript, §5), spawn, return immediately. `model` is the
+/// same single-knob selection as the main agent (`provider/model`); when
+/// present it overrides the definition for this spawn (complexity-based
+/// pick), otherwise the child inherits this turn's resolved model (§13).
+/// Resume: `resume_from` names a terminal child whose transcript replays as
 /// generation + 1 with an interruption nudge (§24.1–§24.3); `task` is
 /// then unneeded, and `instruction` (plus `file_hints`) folds into the
 /// nudge instead of replacing the original task.
@@ -189,7 +192,16 @@ async fn delegate(
         )));
     }
     let agent_name = string_arg(args, "agent").ok_or(ToolError::Missing("agent"))?;
-    let def = super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
+    let mut def = super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
+    if let Some(model) = string_arg(args, "model") {
+        // Fail fast at dispatch: the child body would otherwise spawn
+        // Running and fail on its first turn after `apply_model` rejects.
+        let mut probe = (*ctx.config).clone();
+        probe
+            .apply_model(&model, false)
+            .map_err(ToolError::InvalidArgument)?;
+        def.model = Some(model);
+    }
     let resume_from = string_arg(args, "resume_from");
     let task = string_arg(args, "task");
     if resume_from.is_none() && task.is_none() {
@@ -854,15 +866,18 @@ async fn child_run(
         allowed,
     };
     // The child's daemon context for one more level, when allowed. Shares
-    // the session coordinates, model config, manager, and approval bridges —
-    // only the depth advances.
+    // the session coordinates, manager, and approval bridges — only the
+    // depth advances. The config is the child's *resolved* model (parent
+    // model plus definition / per-spawn `model` override), so a grandchild
+    // without its own override inherits the complexity-chosen model rather
+    // than skipping back to the root.
     let child_ctx: Option<Arc<AgentTurnContext>> = if may_delegate {
         Some(Arc::new(AgentTurnContext {
             depth: child_depth,
             session_id: ctx.session_id.clone(),
             session_path: ctx.session_path.clone(),
             cwd: ctx.cwd.clone(),
-            config: ctx.config.clone(),
+            config: Arc::new(config.clone()),
             manager: ctx.manager.clone(),
             session_approvals: ctx.session_approvals.clone(),
             child_approvals: ctx.child_approvals.clone(),
@@ -1073,6 +1088,67 @@ mod tests {
         if crate::llm::prompt::project_context().is_some() {
             assert!(prompt.contains("--- Project instructions ---"), "{prompt}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; env must stay redirected across the spawn
+    async fn delegate_rejects_unresolvable_model_before_spawning() {
+        // Complexity-based override fails fast: an unresolvable `model`
+        // returns InvalidArgument without spawning a child (no Running
+        // entry the parent must poll to discover the error).
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = [
+            "OPENCODE_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_ACCOUNT_ID",
+            "CODEX_HOME",
+            "XDG_CACHE_HOME",
+        ]
+        .iter()
+        .map(|key| (*key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+        for key in ["OPENCODE_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID"] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-delegate-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("CODEX_HOME", dir.join("codex-home"));
+        let manager = AgentManager::new("sess");
+        let ctx = Arc::new(AgentTurnContext {
+            depth: 0,
+            session_id: "sess".to_string(),
+            session_path: PathBuf::new(),
+            cwd: String::new(),
+            config: Arc::new(crate::llm::config::tests::test_cfg()),
+            manager: manager.clone(),
+            session_approvals: HashSet::new(),
+            child_approvals: None,
+            live_approvals: None,
+        });
+        let mut args = Map::new();
+        args.insert("agent".into(), json!("explorer"));
+        args.insert("task".into(), json!("look around"));
+        args.insert("model".into(), json!("openai-codex/gpt-x"));
+        let error = delegate(&ctx, &args, &Policy::trusted()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("openai-codex")
+                || error.to_string().contains("credentials")
+                || error.to_string().contains("endpoint"),
+            "{error}"
+        );
+        assert_eq!(manager.active_count(), 0);
+        manager.shutdown().await;
+        for (key, prev) in saved {
+            match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
