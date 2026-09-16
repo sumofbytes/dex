@@ -1,7 +1,11 @@
 use serde_json::{json, Value};
+use std::sync::Arc;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 use crate::core::types::{
     ChatMessage, FunctionCall, FunctionDef, LlmToolCall, Role, StreamToolCall, ToolDefinition,
+    WireMessage,
 };
 
 pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
@@ -30,11 +34,41 @@ pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamTo
 }
 
 pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
+    // One merged copy per request: `ChatRequest.tools` owns its vec. Callers
+    // that serialize straight to `Value` use `tools_schema_parts` and skip
+    // even this copy.
+    let (mut tools, mcp, ext) = tools_schema_parts();
+    tools.extend(mcp.iter().cloned());
+    tools.extend(ext.iter().cloned());
+    tools
+}
+
+/// Borrowed schema slices for wire serialization without the merged copy:
+/// (native, mcp, extensions). Same content as `tools_schema()`.
+pub(crate) fn tools_schema_parts() -> (
+    Vec<ToolDefinition>,
+    Arc<[ToolDefinition]>,
+    Arc<[ToolDefinition]>,
+) {
+    let tools = native_tools();
+    // MCP + extension tools merge from the background-refreshed caches:
+    // sync, never blocks the turn loop. Empty until the first refresh
+    // lands. The caches hand out `Arc` slices — the caller clones the
+    // `Arc`, not the defs.
+    let mcp = crate::mcp::cached_tools();
+    let ext = crate::extensions::cached_tools();
+    (tools, mcp, ext)
+}
+
+/// Native + experiment schema: everything `tools_schema()` owns itself.
+/// Built fresh per call (small: ~11 defs); the MCP + extension slices ride
+/// alongside as borrowed `Arc`s.
+fn native_tools() -> Vec<ToolDefinition> {
     // Six default tools. `chain` and `git`
     // cost ~800 prompt tokens per request and are rarely used — `read`
     // fan-out + parallel calls cover the same, and `git` is reachable via
     // `bash "git ..."`. Gate them behind DEX_EXTRA_TOOLS=1 for compat.
-    let extra = std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1");
+    let extra = extra_tools_enabled();
     let mut tools = vec![
         ToolDefinition {
             tool_type: "function".to_string(),
@@ -256,37 +290,38 @@ pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
                     "required": ["steps"]
                 }),
             },
-        });
+          });
     }
-    // MCP tools merge from the background-refreshed cache: sync, never
-    // blocks the turn loop. Empty until the first refresh lands.
-    tools.extend(crate::mcp::cached_tools());
-    // Extension tools merge from the same kind of cache (plan §11 P0).
-    tools.extend(crate::extensions::cached_tools());
     tools
 }
 
-/// Chat-completions wire messages: serialized from [`ChatMessage`] minus
-/// dex-internal fields. `name` is a local tag (`steering`, `skill`,
-/// `summary`, `follow-up`, `agent-notifications`) that the model never needs
-/// and strict OpenAI-compatible endpoints reject (`messages[i]: "name" is
-/// not supported by this endpoint`). `reasoning_items` are Responses-API
-/// blobs the Responses wire replays inside `input` (and the Anthropic wire
-/// filters in `assistant_blocks`) — as a chat-completions field they would
-/// be garbage. `reasoning_content` stays: it is the model-facing DeepSeek
-/// field.
-pub(crate) fn chat_completions_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| {
-            let mut wire = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
-            if let Some(object) = wire.as_object_mut() {
-                object.remove("name");
-                object.remove("reasoning_items");
-            }
-            wire
-        })
-        .collect()
+/// `DEX_EXTRA_TOOLS` flag, cached process-wide: `tools_schema()` runs per
+/// model call and the env lookup is pure overhead after boot. Tests bypass
+/// the cache — they flip the var mid-process and expect the schema to
+/// follow (see the experiments schema test).
+fn extra_tools_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1")
+    }
+    #[cfg(not(test))]
+    {
+        static EXTRA_TOOLS: OnceLock<bool> = OnceLock::new();
+        *EXTRA_TOOLS.get_or_init(|| std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1"))
+    }
+}
+
+/// Chat-completions wire messages: borrowed [`WireMessage`] views, serialized
+/// straight to bytes by reqwest — no `Value` middleman (perf doc §8). `name`
+/// is a local tag (`steering`, `skill`, `summary`, `follow-up`,
+/// `agent-notifications`) that the model never needs and strict
+/// OpenAI-compatible endpoints reject (`messages[i]: "name" is not supported
+/// by this endpoint`). `reasoning_items` are Responses-API blobs the
+/// Responses wire replays inside `input` (and the Anthropic wire filters in
+/// `assistant_blocks`) — as a chat-completions field they would be garbage.
+/// `reasoning_content` stays: it is the model-facing DeepSeek field.
+pub(crate) fn chat_completions_messages(messages: &[ChatMessage]) -> Vec<WireMessage<'_>> {
+    messages.iter().map(ChatMessage::wire).collect()
 }
 
 pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
@@ -344,8 +379,12 @@ pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<
 }
 
 pub(crate) fn responses_tools() -> Vec<Value> {
-    tools_schema()
-        .into_iter()
+    // Borrowed slices: no merged-schema copy on the wire path.
+    let (native, mcp, ext) = tools_schema_parts();
+    native
+        .iter()
+        .chain(mcp.iter())
+        .chain(ext.iter())
         .map(|tool| {
             json!({
                 "type": "function",
@@ -478,7 +517,10 @@ mod tests {
             tagged,
             ChatMessage::tool_result("call_1", "out"),
         ];
-        let wire = chat_completions_messages(&msgs);
+        let wire: Vec<serde_json::Value> = chat_completions_messages(&msgs)
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
         assert_eq!(wire[0], json!({"role": "system", "content": "sys"}));
         assert_eq!(wire[1], json!({"role": "user", "content": "hi"}));
         assert_eq!(

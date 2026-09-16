@@ -330,13 +330,44 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
+/// Chat-completions wire view of a [`ChatMessage`]: borrowed, serialized
+/// straight to bytes by reqwest with no `Value` middleman (perf doc §8).
+/// Dex-internal fields (`name`, `reasoning_items`) are absent by
+/// construction, so strict OpenAI-compatible endpoints never see them.
+/// Every other field mirrors [`ChatMessage`]'s serde shape exactly
+/// (`content: None` still serializes as `null`, as before).
+#[derive(Serialize)]
+pub(crate) struct WireMessage<'a> {
+    pub(crate) role: Role,
+    pub(crate) content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_calls: Option<&'a Vec<LlmToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_content: Option<&'a str>,
+}
+
+impl ChatMessage {
+    /// Borrowed wire view for the chat-completions request body.
+    pub(crate) fn wire(&self) -> WireMessage<'_> {
+        WireMessage {
+            role: self.role,
+            content: self.content.as_deref(),
+            tool_calls: self.tool_calls.as_ref(),
+            tool_call_id: self.tool_call_id.as_deref(),
+            reasoning_content: self.reasoning_content.as_deref(),
+        }
+    }
+}
+
 /// Serialized straight onto the wire; `messages` arrive wire-shaped (see
 /// [`crate::llm::protocol::chat_completions_messages`]) so dex-internal
 /// `ChatMessage` fields never reach a strict OpenAI-compatible endpoint.
 #[derive(Serialize)]
 pub(crate) struct ChatRequest<'a> {
     pub(crate) model: &'a str,
-    pub(crate) messages: Vec<Value>,
+    pub(crate) messages: Vec<WireMessage<'a>>,
     pub(crate) tools: Vec<ToolDefinition>,
     pub(crate) stream: bool,
     pub(crate) stream_options: StreamOptions,

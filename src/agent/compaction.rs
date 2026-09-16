@@ -8,7 +8,7 @@ use crate::core::types::{ChatMessage, Role, Usage};
 use crate::llm::config::LlmConfig;
 use crate::llm::streaming::complete as call_llm;
 
-pub(crate) use super::tokens::{effective_tokens, estimate_tokens};
+pub(crate) use super::tokens::estimate_tokens;
 
 /// Compaction settings — token-based keep-recent with a message-count fallback.
 /// `keepRecentTokens=20000` (token-based); dex keeps 12 messages as
