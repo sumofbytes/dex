@@ -1135,11 +1135,11 @@ fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, 
         } else {
             (0, c1 + 1)
         };
+        // Endpoint rows highlight only the text range: never pad to the
+        // area edge or patch the line style (that paints the whole row's
+        // margin, so a drag ending on the last char read as a full-line
+        // pick). Fully covered rows above stay a solid bar.
         style_row_range(line, from, to, hl);
-        if to == usize::MAX || to >= line.width() {
-            line.style = line.style.patch(hl);
-            pad_row(line, width, hl);
-        }
     }
 }
 
@@ -1936,9 +1936,12 @@ mod tests {
             .filter(|s| s.style.bg == Some(SEL_BG))
             .map(|s| s.content.as_ref())
             .collect();
-        // "world" highlighted; the bar pads out to the area width because
-        // the selection reaches the row's last char.
-        assert_eq!(highlighted.trim_end(), "world");
+        // "world" highlighted — and only that: the highlight stops at the
+        // text end instead of padding to the area width, so a drag ending
+        // on the last char no longer reads as a full-line pick.
+        assert_eq!(highlighted, "world");
+        assert_eq!(window[0].width(), "hello world".len());
+        assert_eq!(window[0].style.bg, None);
         // Untouched prefix stays plain.
         let plain: String = window[0]
             .spans
