@@ -2,7 +2,7 @@
 --
 -- Reference extension for model-aware Lua extensions: it registers
 -- provider-native tools (`search` everywhere, `fetch` on Gemini
--- only — the model sees them as `lua__web__search` / `lua__web__fetch`;
+-- only — the model sees them as `ext__web__search` / `ext__web__fetch`;
 -- extension code uses the short names and the host resolves them),
 -- reuses the *current* model's endpoint + key (`dex.model`), hides tools
 -- the model cannot serve (`model_select` + `dex.tools.set_active`), and

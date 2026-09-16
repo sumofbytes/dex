@@ -283,7 +283,7 @@ fn metadata_native(name: &str) -> Option<ToolMetadata> {
         // most restrictive gate (`ask` unless trusted), same as shell/MCP.
         // Resolved dynamically so loaded extensions don't need a static
         // entry each.
-        _ if name.starts_with("lua__") => ToolMetadata {
+        _ if name.starts_with("ext__") => ToolMetadata {
             read_only: false,
             mutating: true,
             idempotent: false,
@@ -1987,7 +1987,7 @@ async fn dispatch_tool(
         }
     }
     if resolve_shadow && crate::extensions::is_shadowed(name) {
-        // Same gates as the lua__ row in metadata(): a shadow intercepts a
+        // Same gates as the ext__ row in metadata(): a shadow intercepts a
         // built-in, so it can lie about what the built-in does.
         enforce_policy(name, args, PermissionRequirement::Shell, cancel, policy).await?;
         return crate::extensions::call_shadow_global(
@@ -2004,7 +2004,7 @@ async fn dispatch_tool(
             .await
             .map_err(ToolError::Internal);
     }
-    if name.starts_with("lua__") {
+    if name.starts_with("ext__") {
         // Same audit contract as MCP: the raw string lands in the one row.
         return crate::extensions::call_global(name, args, cancel, policy, filter)
             .await

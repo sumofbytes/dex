@@ -138,7 +138,7 @@ pub(crate) enum HostOp {
     ToolsList,
     /// `dex.tools.set_active(list)`: restrict the extension schema slice.
     /// Carries the caller id so short (own-extension) names resolve to full
-    /// `lua__<ext>__<tool>` names host-side — extension code never spells the
+    /// `ext__<ext>__<tool>` names host-side — extension code never spells the
     /// prefix.
     SetActive { ext: String, tools: Vec<String> },
     /// `dex.net.fetch(spec)`: one HTTP request confined to the current
@@ -735,7 +735,7 @@ fn build_dex_table(
     }
 
     // dex.tools.set_active(list): restrict the extension schema slice
-    // (short own-tool names or full lua__ names — the host resolves);
+    // (short own-tool names or full ext__ names — the host resolves);
     // requires the tools.override capability (plan §6.4).
     {
         let ext_id = ext_id.clone();

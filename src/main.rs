@@ -554,9 +554,9 @@ fn main() {
                 }
             };
             // Extension tools resolve from the manager cache: load
-            // synchronously so `dex run lua__...` sees them (MCP tools have
+            // synchronously so `dex run ext__...` sees them (MCP tools have
             // the same race; out of scope here).
-            if name.starts_with("lua__") {
+            if name.starts_with("ext__") {
                 crate::client::http::block_on(crate::extensions::global_manager().refresh());
             }
             match execute(&name, &parsed, &GlobalCancellation) {
