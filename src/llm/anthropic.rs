@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::core::types::{ChatMessage, LlmToolCall, Role};
 use crate::llm::config::LlmConfig;
-use crate::llm::protocol::tools_schema;
+use crate::llm::protocol::tools_schema_parts;
 
 /// `anthropic-version` header value pinned by `AuthScheme::Anthropic`.
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -244,10 +244,14 @@ fn tool_result_block(message: &ChatMessage) -> Value {
 }
 
 /// Shared tool schemas → Anthropic shape (`input_schema` instead of the
-/// OpenAI `function.parameters` wrapper).
+/// OpenAI `function.parameters` wrapper). Borrowed slices: no merged-schema
+/// copy on the wire path.
 pub(crate) fn anthropic_tools() -> Vec<Value> {
-    tools_schema()
-        .into_iter()
+    let (native, mcp, ext) = tools_schema_parts();
+    native
+        .iter()
+        .chain(mcp.iter())
+        .chain(ext.iter())
         .map(|tool| {
             json!({
                 "name": tool.function.name,

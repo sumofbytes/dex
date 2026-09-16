@@ -383,21 +383,6 @@ fn insert_server(
     }
 }
 
-fn config_file_value() -> Option<serde_yaml::Value> {
-    let path = if let Some(p) = std::env::var_os("DEX_CONFIG") {
-        std::path::PathBuf::from(p)
-    } else {
-        let dir = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-            })?;
-        dir.join("dex/config.yaml")
-    };
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&text).ok()
-}
-
 /// Load server configs from config.yaml (`DEX_MCP_SERVERS_JSON` wins for tests).
 pub(crate) fn load_server_configs() -> BTreeMap<String, McpServerConfig> {
     if !mcp_enabled() {
@@ -421,7 +406,11 @@ pub(crate) fn load_server_configs() -> BTreeMap<String, McpServerConfig> {
             }
         }
     }
-    config_file_value()
+    // Shared cached parse (perf doc §30): the old shadow reader re-read +
+    // re-parsed config.yaml on every call — same paths, same outcome for
+    // valid files (invalid files yield no servers either way, plus a
+    // one-time warning from the cached loader).
+    crate::llm::config::config_file_value()
         .as_ref()
         .map(parse_mcp_servers)
         .unwrap_or_default()
@@ -1127,13 +1116,28 @@ pub(crate) struct ServerStatus {
     pub(crate) error: Option<String>,
 }
 
+/// One server's fetched schema slice: raw defs plus the synthetic reader.
+/// The caller merges (collision renames need the shared map, so merging
+/// stays serial over a sorted server list).
+struct ServerDefs {
+    tools: Vec<(ToolDefinition, String)>,
+    reader: Option<ToolDefinition>,
+}
+
 pub(crate) struct McpManager {
     configs: BTreeMap<String, McpServerConfig>,
     clients: RwLock<HashMap<String, Arc<McpClient>>>,
     down: RwLock<HashMap<String, String>>,
-    cached_tools: RwLock<Vec<ToolDefinition>>,
+    /// Schema cache behind `Arc`: readers clone the `Arc`, never the defs
+    /// (each `parameters: Value` re-serializes expensively — see
+    /// `cached_schema_tokens`).
+    cached_tools: RwLock<Arc<[ToolDefinition]>>,
     cached_names: RwLock<HashMap<String, (String, String)>>,
     cached_truncated: RwLock<usize>,
+    /// Token cost of `cached_tools`, precomputed at swap time: the per-turn
+    /// budget reads this instead of re-running `schema_token_estimate`
+    /// (`parameters.to_string()` per def) on every model call.
+    cached_schema_tokens: RwLock<u64>,
 }
 
 impl McpManager {
@@ -1142,9 +1146,10 @@ impl McpManager {
             configs,
             clients: RwLock::new(HashMap::new()),
             down: RwLock::new(HashMap::new()),
-            cached_tools: RwLock::new(Vec::new()),
+            cached_tools: RwLock::new(Arc::new([])),
             cached_names: RwLock::new(HashMap::new()),
             cached_truncated: RwLock::new(0),
+            cached_schema_tokens: RwLock::new(0),
         }
     }
 
@@ -1213,17 +1218,47 @@ impl McpManager {
 
     async fn rebuild_cache(&self) {
         let clients = self.clients.read().await.clone();
-        let mut tools = Vec::new();
-        let mut names = HashMap::new();
+        // Fan out the per-server RPCs: `fetch_server_defs` holds no locks,
+        // so one slow server never stalls the rest (previously serial, 2
+        // RPCs each with 30s timeouts).
+        let mut set = tokio::task::JoinSet::new();
         for (server, client) in &clients {
             // Test clients have no config entry: default allows everything.
             let cfg = self.configs.get(server).cloned().unwrap_or_default();
-            Self::cache_server_into(server, &cfg, client, &mut tools, &mut names).await;
+            let server = server.clone();
+            let client = Arc::clone(client);
+            set.spawn(async move {
+                let defs = Self::fetch_server_defs(&server, &cfg, &client).await;
+                (server, defs)
+            });
+        }
+        let mut fetched = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(row) = joined {
+                fetched.push(row);
+            }
+        }
+        // Merge single-threaded over a sorted server list: collision renames
+        // (`~2` suffixes) are order-dependent, so a fixed order keeps them
+        // stable from rebuild to rebuild.
+        fetched.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut tools = Vec::new();
+        let mut names = HashMap::new();
+        for (server, defs) in fetched {
+            for (def, tool) in defs.tools {
+                insert_cached(&mut tools, &mut names, def, &server, &tool);
+            }
+            if let Some(def) = defs.reader {
+                names.insert(
+                    def.function.name.clone(),
+                    (server.clone(), "\0resource".to_string()),
+                );
+                tools.push(def);
+            }
         }
         self.enforce_cap(&mut tools, &mut names, mcp_max_tools())
             .await;
-        *self.cached_tools.write().await = tools;
-        *self.cached_names.write().await = names;
+        self.swap_cache(tools, names).await;
     }
 
     /// Schema cap: the model pays for the schema on every request, so bound
@@ -1248,47 +1283,78 @@ impl McpManager {
         *self.cached_truncated.write().await = dropped;
     }
 
-    /// List one server's tools (+ resource reader) into the given sinks,
-    /// honoring the server's allow/deny filter.
-    async fn cache_server_into(
+    /// One server's schema slice, fetched with no cache locks held: the
+    /// `list_tools` + `has_resources` RPCs. Raw defs — the caller merges
+    /// (collision renames need the shared map, so merging stays serial).
+    /// List one server's tools (+ resource reader), honoring the server's
+    /// allow/deny filter.
+    async fn fetch_server_defs(
         server: &str,
         cfg: &McpServerConfig,
         client: &Arc<McpClient>,
-        tools: &mut Vec<ToolDefinition>,
-        names: &mut HashMap<String, (String, String)>,
-    ) {
+    ) -> ServerDefs {
+        let mut tools = Vec::new();
         let listed = client.list_tools(None).await.unwrap_or_default();
         for tool in &listed {
             if !cfg.tool_allowed(&tool.name) {
                 continue;
             }
-            insert_cached(tools, names, tool.to_definition(server), server, &tool.name);
+            tools.push((tool.to_definition(server), tool.name.clone()));
         }
-        if client.has_resources(None).await {
-            let def = resource_reader_definition(server);
-            names.insert(
-                def.function.name.clone(),
-                (server.to_string(), "\0resource".to_string()),
-            );
-            tools.push(def);
-        }
+        let reader = if client.has_resources(None).await {
+            Some(resource_reader_definition(server))
+        } else {
+            None
+        };
+        ServerDefs { tools, reader }
+    }
+
+    /// Swap a freshly built cache under the write locks: the only locked
+    /// section of the rebuild path — RPCs, cap math, and token math all
+    /// happen lock-free on locals first.
+    async fn swap_cache(
+        &self,
+        tools: Vec<ToolDefinition>,
+        names: HashMap<String, (String, String)>,
+    ) {
+        let tokens = crate::agent::tokens::schema_token_estimate(&tools);
+        *self.cached_tools.write().await = Arc::from(tools);
+        *self.cached_names.write().await = names;
+        *self.cached_schema_tokens.write().await = tokens;
     }
 
     /// Connect one server and merge its tools into the live cache (the batch
     /// `refresh` path rebuilds wholesale; this keeps a lazy connect cheap).
+    /// Fetch first, lock only to swap: readers keep serving the previous
+    /// cache across the lazy-connect RPCs instead of degrading to an empty
+    /// slice under a held write lock.
     async fn connect_and_cache(&self, name: &str, cfg: &McpServerConfig) {
         self.connect_one(name, cfg).await;
-        let clients = self.clients.read().await.clone();
-        let Some(client) = clients.get(name) else {
+        let Some(client) = self.clients.read().await.get(name).cloned() else {
             return;
         };
-        let mut tools = self.cached_tools.write().await;
-        let mut names = self.cached_names.write().await;
-        tools.retain(|d| !def_belongs_to(&d.function.name, name));
+        let defs = Self::fetch_server_defs(name, cfg, &client).await;
+        let current = self.cached_tools.read().await.clone();
+        let mut tools: Vec<ToolDefinition> = current
+            .iter()
+            .filter(|d| !def_belongs_to(&d.function.name, name))
+            .cloned()
+            .collect();
+        let mut names = self.cached_names.read().await.clone();
         names.retain(|_, (server, _)| server != name);
-        Self::cache_server_into(name, cfg, client, &mut tools, &mut names).await;
+        for (def, tool) in defs.tools {
+            insert_cached(&mut tools, &mut names, def, name, &tool);
+        }
+        if let Some(def) = defs.reader {
+            names.insert(
+                def.function.name.clone(),
+                (name.to_string(), "\0resource".to_string()),
+            );
+            tools.push(def);
+        }
         self.enforce_cap(&mut tools, &mut names, mcp_max_tools())
             .await;
+        self.swap_cache(tools, names).await;
     }
 
     /// Drop the client and reconnect now; surfaces the error instead of only
@@ -1319,29 +1385,44 @@ impl McpManager {
         }
     }
 
-    /// Ping every client; drop the dead so they go `down` before the next
-    /// turn. Runs every 60s on the global manager; never fails the batch.
+    /// Ping every client concurrently; drop the dead so they go `down`
+    /// before the next turn. Runs every 60s on the global manager; never
+    /// fails the batch.
     pub(crate) async fn sweep_once(&self) {
         let clients: Vec<(String, Arc<McpClient>)> =
             self.clients.read().await.clone().into_iter().collect();
-        let mut changed = false;
-        for (name, client) in &clients {
-            if client.ping().await.is_err() {
-                self.clients.write().await.remove(name);
-                self.down.write().await.insert(
+        let mut set = tokio::task::JoinSet::new();
+        for (name, client) in clients {
+            set.spawn(async move {
+                let dead = client.ping().await.is_err();
+                (name, dead)
+            });
+        }
+        let mut dead = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((name, true)) = joined {
+                dead.push(name);
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        {
+            let mut clients = self.clients.write().await;
+            let mut down = self.down.write().await;
+            for name in &dead {
+                clients.remove(name);
+                down.insert(
                     name.clone(),
                     "liveness probe failed; will reconnect on next use".to_string(),
                 );
-                changed = true;
             }
         }
-        if changed {
-            self.rebuild_cache().await;
-        }
+        self.rebuild_cache().await;
     }
 
     #[cfg(test)]
-    pub(crate) async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+    pub(crate) async fn tool_definitions(&self) -> Arc<[ToolDefinition]> {
         self.cached_tools.read().await.clone()
     }
 
@@ -1424,8 +1505,13 @@ impl McpManager {
             }
             None => (server, tool),
         };
-        let clients = self.clients.read().await;
-        let Some(client) = clients.get(&server) else {
+        let clients = self.clients.read().await.get(&server).cloned();
+        // Clone the client out of the map and drop the guard before any
+        // `.await`: holding the read guard across the tool RPC (up to the
+        // 30s timeout) would stall every map writer — reconnect, sweeper
+        // drops, lazy-connect inserts — on a hung server. Read-shared
+        // otherwise, so concurrent calls never block each other here.
+        let Some(client) = clients else {
             let reason = self
                 .down
                 .read()
@@ -1485,23 +1571,20 @@ pub(crate) fn global_manager() -> Arc<McpManager> {
 }
 
 /// Cached MCP tools for `tools_schema()` — never blocks, never fails.
-pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
+/// Clones the `Arc`, not the defs.
+pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
     GLOBAL
         .get()
         .and_then(|m| m.cached_tools.try_read().ok().map(|t| t.clone()))
-        .unwrap_or_default()
+        .unwrap_or_else(|| Arc::new([]))
 }
 
 /// Token cost of the cached MCP schema slice, for the compaction budget.
+/// Precomputed at cache-swap time — a cached load, never a re-serialize.
 pub(crate) fn cached_schema_tokens() -> u64 {
     GLOBAL
         .get()
-        .and_then(|m| {
-            m.cached_tools
-                .try_read()
-                .ok()
-                .map(|t| crate::agent::tokens::schema_token_estimate(&t))
-        })
+        .and_then(|m| m.cached_schema_tokens.try_read().ok().map(|n| *n))
         .unwrap_or_default()
 }
 

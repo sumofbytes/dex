@@ -169,6 +169,33 @@ fn branch_pieces(app: &App) -> Vec<Piece> {
 /// `↑42k ↓1.2k` (cumulative in/out), `123 tok/s`. Redundant detail is
 /// dropped, never information: the cached absolute is the ctx number times
 /// its %, and a trailing `.0` on scaled tokens says nothing.
+/// Context size for the status bar: provider-reported prompt tokens once
+/// the first `Usage` event lands, else a cached transcript estimate (perf
+/// doc §29). The estimate is served from `App::status_tokens_cache` while
+/// the history is unchanged, so per-frame callers (keystrokes, SSE batches,
+/// busy ticks) pay one walk per history change instead of two walks per
+/// frame. Display-only — a stale read would merely lag the ctx % by a frame.
+pub(super) fn status_tokens(app: &App) -> u64 {
+    if let Some(usage) = app.tool_state.last_usage {
+        return usage;
+    }
+    let (tail_content, tail_reasoning) = app.messages.last().map_or((0, 0), |m| {
+        (
+            m.content.as_deref().map_or(0, str::len),
+            m.reasoning_content.as_deref().map_or(0, str::len)
+                + m.reasoning_items.as_ref().map_or(0, Vec::len),
+        )
+    });
+    let key = (app.messages.len(), tail_content, tail_reasoning);
+    let (n, c, r, tokens) = app.status_tokens_cache.get();
+    if (n, c, r) == key {
+        return tokens;
+    }
+    let tokens = crate::agent::compaction::estimate_tokens(&app.messages);
+    app.status_tokens_cache.set((key.0, key.1, key.2, tokens));
+    tokens
+}
+
 pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     // Transient notice (copy confirmation) takes over the line until it
     // expires: unmissable feedback beats the quiet facts for two seconds.
@@ -177,10 +204,7 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
             return vec![(text.clone(), Style::default().fg(Color::Green))];
         }
     }
-    let tokens = app
-        .tool_state
-        .last_usage
-        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
+    let tokens = status_tokens(app);
     let context_pct = if app.config.context_window == 0 {
         0
     } else {
@@ -403,14 +427,17 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
     let hint = hint_pieces(app);
     let conn = conn_piece(app);
     let conn_w = pieces_width(std::slice::from_ref(&conn));
-    let candidates = [
-        status_pieces(app, true),
-        status_pieces(app, false),
-        compact_pieces(app),
-        bare_pieces(app),
-    ];
+    // Tier candidates build lazily, widest first: the full line almost
+    // always fits, so on a wide terminal the narrower tiers (and their
+    // transcript walks) never build at all.
     let mut left_only: Option<Vec<Piece>> = None;
-    for candidate in candidates {
+    for tier in 0..4 {
+        let candidate = match tier {
+            0 => status_pieces(app, true),
+            1 => status_pieces(app, false),
+            2 => compact_pieces(app),
+            _ => bare_pieces(app),
+        };
         let mut left = hint.clone();
         left.extend(candidate);
         let lw = pieces_width(&left);
