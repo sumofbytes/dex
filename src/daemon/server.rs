@@ -203,8 +203,13 @@ async fn resolve_daemon_info_async() -> DaemonInfo {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let (git_branch, git_dirty) = cached_git_context_async(&cwd).await;
-    match LlmConfig::from_env_async(None, None, None, Vec::new()).await {
+    // Git spawns and config resolution (file + catalog-index reads) are
+    // independent — overlap them; both sit on TUI first-paint's critical path.
+    let ((git_branch, git_dirty), config) = tokio::join!(
+        cached_git_context_async(&cwd),
+        LlmConfig::from_env_async(None, None, None, Vec::new())
+    );
+    match config {
         Ok(config) => {
             let mut info = DaemonInfo::default_for(
                 cwd,

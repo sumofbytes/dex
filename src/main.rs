@@ -314,7 +314,14 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
     let addr = listener.local_addr()?;
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        // Single-threaded: this runtime only pumps the local HTTP server
+        // (async I/O plus `spawn_blocking` file work). A default
+        // multi-thread pool spins up one worker per core (~10-50ms) on the
+        // TUI's critical path for no concurrent-CPU gain.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
         rt.block_on(async {
             if let Err(e) = daemon::run_daemon(listener).await {
                 eprintln!("daemon error: {e}");
