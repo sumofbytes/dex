@@ -232,6 +232,15 @@ pub(crate) struct SessionEntry {
     /// turn (registry rebuilds only read headers) — the wake falls back to
     /// the file scan then.
     pub model: Option<String>,
+    /// Last `plan` JSON this daemon persisted + the session file's mtime
+    /// right after the write (perf doc §28): a re-sent identical plan
+    /// skips the append when the mtime proves nobody else touched the file
+    /// since (the co-located TUI can write the same file directly, so an
+    /// entry-only comparison could skip a needed restore).
+    pub plan_persisted: Option<(String, std::time::SystemTime)>,
+    /// Same for the `model`/`provider` pair: raw client model string +
+    /// resolved provider name + file mtime after the write.
+    pub model_persisted: Option<((String, String), std::time::SystemTime)>,
 }
 
 impl DaemonState {
@@ -548,6 +557,8 @@ impl DaemonState {
                     name,
                     cwd,
                     model: None,
+                    plan_persisted: None,
+                    model_persisted: None,
                 },
             ));
         }
@@ -1137,6 +1148,8 @@ mod tests {
             name: None,
             cwd: "/tmp".into(),
             model: None,
+            plan_persisted: None,
+            model_persisted: None,
         };
         state.sessions.lock().unwrap().insert(id.clone(), live);
         state.rebuild_async().await;

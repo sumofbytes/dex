@@ -414,6 +414,8 @@ async fn create_session(
         name: session.name().map(ToString::to_string),
         cwd,
         model: None,
+        plan_persisted: None,
+        model_persisted: None,
     };
     lock_map(&state.sessions).insert(session_id.clone(), entry);
     // A re-created id (server-minted, so effectively never) must not stick
@@ -581,7 +583,7 @@ async fn chat(
     // append-only session log stays consistent. A replay must not hold the
     // active-turn slot, so it is checked before registration.
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
     // Pre-create per-turn channels so `POST /steer` / `POST /followup`
@@ -944,16 +946,30 @@ async fn run_turn_inner(
     // string clears. Invalid JSON is rejected explicitly rather than silently
     // storing garbage (which would come back as an empty plan on reload).
     if let Some(plan_json) = &req.plan {
-        if plan_json.is_empty() {
-            session
-                .set_state("plan", &crate::core::types::Plan::default().to_json())
-                .map_err(|e| format!("failed to persist plan: {e}"))?;
+        let canonical = if plan_json.is_empty() {
+            crate::core::types::Plan::default().to_json()
         } else {
             let plan: crate::core::types::Plan = serde_json::from_str(plan_json)
                 .map_err(|e| format!("invalid plan JSON from client: {e}"))?;
+            plan.to_json()
+        };
+        // §28: the client re-sends its plan on later turns; skip the append
+        // when the daemon already persisted exactly this value and nobody
+        // else touched the file since (the mtime guard — the co-located TUI
+        // can write the same file directly, so an entry-only comparison
+        // could skip a needed restore). Skipping also stops duplicate plan
+        // rows from accumulating for every `load_session_state` scan to walk.
+        let persisted = lock_map(&state.sessions)
+            .get(session_id)
+            .and_then(|e| e.plan_persisted.clone());
+        if !persisted_current(&persisted, &canonical, &entry.path) {
             session
-                .set_state("plan", &plan.to_json())
+                .set_state("plan", &canonical)
                 .map_err(|e| format!("failed to persist plan: {e}"))?;
+            let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
+            if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
+                slot.plan_persisted = Some((canonical, at));
+            }
         }
     }
 
@@ -1005,11 +1021,24 @@ async fn run_turn_inner(
             crate::llm::config::insert_extra_header(&mut config.extra_headers, k, v);
         }
     }
-    // Persist provider/model overrides so /resume restores the same provider/base_url without env
+    // Persist provider/model overrides so /resume restores the same provider/base_url without env.
+    // §28: skip the two appends when this exact pair is already persisted
+    // and untouched since (same mtime guard as the plan above).
     if let Some(raw) = &req.model {
         if !raw.is_empty() {
-            let _ = session.set_state("model", raw);
-            let _ = session.set_state("provider", config.provider.name());
+            let provider_name = config.provider.name().to_string();
+            let persisted = lock_map(&state.sessions)
+                .get(session_id)
+                .and_then(|e| e.model_persisted.clone());
+            let value = (raw.clone(), provider_name.clone());
+            if !persisted_current(&persisted, &value, &entry.path) {
+                let _ = session.set_state("model", raw);
+                let _ = session.set_state("provider", &provider_name);
+                let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
+                if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
+                    slot.model_persisted = Some((value, at));
+                }
+            }
         }
     }
     // Stash the turn's model on the registry entry (perf doc §30): the
@@ -1761,7 +1790,7 @@ async fn steer(
     }
     // Session must exist; steering only valid while a turn is active.
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, false).ok_or(StatusCode::CONFLICT)?;
@@ -1781,7 +1810,7 @@ async fn followup(
         return Err(StatusCode::BAD_REQUEST);
     }
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, true).ok_or(StatusCode::CONFLICT)?;
@@ -1805,7 +1834,7 @@ async fn recall(
     if content.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, req.followup).ok_or(StatusCode::CONFLICT)?;
@@ -1847,17 +1876,59 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
         name: header.name().map(ToOwned::to_owned),
         cwd: header.cwd().to_string(),
         model: None,
+        plan_persisted: None,
+        model_persisted: None,
     };
     lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
     Some(entry)
 }
 
+/// True when an identical daemon-persisted session-state value is still
+/// current (perf doc §28): never written, changed since, or written but the
+/// file moved under us — the mtime guard, because the co-located TUI can
+/// write the same file directly, so an entry-only comparison could skip a
+/// needed restore. A missing file also forces the write (same as before).
+fn persisted_current<T: PartialEq>(
+    persisted: &Option<(T, std::time::SystemTime)>,
+    value: &T,
+    path: &std::path::Path,
+) -> bool {
+    let Some((prev, at)) = persisted else {
+        return false;
+    };
+    prev == value
+        && std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime == *at)
+}
+
+/// Async registry lookup with the disk fallback off the executor (perf doc
+/// §27): `Session::list_all` walks the workspace, so the scan +
+/// registration run in `spawn_blocking`. In-memory hits (and post-rebuild
+/// negative hits) stay inline — only a true registry miss pays the hop.
+async fn lookup_entry_async(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
+    if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
+        return Some(entry);
+    }
+    if state.rebuild_complete.load(Ordering::Relaxed)
+        && lock_map(&state.missing_sessions).contains(session_id)
+    {
+        return None;
+    }
+    let state = Arc::clone(state);
+    let session_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || lookup_entry(&state, &session_id))
+        .await
+        .ok()?
+}
+
 /// Resolve a session file path from the registry (with disk fallback), or 404.
-fn session_path(
+async fn session_path(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<std::path::PathBuf, StatusCode> {
-    lookup_entry(state, session_id)
+    lookup_entry_async(state, session_id)
+        .await
         .map(|e| e.path)
         .filter(|p| p.exists())
         .ok_or(StatusCode::NOT_FOUND)
@@ -1898,7 +1969,7 @@ async fn session_events(
     Path(session_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<EventsResponse>, StatusCode> {
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     // Presence heartbeat (§10b V1b): every journal read counts as a client
     // listening; the idle wake fires only while this stays fresh.
     state.touch_client_seen(&session_id);
@@ -1906,10 +1977,17 @@ async fn session_events(
         .get("since")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // Page-limited serving (§1): giant journals stream as bounded pages the
+    // replay loop drains with a paint between, instead of one huge slurp.
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(crate::session::EVENTS_PAGE_LIMIT);
     let events = tokio::task::spawn_blocking(move || {
         let mut events = Vec::new();
         let mut last_raw = since;
-        for (seq, payload) in Session::load_events(&path, since).unwrap_or_default() {
+        for (seq, payload) in Session::load_events(&path, since, limit).unwrap_or_default() {
             last_raw = last_raw.max(seq);
             // Unknown event types are skipped for the payload (the client's
             // fallback rule) but still advance the cursor — otherwise a
@@ -1942,7 +2020,9 @@ async fn reattach(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ReattachResponse>, StatusCode> {
-    let entry = lookup_entry(&state, &session_id).ok_or(StatusCode::NOT_FOUND)?;
+    let entry = lookup_entry_async(&state, &session_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
     if !entry.path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -1962,7 +2042,7 @@ async fn session_trace(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let trace_path = path.with_extension("trace.jsonl");
     let rows = tokio::task::spawn_blocking(move || -> Vec<serde_json::Value> {
         let Ok(text) = std::fs::read_to_string(&trace_path) else {
@@ -1983,7 +2063,7 @@ async fn session_undo(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
         session::undo_last_change(&mut session)
@@ -2014,7 +2094,7 @@ async fn session_waive(
     if reason.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let reason = reason.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
@@ -2062,7 +2142,7 @@ async fn session_shell(
     }
     // Session must exist — the workspace is resolved from the daemon cwd,
     // but the lookup guards against typos/stale ids like every other route.
-    let session_file = session_path(&state, &session_id)?;
+    let session_file = session_path(&state, &session_id).await?;
     let shell_cancel = CancellationToken::new();
     {
         let mut running = lock_map(&state.shell_tokens);
@@ -2194,7 +2274,7 @@ async fn session_name(
     let Some(name) = name.filter(|n| !n.is_empty()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let name = name.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
@@ -2235,6 +2315,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp/dex-test-cwd".into(),
                 model: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         (state, id)
@@ -2522,6 +2604,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         let r = steer(
@@ -2752,6 +2836,36 @@ mod handler_tests {
         assert!(rx_b.try_recv().is_err(), "other sessions must be untouched");
     }
 
+    #[test]
+    fn persisted_state_skip_logic() {
+        // §28: identical + untouched → skip; anything else → write.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "dex-persisted-current-{}-{}.jsonl",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        // Never written → must write.
+        assert!(!persisted_current(&None, &"v".to_string(), &path));
+        std::fs::write(&path, "{}\n").unwrap();
+        let at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let persisted = Some(("v".to_string(), at));
+        // Identical + untouched → skip the append.
+        assert!(persisted_current(&persisted, &"v".to_string(), &path));
+        // Changed value → write.
+        assert!(!persisted_current(&persisted, &"w".to_string(), &path));
+        // Same value but a stale mtime (someone rewrote the file) → write.
+        assert!(!persisted_current(
+            &Some(("v".to_string(), std::time::UNIX_EPOCH)),
+            &"v".to_string(),
+            &path
+        ));
+        // Missing file → write (same as before).
+        std::fs::remove_file(&path).unwrap();
+        assert!(!persisted_current(&persisted, &"v".to_string(), &path));
+    }
+
     #[tokio::test]
     async fn cancel_leaves_child_agent_approvals_pending() {
         let state = Arc::new(DaemonState::new());
@@ -2882,6 +2996,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         let (stx, mut srx) = mpsc::channel::<QueueMsg>(4);
@@ -2927,6 +3043,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
@@ -3574,6 +3692,8 @@ mod permission_gate_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
 
@@ -4570,6 +4690,8 @@ mod async_parallel_tests {
                     name: Some(format!("n{i}")),
                     cwd: format!("/tmp/cwd-{i}"),
                     model: None,
+                    plan_persisted: None,
+                    model_persisted: None,
                 },
             );
         }

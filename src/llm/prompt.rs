@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::core::types::Skill;
 use crate::skills::format_skills_for_prompt;
@@ -23,9 +25,48 @@ fn project_file() -> Option<PathBuf> {
     None
 }
 
+/// `project_context` result, cached process-wide and invalidated by file
+/// identity (perf doc §11): the daemon rebuilds the system prompt every
+/// turn, and each rebuild was re-walking ancestors + re-reading AGENTS.md.
+/// A missing project file is NOT cached (a walk is stat-only; caching the
+/// absence would hide a file created mid-process).
+static PROJECT_CONTEXT_CACHE: OnceLock<Mutex<Option<ProjectContextCache>>> = OnceLock::new();
+
+struct ProjectContextCache {
+    cwd: PathBuf,
+    path: PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    content: Option<String>,
+}
+
 pub(crate) fn project_context() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
     let path = project_file()?;
-    fs::read_to_string(path).ok()
+    let meta = fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    if let Some(hit) = PROJECT_CONTEXT_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("project context cache lock")
+        .as_ref()
+    {
+        if hit.cwd == cwd && hit.path == path && hit.mtime == mtime && hit.len == len {
+            return hit.content.clone();
+        }
+    }
+    let content = fs::read_to_string(&path).ok();
+    *PROJECT_CONTEXT_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("project context cache lock") = Some(ProjectContextCache {
+        cwd,
+        path,
+        mtime,
+        len,
+        content: content.clone(),
+    });
+    content
 }
 
 /// Base system prompt: identity plus imperative working rules.
