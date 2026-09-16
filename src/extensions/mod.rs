@@ -390,6 +390,42 @@ impl ExtensionManager {
         self.refresh_found(discover_scoped()).await;
     }
 
+    /// Ensure one extension is loaded, booting just it on first use (§26):
+    /// `dex run ext__foo__bar` boots one Lua VM instead of every installed
+    /// extension, and a dispatch racing the background refresh self-heals
+    /// instead of failing "unknown tool". No-op when already loaded. An
+    /// explicitly addressed extension loads even if a full refresh would
+    /// have rejected it as a latecomer — no schema ambiguity when the
+    /// caller names the owner.
+    pub(crate) async fn ensure_loaded(&self, ext_id: &str) -> Result<(), String> {
+        if self.engines.read().await.contains_key(ext_id) {
+            return Ok(());
+        }
+        self.ensure_loaded_found(ext_id, discover_scoped()).await
+    }
+
+    async fn ensure_loaded_found(
+        &self,
+        ext_id: &str,
+        found: Vec<(PathBuf, Manifest)>,
+    ) -> Result<(), String> {
+        if self.engines.read().await.contains_key(ext_id) {
+            return Ok(());
+        }
+        let Some((dir, m)) = found.into_iter().find(|(_, m)| m.id == ext_id) else {
+            return Err(format!("unknown extension '{ext_id}'"));
+        };
+        // Same serialized core as `refresh_found` (load + cache rebuild),
+        // minus the scan — concurrent refreshes can't double-load.
+        let _guard = self.refresh_lock.lock().await;
+        if self.engines.read().await.contains_key(&m.id) {
+            return Ok(());
+        }
+        self.load_one(&dir, m).await?;
+        self.rebuild_cache().await;
+        Ok(())
+    }
+
     /// Explicit reload (`/extensions reload`): like [`refresh`], plus the
     /// reconcile — extensions that vanished from disk or lost consent
     /// unload, so disable/remove takes effect in the running process
@@ -487,10 +523,23 @@ impl ExtensionManager {
         // state is held across the `.await` below.
         let (engine, timeout) = {
             let engines = self.engines.read().await;
-            let Some(ext) = engines.get(ext_id) else {
-                return Err(format!("unknown tool '{full_name}'"));
-            };
-            (ext.engine.clone(), ext.engine.tool_timeout(tool))
+            if let Some(ext) = engines.get(ext_id) {
+                (ext.engine.clone(), ext.engine.tool_timeout(tool))
+            } else {
+                // Lazy (§26): the background refresh may still be running
+                // (or this process never refreshed) — boot the addressed
+                // extension on first use. A genuinely unknown tool keeps
+                // the same error.
+                drop(engines);
+                self.ensure_loaded(ext_id)
+                    .await
+                    .map_err(|_| format!("unknown tool '{full_name}'"))?;
+                let engines = self.engines.read().await;
+                let Some(ext) = engines.get(ext_id) else {
+                    return Err(format!("unknown tool '{full_name}'"));
+                };
+                (ext.engine.clone(), ext.engine.tool_timeout(tool))
+            }
         };
         engine
             .drive(
@@ -2347,6 +2396,23 @@ end
         mgr.refresh_with(std::slice::from_ref(&root)).await;
         assert!(mgr.cached.try_read().unwrap().is_empty());
         assert!(mgr.engines.read().await.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_boots_one_extension_lazily() {
+        // §26: no refresh — the first addressed load boots just this
+        // extension; repeats are no-ops; unknown ids error without parking.
+        let root = fixture_ext(hello_manifest(), hello_lua());
+        let mgr = ExtensionManager::fresh();
+        let m = crate::extensions::manifest::parse_manifest(hello_manifest()).unwrap();
+        mgr.ensure_loaded_found("hello", vec![(root.join("ext"), m)])
+            .await
+            .unwrap();
+        assert!(mgr.engines.read().await.contains_key("hello"));
+        mgr.ensure_loaded_found("hello", vec![]).await.unwrap();
+        assert!(mgr.ensure_loaded_found("nope", vec![]).await.is_err());
+        assert!(!mgr.engines.read().await.contains_key("nope"));
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -565,6 +565,55 @@ pub(crate) fn run_ratatui_repl_with_remote(
         remote.app.session.set_name(name).ok();
     }
 
+    // §1: first paint before replay. The terminal comes up on an empty frame
+    // here; the reattach replay below then streams history in with a paint
+    // per chunk/page. Time-to-first-paint no longer includes the full
+    // history render.
+    // Detect the terminal background before raw mode / the alternate screen
+    // take over; surface colors (including the skills listing below) are
+    // resolved from this once. The probe flew with the boot fan-out (§2);
+    // this is instant when it finished alongside the session RTT. The probe
+    // warms a memoized query; a panic in it must not take down startup.
+    // (Moved up with the terminal init: the palette must resolve before raw
+    // mode, and first paint precedes replay now.)
+    let _ = crate::client::http::block_on(palette_handle);
+    enable_raw_mode()?;
+    // No startup drain here: a blind deadline cuts OSC reply bursts in half
+    // and leaks the tail (sans lead-in) into the composer. Late replies —
+    // from the theme query above or from anything else querying this tty,
+    // at any time — are swallowed whole by `strip_osc_report` in the event
+    // loop below.
+    let cleanup = TerminalCleanup;
+    let mut stdout = io::stdout();
+    // Wheel reporting (DECSET 1000 + SGR 1006): scroll events arrive as real
+    // `Event::Mouse` input instead of the terminal synthesizing Up/Down arrow
+    // presses (DECSET 1007), so the wheel always scrolls the transcript and
+    // plain Up/Down always edit the composer. Clicks are ignored; hold Shift
+    // (Option in iTerm2) for native drag-select/copy.
+    execute!(
+        stdout,
+        DisableMouseCapture,
+        EnterAlternateScreen,
+        EnableMouseScroll,
+        // DECSET 2004: the terminal wraps pastes in `ESC[200~ … ESC[201~` so
+        // crossterm delivers them as one `Event::Paste`. Without it a paste is
+        // typed through as individual keys and every embedded newline arrives
+        // as a real Enter — submitting the first line of a multi-line paste.
+        EnableBracketedPaste,
+        // Kitty keyboard protocol (disambiguate only): supporting terminals
+        // then report Shift+Enter as `Enter + SHIFT` (`CSI 13;2 u`) instead of
+        // the same bare `\r` as Enter, so the composer can tell "newline"
+        // from "submit" (see `handle_key`: Enter without SHIFT submits,
+        // everything else falls through to the composer). Terminals without
+        // support ignore the sequence; Ctrl+J (`InputField::handle_key`)
+        // stays the universal fallback. Popped by `TerminalCleanup`.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    // First paint: empty transcript + composer. History streams in below.
+    terminal.draw(|f| view(f, &mut remote.app))?;
+
     // P10: reconstruct the transcript for a reattached session. Prefer the
     // persisted JSONL messages (complete, includes user prompts the events
     // journal never records); fall back to the events journal when the file
@@ -577,6 +626,12 @@ pub(crate) fn run_ratatui_repl_with_remote(
         // recomputes this flag every iteration, so boot is the only window
         // it covers.)
         remote.busy_poll.store(true, Ordering::SeqCst);
+        // Progressive paints (§1): each replay chunk/page draws, so history
+        // streams into the already-painted frame. Best-effort: the event
+        // loop's draws remain authoritative.
+        let mut paint = |remote: &mut RemoteApp| {
+            let _ = terminal.draw(|f| view(f, &mut remote.app));
+        };
         let local = find_local_session_file(&remote.session_id);
         let mut rebuilt = false;
         if let Some(p) = local.as_deref() {
@@ -584,7 +639,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
                 remote.app.session = s;
             }
             if let Some(p) = local.as_deref() {
-                rebuilt = rebuild_remote_from_messages(&mut remote, p);
+                rebuilt = rebuild_remote_from_messages(&mut remote, p, &mut paint);
             }
             if rebuilt {
                 // The drain path seeds the cursor per page; the local path
@@ -598,7 +653,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
         }
         if !rebuilt {
             let sid = remote.session_id.clone();
-            replay_remote_events(&mut remote, &sid);
+            replay_remote_events(&mut remote, &sid, &mut paint);
         }
         remote.busy_poll.store(false, Ordering::SeqCst);
         push_info(
@@ -638,13 +693,6 @@ pub(crate) fn run_ratatui_repl_with_remote(
         })
         .collect();
 
-    // Detect the terminal background before raw mode / the alternate screen
-    // take over; surface colors (including the skills listing below) are
-    // resolved from this once. The probe flew with the boot fan-out (§2);
-    // this is instant when it finished alongside the session RTT. The probe
-    // warms a memoized query; a panic in it must not take down startup.
-    let _ = crate::client::http::block_on(palette_handle);
-
     // Session-start view: the DEX art, then the skills the daemon discovered,
     // then how fast the TUI was ready to use.
     push_banner(&mut remote.app);
@@ -661,41 +709,6 @@ pub(crate) fn run_ratatui_repl_with_remote(
     if let Some(warning) = info.thinking_warning.clone() {
         push_info(&mut remote.app, format!("dex: {warning}"));
     }
-
-    enable_raw_mode()?;
-    // No startup drain here: a blind deadline cuts OSC reply bursts in half
-    // and leaks the tail (sans lead-in) into the composer. Late replies —
-    // from the theme query above or from anything else querying this tty,
-    // at any time — are swallowed whole by `strip_osc_report` in the event
-    // loop below.
-    let cleanup = TerminalCleanup;
-    let mut stdout = io::stdout();
-    // Wheel reporting (DECSET 1000 + SGR 1006): scroll events arrive as real
-    // `Event::Mouse` input instead of the terminal synthesizing Up/Down arrow
-    // presses (DECSET 1007), so the wheel always scrolls the transcript and
-    // plain Up/Down always edit the composer. Clicks are ignored; hold Shift
-    // (Option in iTerm2) for native drag-select/copy.
-    execute!(
-        stdout,
-        DisableMouseCapture,
-        EnterAlternateScreen,
-        EnableMouseScroll,
-        // DECSET 2004: the terminal wraps pastes in `ESC[200~ … ESC[201~` so
-        // crossterm delivers them as one `Event::Paste`. Without it a paste is
-        // typed through as individual keys and every embedded newline arrives
-        // as a real Enter — submitting the first line of a multi-line paste.
-        EnableBracketedPaste,
-        // Kitty keyboard protocol (disambiguate only): supporting terminals
-        // then report Shift+Enter as `Enter + SHIFT` (`CSI 13;2 u`) instead of
-        // the same bare `\r` as Enter, so the composer can tell "newline"
-        // from "submit" (see `handle_key`: Enter without SHIFT submits,
-        // everything else falls through to the composer). Terminals without
-        // support ignore the sequence; Ctrl+J (`InputField::handle_key`)
-        // stays the universal fallback. Popped by `TerminalCleanup`.
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
 
     // Report lifecycle state to the enclosing Herdr pane, if any.
     let mut herdr = super::herdr::Reporter::new();
@@ -1084,14 +1097,13 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             // the parent turn, so several can be answerable at once. The
             // overlay resolves the front; each entry POSTs its own decision.
             let (response, decision_rx) = mpsc::channel::<CoreApprovalDecision>(1);
-            remote.app.pending_approvals.push(PendingApproval {
+            remote.app.pending_approvals.push(PendingApproval::new(
                 name,
                 input,
                 response,
-                selected: 0,
-                request_id: request_id.clone(),
+                request_id.clone(),
                 agent,
-            });
+            ));
             spawn_approval_poster(
                 remote.client.clone(),
                 remote.session_id.clone(),
@@ -1212,10 +1224,28 @@ fn find_local_session_file(sid: &str) -> Option<std::path::PathBuf> {
         .map(|(p, _)| p)
 }
 
+/// Messages rendered per paint during a chunked startup replay (§1).
+const REPLAY_PAINT_CHUNK: usize = 200;
+
 /// Rebuild the transcript from the persisted JSONL messages (complete:
 /// includes the user prompts the events journal never records). Returns
 /// true when anything was rendered. Mirrors the local `/resume` path.
-fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) -> bool {
+/// Progressive (§1): renders head→tail in chunks with a `paint` between,
+/// so a huge history streams into the already-painted frame instead of
+/// blocking first paint. `render_message_slice` threads ids across chunks
+/// with no mid flush, so the final transcript is byte-identical to one-shot
+/// (`app.messages` is taken for the render and restored after — the footer
+/// token estimate reads it, so mid-replay frames show a stale count that
+/// corrects on the final paint).
+/// No-op replay paint for the mid-loop `/resume` path (the event loop's
+/// own draws pick the rebuilt transcript up).
+fn no_paint(_: &mut RemoteApp) {}
+
+fn rebuild_remote_from_messages(
+    remote: &mut RemoteApp,
+    path: &std::path::Path,
+    mut paint: impl for<'r> FnMut(&'r mut RemoteApp),
+) -> bool {
     // Messages + plan ride one scan (§1): the plan used to cost a second
     // full pass right after the messages load.
     let Ok((loaded, plan)) = crate::session::load_messages_and_plan(path) else {
@@ -1233,7 +1263,23 @@ fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) 
     remote.app.messages.clear();
     remote.app.messages.push(system);
     remote.app.messages.extend(loaded);
-    super::rebuild_transcript(&mut remote.app);
+    let msgs = std::mem::take(&mut remote.app.messages);
+    remote.app.transcript.clear();
+    remote.app.assistant_pending.clear();
+    remote.app.assistant_gap.reset();
+    remote.app.assistant_open = false;
+    remote.app.thinking_open = false;
+    let mut opened = std::collections::HashSet::new();
+    if msgs.len() > 1 {
+        // Skip the leading system message (never rendered).
+        for chunk in msgs[1..].chunks(REPLAY_PAINT_CHUNK) {
+            super::render_message_slice(&mut remote.app, chunk, &mut opened);
+            paint(remote);
+        }
+    }
+    remote.app.messages = msgs;
+    super::flush_assistant(&mut remote.app);
+    remote.app.autoscroll = true;
     if !plan.is_empty() {
         remote.app.plan = plan;
     }
@@ -1243,12 +1289,20 @@ fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) 
 /// Replay the daemon's events journal into the transcript (best effort when
 /// no local file is available, e.g. true remote). Skips parked approvals;
 /// flushes the throttled assistant buffer so the replay is visible.
-fn replay_remote_events(remote: &mut RemoteApp, session_id: &str) {
+/// Paged (§1): the server caps pages, so each iteration is one bounded RTT
+/// plus a render with a `paint` between — a giant journal streams in
+/// instead of arriving as one huge slurp, and pages always advance.
+fn replay_remote_events(
+    remote: &mut RemoteApp,
+    session_id: &str,
+    mut paint: impl for<'r> FnMut(&'r mut RemoteApp),
+) {
     let mut since = 0u64;
     loop {
         let prev = since;
         match remote.client.events(session_id, since) {
             Ok(resp) => {
+                let served = resp.events.len();
                 for env in resp.events {
                     // A parked parent-turn approval is dead (denied at its
                     // turn's teardown); a child approval (V1b) stays
@@ -1262,8 +1316,12 @@ fn replay_remote_events(remote: &mut RemoteApp, session_id: &str) {
                 remote
                     .events_cursor
                     .fetch_max(resp.next_seq, Ordering::SeqCst);
-                // No forward progress means the journal is drained.
-                if since <= prev {
+                paint(remote);
+                // No forward progress means the journal is drained. A short
+                // page means EOF (saves the extra empty fetch); the
+                // no-progress break stays as backup for old daemons without
+                // page limits.
+                if since <= prev || served < crate::session::EVENTS_PAGE_LIMIT {
                     break;
                 }
             }
@@ -2774,11 +2832,11 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     // when no local file is available (true remote).
                     let mut rebuilt = false;
                     if let Some(p) = local_path.as_deref() {
-                        rebuilt = rebuild_remote_from_messages(remote, p);
+                        rebuilt = rebuild_remote_from_messages(remote, p, no_paint);
                     }
                     if !rebuilt {
                         let sid = remote.session_id.clone();
-                        replay_remote_events(remote, &sid);
+                        replay_remote_events(remote, &sid, no_paint);
                         if remote.app.transcript.is_empty()
                             && remote.app.assistant_pending.is_empty()
                         {

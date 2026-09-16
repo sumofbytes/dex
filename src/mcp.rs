@@ -890,7 +890,7 @@ impl HttpTransport {
         if let Some(s) = had_session.clone() {
             req = req.header("mcp-session-id", s);
         }
-        let resp = req
+        let mut resp = req
             .json(&body)
             .send()
             .await
@@ -932,8 +932,34 @@ impl HttpTransport {
         if !status.is_success() {
             return Err(fail(format!("mcp http {status}: {method}")));
         }
-        let text = resp.text().await.map_err(|e| fail(e.to_string()))?;
-        // Plain JSON wins; otherwise scan SSE `data:` lines for the reply.
+        // Stream-decode (§20): the server may hold the SSE stream open after
+        // the result (server-initiated messages) — waiting for the full body
+        // then meant hanging until the call timeout even though the reply
+        // had arrived. Decode `data:` lines incrementally and return on the
+        // first envelope carrying a result/error (same "first wins" rule as
+        // the old full-body scan). A non-SSE plain-JSON body falls back to a
+        // whole-body parse at EOF.
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if let Some(r) = sse_scan_chunk(&mut buf, &chunk) {
+                        return Ok(r);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(fail(e.to_string())),
+            }
+        }
+        // Trailing line without a newline, then the plain-JSON fallback for
+        // non-SSE responses (as before).
+        if !buf.is_empty() {
+            let line = String::from_utf8_lossy(&buf);
+            if let Some(r) = sse_result(&line) {
+                return Ok(r);
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
         if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
             if v.is_object() {
                 if let Some(r) = extract_rpc_result(&v) {
@@ -941,19 +967,33 @@ impl HttpTransport {
                 }
             }
         }
-        for line in text.lines() {
-            let data = line.trim().strip_prefix("data:").unwrap_or("").trim();
-            if data.is_empty() || data == "[DONE]" {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                if let Some(r) = extract_rpc_result(&v) {
-                    return Ok(r);
-                }
-            }
-        }
         Err(fail("mcp: no result in http response".to_string()))
     }
+}
+
+/// One SSE `data:` line → RPC result/error, if it carries one. Progress
+/// notifications (no `result`/`error`) return `None` so the scan continues.
+fn sse_result(line: &str) -> Option<Value> {
+    let data = line.trim().strip_prefix("data:").unwrap_or("").trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|v| extract_rpc_result(&v))
+}
+
+/// Append one body chunk and scan the newly completed lines (§20): a `data:`
+/// line split across chunks stays buffered until its newline arrives.
+fn sse_scan_chunk(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Value> {
+    buf.extend_from_slice(chunk);
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=pos).collect();
+        if let Some(r) = sse_result(&String::from_utf8_lossy(&line)) {
+            return Some(r);
+        }
+    }
+    None
 }
 
 fn extract_rpc_result(v: &Value) -> Option<Value> {
@@ -1690,6 +1730,28 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn sse_stream_decode_returns_first_result_with_early_exit() {
+        // §20: notifications and blanks scan past; a result split across
+        // chunks still matches once its newline arrives.
+        let mut buf = Vec::new();
+        assert!(sse_scan_chunk(&mut buf, b": keep-alive\n\n").is_none());
+        assert!(sse_scan_chunk(
+            &mut buf,
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"progress\"}\n"
+        )
+        .is_none());
+        assert!(sse_scan_chunk(&mut buf, b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"res").is_none());
+        let r = sse_scan_chunk(&mut buf, b"ult\":{\"ok\":true}}\n").expect("split result matches");
+        assert_eq!(r, serde_json::json!({"ok": true}));
+        // Error envelopes match too; [DONE] and blanks don't.
+        assert!(sse_result("data: [DONE]").is_none());
+        assert!(sse_result("").is_none());
+        assert!(sse_result(": comment").is_none());
+        let e = sse_result("data: {\"error\":{\"code\":-1}}").expect("error matches");
+        assert!(e.get("__mcp_error").is_some());
     }
 
     fn fake_client(tools: Vec<McpTool>, resources: bool, fail: bool) -> McpClient {
