@@ -169,14 +169,42 @@ fn agent_id_arg(args: &Map<String, Value>) -> Result<AgentId, ToolError> {
         .ok_or(ToolError::Missing("agent_id"))
 }
 
-/// `delegate(agent, task?, file_hints?, resume_from?, instruction?)` —
+/// `delegate(agent, task?, file_hints?, model?, resume_from?, instruction?)` —
+///
 /// fresh: resolve the definition, build the isolated seed from the tool
 /// arguments (the parent model writes the task itself; dex never
-/// auto-copies transcript, §5), spawn, return immediately. Resume:
-/// `resume_from` names a terminal child whose transcript replays as
+/// auto-copies transcript, §5), spawn, return immediately. `model` is the
+/// same single-knob selection as the main agent (`provider/model`); when
+/// present it overrides the definition for this spawn (complexity-based
+/// pick), otherwise the child inherits this turn's resolved model (§13).
+/// Resume: `resume_from` names a terminal child whose transcript replays as
 /// generation + 1 with an interruption nudge (§24.1–§24.3); `task` is
 /// then unneeded, and `instruction` (plus `file_hints`) folds into the
-/// nudge instead of replacing the original task.
+/// nudge instead of replacing the original task. A resume without its own
+/// `model` keeps the finished generation's model (handle-carried), so a
+/// complexity-chosen model survives generations unless overridden.
+fn effective_child_model(
+    explicit: Option<String>,
+    handle_model: Option<&str>,
+    def_model: Option<String>,
+) -> Option<String> {
+    explicit
+        .or_else(|| handle_model.map(str::to_string))
+        .or(def_model)
+}
+
+/// Clone the parent config and apply the effective model override, if any.
+/// Single resolution point: dispatch validates here (fail-fast, no Running
+/// entry on a bad pick) and hands the resolved config to the child body, so
+/// the catalog is read once per spawn instead of twice.
+fn resolve_child_config(parent: &LlmConfig, model: Option<&str>) -> Result<LlmConfig, String> {
+    let mut config = parent.clone();
+    if let Some(model) = model {
+        config.apply_model(model, false)?;
+    }
+    Ok(config)
+}
+
 async fn delegate(
     ctx: &Arc<AgentTurnContext>,
     args: &Map<String, Value>,
@@ -189,12 +217,32 @@ async fn delegate(
         )));
     }
     let agent_name = string_arg(args, "agent").ok_or(ToolError::Missing("agent"))?;
-    let def = super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
+    let mut def = super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
     let resume_from = string_arg(args, "resume_from");
     let task = string_arg(args, "task");
     if resume_from.is_none() && task.is_none() {
         return Err(ToolError::Missing("task"));
     }
+    // Resolve the handle before the model so a resume without its own
+    // `model` can inherit the finished generation's pick. On-disk handles
+    // predate model tracking (`None`) and fall back to the definition.
+    let handle_opt = match &resume_from {
+        Some(resume_id) => Some(resolve_resume_handle(ctx, &AgentId(resume_id.clone())).await?),
+        None => None,
+    };
+    let explicit = string_arg(args, "model");
+    let base = def.model.clone();
+    def.model = effective_child_model(
+        explicit,
+        handle_opt.as_ref().and_then(|h| h.model.as_deref()),
+        base,
+    );
+    // Fail fast at dispatch: an unresolvable pick returns InvalidArgument
+    // without spawning a child the parent must poll to discover the error.
+    let child_config: Arc<LlmConfig> = Arc::new(
+        resolve_child_config(&ctx.config, def.model.as_deref())
+            .map_err(ToolError::InvalidArgument)?,
+    );
     let file_hints = args
         .get("file_hints")
         .and_then(Value::as_array)
@@ -206,8 +254,7 @@ async fn delegate(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if let Some(resume_id) = resume_from {
-        let handle = resolve_resume_handle(ctx, &AgentId(resume_id)).await?;
+    if let Some(handle) = handle_opt {
         let instruction = string_arg(args, "instruction");
         let seed = ContextSeed {
             // Unused on the resume path (messages replay from the
@@ -236,7 +283,7 @@ async fn delegate(
                     parent_session: Some(ctx.session_path.clone()),
                     remaining_budget: handle.remaining_budget,
                 },
-                child_body(ctx.clone(), def.clone(), seed, Some(resume)),
+                child_body(ctx.clone(), def.clone(), seed, Some(resume), child_config),
             )
             .map_err(|error| ToolError::Denied(error.to_string()))?;
         if let Some(console) = policy.console.as_ref() {
@@ -270,7 +317,7 @@ async fn delegate(
                 parent_session: Some(ctx.session_path.clone()),
                 remaining_budget: None,
             },
-            child_body(ctx.clone(), def.clone(), seed, None),
+            child_body(ctx.clone(), def.clone(), seed, None, child_config),
         )
         .map_err(|error| ToolError::Denied(error.to_string()))?;
     if let Some(console) = policy.console.as_ref() {
@@ -476,6 +523,8 @@ async fn resolve_resume_handle(
             generation,
             // Spend died with the daemon: the resume runs the full cap.
             remaining_budget: None,
+            // Predates model tracking: the resume falls back to the definition.
+            model: None,
             note: "interrupted (daemon restart or crash); prior spend unknown".to_string(),
         });
     }
@@ -654,12 +703,23 @@ pub(crate) fn child_body(
     def: AgentDefinition,
     seed: ContextSeed,
     resume: Option<ResumeRequest>,
+    child_config: Arc<LlmConfig>,
 ) -> ChildBody {
     Box::new(move |token, progress, id| {
-        Box::pin(child_run(ctx, def, seed, token, progress, id, resume))
+        Box::pin(child_run(
+            ctx,
+            def,
+            seed,
+            token,
+            progress,
+            id,
+            resume,
+            child_config,
+        ))
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn child_run(
     ctx: Arc<AgentTurnContext>,
     def: AgentDefinition,
@@ -668,23 +728,13 @@ async fn child_run(
     progress: ProgressReporter,
     id: AgentId,
     resume: Option<ResumeRequest>,
+    child_config: Arc<LlmConfig>,
 ) -> AgentResult {
-    // §13: the definition's model override resolves through the existing
-    // one-knob path; `None` inherits the parent's resolved model.
-    let mut config = (*ctx.config).clone();
-    if let Some(model) = def.model.as_deref() {
-        if let Err(error) = config.apply_model(model, false) {
-            return AgentResult {
-                status: AgentState::Failed,
-                summary: String::new(),
-                error: Some(format!("agent model '{model}' failed to resolve: {error}")),
-                usage: None,
-                reason: ExitReason::Permanent,
-                tool_calls: 0,
-                resume: None,
-            };
-        }
-    }
+    // §13: `child_config` is the dispatch-resolved model (parent plus
+    // definition / per-spawn `model` override, validated once in
+    // `delegate`), so the body never re-resolves and the catalog is read
+    // once per spawn.
+    let config = (*child_config).clone();
     // Child JSONL (§16): its own file beside the parent's, same marker
     // discipline (`turn_start`/`turn_complete`/`turn_failed`), so a crash
     // loses at most the in-flight event. Resume generations append `.g<N>`
@@ -854,15 +904,18 @@ async fn child_run(
         allowed,
     };
     // The child's daemon context for one more level, when allowed. Shares
-    // the session coordinates, model config, manager, and approval bridges —
-    // only the depth advances.
+    // the session coordinates, manager, and approval bridges — only the
+    // depth advances. The config is the child's *resolved* model (parent
+    // model plus definition / per-spawn `model` override), so a grandchild
+    // without its own override inherits the complexity-chosen model rather
+    // than skipping back to the root.
     let child_ctx: Option<Arc<AgentTurnContext>> = if may_delegate {
         Some(Arc::new(AgentTurnContext {
             depth: child_depth,
             session_id: ctx.session_id.clone(),
             session_path: ctx.session_path.clone(),
             cwd: ctx.cwd.clone(),
-            config: ctx.config.clone(),
+            config: Arc::new(config.clone()),
             manager: ctx.manager.clone(),
             session_approvals: ctx.session_approvals.clone(),
             child_approvals: ctx.child_approvals.clone(),
@@ -1076,6 +1129,126 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; env must stay redirected across the spawn
+    async fn delegate_rejects_unresolvable_model_before_spawning() {
+        // Complexity-based override fails fast: an unresolvable `model`
+        // returns InvalidArgument without spawning a child (no Running
+        // entry the parent must poll to discover the error).
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = [
+            "OPENCODE_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_ACCOUNT_ID",
+            "CODEX_HOME",
+            "XDG_CACHE_HOME",
+        ]
+        .iter()
+        .map(|key| (*key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+        for key in ["OPENCODE_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID"] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-delegate-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("CODEX_HOME", dir.join("codex-home"));
+        let manager = AgentManager::new("sess");
+        let ctx = Arc::new(AgentTurnContext {
+            depth: 0,
+            session_id: "sess".to_string(),
+            session_path: PathBuf::new(),
+            cwd: String::new(),
+            config: Arc::new(crate::llm::config::tests::test_cfg()),
+            manager: manager.clone(),
+            session_approvals: HashSet::new(),
+            child_approvals: None,
+            live_approvals: None,
+        });
+        let mut args = Map::new();
+        args.insert("agent".into(), json!("explorer"));
+        args.insert("task".into(), json!("look around"));
+        args.insert("model".into(), json!("openai-codex/gpt-x"));
+        let error = delegate(&ctx, &args, &Policy::trusted()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("openai-codex")
+                || error.to_string().contains("credentials")
+                || error.to_string().contains("endpoint"),
+            "{error}"
+        );
+        assert_eq!(manager.active_count(), 0);
+        manager.shutdown().await;
+        for (key, prev) in saved {
+            match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_child_model_prefers_explicit_then_handle_then_def() {
+        // Per-spawn beats file-frontmatter; a resume without its own pick
+        // keeps the finished generation's model; otherwise the definition
+        // (frontmatter or `None` = inherit) stands.
+        assert_eq!(
+            effective_child_model(
+                Some("opencode/m-strong".to_string()),
+                Some("opencode/m-cheap"),
+                Some("opencode/m-front".to_string()),
+            )
+            .as_deref(),
+            Some("opencode/m-strong")
+        );
+        assert_eq!(
+            effective_child_model(
+                None,
+                Some("opencode/m-cheap"),
+                Some("opencode/m-front".to_string()),
+            )
+            .as_deref(),
+            Some("opencode/m-cheap")
+        );
+        assert_eq!(
+            effective_child_model(None, None, Some("opencode/m-front".to_string()),).as_deref(),
+            Some("opencode/m-front")
+        );
+        assert_eq!(effective_child_model(None, None, None), None);
+    }
+
+    #[test]
+    fn resolve_child_config_applies_override_once_and_inherits_on_none() {
+        // Success path the failure test above doesn't cover: a same-provider
+        // bare id resolves without credentials, `None` clones the parent,
+        // and the resolved config is what the child (and grandchild) runs.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("dex-delegate-model-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_cache = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let parent = crate::llm::config::tests::test_cfg();
+        let inherited = resolve_child_config(&parent, None).unwrap();
+        assert_eq!(inherited.model, parent.model);
+        assert_eq!(inherited.base_url, parent.base_url);
+        let cheap = resolve_child_config(&parent, Some("m-c")).unwrap();
+        assert_eq!(cheap.model, "m-c");
+        // Same provider, so the endpoint stays put; only the id moves.
+        assert_eq!(cheap.base_url, parent.base_url);
+        match prev_cache {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn parent_cancel_ends_delegate_output_without_touching_children() {
         // §22-I: the parent's cancel token ends the `delegate_output` wait
         // early (the deadline is minutes away, so an instant return proves
@@ -1193,6 +1366,7 @@ mod tests {
                 transcript: Session::child_path(&parent_path, "sess-2", "tester", 0),
                 generation: 0,
                 remaining_budget: Some(7),
+                model: None,
                 note: "timed out after 3 tool calls; continue from the transcript".to_string(),
             },
             instruction: Some("skip the build".to_string()),
@@ -1263,6 +1437,7 @@ mod tests {
                 transcript: Session::child_path(&parent_path, "sess-3", "tester", 0),
                 generation: 0,
                 remaining_budget: None,
+                model: None,
                 note: "interrupted".to_string(),
             },
             instruction: None,
@@ -1282,6 +1457,7 @@ mod tests {
                 transcript: PathBuf::from("/tmp/x.jsonl"),
                 generation: 2,
                 remaining_budget: Some(5),
+                model: None,
                 note: "turn budget exhausted after 50 tool calls; continue from the transcript"
                     .to_string(),
             },
@@ -1327,6 +1503,7 @@ mod tests {
                 transcript: PathBuf::from("/tmp/x.jsonl"),
                 generation: 0,
                 remaining_budget: Some(5),
+                model: None,
                 note: "timed out".to_string(),
             },
             instruction: Some("skip the build".to_string()),
@@ -1410,6 +1587,7 @@ mod tests {
                                 transcript,
                                 generation: 0,
                                 remaining_budget: Some(46),
+                                model: None,
                                 note: "timed out after 4 tool calls; continue from the transcript"
                                     .to_string(),
                             }),
