@@ -197,7 +197,7 @@ pub(crate) fn set_enabled(id: &str, enabled: bool) -> std::io::Result<()> {
     if !manifest::valid_segment(id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars"),
+            format!("invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"),
         ));
     }
     let enabled_path = marker_path("enabled", id);
@@ -217,8 +217,8 @@ pub(crate) fn set_enabled(id: &str, enabled: bool) -> std::io::Result<()> {
 struct LoadedExtension {
     manifest: Manifest,
     engine: ExtensionEngine,
-    /// Full `lua__<ext>__<tool>` names, sorted (shadows excluded: they ride
-    /// the built-in name, never a `lua__` one).
+    /// Full `ext__<ext>__<tool>` names, sorted (shadows excluded: they ride
+    /// the built-in name, never a `ext__` one).
     tools: Vec<String>,
     /// Subscribed event names, sorted.
     events: Vec<String>,
@@ -434,7 +434,7 @@ impl ExtensionManager {
         for ext in engines.values() {
             for full in &ext.tools {
                 let short = full
-                    .strip_prefix(&format!("lua__{}__", ext.manifest.id))
+                    .strip_prefix(&format!("ext__{}__", ext.manifest.id))
                     .unwrap_or(full);
                 if let Some(declared) = ext.manifest.tools.iter().find(|t| t.name == short) {
                     tools.push(ToolDefinition {
@@ -463,7 +463,7 @@ impl ExtensionManager {
         *self.shadowed.write().await = shadowed;
     }
 
-    /// Dispatch `lua__<ext>__<tool>`: run the tool on its worker, answering
+    /// Dispatch `ext__<ext>__<tool>`: run the tool on its worker, answering
     /// nested `dex.tools.call` with the caller's gates.
     async fn call(
         &self,
@@ -472,7 +472,7 @@ impl ExtensionManager {
         host: &HostCtx<'_>,
     ) -> Result<String, String> {
         let (ext_id, tool) =
-            split_lua_name(full_name).ok_or_else(|| format!("unknown tool '{full_name}'"))?;
+            split_ext_name(full_name).ok_or_else(|| format!("unknown tool '{full_name}'"))?;
         // Clone the engine out of the lock: it is channel-based, so no Lua
         // state is held across the `.await` below.
         let (engine, timeout) = {
@@ -866,12 +866,41 @@ pub(crate) fn prompt_appendix() -> String {
         )
 }
 pub(crate) fn full_tool_name(ext: &str, tool: &str) -> String {
-    format!("lua__{ext}__{tool}")
+    format!("ext__{ext}__{tool}")
 }
 
-/// Split `lua__<ext>__<tool>`; `None` for anything else (built-ins, MCP).
-pub(crate) fn split_lua_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("lua__")?;
+/// True for extension tools under either the canonical `ext__` prefix or
+/// the pre-rename `lua__` alias (single place that knows both, so dispatch,
+/// gates, and preload stay in sync).
+pub(crate) fn is_extension_tool(name: &str) -> bool {
+    name.starts_with("ext__") || name.starts_with("lua__")
+}
+
+/// Map a legacy `lua__<ext>__<tool>` name to its canonical `ext__` form.
+/// Canonical names (and non-extension names) pass through untouched.
+pub(crate) fn normalize_tool_name(name: &str) -> String {
+    match split_ext_name(name) {
+        Some((ext, tool)) => full_tool_name(ext, tool),
+        None => name.to_string(),
+    }
+}
+
+/// Split `ext__<ext>__<tool>`; `None` for anything else (built-ins, MCP).
+/// The pre-rename `lua__` prefix still splits (deprecated alias) with a
+/// one-time pointer at the replacement, so old sessions and one-liners keep
+/// dispatching instead of hitting `unknown tool`.
+pub(crate) fn split_ext_name(name: &str) -> Option<(&str, &str)> {
+    let rest = match name.strip_prefix("ext__") {
+        Some(rest) => rest,
+        None => {
+            let rest = name.strip_prefix("lua__")?;
+            crate::llm::config::warn_once(
+                "ext.lua-prefix",
+                "tool prefix `lua__` is deprecated, use `ext__` instead",
+            );
+            rest
+        }
+    };
     let (ext, tool) = rest.split_once("__")?;
     if ext.is_empty() || tool.is_empty() || tool.contains("__") {
         return None;
@@ -946,7 +975,7 @@ pub(crate) fn cached_schema_tokens() -> u64 {
         .unwrap_or_default()
 }
 
-/// Dispatch `lua__<ext>__<tool>`. All errors are plain strings; the caller
+/// Dispatch `ext__<ext>__<tool>`. All errors are plain strings; the caller
 /// maps to `ToolError::Internal` for the single audit row.
 pub(crate) async fn call_global(
     name: &str,
@@ -1529,7 +1558,7 @@ pub(crate) fn state_set(ext_id: &str, key: String, value: serde_json::Value) {
     });
 }
 
-/// `dex.tools.list()`: the extension tool names (full `lua__` names).
+/// `dex.tools.list()`: the extension tool names (full `ext__` names).
 pub(crate) fn tools_list() -> Vec<String> {
     GLOBAL
         .get()
@@ -1544,7 +1573,7 @@ pub(crate) fn tools_list() -> Vec<String> {
 
 /// `dex.tools.set_active(list)`: persist the schema slice; an empty list
 /// means "no extension tools". Short (own-extension) names resolve to full
-/// `lua__<ext>__<tool>` names here so extension code never spells the
+/// `ext__<ext>__<tool>` names here so extension code never spells the
 /// prefix; full names pass through, and unknown names filter out at read
 /// time (see `set_active`).
 pub(crate) async fn set_active_global(ext: &str, tools: Vec<String>) {
@@ -1554,11 +1583,15 @@ pub(crate) async fn set_active_global(ext: &str, tools: Vec<String>) {
     }
 }
 
-/// Resolve one `set_active` entry to its full name: already-full `lua__`
-/// names pass through, anything else names the caller's own tool.
+/// Resolve one `set_active` entry to its full name: already-full `ext__`
+/// names pass through, legacy `lua__` names normalize to `ext__` (so the
+/// read-time filter against canonical cache names still matches), and
+/// anything else names the caller's own tool.
 pub(crate) fn resolve_active_name(ext: &str, name: &str) -> String {
-    if name.starts_with("lua__") {
+    if name.starts_with("ext__") {
         name.to_string()
+    } else if name.starts_with("lua__") {
+        normalize_tool_name(name)
     } else {
         full_tool_name(ext, name)
     }
@@ -1606,10 +1639,10 @@ pub(crate) fn install(src: &str) -> Result<String, String> {
 /// was discovered (user or project scope — removing is always a user act).
 pub(crate) fn remove(id: &str) -> Result<(), String> {
     // `dir.join(id)` below must never traverse: reject anything outside the
-    // same [a-z0-9_-]+ shape the manifest validator enforces.
+    // same [a-z0-9_-]+ (no `__`) shape the manifest validator enforces.
     if !manifest::valid_segment(id) {
         return Err(format!(
-            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars"
+            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
         ));
     }
     for (dir, _) in scoped_extension_dirs() {
@@ -1845,21 +1878,39 @@ pub(crate) mod tests {
 
     #[test]
     fn split_names() {
-        assert_eq!(split_lua_name("lua__myext__tool"), Some(("myext", "tool")));
-        assert_eq!(full_tool_name("myext", "tool"), "lua__myext__tool");
-        assert!(split_lua_name("read").is_none());
-        assert!(split_lua_name("mcp__a__b").is_none());
-        assert!(split_lua_name("lua__a").is_none());
-        assert!(split_lua_name("lua____t").is_none());
-        assert!(split_lua_name("lua__a__b__c").is_none());
+        assert_eq!(split_ext_name("ext__myext__tool"), Some(("myext", "tool")));
+        assert_eq!(full_tool_name("myext", "tool"), "ext__myext__tool");
+        assert!(split_ext_name("read").is_none());
+        assert!(split_ext_name("mcp__a__b").is_none());
+        assert!(split_ext_name("ext__a").is_none());
+        assert!(split_ext_name("ext____t").is_none());
+        assert!(split_ext_name("ext__a__b__c").is_none());
+        // Deprecated pre-rename alias still dispatches.
+        assert_eq!(split_ext_name("lua__myext__tool"), Some(("myext", "tool")));
+        assert!(split_ext_name("lua__a__b__c").is_none());
+    }
+
+    #[test]
+    fn legacy_alias_names() {
+        assert!(is_extension_tool("ext__web__search"));
+        assert!(is_extension_tool("lua__web__search"));
+        assert!(!is_extension_tool("mcp__srv__tool"));
+        assert!(!is_extension_tool("read"));
+        assert_eq!(normalize_tool_name("lua__web__search"), "ext__web__search");
+        assert_eq!(normalize_tool_name("ext__web__search"), "ext__web__search");
     }
 
     #[test]
     fn active_names_resolve() {
-        assert_eq!(resolve_active_name("web", "search"), "lua__web__search");
+        assert_eq!(resolve_active_name("web", "search"), "ext__web__search");
+        assert_eq!(
+            resolve_active_name("web", "ext__web__search"),
+            "ext__web__search"
+        );
+        // Legacy alias normalizes so the read-time filter still matches.
         assert_eq!(
             resolve_active_name("web", "lua__web__search"),
-            "lua__web__search"
+            "ext__web__search"
         );
     }
 
@@ -1910,7 +1961,7 @@ end
         mgr.refresh_with(std::slice::from_ref(&root)).await;
         let tools = mgr.cached.try_read().unwrap().clone();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "lua__hello__greet");
+        assert_eq!(tools[0].function.name, "ext__hello__greet");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1972,7 +2023,7 @@ end
             filter: None,
         };
         let err = mgr2
-            .call("lua__bomb__evil", &serde_json::Map::new(), &host)
+            .call("ext__bomb__evil", &serde_json::Map::new(), &host)
             .await
             .unwrap_err();
         assert!(
@@ -1988,14 +2039,14 @@ end
         use crate::core::types::PermissionMode;
         use crate::tools::{Policy, ToolFilter};
         // Static metadata arm: Shell requirement, like mcp__.
-        let meta = crate::tools::metadata("lua__anything__tool").unwrap();
+        let meta = crate::tools::metadata("ext__anything__tool").unwrap();
         assert_eq!(meta.permission, crate::tools::PermissionRequirement::Shell);
 
         let args = serde_json::Map::new();
         // GLOBAL is empty in tests: Trusted passes the gates and fails at
         // dispatch (unknown tool) — proving the gate passed, not denied.
         let err = crate::tools::execute(
-            "lua__noext__notool",
+            "ext__noext__notool",
             &args,
             &crate::agent::state::GlobalCancellation,
             &Policy::trusted(),
@@ -2008,7 +2059,7 @@ end
         // ReadOnly denies before dispatch.
         let console = crate::core::console::Console::none();
         let err = crate::tools::execute(
-            "lua__noext__notool",
+            "ext__noext__notool",
             &args,
             &crate::agent::state::GlobalCancellation,
             &Policy::turn(PermissionMode::ReadOnly, &console),
@@ -2018,10 +2069,10 @@ end
         .unwrap_err()
         .to_string();
         assert!(err.contains("denied"), "got: {err}");
-        // Child allowlists reject lua__ before any gate or dispatch.
+        // Child allowlists reject ext__ before any gate or dispatch.
         let filter = ToolFilter::new("explorer", ["read"]);
         let err = crate::tools::execute(
-            "lua__noext__notool",
+            "ext__noext__notool",
             &args,
             &crate::agent::state::GlobalCancellation,
             &Policy::trusted(),
@@ -2298,7 +2349,7 @@ end
             filter: None,
         };
         let err = mgr
-            .call("lua__noshadow__oops", &serde_json::Map::new(), &host)
+            .call("ext__noshadow__oops", &serde_json::Map::new(), &host)
             .await
             .unwrap_err();
         assert!(err.contains("outside a shadow"), "got: {err}");
@@ -2532,8 +2583,8 @@ end
         assert_eq!(action.summary.as_deref(), Some("HOOK SUMMARY"));
         // set_active slice: full name filtering, unknown names dropped.
         mgr.set_active(vec![
-            "lua__compactor__probe".to_string(),
-            "lua__compactor__ghost".to_string(),
+            "ext__compactor__probe".to_string(),
+            "ext__compactor__ghost".to_string(),
         ])
         .await;
         let names: Vec<String> = mgr
@@ -2542,7 +2593,7 @@ end
             .iter()
             .map(|d| d.function.name.clone())
             .collect();
-        assert_eq!(names, vec!["lua__compactor__probe".to_string()]);
+        assert_eq!(names, vec!["ext__compactor__probe".to_string()]);
         // Empty list = no extension tools.
         mgr.set_active(vec![]).await;
         assert_eq!(mgr.active_cached().await.len(), 0);
@@ -2692,9 +2743,9 @@ end
             policy: &policy,
             filter: None,
         };
-        let out = mgr.call("lua__hello__greet", &args, &host).await.unwrap();
+        let out = mgr.call("ext__hello__greet", &args, &host).await.unwrap();
         assert_eq!(out, "hi bob");
-        assert!(mgr.call("lua__hello__nope", &args, &host).await.is_err());
+        assert!(mgr.call("ext__hello__nope", &args, &host).await.is_err());
         assert!(mgr.call("read", &args, &host).await.is_err());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2980,11 +3031,11 @@ end
         let (left, right) = tokio::join!(
             with_drive_model(
                 drive_for("prov-a", "m-a"),
-                mgr.call("lua__iso__who", &empty, &host)
+                mgr.call("ext__iso__who", &empty, &host)
             ),
             with_drive_model(
                 drive_for("prov-b", "m-b"),
-                mgr.call("lua__iso__who", &empty, &host)
+                mgr.call("ext__iso__who", &empty, &host)
             ),
         );
         assert_eq!(left.unwrap(), "prov-a/m-a");
@@ -3016,7 +3067,7 @@ end
         };
         let mut args = serde_json::Map::new();
         args.insert("x".to_string(), serde_json::Value::String("hi".to_string()));
-        let out = mgr.call("lua__jx__rt", &args, &host).await.unwrap();
+        let out = mgr.call("ext__jx__rt", &args, &host).await.unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             value,
@@ -3076,7 +3127,7 @@ end
             filter: None,
         };
         let empty = serde_json::Map::new();
-        let out = mgr.call("lua__capped__who", &empty, &host).await.unwrap();
+        let out = mgr.call("ext__capped__who", &empty, &host).await.unwrap();
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             value,
@@ -3089,7 +3140,7 @@ end
             })
         );
         let key = mgr
-            .call("lua__capped__key", &empty, &host)
+            .call("ext__capped__key", &empty, &host)
             .await
             .unwrap_err();
         // No deposits for `myprov` in this process: the error names the
@@ -3099,7 +3150,7 @@ end
             "got: {key}"
         );
         let err = mgr
-            .call("lua__nocap__peek", &empty, &host)
+            .call("ext__nocap__peek", &empty, &host)
             .await
             .unwrap_err();
         assert!(err.contains("without the model capability"), "got: {err}");
@@ -3324,14 +3375,14 @@ end
                 "gemini",
                 "https://generativelanguage.googleapis.com",
                 vec![
-                    "lua__web__fetch".to_string(),
-                    "lua__web__search".to_string(),
+                    "ext__web__fetch".to_string(),
+                    "ext__web__search".to_string(),
                 ],
             ),
             (
                 "myprov",
                 "https://myprov.example/v1",
-                vec!["lua__web__search".to_string()],
+                vec!["ext__web__search".to_string()],
             ),
         ] {
             let mgr = global_manager();

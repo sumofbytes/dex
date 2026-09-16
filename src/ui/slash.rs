@@ -390,7 +390,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
         },
         _ if line.starts_with("/extensions") => {
             let arg = line["/extensions".len()..].trim();
-            // A remote TUI's daemon is the process that dispatches `lua__*`
+            // A remote TUI's daemon is the process that dispatches `ext__*`
             // tools and hooks, so its manager is the one that matters: both
             // subcommands go to the daemon API (§9 — reload/status reach the
             // dispatcher, never just the client's local copy).

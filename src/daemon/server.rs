@@ -282,7 +282,7 @@ async fn mcp_reconnect(Path(server): Path<String>) -> Json<serde_json::Value> {
 
 /// Loaded extension summaries for remote clients (`/extensions` in a
 /// connected TUI reads this, never the client process's own manager — the
-/// daemon is the process that dispatches `lua__*` tools and hooks).
+/// daemon is the process that dispatches `ext__*` tools and hooks).
 async fn get_extensions() -> Json<serde_json::Value> {
     let extensions: Vec<serde_json::Value> = crate::extensions::loaded_summaries()
         .into_iter()
