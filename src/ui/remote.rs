@@ -376,50 +376,74 @@ pub(crate) fn run_ratatui_repl_with_remote(
 
     let client = DaemonClient::new(daemon_url)
         .map_err(|e| std::io::Error::other(format!("failed to connect to daemon: {e}")))?;
-    client
-        .wait_until_ready(Duration::from_secs(10))
-        .map_err(|e| std::io::Error::other(format!("daemon not ready: {e}")))?;
+    // A freshly-spawned local daemon already passed readiness inside
+    // `start_daemon_background`; polling again is a wasted RTT. A remote
+    // daemon (`dex connect`) may still be booting, so keep the wait there.
+    if !daemon_is_local {
+        client
+            .wait_until_ready(Duration::from_secs(10))
+            .map_err(|e| std::io::Error::other(format!("daemon not ready: {e}")))?;
+    }
 
-    // The daemon owns the model/provider/permission and the workspace; mirror
-    // its state so the UI shows what turns will actually use.
-    let info = client
-        .get_config()
-        .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
-
-    // Session create and skills fetch are independent (`create_session`
-    // only needs `info.cwd` above), so overlap them: `tokio::join!` on the
-    // shared runtime (one RTT + one daemon-side scan off the critical path).
-    // Detach-on-error preserved: skills task is spawned, session awaited first;
-    // on session failure we return without awaiting skills (handle drop detaches).
+    // Boot fan-out: `get_config` (config + git), the session op (one small
+    // write), and `list_skills` (daemon-side dir scan) are independent —
+    // except the default session name, which is minted from the daemon
+    // workspace in `info.cwd`. With `--name`/`--reattach` nothing is needed
+    // from `info`, so all three fly together; otherwise `get_config` still
+    // overlaps the skills scan. (`create_session` carries a cwd the server
+    // ignores in favor of its own, so a local placeholder is fine there.)
+    // Detach-on-error preserved: the spawned tasks are awaited only on the
+    // success path; an early return drops their handles (detaches).
     let skills_client = client.clone();
     let skills_handle = crate::client::http::spawn_task(async move {
         skills_client.list_skills_async().await.unwrap_or_default()
     });
+    // The daemon owns the model/provider/permission and the workspace; mirror
+    // its state so the UI shows what turns will actually use.
+    let config_client = client.clone();
+    let info_handle = crate::client::http::spawn_task(async move {
+        // `Box<dyn Error>` is not `Send`; stringify across the spawn boundary.
+        config_client
+            .get_config_async()
+            .await
+            .map_err(|e| e.to_string())
+    });
     // Sessions default to `<workspace>-<7 chars>` (k8s-style); an explicit
     // `--name` wins. Generated client-side so the local placeholder shows the
     // same name the daemon persists.
-    let session_name = args
-        .session_name
-        .clone()
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| Session::default_session_name(&info.cwd));
-    let session_result: Result<(String, bool), String> = if let Some(reattach) = &args.reattach {
+    let explicit_name = args.session_name.clone().filter(|n| !n.is_empty());
+    let local_cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (session_id, is_reattach, info, session_name) = if let Some(reattach) = &args.reattach {
         // P10: attach to an existing persisted session on the daemon and get
         // the replay cursor, instead of creating a fresh one.
-        client
+        let resp = client
             .reattach(reattach)
-            .map(|resp| (resp.session_id, true))
-            .map_err(|e| format!("failed to reattach session: {e}"))
+            .map_err(|e| std::io::Error::other(format!("failed to reattach session: {e}")))?;
+        let info = crate::client::http::block_on(info_handle)
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
+            .map_err(std::io::Error::other)?;
+        (resp.session_id, true, info, None)
+    } else if let Some(name) = explicit_name.as_deref() {
+        let resp = client
+            .create_session(&local_cwd, Some(name))
+            .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        let info = crate::client::http::block_on(info_handle)
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
+            .map_err(std::io::Error::other)?;
+        (resp.session_id, false, info, Some(name.to_string()))
     } else {
-        client
+        // Default name needs the daemon workspace first; the skills scan
+        // above still overlaps this fetch.
+        let info = crate::client::http::block_on(info_handle)
+            .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
+            .map_err(std::io::Error::other)?;
+        let session_name = Session::default_session_name(&info.cwd);
+        let resp = client
             .create_session(&info.cwd, Some(&session_name))
-            .map(|resp| (resp.session_id, false))
-            .map_err(|e| format!("failed to create session: {e}"))
-    };
-    let (session_id, is_reattach) = match session_result {
-        // Dropping the JoinHandle detaches the skills task; error path never waits.
-        Err(e) => return Err(std::io::Error::other(e)),
-        Ok(ok) => (ok.0, ok.1),
+            .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        (resp.session_id, false, info, Some(session_name))
     };
     let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
     // Skills live on the daemon (its workspace); a stale list is harmless —
@@ -524,10 +548,11 @@ pub(crate) fn run_ratatui_repl_with_remote(
         busy_poll.clone(),
         events_cursor,
     );
-    if !is_reattach {
+    if let Some(name) = session_name {
         // Keep the local placeholder's display name in sync with the daemon
-        // record (a reattach overwrites `app.session` from disk below).
-        remote.app.session.set_name(session_name).ok();
+        // record (a reattach overwrites `app.session` from disk below, so it
+        // carries no name here).
+        remote.app.session.set_name(name).ok();
     }
 
     // P10: reconstruct the transcript for a reattached session. Prefer the
