@@ -57,6 +57,15 @@ pub(super) const TAB_WIDTH: usize = 8;
 /// tick-based, so it stays constant when the frame rate changes.
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(120);
 
+/// Cap for stored streamed-thinking text (§29): the expanded (Ctrl+T) wrap
+/// is linear per flush, so unbounded growth made long reasoning quadratic
+/// over the turn. The oldest reasoning drops; the collapsed indicator is
+/// unaffected.
+pub(crate) const THINKING_TEXT_CAP: usize = 32 * 1024;
+/// Cut back to the cap only once past cap + slack, so the O(n) head drain
+/// is amortized over many deltas instead of paid per delta while over cap.
+const THINKING_TEXT_SLACK: usize = 4 * 1024;
+
 /// A semantic transcript block. Gaps between blocks are **not** stored;
 /// they are inserted by `TranscriptView::render` (`ui/render.rs`) as a
 /// single blank `Line` between any two blocks. This makes gutter handling
@@ -172,6 +181,20 @@ pub(crate) struct WrappedBlock {
     /// Block stamp the rows were wrapped at; `u64::MAX` = not wrapped yet.
     stamp: u64,
     rows: Vec<Line<'static>>,
+    /// Incremental expanded-thinking state (§29): bytes of thinking `text`
+    /// already reflected in `rows` (`src_len`), of which the last source
+    /// line (`open_len` bytes → `open_rows` rows) may still be open. Only
+    /// meaningful when `expanded`; stored text is append-only below the
+    /// cap, so rows before the open line are final and only the appended
+    /// tail re-wraps per flush.
+    src_len: usize,
+    open_len: usize,
+    open_rows: usize,
+    /// `rows` were built by the expanded-thinking path. Ctrl+T bumps stamps
+    /// (`bump_thinking_stamps`), so a mode flip never incrementally extends
+    /// rows built for the other mode — but the flag is the guard that makes
+    /// that airtight.
+    expanded: bool,
 }
 
 impl TranscriptBlock {
@@ -482,6 +505,41 @@ pub(crate) struct PendingApproval {
     /// The child agent's definition name (V1b, §12): the prompt renders
     /// labeled ("explorer wants to run bash: …").
     pub(crate) agent: Option<String>,
+    /// Render-ready copy, parsed once at enqueue (§29): the overlay used to
+    /// re-parse the same `input` JSON 3–4× per frame while pending.
+    pub(crate) title: &'static str,
+    pub(crate) summary: String,
+    pub(crate) details: Vec<String>,
+    pub(crate) risk_label: &'static str,
+    pub(crate) risk_color: ratatui::style::Color,
+}
+
+impl PendingApproval {
+    pub(crate) fn new(
+        name: String,
+        input: String,
+        response: tokio::sync::mpsc::Sender<crate::core::types::ApprovalDecision>,
+        request_id: String,
+        agent: Option<String>,
+    ) -> Self {
+        let title = crate::core::format::approval_title(&name, &input);
+        let summary = crate::core::format::approval_summary(&name, &input);
+        let details = crate::core::format::approval_details(&name, &input);
+        let (risk_label, risk_color) = crate::core::format::approval_risk(&name, &input);
+        Self {
+            name,
+            input,
+            response,
+            selected: 0,
+            request_id,
+            agent,
+            title,
+            summary,
+            details,
+            risk_label,
+            risk_color,
+        }
+    }
 }
 
 /// One live child agent, from the V1b typed lifecycle events (§15): the
@@ -940,6 +998,32 @@ fn flush_assistant(app: &mut App) {
     move_activity_to_tail(app);
 }
 
+/// Drop the oldest stored thinking past [`THINKING_TEXT_CAP`] (§29). The cut
+/// shifts bytes, so every wrapped block's stamp resets — the incremental
+/// tail-wrap state rebuilds from scratch on the next frame instead of
+/// grafting onto shifted rows.
+fn trim_thinking_head(app: &mut App) {
+    let mut cut = false;
+    if let Some(idx) = content_tail_idx(app) {
+        if let Some(TranscriptBlock::Thinking { text, .. }) = app.transcript.get_mut(idx) {
+            let target = text.len().saturating_sub(THINKING_TEXT_CAP);
+            let mut at = target;
+            while at < text.len() && !text.is_char_boundary(at) {
+                at += 1;
+            }
+            if at > 0 {
+                text.drain(..at);
+                cut = true;
+            }
+        }
+    }
+    if cut {
+        for wb in &mut app.wrapped_cache {
+            wb.stamp = u64::MAX;
+        }
+    }
+}
+
 /// Route a streamed console line into the transcript with the same styling
 /// the local engine uses, so remote and local turns look identical.
 /// Each `SinkLine` maps to one `TranscriptBlock` (or an extension of the
@@ -1021,8 +1105,10 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
             // token; the block settles on close, which bumps unconditionally.
             // (Gate read before the mutable borrow; clock reset after it.)
             let due = stream_flush_due(app);
+            let mut over_cap = false;
             if let Some(TranscriptBlock::Thinking { text, stamp, .. }) = content_tail_mut(app) {
                 text.push_str(&s);
+                over_cap = text.len() > THINKING_TEXT_CAP + THINKING_TEXT_SLACK;
                 if due {
                     *stamp = stamp.wrapping_add(1);
                 }
@@ -1033,6 +1119,9 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                     started: Instant::now(),
                     elapsed: None,
                 });
+            }
+            if over_cap {
+                trim_thinking_head(app);
             }
             if due {
                 note_stream_flush(app);
@@ -1454,7 +1543,30 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
     // loop emitted its `ToolInput` without the matching `ToolOutput` yet —
     // no linear block scan per tool message (was O(tools × blocks)).
     let mut opened: HashSet<&str> = HashSet::new();
-    for msg in msgs.iter().skip(1) {
+    if msgs.len() > 1 {
+        // Skip the leading system message (never rendered).
+        render_message_slice(app, &msgs[1..], &mut opened);
+    }
+    app.messages = msgs;
+    // The last replayed message may be assistant text still sitting in the
+    // delta buffer; drain it so the rebuilt transcript is complete.
+    flush_assistant(app);
+    app.autoscroll = true;
+}
+
+/// Render one slice of session messages into transcript blocks (§1, excludes
+/// the leading system message): the startup replay renders head→tail in
+/// chunks with a paint between (progressive backfill), threading `opened`
+/// across chunks so the final transcript is byte-identical to one-shot
+/// `rebuild_transcript`. No flushing here — the caller flushes once at the
+/// end, so assistant text spanning a chunk seam coalesces exactly like
+/// one-shot.
+pub(super) fn render_message_slice<'m>(
+    app: &mut App,
+    msgs: &'m [crate::core::types::ChatMessage],
+    opened: &mut HashSet<&'m str>,
+) {
+    for msg in msgs {
         match msg.role {
             Role::User => {
                 if let Some(content) = &msg.content {
@@ -1534,11 +1646,6 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
             Role::System => {}
         }
     }
-    app.messages = msgs;
-    // The last replayed message may be assistant text still sitting in the
-    // delta buffer; drain it so the rebuilt transcript is complete.
-    flush_assistant(app);
-    app.autoscroll = true;
 }
 
 #[cfg(test)]
@@ -2041,6 +2148,34 @@ mod tests {
     }
 
     #[test]
+    fn thinking_text_caps_oldest_reasoning() {
+        let mut app = test_app();
+        for i in 0..4000 {
+            append_sink_line(
+                &mut app,
+                crate::core::types::SinkLine::Thinking(format!("{i:06}abcdefghij")),
+            );
+        }
+        let text = match app.transcript.last() {
+            Some(TranscriptBlock::Thinking { text, .. }) => text.clone(),
+            other => panic!("expected thinking tail, got {other:?}"),
+        };
+        assert!(
+            text.len() <= THINKING_TEXT_CAP + THINKING_TEXT_SLACK,
+            "stored thinking capped, got {}",
+            text.len()
+        );
+        assert!(
+            text.ends_with("003999abcdefghij"),
+            "keeps the newest reasoning"
+        );
+        assert!(
+            !text.contains("000000abcdefghij"),
+            "drops the oldest reasoning"
+        );
+    }
+
+    #[test]
     fn selection_above_retrailed_activity_survives_streaming() {
         // Two rendered blocks (3 + 2 rows, one separator between) and the
         // open spinner after them: it starts at display row 6. A streaming
@@ -2073,14 +2208,26 @@ mod tests {
                 WrappedBlock {
                     stamp: 0,
                     rows: rows(3),
+                    src_len: 0,
+                    open_len: 0,
+                    open_rows: 0,
+                    expanded: false,
                 },
                 WrappedBlock {
                     stamp: 0,
                     rows: rows(2),
+                    src_len: 0,
+                    open_len: 0,
+                    open_rows: 0,
+                    expanded: false,
                 },
                 WrappedBlock {
                     stamp: 0,
                     rows: rows(1),
+                    src_len: 0,
+                    open_len: 0,
+                    open_rows: 0,
+                    expanded: false,
                 },
             ];
             app.transcript.push(TranscriptBlock::Assistant {
@@ -2266,6 +2413,73 @@ mod tests {
             assert_eq!(tool_id, id);
             assert!(output.is_some(), "rebuilt block left open for {arg}");
         }
+    }
+
+    #[test]
+    fn chunked_replay_matches_one_shot_rebuild() {
+        // §1: chunked startup replay (one message per chunk — every seam is
+        // a chunk boundary) must render exactly what one-shot does: tool
+        // ids thread across chunks, assistant text spanning a seam still
+        // coalesces (no mid flush).
+        use crate::core::types::{ChatMessage, FunctionCall, LlmToolCall};
+        use std::collections::HashSet;
+        let call = |id: &str| LlmToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read".to_string(),
+                arguments: r#"{"path":"a.rs"}"#.to_string(),
+            },
+        };
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello "),
+            ChatMessage::assistant_calls(Some("doing".into()), vec![call("call-A")]),
+            ChatMessage::assistant("world"),
+            ChatMessage::tool_result("call-A", "v 1 line"),
+        ];
+        fn shape(app: &App) -> Vec<String> {
+            app.transcript
+                .iter()
+                .map(|b| match b {
+                    TranscriptBlock::User { lines, .. } => format!("user:{}", lines.len()),
+                    TranscriptBlock::Assistant { lines, .. } => {
+                        let text: String = lines
+                            .iter()
+                            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                            .collect();
+                        format!("assistant:{text}")
+                    }
+                    TranscriptBlock::Tool {
+                        tool_id, output, ..
+                    } => format!("tool:{tool_id}:{}", output.is_some()),
+                    TranscriptBlock::Thinking { text, .. } => format!("thinking:{text}"),
+                    _ => "other".to_string(),
+                })
+                .collect()
+        }
+        let mut one_shot = test_app();
+        one_shot.messages = messages.clone();
+        rebuild_transcript(&mut one_shot);
+        let mut chunked = test_app();
+        chunked.messages = messages;
+        let msgs = std::mem::take(&mut chunked.messages);
+        let mut opened = HashSet::new();
+        for chunk in msgs[1..].chunks(1) {
+            render_message_slice(&mut chunked, chunk, &mut opened);
+        }
+        chunked.messages = msgs;
+        flush_assistant(&mut chunked);
+        chunked.autoscroll = true;
+        assert_eq!(shape(&chunked), shape(&one_shot));
+        // The tool block completed across the seam; assistant text around
+        // the tool call renders in both halves (a tool call always splits
+        // assistant blocks, chunked or not).
+        let shapes = shape(&chunked);
+        assert!(shapes.iter().any(|s| s == "tool:call-A:true"), "{shapes:?}");
+        assert!(shapes.iter().any(|s| s.contains("hello")), "{shapes:?}");
+        assert!(shapes.iter().any(|s| s.contains("world")), "{shapes:?}");
     }
 
     #[test]

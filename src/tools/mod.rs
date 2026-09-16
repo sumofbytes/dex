@@ -762,25 +762,89 @@ async fn expand_glob(glob: &str) -> Result<Vec<PathBuf>, ToolError> {
                 .to_string(),
         ));
     }
-    let command = if glob.contains('/') {
-        format!("find . \\( -name .git -o -name target -o -name node_modules \\) -prune -o -path './{glob}' -print")
+    expand_glob_in(&workspace_root()?, &glob).await
+}
+
+/// `expand_glob` rooted at `root` (the live one uses the workspace root):
+/// hermetic in tests, no `current_dir` redirect needed.
+async fn expand_glob_in(root: &Path, glob: &str) -> Result<Vec<PathBuf>, ToolError> {
+    // No shell: the old path interpolated the pattern into a single-quoted
+    // `find` command through `run_bash`, so a `'` or space in the pattern
+    // broke the command — and every call paid the sh spawn + drain tasks +
+    // 120 s-timeout machinery for a sub-second directory walk. `find` itself
+    // stays (exact `-prune`/`-path` semantics; serving from the fff index
+    // would miss files never read, and a hand-rolled matcher would drift
+    // from `find`); only the wrapping changes.
+    let mut cmd = tokio::process::Command::new("find");
+    cmd.arg(".")
+        .arg("(")
+        .arg("-name")
+        .arg(".git")
+        .arg("-o")
+        .arg("-name")
+        .arg("target")
+        .arg("-o")
+        .arg("-name")
+        .arg("node_modules")
+        .arg(")")
+        .arg("-prune")
+        .arg("-o");
+    if glob.contains('/') {
+        cmd.arg("-path").arg(format!("./{glob}"));
     } else {
-        format!("find . \\( -name .git -o -name target -o -name node_modules \\) -prune -o -name '{glob}' -print")
+        cmd.arg("-name").arg(glob);
+    }
+    cmd.arg("-print")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .current_dir(root);
+    let child = cmd.spawn().map_err(ToolError::Io)?;
+    // A pruned walk is bounded, but a wedge (stalled FS) or Ctrl+C must not
+    // park the turn: race the wait against cancellation, like `run_bash`.
+    let output = tokio::select! {
+        out = child.wait_with_output() => out.map_err(ToolError::Io)?,
+        _ = wait_cancelled(&crate::agent::state::GlobalCancellation) => {
+            return Err(ToolError::Shell {
+                output: "Error: shell command cancelled".to_string(),
+                code: None,
+            });
+        }
     };
-    let (output, code) = run_bash(&command, &crate::agent::state::GlobalCancellation).await?;
-    if !matches!(code, Some(0) | Some(1)) {
-        return Err(ToolError::Shell { output, code });
+    if !matches!(output.status.code(), Some(0) | Some(1)) {
+        return Err(ToolError::Shell {
+            output: String::from_utf8_lossy(&output.stdout).into_owned(),
+            code: output.status.code(),
+        });
     }
-    let mut paths: Vec<PathBuf> = output
+    // Hoisted root canonicalization (was re-canonicalized per match) and
+    // truncate-before-resolve: at most 8 candidates pay the symlink check.
+    let root = root.canonicalize().map_err(ToolError::Io)?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut rels: Vec<&str> = text
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| workspace_path(line).ok())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
         .collect();
-    paths.sort_unstable();
-    paths.dedup();
-    if paths.len() > READ_FANOUT_GLOB_MAX_FILES {
-        paths.truncate(READ_FANOUT_GLOB_MAX_FILES);
+    rels.sort_unstable();
+    rels.dedup();
+    // Resolve window before the file filter: directories and rejected
+    // symlinks below still cost a stat, but bounding the window bounds the
+    // stats (was: one root canonicalize + one resolve per match, unbounded).
+    rels.truncate(READ_FANOUT_GLOB_MAX_FILES * 8);
+    let mut paths = Vec::new();
+    for rel in rels {
+        // Directories (and the `.` root itself for a bare `*`) used to ride
+        // along and die as per-file read errors in `fanout_read`, eating cap
+        // slots real files could have used — keep files only.
+        if let Ok(path) = resolve_workspace_path(&root, rel) {
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
     }
+    paths.truncate(READ_FANOUT_GLOB_MAX_FILES);
     if paths.is_empty() {
         return Err(ToolError::InvalidArgument(format!(
             "glob '{glob}' matched no files"
@@ -2182,6 +2246,74 @@ mod tests {
         assert!(metadata("read").unwrap().read_only);
         assert!(metadata("write").unwrap().mutating);
         assert!(!metadata("bash").unwrap().idempotent);
+    }
+
+    #[tokio::test]
+    async fn expand_glob_lists_pruned_files_only() {
+        // Hermetic fixture for the `find -prune` semantics glob expansion
+        // relies on: pruned dirs never match, symlinked dirs are listed but
+        // never descended, outside-workspace symlinks are rejected.
+        let dir = std::env::temp_dir().join(format!(
+            "dex-glob-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["sub/nested", "target", ".git", "node_modules"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        for f in [
+            "a.rs",
+            "sub/b.rs",
+            "sub/c.txt",
+            "sub/nested/g.rs",
+            "target/d.rs",
+            ".git/e.rs",
+            "node_modules/f.rs",
+            "x",
+        ] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::os::unix::fs::symlink("sub", dir.join("linksub")).unwrap();
+        let outside = dir.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("leak")).unwrap();
+        let names = |paths: Vec<std::path::PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        // Bare pattern: basenames anywhere, pruned dirs excluded.
+        assert_eq!(
+            names(expand_glob_in(&dir, "*.rs").await.unwrap()),
+            ["a.rs", "b.rs", "g.rs"]
+        );
+        // Path pattern: `*` spans `/`, like `find -path`.
+        assert_eq!(
+            names(expand_glob_in(&dir, "sub/*.rs").await.unwrap()),
+            ["b.rs", "g.rs"]
+        );
+        // No double-descent through the symlinked dir: each file once.
+        assert_eq!(
+            names(expand_glob_in(&dir, "sub/*").await.unwrap()),
+            ["b.rs", "c.txt", "g.rs"]
+        );
+        // `?` matches the single-char file; the `.` root never surfaces.
+        assert_eq!(names(expand_glob_in(&dir, "?").await.unwrap()), ["x"]);
+        // Outside-workspace symlink stays rejected; dirs stay files-only.
+        assert_eq!(
+            names(expand_glob_in(&dir, "*").await.unwrap()),
+            ["a.rs", "b.rs", "c.txt", "g.rs", "x"]
+        );
+        assert!(expand_glob_in(&dir, "*.nope").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[tokio::test]
