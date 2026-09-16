@@ -152,14 +152,10 @@ fn spawn_events_poller(
     cursor: Arc<AtomicU64>,
 ) {
     crate::client::http::spawn_task(async move {
-        // Seed the cursor from the daemon's journal so rows rendered by the
-        // initial replay (or by a local JSONL rebuild) are never re-fetched.
-        // Async form: this task runs on the shared runtime, and the sync
-        // wrapper's `block_on` would panic ("cannot start a runtime from
-        // within a runtime") on a worker thread.
-        if let Ok(resp) = client.reattach_async(&session_id).await {
-            cursor.fetch_max(resp.seq, Ordering::SeqCst);
-        }
+        // No tip seed here: the boot flow seeds the cursor (§4 — the replay
+        // drain advances it per page, the local-JSONL path from the local
+        // journal tip), so this task only advances it past rows it serves.
+        // Replay holds `busy` so a slow drain can't race the first polls.
         loop {
             tokio::time::sleep(EVENTS_POLL_INTERVAL).await;
             if busy.load(Ordering::SeqCst) || !live.load(Ordering::SeqCst) {
@@ -399,6 +395,13 @@ pub(crate) fn run_ratatui_repl_with_remote(
     let skills_handle = crate::client::http::spawn_task(async move {
         skills_client.list_skills_async().await.unwrap_or_default()
     });
+    // §2: warm the one-time OSC 11 palette query alongside the session RTT
+    // instead of serially before first paint. The `block_on` before the
+    // skills listing (the first consumer of colors) is instant when the
+    // probe finished in flight.
+    let palette_handle = crate::client::http::spawn_task(async move {
+        super::theme::detect_background();
+    });
     // The daemon owns the model/provider/permission and the workspace; mirror
     // its state so the UI shows what turns will actually use.
     let config_client = client.clone();
@@ -458,17 +461,9 @@ pub(crate) fn run_ratatui_repl_with_remote(
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
         (resp.session_id, false, info, Some(session_name))
     };
-    let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
-    // Skills live on the daemon (its workspace); a stale list is harmless —
-    // the load call re-discovers on the daemon side.
-    let tui_skills: Vec<crate::core::types::Skill> = daemon_skills
-        .into_iter()
-        .map(|info| crate::core::types::Skill {
-            name: info.name,
-            description: info.description,
-            path: std::path::PathBuf::from(""),
-        })
-        .collect();
+    // §3: the skills future flies with the boot fan-out (spawned above) but
+    // is collected after replay below — neither App construction nor replay
+    // needs skills, only the session-start listing does.
 
     // Per-request overrides so client flags keep working in remote mode.
     let options = crate::chat_options_from_args(args);
@@ -484,7 +479,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
         tool_state: crate::agent::state::ToolState::default(),
         session: Session::in_memory(info.cwd.clone()),
         plan: crate::core::types::Plan::default(),
-        skills: tui_skills,
+        skills: Vec::new(),
         turn_start: 0,
         cwd: info.cwd.clone(),
         git_branch: info.git_branch.clone(),
@@ -522,6 +517,8 @@ pub(crate) fn run_ratatui_repl_with_remote(
         transcript_area: None,
         selection: None,
         notice: None,
+        status_tokens_cache: std::cell::Cell::new((0, 0, 0, 0)),
+        slash_cache: std::cell::RefCell::new(None),
     };
 
     // Shared poller gates (§15 V1b): children live → poll the journal;
@@ -574,6 +571,12 @@ pub(crate) fn run_ratatui_repl_with_remote(
     // isn't shared (true remote). Idempotent replays skip stale approvals
     // (parked approvals die with their turn on the daemon).
     if is_reattach {
+        // §4: hold the idle poller paused across the replay — a drain past
+        // the first 2s tick would otherwise serve rows the replay hasn't
+        // reached yet and duplicate them in the transcript. (The event loop
+        // recomputes this flag every iteration, so boot is the only window
+        // it covers.)
+        remote.busy_poll.store(true, Ordering::SeqCst);
         let local = find_local_session_file(&remote.session_id);
         let mut rebuilt = false;
         if let Some(p) = local.as_deref() {
@@ -583,11 +586,21 @@ pub(crate) fn run_ratatui_repl_with_remote(
             if let Some(p) = local.as_deref() {
                 rebuilt = rebuild_remote_from_messages(&mut remote, p);
             }
+            if rebuilt {
+                // The drain path seeds the cursor per page; the local path
+                // seeds it from the local journal tip (no HTTP round trip —
+                // the file is right here). Either way the poller resumes
+                // past replayed rows without its own reattach scan.
+                if let Some(max) = Session::max_event_seq(p) {
+                    remote.events_cursor.fetch_max(max, Ordering::SeqCst);
+                }
+            }
         }
         if !rebuilt {
             let sid = remote.session_id.clone();
             replay_remote_events(&mut remote, &sid);
         }
+        remote.busy_poll.store(false, Ordering::SeqCst);
         push_info(
             &mut remote.app,
             format!("reattached to session {session_id}"),
@@ -610,10 +623,27 @@ pub(crate) fn run_ratatui_repl_with_remote(
         }
     }
 
+    // §3: collect the skills future here — after replay, before the
+    // session-start listing (its only consumer) — so a slow daemon dir scan
+    // never delays replay or first paint.
+    let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
+    // Skills live on the daemon (its workspace); a stale list is harmless —
+    // the load call re-discovers on the daemon side.
+    remote.app.skills = daemon_skills
+        .into_iter()
+        .map(|info| crate::core::types::Skill {
+            name: info.name,
+            description: info.description,
+            path: std::path::PathBuf::from(""),
+        })
+        .collect();
+
     // Detect the terminal background before raw mode / the alternate screen
     // take over; surface colors (including the skills listing below) are
-    // resolved from this once.
-    super::theme::detect_background();
+    // resolved from this once. The probe flew with the boot fan-out (§2);
+    // this is instant when it finished alongside the session RTT. The probe
+    // warms a memoized query; a panic in it must not take down startup.
+    let _ = crate::client::http::block_on(palette_handle);
 
     // Session-start view: the DEX art, then the skills the daemon discovered,
     // then how fast the TUI was ready to use.
@@ -1156,6 +1186,13 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
 /// lookup through it silently misses and left `/resume` with no file to
 /// rebuild from (blank terminal).
 fn find_local_session_file(sid: &str) -> Option<std::path::PathBuf> {
+    // Fast path first: the id is the JSONL filename, so filename matching
+    // (one header read per hit) replaces the workspace-wide open+parse of
+    // every session (§1). The legacy scan below only serves renamed/legacy
+    // files whose stem no longer names the id.
+    if let Some(path) = Session::find_by_id_filename(sid) {
+        return Some(path);
+    }
     let all = Session::list_all().unwrap_or_default();
     if let Some((p, _)) = all.iter().find(|(_, h)| h.id() == sid) {
         return Some(p.clone());
@@ -1179,7 +1216,9 @@ fn find_local_session_file(sid: &str) -> Option<std::path::PathBuf> {
 /// includes the user prompts the events journal never records). Returns
 /// true when anything was rendered. Mirrors the local `/resume` path.
 fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) -> bool {
-    let Ok(loaded) = crate::session::load_messages_from_session(path) else {
+    // Messages + plan ride one scan (§1): the plan used to cost a second
+    // full pass right after the messages load.
+    let Ok((loaded, plan)) = crate::session::load_messages_and_plan(path) else {
         return false;
     };
     if loaded.is_empty() {
@@ -1195,16 +1234,8 @@ fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) 
     remote.app.messages.push(system);
     remote.app.messages.extend(loaded);
     super::rebuild_transcript(&mut remote.app);
-    if let Some(p) = remote.app.session.path() {
-        let plan = crate::session::load_plan(p);
-        if !plan.is_empty() {
-            remote.app.plan = plan;
-        }
-    } else {
-        let plan = crate::session::load_plan(path);
-        if !plan.is_empty() {
-            remote.app.plan = plan;
-        }
+    if !plan.is_empty() {
+        remote.app.plan = plan;
     }
     true
 }
@@ -3168,6 +3199,8 @@ mod tests {
             transcript_area: None,
             selection: None,
             notice: None,
+            status_tokens_cache: std::cell::Cell::new((0, 0, 0, 0)),
+            slash_cache: std::cell::RefCell::new(None),
         };
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(16);
         RemoteApp {

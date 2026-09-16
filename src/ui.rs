@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::fmt;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -294,6 +296,20 @@ pub(crate) struct App {
     /// Transient status-bar notice, e.g. copy confirmation. Expires after
     /// [`NOTICE_LIFETIME`]; the event loop redraws once on expiry.
     pub(crate) notice: Option<(String, Instant)>,
+    /// Cached fallback context estimate for the status bar (perf doc §29):
+    /// `status::status_tokens()` serves it while `messages` is unchanged,
+    /// so frames (keystrokes, SSE batches, 8fps busy ticks) never re-walk
+    /// the transcript until the first provider-reported `Usage` arrives.
+    /// Keyed on (message count, tail content/reasoning sizes) — the TUI
+    /// never mutates messages in place (streaming lands in transcript
+    /// blocks; history changes are pushes/truncations/reloads), so the key
+    /// is exact.
+    pub(crate) status_tokens_cache: Cell<(usize, usize, usize, u64)>,
+    /// Cached slash-popup listing, keyed per input change (§29) — see
+    /// `slash::SlashCache`. `RefCell` (not a plain field) so the
+    /// `&App` render path can memoize without signature ripples; never
+    /// borrowed reentrantly (the compute path never calls back in).
+    pub(crate) slash_cache: std::cell::RefCell<Option<slash::SlashCache>>,
 }
 
 #[cfg(test)]
@@ -367,6 +383,8 @@ impl App {
             transcript_area: None,
             selection: None,
             notice: None,
+            status_tokens_cache: Cell::new((0, 0, 0, 0)),
+            slash_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -1330,10 +1348,7 @@ pub(super) fn settle_activity(app: &mut App) {
         TranscriptBlock::Activity { started, .. } => *started,
         _ => unreachable!(),
     };
-    let tokens = app
-        .tool_state
-        .last_usage
-        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
+    let tokens = status::status_tokens(app);
     app.transcript.remove(pos);
     app.transcript.push(TranscriptBlock::Activity {
         stamp: 0,
@@ -1430,7 +1445,15 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
     app.assistant_gap.reset();
     app.assistant_open = false;
     app.thinking_open = false;
-    let msgs = app.messages.clone();
+    // The message vec moves out instead of cloning: none of the render
+    // paths below touch `app.messages` (streaming lands in transcript
+    // blocks), so the restore at the end is exact (§1).
+    let msgs = std::mem::take(&mut app.messages);
+    // Tool ids with an open `Tool` block, maintained as blocks are emitted
+    // (§1): the transcript starts empty, so an id is open exactly when this
+    // loop emitted its `ToolInput` without the matching `ToolOutput` yet —
+    // no linear block scan per tool message (was O(tools × blocks)).
+    let mut opened: HashSet<&str> = HashSet::new();
     for msg in msgs.iter().skip(1) {
         match msg.role {
             Role::User => {
@@ -1451,6 +1474,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 }
                 if let Some(calls) = &msg.tool_calls {
                     for tc in calls {
+                        opened.insert(tc.id.as_str());
                         let input = format!(
                             "{} {}",
                             tc.function.name,
@@ -1482,16 +1506,15 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 // without an arg. Both carry the stored call id so the
                 // output pairs with this block even when replayed messages
                 // interleave.
-                let tool_id = msg.tool_call_id.clone().unwrap_or_default();
-                let already_open = !tool_id.is_empty()
-                      && app.transcript.iter().any(|b| {
-                          matches!(b, TranscriptBlock::Tool { tool_id: tid, output: None, .. } if tid == &tool_id)
-                      });
-                if !already_open {
+                let tool_id = msg.tool_call_id.as_deref().unwrap_or_default();
+                let already_open = !tool_id.is_empty() && opened.contains(tool_id);
+                if already_open {
+                    opened.remove(tool_id);
+                } else {
                     append_sink_line(
                         app,
                         crate::core::types::SinkLine::ToolInput {
-                            id: tool_id.clone(),
+                            id: tool_id.to_string(),
                             input: name.clone(),
                         },
                     );
@@ -1499,7 +1522,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
                 append_sink_line(
                     app,
                     crate::core::types::SinkLine::ToolOutput {
-                        id: tool_id,
+                        id: tool_id.to_string(),
                         name,
                         summary,
                         success: true,
@@ -1511,6 +1534,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
             Role::System => {}
         }
     }
+    app.messages = msgs;
     // The last replayed message may be assistant text still sitting in the
     // delta buffer; drain it so the rebuilt transcript is complete.
     flush_assistant(app);

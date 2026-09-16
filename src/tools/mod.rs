@@ -973,6 +973,33 @@ async fn atomic_write(path: &Path, content: &str) -> Result<(), ToolError> {
     result
 }
 
+/// `expected_hash` check against already-read bytes (perf doc §17): `edit`
+/// reads the whole file right after the check, so hashing the bytes in hand
+/// deletes a second full read. Byte-identical to hashing the file for UTF-8
+/// content; non-UTF-8 files fail the read first either way (they cannot be
+/// edited as text regardless).
+fn check_expected_hash_bytes(
+    args: &Map<String, Value>,
+    path: &Path,
+    content: &str,
+) -> Result<(), ToolError> {
+    let Some(expected) = args.get("expected_hash").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let actual = hash_bytes(content.as_bytes());
+    if actual != expected {
+        return Err(ToolError::StaleFile {
+            path: path.display().to_string(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// When a write/edit carries `expected_hash`, reject if the file on disk no
 /// longer matches (stale read → 409 semantics). Absent file hashes to the
 /// empty-string sentinel.
@@ -1019,10 +1046,10 @@ async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
         .get("replaceAll")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    check_expected_hash(args, &path).await?;
     let content = tokio::fs::read_to_string(&path)
         .await
         .map_err(ToolError::Io)?;
+    check_expected_hash_bytes(args, &path, &content)?;
     let (updated, note) = apply_edit_batch(&content, &ops, replace_all)?;
     atomic_write(&path, &updated).await?;
     Ok(format!("edited {}{note}", path.display()))

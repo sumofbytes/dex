@@ -171,32 +171,62 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     } // MCP bootstrap (background connect; schema merges whatever is cached).
       // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
     crate::mcp::global_manager();
-    // Extensions load synchronously here: the one-shot schema must include
-    // them (the daemon instead fills the cache in the background).
-    crate::client::http::block_on(crate::extensions::global_manager().refresh());
-    let mut config = LlmConfig::from_env(
-        args.base_url.clone(),
-        args.model.clone(),
-        args.permission,
-        &args.headers,
-    )?;
+    // Cold-init fan-out (perf doc §26): extension Lua loads, the config
+    // build (cold catalog parse + index), the skills dir walk, and the
+    // session open + history parse are independent — scoped threads overlap
+    // them instead of summing them. The daemon instead fills the extension
+    // cache in the background; one-shot turns need the schema inline.
+    let mut skill_dirs = skill_dirs();
+    skill_dirs.extend(args.skill_dirs.iter().cloned());
+    let cwd = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (config_result, skills, (mut session, history)) = std::thread::scope(|s| {
+        let ext = s
+            .spawn(|| crate::client::http::block_on(crate::extensions::global_manager().refresh()));
+        // `from_env`'s boxed error is not `Send`; stringify it at the
+        // thread boundary (same pattern as `from_env_async`).
+        let cfg = s.spawn(|| {
+            LlmConfig::from_env(
+                args.base_url.clone(),
+                args.model.clone(),
+                args.permission,
+                &args.headers,
+            )
+            .map_err(|e| e.to_string())
+        });
+        let sk = s.spawn(|| discover_skills(&skill_dirs));
+        let sess = s.spawn(|| {
+            if args.no_session {
+                return (None, Vec::new());
+            }
+            let session = open_session(args, &cwd);
+            // Model-bound load: `!!` shell runs stay out of the LLM context.
+            let history = session
+                .as_ref()
+                .and_then(|sess| sess.path())
+                .map(load_llm_messages_from_session)
+                .unwrap_or_else(|| Ok(Vec::new()))
+                .unwrap_or_default();
+            (session, history)
+        });
+        // Extension refresh is best-effort; a failed join must not fail the turn.
+        let _ = ext.join();
+        let config_result: Result<LlmConfig, Box<dyn std::error::Error>> = cfg
+            .join()
+            .unwrap_or_else(|_| Err("config init thread failed".to_string()))
+            .map_err(|e| e.into());
+        let skills = sk.join().unwrap_or_default();
+        let sess = sess.join().unwrap_or((None, Vec::new()));
+        (config_result, skills, sess)
+    });
+    let mut config = config_result?;
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
     if let Some(warning) = config.thinking_mismatch_warning() {
         eprintln!("dex: {warning}");
     }
     // Verification opt-in only — see llm/config.rs.
     crate::llm::config::apply_verify_optin(&mut config);
-    let mut skill_dirs = skill_dirs();
-    skill_dirs.extend(args.skill_dirs.iter().cloned());
-    let skills = discover_skills(&skill_dirs);
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let mut session = if args.no_session {
-        None
-    } else {
-        open_session(args, &cwd)
-    };
     if let Some(name) = &args.session_name {
         if let Some(session) = session.as_mut() {
             let _ = session.set_name(name.clone());
@@ -208,10 +238,9 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             .as_ref()
             .map(|(text, _)| text.as_str()),
     ))];
-    if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
-        // Model-bound load: `!!` shell runs stay out of the LLM context.
-        messages.extend(load_llm_messages_from_session(existing).unwrap_or_default());
-    }
+    // History already loaded on the session thread above (`!!` runs
+    // excluded there); the turn below appends the new user message.
+    messages.extend(history);
     let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event("turn_start");
