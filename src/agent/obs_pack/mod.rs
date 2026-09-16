@@ -63,18 +63,19 @@ pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
     }]
 }
 
-/// Host-facing projection seam: the provider-bound message list, or the
-/// history unchanged when the experiment is off. `loop.rs` calls this
-/// instead of naming the gate.
-pub(crate) fn project_messages(
+/// Host-facing projection seam: the provider-bound message list, or a
+/// borrow of the history unchanged when the experiment is off. `loop.rs`
+/// calls this instead of naming the gate. Borrowed when off so the common
+/// path pays no `to_vec` clone per model call.
+pub(crate) fn project_messages<'a>(
     projection: &ProjectionState,
     session_path: Option<&Path>,
-    messages: &[ChatMessage],
-) -> Vec<ChatMessage> {
+    messages: &'a [ChatMessage],
+) -> std::borrow::Cow<'a, [ChatMessage]> {
     if !observation_pack_enabled() {
-        return messages.to_vec();
+        return std::borrow::Cow::Borrowed(messages);
     }
-    project(projection, session_path, messages)
+    std::borrow::Cow::Owned(project(projection, session_path, messages))
 }
 
 /// `dex doctor` row: printed unconditionally (snapshot byte-stability),

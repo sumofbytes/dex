@@ -971,11 +971,18 @@ impl TranscriptView {
         // changed (usually the tail) instead of the whole transcript. Scroll
         // and resize reuse cached rows; only the visible window is cloned
         // into the paragraph each draw.
-        let mut changed = app.wrapped_width != area.width;
-        if changed {
+        // First block whose display rows may have changed (perf doc §29):
+        // the concat below re-extends from here instead of re-cloning the
+        // whole transcript per streaming flush.
+        let mut first_dirty: Option<usize> = None;
+        let mut mark = |idx: usize| {
+            first_dirty = Some(first_dirty.map_or(idx, |first| first.min(idx)));
+        };
+        if app.wrapped_width != area.width {
             app.wrapped_cache.clear();
             app.display_cache.clear();
             app.wrapped_width = area.width;
+            mark(0);
         }
         // Keep the cache parallel to the transcript. A shorter transcript
         // (reset/resume) drops stale entries; appended blocks start unwrapped.
@@ -984,14 +991,14 @@ impl TranscriptView {
             // Selection rows refer to the old cache; drop them rather than
             // highlight or copy rows that no longer exist.
             app.selection = None;
-            changed = true;
+            mark(app.transcript.len());
         }
         while app.wrapped_cache.len() < app.transcript.len() {
+            mark(app.wrapped_cache.len());
             app.wrapped_cache.push(WrappedBlock {
                 stamp: u64::MAX,
                 rows: Vec::new(),
             });
-            changed = true;
         }
         for (idx, block) in app.transcript.iter().enumerate() {
             if app.wrapped_cache[idx].stamp == block.stamp() {
@@ -1002,21 +1009,30 @@ impl TranscriptView {
                 stamp: block.stamp(),
                 rows,
             };
-            changed = true;
+            mark(idx);
         }
-        if changed {
-            // Re-concatenate the already-wrapped rows (no re-wrapping); this
-            // runs only on content or width changes, never for scroll.
-            // Tool steps carry the `surface_bg()` band themselves, so every
-            // gap between blocks stays blank terminal bg.
-            let mut display: Vec<Line<'static>> = Vec::new();
-            for (idx, wb) in app.wrapped_cache.iter().enumerate() {
+        if let Some(dirty) = first_dirty {
+            // Truncate the display to the first dirty block's start offset
+            // (gap separators + wrapped-row counts — length arithmetic, no
+            // clones), then re-extend from there. Unchanged leading blocks
+            // keep byte-identical rows, so the offsets line up; this runs
+            // only on content or width changes, never for scroll. Tool
+            // steps carry the `surface_bg()` band themselves, so every gap
+            // between blocks stays blank terminal bg.
+            let mut start = 0usize;
+            for (idx, wb) in app.wrapped_cache.iter().enumerate().take(dirty) {
                 if idx > 0 && !wb.rows.is_empty() {
-                    display.push(Line::default());
+                    start += 1;
                 }
-                display.extend(wb.rows.iter().cloned());
+                start += wb.rows.len();
             }
-            app.display_cache = display;
+            app.display_cache.truncate(start);
+            for (idx, wb) in app.wrapped_cache.iter().enumerate().skip(dirty) {
+                if idx > 0 && !wb.rows.is_empty() {
+                    app.display_cache.push(Line::default());
+                }
+                app.display_cache.extend(wb.rows.iter().cloned());
+            }
         }
         // The open thinking / activity rows animate in place: their cached
         // lines are rewritten every frame (O(1)) instead of invalidating
@@ -1246,7 +1262,11 @@ fn queue_groups(app: &App) -> Vec<QueueGroup> {
                 // Empty queued text still gets its badge row.
                 lines.push(String::new());
             }
-            if pending.lines().count() > lines.len() {
+            // Overflow probe without the old `lines().count()` full walk:
+            // one more row tells all (§29). Exact for any
+            // `QUEUE_MAX_ITEM_ROWS >= 1` (a row past the window exists iff
+            // the item overflows it).
+            if pending.lines().nth(QUEUE_MAX_ITEM_ROWS).is_some() {
                 // Never the badge row: an overflowing item keeps at least
                 // one continuation line before the collapse.
                 *lines.last_mut().expect("non-empty") = "…".into();
@@ -2212,6 +2232,8 @@ mod tests {
             transcript_area: None,
             selection: None,
             notice: None,
+            status_tokens_cache: std::cell::Cell::new((0, 0, 0, 0)),
+            slash_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -2676,6 +2698,43 @@ mod tests {
             lines.iter().filter(|l| l.is_empty()).count(),
             1,
             "exactly one gap between the two blocks"
+        );
+    }
+
+    #[test]
+    fn display_cache_extends_incrementally_on_tail_append() {
+        // The incremental concat (§29) must keep leading display rows
+        // byte-identical when only the tail grows — a full re-concat per
+        // ~120ms streaming flush is O(transcript) clones per change.
+        let mut app = test_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let text =
+            |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let before: Vec<String> = app.display_cache.iter().map(&text).collect();
+        assert!(!before.is_empty(), "first render must populate the cache");
+
+        // Flush immediately so the streamed delta lands in the transcript.
+        app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("more text".into()),
+        );
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let after: Vec<String> = app.display_cache.iter().map(text).collect();
+        assert!(
+            after.len() > before.len(),
+            "tail append must grow the cache: {after:?}"
+        );
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "leading display rows must survive a tail append unchanged"
         );
     }
 

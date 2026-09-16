@@ -15,6 +15,10 @@ pub(crate) use engine::{CallKind, ExtensionEngine, HostCtx, ShadowCtx, HOOK_TIME
 /// [`HOOK_TIMEOUT_SECS`] as a `Duration` for the event drive loop.
 pub(crate) const HOOK_TIMEOUT_SECS_DURATION: std::time::Duration =
     std::time::Duration::from_secs(HOOK_TIMEOUT_SECS);
+/// Slow-hook warning threshold: a hook call slower than this logs a warning
+/// (perf doc §9). Hooks run inline on the dispatch path, so anything near
+/// the 10s hook timeout is per-turn latency; 500ms flags the offender early.
+const SLOW_HOOK_WARN: std::time::Duration = std::time::Duration::from_millis(500);
 /// `dex.net.fetch` ceilings: per-request timeout cap (matches the tool
 /// budget) and response-body cap (a runaway body fails the call, not the
 /// daemon).
@@ -25,7 +29,7 @@ pub(crate) use manifest::Manifest;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::core::types::{FunctionDef, ToolDefinition};
@@ -229,7 +233,11 @@ struct LoadedExtension {
 }
 
 pub(crate) struct ExtensionManager {
-    cached: tokio::sync::RwLock<Vec<ToolDefinition>>,
+    /// Schema cache behind `Arc`: readers clone the `Arc`, never the defs.
+    cached: tokio::sync::RwLock<Arc<[ToolDefinition]>>,
+    /// Token cost of `cached`, precomputed at rebuild: the per-turn budget
+    /// reads this instead of re-serializing schemas on every model call.
+    cached_tokens: tokio::sync::RwLock<u64>,
     /// Sorted by id: iteration order is hook order (same contract as the
     /// skills dedup — deterministic, first-wins on collision).
     engines: tokio::sync::RwLock<BTreeMap<String, LoadedExtension>>,
@@ -252,7 +260,8 @@ pub(crate) struct ExtensionManager {
 impl ExtensionManager {
     fn fresh() -> Self {
         Self {
-            cached: tokio::sync::RwLock::new(Vec::new()),
+            cached: tokio::sync::RwLock::new(Arc::new([])),
+            cached_tokens: tokio::sync::RwLock::new(0),
             engines: tokio::sync::RwLock::new(BTreeMap::new()),
             shadowed: tokio::sync::RwLock::new(HashSet::new()),
             active: std::sync::RwLock::new(None),
@@ -455,7 +464,8 @@ impl ExtensionManager {
         if tools.len() > max {
             tools.truncate(max);
         }
-        *self.cached.write().await = tools;
+        *self.cached_tokens.write().await = crate::agent::tokens::schema_token_estimate(&tools);
+        *self.cached.write().await = Arc::from(tools);
         let shadowed: HashSet<String> = engines
             .values()
             .flat_map(|e| e.shadows.iter().cloned())
@@ -533,7 +543,9 @@ impl ExtensionManager {
 
     /// Run one extension's handlers for `event`, returning the directive
     /// envelope JSON. The manager does not interpret it — the typed runners
-    /// in [`hooks`] do.
+    /// in [`hooks`] do. Calls slower than [`SLOW_HOOK_WARN`] log a warning:
+    /// hooks run inline on the dispatch path (perf doc §9), so a slow hook
+    /// is per-turn latency with no other signal.
     async fn run_event(
         &self,
         ext_id: &str,
@@ -551,7 +563,8 @@ impl ExtensionManager {
             }
             ext.engine.clone()
         };
-        engine
+        let started = std::time::Instant::now();
+        let out = engine
             .drive(
                 CallKind::Event {
                     event: event.to_string(),
@@ -562,7 +575,15 @@ impl ExtensionManager {
                 *host,
                 None,
             )
-            .await
+            .await;
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_HOOK_WARN {
+            eprintln!(
+                "dex: [extensions] '{ext_id}' {event} took {}ms (slow hook adds per-turn latency)",
+                elapsed.as_millis()
+            );
+        }
+        out
     }
 
     /// `tool.before` chain (H1, plan §8): run in load order, each handler
@@ -814,13 +835,14 @@ impl ExtensionManager {
     pub(crate) async fn active_cached(&self) -> Vec<ToolDefinition> {
         let all = self.cached.read().await.clone();
         match self.active.read().expect("active lock").clone() {
-            None => all,
+            None => all.iter().cloned().collect(),
             Some(active) => {
                 let known: HashSet<String> = all.iter().map(|d| d.function.name.clone()).collect();
                 let wanted: HashSet<String> =
                     active.into_iter().filter(|t| known.contains(t)).collect();
-                all.into_iter()
+                all.iter()
                     .filter(|d| wanted.contains(&d.function.name))
+                    .cloned()
                     .collect()
             }
         }
@@ -938,16 +960,17 @@ pub(crate) fn global_manager() -> std::sync::Arc<ExtensionManager> {
 }
 
 /// Cached extension tools for `tools_schema()` — never blocks, never fails.
-pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
+/// Clones the `Arc`, not the defs.
+pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
     let Some(m) = GLOBAL.get() else {
-        return Vec::new();
+        return Arc::new([]);
     };
     let all = m
         .cached
         .try_read()
         .ok()
         .map(|t| t.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| Arc::new([]));
     match m.active.read().expect("active lock").clone() {
         None => all,
         // Filtered here, not at set time: a load-time `set_active` races
@@ -955,23 +978,29 @@ pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
         // a fresh process to an empty schema.
         Some(active) => {
             let wanted: HashSet<String> = active.into_iter().collect();
-            all.into_iter()
+            all.iter()
                 .filter(|d| wanted.contains(&d.function.name))
-                .collect()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into()
         }
     }
 }
 
 /// Token cost of the cached extension schema slice, for the compaction budget.
+/// Precomputed at rebuild — a cached load, never a re-serialize. (With an
+/// `active` slice the filtered set is estimated live; slicing is rare.)
 pub(crate) fn cached_schema_tokens() -> u64 {
-    GLOBAL
-        .get()
-        .and_then(|m| {
-            m.cached
-                .try_read()
-                .ok()
-                .map(|t| crate::agent::tokens::schema_token_estimate(&t))
-        })
+    let Some(m) = GLOBAL.get() else {
+        return 0;
+    };
+    if m.active.read().expect("active lock").is_some() {
+        return crate::agent::tokens::schema_token_estimate(&cached_tools());
+    }
+    m.cached_tokens
+        .try_read()
+        .ok()
+        .map(|n| *n)
         .unwrap_or_default()
 }
 
@@ -1844,7 +1873,7 @@ pub(crate) mod tests {
         /// included).
         pub(crate) async fn reset_for_tests(&self) {
             self.engines.write().await.clear();
-            *self.cached.write().await = Vec::new();
+            *self.cached.write().await = Arc::new([]);
             *self.shadowed.write().await = HashSet::new();
             *self.active.write().expect("active lock") = None;
             *LAST_MODEL.lock().expect("served model lock") = None;

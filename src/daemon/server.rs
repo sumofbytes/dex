@@ -413,8 +413,12 @@ async fn create_session(
         path: path.clone().into(),
         name: session.name().map(ToString::to_string),
         cwd,
+        model: None,
     };
     lock_map(&state.sessions).insert(session_id.clone(), entry);
+    // A re-created id (server-minted, so effectively never) must not stick
+    // in the §27 negative cache.
+    lock_map(&state.missing_sessions).remove(session_id.as_str());
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -426,26 +430,43 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
     // P10: disk-backed listing with JoinSet parallel per-session scans
     // (`spawn_blocking` per file, join, sort) — fixes the linear scan (S2).
     let listed = session::Session::list_all_async().await.unwrap_or_default();
-    // Per-session message_count + turn_state in parallel (spawn_blocking per file).
+    // §31: every same-workspace session shares one agents dir — count each
+    // distinct dir once (header-only scan + per-child turn states, off the
+    // axum worker) instead of once per session file.
+    let mut child_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for (path, _) in &listed {
+        let dir = session::Session::agents_dir(path);
+        if !child_dirs.contains(&dir) {
+            child_dirs.push(dir);
+        }
+    }
+    let child_counts: HashMap<std::path::PathBuf, (usize, usize)> =
+        tokio::task::spawn_blocking(move || {
+            child_dirs
+                .into_iter()
+                .map(|dir| {
+                    let counts = session::Session::count_children(&dir);
+                    (dir, counts)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+    let child_counts = std::sync::Arc::new(child_counts);
+    // Per-session (message_count, turn_state) in parallel (spawn_blocking per file).
     let mut set = tokio::task::JoinSet::new();
     for (path, header) in listed {
+        let child_counts = child_counts.clone();
         set.spawn(tokio::task::spawn_blocking(move || {
-            let message_count = crate::session::load_messages_from_session(&path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let turn_state = session::Session::last_turn_state(&path).to_string();
+            // §31: one fused open+scan per file — no full message parse for
+            // the count, no second pass for the turn state.
+            let (message_count, turn_state) =
+                crate::session::Session::scan_summary(&path).unwrap_or((0, "unknown".to_string()));
             // §16/Phase 8: child runs surface in the listing (the resume
             // picker shows them); loaders keep excluding `agents/*`.
-            let (child_agents, interrupted_children) = session::Session::list_children(&path)
-                .map(|runs| {
-                    (
-                        runs.len(),
-                        runs.iter()
-                            .filter(|(.., state)| *state == "interrupted")
-                            .count(),
-                    )
-                })
-                .unwrap_or((0, 0));
+            let dir = session::Session::agents_dir(&path);
+            let (child_agents, interrupted_children) =
+                child_counts.get(&dir).copied().unwrap_or((0, 0));
             (
                 path,
                 header,
@@ -541,18 +562,20 @@ async fn chat(
         .and_then(|v| v.to_str().ok())
         .filter(|k| !k.is_empty())
         .map(ToOwned::to_owned);
-    let request_hash = {
+    // Idempotency replay is routed through the SAME channel/stream as a live
+    // turn (single return type below): the recorded terminal envelope is just
+    // pushed and the stream closes. The request hash backs both idempotency
+    // paths (replay lookup here, record after the turn) and neither runs
+    // without a key — compute it only then, not on every chat.
+    let request_hash: Option<u64> = idempotency_key.as_deref().map(|_| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         serde_json::to_string(&req).unwrap_or_default().hash(&mut h);
         h.finish()
-    };
-    // Idempotency replay is routed through the SAME channel/stream as a live
-    // turn (single return type below): the recorded terminal envelope is just
-    // pushed and the stream closes.
+    });
     let replay_envelope: Option<StreamEnvelope> = idempotency_key
         .as_deref()
-        .and_then(|key| state.idempotent_replay(key, &session_id, request_hash))
+        .and_then(|key| state.idempotent_replay(key, &session_id, request_hash?))
         .and_then(|terminal| serde_json::from_str::<StreamEnvelope>(&terminal).ok());
     // Reject concurrent turns on the same session up front so the
     // append-only session log stays consistent. A replay must not hold the
@@ -613,7 +636,7 @@ async fn chat(
                 cancel,
                 tx,
                 idem_key,
-                request_hash,
+                request_hash.unwrap_or(0),
                 steering_rx_opt,
                 followup_rx_opt,
             )
@@ -988,6 +1011,13 @@ async fn run_turn_inner(
             let _ = session.set_state("model", raw);
             let _ = session.set_state("provider", config.provider.name());
         }
+    }
+    // Stash the turn's model on the registry entry (perf doc §30): the
+    // idle-wake path reuses it instead of re-scanning the session file.
+    // Every turn refreshes it (not just overrides), so the entry tracks
+    // `/model` switches made anywhere.
+    if let Some(entry) = lock_map(&state.sessions).get_mut(session_id) {
+        entry.model = Some(config.model.clone());
     }
     // Verification is opt-in (DEX_VERIFY / config verify_command). No
     // auto-detect by default — auto-running
@@ -1586,13 +1616,20 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             lock_map(&state.active_turns).insert(session_id.clone());
             lock_map(&state.cancel_tokens).insert(session_id.clone(), wake_cancel.clone());
             // Same model the session's last turn used (stored per session);
-            // permission resolves from the daemon's own ceiling.
-            let model = lock_map(&state.sessions)
+            // permission resolves from the daemon's own ceiling. Served
+            // from the registry entry (stashed at turn start); the file
+            // scan is the fallback for entries registered before their
+            // first turn.
+            let entry_model = lock_map(&state.sessions)
                 .get(&session_id)
-                .and_then(|entry| {
-                    crate::session::load_session_state(&entry.path)
-                        .ok()
-                        .and_then(|map| map.get("model").cloned())
+                .map(|entry| (entry.model.clone(), entry.path.clone()));
+            let model = entry_model
+                .and_then(|(cached, path)| {
+                    cached.filter(|m| !m.trim().is_empty()).or_else(|| {
+                        crate::session::load_session_state(&path)
+                            .ok()
+                            .and_then(|map| map.get("model").cloned())
+                    })
                 })
                 .filter(|model| !model.trim().is_empty());
             let request = ChatRequest {
@@ -1782,18 +1819,34 @@ async fn recall(
 /// in the background, so an id missing from the registry may simply not have
 /// been scanned yet. A disk hit is registered (live entries win over the
 /// later rebuild merge via `or_insert`) so subsequent lookups stay in-memory.
+/// A post-rebuild disk miss is negative-cached (perf doc §27), so a typo'd
+/// id walks the workspace once, not once per request.
 fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
     if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
-    let (path, header) = session::Session::list_all()
+    if state.rebuild_complete.load(Ordering::Relaxed)
+        && lock_map(&state.missing_sessions).contains(session_id)
+    {
+        return None;
+    }
+    let found = session::Session::list_all()
         .unwrap_or_default()
         .into_iter()
-        .find(|(_, header)| header.id() == session_id)?;
+        .find(|(_, header)| header.id() == session_id);
+    let Some((path, header)) = found else {
+        // Post-rebuild a miss is stable (new ids are server-minted on an
+        // explicit registration path that clears this set): remember it.
+        if state.rebuild_complete.load(Ordering::Relaxed) {
+            lock_map(&state.missing_sessions).insert(session_id.to_string());
+        }
+        return None;
+    };
     let entry = SessionEntry {
         path: path.clone(),
         name: header.name().map(ToOwned::to_owned),
         cwd: header.cwd().to_string(),
+        model: None,
     };
     lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
     Some(entry)
@@ -2181,6 +2234,7 @@ mod handler_tests {
                 path: path.to_path_buf(),
                 name: None,
                 cwd: "/tmp/dex-test-cwd".into(),
+                model: None,
             },
         );
         (state, id)
@@ -2467,6 +2521,7 @@ mod handler_tests {
                 path: "/tmp/does-not-exist.jsonl".into(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
             },
         );
         let r = steer(
@@ -2826,6 +2881,7 @@ mod handler_tests {
                 path: "/tmp/does-not-exist.jsonl".into(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
             },
         );
         let (stx, mut srx) = mpsc::channel::<QueueMsg>(4);
@@ -2870,6 +2926,7 @@ mod handler_tests {
                 path: "/tmp/does-not-exist.jsonl".into(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
@@ -3187,6 +3244,12 @@ this line is torn and not json
             "disk hit must register in memory"
         );
         assert!(lookup_entry(&state, "fb-2").is_none(), "unknown stays None");
+
+        // §27: post-rebuild misses negative-cache instead of re-walking
+        // the workspace on every probe.
+        state.rebuild_complete.store(true, Ordering::Relaxed);
+        assert!(lookup_entry(&state, "fb-2").is_none());
+        assert!(lock_map(&state.missing_sessions).contains("fb-2"));
 
         // Reattach resolves the same disk fallback and returns the replay
         // cursor: the highest journaled seq.
@@ -3510,6 +3573,7 @@ mod permission_gate_tests {
                 path: path.clone(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
             },
         );
 
@@ -4505,6 +4569,7 @@ mod async_parallel_tests {
                     path: s.path().unwrap().to_path_buf(),
                     name: Some(format!("n{i}")),
                     cwd: format!("/tmp/cwd-{i}"),
+                    model: None,
                 },
             );
         }

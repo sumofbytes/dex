@@ -209,6 +209,12 @@ pub(crate) struct DaemonState {
     /// §10b): every `GET /events` refreshes it. A wake fires only when a
     /// client is plausibly listening.
     pub last_client_seen: Mutex<HashMap<String, Instant>>,
+    /// Session ids proven absent from disk (perf doc §27): a typo'd id costs
+    /// one full `list_all` walk, then hits this instead of re-walking per
+    /// request. Populated only after the startup rebuild completes (during
+    /// the rebuild window a miss may simply be unscanned-yet, so the disk
+    /// fallback always runs); cleared on explicit registration.
+    pub missing_sessions: Mutex<HashSet<String>>,
 }
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
@@ -220,6 +226,12 @@ pub(crate) struct SessionEntry {
     pub path: PathBuf,
     pub name: Option<String>,
     pub cwd: String,
+    /// Model the session's last turn used, stashed at turn start (perf doc
+    /// §30): the idle-wake path reuses it instead of re-scanning the
+    /// session file for the stored `model` state. `None` until the first
+    /// turn (registry rebuilds only read headers) — the wake falls back to
+    /// the file scan then.
+    pub model: Option<String>,
 }
 
 impl DaemonState {
@@ -240,6 +252,7 @@ impl DaemonState {
             active_streams: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
             last_client_seen: Mutex::new(HashMap::new()),
+            missing_sessions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -528,7 +541,15 @@ impl DaemonState {
             if is_interrupted {
                 interrupted.push((id.clone(), path.clone()));
             }
-            entries.push((id, SessionEntry { path, name, cwd }));
+            entries.push((
+                id,
+                SessionEntry {
+                    path,
+                    name,
+                    cwd,
+                    model: None,
+                },
+            ));
         }
         for (id, path) in &interrupted {
             let live = lock_map(&self.active_turns).contains(id);
@@ -564,7 +585,7 @@ pub(crate) fn journal_event(state: &DaemonState, session_id: &str, seq: u64, eve
     let Some(path) = path else {
         return;
     };
-    if let Ok(mut journal) = crate::session::Session::from_path(&path) {
+    if let Ok(mut journal) = crate::session::Session::from_path_for_events(&path) {
         let _ = journal.append_event(seq, &serde_json::to_string(event).unwrap_or_default());
     }
 }
@@ -587,7 +608,7 @@ fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentE
     let Some(path) = path else {
         return;
     };
-    let Ok(mut journal) = crate::session::Session::from_path(&path) else {
+    let Ok(mut journal) = crate::session::Session::from_path_for_events(&path) else {
         return;
     };
     let (typed, system_line) = match &event {
@@ -1115,6 +1136,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/dex-live-wins-marker"),
             name: None,
             cwd: "/tmp".into(),
+            model: None,
         };
         state.sessions.lock().unwrap().insert(id.clone(), live);
         state.rebuild_async().await;
