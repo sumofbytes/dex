@@ -1108,15 +1108,28 @@ impl TranscriptView {
 
 const SEL_BG: Color = Color::Indexed(24);
 
+/// True when a display line has no visible text (empty or whitespace-only).
+/// Such an end row has no (visible) text range to highlight, so the caller
+/// pads it to a bar to keep its inclusion in the selection visible.
+fn is_blank_line(line: &Line<'static>) -> bool {
+    line.spans
+        .iter()
+        .flat_map(|s| s.content.chars())
+        .all(|c| c.is_whitespace())
+}
+
 /// Paint the mouse selection onto the visible window rows. Fully covered
 /// rows become a solid bar (style patch + padding to the area width); the
-/// anchor row of a multi-line drag highlights its text range plus the
-/// trailing margin out to the edge (continuation cue, no line-style patch
-/// so the prefix before the anchor stays plain); the end row — and any
-/// single-row selection — highlights only the selected cell range, end cell
-/// inclusive, never padding, so a drag ending on the last char stays
-/// distinct from a whole-line pick. Whole-line (triple-click) selections
-/// paint every covered row as a solid bar.
+/// first row of a multi-line drag (normed top, regardless of drag direction)
+/// highlights its text range plus the trailing margin out to the edge
+/// (continuation cue, no line-style patch so the prefix before the anchor
+/// stays plain); the end row — and any single-row selection — highlights
+/// only the selected cell range, end cell inclusive, never padding, so a
+/// drag ending on the last char stays distinct from a whole-line pick.
+/// Whole-line (triple-click) selections paint every covered row as a solid
+/// bar. When a row's text already fills the area width there is no margin
+/// left, so a last-char drag on that row reads the same as a whole-line
+/// pick — unavoidable with a single highlight style.
 fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, width: u16) {
     let ((r0, c0), (r1, c1)) = sel.norm();
     let hl = Style::default().bg(SEL_BG);
@@ -1142,13 +1155,13 @@ fn apply_selection(window: &mut [Line<'static>], scroll: usize, sel: Selection, 
         };
         style_row_range(line, from, to, hl);
         if !single && row == r0 {
-            // Anchor row continues onto the next rows: extend the highlight
+            // First (top) row continues onto the next rows: extend the highlight
             // through the trailing margin. No line-style patch — that would
             // also paint the unselected prefix before the anchor.
             pad_row(line, width, hl);
-        } else if !single && row == r1 && line.width() == 0 {
-            // A blank last row has no text range to highlight; pad so its
-            // inclusion in the selection stays visible.
+        } else if !single && row == r1 && is_blank_line(line) {
+            // A blank or whitespace-only last row has no (visible) text range
+            // to highlight; pad so its inclusion in the selection stays visible.
             pad_row(line, width, hl);
         }
     }
@@ -2040,6 +2053,90 @@ mod tests {
         assert_eq!(window[0].width(), 20);
         assert_eq!(window[1].width(), 20);
         assert!(window[1].spans.iter().any(|s| s.style.bg == Some(SEL_BG)));
+    }
+
+    #[test]
+    fn apply_selection_multiline_whitespace_last_row_pads_to_bar() {
+        // A whitespace-only last row has no visible text range; like a blank
+        // row it still pads to a bar so its inclusion stays visible.
+        let mut window = vec![Line::from("hello"), Line::from("   ")];
+        apply_selection(
+            &mut window,
+            0,
+            Selection {
+                anchor: (0, 0),
+                end: (1, 0),
+                sticky: false,
+                whole_line: false,
+            },
+            20,
+        );
+        assert_eq!(window[1].width(), 20);
+        assert_eq!(window[1].style.bg, None);
+        assert!(window[1].spans.iter().any(|s| s.style.bg == Some(SEL_BG)));
+    }
+
+    #[test]
+    fn apply_selection_reverse_drag_pads_normed_first_row() {
+        // Bottom-up drag: the normed top row gets the continuation pad, not
+        // the press point. Locks the "first row" (not "anchor row") wording.
+        let mut window = vec![Line::from("hello world"), Line::from("second")];
+        apply_selection(
+            &mut window,
+            0,
+            Selection {
+                anchor: (1, 3),
+                end: (0, 6),
+                sticky: false,
+                whole_line: false,
+            },
+            20,
+        );
+        assert_eq!(window[0].width(), 20);
+        assert_eq!(window[0].style.bg, None);
+        // Press-point (bottom) row highlights text only, no pad.
+        assert_eq!(window[1].width(), "second".len());
+        assert_eq!(window[1].style.bg, None);
+        let end_hl: String = window[1]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(SEL_BG))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(end_hl, "seco");
+    }
+
+    #[test]
+    fn apply_selection_full_width_end_row_matches_whole_line() {
+        // Known limit: with no trailing margin left, a last-char drag on a
+        // full-width row paints the same cells as a whole-line pick.
+        let text = "x".repeat(20);
+        let mut drag = vec![Line::from(text.clone())];
+        apply_selection(
+            &mut drag,
+            0,
+            Selection {
+                anchor: (0, 0),
+                end: (0, 19),
+                sticky: false,
+                whole_line: false,
+            },
+            20,
+        );
+        let mut whole = vec![Line::from(text)];
+        apply_selection(
+            &mut whole,
+            0,
+            Selection {
+                anchor: (0, 0),
+                end: (0, 19),
+                sticky: true,
+                whole_line: true,
+            },
+            20,
+        );
+        assert_eq!(drag[0].width(), 20);
+        assert_eq!(whole[0].width(), 20);
     }
 
     fn test_app() -> super::super::App {
