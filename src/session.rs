@@ -348,6 +348,10 @@ struct EventsCursor {
     id: FileId,
     max_seq: Option<u64>,
     checkpoints: Vec<(u64, u64)>,
+    /// The scan that published this entry reached EOF. A page-limited scan
+    /// (§1) stops early, so the fast path must not treat its `max_seq` as
+    /// the file tip — the next poll re-scans from its checkpoint instead.
+    drained: bool,
 }
 
 /// Byte spacing of events checkpoints: a poll seeks to the newest chunk at
@@ -355,6 +359,11 @@ struct EventsCursor {
 const EVENTS_CHECKPOINT_BYTES: u64 = 64 * 1024;
 /// Checkpoint count cap per journal (perf-only: ancient cursors scan more).
 const EVENTS_CHECKPOINT_CAP: usize = 4096;
+/// Rows served per events-journal page (§1): the startup replay loops pages
+/// with a paint between instead of slurping a giant journal in one HTTP
+/// round trip, and the idle poller self-paces on reconnect backlogs.
+/// Absent `?limit=` means this (old clients keep working, now bounded).
+pub(crate) const EVENTS_PAGE_LIMIT: usize = 1000;
 
 fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
     static CACHE: OnceLock<Mutex<PathCache<EventsCursor>>> = OnceLock::new();
@@ -404,13 +413,20 @@ struct EventRow<'a> {
 /// `collect` is false payloads are skipped (the `max_event_seq` path).
 type EventsScan = (Vec<(u64, String)>, Option<u64>);
 
-fn scan_events(events_path: &Path, since: u64, collect: bool) -> io::Result<EventsScan> {
+fn scan_events(
+    events_path: &Path,
+    since: u64,
+    collect: bool,
+    limit: usize,
+) -> io::Result<EventsScan> {
     // Fast path: the journal is byte-identical to a previous scan and the
     // cursor is at/past everything served — the idle poll. No file open.
+    // Only a drained scan publishes a servable tip (a page-limited scan
+    // stops early, so its `max_seq` is not the file end — §1).
     if let Some(id) = file_id(events_path) {
         let cache = events_cache().lock().expect("events cache lock");
         if let Some(entry) = cache.get(events_path) {
-            if entry.id == id && entry.max_seq.is_none_or(|m| since >= m) {
+            if entry.id == id && entry.drained && entry.max_seq.is_none_or(|m| since >= m) {
                 return Ok((Vec::new(), entry.max_seq));
             }
         }
@@ -479,12 +495,17 @@ fn scan_events(events_path: &Path, since: u64, collect: bool) -> io::Result<Even
     let mut out = Vec::new();
     let mut off = seek_to;
     let mut line = String::new();
+    let mut drained = false;
     loop {
         line.clear();
         let n = match reader.read_line(&mut line) {
-            Ok(0) => break,
+            Ok(0) => {
+                drained = true;
+                break;
+            }
             Ok(n) => n,
-            // Torn read: stop like EOF (matches `for_each_line`).
+            // Torn read: stop like EOF (matches `for_each_line`), but the
+            // end wasn't reached — don't publish a servable tip.
             Err(_) => break,
         };
         let row_start = off;
@@ -499,6 +520,13 @@ fn scan_events(events_path: &Path, since: u64, collect: bool) -> io::Result<Even
         }
         if collect && row.seq > since {
             out.push((row.seq, row.payload.get().to_owned()));
+            // Page-limited serving (§1): stop after `limit` served rows.
+            // `max`/checkpoints cover exactly the served prefix, so the
+            // next page resumes from its checkpoint; `drained` stays false
+            // so the fast path can't mistake this tip for EOF.
+            if out.len() >= limit {
+                break;
+            }
         }
     }
     if let Some(id) = file_id(events_path) {
@@ -516,6 +544,7 @@ fn scan_events(events_path: &Path, since: u64, collect: bool) -> io::Result<Even
                     id,
                     max_seq: max,
                     checkpoints,
+                    drained,
                 },
             );
         }
@@ -1232,9 +1261,13 @@ impl Session {
     /// Served from the steady-state cursor when the journal hasn't grown
     /// (one `stat`, no file open — perf doc §12), otherwise scanned from
     /// the newest checkpoint at or before `since`.
-    pub(crate) fn load_events(path: &Path, since: u64) -> io::Result<Vec<(u64, String)>> {
+    pub(crate) fn load_events(
+        path: &Path,
+        since: u64,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, String)>> {
         let events_path = path.with_extension("events.jsonl");
-        Ok(scan_events(&events_path, since, true)?.0)
+        Ok(scan_events(&events_path, since, true, limit)?.0)
     }
 
     /// Highest event seq recorded for a session (`None` when no seq is
@@ -1243,7 +1276,9 @@ impl Session {
     /// hasn't grown (perf doc §12).
     pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
         let events_path = path.with_extension("events.jsonl");
-        scan_events(&events_path, u64::MAX, false)
+        // The tip query must see the whole file (a limit here would corrupt
+        // seq seeding) — only serving scans page (§1).
+        scan_events(&events_path, u64::MAX, false, usize::MAX)
             .ok()
             .and_then(|(_, max)| max)
     }
@@ -1892,7 +1927,7 @@ mod tests {
         s.append_event(3, r#"{"type":"assistant_text","data":"c"}"#)
             .unwrap();
         let path = s.path().unwrap().to_path_buf();
-        let after = Session::load_events(&path, 1).unwrap();
+        let after = Session::load_events(&path, 1, usize::MAX).unwrap();
         let seqs: Vec<u64> = after.iter().map(|(seq, _)| *seq).collect();
         let texts: Vec<String> = after
             .iter()
@@ -1979,10 +2014,12 @@ mod tests {
         // Miss parses; the idle re-poll serves nothing without file IO.
         // (Cursor semantics are pre-existing `seq > since`: seq 0 is never
         // served to a `since=0` poll.)
-        assert_eq!(Session::load_events(&path, 0).unwrap().len(), 3);
-        assert!(Session::load_events(&path, 3).unwrap().is_empty());
+        assert_eq!(Session::load_events(&path, 0, usize::MAX).unwrap().len(), 3);
+        assert!(Session::load_events(&path, 3, usize::MAX)
+            .unwrap()
+            .is_empty());
         // A behind cursor re-scans and still gets every row exactly once.
-        let behind = Session::load_events(&path, 1).unwrap();
+        let behind = Session::load_events(&path, 1, usize::MAX).unwrap();
         assert_eq!(
             behind.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
             vec![2, 3]
@@ -1990,7 +2027,7 @@ mod tests {
         // Appends extend the cursor: only the tail is served.
         s.append_event(4, r#"{"type":"assistant_text","data":"4"}"#)
             .unwrap();
-        let tail = Session::load_events(&path, 3).unwrap();
+        let tail = Session::load_events(&path, 3, usize::MAX).unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].0, 4);
         assert_eq!(Session::max_event_seq(&path), Some(4));
@@ -2011,7 +2048,7 @@ mod tests {
                 .checkpoints
                 .is_empty());
         }
-        let tail = Session::load_events(&path, 1590).unwrap();
+        let tail = Session::load_events(&path, 1590, usize::MAX).unwrap();
         assert_eq!(tail.len(), 9);
         assert_eq!(tail[0].0, 1591);
         assert_eq!(Session::max_event_seq(&path), Some(1599));
@@ -2020,9 +2057,46 @@ mod tests {
         let events_path = path.with_extension("events.jsonl");
         let stump = fs::read(&events_path).unwrap()[..64].to_vec();
         fs::write(&events_path, stump).unwrap();
-        assert!(Session::load_events(&path, 0).unwrap().is_empty());
+        assert!(Session::load_events(&path, 0, usize::MAX)
+            .unwrap()
+            .is_empty());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(events_path);
+    }
+
+    #[test]
+    fn events_journal_pages_with_exactly_once_delivery() {
+        // §1: page-limited serving splits the journal across pages; chaining
+        // pages by last served seq delivers every row exactly once, and the
+        // drained tail re-arms the one-stat idle fast path.
+        let path = unique_path("dex-events-pages");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        for seq in 0..7u64 {
+            s.append_event(
+                seq,
+                &format!("{{\"type\":\"assistant_text\",\"data\":\"{seq}\"}}"),
+            )
+            .unwrap();
+        }
+        // Cursor semantics are pre-existing `seq > since`: seq 0 is never
+        // served to a `since=0` poll.
+        let mut since = 0u64;
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            let page = Session::load_events(&path, since, 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            since = page.last().unwrap().0;
+            got.extend(page.into_iter().map(|(seq, _)| seq));
+        }
+        assert_eq!(got, vec![1, 2, 3, 4, 5, 6]);
+        // Drained: the idle re-poll serves nothing (fast path, no file open).
+        assert!(Session::load_events(&path, since, 3).unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("events.jsonl"));
     }
 
     #[test]
@@ -2044,7 +2118,7 @@ mod tests {
         journal
             .append_event(1, r#"{"type":"assistant_text","data":"b"}"#)
             .unwrap();
-        let rows = Session::load_events(&path, 0).unwrap();
+        let rows = Session::load_events(&path, 0, usize::MAX).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 1);
         let _ = fs::remove_file(&path);

@@ -1250,14 +1250,13 @@ mod tests {
         app.messages.push(ChatMessage::user("u"));
         // A pending approval is denied on reset so the agent loop unblocks.
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        app.pending_approvals.push(crate::ui::PendingApproval {
-            name: "bash".into(),
-            input: "{}".into(),
-            agent: None,
-            selected: 0,
-            request_id: "r".into(),
-            response: tx,
-        });
+        app.pending_approvals.push(crate::ui::PendingApproval::new(
+            "bash".into(),
+            "{}".into(),
+            tx,
+            "r".into(),
+            None,
+        ));
 
         reset_session_state(&mut app);
 
