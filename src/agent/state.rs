@@ -48,6 +48,12 @@ pub(crate) fn cache_file_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn cache_fingerprint(name: &str, input: &str) -> String {
+    // Gate first: the JSON parse + metadata below ran per read-like tool
+    // result even though the result cache is opt-in (default off). The env
+    // read stays per-call — tests toggle it at runtime.
+    if env::var("DEX_TOOL_CACHE").as_deref() != Ok("1") {
+        return String::new();
+    }
     let mut fingerprint = String::new();
     if matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls") {
         if let Ok(args) = serde_json::from_str::<Value>(input) {

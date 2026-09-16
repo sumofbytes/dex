@@ -61,7 +61,9 @@ fn save_plan(app: &mut App) -> std::io::Result<()> {
 /// Every session for this workspace, newest first, excluding the current one.
 /// No emptiness filtering: users pick by index/time, and resuming a session
 /// without messages just shows an empty transcript. Listing is header-only
-/// (`Session::list` reads one line per file), so no cache is needed.
+/// (`Session::list` reads one line per file); the popup still caches it per
+/// input change (`SlashCache`, keyed on the sessions-dir mtime) so idle
+/// frames never re-walk the dir.
 fn resume_candidates(app: &App) -> Vec<(PathBuf, crate::session::SessionHeader)> {
     let current = app.session.id().to_string();
     Session::list(&app.cwd)
@@ -80,6 +82,26 @@ pub(super) fn popup_open(app: &App) -> bool {
     !slash_suggestions(app).is_empty()
 }
 
+/// Cached slash-popup listing (perf doc §29): `slash_suggestions` runs per
+/// frame while the composer holds a `/` line — including the `/model` walk
+/// over thousands of catalog ids (lowercasing each) and the `/resume` dir
+/// walk per keystroke. Keyed on the input plus everything the arms read
+/// (current model + model/skill counts + sessions-dir mtime), so a hit is
+/// exact and recomputation happens per input change, not per frame.
+#[derive(PartialEq)]
+struct SlashKey {
+    input: String,
+    model: String,
+    models_len: usize,
+    skills_len: usize,
+    resume_mtime: Option<std::time::SystemTime>,
+}
+
+pub(crate) struct SlashCache {
+    key: SlashKey,
+    suggestions: Vec<(String, String)>,
+}
+
 pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     let input = app.input.text();
     // The popup is a typing affordance, not a history companion: while the
@@ -89,7 +111,29 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     if app.busy || app.history_index.is_some() || !input.starts_with('/') || input.contains('\n') {
         return Vec::new();
     }
+    let key = SlashKey {
+        input: input.clone(),
+        model: app.config.model.clone(),
+        models_len: app.config.available_models.len(),
+        skills_len: app.skills.len(),
+        // One stat per input change; a sessions-dir rewrite (new/removed
+        // session) invalidates the `/resume` listing.
+        resume_mtime: Session::list_dir_mtime(&app.cwd),
+    };
+    if let Some(hit) = app.slash_cache.borrow().as_ref() {
+        if hit.key == key {
+            return hit.suggestions.clone();
+        }
+    }
+    let suggestions = compute_suggestions(app, &input);
+    *app.slash_cache.borrow_mut() = Some(SlashCache {
+        key,
+        suggestions: suggestions.clone(),
+    });
+    suggestions
+}
 
+fn compute_suggestions(app: &App, input: &str) -> Vec<(String, String)> {
     if let Some(query) = input.strip_prefix("/model ") {
         let query = query.to_ascii_lowercase();
         return app
@@ -358,7 +402,7 @@ pub(super) fn handle_slash(app: &mut App, line: &str) -> bool {
             if let Some(path) = app.session.path() {
                 push_info(app, format!("path: {}", path.display()));
             }
-            push_info(app, format!("turns: {}", app.session.count()));
+            push_info(app, format!("turns: {}", app.session.count_turns()));
         }
         "/permissions" => {
             push_info(app, format!("permission mode: {:?}", app.config.permission));
@@ -937,6 +981,35 @@ mod tests {
     fn type_input(app: &mut App, text: &str) {
         app.input = InputField::from_text(text);
         app.slash_selected = 0;
+    }
+
+    #[test]
+    fn suggestions_cache_serves_repeated_renders() {
+        // The popup renders per frame; recomputation happens per input
+        // change (plus model/skill/session data changes), not per frame.
+        let mut app = new_app();
+        type_input(&mut app, "/model ");
+        let first = slash_suggestions(&app);
+        assert_eq!(first.len(), 1, "test config serves one model");
+        assert!(
+            app.slash_cache.borrow().is_some(),
+            "popup memoizes per input"
+        );
+        // Same input: served from the cache, same listing.
+        assert_eq!(slash_suggestions(&app), first);
+        // Narrower query recomputes (and can only shrink the listing).
+        type_input(&mut app, "/model t");
+        assert_eq!(slash_suggestions(&app), first);
+        type_input(&mut app, "/model z");
+        assert!(slash_suggestions(&app).is_empty());
+        // A model switch invalidates: the key tracks the current model.
+        app.config.model = "other".to_string();
+        type_input(&mut app, "/model ");
+        let _ = slash_suggestions(&app);
+        assert_eq!(
+            app.slash_cache.borrow().as_ref().unwrap().key.model,
+            "other"
+        );
     }
 
     #[test]
