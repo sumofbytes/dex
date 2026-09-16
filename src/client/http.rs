@@ -25,13 +25,14 @@ pub(crate) struct ChatOptions {
 }
 
 /// Shared tokio runtime for sync callers (one-shot CLI, repl, `dex run`).
-/// Small (2 workers): only bridges sync entry points to async I/O.
+/// Four workers: TUI boot overlaps config/session/skills fetches plus the
+/// git/event pollers here, and two workers head-of-line blocked on that fan-out.
 static SHARED_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn shared_rt() -> &'static tokio::runtime::Runtime {
     SHARED_RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .build()
             .expect("shared runtime")
