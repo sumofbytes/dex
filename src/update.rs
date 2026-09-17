@@ -37,12 +37,9 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| DEFAULT_REPO.to_string());
 
-    let client = reqwest::Client::builder()
-        .user_agent(crate::client::http::USER_AGENT)
-        // Generous total: a release tarball is tens of MB on slow links.
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
+    // Shared client (pool reuse; follows the /releases/latest redirect).
+    // The generous total for multi-MB tarballs rides per-request below.
+    let client = crate::client::http::shared_async_client();
 
     // DEX_VERSION (same env as install.sh) pins a version: it installs that
     // release even when it is older, i.e. it can downgrade/force-reinstall.
@@ -63,6 +60,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
             // segment of the URL we landed on.
             let resp = client
                 .get(format!("https://github.com/{repo}/releases/latest"))
+                .timeout(Duration::from_secs(300))
                 .send()
                 .await
                 .map_err(|e| format!("cannot check the latest release: {e}"))?;
@@ -142,6 +140,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
 async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     let resp = client
         .get(url)
+        .timeout(Duration::from_secs(300))
         .send()
         .await
         .map_err(|e| format!("download failed ({url}): {e}"))?;
