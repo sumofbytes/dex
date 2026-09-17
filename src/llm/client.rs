@@ -51,24 +51,25 @@ impl ModelClient for LlmConfig {
     }
 }
 
-pub(crate) fn authenticated_request(
-    request: reqwest::RequestBuilder,
+/// Merged + validated custom headers for one request. Precedence is the
+/// AGENTS.md rule (provider-scoped file `headers:` > global file, per-key;
+/// env < `--header` above both — the same order `extension_model_auth_for`
+/// serves to Lua). `authorization` is never overridable — the api key owns
+/// it. Malformed names/values are skipped so one bad header can't fail the
+/// turn. Computed once per model call, not once per HTTP attempt.
+pub(crate) fn merged_headers(
     config: &LlmConfig,
-) -> reqwest::RequestBuilder {
-    let request =
-        config
-            .provider
-            .auth_scheme()
-            .apply(request, &config.api_key, config.account_id.as_deref());
-    // Provider-scoped file headers apply first; the global/env/CLI extras
-    // win on collision (explicit always beats file). `authorization` is
-    // never overridable here — the api key owns it. Malformed names or
-    // values are skipped so one bad header can't fail the turn.
-    let mut merged = config.provider_headers.clone();
-    for (name, value) in &config.extra_headers {
+) -> Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+    let mut merged = config.global_headers.clone();
+    for (name, value) in &config.provider_headers {
+        // Provider-scoped beats the global table per key: overwrite.
         insert_extra_header(&mut merged, name, value);
     }
-    let mut request = request;
+    for (name, value) in &config.extra_headers {
+        // Env / `--header` / per-request overrides beat both file layers.
+        insert_extra_header(&mut merged, name, value);
+    }
+    let mut out = Vec::with_capacity(merged.len());
     for (name, value) in &merged {
         if name.eq_ignore_ascii_case("authorization") {
             continue;
@@ -77,8 +78,25 @@ pub(crate) fn authenticated_request(
             reqwest::header::HeaderName::from_bytes(name.as_bytes()),
             reqwest::header::HeaderValue::from_str(value),
         ) {
-            request = request.header(name, value);
+            out.push((name, value));
         }
+    }
+    out
+}
+
+pub(crate) fn authenticated_request(
+    request: reqwest::RequestBuilder,
+    config: &LlmConfig,
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+) -> reqwest::RequestBuilder {
+    let request =
+        config
+            .provider
+            .auth_scheme()
+            .apply(request, &config.api_key, config.account_id.as_deref());
+    let mut request = request;
+    for (name, value) in headers {
+        request = request.header(name.clone(), value.clone());
     }
     request
 }
@@ -203,8 +221,14 @@ async fn post_with_retry(
     sink: Option<&mpsc::Sender<SinkLine>>,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     const MAX_HTTP_RETRIES: u32 = 3;
-    let mut active_config = config.clone();
+    let headers = merged_headers(config);
+    // 401-refresh scratch: `None` borrows `config` (no clone on the common
+    // path — the old code cloned the whole config per call even though only
+    // the 401 path mutates). Materialized only when a refreshable provider
+    // actually returns 401.
+    let mut refreshed: Option<LlmConfig> = None;
     for attempt in 0..=MAX_HTTP_RETRIES {
+        let active: &LlmConfig = refreshed.as_ref().unwrap_or(config);
         let request = config.client.post(url);
         crate::log!(
             Debug,
@@ -212,7 +236,7 @@ async fn post_with_retry(
             config.model
         );
         let started = std::time::Instant::now();
-        let resp = match authenticated_request(request, &active_config)
+        let resp = match authenticated_request(request, active, &headers)
             .json(body)
             .send()
             .await
@@ -254,15 +278,17 @@ async fn post_with_retry(
                 .and_then(retry_after);
             let body_text = resp.text().await.map_err(Box::new)?;
             if status == reqwest::StatusCode::UNAUTHORIZED
-                && active_config.provider.credentials_refreshable()
+                && active.provider.credentials_refreshable()
                 && attempt < MAX_HTTP_RETRIES
             {
                 if let Ok((token, account)) = crate::llm::config::resolve_credentials(
-                    &active_config.provider,
-                    &active_config.provider_entries,
+                    &active.provider,
+                    &active.provider_entries,
                 ) {
-                    active_config.api_key = token;
-                    active_config.account_id = account;
+                    let mut next = refreshed.take().unwrap_or_else(|| config.clone());
+                    next.api_key = token;
+                    next.account_id = account;
+                    refreshed = Some(next);
                     continue;
                 }
             }
@@ -765,9 +791,11 @@ mod tests {
         config
             .extra_headers
             .insert("not a header".to_string(), "bad".to_string());
+        let headers = merged_headers(&config);
         let req = authenticated_request(
             config.client.get("http://localhost/v1/chat/completions"),
             &config,
+            &headers,
         )
         .build()
         .unwrap();
@@ -788,9 +816,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_headers_apply_under_global_extras() {
-        // Provider-scoped file headers ride along; an explicit global /
-        // env / CLI extra wins on collision.
+    fn provider_headers_beat_global_file_but_not_env_extras() {
+        // AGENTS.md precedence on the wire: provider-scoped file headers
+        // beat the global file table per key, env/CLI extras beat both.
         let mut config = crate::llm::config::tests::test_cfg();
         config.api_key = "secret".to_string();
         config
@@ -800,21 +828,28 @@ mod tests {
             .provider_headers
             .insert("X-Both".to_string(), "prov".to_string());
         config
-            .extra_headers
+            .global_headers
             .insert("X-Both".to_string(), "global".to_string());
+        config
+            .extra_headers
+            .insert("X-Prov".to_string(), "env".to_string());
+        let headers = merged_headers(&config);
         let req = authenticated_request(
             config.client.get("http://localhost/v1/chat/completions"),
             &config,
+            &headers,
         )
         .build()
         .unwrap();
-        assert_eq!(
-            req.headers().get("x-prov").map(|v| v.to_str().unwrap()),
-            Some("prov")
-        );
+        // Provider-scoped file beats global-file on collision…
         assert_eq!(
             req.headers().get("x-both").map(|v| v.to_str().unwrap()),
-            Some("global")
+            Some("prov")
+        );
+        // …but an env/CLI/per-request extra beats the provider-scoped one.
+        assert_eq!(
+            req.headers().get("x-prov").map(|v| v.to_str().unwrap()),
+            Some("env")
         );
     }
 

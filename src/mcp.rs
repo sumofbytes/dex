@@ -383,21 +383,6 @@ fn insert_server(
     }
 }
 
-fn config_file_value() -> Option<serde_yaml::Value> {
-    let path = if let Some(p) = std::env::var_os("DEX_CONFIG") {
-        std::path::PathBuf::from(p)
-    } else {
-        let dir = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-            })?;
-        dir.join("dex/config.yaml")
-    };
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&text).ok()
-}
-
 /// Load server configs from config.yaml (`DEX_MCP_SERVERS_JSON` wins for tests).
 pub(crate) fn load_server_configs() -> BTreeMap<String, McpServerConfig> {
     if !mcp_enabled() {
@@ -421,7 +406,11 @@ pub(crate) fn load_server_configs() -> BTreeMap<String, McpServerConfig> {
             }
         }
     }
-    config_file_value()
+    // Shared cached parse (perf doc §30): the old shadow reader re-read +
+    // re-parsed config.yaml on every call — same paths, same outcome for
+    // valid files (invalid files yield no servers either way, plus a
+    // one-time warning from the cached loader).
+    crate::llm::config::config_file_value()
         .as_ref()
         .map(parse_mcp_servers)
         .unwrap_or_default()
@@ -901,7 +890,7 @@ impl HttpTransport {
         if let Some(s) = had_session.clone() {
             req = req.header("mcp-session-id", s);
         }
-        let resp = req
+        let mut resp = req
             .json(&body)
             .send()
             .await
@@ -943,21 +932,66 @@ impl HttpTransport {
         if !status.is_success() {
             return Err(fail(format!("mcp http {status}: {method}")));
         }
-        let text = resp.text().await.map_err(|e| fail(e.to_string()))?;
-        // Plain JSON wins; otherwise scan SSE `data:` lines for the reply.
-        if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
-            if v.is_object() {
-                if let Some(r) = extract_rpc_result(&v) {
-                    return Ok(r);
+        // Stream-decode (§20): the server may hold the SSE stream open after
+        // the result (server-initiated messages) — waiting for the full body
+        // then meant hanging until the call timeout even though the reply
+        // had arrived. Decode `data:` lines incrementally and return on the
+        // envelope carrying this call's `id` with a result/error (same
+        // "first wins" rule as the old full-body scan, now id-matched like
+        // `StdioTransport` so a notification carrying `result` can't
+        // early-exit). A non-SSE plain-JSON body falls back to a whole-body
+        // parse at EOF. `buf` is capped: a malicious infinite `:keep-alive`
+        // stream can't OOM before the result arrives.
+        let mut buf: Vec<u8> = Vec::new();
+        // The non-SSE fallback parses the whole body, but the scan above
+        // drains every completed line out of `buf` (including non-`data:`
+        // ones). Keep the raw bytes separately so a plain-JSON reply that
+        // ends in a newline (very common: `json.NewEncoder`, `print`) is
+        // still parseable at EOF instead of looking empty. Head-capped: an
+        // RPC reply is small, and a bigger SSE body is never JSON anyway.
+        let mut raw: Vec<u8> = Vec::new();
+        const SSE_BUF_CAP: usize = 1024 * 1024;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if raw.len() < SSE_BUF_CAP {
+                        let room = SSE_BUF_CAP - raw.len();
+                        raw.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    }
+                    buf.extend_from_slice(&chunk);
+                    if let Some(r) = sse_scan_buffered_id(&mut buf, id) {
+                        // Early exit drops `resp`, closing the stream: the
+                        // server's post-result broadcasts lose one listener.
+                        // Correctness first (was: hang to timeout); the next
+                        // call re-establishes the stream.
+                        return Ok(r);
+                    }
+                    // After the scan `buf` holds only the unterminated tail:
+                    // progress/`:keep-alive` spam can't OOM the call, and a
+                    // single line bigger than the cap could never be parsed,
+                    // so fail loudly instead of silently dropping it.
+                    if buf.len() > SSE_BUF_CAP {
+                        return Err(fail(format!(
+                            "mcp http response line exceeded the {SSE_BUF_CAP}-byte framing cap"
+                        )));
+                    }
                 }
+                Ok(None) => break,
+                Err(e) => return Err(fail(e.to_string())),
             }
         }
-        for line in text.lines() {
-            let data = line.trim().strip_prefix("data:").unwrap_or("").trim();
-            if data.is_empty() || data == "[DONE]" {
-                continue;
+        // Trailing line without a newline (SSE), then the plain-JSON
+        // fallback for non-SSE responses — parsed from `raw`, since the
+        // scan consumed the completed lines above.
+        if !buf.is_empty() {
+            let line = String::from_utf8_lossy(&buf);
+            if let Some(r) = sse_result_id(&line, id) {
+                return Ok(r);
             }
-            if let Ok(v) = serde_json::from_str::<Value>(data) {
+        }
+        let text = String::from_utf8_lossy(&raw);
+        if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+            if v.get("id").is_none_or(|v| v.as_u64() == Some(id)) {
                 if let Some(r) = extract_rpc_result(&v) {
                     return Ok(r);
                 }
@@ -965,6 +999,38 @@ impl HttpTransport {
         }
         Err(fail("mcp: no result in http response".to_string()))
     }
+}
+
+/// One SSE `data:` line → RPC result/error for `id`, if it carries one.
+/// Progress notifications (no `result`/`error`, or a different `id`) return
+/// `None` so the scan continues. An envelope without an `id` is NEVER this
+/// call's result — under concurrent calls on one transport an id-less
+/// broadcast notification carrying `result` would otherwise be stolen and
+/// misattributed to whoever scans first. Servers that omit `id` are served
+/// by the non-multiplexed stdio path, not here.
+fn sse_result_id(line: &str, id: u64) -> Option<Value> {
+    let data = line.trim().strip_prefix("data:").unwrap_or("").trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    if v.get("id").and_then(|v| v.as_u64()) != Some(id) {
+        return None;
+    }
+    extract_rpc_result(&v)
+}
+
+/// Scan newly completed lines in `buf` for this call's result (§20): a
+/// `data:` line split across chunks stays buffered until its newline
+/// arrives. Completed non-result lines are dropped; the partial tail stays.
+fn sse_scan_buffered_id(buf: &mut Vec<u8>, id: u64) -> Option<Value> {
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=pos).collect();
+        if let Some(r) = sse_result_id(&String::from_utf8_lossy(&line), id) {
+            return Some(r);
+        }
+    }
+    None
 }
 
 fn extract_rpc_result(v: &Value) -> Option<Value> {
@@ -1127,13 +1193,28 @@ pub(crate) struct ServerStatus {
     pub(crate) error: Option<String>,
 }
 
+/// One server's fetched schema slice: raw defs plus the synthetic reader.
+/// The caller merges (collision renames need the shared map, so merging
+/// stays serial over a sorted server list).
+struct ServerDefs {
+    tools: Vec<(ToolDefinition, String)>,
+    reader: Option<ToolDefinition>,
+}
+
 pub(crate) struct McpManager {
     configs: BTreeMap<String, McpServerConfig>,
     clients: RwLock<HashMap<String, Arc<McpClient>>>,
     down: RwLock<HashMap<String, String>>,
-    cached_tools: RwLock<Vec<ToolDefinition>>,
+    /// Schema cache behind `Arc`: readers clone the `Arc`, never the defs
+    /// (each `parameters: Value` re-serializes expensively — see
+    /// `cached_schema_tokens`).
+    cached_tools: RwLock<Arc<[ToolDefinition]>>,
     cached_names: RwLock<HashMap<String, (String, String)>>,
     cached_truncated: RwLock<usize>,
+    /// Token cost of `cached_tools`, precomputed at swap time: the per-turn
+    /// budget reads this instead of re-running `schema_token_estimate`
+    /// (`parameters.to_string()` per def) on every model call.
+    cached_schema_tokens: RwLock<u64>,
 }
 
 impl McpManager {
@@ -1142,9 +1223,10 @@ impl McpManager {
             configs,
             clients: RwLock::new(HashMap::new()),
             down: RwLock::new(HashMap::new()),
-            cached_tools: RwLock::new(Vec::new()),
+            cached_tools: RwLock::new(Arc::new([])),
             cached_names: RwLock::new(HashMap::new()),
             cached_truncated: RwLock::new(0),
+            cached_schema_tokens: RwLock::new(0),
         }
     }
 
@@ -1213,17 +1295,47 @@ impl McpManager {
 
     async fn rebuild_cache(&self) {
         let clients = self.clients.read().await.clone();
-        let mut tools = Vec::new();
-        let mut names = HashMap::new();
+        // Fan out the per-server RPCs: `fetch_server_defs` holds no locks,
+        // so one slow server never stalls the rest (previously serial, 2
+        // RPCs each with 30s timeouts).
+        let mut set = tokio::task::JoinSet::new();
         for (server, client) in &clients {
             // Test clients have no config entry: default allows everything.
             let cfg = self.configs.get(server).cloned().unwrap_or_default();
-            Self::cache_server_into(server, &cfg, client, &mut tools, &mut names).await;
+            let server = server.clone();
+            let client = Arc::clone(client);
+            set.spawn(async move {
+                let defs = Self::fetch_server_defs(&server, &cfg, &client).await;
+                (server, defs)
+            });
+        }
+        let mut fetched = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(row) = joined {
+                fetched.push(row);
+            }
+        }
+        // Merge single-threaded over a sorted server list: collision renames
+        // (`~2` suffixes) are order-dependent, so a fixed order keeps them
+        // stable from rebuild to rebuild.
+        fetched.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut tools = Vec::new();
+        let mut names = HashMap::new();
+        for (server, defs) in fetched {
+            for (def, tool) in defs.tools {
+                insert_cached(&mut tools, &mut names, def, &server, &tool);
+            }
+            if let Some(def) = defs.reader {
+                names.insert(
+                    def.function.name.clone(),
+                    (server.clone(), "\0resource".to_string()),
+                );
+                tools.push(def);
+            }
         }
         self.enforce_cap(&mut tools, &mut names, mcp_max_tools())
             .await;
-        *self.cached_tools.write().await = tools;
-        *self.cached_names.write().await = names;
+        self.swap_cache(tools, names).await;
     }
 
     /// Schema cap: the model pays for the schema on every request, so bound
@@ -1248,47 +1360,78 @@ impl McpManager {
         *self.cached_truncated.write().await = dropped;
     }
 
-    /// List one server's tools (+ resource reader) into the given sinks,
-    /// honoring the server's allow/deny filter.
-    async fn cache_server_into(
+    /// One server's schema slice, fetched with no cache locks held: the
+    /// `list_tools` + `has_resources` RPCs. Raw defs — the caller merges
+    /// (collision renames need the shared map, so merging stays serial).
+    /// List one server's tools (+ resource reader), honoring the server's
+    /// allow/deny filter.
+    async fn fetch_server_defs(
         server: &str,
         cfg: &McpServerConfig,
         client: &Arc<McpClient>,
-        tools: &mut Vec<ToolDefinition>,
-        names: &mut HashMap<String, (String, String)>,
-    ) {
+    ) -> ServerDefs {
+        let mut tools = Vec::new();
         let listed = client.list_tools(None).await.unwrap_or_default();
         for tool in &listed {
             if !cfg.tool_allowed(&tool.name) {
                 continue;
             }
-            insert_cached(tools, names, tool.to_definition(server), server, &tool.name);
+            tools.push((tool.to_definition(server), tool.name.clone()));
         }
-        if client.has_resources(None).await {
-            let def = resource_reader_definition(server);
-            names.insert(
-                def.function.name.clone(),
-                (server.to_string(), "\0resource".to_string()),
-            );
-            tools.push(def);
-        }
+        let reader = if client.has_resources(None).await {
+            Some(resource_reader_definition(server))
+        } else {
+            None
+        };
+        ServerDefs { tools, reader }
+    }
+
+    /// Swap a freshly built cache under the write locks: the only locked
+    /// section of the rebuild path — RPCs, cap math, and token math all
+    /// happen lock-free on locals first.
+    async fn swap_cache(
+        &self,
+        tools: Vec<ToolDefinition>,
+        names: HashMap<String, (String, String)>,
+    ) {
+        let tokens = crate::agent::tokens::schema_token_estimate(&tools);
+        *self.cached_tools.write().await = Arc::from(tools);
+        *self.cached_names.write().await = names;
+        *self.cached_schema_tokens.write().await = tokens;
     }
 
     /// Connect one server and merge its tools into the live cache (the batch
     /// `refresh` path rebuilds wholesale; this keeps a lazy connect cheap).
+    /// Fetch first, lock only to swap: readers keep serving the previous
+    /// cache across the lazy-connect RPCs instead of degrading to an empty
+    /// slice under a held write lock.
     async fn connect_and_cache(&self, name: &str, cfg: &McpServerConfig) {
         self.connect_one(name, cfg).await;
-        let clients = self.clients.read().await.clone();
-        let Some(client) = clients.get(name) else {
+        let Some(client) = self.clients.read().await.get(name).cloned() else {
             return;
         };
-        let mut tools = self.cached_tools.write().await;
-        let mut names = self.cached_names.write().await;
-        tools.retain(|d| !def_belongs_to(&d.function.name, name));
+        let defs = Self::fetch_server_defs(name, cfg, &client).await;
+        let current = self.cached_tools.read().await.clone();
+        let mut tools: Vec<ToolDefinition> = current
+            .iter()
+            .filter(|d| !def_belongs_to(&d.function.name, name))
+            .cloned()
+            .collect();
+        let mut names = self.cached_names.read().await.clone();
         names.retain(|_, (server, _)| server != name);
-        Self::cache_server_into(name, cfg, client, &mut tools, &mut names).await;
+        for (def, tool) in defs.tools {
+            insert_cached(&mut tools, &mut names, def, name, &tool);
+        }
+        if let Some(def) = defs.reader {
+            names.insert(
+                def.function.name.clone(),
+                (name.to_string(), "\0resource".to_string()),
+            );
+            tools.push(def);
+        }
         self.enforce_cap(&mut tools, &mut names, mcp_max_tools())
             .await;
+        self.swap_cache(tools, names).await;
     }
 
     /// Drop the client and reconnect now; surfaces the error instead of only
@@ -1319,29 +1462,44 @@ impl McpManager {
         }
     }
 
-    /// Ping every client; drop the dead so they go `down` before the next
-    /// turn. Runs every 60s on the global manager; never fails the batch.
+    /// Ping every client concurrently; drop the dead so they go `down`
+    /// before the next turn. Runs every 60s on the global manager; never
+    /// fails the batch.
     pub(crate) async fn sweep_once(&self) {
         let clients: Vec<(String, Arc<McpClient>)> =
             self.clients.read().await.clone().into_iter().collect();
-        let mut changed = false;
-        for (name, client) in &clients {
-            if client.ping().await.is_err() {
-                self.clients.write().await.remove(name);
-                self.down.write().await.insert(
+        let mut set = tokio::task::JoinSet::new();
+        for (name, client) in clients {
+            set.spawn(async move {
+                let dead = client.ping().await.is_err();
+                (name, dead)
+            });
+        }
+        let mut dead = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((name, true)) = joined {
+                dead.push(name);
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        {
+            let mut clients = self.clients.write().await;
+            let mut down = self.down.write().await;
+            for name in &dead {
+                clients.remove(name);
+                down.insert(
                     name.clone(),
                     "liveness probe failed; will reconnect on next use".to_string(),
                 );
-                changed = true;
             }
         }
-        if changed {
-            self.rebuild_cache().await;
-        }
+        self.rebuild_cache().await;
     }
 
     #[cfg(test)]
-    pub(crate) async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+    pub(crate) async fn tool_definitions(&self) -> Arc<[ToolDefinition]> {
         self.cached_tools.read().await.clone()
     }
 
@@ -1424,8 +1582,13 @@ impl McpManager {
             }
             None => (server, tool),
         };
-        let clients = self.clients.read().await;
-        let Some(client) = clients.get(&server) else {
+        let clients = self.clients.read().await.get(&server).cloned();
+        // Clone the client out of the map and drop the guard before any
+        // `.await`: holding the read guard across the tool RPC (up to the
+        // 30s timeout) would stall every map writer — reconnect, sweeper
+        // drops, lazy-connect inserts — on a hung server. Read-shared
+        // otherwise, so concurrent calls never block each other here.
+        let Some(client) = clients else {
             let reason = self
                 .down
                 .read()
@@ -1484,24 +1647,40 @@ pub(crate) fn global_manager() -> Arc<McpManager> {
         .clone()
 }
 
+/// Bounded spin on `try_read`: every writer holds its guard for a bare
+/// swap (never across an await), so a contended first try succeeds within
+/// a few yields. A single `try_read().unwrap_or_default()` undercounts the
+/// compaction budget to 0 under contention and skips a needed compaction —
+/// or drops the tools from one request's schema. The spin keeps the
+/// never-block contract (bounded yields) while making the fallback
+/// ~unreachable.
+fn spin_read<T: Clone>(lock: &RwLock<T>) -> Option<T> {
+    for _ in 0..16 {
+        if let Ok(guard) = lock.try_read() {
+            return Some(guard.clone());
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
 /// Cached MCP tools for `tools_schema()` — never blocks, never fails.
-pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
+/// Clones the `Arc`, not the defs.
+pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
     GLOBAL
         .get()
-        .and_then(|m| m.cached_tools.try_read().ok().map(|t| t.clone()))
-        .unwrap_or_default()
+        .and_then(|m| spin_read(&m.cached_tools))
+        .unwrap_or_else(|| Arc::new([]))
 }
 
 /// Token cost of the cached MCP schema slice, for the compaction budget.
+/// Precomputed at cache-swap time — a cached load, never a re-serialize.
+/// Never blocks the loop; contention spins (see `spin_read`) instead of
+/// returning 0 and skipping a needed compaction.
 pub(crate) fn cached_schema_tokens() -> u64 {
     GLOBAL
         .get()
-        .and_then(|m| {
-            m.cached_tools
-                .try_read()
-                .ok()
-                .map(|t| crate::agent::tokens::schema_token_estimate(&t))
-        })
+        .and_then(|m| spin_read(&m.cached_schema_tokens))
         .unwrap_or_default()
 }
 
@@ -1509,7 +1688,7 @@ pub(crate) fn cached_schema_tokens() -> u64 {
 pub(crate) fn cached_truncated() -> usize {
     GLOBAL
         .get()
-        .and_then(|m| m.cached_truncated.try_read().ok().map(|n| *n))
+        .and_then(|m| spin_read(&m.cached_truncated))
         .unwrap_or_default()
 }
 
@@ -1549,9 +1728,9 @@ pub(crate) fn cached_statuses() -> Option<Vec<ServerStatus>> {
 /// contended — callers must treat that as "unavailable", never as an empty
 /// server list (which would wrongly imply no MCP is configured).
 fn try_snapshot(mgr: &McpManager) -> Option<Vec<ServerStatus>> {
-    let clients = mgr.clients.try_read().ok()?;
-    let tools = mgr.cached_tools.try_read().ok()?;
-    let down = mgr.down.try_read().ok()?;
+    let clients = spin_read(&mgr.clients)?;
+    let tools = spin_read(&mgr.cached_tools)?;
+    let down = spin_read(&mgr.down)?;
     Some(McpManager::status_list(
         &mgr.configs,
         &clients,
@@ -1607,6 +1786,38 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn sse_stream_decode_returns_first_result_with_early_exit() {
+        // §20: notifications and blanks scan past; a result split across
+        // chunks still matches once its newline arrives.
+        let mut buf = Vec::new();
+        let scan = |buf: &mut Vec<u8>, chunk: &[u8]| {
+            buf.extend_from_slice(chunk);
+            sse_scan_buffered_id(buf, 1)
+        };
+        assert!(scan(&mut buf, b": keep-alive\n\n").is_none());
+        assert!(scan(
+            &mut buf,
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"progress\"}\n"
+        )
+        .is_none());
+        assert!(scan(&mut buf, b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"res").is_none());
+        let r = scan(&mut buf, b"ult\":{\"ok\":true}}\n").expect("split result matches");
+        assert_eq!(r, serde_json::json!({"ok": true}));
+        // Error envelopes match too; [DONE] and blanks don't.
+        assert!(sse_result_id("data: [DONE]", 1).is_none());
+        assert!(sse_result_id("", 1).is_none());
+        assert!(sse_result_id(": comment", 1).is_none());
+        let e =
+            sse_result_id("data: {\"id\":1,\"error\":{\"code\":-1}}", 1).expect("error matches");
+        assert!(e.get("__mcp_error").is_some());
+        // Id-less envelopes are never this call's result: under concurrent
+        // calls on one transport an id-less broadcast carrying `result`
+        // would otherwise be stolen and misattributed to whoever scans first.
+        assert!(sse_result_id("data: {\"error\":{\"code\":-1}}", 1).is_none());
+        assert!(sse_result_id("data: {\"result\":{\"ok\":true}}", 1).is_none());
     }
 
     fn fake_client(tools: Vec<McpTool>, resources: bool, fail: bool) -> McpClient {

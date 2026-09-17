@@ -21,7 +21,7 @@ use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::core::unwind::CatchUnwind;
 use crate::llm::config::{agent_wake_enabled, LlmConfig};
-use crate::llm::prompt::system_prompt_with_override;
+use crate::llm::prompt::system_prompt_with_override_for;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
     FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, RecallRequest, SkillInfo,
@@ -339,11 +339,7 @@ async fn load_skill(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let entry = {
-        let sessions = lock_map(&state.sessions);
-        sessions.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let entry = lookup_entry_async(&state, &session_id).await?;
     let skill_name = req.name.clone();
     let extra_dirs = req.skill_dirs.clone();
     let mut dirs = skill_dirs();
@@ -413,8 +409,16 @@ async fn create_session(
         path: path.clone().into(),
         name: session.name().map(ToString::to_string),
         cwd,
+        model: None,
+        wake_provider: None,
+        wake_base_url: None,
+        plan_persisted: None,
+        model_persisted: None,
     };
     lock_map(&state.sessions).insert(session_id.clone(), entry);
+    // A re-created id (server-minted, so effectively never) must not stick
+    // in the §27 negative cache.
+    lock_map(&state.missing_sessions).remove(session_id.as_str());
 
     Ok(Json(json!({
         "session_id": session_id,
@@ -426,26 +430,43 @@ async fn list_sessions(State(state): State<Arc<DaemonState>>) -> Json<serde_json
     // P10: disk-backed listing with JoinSet parallel per-session scans
     // (`spawn_blocking` per file, join, sort) — fixes the linear scan (S2).
     let listed = session::Session::list_all_async().await.unwrap_or_default();
-    // Per-session message_count + turn_state in parallel (spawn_blocking per file).
+    // §31: every same-workspace session shares one agents dir — count each
+    // distinct dir once (header-only scan + per-child turn states, off the
+    // axum worker) instead of once per session file.
+    let mut child_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for (path, _) in &listed {
+        let dir = session::Session::agents_dir(path);
+        if !child_dirs.contains(&dir) {
+            child_dirs.push(dir);
+        }
+    }
+    let child_counts: HashMap<std::path::PathBuf, (usize, usize)> =
+        tokio::task::spawn_blocking(move || {
+            child_dirs
+                .into_iter()
+                .map(|dir| {
+                    let counts = session::Session::count_children(&dir);
+                    (dir, counts)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+    let child_counts = std::sync::Arc::new(child_counts);
+    // Per-session (message_count, turn_state) in parallel (spawn_blocking per file).
     let mut set = tokio::task::JoinSet::new();
     for (path, header) in listed {
+        let child_counts = child_counts.clone();
         set.spawn(tokio::task::spawn_blocking(move || {
-            let message_count = crate::session::load_messages_from_session(&path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let turn_state = session::Session::last_turn_state(&path).to_string();
+            // §31: one fused open+scan per file — no full message parse for
+            // the count, no second pass for the turn state.
+            let (message_count, turn_state) =
+                crate::session::Session::scan_summary(&path).unwrap_or((0, "unknown".to_string()));
             // §16/Phase 8: child runs surface in the listing (the resume
             // picker shows them); loaders keep excluding `agents/*`.
-            let (child_agents, interrupted_children) = session::Session::list_children(&path)
-                .map(|runs| {
-                    (
-                        runs.len(),
-                        runs.iter()
-                            .filter(|(.., state)| *state == "interrupted")
-                            .count(),
-                    )
-                })
-                .unwrap_or((0, 0));
+            let dir = session::Session::agents_dir(&path);
+            let (child_agents, interrupted_children) =
+                child_counts.get(&dir).copied().unwrap_or((0, 0));
             (
                 path,
                 header,
@@ -541,24 +562,26 @@ async fn chat(
         .and_then(|v| v.to_str().ok())
         .filter(|k| !k.is_empty())
         .map(ToOwned::to_owned);
-    let request_hash = {
+    // Idempotency replay is routed through the SAME channel/stream as a live
+    // turn (single return type below): the recorded terminal envelope is just
+    // pushed and the stream closes. The request hash backs both idempotency
+    // paths (replay lookup here, record after the turn) and neither runs
+    // without a key — compute it only then, not on every chat.
+    let request_hash: Option<u64> = idempotency_key.as_deref().map(|_| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         serde_json::to_string(&req).unwrap_or_default().hash(&mut h);
         h.finish()
-    };
-    // Idempotency replay is routed through the SAME channel/stream as a live
-    // turn (single return type below): the recorded terminal envelope is just
-    // pushed and the stream closes.
+    });
     let replay_envelope: Option<StreamEnvelope> = idempotency_key
         .as_deref()
-        .and_then(|key| state.idempotent_replay(key, &session_id, request_hash))
+        .and_then(|key| state.idempotent_replay(key, &session_id, request_hash?))
         .and_then(|terminal| serde_json::from_str::<StreamEnvelope>(&terminal).ok());
     // Reject concurrent turns on the same session up front so the
     // append-only session log stays consistent. A replay must not hold the
     // active-turn slot, so it is checked before registration.
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     // Pre-create per-turn channels so `POST /steer` / `POST /followup`
@@ -613,7 +636,7 @@ async fn chat(
                 cancel,
                 tx,
                 idem_key,
-                request_hash,
+                request_hash.unwrap_or(0),
                 steering_rx_opt,
                 followup_rx_opt,
             )
@@ -921,16 +944,30 @@ async fn run_turn_inner(
     // string clears. Invalid JSON is rejected explicitly rather than silently
     // storing garbage (which would come back as an empty plan on reload).
     if let Some(plan_json) = &req.plan {
-        if plan_json.is_empty() {
-            session
-                .set_state("plan", &crate::core::types::Plan::default().to_json())
-                .map_err(|e| format!("failed to persist plan: {e}"))?;
+        let canonical = if plan_json.is_empty() {
+            crate::core::types::Plan::default().to_json()
         } else {
             let plan: crate::core::types::Plan = serde_json::from_str(plan_json)
                 .map_err(|e| format!("invalid plan JSON from client: {e}"))?;
+            plan.to_json()
+        };
+        // §28: the client re-sends its plan on later turns; skip the append
+        // when the daemon already persisted exactly this value and nobody
+        // else touched the file since (the mtime guard — the co-located TUI
+        // can write the same file directly, so an entry-only comparison
+        // could skip a needed restore). Skipping also stops duplicate plan
+        // rows from accumulating for every `load_session_state` scan to walk.
+        let persisted = lock_map(&state.sessions)
+            .get(session_id)
+            .and_then(|e| e.plan_persisted.clone());
+        if !persisted_current(&persisted, &canonical, &entry.path) {
             session
-                .set_state("plan", &plan.to_json())
+                .set_state("plan", &canonical)
                 .map_err(|e| format!("failed to persist plan: {e}"))?;
+            let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
+            if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
+                slot.plan_persisted = Some((canonical, at));
+            }
         }
     }
 
@@ -966,12 +1003,7 @@ async fn run_turn_inner(
     // Console Go routing requires `x-opencode-session`.
     // Auto-fill from the dex session id; explicit per-request headers
     // below still win on collision.
-    crate::llm::config::apply_opencode_session_headers(
-        &mut config.extra_headers,
-        &config.provider,
-        &config.base_url,
-        session_id,
-    );
+    crate::llm::config::apply_opencode_session_headers(&mut config, session_id);
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
     // `insert_extra_header` drops empties + `authorization` and collapses
@@ -982,12 +1014,53 @@ async fn run_turn_inner(
             crate::llm::config::insert_extra_header(&mut config.extra_headers, k, v);
         }
     }
-    // Persist provider/model overrides so /resume restores the same provider/base_url without env
+    // Persist provider/model overrides so /resume restores the same provider/base_url without env.
+    // §28: skip the two appends when this exact pair is already persisted
+    // and untouched since (same mtime guard as the plan above).
     if let Some(raw) = &req.model {
         if !raw.is_empty() {
-            let _ = session.set_state("model", raw);
-            let _ = session.set_state("provider", config.provider.name());
+            let provider_name = config.provider.name().to_string();
+            let persisted = lock_map(&state.sessions)
+                .get(session_id)
+                .and_then(|e| e.model_persisted.clone());
+            let value = (raw.clone(), provider_name.clone());
+            if !persisted_current(&persisted, &value, &entry.path) {
+                session
+                    .set_state("model", raw)
+                    .map_err(|e| format!("failed to persist model: {e}"))?;
+                session
+                    .set_state("provider", &provider_name)
+                    .map_err(|e| format!("failed to persist provider: {e}"))?;
+                let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
+                if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
+                    slot.model_persisted = Some((value, at));
+                    // The idle-wake path reads `wake_*` with no turn running:
+                    // a persist-only `/provider` switch must refresh them
+                    // here, not just at the next turn start below, or the
+                    // wake runs on the old endpoint.
+                    slot.wake_provider = Some(provider_name.clone());
+                    slot.wake_base_url = if config.base_url.trim().is_empty() {
+                        None
+                    } else {
+                        Some(config.base_url.clone())
+                    };
+                }
+            }
         }
+    }
+    // Stash the turn's model on the registry entry (perf doc §30): the
+    // idle-wake path reuses it instead of re-scanning the session file.
+    // Every turn refreshes it (not just overrides), so the entry tracks
+    // `/model` switches made anywhere. Provider + base URL ride along: a
+    // bare model id alone would re-resolve on the default provider.
+    if let Some(entry) = lock_map(&state.sessions).get_mut(session_id) {
+        entry.model = Some(config.model.clone());
+        entry.wake_provider = Some(config.provider.name().to_string());
+        entry.wake_base_url = if config.base_url.trim().is_empty() {
+            None
+        } else {
+            Some(config.base_url.clone())
+        };
     }
     // Verification is opt-in (DEX_VERIFY / config verify_command). No
     // auto-detect by default — auto-running
@@ -1052,9 +1125,10 @@ async fn run_turn_inner(
     // The model-bound load drops `!!` shell runs (saved + shown, never sent
     // to the LLM); the transcript rebuild keeps them.
     let mut messages: Vec<ChatMessage> = Vec::new();
-    messages.push(ChatMessage::system(system_prompt_with_override(
+    messages.push(ChatMessage::system(system_prompt_with_override_for(
         &skills,
         req.system_prompt.as_deref(),
+        Some(std::path::Path::new(&entry.cwd)),
     )));
     if let Some(path) = session.path().map(|p| p.to_path_buf()) {
         let loaded = tokio::task::spawn_blocking(move || {
@@ -1586,19 +1660,49 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             lock_map(&state.active_turns).insert(session_id.clone());
             lock_map(&state.cancel_tokens).insert(session_id.clone(), wake_cancel.clone());
             // Same model the session's last turn used (stored per session);
-            // permission resolves from the daemon's own ceiling.
-            let model = lock_map(&state.sessions)
+            // permission resolves from the daemon's own ceiling. Served
+            // from the registry entry (stashed at turn start); the file
+            // scan is the fallback for entries registered before their
+            // first turn. Provider + base URL ride along so a qualified
+            // `provider/model` turn wakes on the same endpoint.
+            let (model, base_url) = lock_map(&state.sessions)
                 .get(&session_id)
-                .and_then(|entry| {
-                    crate::session::load_session_state(&entry.path)
-                        .ok()
-                        .and_then(|map| map.get("model").cloned())
+                .map(|entry| {
+                    let file_state = if entry.model.is_some() {
+                        None
+                    } else {
+                        crate::session::load_session_state(&entry.path).ok()
+                    };
+                    let m = entry
+                        .model
+                        .clone()
+                        .filter(|m| !m.trim().is_empty())
+                        .or_else(|| {
+                            file_state
+                                .as_ref()
+                                .and_then(|map| map.get("model").cloned())
+                        })
+                        .filter(|s| !s.trim().is_empty());
+                    // Re-qualify a bare model with its provider so `from_env`
+                    // resolves the same endpoint the turn ran on.
+                    let provider = entry.wake_provider.clone().or_else(|| {
+                        file_state
+                            .as_ref()
+                            .and_then(|map| map.get("provider").cloned())
+                    });
+                    let m = match (m, provider) {
+                        (Some(m), Some(p)) if !m.contains('/') && !p.is_empty() => {
+                            Some(format!("{p}/{m}"))
+                        }
+                        (m, _) => m,
+                    };
+                    (m, entry.wake_base_url.clone())
                 })
-                .filter(|model| !model.trim().is_empty());
+                .unwrap_or((None, None));
             let request = ChatRequest {
                 prompt: WAKE_PROMPT.to_string(),
                 skill_dirs: Vec::new(),
-                base_url: None,
+                base_url,
                 model,
                 permission: None,
                 headers: None,
@@ -1724,7 +1828,7 @@ async fn steer(
     }
     // Session must exist; steering only valid while a turn is active.
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, false).ok_or(StatusCode::CONFLICT)?;
@@ -1744,7 +1848,7 @@ async fn followup(
         return Err(StatusCode::BAD_REQUEST);
     }
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, true).ok_or(StatusCode::CONFLICT)?;
@@ -1768,7 +1872,7 @@ async fn recall(
     if content.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if lookup_entry(&state, &session_id).is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, req.followup).ok_or(StatusCode::CONFLICT)?;
@@ -1782,32 +1886,155 @@ async fn recall(
 /// in the background, so an id missing from the registry may simply not have
 /// been scanned yet. A disk hit is registered (live entries win over the
 /// later rebuild merge via `or_insert`) so subsequent lookups stay in-memory.
+/// A post-rebuild disk miss is negative-cached (perf doc §27), so a typo'd
+/// id walks the workspace once, not once per request. Negative entries
+/// expire after `NEGATIVE_TTL` so out-of-band creates become visible.
+fn missing_hit(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    if !state.rebuild_complete.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut missing = lock_map(&state.missing_sessions);
+    match missing.get(session_id) {
+        Some(at) if at.elapsed() < crate::daemon::NEGATIVE_TTL => true,
+        Some(_) => {
+            missing.remove(session_id);
+            false
+        }
+        None => false,
+    }
+}
+
 fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
     if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
-    let (path, header) = session::Session::list_all()
+    // Stale-negative self-heal + typo-storm guard (§27): the filename probe
+    // is readdir-only (no header opens), so a negative hit re-probes cheaply
+    // — an out-of-band create (CLI/TUI writing the file directly, which
+    // never clears this set) becomes visible on the next request instead of
+    // after `NEGATIVE_TTL`, while a true typo still avoids the full
+    // `list_all` open+parse walk on every request. The probe doubles as the
+    // fast path below (perf doc §1).
+    let probed = session::Session::find_by_id_filename(session_id);
+    if missing_hit(state, session_id) && probed.is_none() {
+        return None;
+    }
+    lock_map(&state.missing_sessions).remove(session_id);
+    // Fast path first (perf doc §1): the session id is the JSONL filename,
+    // so a filename match + one header read replaces the workspace-wide
+    // open+parse of every session. The `list_all` scan below only serves
+    // renamed/legacy files whose stem no longer names the id.
+    if let Some(path) = probed {
+        // Exact id only: `find_by_id_filename` also resolves unique prefixes
+        // (a CLI convenience). Accepting one here would register — and cache
+        // — a *different* session under the requested key, so every later
+        // request on that key mutates the wrong journal. Prefix selectors
+        // stay a client-side (`/resume`) affordance.
+        if let Some(entry_session) = session::Session::from_path(&path)
+            .ok()
+            .filter(|s| s.id() == session_id)
+        {
+            let entry = SessionEntry {
+                path: path.clone(),
+                name: entry_session.name().map(ToOwned::to_owned),
+                cwd: entry_session.cwd().to_string(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
+            };
+            lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
+            return Some(entry);
+        }
+    }
+    let found = session::Session::list_all()
         .unwrap_or_default()
         .into_iter()
-        .find(|(_, header)| header.id() == session_id)?;
+        .find(|(_, header)| header.id() == session_id);
+    let Some((path, header)) = found else {
+        // Post-rebuild a miss is stable (new ids are server-minted on an
+        // explicit registration path that clears this set): remember it.
+        if state.rebuild_complete.load(Ordering::Relaxed) {
+            lock_map(&state.missing_sessions)
+                .insert(session_id.to_string(), std::time::Instant::now());
+        }
+        return None;
+    };
+    // An out-of-band create after a negative hit must clear the stale miss.
+    lock_map(&state.missing_sessions).remove(session_id);
     let entry = SessionEntry {
         path: path.clone(),
         name: header.name().map(ToOwned::to_owned),
         cwd: header.cwd().to_string(),
+        model: None,
+        wake_provider: None,
+        wake_base_url: None,
+        plan_persisted: None,
+        model_persisted: None,
     };
     lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
     Some(entry)
 }
 
+/// True when an identical daemon-persisted session-state value is still
+/// current (perf doc §28): never written, changed since, or written but the
+/// file moved under us — the mtime guard, because the co-located TUI can
+/// write the same file directly, so an entry-only comparison could skip a
+/// needed restore. A missing file also forces the write (same as before).
+/// `==` on `SystemTime` is brittle on coarse-granularity filesystems
+/// (1 s FAT/NFS ticks: a same-tick out-of-band write compares equal and is
+/// missed) — accepted: sessions live on local disks (ns ext4/APFS), and a
+/// miss only re-appends an identical value, never a wrong one.
+fn persisted_current<T: PartialEq>(
+    persisted: &Option<(T, std::time::SystemTime)>,
+    value: &T,
+    path: &std::path::Path,
+) -> bool {
+    let Some((prev, at)) = persisted else {
+        return false;
+    };
+    prev == value
+        && std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime == *at)
+}
+
+/// Async registry lookup with the disk fallback off the executor (perf doc
+/// §27): `Session::list_all` walks the workspace, so the scan +
+/// registration run in `spawn_blocking`. In-memory hits (and post-rebuild
+/// negative hits) stay inline — only a true registry miss pays the hop.
+async fn lookup_entry_async(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<SessionEntry, StatusCode> {
+    if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
+        return Ok(entry);
+    }
+    if missing_hit(state, session_id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let state = Arc::clone(state);
+    let session_id = session_id.to_string();
+    // A JoinError (panic/cancel) is an internal failure, not an absent
+    // session: surfacing 500 instead of folding into `None` → 404.
+    tokio::task::spawn_blocking(move || lookup_entry(&state, &session_id))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// Resolve a session file path from the registry (with disk fallback), or 404.
-fn session_path(
+async fn session_path(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<std::path::PathBuf, StatusCode> {
-    lookup_entry(state, session_id)
-        .map(|e| e.path)
-        .filter(|p| p.exists())
-        .ok_or(StatusCode::NOT_FOUND)
+    let path = lookup_entry_async(state, session_id).await?.path;
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 /// Take the session's active-turn slot; `false` when a live turn holds it.
@@ -1845,7 +2072,7 @@ async fn session_events(
     Path(session_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<EventsResponse>, StatusCode> {
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     // Presence heartbeat (§10b V1b): every journal read counts as a client
     // listening; the idle wake fires only while this stays fresh.
     state.touch_client_seen(&session_id);
@@ -1853,11 +2080,18 @@ async fn session_events(
         .get("since")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // Page-limited serving (§1): giant journals stream as bounded pages the
+    // replay loop drains with a paint between, instead of one huge slurp.
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(crate::session::EVENTS_PAGE_LIMIT);
     let events = tokio::task::spawn_blocking(move || {
         let mut events = Vec::new();
-        let mut last_raw = since;
-        for (seq, payload) in Session::load_events(&path, since).unwrap_or_default() {
-            last_raw = last_raw.max(seq);
+        let mut last_raw: Option<u64> = None;
+        for (seq, payload) in Session::load_events(&path, since, limit).unwrap_or_default() {
+            last_raw = Some(last_raw.map_or(seq, |m: u64| m.max(seq)));
             // Unknown event types are skipped for the payload (the client's
             // fallback rule) but still advance the cursor — otherwise a
             // poller would re-fetch the same range forever.
@@ -1866,16 +2100,11 @@ async fn session_events(
             }
         }
         // next_seq follows the raw journal rows (even unknown types), so the
-        // client cursor keeps moving; with no rows past `since` the cursor
-        // stays put so a later row can never be skipped.
-        (
-            events,
-            if last_raw > since {
-                last_raw + 1
-            } else {
-                since
-            },
-        )
+        // client cursor keeps moving; with no rows at/after `since` the cursor
+        // stays put so a later row can never be skipped. Cursor is the next
+        // seq to serve (inclusive): `since=0` serves seq 0.
+        let next_seq = last_raw.map_or(since, |m| m.saturating_add(1));
+        (events, next_seq)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1889,14 +2118,14 @@ async fn reattach(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ReattachResponse>, StatusCode> {
-    let entry = lookup_entry(&state, &session_id).ok_or(StatusCode::NOT_FOUND)?;
+    let entry = lookup_entry_async(&state, &session_id).await?;
     if !entry.path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
     state.seed_seq(&session_id, &entry.path);
     // Prune stale idempotency-recorded seq: reattach hands the client the
-    // cursor to resume from.
-    let seq = Session::max_event_seq(&entry.path).unwrap_or(0);
+    // cursor to resume from (next seq to serve: max + 1, 0 when empty).
+    let seq = Session::max_event_seq(&entry.path).map_or(0, |m| m.saturating_add(1));
     Ok(Json(ReattachResponse {
         session_id: session_id.clone(),
         seq,
@@ -1909,7 +2138,7 @@ async fn session_trace(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let trace_path = path.with_extension("trace.jsonl");
     let rows = tokio::task::spawn_blocking(move || -> Vec<serde_json::Value> {
         let Ok(text) = std::fs::read_to_string(&trace_path) else {
@@ -1930,7 +2159,7 @@ async fn session_undo(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
         session::undo_last_change(&mut session)
@@ -1961,7 +2190,7 @@ async fn session_waive(
     if reason.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let reason = reason.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
@@ -2009,7 +2238,7 @@ async fn session_shell(
     }
     // Session must exist — the workspace is resolved from the daemon cwd,
     // but the lookup guards against typos/stale ids like every other route.
-    let session_file = session_path(&state, &session_id)?;
+    let session_file = session_path(&state, &session_id).await?;
     let shell_cancel = CancellationToken::new();
     {
         let mut running = lock_map(&state.shell_tokens);
@@ -2141,7 +2370,7 @@ async fn session_name(
     let Some(name) = name.filter(|n| !n.is_empty()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let path = session_path(&state, &session_id)?;
+    let path = session_path(&state, &session_id).await?;
     let name = name.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
@@ -2181,6 +2410,11 @@ mod handler_tests {
                 path: path.to_path_buf(),
                 name: None,
                 cwd: "/tmp/dex-test-cwd".into(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         (state, id)
@@ -2467,6 +2701,11 @@ mod handler_tests {
                 path: "/tmp/does-not-exist.jsonl".into(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         let r = steer(
@@ -2697,6 +2936,36 @@ mod handler_tests {
         assert!(rx_b.try_recv().is_err(), "other sessions must be untouched");
     }
 
+    #[test]
+    fn persisted_state_skip_logic() {
+        // §28: identical + untouched → skip; anything else → write.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "dex-persisted-current-{}-{}.jsonl",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        // Never written → must write.
+        assert!(!persisted_current(&None, &"v".to_string(), &path));
+        std::fs::write(&path, "{}\n").unwrap();
+        let at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let persisted = Some(("v".to_string(), at));
+        // Identical + untouched → skip the append.
+        assert!(persisted_current(&persisted, &"v".to_string(), &path));
+        // Changed value → write.
+        assert!(!persisted_current(&persisted, &"w".to_string(), &path));
+        // Same value but a stale mtime (someone rewrote the file) → write.
+        assert!(!persisted_current(
+            &Some(("v".to_string(), std::time::UNIX_EPOCH)),
+            &"v".to_string(),
+            &path
+        ));
+        // Missing file → write (same as before).
+        std::fs::remove_file(&path).unwrap();
+        assert!(!persisted_current(&persisted, &"v".to_string(), &path));
+    }
+
     #[tokio::test]
     async fn cancel_leaves_child_agent_approvals_pending() {
         let state = Arc::new(DaemonState::new());
@@ -2756,22 +3025,24 @@ mod handler_tests {
 
         let mut params = std::collections::HashMap::new();
         params.insert("since".to_string(), "0".to_string());
-        // `since` is exclusive: seq 0 is skipped, seq 1 replays.
+        // `since` is the next seq to serve (inclusive): seq 0 replays.
         let r = session_events(State(state.clone()), Path(id.clone()), Query(params))
             .await
             .unwrap();
-        assert_eq!(r.events.len(), 1);
-        assert_eq!(r.events[0].seq, 1);
+        assert_eq!(r.events.len(), 2);
+        assert_eq!(r.events[0].seq, 0);
+        assert_eq!(r.events[1].seq, 1);
         assert_eq!(r.next_seq, 2);
-        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "two"));
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "one"));
+        assert!(matches!(r.events[1].event, StreamEvent::System(ref s) if s == "two"));
 
         let mut params = std::collections::HashMap::new();
-        params.insert("since".to_string(), "1".to_string());
+        params.insert("since".to_string(), "2".to_string());
         let r = session_events(State(state), Path(id), Query(params))
             .await
             .unwrap();
         assert!(r.events.is_empty(), "fully consumed cursor replays nothing");
-        assert_eq!(r.next_seq, 1);
+        assert_eq!(r.next_seq, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2826,6 +3097,11 @@ mod handler_tests {
                 path: "/tmp/does-not-exist.jsonl".into(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         let (stx, mut srx) = mpsc::channel::<QueueMsg>(4);
@@ -2870,6 +3146,11 @@ mod handler_tests {
                 path: "/tmp/does-not-exist.jsonl".into(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
         let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
@@ -3104,13 +3385,15 @@ this line is torn and not json
             .await
             .unwrap();
         // Unknown event types are skipped for the payload but still advance
-        // the cursor, and torn lines are dropped. (`since` is exclusive, so
-        // seq 0 is skipped here. `agent_recovered` is the wire type the
-        // supervision removal deleted — old journals carrying it replay
-        // cleanly.)
-        assert_eq!(r.events.len(), 1, "{:?}", r.events);
-        assert_eq!(r.events[0].seq, 3);
-        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "three"));
+        // the cursor, and torn lines are dropped. (`since` is the inclusive
+        // next-seq-to-serve cursor, so `since=0` serves seq 0 too.
+        // `agent_recovered` is the wire type the supervision removal
+        // deleted — old journals carrying it replay cleanly.)
+        assert_eq!(r.events.len(), 2, "{:?}", r.events);
+        assert_eq!(r.events[0].seq, 0);
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "one"));
+        assert_eq!(r.events[1].seq, 3);
+        assert!(matches!(r.events[1].event, StreamEvent::System(ref s) if s == "three"));
         assert_eq!(r.next_seq, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3188,13 +3471,19 @@ this line is torn and not json
         );
         assert!(lookup_entry(&state, "fb-2").is_none(), "unknown stays None");
 
+        // §27: post-rebuild misses negative-cache instead of re-walking
+        // the workspace on every probe.
+        state.rebuild_complete.store(true, Ordering::Relaxed);
+        assert!(lookup_entry(&state, "fb-2").is_none());
+        assert!(lock_map(&state.missing_sessions).contains_key("fb-2"));
+
         // Reattach resolves the same disk fallback and returns the replay
-        // cursor: the highest journaled seq.
+        // cursor: the next seq to serve (max + 1, 0 when empty).
         let r = reattach(State(state.clone()), Path("fb-1".into()))
             .await
             .expect("reattach");
         assert_eq!(r.session_id, "fb-1");
-        assert_eq!(r.seq, 3);
+        assert_eq!(r.seq, 4);
         assert!(matches!(
             reattach(State(state), Path("fb-2".into())).await,
             Err(StatusCode::NOT_FOUND)
@@ -3510,6 +3799,11 @@ mod permission_gate_tests {
                 path: path.clone(),
                 name: None,
                 cwd: "/tmp".into(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
             },
         );
 
@@ -4505,6 +4799,11 @@ mod async_parallel_tests {
                     path: s.path().unwrap().to_path_buf(),
                     name: Some(format!("n{i}")),
                     cwd: format!("/tmp/cwd-{i}"),
+                    model: None,
+                    wake_provider: None,
+                    wake_base_url: None,
+                    plan_persisted: None,
+                    model_persisted: None,
                 },
             );
         }

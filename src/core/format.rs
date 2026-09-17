@@ -813,9 +813,16 @@ pub(crate) fn bash_context_text(
 /// lines the overlay and CLI prompt show. No filesystem IO, pure formatting.
 /// ponytail: one place for all tool-to-human mapping; add a tool → add a branch.
 pub(crate) fn approval_title(name: &str, input: &str) -> &'static str {
+    approval_title_with_then_run(name, input_has_then_run(input))
+}
+
+/// [`approval_title`] with a precomputed `then_run` flag: [`PendingApproval::new`]
+/// parses the input once and shares the flag across title/risk instead of
+/// parsing 2× (plus summary/details = 4× per enqueue).
+pub(crate) fn approval_title_with_then_run(name: &str, has_then_run: bool) -> &'static str {
     // A `then_run` makes a file write a shell command too; say so in the
     // title rather than presenting it as a plain write.
-    if matches!(name, "write" | "edit") && input_has_then_run(input) {
+    if matches!(name, "write" | "edit") && has_then_run {
         return "File change + shell verification";
     }
     match name {
@@ -833,10 +840,18 @@ pub(crate) fn approval_title(name: &str, input: &str) -> &'static str {
 }
 
 pub(crate) fn approval_risk(name: &str, input: &str) -> (&'static str, ratatui::style::Color) {
+    approval_risk_with_then_run(name, input_has_then_run(input))
+}
+
+/// [`approval_risk`] with a precomputed flag (see [`approval_title_with_then_run`]).
+pub(crate) fn approval_risk_with_then_run(
+    name: &str,
+    has_then_run: bool,
+) -> (&'static str, ratatui::style::Color) {
     use ratatui::style::Color;
     // A `then_run` turns a file mutation into a shell command; the approver
     // must see the same "high" risk as a bare `bash`.
-    if matches!(name, "write" | "edit") && input_has_then_run(input) {
+    if matches!(name, "write" | "edit") && has_then_run {
         return ("high", Color::LightRed);
     }
     match name {
@@ -848,7 +863,7 @@ pub(crate) fn approval_risk(name: &str, input: &str) -> (&'static str, ratatui::
 
 /// Whether the raw approval input carries a non-empty `then_run` command —
 /// the same field `then_run_suffix` renders in the summary.
-fn input_has_then_run(input: &str) -> bool {
+pub(crate) fn input_has_then_run(input: &str) -> bool {
     serde_json::from_str::<Value>(input)
         .ok()
         .and_then(|v| v.as_object().map(|obj| then_run_of(Some(obj)).is_some()))

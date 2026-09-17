@@ -63,18 +63,30 @@ pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
     }]
 }
 
-/// Host-facing projection seam: the provider-bound message list, or the
-/// history unchanged when the experiment is off. `loop.rs` calls this
-/// instead of naming the gate.
-pub(crate) fn project_messages(
+/// Host-facing projection seam: the provider-bound message list, or a
+/// borrow of the history unchanged when the experiment is off — or when
+/// it is on but nothing is packable. `loop.rs` calls this instead of
+/// naming the gate. Borrowed when off so the common path pays no
+/// `to_vec` clone per model call.
+pub(crate) fn project_messages<'a>(
     projection: &ProjectionState,
     session_path: Option<&Path>,
-    messages: &[ChatMessage],
-) -> Vec<ChatMessage> {
+    messages: &'a [ChatMessage],
+) -> std::borrow::Cow<'a, [ChatMessage]> {
     if !observation_pack_enabled() {
-        return messages.to_vec();
+        return std::borrow::Cow::Borrowed(messages);
     }
-    project(projection, session_path, messages)
+    // Borrowed fast path: with no Tool-role messages there are no
+    // placeholders to substitute, so the provider-bound view IS the
+    // history — skip the per-message clone plus the lock probes and
+    // archive IO inside `project` entirely.
+    if !messages
+        .iter()
+        .any(|m| m.role == crate::core::types::Role::Tool)
+    {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    std::borrow::Cow::Owned(project(projection, session_path, messages))
 }
 
 /// `dex doctor` row: printed unconditionally (snapshot byte-stability),
@@ -239,6 +251,17 @@ fn raw_excerpt(text: &str, budget: usize) -> String {
     text[..end].to_string()
 }
 
+/// Tail counterpart of [`raw_excerpt`]: the last `budget` bytes, trimmed to
+/// a char boundary. Slicing the head for the tail section would repeat the
+/// head excerpt and never show the payload's end.
+fn raw_excerpt_tail(text: &str, budget: usize) -> String {
+    let mut start = text.len().saturating_sub(budget);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
 /// The stable placeholder that replaces the payload in the projection.
 pub(crate) fn placeholder_for(observation: &Observation) -> String {
     let head_budget = PLACEHOLDER_EXCERPT_BYTES / 2;
@@ -252,7 +275,7 @@ pub(crate) fn placeholder_for(observation: &Observation) -> String {
         head = raw_excerpt(&observation.text, head_budget);
     }
     if tail.is_empty() {
-        tail = raw_excerpt(&observation.text, tail_budget);
+        tail = raw_excerpt_tail(&observation.text, tail_budget);
     }
     format!(
         "[large tool result replaced after its first {FULL_SENDS} provider requests]\n\
@@ -720,6 +743,20 @@ mod tests {
             "recall instructions still present"
         );
         assert!(placeholder.len() < 3000, "placeholder stays small");
+    }
+
+    #[test]
+    fn minified_payload_tail_shows_the_end() {
+        // Single-line payload: both the line-based head and tail excerpts are
+        // empty, so both fall back to raw slices. The tail must slice from
+        // the END — slicing the head twice never surfaces the payload's end.
+        let text = format!("{}{}", "x".repeat(THRESHOLD_BYTES * 2), "TAILMARKER");
+        let observation = create_observation("bash", &text).unwrap();
+        let placeholder = placeholder_for(&observation);
+        assert!(
+            placeholder.contains("TAILMARKER"),
+            "raw tail excerpt shows the payload end"
+        );
     }
 
     #[test]
