@@ -236,6 +236,34 @@ fn word_hit(text: &str, needle: &str) -> bool {
     })
 }
 
+/// Score one stem table against already-tokenized text: each hit adds its
+/// weight with its reason (deduped by the caller). One helper covers all
+/// four tables — stems score via [`stem_hit`], phrases via [`word_hit`].
+fn score_stems(
+    tokens: &[String],
+    table: &[(&str, i32, &'static str)],
+    push: &mut impl FnMut(i32, &'static str),
+) {
+    for (stem, weight, reason) in table {
+        if stem_hit(tokens, stem) {
+            push(*weight, reason);
+        }
+    }
+}
+
+/// Score one literal-phrase table against lowercased hyphen-folded text.
+fn score_phrases(
+    lower: &str,
+    table: &[(&str, i32, &'static str)],
+    push: &mut impl FnMut(i32, &'static str),
+) {
+    for (phrase, weight, reason) in table {
+        if word_hit(lower, phrase) {
+            push(*weight, reason);
+        }
+    }
+}
+
 /// One weighted label: the stem its word family shares, its score weight,
 /// and the human reason recorded when it hits. Positive stems escalate,
 /// negative ones mark trivial work; nothing reaches `Powerful` on a single
@@ -402,26 +430,10 @@ pub(crate) fn classify_with_reasons(signal: &TaskSignal, text: &str) -> Decision
         }
     };
 
-    for (stem, weight, reason) in POWERFUL_STEMS {
-        if stem_hit(&tokens, stem) {
-            push(*weight, reason);
-        }
-    }
-    for (phrase, weight, reason) in POWERFUL_PHRASES {
-        if word_hit(&lower, phrase) {
-            push(*weight, reason);
-        }
-    }
-    for (stem, weight, reason) in FAST_STEMS {
-        if stem_hit(&tokens, stem) {
-            push(*weight, reason);
-        }
-    }
-    for (phrase, weight, reason) in FAST_PHRASES {
-        if word_hit(&lower, phrase) {
-            push(*weight, reason);
-        }
-    }
+    score_stems(&tokens, POWERFUL_STEMS, &mut push);
+    score_phrases(&lower, POWERFUL_PHRASES, &mut push);
+    score_stems(&tokens, FAST_STEMS, &mut push);
+    score_phrases(&lower, FAST_PHRASES, &mut push);
 
     // Structure: what the turn looks like, not what it says.
     match count_path_refs(text) {
