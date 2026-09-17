@@ -150,13 +150,14 @@ pub(crate) fn shared_streaming_client() -> reqwest::Client {
 /// Byte framing for SSE `data:` lines. Pure buffer logic (no I/O, no runtime)
 /// shared by `ChatStream`; split lines across TCP chunks are reassembled,
 /// keep-alives and junk skipped, trailing partial line held for `finish()`.
-/// Also tracks the highest envelope `seq` seen, so a caller can resume after
-/// a dropped connection by replaying the journal from that cursor.
+/// Tracks the next journal `seq` to serve (inclusive cursor): 0 until the
+/// first envelope, then `max(seq) + 1` — so "nothing delivered yet" (resume
+/// from 0, serving seq 0) is distinct from "delivered seq 0" (resume from 1).
 #[derive(Default)]
 struct SseFramer {
     buf: Vec<u8>,
     pending: std::collections::VecDeque<StreamEvent>,
-    last_seq: u64,
+    next_seq: u64,
 }
 
 impl SseFramer {
@@ -188,13 +189,13 @@ impl SseFramer {
         };
         match serde_json::from_str::<StreamEnvelope>(data) {
             Ok(env) => {
-                self.last_seq = self.last_seq.max(env.seq);
+                self.next_seq = self.next_seq.max(env.seq.saturating_add(1));
                 self.pending.push_back(env.event);
             }
             Err(_) => {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
                     if let Some(seq) = value.get("seq").and_then(|v| v.as_u64()) {
-                        self.last_seq = self.last_seq.max(seq);
+                        self.next_seq = self.next_seq.max(seq.saturating_add(1));
                     }
                 }
             }
@@ -237,10 +238,10 @@ pub(crate) struct ChatStream {
 }
 
 impl ChatStream {
-    /// Highest journal seq delivered so far — the resume cursor for a
-    /// reattach after the connection drops mid-turn.
+    /// Next journal seq to serve (inclusive resume cursor) — 0 until the
+    /// first envelope, then highest delivered + 1.
     pub(crate) fn last_seq(&self) -> u64 {
-        self.framer.last_seq
+        self.framer.next_seq
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<Result<StreamEvent, String>> {
@@ -729,8 +730,9 @@ impl DaemonClient {
         block_on(self.reattach_async(session_id))
     }
 
-    /// Replay journaled stream events after `since` (P10). Lenient per row
-    /// (V1b fallback): an event type this client does not know is skipped
+    /// Replay journaled stream events from `since` on (`since` is the next
+    /// seq to serve, inclusive — chain with the returned `next_seq`).
+    /// Lenient per row (V1b fallback): an event type this client does not know is skipped
     /// while `next_seq` still advances past it, so a replay never stalls on
     /// a newer daemon's events.
     pub async fn events_async(
@@ -738,12 +740,16 @@ impl DaemonClient {
         session_id: &str,
         since: u64,
     ) -> Result<EventsResponse, Box<dyn std::error::Error>> {
+        // Explicit page limit: old daemons ignore it (their unbounded reply
+        // still drains via the `next_seq` no-progress backup in the replay
+        // loop), new ones bound the page.
         let resp = self
             .http
             .get(format!(
-                "{}?since={}",
+                "{}?since={}&limit={}",
                 self.session_url(session_id, "events"),
-                since
+                since,
+                crate::session::EVENTS_PAGE_LIMIT,
             ))
             .headers(self.api_headers())
             .send()
@@ -1036,10 +1042,10 @@ pub(crate) mod tests {
         framer.push_bytes(format!("data: {}\n", serde_json::to_string(&env2).unwrap()).as_bytes());
         framer.push_bytes(b"data: ping\n");
         framer.push_bytes(b"data: not-json\n");
-        assert_eq!(framer.last_seq, 7);
+        assert_eq!(framer.next_seq, 8);
         assert_eq!(framer.pending.len(), 2);
         framer.finish();
-        assert_eq!(framer.last_seq, 7);
+        assert_eq!(framer.next_seq, 8);
     }
 
     /// The supervision removal deleted `StreamEvent::AgentRecovered`: an
@@ -1051,7 +1057,7 @@ pub(crate) mod tests {
         framer.push_bytes(
             b"data: {\"seq\":9,\"agent_recovered\":{\"agent_id\":\"sess-0\",\"status\":\"resumed\"}}\n",
         );
-        assert_eq!(framer.last_seq, 9);
+        assert_eq!(framer.next_seq, 10);
         assert!(framer.pending.is_empty());
     }
 

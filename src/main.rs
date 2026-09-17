@@ -171,32 +171,71 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     } // MCP bootstrap (background connect; schema merges whatever is cached).
       // Daemon paths bootstrap in `run_daemon`; one-shot turns run in-process.
     crate::mcp::global_manager();
-    // Extensions load synchronously here: the one-shot schema must include
-    // them (the daemon instead fills the cache in the background).
-    crate::client::http::block_on(crate::extensions::global_manager().refresh());
-    let mut config = LlmConfig::from_env(
-        args.base_url.clone(),
-        args.model.clone(),
-        args.permission,
-        &args.headers,
-    )?;
+    // Cold-init fan-out (perf doc §26): extension Lua loads, the config
+    // build (cold catalog parse + index), the skills dir walk, and the
+    // session open + history parse are independent — scoped threads overlap
+    // them instead of summing them. The daemon instead fills the extension
+    // cache in the background; one-shot turns need the schema inline.
+    let mut skill_dirs = skill_dirs();
+    skill_dirs.extend(args.skill_dirs.iter().cloned());
+    let cwd = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let (config_result, skills, (mut session, history)) = std::thread::scope(|s| {
+        let ext = s
+            .spawn(|| crate::client::http::block_on(crate::extensions::global_manager().refresh()));
+        // `from_env`'s boxed error is not `Send`; stringify it at the
+        // thread boundary (same pattern as `from_env_async`).
+        let cfg = s.spawn(|| {
+            LlmConfig::from_env(
+                args.base_url.clone(),
+                args.model.clone(),
+                args.permission,
+                &args.headers,
+            )
+            .map_err(|e| e.to_string())
+        });
+        let sk = s.spawn(|| discover_skills(&skill_dirs));
+        // Extension refresh is best-effort; a failed join must not fail the turn.
+        let _ = ext.join();
+        let config_result: Result<LlmConfig, Box<dyn std::error::Error>> = cfg
+            .join()
+            .unwrap_or_else(|_| Err("config init thread failed".to_string()))
+            .map_err(|e| e.into());
+        // Open the session only after the config validates: `Session::new`
+        // writes its header immediately, so resolving config first keeps a
+        // config error (bad key/model) from leaving a stray empty session
+        // that shows up in `/resume`.
+        let sess = if config_result.is_ok() {
+            s.spawn(|| {
+                if args.no_session {
+                    return (None, Vec::new());
+                }
+                let session = open_session(args, &cwd);
+                // Model-bound load: `!!` shell runs stay out of the LLM context.
+                let history = session
+                    .as_ref()
+                    .and_then(|sess| sess.path())
+                    .map(load_llm_messages_from_session)
+                    .unwrap_or_else(|| Ok(Vec::new()))
+                    .unwrap_or_default();
+                (session, history)
+            })
+            .join()
+            .unwrap_or((None, Vec::new()))
+        } else {
+            (None, Vec::new())
+        };
+        let skills = sk.join().unwrap_or_default();
+        (config_result, skills, sess)
+    });
+    let mut config = config_result?;
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
     if let Some(warning) = config.thinking_mismatch_warning() {
         eprintln!("dex: {warning}");
     }
     // Verification opt-in only — see llm/config.rs.
     crate::llm::config::apply_verify_optin(&mut config);
-    let mut skill_dirs = skill_dirs();
-    skill_dirs.extend(args.skill_dirs.iter().cloned());
-    let skills = discover_skills(&skill_dirs);
-    let cwd = env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let mut session = if args.no_session {
-        None
-    } else {
-        open_session(args, &cwd)
-    };
     if let Some(name) = &args.session_name {
         if let Some(session) = session.as_mut() {
             let _ = session.set_name(name.clone());
@@ -208,10 +247,9 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             .as_ref()
             .map(|(text, _)| text.as_str()),
     ))];
-    if let Some(existing) = session.as_ref().and_then(|s| s.path()) {
-        // Model-bound load: `!!` shell runs stay out of the LLM context.
-        messages.extend(load_llm_messages_from_session(existing).unwrap_or_default());
-    }
+    // History already loaded on the session thread above (`!!` runs
+    // excluded there); the turn below appends the new user message.
+    messages.extend(history);
     let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event("turn_start");
@@ -221,12 +259,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // Console Go routing requires `x-opencode-session`;
     // explicit `--header` flags already baked into `extra_headers` still win.
     if let Some(session) = session.as_ref() {
-        crate::llm::config::apply_opencode_session_headers(
-            &mut config.extra_headers,
-            &config.provider,
-            &config.base_url,
-            session.id(),
-        );
+        crate::llm::config::apply_opencode_session_headers(&mut config, session.id());
     }
     let mut state = ToolState::load();
     let console = crate::core::console::Console::none();
@@ -560,12 +593,30 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            // Extension tools resolve from the manager cache: load
-            // synchronously so `dex run ext__...` sees them (MCP tools have
-            // the same race; out of scope here). The deprecated `lua__`
-            // alias preloads too, so old one-liners keep working.
+            // Extension tools resolve from the manager cache: lazy-load just
+            // the addressed extension (§26) so `dex run ext__...` boots one
+            // Lua VM instead of every installed one (MCP tools have the same
+            // race; out of scope here). The deprecated `lua__` alias preloads
+            // too, so old one-liners keep working. A name that doesn't split
+            // keeps the old full refresh so the dispatch error below stays
+            // the authority on what exists.
             if crate::extensions::is_extension_tool(&name) {
-                crate::client::http::block_on(crate::extensions::global_manager().refresh());
+                let normalized = crate::extensions::normalize_tool_name(&name);
+                match crate::extensions::split_ext_name(&normalized) {
+                    Some((ext, _)) => {
+                        if let Err(e) = crate::client::http::block_on(
+                            crate::extensions::global_manager().ensure_loaded(ext),
+                        ) {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    None => {
+                        crate::client::http::block_on(
+                            crate::extensions::global_manager().refresh(),
+                        );
+                    }
+                }
             }
             match execute(&name, &parsed, &GlobalCancellation) {
                 Ok(out) => print!("{out}"),

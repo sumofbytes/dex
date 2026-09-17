@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
@@ -38,46 +38,60 @@ fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathB
 }
 
 /// File-identity cache entry shared by the config file, learned-apis map,
-/// and models.dev catalog: the parse is served while (path, mtime, len) is
+/// and models.dev catalog: the parse is served while the content hash is
 /// unchanged.
 struct FileCache<T> {
     path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
+    /// FNV-1a of the file bytes: identity is content, not (mtime, len),
+    /// so same-length rewrites within one mtime tick and mtime-preserving
+    /// copies still miss. Reads are per call (these files are KBs, the
+    /// catalog parse below stays cached); the hit saves the parse.
+    hash: u64,
     value: T,
 }
 
-/// Stat `path` and serve `cache`'s stored parse while (path, mtime, len) is
-/// unchanged; on a miss, read the file and hand the text to `parse`, storing
-/// the result. `parse` gets `None` when the read failed and returns `None`
-/// when nothing should be cached (stat/read/parse failure) — the caller
-/// decides what that means (empty default vs hard failure).
+fn fnv_bytes(text: &str) -> u64 {
+    let mut h = 14695981039346656037u64;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
+}
+
+/// Read `path` and serve `cache`'s stored parse while the content hash is
+/// unchanged; on a miss, hand the text to `parse`, storing the result.
+/// `parse` gets `None` when the read failed and returns `None` when nothing
+/// should be cached (read/parse failure) — the caller decides what that
+/// means (empty default vs hard failure). Identity is the content hash
+/// rather than (mtime, len): a same-length rewrite inside one mtime tick
+/// (FAT/NFS 1–2 s granularity, `cp -p`, checkout preserving mtime) still
+/// misses instead of serving stale config/endpoints indefinitely.
 /// Poisoned-mutex recovery matches the rest of the daemon: keep the value.
 fn cached_parse<T: Clone>(
     cache: &OnceLock<Mutex<Option<FileCache<T>>>>,
     path: &std::path::Path,
     parse: impl FnOnce(Option<String>) -> Option<T>,
 ) -> Option<T> {
-    let meta = std::fs::metadata(path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    let text = std::fs::read_to_string(path).ok()?;
+    let hash = fnv_bytes(&text);
     if let Some(hit) = cache
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+        .filter(|cached| cached.path == path && cached.hash == hash)
     {
         return Some(hit.value.clone());
     }
-    let value = parse(std::fs::read_to_string(path).ok())?;
+    let value = parse(Some(text))?;
     cache
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(FileCache {
             path: path.to_path_buf(),
-            mtime,
-            len,
+            hash,
             value: value.clone(),
         });
     Some(value)
@@ -172,9 +186,8 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 
 /// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
 /// survive the `/model` write-back. Missing/invalid file → None (env rules).
-/// Cached process-wide and invalidated by file identity (path + mtime +
-/// length): `from_env` runs per chat turn on the daemon, and each call was
-/// re-reading + re-parsing the file.
+/// Cached process-wide and invalidated by content hash: `from_env` runs per
+/// chat turn on the daemon, and each call was re-reading + re-parsing the file.
 static CONFIG_CACHE: OnceLock<Mutex<Option<FileCache<Option<serde_yaml::Value>>>>> =
     OnceLock::new();
 
@@ -242,12 +255,12 @@ fn invalidate_config_cache() {
 /// then refreshes the index). No built-in default: a model the catalog
 /// doesn't size needs an explicit window, so the miss is an error.
 fn resolve_context_window(model: &str, file: &Option<serde_yaml::Value>) -> Result<u64, String> {
-    env_parse_opt("DEX_CONTEXT_WINDOW")
+    context_window_from_env()
         .or_else(|| load_config_num(file, "context_window"))
         .or_else(|| ctx_from_index(model))
         .or_else(|| {
             load_dex_catalog().and_then(|c| {
-                let ctx = catalog_context_window(model, &c);
+                let ctx = catalog_context_window(model);
                 ensure_ctx_index(&c);
                 ctx
             })
@@ -257,6 +270,23 @@ fn resolve_context_window(model: &str, file: &Option<serde_yaml::Value>) -> Resu
                 "no context window for model '{model}' — set 'context_window: <tokens>' in the config or DEX_CONTEXT_WINDOW (see `dex doctor`)"
             )
         })
+}
+
+/// `DEX_CONTEXT_WINDOW`, positive integers only — mirrors `load_config_num`:
+/// a zero/garbage value is a warning, never a silent zero-width window that
+/// trips the compaction threshold on every turn.
+fn context_window_from_env() -> Option<u64> {
+    let raw = env::var("DEX_CONTEXT_WINDOW").ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            warn_once(
+                "env:DEX_CONTEXT_WINDOW",
+                "DEX_CONTEXT_WINDOW must be a positive token count — ignoring it",
+            );
+            None
+        }
+    }
 }
 
 /// Numeric config-file key (`context_window:`); positive integers only —
@@ -590,36 +620,384 @@ fn split_selection(
     }
 }
 
+/// Per-catalog-generation lookup index (§24/§25): `from_env` runs per daemon
+/// chat turn and every model call re-probes the catalog (idle timeout via
+/// `reasoning_options_for`, `usage_cost`, `cache_write_read_ratio`), but each
+/// probe used to walk all providers × models with a lowercase alloc per id.
+/// The index walks once per catalog generation (same file-identity
+/// invalidation as the catalog parse itself) and serves every probe from
+/// maps. Shape quirks are preserved per lookup via the `endpoint_only` /
+/// `from_flat` flags: each reader sees exactly the entries the old walk
+/// would have visited.
+#[derive(Clone, Default)]
+struct CostRates {
+    input: f64,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    output: Option<f64>,
+}
+
+#[derive(Clone, Default)]
+struct IndexedModel {
+    /// Catalog provider key (`""` for the flat `models` shape, which names none).
+    provider: String,
+    /// The provider entry's `api` URL, if any.
+    api: Option<String>,
+    context: Option<u64>,
+    output: Option<u64>,
+    /// `Some` iff the entry carries a `cost` object (even an empty one —
+    /// the old walk returned the object and defaulted missing rates).
+    cost: Option<CostRates>,
+    reasoning_options: Option<Vec<String>>,
+    /// From the `providers`-nested shape (catalog.json): visible only to
+    /// endpoint routing, like the old walk which consulted that shape solely
+    /// in `catalog_endpoint_for_model`.
+    endpoint_only: bool,
+    /// From the flat top-level `models` shape: visible to context/output/
+    /// has-model/bare-id lookups, never to cost tiers (the old tier walk
+    /// only matched provider entries).
+    from_flat: bool,
+}
+
+struct CatalogIndex {
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    /// FNV-1a of the catalog text this index was built from. (mtime, len)
+    /// alone can't tell a mtime-preserving copy or a same-content rewrite
+    /// from real new data; on a metadata miss this hash decides re-parse
+    /// vs. refresh-without-reparse (see `with_catalog_index`).
+    hash: u64,
+    /// Lowercased model id → entries in catalog iteration order.
+    by_id: HashMap<String, Vec<IndexedModel>>,
+    provider_api: HashMap<String, String>,
+    provider_env: HashMap<String, Vec<String>>,
+    /// Bare model ids with their provider key (top-level providers plus the
+    /// flat shape, whose key is `""`); one id may repeat across providers
+    /// (each contributes its own endpoint prefix at expansion time).
+    bare: Vec<(String, String)>,
+    /// Fully expanded `available_models` lists by configured-provider set
+    /// (capped): concurrent turns with differing sets each hit instead of
+    /// thrashing a single-entry cache.
+    expanded_for: HashMap<BTreeSet<String>, Vec<String>>,
+}
+
+static CATALOG_INDEX: OnceLock<Mutex<Option<CatalogIndex>>> = OnceLock::new();
+
+/// Serve `f` from the in-process catalog index only when it is already warm
+/// AND still describes the catalog on disk: a mutex lock + one `stat`, never
+/// a file read or rebuild. Used for cross-checks (see `ctx_from_index`) that
+/// must not turn the KB-slim fast path into a 4MB parse. The metadata check
+/// matters: without it a warm index left over from the previous catalog
+/// generation would be served (and could rewrite `models.ctx.json` from
+/// stale context windows) after `dex update --models`.
+fn if_catalog_index_warm<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
+    let path = dex_catalog_cache_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    let guard = CATALOG_INDEX
+        .get()?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .filter(|index| index.path == path && index.mtime == mtime && index.len == len)
+        .map(f)
+}
+
+/// Advertised reasoning-effort values of one model entry (models.dev
+/// `reasoning_options`, e.g. glm-5.3-flash: low/high/max).
+fn reasoning_values(entry: &serde_json::Value) -> Option<Vec<String>> {
+    let options = entry.get("reasoning_options")?.as_array()?;
+    let values: Vec<String> = options
+        .iter()
+        .filter_map(|o| o.get("values"))
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
+fn cost_rates(entry: &serde_json::Value) -> Option<CostRates> {
+    let cost = entry.get("cost")?;
+    let rate = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| cost.get(*name))
+            .and_then(|v| v.as_f64())
+    };
+    Some(CostRates {
+        input: rate(&["input"]).unwrap_or(0.0),
+        cache_read: rate(&["cache_read", "cacheRead"]),
+        cache_write: rate(&["cache_write", "cacheWrite"]),
+        output: rate(&["output"]),
+    })
+}
+
+fn limit_of(entry: &serde_json::Value, key: &str) -> Option<u64> {
+    entry
+        .get("limit")
+        .and_then(|l| l.get(key))
+        .and_then(|c| c.as_u64())
+}
+
+/// Fold one provider entry's models into the index.
+fn index_provider_models(
+    index: &mut CatalogIndex,
+    prov_key: &str,
+    api: Option<String>,
+    models: &serde_json::Map<String, serde_json::Value>,
+    endpoint_only: bool,
+    from_flat: bool,
+) {
+    for (id, entry) in models {
+        index
+            .by_id
+            .entry(id.to_ascii_lowercase())
+            .or_default()
+            .push(IndexedModel {
+                provider: prov_key.to_string(),
+                api: api.clone(),
+                context: limit_of(entry, "context"),
+                output: limit_of(entry, "output"),
+                cost: cost_rates(entry),
+                reasoning_options: reasoning_values(entry),
+                endpoint_only,
+                from_flat,
+            });
+        if !endpoint_only {
+            index.bare.push((id.clone(), prov_key.to_string()));
+        }
+    }
+}
+
+fn build_catalog_index(
+    path: std::path::PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    hash: u64,
+    catalog: &serde_json::Value,
+) -> CatalogIndex {
+    let mut index = CatalogIndex {
+        path,
+        mtime,
+        len,
+        hash,
+        by_id: HashMap::new(),
+        provider_api: HashMap::new(),
+        provider_env: HashMap::new(),
+        bare: Vec::new(),
+        expanded_for: HashMap::new(),
+    };
+    // Top-level provider entries (api.json shape). The `models`/`providers`
+    // keys hold model/provider maps, not provider entries — the old walks
+    // found no `models` child in them, so they contribute nothing here.
+    if let Some(providers) = catalog.as_object() {
+        for (prov_key, entry) in providers {
+            if prov_key == "models" || prov_key == "providers" {
+                continue;
+            }
+            let Some(models) = entry.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
+            if let Some(api) = entry
+                .get("api")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+            {
+                index.provider_api.insert(prov_key.clone(), api);
+            }
+            // Same `env`-map reading the old `catalog_env_vars` did (list
+            // or map shape); sorted so resolution never depends on key order.
+            let mut env_names: Vec<String> = match entry.get("env") {
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect(),
+                Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+                _ => Vec::new(),
+            };
+            env_names.sort();
+            env_names.dedup();
+            if !env_names.is_empty() {
+                index.provider_env.insert(prov_key.clone(), env_names);
+            }
+            let api = index.provider_api.get(prov_key).cloned();
+            index_provider_models(&mut index, prov_key, api, models, false, false);
+        }
+    }
+    // Flat `models` shape (catalog.json): bare ids, context/output caps,
+    // has-model — but never cost tiers or endpoint routing (no provider).
+    if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
+        index_provider_models(&mut index, "", None, models, false, true);
+    }
+    // `providers`-nested shape (catalog.json): endpoint routing only.
+    if let Some(nested) = catalog.get("providers").and_then(|p| p.as_object()) {
+        for (prov_key, entry) in nested {
+            let Some(models) = entry.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
+            let api = entry
+                .get("api")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+            index_provider_models(&mut index, prov_key, api, models, true, false);
+        }
+    }
+    index
+}
+
+/// Run `f` against the current catalog index, rebuilding it when the catalog
+/// file changed since. `None` when no catalog is cached — every caller falls
+/// back exactly as before (config error, silent skip, or default).
+/// Run `f` against the current catalog index, rebuilding it when the catalog
+/// file changed since. `None` when no catalog is cached — every caller falls
+/// back exactly as before (config error, silent skip, or default).
+///
+/// Hot path stays metadata-only (`fs::metadata`, no read). On a metadata
+/// miss, identity is content: the 4MB read + FNV hash turns a
+/// mtime-preserving copy or a same-content rewrite into a cheap metadata
+/// refresh instead of a full re-parse. A same-length rewrite inside one
+/// mtime tick still serves the previous generation until the next metadata
+/// change — hashing per call would cost more than the index saves.
+fn with_catalog_index<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
+    let path = dex_catalog_cache_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    {
+        let guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = guard
+            .as_ref()
+            .filter(|index| index.path == path && index.mtime == mtime && index.len == len)
+        {
+            return Some(f(index));
+        }
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let hash = fnv_bytes(&text);
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = (*guard)
+            .as_mut()
+            .filter(|index| index.path == path && index.hash == hash)
+        {
+            // Same bytes under fresh metadata: the parsed index is still
+            // valid; just record the identity the next hot-path check sees.
+            index.mtime = mtime;
+            index.len = len;
+            return Some(f(index));
+        }
+    }
+    let catalog = load_dex_catalog()?;
+    let fresh = build_catalog_index(path.clone(), mtime, len, hash, &catalog);
+    let mut guard = CATALOG_INDEX
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // A concurrent turn may have rebuilt while this one parsed — serve the
+    // newest generation either way (same content hash, same conclusions).
+    // The path check stays: an `XDG_CACHE_HOME` switch between the two
+    // locks must not serve the other cache dir's index as this path's.
+    if let Some(index) = guard
+        .as_ref()
+        .filter(|index| index.path == path && index.hash == hash)
+    {
+        return Some(f(index));
+    }
+    *guard = Some(fresh);
+    Some(f(guard.as_ref()?))
+}
+
+/// Same as [`with_catalog_index`] with a mutable index: the expanded
+/// available-models cache lives on the index itself.
+fn with_catalog_index_mut<T>(f: impl FnOnce(&mut CatalogIndex) -> T) -> Option<T> {
+    let path = dex_catalog_cache_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|index| index.path == path && index.mtime == mtime && index.len == len);
+        if fresh {
+            return Some(f(guard.as_mut()?));
+        }
+    }
+    // Metadata miss — identity is content, same contract as
+    // `with_catalog_index`: same bytes under fresh metadata refresh the
+    // recorded identity without a re-parse; different bytes rebuild.
+    let text = std::fs::read_to_string(&path).ok()?;
+    let hash = fnv_bytes(&text);
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = (*guard)
+            .as_mut()
+            .filter(|index| index.path == path && index.hash == hash)
+        {
+            index.mtime = mtime;
+            index.len = len;
+            return Some(f(index));
+        }
+    }
+    // Parsed outside the lock (like `cached_parse`): the 4MB walk never
+    // blocks concurrent readers serving the previous generation.
+    let catalog = load_dex_catalog()?;
+    let fresh_index = build_catalog_index(path.clone(), mtime, len, hash, &catalog);
+    let mut guard = CATALOG_INDEX
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let stale = guard
+        .as_ref()
+        .map(|index| index.path != path || index.hash != hash)
+        .unwrap_or(true);
+    if stale {
+        *guard = Some(fresh_index);
+    } else {
+        // Same content (another turn rebuilt it while we parsed): refresh
+        // the recorded metadata so the hot path hits.
+        if let Some(index) = (*guard).as_mut() {
+            index.mtime = mtime;
+            index.len = len;
+        }
+    }
+    Some(f(guard.as_mut()?))
+}
+
 /// Catalog `api` URL for a provider key ("zai" → its serving endpoint).
 /// Entries without one (native-API providers like anthropic) are not usable
 /// as generic OpenAI-compatible providers — that absence is the gate.
-fn catalog_api(key: &str, catalog: &serde_json::Value) -> Option<String> {
-    catalog
-        .get(key)
-        .and_then(|e| e.get("api"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
+fn catalog_api(key: &str) -> Option<String> {
+    with_catalog_index(|index| index.provider_api.get(key).cloned()).flatten()
 }
 
 /// Whether `model` names a known model id anywhere in the catalog (either
 /// shape). Guards the provider-like hint: native `org/model` ids share
 /// their prefix with a provider but are legit model ids.
-fn catalog_has_model(model: &str, catalog: &serde_json::Value) -> bool {
-    let needle = model.to_ascii_lowercase();
-    if let Some(providers) = catalog.as_object() {
-        for (_prov, entry) in providers {
-            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                if models.keys().any(|id| id.to_ascii_lowercase() == needle) {
-                    return true;
-                }
-            }
-        }
-    }
-    catalog
-        .get("models")
-        .and_then(|m| m.as_object())
-        .is_some_and(|models| models.keys().any(|id| id.to_ascii_lowercase() == needle))
+fn catalog_has_model(model: &str) -> bool {
+    with_catalog_index(|index| {
+        index
+            .by_id
+            .get(model.to_ascii_lowercase().as_str())
+            .is_some_and(|entries| entries.iter().any(|e| !e.endpoint_only))
+    })
+    .unwrap_or(false)
 }
 
 /// A selection naming an unconfigured models.dev provider — bare (`zai`)
@@ -642,16 +1020,13 @@ fn warn_provider_like_selection(selection: &str, provider_name: &str, served: &[
     if candidate == provider_name {
         return false;
     }
-    let Some(catalog) = load_dex_catalog() else {
-        return false;
-    };
-    if catalog_api(candidate, &catalog).is_none() {
+    if catalog_api(candidate).is_none() {
         return false;
     }
-    if qualified && catalog_has_model(selection, &catalog) {
+    if qualified && catalog_has_model(selection) {
         return false;
     }
-    let key_env = catalog_env_vars(candidate, &catalog)
+    let key_env = catalog_env_vars(candidate)
         .first()
         .cloned()
         .unwrap_or_else(|| "<key>".to_string());
@@ -670,21 +1045,12 @@ fn warn_provider_like_selection(selection: &str, provider_name: &str, served: &[
 /// `env` map: e.g. ZHIPU_API_KEY, OPENROUTER_API_KEY, …), sorted so the
 /// resolution order never depends on JSON key order. Tried in order — a
 /// provider documenting several names accepts any of them.
-fn catalog_env_vars(key: &str, catalog: &serde_json::Value) -> Vec<String> {
+fn catalog_env_vars(key: &str) -> Vec<String> {
     // api.json shape is a list of names; older catalog.json used an object
     // (name → description). Accept both — only the names matter here.
-    let mut out = match catalog.get(key).and_then(|e| e.get("env")) {
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(str::to_string)
-            .collect(),
-        Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
-        _ => Vec::new(),
-    };
-    out.sort();
-    out.dedup();
-    out
+    // Sorted at index time so resolution never depends on JSON key order.
+    with_catalog_index(|index| index.provider_env.get(key).cloned().unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// Builtin providers whose canonical key env var is pinned in dex rather
@@ -715,7 +1081,7 @@ fn landing_base_url_for(
         return Some(url);
     }
     match provider {
-        Provider::Generic(name) => load_dex_catalog().and_then(|c| catalog_api(name, &c)),
+        Provider::Generic(name) => catalog_api(name),
         other => other.default_base_url().map(str::to_string),
     }
 }
@@ -816,9 +1182,7 @@ pub(crate) fn resolve_credentials(
     // The provider's own documented env vars; pinned builtin vars (see
     // `pinned_key_env`) work cache-less — the catalog is the source for
     // every other provider.
-    let mut env_names: Vec<String> = load_dex_catalog()
-        .map(|c| catalog_env_vars(name, &c))
-        .unwrap_or_default();
+    let mut env_names: Vec<String> = catalog_env_vars(name);
     if let Some(pinned) = pinned_key_env(provider) {
         if !env_names.iter().any(|v| v == pinned) {
             env_names.insert(0, pinned.to_string());
@@ -965,12 +1329,8 @@ fn extension_model_parts() -> Result<ExtensionModelParts, String> {
                 model = rest.to_string();
             }
         }
-        if let Some(catalog) = load_dex_catalog() {
-            if let Some(url) =
-                catalog_endpoint_for_model(&catalog, &model, &resolved.endpoints, &base_url)
-            {
-                base_url = url;
-            }
+        if let Some(url) = catalog_endpoint_for_model(&model, &resolved.endpoints, &base_url) {
+            base_url = url;
         }
     } else if let Some((name, rest)) = model.split_once('/') {
         // Pinned endpoint: prefixes name the target but never move the URL.
@@ -1023,9 +1383,11 @@ pub(crate) fn extension_model_auth_for(
         .unwrap_or_else(|| Provider::Generic(provider_name.to_string()));
     let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| e.to_string())?;
     let mut headers = load_config_headers(&file);
+    // Provider-scoped entries beat the global table per key (AGENTS.md
+    // precedence): overwrite, don't `or_insert`.
     if let Some(entry) = entries.get(provider.name()) {
         for (name, value) in &entry.headers {
-            headers.entry(name.clone()).or_insert_with(|| value.clone());
+            headers.insert(name.clone(), value.clone());
         }
     }
     for (name, value) in custom_headers_from_env() {
@@ -1114,28 +1476,18 @@ pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol
 /// replies so the thinking knob is discoverable per model; `None` when the
 /// catalog has no entry or advertises no effort options.
 pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
-    let catalog = load_dex_catalog()?;
-    let needle = model.to_ascii_lowercase();
-    let entry = catalog.as_object()?.values().find_map(|provider| {
-        provider
-            .get("models")
-            .and_then(|m| m.as_object())
-            .and_then(|models| {
-                models
-                    .iter()
-                    .find(|(id, _)| id.to_ascii_lowercase() == needle)
-                    .map(|(_, v)| v)
-            })
-    })?;
-    let options = entry.get("reasoning_options")?.as_array()?;
-    let values: Vec<String> = options
-        .iter()
-        .filter_map(|o| o.get("values"))
-        .filter_map(|v| v.as_array())
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    (!values.is_empty()).then_some(values)
+    // First catalog entry in iteration order wins — the old provider×model
+    // walk returned the first provider containing the id, even when that
+    // entry advertised no effort options.
+    with_catalog_index(|index| {
+        index
+            .by_id
+            .get(model.to_ascii_lowercase().as_str())?
+            .iter()
+            .find(|e| !e.endpoint_only)
+            .and_then(|e| e.reasoning_options.clone())
+    })
+    .flatten()
 }
 
 /// Per-model reasoning effort chosen via `/thinking`
@@ -1163,7 +1515,13 @@ fn write_thinking_map(map: &serde_json::Map<String, serde_json::Value>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string_pretty(map) {
-        let _ = std::fs::write(path, text);
+        // Atomic (unique tmp + rename): the daemon re-reads this file per
+        // turn; a direct write can hand it torn JSON that then sticks as a
+        // cached parse failure until the next write.
+        let tmp = unique_tmp_path(&path);
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -1249,7 +1607,13 @@ fn persist_selection(
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_yaml::to_string(&root) {
-        let _ = std::fs::write(path, text);
+        // Atomic (unique tmp + rename): a co-located reader caches the file
+        // by content hash — a direct write can hand it torn YAML, which
+        // then sticks as a parse error until the next write.
+        let tmp = unique_tmp_path(&path);
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
         invalidate_config_cache();
     }
 }
@@ -1282,9 +1646,54 @@ fn ctx_from_index(model: &str) -> Option<u64> {
     let path = dex_ctx_index_path()?;
     let text = std::fs::read_to_string(&path).ok()?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
-    map.get(model.to_ascii_lowercase().as_str())?
-        .as_u64()
-        .filter(|ctx| *ctx > 0)
+    let from_index = map
+        .get(model.to_ascii_lowercase().as_str())
+        .and_then(|v| v.as_u64())
+        .filter(|ctx| *ctx > 0)?;
+    // Cross-check against a warm in-process catalog index (a lock + one
+    // lookup, never a file read — `if_catalog_index_warm`): the KB file can
+    // lag the catalog it was derived from (upstream re-sized a model; the
+    // catalog was rewritten between the index write and this read). A
+    // mismatch prefers the catalog and rewrites the whole file from the
+    // warm index, so one wrong answer self-corrects without paying a cold
+    // 4MB parse on the hot path.
+    let from_catalog = if_catalog_index_warm(|index| {
+        index
+            .by_id
+            .get(model.to_ascii_lowercase().as_str())
+            .and_then(|entries| indexed_context(entries))
+    })
+    .flatten();
+    match from_catalog {
+        Some(ctx) if ctx != from_index => {
+            if_catalog_index_warm(|index| write_ctx_index(&ctx_map_from_index(index)));
+            Some(ctx)
+        }
+        _ => Some(from_index),
+    }
+}
+
+/// The context window every reader agrees on: the first non-`endpoint_only`
+/// entry in catalog iteration order with a positive `context`. Shared by the
+/// slim-index reader (`ctx_from_index`), its repair table
+/// (`ctx_map_from_index`) and `build_ctx_map`, so a cold process and a warm
+/// one can't disagree and rewrite `models.ctx.json` back and forth.
+fn indexed_context(entries: &[IndexedModel]) -> Option<u64> {
+    entries
+        .iter()
+        .filter(|e| !e.endpoint_only)
+        .find_map(|e| e.context.filter(|c| *c > 0))
+}
+
+/// The full model→context table from the warm catalog index — the repair
+/// `ctx_from_index` writes when the slim file disagrees with the catalog,
+/// instead of re-parsing the 4MB catalog to rebuild it.
+fn ctx_map_from_index(index: &CatalogIndex) -> BTreeMap<String, u64> {
+    index
+        .by_id
+        .iter()
+        .filter_map(|(id, entries)| indexed_context(entries).map(|ctx| (id.clone(), ctx)))
+        .collect()
 }
 
 /// Collect every known `model id → context` pair from the catalog (both the
@@ -1304,7 +1713,7 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
             if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
                 for (id, m) in models {
                     if let Some(ctx) = context_of(m) {
-                        map.insert(id.to_ascii_lowercase(), ctx);
+                        map.entry(id.to_ascii_lowercase()).or_insert(ctx);
                     }
                 }
             }
@@ -1313,7 +1722,7 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
     if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
         for (id, m) in models {
             if let Some(ctx) = context_of(m) {
-                map.insert(id.to_ascii_lowercase(), ctx);
+                map.entry(id.to_ascii_lowercase()).or_insert(ctx);
             }
         }
     }
@@ -1401,51 +1810,37 @@ fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
 /// `output` = generation cap). Matches either cache shape — api.json
 /// (per-provider models) or catalog.json (flat models map) — case-
 /// insensitively.
-fn catalog_limit(model: &str, catalog: &serde_json::Value, key: &str) -> Option<u64> {
-    let needle = model.to_ascii_lowercase();
-    // catalog is api.json (providers) or catalog.json (models+providers) — try both shapes
-    if let Some(providers) = catalog.as_object() {
-        let lookup = |models: &serde_json::Map<String, serde_json::Value>| {
-            models
-                .get(needle.as_str())
-                .or_else(|| {
-                    // fallback case-insensitive scan
-                    models
-                        .iter()
-                        .find(|(k, _)| k.to_ascii_lowercase() == needle)
-                        .map(|(_, v)| v)
-                })
-                .and_then(|m| m.get("limit"))
-                .and_then(|l| l.get(key))
-                .and_then(|c| c.as_u64())
-        };
-        // api.json shape: { "opencode": { models: { "id": { limit:{context} } } } }
-        for (_prov, entry) in providers {
-            if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                if let Some(v) = lookup(models) {
-                    return Some(v);
-                }
-            }
-        }
-        // catalog.json shape: { models: { "id": { limit } }, providers: { } }
-        if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
-            if let Some(v) = lookup(models) {
-                return Some(v);
-            }
-        }
-    }
-    None
+/// models.dev catalog `limit.<key>` for `model` (`context` = window,
+/// `output` = generation cap). Matches either cache shape — api.json
+/// (per-provider models) or catalog.json (flat models map) — case-
+/// insensitively. First catalog entry in iteration order wins, as before.
+/// A zero `limit` is no limit, so it is filtered like the slim index does.
+fn catalog_limit(model: &str, key: &str) -> Option<u64> {
+    with_catalog_index(|index| {
+        index
+            .by_id
+            .get(model.to_ascii_lowercase().as_str())?
+            .iter()
+            .filter(|e| !e.endpoint_only)
+            .find_map(|e| match key {
+                "context" => e.context,
+                "output" => e.output,
+                _ => None,
+            })
+    })
+    .flatten()
+    .filter(|v| *v > 0)
 }
 
-fn catalog_context_window(model: &str, catalog: &serde_json::Value) -> Option<u64> {
-    catalog_limit(model, catalog, "context")
+fn catalog_context_window(model: &str) -> Option<u64> {
+    catalog_limit(model, "context")
 }
 
 /// models.dev `limit.output` for the model — the generation cap wires that
-/// must declare one up front (Anthropic `max_tokens`) clamp against. Reads
-/// the cached catalog parse, so safe on hot paths.
+/// must declare one up front (Anthropic `max_tokens`) clamp against. Served
+/// from the per-generation index, so safe on hot paths.
 pub(crate) fn catalog_output_limit_for(model: &str) -> Option<u64> {
-    load_dex_catalog().and_then(|c| catalog_limit(model, &c, "output"))
+    catalog_limit(model, "output")
 }
 
 /// Endpoint URL serving `model` per the models.dev catalog, for bare model
@@ -1458,7 +1853,6 @@ pub(crate) fn catalog_output_limit_for(model: &str) -> Option<u64> {
 /// and on every config rebuild (`from_env` runs per daemon chat turn) —
 /// cheap behind the cached parse + endpoint guard.
 fn catalog_endpoint_for_model(
-    catalog: &serde_json::Value,
     model: &str,
     endpoints: &BTreeMap<String, String>,
     current_base_url: &str,
@@ -1466,91 +1860,61 @@ fn catalog_endpoint_for_model(
     if !endpoints.values().any(|url| url == current_base_url) {
         return None;
     }
-    let needle = model.to_ascii_lowercase();
-    let serves = |entry: &serde_json::Value| {
-        entry
-            .get("models")
-            .and_then(|m| m.as_object())
-            .is_some_and(|models| models.keys().any(|id| id.to_ascii_lowercase() == needle))
-    };
-    let mut fallback = None;
-    // api.json shape nests providers at the top level; catalog.json shape
-    // nests them under `providers` (a top-level `models` dict has no
-    // `models` child per entry, so it is skipped by `serves`).
-    let mut entries: Vec<&serde_json::Value> = Vec::new();
-    if let Some(obj) = catalog.as_object() {
-        entries.extend(obj.values());
-    }
-    if let Some(obj) = catalog.get("providers").and_then(|p| p.as_object()) {
-        entries.extend(obj.values());
-    }
-    for entry in entries {
-        let url = entry.get("api").and_then(|v| v.as_str()).unwrap_or("");
-        if !endpoints.values().any(|known| known == url) || !serves(entry) {
-            continue;
-        }
-        if url == current_base_url {
-            return None;
-        }
-        if fallback.is_none() {
-            fallback = Some(url.to_string());
-        }
-    }
-    fallback
-}
-
-/// First `cost` object for `needle` among catalog providers accepted by
-/// `pick`, in the catalog's provider order.
-fn catalog_cost<'a>(
-    catalog: &'a serde_json::Value,
-    needle: &str,
-    pick: impl Fn(&str, &serde_json::Value) -> bool,
-) -> Option<&'a serde_json::Value> {
-    let providers = catalog.as_object()?;
-    for (key, entry) in providers {
-        if !pick(key, entry) {
-            continue;
-        }
-        if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-            if let Some(m) = models.get(needle).or_else(|| {
-                models
-                    .iter()
-                    .find(|(k, _)| k.to_ascii_lowercase() == needle)
-                    .map(|(_, v)| v)
-            }) {
-                if let Some(c) = m.get("cost") {
-                    return Some(c);
-                }
+    // The index `by_id` vec holds exactly the serving entries (top-level
+    // providers, then the `providers`-nested shape) in catalog iteration
+    // order — the same sequence the old walk filtered with `serves`.
+    with_catalog_index(|index| {
+        let entries = index.by_id.get(model.to_ascii_lowercase().as_str())?;
+        let mut fallback = None;
+        for entry in entries {
+            let Some(url) = entry.api.as_deref().filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            if !endpoints.values().any(|known| known == url) {
+                continue;
+            }
+            if url == current_base_url {
+                return None;
+            }
+            if fallback.is_none() {
+                fallback = Some(url.to_string());
             }
         }
-    }
-    None
+        fallback
+    })
+    .flatten()
 }
 
 /// Shared 3-tier model-cost lookup for `usage_cost` and
 /// `cache_write_read_ratio`: the entry whose `api` matches the configured
 /// endpoint wins, then any catalog entry of the configured provider, then
-/// any provider at all.
-fn resolve_model_cost<'a>(
-    catalog: &'a serde_json::Value,
-    model: &str,
-    provider_keys: &[String],
-    base_url: &str,
-) -> Option<&'a serde_json::Value> {
-    let needle = model.to_ascii_lowercase();
+/// any provider at all. Served from the per-generation index — a map lookup
+/// plus a scan over one model's entries instead of a full catalog walk.
+fn resolve_model_cost(model: &str, provider_keys: &[String], base_url: &str) -> Option<CostRates> {
     let base = base_url.trim_end_matches('/');
-    catalog_cost(catalog, &needle, |_, entry| {
-        entry
-            .get("api")
-            .and_then(|v| v.as_str())
-            .is_some_and(|api| api.trim_end_matches('/') == base)
+    with_catalog_index(|index| {
+        let entries = index.by_id.get(model.to_ascii_lowercase().as_str())?;
+        // Priced top-level provider entries only: the flat `models` shape
+        // and the `providers`-nested shape never fed the old tier walk.
+        let priced = |e: &&IndexedModel| !e.endpoint_only && !e.from_flat && e.cost.is_some();
+        entries
+            .iter()
+            .filter(priced)
+            .find(|e| {
+                e.api
+                    .as_deref()
+                    .is_some_and(|api| api.trim_end_matches('/') == base)
+            })
+            .or_else(|| {
+                entries
+                    .iter()
+                    .filter(priced)
+                    .find(|e| provider_keys.iter().any(|k| k == &e.provider))
+            })
+            .or_else(|| entries.iter().find(priced))
+            .and_then(|e| e.cost.clone())
     })
-    .or_else(|| {
-        catalog_cost(catalog, &needle, |key, _| {
-            provider_keys.iter().any(|k| k == key)
-        })
-    })
-    .or_else(|| catalog_cost(catalog, &needle, |_, _| true))
+    .flatten()
 }
 
 /// Cost for one LLM call, using models.dev pricing when available. The same
@@ -1567,22 +1931,11 @@ pub(crate) fn usage_cost(
     base_url: &str,
     usage: &crate::core::types::Usage,
 ) -> Option<f64> {
-    let catalog = load_dex_catalog()?;
     let keys = provider.catalog_keys();
-    let cost_val = resolve_model_cost(&catalog, model, &keys, base_url)?;
-    let input_rate = cost_val
-        .get("input")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let cache_read_rate = cost_val
-        .get("cache_read")
-        .or_else(|| cost_val.get("cacheRead"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(input_rate);
-    let output_rate = cost_val
-        .get("output")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(input_rate);
+    let cost = resolve_model_cost(model, &keys, base_url)?;
+    let input_rate = cost.input;
+    let cache_read_rate = cost.cache_read.unwrap_or(input_rate);
+    let output_rate = cost.output.unwrap_or(input_rate);
     let cached = usage.cached_tokens.unwrap_or(0).min(usage.prompt_tokens);
     let fresh = usage.prompt_tokens.saturating_sub(cached);
     #[allow(clippy::cast_precision_loss)]
@@ -1595,47 +1948,48 @@ pub(crate) fn usage_cost(
 fn load_dex_models_cache() -> Option<Vec<String>> {
     // dex cache is models.dev api.json — expose bare ids plus endpoint-qualified
     // variants (`zen/<id>`, `go/<id>`) so a pick names the endpoint it targets;
-    // the prefixes are exactly the names `apply_model` routes on.
-    if let Some(catalog) = load_dex_catalog() {
-        if let Some(providers) = catalog.as_object() {
-            let mut ids: Vec<String> = Vec::new();
-            // Endpoint-qualified prefixes: builtins map to their named
-            // endpoints, configured generic providers to their own name.
-            let configured: BTreeSet<String> = load_provider_entries(&load_config_file())
-                .into_keys()
-                .collect();
-            for (prov_key, entry) in providers {
-                if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
-                    let dex_prefix: Option<String> = match prov_key.as_str() {
-                        "opencode" => Some("zen".to_string()),
-                        "opencode-go" => Some("go".to_string()),
-                        "openai-codex" | "codex" => Some("openai-codex".to_string()),
-                        other => configured.contains(other).then(|| other.to_string()),
-                    };
-                    for id in models.keys() {
-                        ids.push(id.clone());
-                        if let Some(prefix) = &dex_prefix {
-                            if prefix != id.as_str() {
-                                ids.push(format!("{prefix}/{id}"));
-                            }
-                        }
-                    }
-                }
-            }
-            if !ids.is_empty() {
-                ids.sort();
-                ids.dedup();
-                return Some(ids);
+    // the prefixes are exactly the names `apply_model` routes on. The bare
+    // (id, provider) pairs come from the per-generation index (no catalog
+    // walk); the fully expanded list is cached per configured-provider set,
+    // so repeat `from_env` calls clone one vec instead of re-sorting.
+    let configured: BTreeSet<String> = load_provider_entries(&load_config_file())
+        .into_keys()
+        .collect();
+    with_catalog_index_mut(|index| {
+        if let Some(ids) = index.expanded_for.get(&configured) {
+            return Some(ids.clone());
+        }
+        if index.bare.is_empty() {
+            return None;
+        }
+        let mut ids: Vec<String> = Vec::with_capacity(index.bare.len() * 2);
+        // Endpoint-qualified prefixes: builtins map to their named
+        // endpoints, configured generic providers to their own name. Flat-
+        // shape ids (empty provider key) ride bare, as before.
+        for (id, prov_key) in index.bare.iter() {
+            ids.push(id.clone());
+            let dex_prefix: Option<&str> = match prov_key.as_str() {
+                "opencode" => Some("zen"),
+                "opencode-go" => Some("go"),
+                "openai-codex" | "codex" => Some("openai-codex"),
+                other => configured.contains(other).then_some(other),
+            };
+            if let Some(prefix) = dex_prefix.filter(|p| *p != id.as_str()) {
+                ids.push(format!("{prefix}/{id}"));
             }
         }
-        if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
-            let ids: Vec<String> = models.keys().cloned().collect();
-            if !ids.is_empty() {
-                return Some(ids);
-            }
+        if ids.is_empty() {
+            return None;
         }
-    }
-    None
+        ids.sort();
+        ids.dedup();
+        if index.expanded_for.len() >= 4 {
+            index.expanded_for.clear();
+        }
+        index.expanded_for.insert(configured, ids.clone());
+        Some(ids)
+    })
+    .flatten()
 }
 
 /// Refresh the dex models cache via models.dev.
@@ -1888,19 +2242,16 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
 /// Console Go routing affinity: the zen/go endpoint rejects requests without
 /// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
 /// base URL, filled from the dex session id. Keys already present (any
-/// casing) are left alone, so explicit user headers always win regardless
-/// of call order.
-pub(crate) fn apply_opencode_session_headers(
-    out: &mut BTreeMap<String, String>,
-    provider: &Provider,
-    base_url: &str,
-    session_id: &str,
-) {
+/// casing) are left alone — including in the two file layers, which merge
+/// BELOW `extra_headers` on the wire — so explicit user headers always win
+/// regardless of call order.
+pub(crate) fn apply_opencode_session_headers(config: &mut LlmConfig, session_id: &str) {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return;
     }
-    let is_opencode = matches!(provider, Provider::OpenCode)
+    let base_url = config.base_url.as_str();
+    let is_opencode = matches!(config.provider, Provider::OpenCode)
         || reqwest::Url::parse(base_url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
@@ -1908,13 +2259,30 @@ pub(crate) fn apply_opencode_session_headers(
     if !is_opencode {
         return;
     }
-    for (name, value) in [
-        ("x-opencode-session", session_id),
-        ("x-opencode-client", "dex"),
-    ] {
-        if !out.keys().any(|k| k.eq_ignore_ascii_case(name)) {
-            out.insert(name.to_string(), value.to_string());
-        }
+    // A name pinned in ANY layer — file (`global_headers`/`provider_headers`)
+    // or env/CLI/per-request (`extra_headers`) — suppresses the auto-fill:
+    // the function writes into `extra_headers`, which merges last, so a
+    // file-level user header would otherwise lose to it. Resolve both
+    // predicates before mutating (they borrow `config` immutably).
+    let taken = |name: &str| {
+        config
+            .global_headers
+            .keys()
+            .chain(config.provider_headers.keys())
+            .chain(config.extra_headers.keys())
+            .any(|k| k.eq_ignore_ascii_case(name))
+    };
+    let session_taken = taken("x-opencode-session");
+    let client_taken = taken("x-opencode-client");
+    if !session_taken {
+        config
+            .extra_headers
+            .insert("x-opencode-session".to_string(), session_id.to_string());
+    }
+    if !client_taken {
+        config
+            .extra_headers
+            .insert("x-opencode-client".to_string(), "dex".to_string());
     }
 }
 
@@ -2024,7 +2392,8 @@ pub(crate) struct LlmConfig {
     /// per-provider keys plus optional base_url/`api:` overrides.
     pub(crate) provider_entries: BTreeMap<String, ProviderEntry>,
     /// The active provider's scoped `headers:`, refreshed on every provider
-    /// switch. Applied under the global/env/CLI extras, which win.
+    /// Switch. Provider-scoped beats the global file table per key; env
+    /// and `--header` extras still win over both.
     pub(crate) provider_headers: BTreeMap<String, String>,
     pub(crate) api: ApiProtocol,
     /// True when the user pinned the wire protocol globally: a top-level
@@ -2043,11 +2412,18 @@ pub(crate) struct LlmConfig {
     pub(crate) permission: PermissionMode,
     pub(crate) verify_command: Option<String>,
     /// Extra HTTP headers sent on every provider request (gateway auth,
-    /// routing, attribution). Config `headers:`/`http_headers:` < env
-    /// (`ANTHROPIC_CUSTOM_HEADERS`/`OPENAI_HEADERS`/`DEX_HEADERS`) <
-    /// `--header` / per-request overrides. Never carries `authorization`
-    /// (the api key owns that) — it is dropped at send time.
+    /// routing, attribution). env (`ANTHROPIC_CUSTOM_HEADERS`/`OPENAI_HEADERS`/
+    /// `DEX_HEADERS`) < `--header` / per-request overrides — these beat both
+    /// file layers on the wire (see `merged_headers`). The global file
+    /// `headers:`/`http_headers:` table lives in `global_headers`. Never
+    /// carries `authorization` (the api key owns that) — dropped at send time.
     pub(crate) extra_headers: BTreeMap<String, String>,
+    /// Global config-file `headers:`/`http_headers:` (the lowest precedence
+    /// layer: provider-scoped file headers and env/CLI extras both beat it,
+    /// per key). Split from `extra_headers` so the wire merge in
+    /// `merged_headers` can order the three layers exactly like
+    /// `extension_model_auth_for` does.
+    pub(crate) global_headers: BTreeMap<String, String>,
     pub(crate) client: reqwest::Client,
 }
 
@@ -2084,8 +2460,13 @@ impl LlmConfig {
             None => permission_from_env()?,
         };
         let file = load_config_file();
-        // Custom provider headers: config file < env < CLI flags.
-        let mut extra_headers = load_config_headers(&file);
+        // Custom headers, three layers so the wire merge can order them like
+        // `extension_model_auth_for` (AGENTS.md precedence): global file table
+        // < provider-scoped < env < CLI. `extra_headers` carries env+CLI (and
+        // later per-request overrides); the file's global table rides in
+        // `global_headers`.
+        let global_headers = load_config_headers(&file);
+        let mut extra_headers = BTreeMap::new();
         for (k, v) in custom_headers_from_env() {
             insert_extra_header(&mut extra_headers, &k, &v);
         }
@@ -2298,6 +2679,7 @@ impl LlmConfig {
             verify_command: env::var("DEX_VERIFY").ok(),
             permission,
             extra_headers,
+            global_headers,
             client,
             endpoints: resolved.endpoints,
             provider_entries,
@@ -2467,19 +2849,14 @@ impl LlmConfig {
             // model lives on another known endpoint.
             self.model = sel.to_string();
             warn_provider_like_selection(&sel, self.provider.name(), &self.available_models);
-            if let Some(catalog) = load_dex_catalog() {
-                if let Some(url) = catalog_endpoint_for_model(
-                    &catalog,
-                    &self.model,
-                    &self.endpoints,
-                    &self.base_url,
-                ) {
-                    result = self
-                        .endpoints
-                        .iter()
-                        .find_map(|(name, known)| (*known == url).then(|| name.clone()));
-                    self.base_url = url;
-                }
+            if let Some(url) =
+                catalog_endpoint_for_model(&self.model, &self.endpoints, &self.base_url)
+            {
+                result = self
+                    .endpoints
+                    .iter()
+                    .find_map(|(name, known)| (*known == url).then(|| name.clone()));
+                self.base_url = url;
             }
         }
         // The model carries its wire protocol; the global `api` is the
@@ -2496,10 +2873,8 @@ impl LlmConfig {
         if env::var("DEX_CONTEXT_WINDOW").is_err()
             && load_config_num(&load_config_file(), "context_window").is_none()
         {
-            if let Some(catalog) = load_dex_catalog() {
-                if let Some(ctx) = catalog_context_window(&self.model, &catalog) {
-                    self.context_window = ctx;
-                }
+            if let Some(ctx) = catalog_context_window(&self.model) {
+                self.context_window = ctx;
             }
         }
         // Effort follows the final model+endpoint: stored `/thinking`
@@ -2527,25 +2902,16 @@ impl LlmConfig {
     /// price.
     pub(crate) fn cache_write_read_ratio(&self) -> f64 {
         const FALLBACK: f64 = crate::agent::online_compaction::DEFAULT_CACHE_WRITE_READ_RATIO;
-        let Some(catalog) = load_dex_catalog() else {
-            return FALLBACK;
-        };
         let keys = self.provider.catalog_keys();
-        let Some(cost_val) = resolve_model_cost(&catalog, &self.model, &keys, &self.base_url)
-        else {
+        let Some(cost) = resolve_model_cost(&self.model, &keys, &self.base_url) else {
             return FALLBACK;
         };
-        let rate = |names: &[&str]| {
-            names
-                .iter()
-                .find_map(|name| cost_val.get(*name).and_then(|v| v.as_f64()))
-        };
-        let input_rate = rate(&["input"]).filter(|r| *r > 0.0);
+        let input_rate = (cost.input > 0.0).then_some(cost.input);
         // Same unbilled-rate assumptions as `usage_cost`: a missing rate
         // bills at the input price, so `write / read` covers every pricing
         // shape the catalog actually carries.
-        let read_rate = rate(&["cache_read", "cacheRead"]).or(input_rate);
-        let write_rate = rate(&["cache_write", "cacheWrite"]).or(input_rate);
+        let read_rate = cost.cache_read.or(input_rate);
+        let write_rate = cost.cache_write.or(input_rate);
         match (write_rate, read_rate) {
             (Some(write), Some(read)) if write > 0.0 && read > 0.0 => write / read,
             _ => FALLBACK,
@@ -2896,9 +3262,7 @@ pub(crate) fn doctor(
             {
                 format!("config providers.{}.api_key", provider.name())
             } else {
-                let mut names = load_dex_catalog()
-                    .map(|c| catalog_env_vars(provider.name(), &c))
-                    .unwrap_or_default();
+                let mut names = catalog_env_vars(provider.name());
                 // Mirror `resolve_credentials`: pinned builtin vars resolve
                 // cache-less, ahead of any catalog `env` discovery.
                 if let Some(pinned) = pinned_key_env(&provider) {
@@ -2943,18 +3307,16 @@ pub(crate) fn doctor(
             };
             let api = live.map(|c| c.api.name().to_string()).unwrap_or(chain_api);
             row(&mut out, "protocol", &api, api_source);
-            let (chain_ctx, ctx_source) = if let Ok(v) = env::var("DEX_CONTEXT_WINDOW") {
-                (v, "DEX_CONTEXT_WINDOW".to_string())
+            let (chain_ctx, ctx_source) = if let Some(v) = context_window_from_env() {
+                (v.to_string(), "DEX_CONTEXT_WINDOW".to_string())
+            } else if let Some(ctx) = load_config_num(&file, "context_window") {
+                (ctx.to_string(), "config context_window:".to_string())
             } else if let Some(ctx) = ctx_from_index(&model) {
                 (ctx.to_string(), "cached context index".to_string())
             } else {
-                match (
-                    load_config_num(&file, "context_window"),
-                    load_dex_catalog().and_then(|c| catalog_context_window(&model, &c)),
-                ) {
-                    (_, Some(ctx)) => (ctx.to_string(), "models.dev catalog".to_string()),
-                    (Some(ctx), None) => (ctx.to_string(), "config context_window:".to_string()),
-                    (None, None) => (
+                match catalog_context_window(&model) {
+                    Some(ctx) => (ctx.to_string(), "models.dev catalog".to_string()),
+                    None => (
                         "UNKNOWN".to_string(),
                         "no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW"
                             .to_string(),
@@ -3301,24 +3663,33 @@ pub(crate) mod tests {
 
     #[test]
     fn resolve_model_cost_ignores_trailing_slash() {
-        let catalog = serde_json::json!({
-            "go": {
-                "api": "https://go.example/v1",
-                "models": {"m-1": {"cost": {"input": 1.0}}}
-            }
-        });
+        // Serializes process-env redirection against other tests. Hermetic
+        // catalog via `XDG_CACHE_HOME` — the lookup is index-backed, so the
+        // catalog arrives as a file, not a `Value`.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dex-cost-slash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dex")).unwrap();
+        std::fs::write(
+            dir.join("dex/models.dev.json"),
+            serde_json::json!({
+                "go": {
+                    "api": "https://go.example/v1",
+                    "models": {"m-1": {"cost": {"input": 1.0}}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+        std::env::set_var("XDG_CACHE_HOME", &dir);
         // A pinned `base_url` with a trailing slash still hits the
         // endpoint-exact tier instead of falling through to reseller pricing.
-        let cost = super::resolve_model_cost(
-            &catalog,
-            "m-1",
-            &["go".to_string()],
-            "https://go.example/v1/",
-        );
-        assert_eq!(
-            cost.and_then(|c| c.get("input")).and_then(|v| v.as_f64()),
-            Some(1.0)
-        );
+        let cost = super::resolve_model_cost("m-1", &["go".to_string()], "https://go.example/v1/");
+        assert_eq!(cost.map(|c| c.input), Some(1.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cache-write/read ratio resolution feeding the online compaction
@@ -3409,6 +3780,7 @@ pub(crate) mod tests {
             permission: PermissionMode::AskWrites,
             verify_command: None,
             extra_headers: Default::default(),
+            global_headers: Default::default(),
             client: reqwest::Client::new(),
             provider_entries: Default::default(),
             provider_headers: Default::default(),
@@ -3738,6 +4110,8 @@ pub(crate) mod tests {
 
     #[test]
     fn custom_headers_layer_file_env_cli() {
+        use std::collections::BTreeMap;
+
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3773,10 +4147,17 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(cfg.model, "m-h");
+        // File layers land in `global_headers` (lowest precedence on the
+        // wire); `http_headers:` loses to `headers:` per key inside that map.
         assert_eq!(
-            cfg.extra_headers.get("X-File").map(String::as_str),
+            cfg.global_headers.get("X-File").map(String::as_str),
             Some("file")
         );
+        assert_eq!(
+            cfg.global_headers.get("X-Shared").map(String::as_str),
+            Some("file")
+        );
+        // Env / CLI land in `extra_headers` — above both file layers.
         assert_eq!(
             cfg.extra_headers.get("X-Env").map(String::as_str),
             Some("env")
@@ -3793,11 +4174,20 @@ pub(crate) mod tests {
             cfg.extra_headers.get("X-Cli").map(String::as_str),
             Some("cli")
         );
-        // CLI wins over both config-file spellings.
-        assert_eq!(
-            cfg.extra_headers.get("X-Shared").map(String::as_str),
-            Some("cli")
-        );
+        assert!(!cfg.extra_headers.contains_key("X-File"));
+        // The wire merge orders the layers: CLI wins over both config-file
+        // spellings, file keys survive where nothing above them speaks.
+        let merged: BTreeMap<String, String> = crate::llm::client::merged_headers(&cfg)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(merged.get("x-shared").map(String::as_str), Some("cli"));
+        assert_eq!(merged.get("x-file").map(String::as_str), Some("file"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3829,65 +4219,65 @@ pub(crate) mod tests {
     #[test]
     fn opencode_session_headers_gated_and_explicit_wins() {
         use super::apply_opencode_session_headers;
-        use std::collections::BTreeMap;
         // Opencode provider (zen or go endpoint) + session id → both headers.
-        let mut out = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::OpenCode,
-            "https://opencode.ai/zen/go/v1",
-            "sess-1",
-        );
+        let mut cfg = test_cfg();
+        apply_opencode_session_headers(&mut cfg, "sess-1");
         assert_eq!(
-            out.get("x-opencode-session").map(String::as_str),
+            cfg.extra_headers
+                .get("x-opencode-session")
+                .map(String::as_str),
             Some("sess-1")
         );
         assert_eq!(
-            out.get("x-opencode-client").map(String::as_str),
+            cfg.extra_headers
+                .get("x-opencode-client")
+                .map(String::as_str),
             Some("dex")
         );
         // Generic provider on another host → nothing.
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::Generic("other".to_string()),
-            "https://other.example/v1",
-            "sess-1",
-        );
-        assert!(out.is_empty());
+        let mut cfg = test_cfg();
+        cfg.provider = Provider::Generic("other".to_string());
+        cfg.base_url = "https://other.example/v1".into();
+        apply_opencode_session_headers(&mut cfg, "sess-1");
+        assert!(cfg.extra_headers.is_empty());
         // Generic provider pointed at opencode.ai → headers (host fallback).
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::Generic("proxy".to_string()),
-            "https://opencode.ai/zen/v1",
-            "sess-1",
-        );
-        assert_eq!(out.len(), 2);
+        let mut cfg = test_cfg();
+        cfg.provider = Provider::Generic("proxy".to_string());
+        apply_opencode_session_headers(&mut cfg, "sess-1");
+        assert_eq!(cfg.extra_headers.len(), 2);
         // Empty session id → nothing, even for opencode.
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::OpenCode,
-            "https://opencode.ai/zen/v1",
-            "  ",
-        );
-        assert!(out.is_empty());
+        let mut cfg = test_cfg();
+        apply_opencode_session_headers(&mut cfg, "  ");
+        assert!(cfg.extra_headers.is_empty());
         // Explicit user header wins (any casing); client header still fills.
-        let mut out: BTreeMap<String, String> =
-            BTreeMap::from([("X-Opencode-Session".to_string(), "mine".to_string())]);
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::OpenCode,
-            "https://opencode.ai/zen/v1",
-            "sess-1",
-        );
+        let mut cfg = test_cfg();
+        cfg.extra_headers
+            .insert("X-Opencode-Session".to_string(), "mine".to_string());
+        apply_opencode_session_headers(&mut cfg, "sess-1");
         assert_eq!(
-            out.get("X-Opencode-Session").map(String::as_str),
+            cfg.extra_headers
+                .get("X-Opencode-Session")
+                .map(String::as_str),
             Some("mine")
         );
         assert_eq!(
-            out.get("x-opencode-client").map(String::as_str),
+            cfg.extra_headers
+                .get("x-opencode-client")
+                .map(String::as_str),
+            Some("dex")
+        );
+        // A FILE-layer pin must suppress the auto-fill too: `extra_headers`
+        // merges after both file layers, so injecting here would silently
+        // override the user's config-file header.
+        let mut cfg = test_cfg();
+        cfg.provider_headers
+            .insert("x-opencode-session".to_string(), "file".to_string());
+        apply_opencode_session_headers(&mut cfg, "sess-1");
+        assert!(!cfg.extra_headers.contains_key("x-opencode-session"));
+        assert_eq!(
+            cfg.extra_headers
+                .get("x-opencode-client")
+                .map(String::as_str),
             Some("dex")
         );
     }
@@ -6086,9 +6476,10 @@ pub(crate) mod tests {
             std::env::remove_var(key);
         }
         let auth = super::extension_model_auth().unwrap();
-        // Global file headers win over provider-scoped ones; `authorization`
-        // never travels with the headers (the key goes separately).
-        assert_eq!(auth.headers.get("X-A").map(String::as_str), Some("global"));
+        // Provider-scoped entries beat the global table per key (AGENTS.md
+        // precedence); `authorization` never travels with the headers (the
+        // key goes separately).
+        assert_eq!(auth.headers.get("X-A").map(String::as_str), Some("scoped"));
         assert_eq!(auth.headers.get("X-B").map(String::as_str), Some("scoped"));
         assert!(auth
             .headers

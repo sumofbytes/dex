@@ -763,6 +763,13 @@ pub(super) fn render_search_preview(preview: &[String]) -> Vec<Line<'static>> {
 /// that animates "◌ Thinking .." while the block streams and settles at
 /// "Thought for 4s" (or "◌ Thinking ..." when no span was measured) once it
 /// closes; expanded (Ctrl+T) = the full text, dim.
+/// One expanded-thinking source line: dim + transcript-indented, exactly as
+/// the expanded arm of `thinking_display_lines` builds it.
+fn thinking_line(s: &str) -> Line<'static> {
+    let style = Style::default().fg(theme::muted_fg());
+    super::indent_transcript_line(Line::from(Span::styled(s.to_string(), style)))
+}
+
 fn thinking_display_lines(
     text: &str,
     expanded: bool,
@@ -771,16 +778,77 @@ fn thinking_display_lines(
     tick: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let style = Style::default().fg(theme::muted_fg());
-    let line =
-        |s: &str| super::indent_transcript_line(Line::from(Span::styled(s.to_string(), style)));
     if expanded {
         return text
             .lines()
-            .flat_map(|l| wrap_line_display(&line(l), width))
+            .flat_map(|l| wrap_line_display(&thinking_line(l), width))
             .collect();
     }
     vec![thinking_indicator_line(thinking_open, elapsed, tick, width)]
+}
+
+/// Incremental cursor for an expanded thinking block's wrapped rows (§29):
+/// bytes of `text` already reflected in the cached rows, of which the last
+/// source line (`open_len` bytes → `open_rows` rows) may still be open.
+#[derive(Clone, Copy)]
+struct ThinkingWrap {
+    src_len: usize,
+    open_len: usize,
+    open_rows: usize,
+}
+
+/// Full wrap of expanded thinking text plus the incremental cursor
+/// describing it. The still-open line is the text after the last newline
+/// (empty when the text ends with one — it contributes no rows).
+fn wrap_thinking_full(text: &str, width: u16) -> (Vec<Line<'static>>, ThinkingWrap) {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut head_rows = 0usize;
+    for l in text.lines() {
+        head_rows = rows.len();
+        rows.extend(wrap_line_display(&thinking_line(l), width));
+    }
+    let (open_len, open_rows) = if text.ends_with('\n') || text.is_empty() {
+        (0, 0)
+    } else {
+        (
+            text.rsplit('\n').next().map_or(0, str::len),
+            rows.len() - head_rows,
+        )
+    };
+    (
+        rows,
+        ThinkingWrap {
+            src_len: text.len(),
+            open_len,
+            open_rows,
+        },
+    )
+}
+
+/// Extend cached expanded-thinking rows with newly appended text (§29).
+/// Everything before the previously open source line is final, so only the
+/// open line plus the tail re-wrap. Returns `None` when the cache can't be
+/// reused — shorter text (head-cut, reset, rebuild) or rows built collapsed
+/// — and the caller must fully re-wrap.
+fn extend_thinking_rows(
+    rows: &mut Vec<Line<'static>>,
+    state: ThinkingWrap,
+    text: &str,
+    width: u16,
+) -> Option<ThinkingWrap> {
+    if state.src_len > text.len() {
+        return None;
+    }
+    let start = state.src_len.saturating_sub(state.open_len);
+    let tail = text.get(start..)?;
+    rows.truncate(rows.len().saturating_sub(state.open_rows));
+    let (mut tail_rows, tail_state) = wrap_thinking_full(tail, width);
+    rows.append(&mut tail_rows);
+    Some(ThinkingWrap {
+        src_len: text.len(),
+        open_len: tail_state.open_len,
+        open_rows: tail_state.open_rows,
+    })
 }
 
 /// The collapsed thinking indicator's text: while the block streams, the
@@ -971,11 +1039,21 @@ impl TranscriptView {
         // changed (usually the tail) instead of the whole transcript. Scroll
         // and resize reuse cached rows; only the visible window is cloned
         // into the paragraph each draw.
-        let mut changed = app.wrapped_width != area.width;
-        if changed {
+        // First block whose display rows may have changed (perf doc §29):
+        // the concat below re-extends from here instead of re-cloning the
+        // whole transcript per streaming flush.
+        let mut first_dirty: Option<usize> = None;
+        let mut mark = |idx: usize| {
+            first_dirty = Some(first_dirty.map_or(idx, |first| first.min(idx)));
+        };
+        if app.wrapped_width != area.width {
             app.wrapped_cache.clear();
             app.display_cache.clear();
             app.wrapped_width = area.width;
+            // Every row is re-wrapped at the new width, so the old selection's
+            // row coordinates (and the text they'd copy) are gone too.
+            app.selection = None;
+            mark(0);
         }
         // Keep the cache parallel to the transcript. A shorter transcript
         // (reset/resume) drops stale entries; appended blocks start unwrapped.
@@ -984,46 +1062,109 @@ impl TranscriptView {
             // Selection rows refer to the old cache; drop them rather than
             // highlight or copy rows that no longer exist.
             app.selection = None;
-            changed = true;
+            mark(app.transcript.len());
         }
         while app.wrapped_cache.len() < app.transcript.len() {
+            mark(app.wrapped_cache.len());
             app.wrapped_cache.push(WrappedBlock {
                 stamp: u64::MAX,
                 rows: Vec::new(),
+                src_len: 0,
+                open_len: 0,
+                open_rows: 0,
+                expanded: false,
             });
-            changed = true;
         }
+        // Every transcript mutation must extend/truncate `wrapped_cache`
+        // alongside (or clear both, like `reset_session_state`): a missed
+        // site serves stale rows with no other signal. The tail-append path
+        // below only ever pushes, so this holds on entry to the wrap loop.
+        debug_assert_eq!(
+            app.wrapped_cache.len(),
+            app.transcript.len(),
+            "wrapped_cache drifted from transcript — new mutation site missed the parallel cache"
+        );
         for (idx, block) in app.transcript.iter().enumerate() {
             if app.wrapped_cache[idx].stamp == block.stamp() {
                 continue;
+            }
+            // Expanded thinking re-wraps only the appended tail (§29):
+            // stored text is append-only below the cap, so rows before the
+            // last source line are final. A head-cut, reset, or rebuild
+            // resets stamps and takes the full wrap below.
+            if let super::TranscriptBlock::Thinking { text, .. } = block {
+                if app.show_thinking {
+                    let stamp = block.stamp();
+                    let width = area.width;
+                    let wb = &mut app.wrapped_cache[idx];
+                    if wb.expanded {
+                        let state = ThinkingWrap {
+                            src_len: wb.src_len,
+                            open_len: wb.open_len,
+                            open_rows: wb.open_rows,
+                        };
+                        if let Some(next) = extend_thinking_rows(&mut wb.rows, state, text, width) {
+                            wb.stamp = stamp;
+                            wb.src_len = next.src_len;
+                            wb.open_len = next.open_len;
+                            wb.open_rows = next.open_rows;
+                            mark(idx);
+                            continue;
+                        }
+                    }
+                    let (rows, state) = wrap_thinking_full(text, width);
+                    *wb = WrappedBlock {
+                        stamp,
+                        rows,
+                        src_len: state.src_len,
+                        open_len: state.open_len,
+                        open_rows: state.open_rows,
+                        expanded: true,
+                    };
+                    mark(idx);
+                    continue;
+                }
             }
             let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
             app.wrapped_cache[idx] = WrappedBlock {
                 stamp: block.stamp(),
                 rows,
+                src_len: 0,
+                open_len: 0,
+                open_rows: 0,
+                expanded: false,
             };
-            changed = true;
+            mark(idx);
         }
-        if changed {
-            // Re-concatenate the already-wrapped rows (no re-wrapping); this
-            // runs only on content or width changes, never for scroll.
-            // Tool steps carry the `surface_bg()` band themselves, so every
-            // gap between blocks stays blank terminal bg.
-            let mut display: Vec<Line<'static>> = Vec::new();
-            for (idx, wb) in app.wrapped_cache.iter().enumerate() {
+        if let Some(dirty) = first_dirty {
+            // Truncate the display to the first dirty block's start offset
+            // (gap separators + wrapped-row counts — length arithmetic, no
+            // clones), then re-extend from there. Unchanged leading blocks
+            // keep byte-identical rows, so the offsets line up; this runs
+            // only on content or width changes, never for scroll. Tool
+            // steps carry the `surface_bg()` band themselves, so every gap
+            // between blocks stays blank terminal bg.
+            let mut start = 0usize;
+            for (idx, wb) in app.wrapped_cache.iter().enumerate().take(dirty) {
                 if idx > 0 && !wb.rows.is_empty() {
-                    display.push(Line::default());
+                    start += 1;
                 }
-                display.extend(wb.rows.iter().cloned());
+                start += wb.rows.len();
             }
-            app.display_cache = display;
+            app.display_cache.truncate(start);
+            for (idx, wb) in app.wrapped_cache.iter().enumerate().skip(dirty) {
+                if idx > 0 && !wb.rows.is_empty() {
+                    app.display_cache.push(Line::default());
+                }
+                app.display_cache.extend(wb.rows.iter().cloned());
+            }
         }
-        // The open thinking / activity rows animate in place: their cached
-        // lines are rewritten every frame (O(1)) instead of invalidating
-        // the cache, which would re-wrap the whole transcript at animation
-        // rate. Both animated blocks sit at the transcript tail — the open
-        // activity block is the tail block while busy, and the open
-        // thinking block is the last content block (any non-thinking sink
+        // The open thinking / activity rows animate: their lines are overlaid
+        // on the rendered window (not written back into `display_cache`), so
+        // a later `first_dirty` re-extend from `wrapped_cache` can't resurrect
+        // a stale spinner tick. Both animated blocks sit at the transcript
+        // tail — the open activity block is the tail block while busy, and the
+        // open thinking block is the last content block (any non-thinking sink
         // line closes it) — so their display rows derive from the tail
         // instead of walking the cache.
         let mut thinking_row: Option<usize> = None;
@@ -1064,16 +1205,6 @@ impl TranscriptView {
                 }
             }
         }
-        if let Some(row) = thinking_row {
-            if let Some(line) = app.display_cache.get_mut(row) {
-                *line = thinking_indicator_line(true, None, app.tick, area.width);
-            }
-        }
-        if let Some(row) = activity_row {
-            if let Some(line) = app.display_cache.get_mut(row) {
-                *line = activity_indicator_line(app.tick, area.width);
-            }
-        }
         let total = app.display_cache.len();
         let max_scroll = (total.saturating_sub(visible)) as u16;
         if app.autoscroll {
@@ -1098,6 +1229,19 @@ impl TranscriptView {
             .take(visible)
             .cloned()
             .collect();
+        // Animated overlay on the window copy (O(1)): `display_cache` keeps
+        // the un-animated rows so cache re-extends never resurrect a stale tick.
+        let scroll = app.scroll as usize;
+        if let Some(row) = thinking_row {
+            if row >= scroll && row - scroll < window.len() {
+                window[row - scroll] = thinking_indicator_line(true, None, app.tick, area.width);
+            }
+        }
+        if let Some(row) = activity_row {
+            if row >= scroll && row - scroll < window.len() {
+                window[row - scroll] = activity_indicator_line(app.tick, area.width);
+            }
+        }
         if let Some(sel) = app.selection {
             apply_selection(&mut window, app.scroll as usize, sel, area.width);
         }
@@ -1246,7 +1390,11 @@ fn queue_groups(app: &App) -> Vec<QueueGroup> {
                 // Empty queued text still gets its badge row.
                 lines.push(String::new());
             }
-            if pending.lines().count() > lines.len() {
+            // Overflow probe without the old `lines().count()` full walk:
+            // one more row tells all (§29). Exact for any
+            // `QUEUE_MAX_ITEM_ROWS >= 1` (a row past the window exists iff
+            // the item overflows it).
+            if pending.lines().nth(QUEUE_MAX_ITEM_ROWS).is_some() {
                 // Never the badge row: an overflowing item keeps at least
                 // one continuation line before the collapse.
                 *lines.last_mut().expect("non-empty") = "…".into();
@@ -1268,8 +1416,7 @@ fn queue_groups(app: &App) -> Vec<QueueGroup> {
 
 /// Items and content rows the strip renders, straight from `queue_groups`
 /// so sizing can't drift from the drawing.
-fn pending_queue_metrics(app: &App) -> QueueMetrics {
-    let groups = queue_groups(app);
+fn queue_metrics_of(groups: &[QueueGroup]) -> QueueMetrics {
     QueueMetrics {
         items: u16::try_from(groups.len()).unwrap_or(u16::MAX),
         rows: u16::try_from(groups.iter().map(|g| g.lines.len()).sum::<usize>())
@@ -1277,8 +1424,16 @@ fn pending_queue_metrics(app: &App) -> QueueMetrics {
     }
 }
 
+/// Items and content rows the strip renders, straight from `queue_groups`
+/// so sizing can't drift from the drawing.
+fn pending_queue_metrics(app: &App) -> QueueMetrics {
+    queue_metrics_of(&queue_groups(app))
+}
+
 impl ActivityView {
-    fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    /// The queue groups come from `view` (built once per frame, §29) —
+    /// rebuilding them here doubled the per-frame queue cost.
+    fn render(f: &mut ratatui::Frame, area: Rect, groups: &[QueueGroup]) {
         // Always clear the rect first: ratatui only repaints cells the
         // widget writes, so a shorter line (e.g. fewer queued-steer
         // badges) would otherwise leave trailing chars from the previous
@@ -1287,7 +1442,6 @@ impl ActivityView {
         // The busy "● Working" spinner and the "worked for …" summary now
         // live in the transcript as the turn-activity block; this strip
         // only carries the pending steer/follow-up queue.
-        let groups = queue_groups(app);
         if groups.is_empty() {
             return;
         }
@@ -1300,18 +1454,18 @@ impl ActivityView {
             if !rows.is_empty() {
                 rows.push(Line::from(String::new()));
             }
-            let mut lines = group.lines.into_iter();
-            let first = lines.next().unwrap_or_default();
+            let mut lines = group.lines.iter();
+            let first = lines.next().map(String::as_str).unwrap_or("");
             let text = match group.badge {
                 Some(badge) => format!("{badge} · {first}"),
-                None => first,
+                None => first.to_string(),
             };
             rows.push(Line::from(Span::styled(
                 truncate_display(&text, content_width),
                 style,
             )));
             rows.extend(lines.map(|rest| {
-                Line::from(Span::styled(truncate_display(&rest, content_width), style))
+                Line::from(Span::styled(truncate_display(rest, content_width), style))
             }));
         }
         f.render_widget(
@@ -1554,9 +1708,10 @@ impl BottomPane {
         app: &mut App,
         input_lines: Vec<Line<'static>>,
         input_cursor: (u16, u16, u16),
+        queue: &[QueueGroup],
     ) {
         if layout.activity.height > 0 {
-            ActivityView::render(f, layout.activity, app);
+            ActivityView::render(f, layout.activity, queue);
         }
         if layout.input.height > 0 {
             ComposerView::render(f, layout.input, app, input_lines, input_cursor);
@@ -1584,11 +1739,11 @@ impl ApprovalOverlay {
             .map(|agent| format!("{agent} wants to "))
             .unwrap_or_default();
         // — centered modal, clean readable command —
-        let details = crate::core::format::approval_details(&approval.name, &approval.input);
-        let title = crate::core::format::approval_title(&approval.name, &approval.input);
-        let (risk_label, risk_color) =
-            crate::core::format::approval_risk(&approval.name, &approval.input);
-        let summary = crate::core::format::approval_summary(&approval.name, &approval.input);
+        // Parsed once at enqueue (§29); never re-parse per frame.
+        let title = &approval.title;
+        let summary = &approval.summary;
+        let details = &approval.details;
+        let (risk_label, risk_color) = (approval.risk_label, approval.risk_color);
         // width clamped so modal feels floating, not full-bleed; height grows with details
         let width = area
             .width
@@ -1746,15 +1901,18 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     );
     let input_rows = input_lines.len() as u16;
     // The busy "● Working" status lives in the transcript (turn-activity
-    // block); this strip only sizes for the pending queue.
-    let queue = pending_queue_metrics(app);
+    // block); this strip only sizes for the pending queue. The groups are
+    // built once per frame here (§29) and shared with the strip drawing
+    // below, instead of rebuilt in both sizing and drawing.
+    let groups = queue_groups(app);
+    let queue = queue_metrics_of(&groups);
     // Approval is a centered modal, not a bottom-pane split — don't reserve
     // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
     // no reason and push the composer up.
     let layout = compute_layout(area, input_rows, queue, false).expect("layout always exists");
 
     TranscriptView::render(f, layout.transcript, app);
-    BottomPane::render(f, &layout, app, input_lines, input_cursor);
+    BottomPane::render(f, &layout, app, input_lines, input_cursor, &groups);
     if !app.pending_approvals.is_empty() {
         ApprovalOverlay::render(f, area, app);
     }
@@ -2165,6 +2323,7 @@ mod tests {
                 permission: PermissionMode::Trusted,
                 verify_command: None,
                 extra_headers: Default::default(),
+                global_headers: Default::default(),
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
@@ -2212,6 +2371,8 @@ mod tests {
             transcript_area: None,
             selection: None,
             notice: None,
+            status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
+            slash_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -2432,6 +2593,37 @@ mod tests {
     }
 
     #[test]
+    fn thinking_tail_extend_matches_full_wrap() {
+        let width = 40;
+        let first =
+            "first line of thought\na second line much longer than the wrap width allows here";
+        let (mut rows, state) = wrap_thinking_full(first, width);
+        assert_eq!(state.src_len, first.len());
+        // Extending with identical text re-wraps just the open line.
+        let mut same = rows.clone();
+        let again = extend_thinking_rows(&mut same, state, first, width).expect("no-op extends");
+        assert_eq!(same, rows);
+        assert_eq!(again.src_len, first.len());
+        // Append mid-line, then newlines, then more: only the tail re-wraps.
+        let text = format!("{first} plus more\nthird line\nfourth");
+        let next =
+            extend_thinking_rows(&mut rows, state, &text, width).expect("append-only extends");
+        let (full, _) = wrap_thinking_full(&text, width);
+        assert_eq!(rows, full);
+        assert_eq!(next.src_len, text.len());
+        // A non-prefix (head-cut, reset, rebuild) refuses the fast path.
+        assert!(extend_thinking_rows(&mut rows, next, "totally different text", width).is_none());
+        // Trailing newline: the open line is empty, the next append starts clean.
+        let nl = format!("{text}\n");
+        let (mut rows_nl, st_nl) = wrap_thinking_full(&nl, width);
+        assert_eq!((st_nl.open_len, st_nl.open_rows), (0, 0));
+        let text2 = format!("{nl}fifth line");
+        extend_thinking_rows(&mut rows_nl, st_nl, &text2, width).expect("extends after newline");
+        let (full2, _) = wrap_thinking_full(&text2, width);
+        assert_eq!(rows_nl, full2);
+    }
+
+    #[test]
     fn thinking_display_collapsed_previews_expanded_shows_all() {
         let text = "first line\n\nsecond line";
         let collapsed = thinking_display_lines(text, false, false, None, 0, 80);
@@ -2532,12 +2724,18 @@ mod tests {
             started: Instant::now(),
             settled: None,
         }];
-        let draw = |app: &mut super::super::App| {
-            let mut terminal =
-                ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
-            terminal
-                .draw(|frame| view(frame, app))
-                .expect("render should succeed");
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let rendered = |terminal: &ratatui::Terminal<TestBackend>| -> Vec<String> {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim()
+                        .to_string()
+                })
+                .collect()
         };
         let lines = |app: &super::super::App| -> Vec<String> {
             app.display_cache
@@ -2552,16 +2750,16 @@ mod tests {
                 })
                 .collect()
         };
-        draw(&mut app);
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        // The live spinner paints onto the window overlay, not back into
+        // `display_cache` (so a later cache re-extend can't resurrect a
+        // stale tick): assert on the painted buffer.
+        let painted = rendered(&terminal);
         assert!(
-            app.display_cache.iter().any(|l| l
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                .contains("● Working ..")),
-            "{:?}",
-            app.display_cache
+            painted.iter().any(|l| l.contains("● Working ..")),
+            "{painted:?}"
         );
 
         app.busy = false;
@@ -2570,7 +2768,9 @@ mod tests {
             started: Instant::now(),
             settled: Some("Worked for 12s · 4.2k tokens".into()),
         };
-        draw(&mut app);
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
         let settled = lines(&app);
         assert!(
             settled
@@ -2625,10 +2825,21 @@ mod tests {
             .iter()
             .map(|l| text(l).trim().to_string())
             .collect();
+        let buffer = terminal.backend().buffer();
+        let painted: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
         // The settled block stays at three dots even though a block is open.
         assert!(lines.iter().any(|l| l == "◌ Thinking ..."), "{lines:?}");
-        // The open tail block still animates.
-        assert!(lines.iter().any(|l| l == "◌ Thinking .."), "{lines:?}");
+        // The open tail block still animates — the live tick paints onto the
+        // window overlay, not back into `display_cache`.
+        assert!(painted.iter().any(|l| l == "◌ Thinking .."), "{painted:?}");
     }
 
     #[test]
@@ -2676,6 +2887,43 @@ mod tests {
             lines.iter().filter(|l| l.is_empty()).count(),
             1,
             "exactly one gap between the two blocks"
+        );
+    }
+
+    #[test]
+    fn display_cache_extends_incrementally_on_tail_append() {
+        // The incremental concat (§29) must keep leading display rows
+        // byte-identical when only the tail grows — a full re-concat per
+        // ~120ms streaming flush is O(transcript) clones per change.
+        let mut app = test_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let text =
+            |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let before: Vec<String> = app.display_cache.iter().map(&text).collect();
+        assert!(!before.is_empty(), "first render must populate the cache");
+
+        // Flush immediately so the streamed delta lands in the transcript.
+        app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
+        super::super::append_sink_line(
+            &mut app,
+            crate::core::types::SinkLine::Assistant("more text".into()),
+        );
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        let after: Vec<String> = app.display_cache.iter().map(text).collect();
+        assert!(
+            after.len() > before.len(),
+            "tail append must grow the cache: {after:?}"
+        );
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "leading display rows must survive a tail append unchanged"
         );
     }
 
@@ -3125,14 +3373,15 @@ mod tests {
         // plus the human title, not the raw `bash cargo test` dump.
         let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
         let mut app = test_app();
-        app.pending_approvals = vec![super::super::PendingApproval {
-            name: "bash".to_string(),
-            input: r#"{"command":"cargo test"}"#.to_string(),
-            response: response_tx,
-            selected: 1,
-            request_id: "req-1".to_string(),
-            agent: None,
-        }];
+        let mut approval = super::super::PendingApproval::new(
+            "bash".to_string(),
+            r#"{"command":"cargo test"}"#.to_string(),
+            response_tx,
+            "req-1".to_string(),
+            None,
+        );
+        approval.selected = 1;
+        app.pending_approvals = vec![approval];
         let backend = TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
@@ -3171,14 +3420,13 @@ mod tests {
         // Second check: write tool formats path/lines, not raw JSON
         let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
         let mut app2 = test_app();
-        app2.pending_approvals = vec![super::super::PendingApproval {
-            name: "write".to_string(),
-            input: r#"{"path":"src/main.rs","content":"hello\nworld\n"}"#.to_string(),
-            response: tx2,
-            selected: 0,
-            request_id: "req-2".to_string(),
-            agent: Some("explorer".to_string()),
-        }];
+        app2.pending_approvals = vec![super::super::PendingApproval::new(
+            "write".to_string(),
+            r#"{"path":"src/main.rs","content":"hello\nworld\n"}"#.to_string(),
+            tx2,
+            "req-2".to_string(),
+            Some("explorer".to_string()),
+        )];
         let backend2 = TestBackend::new(80, 24);
         let mut term2 = ratatui::Terminal::new(backend2).expect("test terminal");
         term2.draw(|f| view(f, &mut app2)).expect("render");
