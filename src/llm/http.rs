@@ -1,8 +1,8 @@
 //! Shared HTTP transport core for provider calls: auth + header merging,
 //! retry/backoff taxonomy, provider logging, and error-message helpers.
-//! Both the chat/streaming path (`client`, `dispatch`, `sse`) and the typed
-//! Jev path (`jev`) build on this, so a new scheme (e.g. an Azure-style
-//! `api-key` header) lands in one place: [`Provider::auth_scheme`].
+//! The chat/streaming path (`client`, `dispatch`, `sse`) builds on this, so
+//! a new scheme (e.g. an Azure-style `api-key` header) lands in one place:
+//! [`Provider::auth_scheme`].
 
 use std::env;
 use std::fs;
