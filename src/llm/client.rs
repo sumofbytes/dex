@@ -51,17 +51,22 @@ impl ModelClient for LlmConfig {
     }
 }
 
-/// Merged + validated custom headers for one request (perf doc §30):
-/// provider-scoped file headers first, global/env/CLI extras winning on
-/// collision (explicit always beats file). `authorization` is never
-/// overridable — the api key owns it. Malformed names/values are skipped
-/// so one bad header can't fail the turn. Computed once per model call,
-/// not once per HTTP attempt.
+/// Merged + validated custom headers for one request. Precedence is the
+/// AGENTS.md rule (provider-scoped file `headers:` > global file, per-key;
+/// env < `--header` above both — the same order `extension_model_auth_for`
+/// serves to Lua). `authorization` is never overridable — the api key owns
+/// it. Malformed names/values are skipped so one bad header can't fail the
+/// turn. Computed once per model call, not once per HTTP attempt.
 pub(crate) fn merged_headers(
     config: &LlmConfig,
 ) -> Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
-    let mut merged = config.provider_headers.clone();
+    let mut merged = config.global_headers.clone();
+    for (name, value) in &config.provider_headers {
+        // Provider-scoped beats the global table per key: overwrite.
+        insert_extra_header(&mut merged, name, value);
+    }
     for (name, value) in &config.extra_headers {
+        // Env / `--header` / per-request overrides beat both file layers.
         insert_extra_header(&mut merged, name, value);
     }
     let mut out = Vec::with_capacity(merged.len());
@@ -811,9 +816,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_headers_apply_under_global_extras() {
-        // Provider-scoped file headers ride along; an explicit global /
-        // env / CLI extra wins on collision.
+    fn provider_headers_beat_global_file_but_not_env_extras() {
+        // AGENTS.md precedence on the wire: provider-scoped file headers
+        // beat the global file table per key, env/CLI extras beat both.
         let mut config = crate::llm::config::tests::test_cfg();
         config.api_key = "secret".to_string();
         config
@@ -823,8 +828,11 @@ mod tests {
             .provider_headers
             .insert("X-Both".to_string(), "prov".to_string());
         config
-            .extra_headers
+            .global_headers
             .insert("X-Both".to_string(), "global".to_string());
+        config
+            .extra_headers
+            .insert("X-Prov".to_string(), "env".to_string());
         let headers = merged_headers(&config);
         let req = authenticated_request(
             config.client.get("http://localhost/v1/chat/completions"),
@@ -833,13 +841,15 @@ mod tests {
         )
         .build()
         .unwrap();
-        assert_eq!(
-            req.headers().get("x-prov").map(|v| v.to_str().unwrap()),
-            Some("prov")
-        );
+        // Provider-scoped file beats global-file on collision…
         assert_eq!(
             req.headers().get("x-both").map(|v| v.to_str().unwrap()),
-            Some("global")
+            Some("prov")
+        );
+        // …but an env/CLI/per-request extra beats the provider-scoped one.
+        assert_eq!(
+            req.headers().get("x-prov").map(|v| v.to_str().unwrap()),
+            Some("env")
         );
     }
 
