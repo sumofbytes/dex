@@ -220,6 +220,21 @@ fn fallback_key(lang: &str) -> &str {
     }
 }
 
+/// End of the line starting at `from`: the next `\n` or EOF. An unclosed
+/// comment colors to EOL rather than vanishing.
+fn scan_to_eol(bytes: &[u8], from: usize) -> usize {
+    let mut end = from;
+    while end < bytes.len() && bytes[end] != b'\n' {
+        end += 1;
+    }
+    end
+}
+
+/// Record a comment run covering `[start, end)`.
+fn close_comment(segs: &mut Vec<StyleSegment>, start: usize, end: usize, style: Style) {
+    segs.push(StyleSegment { start, end, style });
+}
+
 fn fallback_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
     if !fallback_enabled(lang) {
         return Vec::new();
@@ -249,20 +264,12 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
         if let Some(s) = block_start {
             if pos + 1 < len && bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
                 pos += 2;
-                segs.push(StyleSegment {
-                    start: s,
-                    end: pos,
-                    style: comment,
-                });
+                close_comment(&mut segs, s, pos, comment);
                 block_start = None;
             } else {
                 pos += char_len_at(pos);
                 if pos >= len {
-                    segs.push(StyleSegment {
-                        start: s,
-                        end: len,
-                        style: comment,
-                    });
+                    close_comment(&mut segs, s, len, comment);
                 }
             }
             continue;
@@ -274,20 +281,12 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
                 && bytes[pos + 2] == b'>'
             {
                 pos += 3;
-                segs.push(StyleSegment {
-                    start: s,
-                    end: pos,
-                    style: comment,
-                });
+                close_comment(&mut segs, s, pos, comment);
                 html_start = None;
             } else {
                 pos += char_len_at(pos);
                 if pos >= len {
-                    segs.push(StyleSegment {
-                        start: s,
-                        end: len,
-                        style: comment,
-                    });
+                    close_comment(&mut segs, s, len, comment);
                 }
             }
             continue;
@@ -310,41 +309,20 @@ fn fallback_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
             continue;
         }
         if slash && pos + 1 < len && b == b'/' && bytes[pos + 1] == b'/' {
-            let mut end = pos + 2;
-            while end < len && bytes[end] != b'\n' {
-                end += 1;
-            }
-            segs.push(StyleSegment {
-                start: pos,
-                end,
-                style: comment,
-            });
+            let end = scan_to_eol(bytes, pos + 2);
+            close_comment(&mut segs, pos, end, comment);
             pos = end;
             continue;
         }
         if dash && pos + 1 < len && b == b'-' && bytes[pos + 1] == b'-' {
-            let mut end = pos + 2;
-            while end < len && bytes[end] != b'\n' {
-                end += 1;
-            }
-            segs.push(StyleSegment {
-                start: pos,
-                end,
-                style: comment,
-            });
+            let end = scan_to_eol(bytes, pos + 2);
+            close_comment(&mut segs, pos, end, comment);
             pos = end;
             continue;
         }
         if hash && b == b'#' {
-            let mut end = pos + 1;
-            while end < len && bytes[end] != b'\n' {
-                end += 1;
-            }
-            segs.push(StyleSegment {
-                start: pos,
-                end,
-                style: comment,
-            });
+            let end = scan_to_eol(bytes, pos + 1);
+            close_comment(&mut segs, pos, end, comment);
             pos = end;
             continue;
         }

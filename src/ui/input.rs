@@ -108,76 +108,91 @@ impl InputField {
             }
             KeyCode::Char(_) => {}
             KeyCode::Enter => self.insert_char('\n'),
-            KeyCode::Backspace => {
-                if self.col == 0 {
-                    if self.row > 0 {
-                        let removed = self.lines.remove(self.row);
-                        self.row -= 1;
-                        self.col = self.lines[self.row].len();
-                        self.lines[self.row].push_str(&removed);
-                    }
-                } else {
-                    let line = &mut self.lines[self.row];
-                    let mut idx = self.col;
-                    while idx > 0 && !line.is_char_boundary(idx - 1) {
-                        idx -= 1;
-                    }
-                    line.remove(idx - 1);
-                    self.col = idx - 1;
-                }
-            }
-            KeyCode::Delete => {
-                let line = &mut self.lines[self.row];
-                if self.col < line.len() {
-                    let mut idx = self.col;
-                    while idx < line.len() && !line.is_char_boundary(idx + 1) {
-                        idx += 1;
-                    }
-                    line.remove(idx);
-                } else if self.row + 1 < self.lines.len() {
-                    let removed = self.lines.remove(self.row + 1);
-                    self.lines[self.row].push_str(&removed);
-                }
-            }
-            KeyCode::Left => {
-                if self.col > 0 {
-                    let line = &self.lines[self.row];
-                    let mut idx = self.col;
-                    while idx > 0 && !line.is_char_boundary(idx - 1) {
-                        idx -= 1;
-                    }
-                    self.col = idx - 1;
-                } else if self.row > 0 {
-                    self.row -= 1;
-                    self.col = self.lines[self.row].len();
-                }
-            }
-            KeyCode::Right => {
-                let line = &self.lines[self.row];
-                if self.col < line.len() {
-                    let mut idx = self.col;
-                    while idx < line.len() && !line.is_char_boundary(idx + 1) {
-                        idx += 1;
-                    }
-                    self.col = idx + 1;
-                } else if self.row + 1 < self.lines.len() {
-                    self.row += 1;
-                    self.col = 0;
-                }
-            }
-            KeyCode::Up if self.row > 0 => {
-                self.row -= 1;
-                self.clamp_col();
-            }
-            KeyCode::Down if self.row + 1 < self.lines.len() => {
-                self.row += 1;
-                self.clamp_col();
-            }
+            KeyCode::Backspace => self.handle_backspace(),
+            KeyCode::Delete => self.handle_delete(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Up if self.row > 0 => self.move_up(),
+            KeyCode::Down if self.row + 1 < self.lines.len() => self.move_down(),
             KeyCode::Home => self.col = 0,
             KeyCode::End => self.col = self.lines[self.row].len(),
             KeyCode::Tab => self.insert_char('\t'),
             _ => {}
         }
+    }
+
+    /// Backspace: join with the previous row at column 0, else remove the
+    /// character before the cursor (snapping to a char boundary).
+    fn handle_backspace(&mut self) {
+        if self.col == 0 {
+            if self.row > 0 {
+                let removed = self.lines.remove(self.row);
+                self.row -= 1;
+                self.col = self.lines[self.row].len();
+                self.lines[self.row].push_str(&removed);
+            }
+        } else {
+            let line = &mut self.lines[self.row];
+            let mut idx = self.col;
+            while idx > 0 && !line.is_char_boundary(idx - 1) {
+                idx -= 1;
+            }
+            line.remove(idx - 1);
+            self.col = idx - 1;
+        }
+    }
+
+    /// Delete: remove the character at the cursor, else join the next row in.
+    fn handle_delete(&mut self) {
+        let line = &mut self.lines[self.row];
+        if self.col < line.len() {
+            let mut idx = self.col;
+            while idx < line.len() && !line.is_char_boundary(idx + 1) {
+                idx += 1;
+            }
+            line.remove(idx);
+        } else if self.row + 1 < self.lines.len() {
+            let removed = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&removed);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.col > 0 {
+            let line = &self.lines[self.row];
+            let mut idx = self.col;
+            while idx > 0 && !line.is_char_boundary(idx - 1) {
+                idx -= 1;
+            }
+            self.col = idx - 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].len();
+        }
+    }
+
+    fn move_right(&mut self) {
+        let line = &self.lines[self.row];
+        if self.col < line.len() {
+            let mut idx = self.col;
+            while idx < line.len() && !line.is_char_boundary(idx + 1) {
+                idx += 1;
+            }
+            self.col = idx + 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.row -= 1;
+        self.clamp_col();
+    }
+
+    fn move_down(&mut self) {
+        self.row += 1;
+        self.clamp_col();
     }
 
     /// Clamp `col` to a char boundary on the current row. A byte offset that
