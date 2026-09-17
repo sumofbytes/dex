@@ -95,18 +95,22 @@ fn find_cut_point(
     if cut_points.is_empty() {
         return None;
     }
-    let mut accumulated: u64 = 0;
+    let mut recent_chars: u64 = 0;
+    let mut recent_count: u64 = 0;
     let mut cut_index = cut_points[0];
     let mut hit_budget = false;
     for i in (start..end).rev() {
-        // Estimate per message via chars/4 plus per-message overhead.
-        let len = message_char_len(&messages[i]);
-        let est = (len as u64) / 4 + PER_MESSAGE_OVERHEAD;
-        if est == 0 {
+        // Same sum-then-divide formula as `TokenLedger` (chars/4 +
+        // count*OVERHEAD over the whole recent window): divide-then-sum per
+        // message drifts up to 3/4 token per message from the gate's ledger.
+        let len = message_char_len(&messages[i]) as u64;
+        if len == 0 && PER_MESSAGE_OVERHEAD == 0 {
             continue;
         }
-        accumulated += est;
-        if accumulated >= keep_recent_tokens {
+        recent_chars += len;
+        recent_count += 1;
+        let recent = recent_chars / 4 + recent_count * PER_MESSAGE_OVERHEAD;
+        if recent >= keep_recent_tokens {
             // closest valid cut at or after i
             for &cp in &cut_points {
                 if cp >= i {
