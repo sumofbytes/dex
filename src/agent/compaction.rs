@@ -6,7 +6,7 @@ use crate::agent::tokens::{message_char_len, PER_MESSAGE_OVERHEAD};
 use crate::core::format::truncate_text;
 use crate::core::types::{ChatMessage, Role, Usage};
 use crate::llm::config::LlmConfig;
-use crate::llm::streaming::complete as call_llm;
+use crate::llm::dispatch::complete as call_llm;
 
 pub(crate) use super::tokens::estimate_tokens;
 
