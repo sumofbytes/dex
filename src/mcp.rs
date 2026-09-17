@@ -993,19 +993,19 @@ impl HttpTransport {
 
 /// One SSE `data:` line → RPC result/error for `id`, if it carries one.
 /// Progress notifications (no `result`/`error`, or a different `id`) return
-/// `None` so the scan continues. An envelope without an `id` that carries a
-/// result is accepted (back-compat with servers that omit it); one with a
-/// mismatched `id` is skipped.
+/// `None` so the scan continues. An envelope without an `id` is NEVER this
+/// call's result — under concurrent calls on one transport an id-less
+/// broadcast notification carrying `result` would otherwise be stolen and
+/// misattributed to whoever scans first. Servers that omit `id` are served
+/// by the non-multiplexed stdio path, not here.
 fn sse_result_id(line: &str, id: u64) -> Option<Value> {
     let data = line.trim().strip_prefix("data:").unwrap_or("").trim();
     if data.is_empty() || data == "[DONE]" {
         return None;
     }
     let v: Value = serde_json::from_str(data).ok()?;
-    if let Some(got) = v.get("id").and_then(|v| v.as_u64()) {
-        if got != id {
-            return None;
-        }
+    if v.get("id").and_then(|v| v.as_u64()) != Some(id) {
+        return None;
     }
     extract_rpc_result(&v)
 }
@@ -1637,24 +1637,40 @@ pub(crate) fn global_manager() -> Arc<McpManager> {
         .clone()
 }
 
+/// Bounded spin on `try_read`: every writer holds its guard for a bare
+/// swap (never across an await), so a contended first try succeeds within
+/// a few yields. A single `try_read().unwrap_or_default()` undercounts the
+/// compaction budget to 0 under contention and skips a needed compaction —
+/// or drops the tools from one request's schema. The spin keeps the
+/// never-block contract (bounded yields) while making the fallback
+/// ~unreachable.
+fn spin_read<T: Clone>(lock: &RwLock<T>) -> Option<T> {
+    for _ in 0..16 {
+        if let Ok(guard) = lock.try_read() {
+            return Some(guard.clone());
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
 /// Cached MCP tools for `tools_schema()` — never blocks, never fails.
 /// Clones the `Arc`, not the defs.
 pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
     GLOBAL
         .get()
-        .and_then(|m| m.cached_tools.try_read().ok().map(|t| t.clone()))
+        .and_then(|m| spin_read(&m.cached_tools))
         .unwrap_or_else(|| Arc::new([]))
 }
 
 /// Token cost of the cached MCP schema slice, for the compaction budget.
 /// Precomputed at cache-swap time — a cached load, never a re-serialize.
-/// `try_read` (never block the loop): contention returns 0, underestimating
-/// the budget once and delaying compaction by one check — self-corrects on
-/// the next call when the rebuild lock releases.
+/// Never blocks the loop; contention spins (see `spin_read`) instead of
+/// returning 0 and skipping a needed compaction.
 pub(crate) fn cached_schema_tokens() -> u64 {
     GLOBAL
         .get()
-        .and_then(|m| m.cached_schema_tokens.try_read().ok().map(|n| *n))
+        .and_then(|m| spin_read(&m.cached_schema_tokens))
         .unwrap_or_default()
 }
 
@@ -1662,7 +1678,7 @@ pub(crate) fn cached_schema_tokens() -> u64 {
 pub(crate) fn cached_truncated() -> usize {
     GLOBAL
         .get()
-        .and_then(|m| m.cached_truncated.try_read().ok().map(|n| *n))
+        .and_then(|m| spin_read(&m.cached_truncated))
         .unwrap_or_default()
 }
 
@@ -1702,9 +1718,9 @@ pub(crate) fn cached_statuses() -> Option<Vec<ServerStatus>> {
 /// contended — callers must treat that as "unavailable", never as an empty
 /// server list (which would wrongly imply no MCP is configured).
 fn try_snapshot(mgr: &McpManager) -> Option<Vec<ServerStatus>> {
-    let clients = mgr.clients.try_read().ok()?;
-    let tools = mgr.cached_tools.try_read().ok()?;
-    let down = mgr.down.try_read().ok()?;
+    let clients = spin_read(&mgr.clients)?;
+    let tools = spin_read(&mgr.cached_tools)?;
+    let down = spin_read(&mgr.down)?;
     Some(McpManager::status_list(
         &mgr.configs,
         &clients,
@@ -1784,8 +1800,14 @@ mod tests {
         assert!(sse_result_id("data: [DONE]", 1).is_none());
         assert!(sse_result_id("", 1).is_none());
         assert!(sse_result_id(": comment", 1).is_none());
-        let e = sse_result_id("data: {\"error\":{\"code\":-1}}", 1).expect("error matches");
+        let e =
+            sse_result_id("data: {\"id\":1,\"error\":{\"code\":-1}}", 1).expect("error matches");
         assert!(e.get("__mcp_error").is_some());
+        // Id-less envelopes are never this call's result: under concurrent
+        // calls on one transport an id-less broadcast carrying `result`
+        // would otherwise be stolen and misattributed to whoever scans first.
+        assert!(sse_result_id("data: {\"error\":{\"code\":-1}}", 1).is_none());
+        assert!(sse_result_id("data: {\"result\":{\"ok\":true}}", 1).is_none());
     }
 
     fn fake_client(tools: Vec<McpTool>, resources: bool, fail: bool) -> McpClient {

@@ -222,11 +222,13 @@ fn for_each_line(path: &Path, mut f: impl FnMut(&str)) -> io::Result<()> {
 // marker the loader folds, and no delete/reset endpoint exists — so a
 // snapshot stays exact as long as every mutation flows through
 // `append_line` (session journal) / `append_event` (events journal) below,
-// which refresh the snapshot's identity after each write. Identity is
-// `(mtime, len)`: any out-of-band rewrite (a test's `fs::write`, a hand
-// edit) misses and re-parses from disk, and a missing file evicts. Paths
-// are unique per session and entries are FIFO-capped, so a long-lived
-// daemon can't accumulate dead sessions.
+// which refresh the snapshot's identity after each write. The one exception
+// is `rewrite_messages` (post-compaction): it replaces the file atomically
+// (temp + rename) and publishes the fresh snapshot fused with its identity
+// under one lock. Identity is `(mtime, len)`: any out-of-band rewrite (a
+// test's `fs::write`, a hand edit) misses and re-parses from disk, and a
+// missing file evicts. Paths are unique per session and entries are
+// FIFO-capped, so a long-lived daemon can't accumulate dead sessions.
 
 /// `(mtime, len)` identity for a journal snapshot.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -283,11 +285,12 @@ impl<V> PathCache<V> {
     }
 }
 
-/// Process-wide durable-journal mode: `env::var` per appended line is pure
-/// overhead on the journal hot path, and the var is fixed for the process.
+/// Durable-journal mode, read per call: `env::var` on the journal hot path
+/// is a few microseconds per appended line (lines are per-message, not per
+/// frame), while a `OnceLock` would cache the first read forever and poison
+/// runtime flips plus every recovery test after the first append.
 fn durable_journal() -> bool {
-    static DURABLE: OnceLock<bool> = OnceLock::new();
-    *DURABLE.get_or_init(|| env::var("DEX_DURABLE").as_deref() == Ok("1"))
+    env::var("DEX_DURABLE").as_deref() == Ok("1")
 }
 
 /// Parsed session history by journal path (perf doc §11): the per-turn
@@ -1052,22 +1055,17 @@ impl Session {
             },
             false,
         )?;
-        // Write-through to the parsed-history snapshot (perf doc §11):
-        // mirror the loader, which skips System-role messages. Fused with
-        // the identity refresh under one lock — a separate touch + push
-        // lets a concurrent reader see the new FileId with the old vec and
-        // miss the last message.
+        // Invalidate the parsed-history snapshot (perf doc §11) instead of
+        // fusing write+stat+push: two `Session` handles (daemon turn + `!`
+        // shell, or concurrent appends) interleave write;stat;push so the
+        // second stat sees both rows while its vec holds one — publishing
+        // a new FileId with a stale/misordered tail. Eviction forces the
+        // next load to rescan (one scan per turn, never per frame).
         if let Some(path) = self.path.as_deref() {
-            let Some(id) = file_id(path) else {
-                return Ok(());
-            };
-            let mut cache = history_cache().lock().expect("history cache lock");
-            if let Some(entry) = cache.get_mut(path) {
-                entry.0 = id;
-                if message.role != Role::System {
-                    entry.1.push(message.clone());
-                }
-            }
+            history_cache()
+                .lock()
+                .expect("history cache lock")
+                .evict(path);
         }
         Ok(())
     }
@@ -1079,17 +1077,86 @@ impl Session {
             timestamp: Self::now_iso(),
         };
         self.append_line_inner(&entry, false)?;
-        // The loader folds everything before a `clear` marker: mirror it
-        // under the same lock as the identity refresh (see above).
+        // Same invalidate-not-push as `append_message` (see above).
         if let Some(path) = self.path.as_deref() {
-            let Some(id) = file_id(path) else {
-                return Ok(());
+            history_cache()
+                .lock()
+                .expect("history cache lock")
+                .evict(path);
+        }
+        Ok(())
+    }
+
+    /// Atomically replace the journal's message tail after compaction:
+    /// header + `clear` + every message after the system prompt go to a
+    /// temp file in the same directory, fsync, then `rename` over the
+    /// journal. The old clear+N-appends sequence left a crash window
+    /// mid-rewrite — a `clear` plus a partial tail permanently dropped the
+    /// pre-compaction history. A rename is atomic: readers see the old or
+    /// the new history, never a torn one. The append handle reopens (it
+    /// pointed at the renamed-away inode) and the snapshot publishes fused
+    /// with its new identity, mirroring the loader (System role skipped).
+    /// In-memory sessions (no path) are a no-op, like the appends were.
+    pub(crate) fn rewrite_messages(&mut self, messages: &[ChatMessage]) -> io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        // Non-`.jsonl` suffix: the session listing scans `*.jsonl`, so a
+        // half-written temp never appears as a phantom session.
+        let tmp = path.with_extension(format!("rewrite-{}.tmp", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let header_line = serde_json::to_string(&self.header).map_err(io::Error::other)?;
+        let mut tmp_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        writeln!(tmp_file, "{header_line}")?;
+        let clear = SessionClearEntry {
+            entry_type: "clear".into(),
+            id: Self::random_suffix(8),
+            timestamp: Self::now_iso(),
+        };
+        writeln!(
+            tmp_file,
+            "{}",
+            serde_json::to_string(&clear).map_err(io::Error::other)?
+        )?;
+        for message in messages.iter().skip(1) {
+            let entry = SessionMessageEntry {
+                entry_type: "message",
+                id: &Self::random_suffix(8),
+                timestamp: &Self::now_iso(),
+                message,
             };
-            let mut cache = history_cache().lock().expect("history cache lock");
-            if let Some(entry) = cache.get_mut(path) {
-                entry.0 = id;
-                entry.1.clear();
+            writeln!(
+                tmp_file,
+                "{}",
+                serde_json::to_string(&entry).map_err(io::Error::other)?
+            )?;
+        }
+        tmp_file.flush()?;
+        tmp_file.sync_data()?;
+        drop(tmp_file);
+        fs::rename(&tmp, &path)?;
+        // Best-effort dir fsync so the rename itself survives a crash.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
             }
+        }
+        self.journal = Some(Self::open_append(&path)?);
+        if let Some(id) = file_id(&path) {
+            let kept: Vec<ChatMessage> = messages
+                .iter()
+                .skip(1)
+                .filter(|m| m.role != Role::System)
+                .cloned()
+                .collect();
+            history_cache()
+                .lock()
+                .expect("history cache lock")
+                .insert(&path, (id, kept));
         }
         Ok(())
     }
@@ -1172,9 +1239,12 @@ impl Session {
         // Sync only when
         // durability matters (turn boundaries / effect journal) or when
         // DEX_DURABLE=1 is set for strict recovery testing.
+        // `clear` is rare (compaction rewrites atomically now; `/clear` is
+        // user intent) — sync it so the fold point itself is durable.
         let durable = durable_journal()
             || line.contains("\"type\":\"turn_")
-            || line.contains("\"type\":\"effect_");
+            || line.contains("\"type\":\"effect_")
+            || line.contains("\"type\":\"clear\"");
         if durable {
             file.sync_data()?;
         }
