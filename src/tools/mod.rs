@@ -44,6 +44,11 @@ const READ_MAX_BYTES: usize = 256 * 1024;
 /// in one call, small enough that a fan-out cannot flood the context.
 const READ_FANOUT_MAX_FILES: usize = 10;
 const READ_FANOUT_GLOB_MAX_FILES: usize = 8;
+/// Cap on buffered `find -print0` output before splitting: a huge monorepo
+/// lists megabytes of names and `wait_with_output` already collected them,
+/// so this bounds the parse (not the walk — the 30 s timeout bounds that).
+/// 1 MiB holds ~10k typical paths, far above the truncate window below.
+const FIND_GLOB_STDOUT_CAP: usize = 1024 * 1024;
 const READ_FANOUT_PER_FILE_LINES: usize = 200;
 
 pub(crate) fn set_output_limit(limit: usize) {
@@ -893,10 +898,16 @@ async fn expand_glob_via_find(root: &Path, glob: &str) -> Result<Vec<PathBuf>, T
     }
     // Files only at the source: without this a bare `*` returns directories
     // (and `.` itself) that then eat the pre-filter truncate window and
-    // starve real files.
+    // starve real files. `-print0`: newline-containing filenames would split
+    // on `lines()` below into phantom paths; NUL-separated output keeps them
+    // intact. Note `find` interprets `[ ]` as character classes while the
+    // native fallback (`glob_match_path`) matches them literally, and both
+    // skip symlinked dirs but follow symlinked files the same way — the
+    // native path is only a no-`find` fallback, so the drift is documented,
+    // not papered over.
     cmd.arg("-type")
         .arg("f")
-        .arg("-print")
+        .arg("-print0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -936,14 +947,26 @@ async fn expand_glob_via_find(root: &Path, glob: &str) -> Result<Vec<PathBuf>, T
     }
     // Hoisted root canonicalization (was re-canonicalized per match) and
     // truncate-before-resolve: at most 8 candidates pay the symlink check.
+    // The stdout is capped before splitting (a huge monorepo's `find`
+    // output would otherwise sit whole in memory): the trailing partial
+    // token of a cut is dropped so a truncated name can never resolve to a
+    // wrong file.
     let root = root.canonicalize().map_err(ToolError::Io)?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut rels: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
+    let mut stdout = output.stdout;
+    let cut = stdout.len() > FIND_GLOB_STDOUT_CAP;
+    if cut {
+        stdout.truncate(FIND_GLOB_STDOUT_CAP);
+    }
+    let mut rels: Vec<String> = stdout
+        .split(|&b| b == 0)
+        .filter_map(|chunk| {
+            let s = std::str::from_utf8(chunk).ok()?.trim();
+            (!s.is_empty()).then(|| s.to_owned())
+        })
         .collect();
+    if cut {
+        rels.pop();
+    }
     rels.sort_unstable();
     rels.dedup();
     // `find -type f` already excludes directories, so truncating here can't

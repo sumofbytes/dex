@@ -295,17 +295,25 @@ impl DaemonState {
     }
 
     /// Push one journal event to every attached stream, best effort: the
-    /// journal is the source of truth; the push is a latency nicety and a
-    /// full/closed channel is harmless. One struct clone per stream — no
-    /// per-receiver serialization (the envelope is already typed, never
-    /// re-encoded to JSON here); streams per session are typically one.
+    /// journal is the source of truth; the push is a latency nicety. One
+    /// struct clone per stream — no per-receiver serialization here (each
+    /// SSE body serializes once in its own `poll_next`, unavoidable with
+    /// per-stream backpressure; sessions typically have one stream). A
+    /// closed receiver is pruned so dead streams don't accumulate; a full
+    /// one is dropped (its next poll backfills from the journal).
     pub(crate) fn broadcast_event(&self, session_id: &str, env: &StreamEnvelope) {
         let senders = lock_map(&self.active_streams)
             .get(session_id)
             .cloned()
             .unwrap_or_default();
         for tx in senders {
-            let _ = tx.try_send(env.clone());
+            match tx.try_send(env.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.unregister_stream(session_id, &tx);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            }
         }
     }
 
