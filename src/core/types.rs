@@ -426,6 +426,12 @@ pub(crate) enum Provider {
 }
 
 impl Provider {
+    /// Builtin provider names (no file entry needed): every spelling
+    /// `parse_known` accepts without consulting `known`, including the
+    /// `codex` alias (alias spellings dedupe to one canonical provider
+    /// downstream). Keep in sync with `parse_known` — a test pins this.
+    pub(crate) const BUILTINS: &[&str] = &["opencode", "openai-codex", "codex", "anthropic"];
+
     /// Resolve a provider name: builtins plus configured generic providers
     /// (`known`). Returns None for unknown names — call sites that route
     /// model-id prefixes must keep those as part of the model id. The only
