@@ -1466,17 +1466,22 @@ fn net_client() -> reqwest::Client {
 /// network). Confined to the served model's own endpoint: scheme+host+port
 /// must match its `base_url`, anything else is a loud error — and redirects
 /// are never followed, so a 3xx surfaces as a value instead of escaping the
-/// check. This turn's routing-affinity headers ride along under
-/// Lua-explicit ones, so calls to a Console Go endpoint route like dex's
-/// own. Non-2xx is a value (`{status, headers, body}`), never an error.
-/// Errors never carry headers, bodies, or URL queries (a `?key=` parameter
-/// would leak the key into logs).
+/// check. When the extension's manifest declares `net.providers`, the
+/// allowlist widens to the configured provider endpoints (each fetched with
+/// that provider's own key) — every allowed origin still comes from the
+/// user's own config, never an arbitrary host. This turn's routing-affinity
+/// headers ride along under Lua-explicit ones, so calls to a Console Go
+/// endpoint route like dex's own. Non-2xx is a value
+/// (`{status, headers, body}`), never an error. Errors never carry headers,
+/// bodies, or URL queries (a `?key=` parameter would leak the key into
+/// logs).
 pub(crate) async fn net_fetch(
     url: String,
     method: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
     timeout_ms: u64,
+    allow_configured_providers: bool,
 ) -> Result<String, String> {
     use reqwest::header::{HeaderName, HeaderValue};
     let snapshot = served_model_snapshot()
@@ -1492,12 +1497,21 @@ pub(crate) async fn net_fetch(
             parsed.scheme()
         ));
     }
-    if parsed.scheme() != base.scheme()
-        || parsed.host_str() != base.host_str()
-        || parsed.port_or_known_default() != base.port_or_known_default()
-    {
+    // Origin allowlist: the model's own endpoint always; the configured
+    // provider endpoints when `net.providers` is declared. All of them
+    // come from the user's own deposits — the fetch can reach another
+    // provider, never an arbitrary host.
+    let mut origins = vec![net_origin(&base)];
+    if allow_configured_providers {
+        for entry in crate::llm::config::extension_configured_providers() {
+            if let Ok(endpoint) = reqwest::Url::parse(&entry.base_url) {
+                origins.push(net_origin(&endpoint));
+            }
+        }
+    }
+    if !origins.iter().any(|origin| *origin == net_origin(&parsed)) {
         return Err(format!(
-            "dex.net.fetch: url '{}' is outside the model endpoint '{}'",
+            "dex.net.fetch: url '{}' is outside the model endpoint '{}' and configured provider endpoints",
             net_display_url(&parsed),
             base.host_str().unwrap_or_default()
         ));
@@ -1584,6 +1598,15 @@ fn net_display_url(url: &reqwest::Url) -> String {
         url.scheme(),
         url.host_str().unwrap_or_default(),
         url.path()
+    )
+}
+
+/// Scheme+host+port — the confinement identity for `net_fetch`.
+fn net_origin(url: &reqwest::Url) -> (String, String, Option<u16>) {
+    (
+        url.scheme().to_string(),
+        url.host_str().unwrap_or_default().to_string(),
+        url.port_or_known_default(),
     )
 }
 
@@ -2048,6 +2071,10 @@ pub(crate) mod tests {
                 .lock()
                 .expect("prompt appendix lock")
                 .clear();
+            // `dex.state` is an in-process static too: a previous test's
+            // extension state (e.g. the web example's override_model) must
+            // not leak into the next test's Lua.
+            STATE.lock().expect("state lock").clear();
         }
     }
 
@@ -2417,6 +2444,9 @@ end
 
     #[tokio::test]
     async fn reload_unloads_vanished_extensions_and_their_prompt_appendix() {
+        // The appendix is process-global: serialize against the tests that
+        // `reset_for_tests` (which clears it) like every other asserter.
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let manifest = "manifest_version: 1\nid: fleeting\nversion: 0.1.0\ncapabilities: []\n";
         let root = fixture_ext(
             manifest,
@@ -3305,14 +3335,17 @@ end
         let root = fixture_exts(&[
             (
                 "capped",
-                "manifest_version: 1\nid: capped\nversion: 0.1.0\ncapabilities: [tools, model]\ntools:\n  - name: who\n    description: Who.\n    parameters: {\"type\": \"object\"}\n  - name: key\n    description: Key.\n    parameters: {\"type\": \"object\"}\n",
+                "manifest_version: 1\nid: capped\nversion: 0.1.0\ncapabilities: [tools, model]\ntools:\n  - name: who\n    description: Who.\n    parameters: {\"type\": \"object\"}\n  - name: key\n    description: Key.\n    parameters: {\"type\": \"object\"}\n  - name: xkey\n    description: Xkey.\n    parameters: {\"type\": \"object\"}\n",
                 r#"return function(dex)
   dex.tools.register({ name = "who", execute = function(ctx, args)
     return dex.json.encode(dex.model.current())
   end })
   dex.tools.register({ name = "key", execute = function(ctx, args)
-    return (dex.model.auth()).api_key
-  end })
+      return (dex.model.auth()).api_key
+    end })
+    dex.tools.register({ name = "xkey", execute = function(ctx, args)
+      return (dex.model.auth("anthropic")).api_key
+    end })
 end
 "#,
             ),
@@ -3358,6 +3391,12 @@ end
             key.contains("no API key for provider 'myprov'"),
             "got: {key}"
         );
+        // Cross-provider keys need `net.providers` on top of `model`.
+        let xkey = mgr
+            .call("ext__capped__xkey", &empty, &host)
+            .await
+            .unwrap_err();
+        assert!(xkey.contains("net.providers"), "got: {xkey}");
         let err = mgr
             .call("ext__nocap__peek", &empty, &host)
             .await
@@ -3388,6 +3427,7 @@ end
             Vec::new(),
             None,
             5_000,
+            false,
         )
         .await
         .unwrap_err();
@@ -3402,6 +3442,7 @@ end
             Vec::new(),
             None,
             5_000,
+            false,
         )
         .await
         .unwrap_err();
@@ -3415,6 +3456,7 @@ end
             Vec::new(),
             None,
             5_000,
+            false,
         )
         .await
         .unwrap_err();
@@ -3425,6 +3467,7 @@ end
             Vec::new(),
             None,
             5_000,
+            false,
         )
         .await
         .unwrap_err();
@@ -3435,6 +3478,7 @@ end
             vec![("Host".to_string(), "myprov.example".to_string())],
             None,
             5_000,
+            false,
         )
         .await
         .unwrap_err();
@@ -3448,6 +3492,7 @@ end
             Vec::new(),
             None,
             5_000,
+            false,
         )
         .await
         .unwrap_err();
@@ -3457,6 +3502,86 @@ end
             "got: {keyed}"
         );
         mgr.reset_for_tests().await;
+    }
+
+    /// `net.providers` widens the allowlist to configured provider
+    /// endpoints (each with its own key); lookalike hosts and anything
+    /// unconfigured stay confined even with the capability declared.
+    #[tokio::test]
+    async fn net_fetch_allows_configured_provider_endpoints() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _env = EnvRestore::take(&["DEX_CONFIG", "XDG_CACHE_HOME", "DEX_MODEL", "DEX_PROVIDER"]);
+        let root = std::env::temp_dir().join(format!("dex-ext-netprov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.yaml"),
+            "providers:\n  otherprov:\n    base_url: https://otherprov.example/v1\n    api_key: k-other\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", root.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+        for key in ["DEX_MODEL", "DEX_PROVIDER"] {
+            std::env::remove_var(key);
+        }
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "myprov".to_string(),
+                model: "m-7".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: "https://myprov.example/v1".to_string(),
+            });
+        // Without the capability flag the configured provider stays outside.
+        let denied = net_fetch(
+            "https://otherprov.example/v1/x".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            denied.contains("outside the model endpoint"),
+            "got: {denied}"
+        );
+        // With it, the request proceeds — DNS for the nonexistent domain
+        // fails at the network layer, never at confinement.
+        let allowed = net_fetch(
+            "https://otherprov.example/v1/x".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !allowed.contains("outside the model endpoint"),
+            "got: {allowed}"
+        );
+        // A lookalike host stays outside even with the flag declared.
+        let prefix = net_fetch(
+            "https://otherprov.example.evil.example/x".to_string(),
+            "GET".to_string(),
+            Vec::new(),
+            None,
+            5_000,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            prefix.contains("outside the model endpoint"),
+            "got: {prefix}"
+        );
+        mgr.reset_for_tests().await;
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// `dex.net.fetch` success path against a loopback stub: status +
@@ -3503,6 +3628,7 @@ end
             vec![("X-Test".to_string(), "1".to_string())],
             Some("{}".to_string()),
             5_000,
+            false,
         )
         .await
         .unwrap();
@@ -3553,6 +3679,7 @@ end
             Vec::new(),
             None,
             5_000,
+            false,
         )
         .await
         .unwrap();
@@ -3630,5 +3757,218 @@ end
             );
         }
         global_manager().reset_for_tests().await;
+    }
+
+    /// Model-independent search: an unsupported served model (no search
+    /// API) gets no tools at all, while `/search-model` arms a configured
+    /// override provider — `search` then becomes visible again and serves
+    /// through that provider's endpoint + key over `net.providers`.
+    /// Visibility re-syncs inside the command itself (no `model_select`
+    /// round-trip — that event only fires on provider/model change).
+    #[tokio::test]
+    async fn web_example_falls_back_to_override_model() {
+        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let example =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions");
+        let policy = crate::tools::Policy::trusted();
+        let cancel = crate::agent::state::GlobalCancellation;
+        let host = HostCtx {
+            cancel: &cancel,
+            policy: &policy,
+            filter: None,
+        };
+        let active = |mgr: &std::sync::Arc<ExtensionManager>| {
+            let mgr = std::sync::Arc::clone(mgr);
+            async move {
+                let mut names: Vec<String> = mgr
+                    .active_cached()
+                    .await
+                    .iter()
+                    .map(|d| d.function.name.clone())
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        // Hermetic XDG paths from the start: dex.state writes a JSON file
+        // under XDG_DATA_HOME, and discovery must not find an installed
+        // copy of `web` (ensure_loaded re-boots from the installed dirs).
+        let _env = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+        ]);
+        let root = std::env::temp_dir().join(format!("dex-ext-webfall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+        std::env::set_var("XDG_DATA_HOME", root.join("data"));
+        std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+        // Loopback must not ride a proxy, wherever the suite runs.
+        let _proxy = EnvRestore::take(&["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]);
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        for key in ["DEX_MODEL", "DEX_PROVIDER"] {
+            std::env::remove_var(key);
+        }
+
+        // 1. A codex-served model rides the OpenAI wire but serves no
+        //    search tool: the extension must show nothing, not a tool
+        //    that always errors.
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        mgr.refresh_with(std::slice::from_ref(&example)).await;
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "openai-codex".to_string(),
+                model: "m".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: "https://chatgpt.example/backend".to_string(),
+            });
+        mgr.fire_event(
+            "model_select",
+            serde_json::json!({"model": "openai-codex/m", "previous": null}),
+            &host,
+        )
+        .await;
+        assert!(
+            active(&mgr).await.is_empty(),
+            "codex must not see search/fetch, got: {:?}",
+            active(&mgr).await
+        );
+        global_manager().reset_for_tests().await;
+
+        // 2. The served model has no search API, but another configured
+        //    provider does. /search-model arms it; the search falls back
+        //    to that provider's endpoint + key (anthropic wire stub).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::write(
+            root.join("config.yaml"),
+            format!(
+                "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n"
+            ),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", root.join("config.yaml"));
+        let body = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "fallback search works",
+                "citations": [{"url": "https://example.test/a", "document_title": "A"}]
+            }]
+        });
+        let payload = body.to_string();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = seen_tx.send(buf);
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        mgr.refresh_with(std::slice::from_ref(&example)).await;
+        *LAST_MODEL.lock().expect("served model lock") =
+            Some(crate::llm::config::ExtensionModelSnapshot {
+                provider: "glmprov".to_string(),
+                model: "glm-5".to_string(),
+                api: "openai-completions".to_string(),
+                base_url: "https://glm.example/v1".to_string(),
+            });
+        // Arm the override through the user-facing command.
+        let out = crate::extensions::run_command_global(
+            "web",
+            "search-model",
+            "anthropic/claude-fallback",
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains("override set to anthropic/claude-fallback"),
+            "got: {out}"
+        );
+        // No `model_select` fire: the command re-syncs visibility itself
+        // (that event only fires on provider/model change).
+        assert_eq!(
+            active(&mgr).await,
+            vec!["ext__web__search".to_string()],
+            "the override must make search visible again"
+        );
+        let result = mgr
+            .call(
+                "ext__web__search",
+                &serde_json::json!({"query": "hi"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                &host,
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("fallback search works"), "got: {result}");
+        assert!(result.contains("example.test/a"), "got: {result}");
+        // The request went to the override provider's endpoint with the
+        // override model id and its key — the whole point of the fallback.
+        let seen = String::from_utf8_lossy(&seen_rx.await.unwrap()).to_lowercase();
+        assert!(seen.contains("claude-fallback"), "got: {seen}");
+        assert!(seen.contains("x-api-key: k-fallback"), "got: {seen}");
+        let _ = server.await;
+
+        // 3. A gemini override serves both tools, even when the current
+        //    model serves neither. Then clear it (no state leaks). The
+        //    engines stay loaded here — `ensure_loaded` would otherwise
+        //    boot `web` from the installed dirs, not the example.
+        //    (The override must be a configured provider — set-time
+        //    validation rejects keyless ones, so declare gemini here.)
+        std::fs::write(
+              root.join("config.yaml"),
+              format!(
+                  "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n  gemini:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-gemini\n"
+              ),
+          )
+          .unwrap();
+        let out =
+            crate::extensions::run_command_global("web", "search-model", "gemini/gm-1", &cancel)
+                .await
+                .unwrap();
+        assert!(out.contains("family gemini"), "got: {out}");
+        assert_eq!(
+            active(&mgr).await,
+            vec![
+                "ext__web__fetch".to_string(),
+                "ext__web__search".to_string()
+            ],
+            "a gemini override serves both tools"
+        );
+        let off = crate::extensions::run_command_global("web", "search-model", "off", &cancel)
+            .await
+            .unwrap();
+        assert!(off.contains("cleared"), "got: {off}");
+        assert!(
+            active(&mgr).await.is_empty(),
+            "cleared override hides the tools again, got: {:?}",
+            active(&mgr).await
+        );
+        global_manager().reset_for_tests().await;
+        std::fs::remove_dir_all(&root).ok();
     }
 }
