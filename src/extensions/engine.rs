@@ -582,20 +582,40 @@ fn run_load_inner(
     })
 }
 
-/// Build the `dex.*` table once per worker. Closures capture the worker-side
-/// registration state plus (for upcalls) nothing task-specific: host routing
-/// happens on the task side of the channel.
+/// Build the `dex.*` table once per worker: one sub-table per namespace, each
+/// assembled by its own builder so no single function registers the whole API.
+/// Closures capture the worker-side registration state plus (for upcalls)
+/// nothing task-specific: host routing happens on the task side of the channel.
 fn build_dex_table(
     lua: &Lua,
     manifest: &Manifest,
     regs: &Rc<RefCell<WorkerRegistrations>>,
 ) -> Table {
-    let ext_id = manifest.id.clone();
     let dex = lua.create_table().expect("dex table");
+    dex.set("tools", tools_table(lua, manifest, regs))
+        .expect("dex.tools");
+    dex.set("events", events_table(lua, manifest, regs))
+        .expect("dex.events");
+    dex.set("log", log_table(lua, manifest)).expect("dex.log");
+    dex.set("workspace", workspace_table(lua, manifest))
+        .expect("dex.workspace");
+    dex.set("commands", commands_table(lua, manifest, regs))
+        .expect("dex.commands");
+    dex.set("state", state_table(lua, manifest))
+        .expect("dex.state");
+    dex.set("prompt", prompt_table(lua, manifest))
+        .expect("dex.prompt");
+    dex.set("model", model_table(lua, manifest))
+        .expect("dex.model");
+    dex.set("net", net_table(lua, manifest)).expect("dex.net");
+    dex.set("json", json_table(lua)).expect("dex.json");
+    dex
+}
+
+/// `dex.tools.*` — registration, host-mediated calls, shadow rails.
+fn tools_table(lua: &Lua, manifest: &Manifest, regs: &Rc<RefCell<WorkerRegistrations>>) -> Table {
+    let ext_id = manifest.id.clone();
     let tools = lua.create_table().expect("dex.tools table");
-    let events = lua.create_table().expect("dex.events table");
-    let log = lua.create_table().expect("dex.log table");
-    let workspace = lua.create_table().expect("dex.workspace table");
 
     // dex.tools.register({ name, execute, override? })
     {
@@ -780,6 +800,14 @@ fn build_dex_table(
             .expect("tools.set_active slot");
     }
 
+    tools
+}
+
+/// `dex.events.on(event, fn)` — subscribe to a known event.
+fn events_table(lua: &Lua, manifest: &Manifest, regs: &Rc<RefCell<WorkerRegistrations>>) -> Table {
+    let ext_id = manifest.id.clone();
+    let events = lua.create_table().expect("dex.events table");
+
     // dex.events.on(event, fn)
     {
         let regs = Rc::clone(regs);
@@ -805,6 +833,14 @@ fn build_dex_table(
             .expect("events.on slot");
     }
 
+    events
+}
+
+/// `dex.log.*` — daemon log + journal lines, prefixed `lua[<ext>]`.
+fn log_table(lua: &Lua, manifest: &Manifest) -> Table {
+    let ext_id = manifest.id.clone();
+    let log = lua.create_table().expect("dex.log table");
+
     // dex.log.*: daemon log + journal, prefixed lua[<ext>].
     for level in ["debug", "info", "warn", "error"] {
         let ext_id = ext_id.clone();
@@ -824,8 +860,15 @@ fn build_dex_table(
         .expect("log slot");
     }
 
-    // dex.workspace.read(path) / dex.workspace.exists(path): confined,
-    // capability-gated reads (§5.2).
+    log
+}
+
+/// `dex.workspace.read(path)` / `dex.workspace.exists(path)`: confined,
+/// capability-gated reads (§5.2).
+fn workspace_table(lua: &Lua, manifest: &Manifest) -> Table {
+    let ext_id = manifest.id.clone();
+    let workspace = lua.create_table().expect("dex.workspace table");
+
     {
         let ext_id = ext_id.clone();
         let manifest = manifest.clone();
@@ -878,8 +921,17 @@ fn build_dex_table(
             .expect("workspace.exists slot");
     }
 
-    // dex.commands.register({ name, description, execute }): a slash
-    // command. Name must be a bare word (no spaces — it is the slash word).
+    workspace
+}
+
+/// `dex.commands.register({ name, description, execute })`: a slash command.
+/// The name must be a bare word (no spaces — it is the slash word).
+fn commands_table(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Table {
+    let ext_id = manifest.id.clone();
     let commands = lua.create_table().expect("dex.commands table");
     {
         let regs = Rc::clone(regs);
@@ -915,10 +967,13 @@ fn build_dex_table(
             )
             .expect("commands.register slot");
     }
-    dex.set("commands", commands).expect("dex.commands");
+    commands
+}
 
-    // dex.state.get/set: per-extension JSON key/value store (plan §7 P3;
-    // minimal persistence: one JSON file per extension, write-through).
+/// `dex.state.get/set`: per-extension JSON key/value store (plan §7 P3;
+/// minimal persistence: one JSON file per extension, write-through).
+fn state_table(lua: &Lua, manifest: &Manifest) -> Table {
+    let ext_id = manifest.id.clone();
     let state = lua.create_table().expect("dex.state table");
     {
         let ext_id = ext_id.clone();
@@ -955,11 +1010,14 @@ fn build_dex_table(
             )
             .expect("state.set slot");
     }
-    dex.set("state", state).expect("dex.state");
+    state
+}
 
-    // dex.prompt: read-only system-prompt influence (plan §7). `append`
-    // contributes load-time text to the base system prompt; `get` reads the
-    // composed prompt (no skills — those are session-scoped).
+/// `dex.prompt`: read-only system-prompt influence (plan §7). `append`
+/// contributes load-time text to the base system prompt; `get` reads the
+/// composed prompt (no skills — those are session-scoped).
+fn prompt_table(lua: &Lua, manifest: &Manifest) -> Table {
+    let ext_id = manifest.id.clone();
     let prompt = lua.create_table().expect("dex.prompt table");
     {
         let ext_id = ext_id.clone();
@@ -981,14 +1039,17 @@ fn build_dex_table(
                 .expect("prompt.get fn"),
         )
         .expect("prompt.get slot");
-    dex.set("prompt", prompt).expect("dex.prompt");
+    prompt
+}
 
-    // dex.model.current()/auth(): the current model + its credentials, so a
-    // model-aware extension (provider-native search, …) can reuse the
-    // endpoint and key instead of configuring its own. Reads file+env on
-    // the worker (sync, no secrets cross into logs); the daemon records
-    // the served snapshot per turn, which wins when set. Gated on the
-    // `model` capability like `workspace.read`.
+/// `dex.model.current()/auth()`: the current model + its credentials, so a
+/// model-aware extension (provider-native search, …) can reuse the
+/// endpoint and key instead of configuring its own. Reads file+env on
+/// the worker (sync, no secrets cross into logs); the daemon records
+/// the served snapshot per turn, which wins when set. Gated on the
+/// `model` capability like `workspace.read`.
+fn model_table(lua: &Lua, manifest: &Manifest) -> Table {
+    let ext_id = manifest.id.clone();
     let model = lua.create_table().expect("dex.model table");
     {
         let ext_id = ext_id.clone();
@@ -1069,12 +1130,15 @@ fn build_dex_table(
             )
             .expect("model.auth slot");
     }
-    dex.set("model", model).expect("dex.model");
+    model
+}
 
-    // dex.net.fetch(spec): one HTTP request confined to the model's own
-    // endpoint (scheme+host+port must match `dex.model.auth().base_url`).
-    // Non-2xx is a value (`{status, headers, body}`), not a Lua error.
-    // Gated on the `net` capability (which itself requires `model`).
+/// `dex.net.fetch(spec)`: one HTTP request confined to the model's own
+/// endpoint (scheme+host+port must match `dex.model.auth().base_url`).
+/// Non-2xx is a value (`{status, headers, body}`), not a Lua error. Gated
+/// on the `net` capability (which itself requires `model`).
+fn net_table(lua: &Lua, manifest: &Manifest) -> Table {
+    let ext_id = manifest.id.clone();
     let net = lua.create_table().expect("dex.net table");
     {
         let ext_id = ext_id.clone();
@@ -1162,10 +1226,12 @@ fn build_dex_table(
         )
         .expect("net.fetch slot");
     }
-    dex.set("net", net).expect("dex.net");
+    net
+}
 
-    // dex.json.encode/decode: table<->JSON string for request bodies and
-    // response parsing. Pure data transform, no capability gate.
+/// `dex.json.encode/decode`: table<->JSON string for request bodies and
+/// response parsing. Pure data transform, no capability gate.
+fn json_table(lua: &Lua) -> Table {
     let json = lua.create_table().expect("dex.json table");
     json.set(
         "encode",
@@ -1187,12 +1253,7 @@ fn build_dex_table(
         .expect("json.decode fn"),
     )
     .expect("json.decode slot");
-    dex.set("json", json).expect("dex.json");
-    dex.set("tools", tools).expect("dex.tools");
-    dex.set("events", events).expect("dex.events");
-    dex.set("log", log).expect("dex.log");
-    dex.set("workspace", workspace).expect("dex.workspace");
-    dex
+    json
 }
 
 /// Send a host upcall to the awaiting task and block the worker for the

@@ -24,8 +24,8 @@ use crate::llm::config::{agent_wake_enabled, LlmConfig};
 use crate::llm::prompt::system_prompt_with_override_for;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
-    FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, RecallRequest, SkillInfo,
-    SteerRequest, StreamEnvelope, StreamEvent,
+    ExtensionRunRequest, FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse,
+    RecallRequest, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
 };
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
@@ -107,6 +107,7 @@ pub(crate) fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/mcp/{server}/reconnect", post(mcp_reconnect))
         .route("/api/extensions", get(get_extensions))
         .route("/api/extensions/reload", post(extensions_reload))
+        .route("/api/extensions/run", post(extensions_run))
         .route("/api/skills", get(list_skills))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
@@ -311,6 +312,30 @@ async fn get_extensions() -> Json<serde_json::Value> {
 async fn extensions_reload() -> Json<serde_json::Value> {
     crate::extensions::global_manager().reload().await;
     get_extensions().await
+}
+
+/// Run one registered extension slash command on the daemon process — the
+/// remote TUI's `/<ext-cmd>` lands here, never on the client's local copy
+/// (which owns neither the workspace nor the dispatching manager). Unknown
+/// names are 404 so the caller falls back to "unknown command"; handler
+/// failures are 200 with an `error` field so the Lua message survives.
+async fn extensions_run(
+    Json(req): Json<ExtensionRunRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let (ext_id, arg) = crate::extensions::command_list()
+        .into_iter()
+        .find(|(_, n, _)| *n == name)
+        .map(|(ext, _, _)| (ext, req.arg.clone()))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let cancel = crate::agent::state::GlobalCancellation;
+    match crate::extensions::run_command_global(&ext_id, &name, &arg, &cancel).await {
+        Ok(output) => Ok(Json(json!({ "extension": ext_id, "output": output }))),
+        Err(error) => Ok(Json(json!({ "extension": ext_id, "error": error }))),
+    }
 }
 
 async fn list_skills() -> Json<serde_json::Value> {
@@ -917,6 +942,43 @@ async fn run_agent_turn(
     let _ = tx.send(env).await;
 }
 
+/// Remote `/thinking` override: `None` keeps the daemon default, `Some("")`
+/// is an explicit clear (unset), otherwise the level. This is what makes a
+/// remote choice stick — without it the daemon would use its own file/env
+/// and silently ignore the client's display. Pure so the override is
+/// unit-testable without a turn.
+fn apply_thinking_override(config: &mut LlmConfig, effort: Option<&str>) {
+    match effort {
+        None => {}
+        Some("") => config.thinking_effort = None,
+        Some(e) => config.thinking_effort = Some(e.to_string()),
+    }
+}
+
+/// Deduped write-through of one session state key: skip when `cached` still
+/// holds this value and the file is untouched since (the mtime guard — the
+/// co-located TUI can write the same file directly, so an entry-only
+/// comparison could skip a needed restore). Skipping also stops duplicate rows
+/// accumulating for every `load_session_state` scan to walk. Returns true when
+/// a write happened, so the caller can re-stat and refresh its cached slot
+/// once any follow-up writes have landed.
+fn persist_if_stale<V: PartialEq>(
+    session: &mut Session,
+    path: &std::path::Path,
+    cached: Option<(V, std::time::SystemTime)>,
+    key: &str,
+    value: &str,
+    new: &V,
+) -> Result<bool, String> {
+    if persisted_current(&cached, new, path) {
+        return Ok(false);
+    }
+    session
+        .set_state(key, value)
+        .map_err(|e| format!("failed to persist {key}: {e}"))?;
+    Ok(true)
+}
+
 async fn run_turn_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
@@ -953,17 +1015,18 @@ async fn run_turn_inner(
         };
         // §28: the client re-sends its plan on later turns; skip the append
         // when the daemon already persisted exactly this value and nobody
-        // else touched the file since (the mtime guard — the co-located TUI
-        // can write the same file directly, so an entry-only comparison
-        // could skip a needed restore). Skipping also stops duplicate plan
-        // rows from accumulating for every `load_session_state` scan to walk.
+        // else touched the file since.
         let persisted = lock_map(&state.sessions)
             .get(session_id)
             .and_then(|e| e.plan_persisted.clone());
-        if !persisted_current(&persisted, &canonical, &entry.path) {
-            session
-                .set_state("plan", &canonical)
-                .map_err(|e| format!("failed to persist plan: {e}"))?;
+        if persist_if_stale(
+            &mut session,
+            &entry.path,
+            persisted,
+            "plan",
+            &canonical,
+            &canonical,
+        )? {
             let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
             if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
                 slot.plan_persisted = Some((canonical, at));
@@ -1000,6 +1063,7 @@ async fn run_turn_inner(
     )
     .await
     .map_err(|e| format!("failed to build config: {e}"))?;
+    apply_thinking_override(&mut config, req.thinking_effort.as_deref());
     // Console Go routing requires `x-opencode-session`.
     // Auto-fill from the dex session id; explicit per-request headers
     // below still win on collision.
@@ -1024,10 +1088,7 @@ async fn run_turn_inner(
                 .get(session_id)
                 .and_then(|e| e.model_persisted.clone());
             let value = (raw.clone(), provider_name.clone());
-            if !persisted_current(&persisted, &value, &entry.path) {
-                session
-                    .set_state("model", raw)
-                    .map_err(|e| format!("failed to persist model: {e}"))?;
+            if persist_if_stale(&mut session, &entry.path, persisted, "model", raw, &value)? {
                 session
                     .set_state("provider", &provider_name)
                     .map_err(|e| format!("failed to persist provider: {e}"))?;
@@ -1708,6 +1769,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 headers: None,
                 plan: None,
                 system_prompt: None,
+                thinking_effort: None,
             };
             // The wake's stream has no attached client; the journal is the
             // delivery path and the terminal event's send is best effort.
@@ -2549,6 +2611,7 @@ mod handler_tests {
             headers: None,
             plan: None,
             system_prompt: None,
+            thinking_effort: None,
         };
         // unknown session -> 404
         let r = chat(
@@ -2662,6 +2725,61 @@ mod handler_tests {
         crate::extensions::global_manager().reset_for_tests().await;
         std::fs::remove_dir_all(&root).ok();
         drop(saved);
+    }
+
+    #[test]
+    fn thinking_override_sets_clears_and_keeps_default() {
+        // Pure override applied per turn: None keeps, "" clears, else sets.
+        let mut config = LlmConfig {
+            provider: crate::core::types::Provider::OpenCode,
+            api_key: String::new(),
+            base_url: String::new(),
+            model: "m".into(),
+            available_models: Vec::new(),
+            endpoints: Default::default(),
+            api: crate::core::types::ApiProtocol::Responses,
+            account_id: None,
+            thinking_effort: Some("low".into()),
+            context_window: 128_000,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+            permission: crate::core::types::PermissionMode::Trusted,
+            verify_command: None,
+            extra_headers: Default::default(),
+            global_headers: Default::default(),
+            provider_entries: Default::default(),
+            provider_headers: Default::default(),
+            api_pinned: false,
+            client: reqwest::Client::new(),
+        };
+        apply_thinking_override(&mut config, None);
+        assert_eq!(config.thinking_effort.as_deref(), Some("low"));
+        apply_thinking_override(&mut config, Some(""));
+        assert!(config.thinking_effort.is_none());
+        apply_thinking_override(&mut config, Some("high"));
+        assert_eq!(config.thinking_effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock guards the manager reset below
+    async fn extensions_run_rejects_unknown_and_empty() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Empty name is a bad request, unknown names are 404 so the remote
+        // TUI can fall back to "unknown command".
+        let r = extensions_run(Json(ExtensionRunRequest {
+            name: String::new(),
+            arg: String::new(),
+        }))
+        .await;
+        assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+        let r = extensions_run(Json(ExtensionRunRequest {
+            name: "no-such-ext-command-xyz".into(),
+            arg: String::new(),
+        }))
+        .await;
+        assert!(matches!(r, Err(StatusCode::NOT_FOUND)));
     }
 
     #[tokio::test]
@@ -3832,6 +3950,7 @@ mod permission_gate_tests {
             headers: None,
             plan: plan.map(String::from),
             system_prompt: None,
+            thinking_effort: None,
         };
 
         // 1. Client escalating to trusted against a read-only daemon: rejected.
