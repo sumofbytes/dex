@@ -209,7 +209,18 @@ pub(crate) struct DaemonState {
     /// §10b): every `GET /events` refreshes it. A wake fires only when a
     /// client is plausibly listening.
     pub last_client_seen: Mutex<HashMap<String, Instant>>,
+    /// Session ids proven absent from disk (perf doc §27): a typo'd id costs
+    /// one full `list_all` walk, then hits this instead of re-walking per
+    /// request. Populated only after the startup rebuild completes (during
+    /// the rebuild window a miss may simply be unscanned-yet, so the disk
+    /// fallback always runs); cleared on explicit registration. Entries
+    /// expire after `NEGATIVE_TTL` so a session created out-of-band (CLI/TUI
+    /// direct file) after a miss becomes visible without a restart.
+    pub missing_sessions: Mutex<HashMap<String, Instant>>,
 }
+
+/// Negative-cache TTL for absent session ids (see `missing_sessions`).
+pub(crate) const NEGATIVE_TTL: Duration = Duration::from_secs(60);
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
 /// turn instead of running it again.
@@ -220,6 +231,27 @@ pub(crate) struct SessionEntry {
     pub path: PathBuf,
     pub name: Option<String>,
     pub cwd: String,
+    /// Model the session's last turn used, stashed at turn start (perf doc
+    /// §30): the idle-wake path reuses it instead of re-scanning the
+    /// session file for the stored `model` state. `None` until the first
+    /// turn (registry rebuilds only read headers) — the wake falls back to
+    /// the file scan then.
+    pub model: Option<String>,
+    /// Provider + base URL the stashed model resolved to: a bare model id
+    /// alone re-resolves on the default provider/endpoint, so the wake
+    /// would run on the wrong endpoint after a `/provider` switch or a
+    /// custom `--base-url` turn. `None` until the first turn, like `model`.
+    pub wake_provider: Option<String>,
+    pub wake_base_url: Option<String>,
+    /// Last `plan` JSON this daemon persisted + the session file's mtime
+    /// right after the write (perf doc §28): a re-sent identical plan
+    /// skips the append when the mtime proves nobody else touched the file
+    /// since (the co-located TUI can write the same file directly, so an
+    /// entry-only comparison could skip a needed restore).
+    pub plan_persisted: Option<(String, std::time::SystemTime)>,
+    /// Same for the `model`/`provider` pair: raw client model string +
+    /// resolved provider name + file mtime after the write.
+    pub model_persisted: Option<((String, String), std::time::SystemTime)>,
 }
 
 impl DaemonState {
@@ -240,6 +272,7 @@ impl DaemonState {
             active_streams: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
             last_client_seen: Mutex::new(HashMap::new()),
+            missing_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -262,15 +295,25 @@ impl DaemonState {
     }
 
     /// Push one journal event to every attached stream, best effort: the
-    /// journal is the source of truth; the push is a latency nicety and a
-    /// full/closed channel is harmless.
+    /// journal is the source of truth; the push is a latency nicety. One
+    /// struct clone per stream — no per-receiver serialization here (each
+    /// SSE body serializes once in its own `poll_next`, unavoidable with
+    /// per-stream backpressure; sessions typically have one stream). A
+    /// closed receiver is pruned so dead streams don't accumulate; a full
+    /// one is dropped (its next poll backfills from the journal).
     pub(crate) fn broadcast_event(&self, session_id: &str, env: &StreamEnvelope) {
         let senders = lock_map(&self.active_streams)
             .get(session_id)
             .cloned()
             .unwrap_or_default();
         for tx in senders {
-            let _ = tx.try_send(env.clone());
+            match tx.try_send(env.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.unregister_stream(session_id, &tx);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            }
         }
     }
 
@@ -528,7 +571,19 @@ impl DaemonState {
             if is_interrupted {
                 interrupted.push((id.clone(), path.clone()));
             }
-            entries.push((id, SessionEntry { path, name, cwd }));
+            entries.push((
+                id,
+                SessionEntry {
+                    path,
+                    name,
+                    cwd,
+                    model: None,
+                    wake_provider: None,
+                    wake_base_url: None,
+                    plan_persisted: None,
+                    model_persisted: None,
+                },
+            ));
         }
         for (id, path) in &interrupted {
             let live = lock_map(&self.active_turns).contains(id);
@@ -564,7 +619,7 @@ pub(crate) fn journal_event(state: &DaemonState, session_id: &str, seq: u64, eve
     let Some(path) = path else {
         return;
     };
-    if let Ok(mut journal) = crate::session::Session::from_path(&path) {
+    if let Ok(mut journal) = crate::session::Session::from_path_for_events(&path) {
         let _ = journal.append_event(seq, &serde_json::to_string(event).unwrap_or_default());
     }
 }
@@ -587,7 +642,7 @@ fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, event: AgentE
     let Some(path) = path else {
         return;
     };
-    let Ok(mut journal) = crate::session::Session::from_path(&path) else {
+    let Ok(mut journal) = crate::session::Session::from_path_for_events(&path) else {
         return;
     };
     let (typed, system_line) = match &event {
@@ -1115,6 +1170,11 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/dex-live-wins-marker"),
             name: None,
             cwd: "/tmp".into(),
+            model: None,
+            wake_provider: None,
+            wake_base_url: None,
+            plan_persisted: None,
+            model_persisted: None,
         };
         state.sessions.lock().unwrap().insert(id.clone(), live);
         state.rebuild_async().await;

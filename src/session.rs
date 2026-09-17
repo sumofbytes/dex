@@ -1,10 +1,13 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::types::{ChatMessage, Role};
@@ -151,7 +154,6 @@ struct SessionStateEntry {
 pub(crate) struct Session {
     header: SessionHeader,
     path: Option<PathBuf>,
-    counter: u64,
     /// Reused append handle for the main JSONL, opened lazily on first write;
     /// one write syscall per line, same as the old open-append-write-close —
     /// the cache only removes the per-append open/close.
@@ -210,6 +212,394 @@ fn for_each_line(path: &Path, mut f: impl FnMut(&str)) -> io::Result<()> {
         }
         f(&line);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Append-only journal caches (perf doc §§11–12)
+// ---------------------------------------------------------------------------
+//
+// Production writers only ever append — `clear_messages` writes a `clear`
+// marker the loader folds, and no delete/reset endpoint exists — so a
+// snapshot stays exact as long as every mutation flows through
+// `append_line` (session journal) / `append_event` (events journal) below,
+// which refresh the snapshot's identity after each write. The one exception
+// is `rewrite_messages` (post-compaction): it replaces the file atomically
+// (temp + rename) and publishes the fresh snapshot fused with its identity
+// under one lock. Identity is `(mtime, len)`: any out-of-band rewrite (a
+// test's `fs::write`, a hand edit) misses and re-parses from disk, and a
+// missing file evicts. Paths are unique per session and entries are
+// FIFO-capped, so a long-lived daemon can't accumulate dead sessions.
+
+/// `(mtime, len)` identity for a journal snapshot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    mtime: SystemTime,
+    len: u64,
+}
+
+fn file_id(path: &Path) -> Option<FileId> {
+    fs::metadata(path).ok().and_then(|m| {
+        m.modified().ok().map(|mtime| FileId {
+            mtime,
+            len: m.len(),
+        })
+    })
+}
+
+/// FIFO-capped process-global cache keyed by journal path.
+struct PathCache<V> {
+    map: HashMap<PathBuf, V>,
+    order: VecDeque<PathBuf>,
+}
+
+impl<V> PathCache<V> {
+    const CAP: usize = 32;
+
+    fn insert(&mut self, path: &Path, value: V) {
+        if !self.map.contains_key(path) {
+            self.order.push_back(path.to_path_buf());
+            while self.order.len() > Self::CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+            // Eviction above skips keys removed out of band; compact the
+            // queue if it still overflows with stale keys.
+            if self.order.len() > Self::CAP * 2 {
+                self.order.retain(|p| self.map.contains_key(p));
+            }
+        }
+        self.map.insert(path.to_path_buf(), value);
+    }
+
+    fn get(&self, path: &Path) -> Option<&V> {
+        self.map.get(path)
+    }
+
+    fn get_mut(&mut self, path: &Path) -> Option<&mut V> {
+        self.map.get_mut(path)
+    }
+
+    fn evict(&mut self, path: &Path) {
+        self.map.remove(path);
+    }
+}
+
+/// Durable-journal mode, read per call: `env::var` on the journal hot path
+/// is a few microseconds per appended line (lines are per-message, not per
+/// frame), while a `OnceLock` would cache the first read forever and poison
+/// runtime flips plus every recovery test after the first append.
+fn durable_journal() -> bool {
+    env::var("DEX_DURABLE").as_deref() == Ok("1")
+}
+
+/// Parsed session history by journal path (perf doc §11): the per-turn
+/// daemon rebuild and the TUI's transcript loads share it within a process.
+/// Stored PRE-repair — every load (hit or miss) runs
+/// `repair_dangling_tool_calls` on its own copy, exactly like a fresh parse.
+type HistorySnapshot = (FileId, Vec<ChatMessage>);
+
+fn history_cache() -> &'static Mutex<PathCache<HistorySnapshot>> {
+    static CACHE: OnceLock<Mutex<PathCache<HistorySnapshot>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(PathCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
+/// Snapshot lookup: cloned vec on identity match; a missing file evicts.
+/// Identity is `(mtime, len)`: sufficient on filesystems with
+/// nanosecond mtime granularity (ext4/APFS/NTFS — any same-length
+/// rewrite changes mtime and misses). Coarse-granularity filesystems
+/// (1 s, e.g. FAT) can false-hit on a same-length rewrite within one
+/// tick — accepted: sessions live on local disks, and production
+/// writers only append (len always grows).
+fn history_cache_get(path: &Path) -> Option<Vec<ChatMessage>> {
+    let Some(id) = file_id(path) else {
+        history_cache()
+            .lock()
+            .expect("history cache lock")
+            .evict(path);
+        return None;
+    };
+    let cache = history_cache().lock().expect("history cache lock");
+    match cache.get(path) {
+        Some((cached_id, messages)) if *cached_id == id => Some(messages.clone()),
+        _ => None,
+    }
+}
+
+fn history_cache_put(path: &Path, id: FileId, messages: Vec<ChatMessage>) {
+    history_cache()
+        .lock()
+        .expect("history cache lock")
+        .insert(path, (id, messages));
+}
+
+/// Refresh the history snapshot's identity after one of our own appends.
+/// The message vector itself is extended by `append_message` /
+/// `clear_messages` — the only message-shape writers — while every other
+/// entry type (turn markers, effects, state) only moves the identity.
+///
+/// `appended` is the byte count this handle just wrote. The bump is only
+/// valid when the file grew by exactly that much since the cached parse:
+/// a second process (TUI + spawned daemon, or a hand edit) appending a
+/// message row in between would otherwise make the entry claim a length it
+/// never parsed, serving a history silently missing those rows — and every
+/// later marker append would keep re-bumping it. Foreign growth evicts.
+fn history_cache_touch(path: &Path, appended: u64) {
+    let Some(id) = file_id(path) else { return };
+    let mut cache = history_cache().lock().expect("history cache lock");
+    let foreign = match cache.get_mut(path) {
+        Some(entry) if entry.0.len.saturating_add(appended) == id.len => {
+            entry.0 = id;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if foreign {
+        cache.evict(path);
+    }
+}
+
+/// Steady-state events cursor (perf doc §12): per events-journal path, the
+/// exact parsed-end identity, highest seq served, and byte-offset
+/// checkpoints (first seq per 64 KiB chunk) so a poll seeks past
+/// already-served rows. The idle 2 s poll with no new rows is then one
+/// `stat` and no file open.
+struct EventsCursor {
+    id: FileId,
+    max_seq: Option<u64>,
+    checkpoints: Vec<(u64, u64)>,
+    /// The scan that published this entry reached EOF. A page-limited scan
+    /// (§1) stops early, so the fast path must not treat its `max_seq` as
+    /// the file tip — the next poll re-scans from its checkpoint instead.
+    drained: bool,
+}
+
+/// Byte spacing of events checkpoints: a poll seeks to the newest chunk at
+/// or before its cursor and parses only the tail.
+const EVENTS_CHECKPOINT_BYTES: u64 = 64 * 1024;
+/// Checkpoint count cap per journal (perf-only: ancient cursors scan more).
+const EVENTS_CHECKPOINT_CAP: usize = 4096;
+/// Rows served per events-journal page (§1): the startup replay loops pages
+/// with a paint between instead of slurping a giant journal in one HTTP
+/// round trip, and the idle poller self-paces on reconnect backlogs.
+/// Absent `?limit=` means this (old clients keep working, now bounded).
+pub(crate) const EVENTS_PAGE_LIMIT: usize = 1000;
+
+fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
+    static CACHE: OnceLock<Mutex<PathCache<EventsCursor>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(PathCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
+/// Refresh the events cursor after one of our own appends (perf doc §12):
+/// the common case keeps a poll from ever re-scanning. `written` is the byte
+/// count this handle just appended; a foreign writer (another handle/task)
+/// interleaving a row between our write and this stat would make the recorded
+/// tip and checkpoints describe bytes we didn't write — a tip below the
+/// foreign row would then starve a poller parked at that row. Detect it by
+/// the length delta and drop the cursor rather than publish it.
+fn events_cache_touched(events_path: &Path, seq: u64, written: u64) {
+    let Some(id) = file_id(events_path) else {
+        return;
+    };
+    let mut cache = events_cache().lock().expect("events cache lock");
+    let foreign = match cache.get_mut(events_path) {
+        Some(entry) if entry.id.len.saturating_add(written) == id.len => {
+            let prev_len = entry.id.len;
+            entry.id = id;
+            entry.max_seq = Some(entry.max_seq.map_or(seq, |m| m.max(seq)));
+            let base = entry.checkpoints.last().map(|&(_, off)| off).unwrap_or(0);
+            if id.len.saturating_sub(base) >= EVENTS_CHECKPOINT_BYTES {
+                entry.checkpoints.push((seq, prev_len));
+                if entry.checkpoints.len() > EVENTS_CHECKPOINT_CAP {
+                    let excess = entry.checkpoints.len() - EVENTS_CHECKPOINT_CAP;
+                    entry.checkpoints.drain(..excess);
+                }
+            }
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if foreign {
+        cache.evict(events_path);
+    }
+}
+
+/// One events-journal row: `seq` drives the replay cursor, `payload`
+/// borrows the raw JSON — no parse → re-serialize round trip on the hot
+/// poll path (perf doc §12).
+#[derive(Deserialize)]
+struct EventRow<'a> {
+    seq: u64,
+    #[serde(borrow)]
+    payload: &'a RawValue,
+}
+
+/// Scan the events journal from the newest checkpoint at or before `since`,
+/// returning `(rows with seq >= since, highest seq in the file)`. When
+/// `collect` is false payloads are skipped (the `max_event_seq` path).
+type EventsScan = (Vec<(u64, String)>, Option<u64>);
+
+fn scan_events(
+    events_path: &Path,
+    since: u64,
+    collect: bool,
+    limit: usize,
+) -> io::Result<EventsScan> {
+    // A zero page serves nothing: without this the `out.len() >= limit`
+    // check below runs only after the first push and returns one row.
+    if collect && limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+    // Cursor is the next seq to serve (inclusive): initial 0 serves seq 0,
+    // and `next_seq = max + 1` resumes without loss or duplication.
+    // Fast path: the journal is byte-identical to a previous scan and the
+    // cursor is past everything served — the idle poll. No file open.
+    // Only a drained scan publishes a servable tip (a page-limited scan
+    // stops early, so its `max_seq` is not the file end — §1).
+    if let Some(id) = file_id(events_path) {
+        let cache = events_cache().lock().expect("events cache lock");
+        if let Some(entry) = cache.get(events_path) {
+            if entry.id == id && entry.drained && entry.max_seq.is_none_or(|m| since > m) {
+                return Ok((Vec::new(), entry.max_seq));
+            }
+        }
+    }
+    let meta_len = fs::metadata(events_path)?.len();
+    // Resume from the newest checkpoint at or before the cursor. The file
+    // only grows in production, but a checkpoint is verified against its
+    // row before use, so an out-of-band rewrite falls back to a full scan
+    // instead of serving garbage.
+    let (mut checkpoints, mut seek_to, seek_seq) = {
+        let cache = events_cache().lock().expect("events cache lock");
+        match cache.get(events_path) {
+            Some(entry) if meta_len >= entry.id.len => {
+                let kept: Vec<(u64, u64)> = entry
+                    .checkpoints
+                    .iter()
+                    .copied()
+                    .filter(|&(_, off)| off <= meta_len)
+                    .collect();
+                let target = kept.iter().rev().find(|&&(seq, _)| seq <= since).copied();
+                match target {
+                    Some((seq, off)) => (kept, off, Some(seq)),
+                    None => (Vec::new(), 0, None),
+                }
+            }
+            _ => (Vec::new(), 0, None),
+        }
+    };
+    let mut file = File::open(events_path)?;
+    // Checkpoint beyond EOF (a shrink raced the stat): full scan instead.
+    if seek_to > meta_len {
+        seek_to = 0;
+        checkpoints.clear();
+    }
+    if seek_to > 0 {
+        file.seek(SeekFrom::Start(seek_to))?;
+        let probe = {
+            let mut probe_reader = BufReader::new(&file);
+            let mut probe = String::new();
+            match probe_reader.read_line(&mut probe) {
+                Ok(_) => serde_json::from_str::<EventRow<'_>>(&probe)
+                    .ok()
+                    .map(|r| r.seq),
+                Err(_) => None,
+            }
+        };
+        if probe != seek_seq {
+            seek_to = 0;
+            checkpoints.clear();
+        }
+        file.seek(SeekFrom::Start(seek_to))?;
+    }
+    // Checkpoints from before the resume point would interleave with the
+    // fresh ones appended during the scan, leaving the vector unsorted and
+    // breaking `iter().rev().find(...)` and `events_cache_touched`'s
+    // `last()` base. A checkpoint at or before the resume point is kept.
+    checkpoints.retain(|&(_, off)| off <= seek_to);
+    let mut reader = BufReader::new(file);
+    // Highest seq below the resume point, so the cached max covers the
+    // whole file, not just the scanned tail.
+    let mut max: Option<u64> = if seek_to > 0 {
+        events_cache()
+            .lock()
+            .expect("events cache lock")
+            .get(events_path)
+            .and_then(|e| e.max_seq)
+    } else {
+        None
+    };
+    let mut next_chunk_at = seek_to.saturating_add(EVENTS_CHECKPOINT_BYTES);
+    let mut out = Vec::new();
+    let mut off = seek_to;
+    let mut line = String::new();
+    let mut drained = false;
+    loop {
+        line.clear();
+        let n = match reader.read_line(&mut line) {
+            Ok(0) => {
+                drained = true;
+                break;
+            }
+            Ok(n) => n,
+            // Torn read: stop like EOF (matches `for_each_line`), but the
+            // end wasn't reached — don't publish a servable tip.
+            Err(_) => break,
+        };
+        let row_start = off;
+        off += n as u64;
+        let Ok(row) = serde_json::from_str::<EventRow<'_>>(line.trim_end()) else {
+            continue;
+        };
+        max = Some(max.map_or(row.seq, |m| m.max(row.seq)));
+        if row_start >= next_chunk_at {
+            checkpoints.push((row.seq, row_start));
+            next_chunk_at = row_start.saturating_add(EVENTS_CHECKPOINT_BYTES);
+        }
+        if collect && row.seq >= since {
+            out.push((row.seq, row.payload.get().to_owned()));
+            // Page-limited serving (§1): stop after `limit` served rows.
+            // `max`/checkpoints cover exactly the served prefix, so the
+            // next page resumes from its checkpoint; `drained` stays false
+            // so the fast path can't mistake this tip for EOF.
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    if let Some(id) = file_id(events_path) {
+        // Publish only when the identity still describes what was parsed:
+        // an append racing past the scan end would make `max` stale, and
+        // the next poll then re-scans from its checkpoint instead.
+        if id.len == off {
+            if checkpoints.len() > EVENTS_CHECKPOINT_CAP {
+                let excess = checkpoints.len() - EVENTS_CHECKPOINT_CAP;
+                checkpoints.drain(..excess);
+            }
+            events_cache().lock().expect("events cache lock").insert(
+                events_path,
+                EventsCursor {
+                    id,
+                    max_seq: max,
+                    checkpoints,
+                    drained,
+                },
+            );
+        }
+    }
+    Ok((out, max))
 }
 
 impl Session {
@@ -337,7 +727,6 @@ impl Session {
         let mut session = Self {
             header,
             path: Some(path),
-            counter: 0,
             journal: None,
             events_journal: None,
         };
@@ -358,10 +747,9 @@ impl Session {
         let _ = self.set_state("skills", &value);
     }
 
-    pub(crate) fn from_path(path: &Path) -> io::Result<Self> {
-        // Stream instead of read_to_string: session files grow with the
-        // message history and only the header plus a line count are needed.
-        let mut reader = BufReader::new(File::open(path)?);
+    /// Read + validate the session header, returning it with the handle
+    /// positioned just past it for callers that keep scanning (`from_path`).
+    fn read_header(reader: &mut BufReader<File>) -> io::Result<SessionHeader> {
         let mut first = String::new();
         if reader.read_line(&mut first)? == 0 {
             return Err(io::Error::new(
@@ -387,20 +775,30 @@ impl Session {
                 format!("unsupported session version {}", header.version),
             ));
         }
-        // Count the lines after the header without materializing the file.
-        let mut counter = 0u64;
-        let mut buf = Vec::new();
-        while reader.read_until(b'\n', &mut buf)? > 0 {
-            counter += 1;
-            buf.clear();
-        }
+        Ok(header)
+    }
+
+    pub(crate) fn from_path(path: &Path) -> io::Result<Self> {
+        // Header only: entry ids are random (see `next_id`), so opening never
+        // needs the old line-count scan — O(1) no matter the history size
+        // (perf doc §§22/28).
+        let mut reader = BufReader::new(File::open(path)?);
+        let header = Self::read_header(&mut reader)?;
         Ok(Self {
             header,
             path: Some(path.to_path_buf()),
-            counter,
             journal: None,
             events_journal: None,
         })
+    }
+
+    /// Events-only opener for the journal hot path (perf doc §22):
+    /// `journal_event` appends stream events dozens–hundreds of times per
+    /// turn. Same header-only open as `from_path`; the separate name documents
+    /// that only `append_event` (whose seq comes from the daemon) ever runs
+    /// on this handle.
+    pub(crate) fn from_path_for_events(path: &Path) -> io::Result<Self> {
+        Self::from_path(path)
     }
 
     /// Derive a child run's transcript path without touching the disk
@@ -465,17 +863,8 @@ impl Session {
         // The agent id is session-scoped and the manager counter restarts
         // after a daemon restart, so a resumed session can collide with a
         // prior run's file: append (never truncate) keeps the interrupted
-        // run's record readable, and continuing the line counter keeps
-        // entry ids unique across the seam.
-        let mut counter = 0u64;
-        if path.exists() {
-            let mut reader = BufReader::new(File::open(&path)?);
-            let mut buf = Vec::new();
-            while reader.read_until(b'\n', &mut buf)? > 0 {
-                counter += 1;
-                buf.clear();
-            }
-        }
+        // run's record readable, and random entry ids (see `next_id`) stay
+        // unique across the seam without a line-count scan.
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -484,7 +873,6 @@ impl Session {
         Ok(Self {
             header,
             path: Some(path),
-            counter,
             journal: None,
             events_journal: None,
         })
@@ -501,7 +889,6 @@ impl Session {
                 name: None,
             },
             path: None,
-            counter: 0,
             journal: None,
             events_journal: None,
         }
@@ -530,6 +917,16 @@ impl Session {
         Ok(sessions)
     }
 
+    /// mtime of one workspace's sessions dir, for the slash-popup cache key
+    /// (perf doc §29): one stat instead of a readdir + header parses per
+    /// frame while `/resume ...` sits in the composer.
+    pub(crate) fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
+        std::fs::metadata(Self::session_dir().join(Self::cwd_slug(cwd)))
+            .ok()?
+            .modified()
+            .ok()
+    }
+
     /// List every persisted session across all workspaces (registry rebuild
     /// and disk-backed `GET /api/sessions`).
     pub(crate) fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
@@ -548,6 +945,66 @@ impl Session {
         Ok(sessions)
     }
 
+    /// Fast id→path lookup (perf doc §1): the session id is the JSONL
+    /// filename, so match by file name across workspace dirs without
+    /// opening every file — `list_all` opens + header-parses each one just
+    /// to locate a single session. Each filename hit is confirmed by one
+    /// header-only `from_path` read; anything unconfirmed (renamed stems,
+    /// legacy files) falls through to the `list_all` scan at the caller.
+    pub(crate) fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
+        let q = sid.to_ascii_lowercase();
+        let mut exact: Option<PathBuf> = None;
+        let mut prefixed: Vec<PathBuf> = Vec::new();
+        if let Ok(slugs) = fs::read_dir(Self::session_dir()) {
+            for slug in slugs.flatten() {
+                let dir = slug.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let Ok(files) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if stem == sid {
+                        exact = Some(path);
+                        break;
+                    }
+                    let lower = stem.to_ascii_lowercase();
+                    if lower.starts_with(&q) || q.starts_with(&lower) {
+                        prefixed.push(path);
+                    }
+                }
+                if exact.is_some() {
+                    break;
+                }
+            }
+        }
+        // An exact filename with a foreign header (a stale same-named file)
+        // must not shadow the real session: confirm before returning, else
+        // keep scanning like the legacy path would.
+        if let Some(path) = exact {
+            if Self::from_path(&path).is_ok_and(|s| s.id() == sid) {
+                return Some(path);
+            }
+        }
+        // Deterministic on colliding prefixes: filesystem order is
+        // unspecified, so sort before confirming.
+        prefixed.sort_unstable();
+        prefixed.into_iter().find(|path| {
+            Self::from_path(path).is_ok_and(|s| {
+                let id = s.id().to_ascii_lowercase();
+                id.starts_with(&q) || q.starts_with(&id)
+            })
+        })
+    }
+
     /// List one session's child runs (§16): every JSONL under the session's
     /// `agents/` directory, each with its header and last turn state —
     /// `"interrupted"` is a `turn_start` with no terminal marker (a crashed
@@ -557,10 +1014,7 @@ impl Session {
     pub(crate) fn list_children(
         parent_path: &Path,
     ) -> io::Result<Vec<(PathBuf, SessionHeader, &'static str)>> {
-        let dir = parent_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("agents");
+        let dir = Self::agents_dir(parent_path);
         let mut children = scan_jsonl_dir(&dir);
         sort_newest_first(&mut children);
         // Enrich with the turn state after the shared scan/sort: the state
@@ -572,6 +1026,29 @@ impl Session {
                 (path, header, turn_state)
             })
             .collect())
+    }
+
+    /// Directory holding a session's child-agent transcripts (`agents/`
+    /// beside the session file). Single spelling shared by `list_children`
+    /// and the §31 listing pre-scan.
+    pub(crate) fn agents_dir(parent_path: &Path) -> PathBuf {
+        parent_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("agents")
+    }
+
+    /// Listing helper (perf doc §31): child-run counts for one agents dir —
+    /// total runs plus interrupted ones. One header-only dir scan plus one
+    /// turn-state scan per child; `list_sessions` calls it once per distinct
+    /// dir instead of once per session file.
+    pub(crate) fn count_children(dir: &Path) -> (usize, usize) {
+        let children = scan_jsonl_dir(dir);
+        let interrupted = children
+            .iter()
+            .filter(|(path, _)| Self::last_turn_state(path) == "interrupted")
+            .count();
+        (children.len(), interrupted)
     }
 
     pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Self> {
@@ -606,12 +1083,28 @@ impl Session {
     pub(crate) fn append_message(&mut self, message: &ChatMessage) -> io::Result<()> {
         let id = self.next_id();
         let timestamp = Self::now_iso();
-        self.append_line(&SessionMessageEntry {
-            entry_type: "message",
-            id: &id,
-            timestamp: &timestamp,
-            message,
-        })
+        self.append_line_inner(
+            &SessionMessageEntry {
+                entry_type: "message",
+                id: &id,
+                timestamp: &timestamp,
+                message,
+            },
+            false,
+        )?;
+        // Invalidate the parsed-history snapshot (perf doc §11) instead of
+        // fusing write+stat+push: two `Session` handles (daemon turn + `!`
+        // shell, or concurrent appends) interleave write;stat;push so the
+        // second stat sees both rows while its vec holds one — publishing
+        // a new FileId with a stale/misordered tail. Eviction forces the
+        // next load to rescan (one scan per turn, never per frame).
+        if let Some(path) = self.path.as_deref() {
+            history_cache()
+                .lock()
+                .expect("history cache lock")
+                .evict(path);
+        }
+        Ok(())
     }
 
     pub(crate) fn clear_messages(&mut self) -> io::Result<()> {
@@ -620,7 +1113,112 @@ impl Session {
             id: self.next_id(),
             timestamp: Self::now_iso(),
         };
-        self.append_line(&entry)
+        self.append_line_inner(&entry, false)?;
+        // Same invalidate-not-push as `append_message` (see above).
+        if let Some(path) = self.path.as_deref() {
+            history_cache()
+                .lock()
+                .expect("history cache lock")
+                .evict(path);
+        }
+        Ok(())
+    }
+
+    /// Atomically replace the journal's message tail after compaction:
+    /// header + `clear` + every message after the system prompt go to a
+    /// temp file in the same directory, fsync, then `rename` over the
+    /// journal. The old clear+N-appends sequence left a crash window
+    /// mid-rewrite — a `clear` plus a partial tail permanently dropped the
+    /// pre-compaction history. A rename is atomic: readers see the old or
+    /// the new history, never a torn one. The append handle reopens (it
+    /// pointed at the renamed-away inode) and the snapshot publishes fused
+    /// with its new identity, mirroring the loader (System role skipped).
+    /// In-memory sessions (no path) are a no-op, like the appends were.
+    pub(crate) fn rewrite_messages(&mut self, messages: &[ChatMessage]) -> io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        // Non-`.jsonl` suffix: the session listing scans `*.jsonl`, so a
+        // half-written temp never appears as a phantom session.
+        let tmp = path.with_extension(format!("rewrite-{}.tmp", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let header_line = serde_json::to_string(&self.header).map_err(io::Error::other)?;
+        let mut tmp_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        writeln!(tmp_file, "{header_line}")?;
+        let clear = SessionClearEntry {
+            entry_type: "clear".into(),
+            id: Self::random_suffix(8),
+            timestamp: Self::now_iso(),
+        };
+        writeln!(
+            tmp_file,
+            "{}",
+            serde_json::to_string(&clear).map_err(io::Error::other)?
+        )?;
+        // Preserve the non-message tail: `session_state` rows (plan, model,
+        // skills, verify, last_error, and the change ledger `/undo` reads)
+        // are not part of `messages`, but the append path kept them and the
+        // loaders read the whole file last-write-wins. Reload the surviving
+        // values before the rename and re-emit them, or every compaction
+        // silently empties `/undo` and drops the persisted plan.
+        let preserved = load_session_state(&path).unwrap_or_default();
+        for message in messages.iter().skip(1) {
+            let entry = SessionMessageEntry {
+                entry_type: "message",
+                id: &Self::random_suffix(8),
+                timestamp: &Self::now_iso(),
+                message,
+            };
+            writeln!(
+                tmp_file,
+                "{}",
+                serde_json::to_string(&entry).map_err(io::Error::other)?
+            )?;
+        }
+        let mut preserved: Vec<(String, String)> = preserved.into_iter().collect();
+        preserved.sort();
+        for (key, value) in preserved {
+            let state_entry = SessionStateEntry {
+                entry_type: "session_state".into(),
+                id: Self::random_suffix(8),
+                timestamp: Self::now_iso(),
+                key,
+                value,
+            };
+            writeln!(
+                tmp_file,
+                "{}",
+                serde_json::to_string(&state_entry).map_err(io::Error::other)?
+            )?;
+        }
+        tmp_file.flush()?;
+        tmp_file.sync_data()?;
+        drop(tmp_file);
+        fs::rename(&tmp, &path)?;
+        // Best-effort dir fsync so the rename itself survives a crash.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        self.journal = Some(Self::open_append(&path)?);
+        if let Some(id) = file_id(&path) {
+            let kept: Vec<ChatMessage> = messages
+                .iter()
+                .skip(1)
+                .filter(|m| m.role != Role::System)
+                .cloned()
+                .collect();
+            history_cache()
+                .lock()
+                .expect("history cache lock")
+                .insert(&path, (id, kept));
+        }
+        Ok(())
     }
 
     pub(crate) fn turn_event(&mut self, event: &str) -> io::Result<()> {
@@ -683,6 +1281,10 @@ impl Session {
     }
 
     fn append_line<T: Serialize>(&mut self, entry: &T) -> io::Result<()> {
+        self.append_line_inner(entry, true)
+    }
+
+    fn append_line_inner<T: Serialize>(&mut self, entry: &T, touch: bool) -> io::Result<()> {
         // Path is only needed to open the handle — avoid allocating per line.
         if self.journal.is_none() {
             let Some(path) = self.path.as_deref() else {
@@ -697,18 +1299,36 @@ impl Session {
         // Sync only when
         // durability matters (turn boundaries / effect journal) or when
         // DEX_DURABLE=1 is set for strict recovery testing.
-        let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
+        // `clear` is rare (compaction rewrites atomically now; `/clear` is
+        // user intent) — sync it so the fold point itself is durable.
+        let durable = durable_journal()
             || line.contains("\"type\":\"turn_")
-            || line.contains("\"type\":\"effect_");
+            || line.contains("\"type\":\"effect_")
+            || line.contains("\"type\":\"clear\"");
         if durable {
             file.sync_data()?;
+        }
+        // Refresh the history snapshot's identity: our own append never
+        // invalidates it (see `history_cache_touch`). Message/clear writers
+        // pass `touch: false` and fuse the refresh with their vector update
+        // under one lock instead.
+        if touch {
+            if let Some(path) = self.path.as_deref() {
+                history_cache_touch(path, line.len() as u64 + 1);
+            }
         }
         Ok(())
     }
 
-    fn next_id(&mut self) -> String {
-        self.counter += 1;
-        format!("{:x}", self.counter)
+    /// Opaque per-line entry id. Random rather than counted: nothing ever
+    /// reads these back (no correlation, no ordering — creation order comes
+    /// from file position), so uniqueness is the only requirement, and a
+    /// counter would force every open to scan the file first (perf doc §28).
+    /// 8 k8s-style chars (~41 bits) against the UUID-backed `random_suffix`
+    /// the session-id scheme already trusts for the stronger filename
+    /// uniqueness.
+    fn next_id(&self) -> String {
+        Self::random_suffix(8)
     }
     fn now_iso() -> String {
         let secs = SystemTime::now()
@@ -734,8 +1354,21 @@ impl Session {
     pub(crate) fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
-    pub(crate) fn count(&self) -> u64 {
-        self.counter
+    /// Display helper for `/session`: number of recorded turns
+    /// (`turn_start` markers). A rare explicit user command, so a
+    /// streaming scan is fine — and it matches the label better than the
+    /// old journal-line counter did.
+    pub(crate) fn count_turns(&self) -> usize {
+        let Some(path) = self.path.as_deref() else {
+            return 0;
+        };
+        let mut turns = 0usize;
+        let _ = for_each_line(path, |line| {
+            if line.contains("\"type\":\"turn_start\"") {
+                turns += 1;
+            }
+        });
+        turns
     }
     pub(crate) fn display_name(&self) -> String {
         self.name().unwrap_or(self.id()).to_string()
@@ -769,69 +1402,51 @@ impl Session {
         // line stays parseable for replay.
         let payload = if payload.is_empty() { "\"\"" } else { payload };
         let ts = Self::now_iso();
-        writeln!(
-            file,
-            "{{\"seq\":{seq},\"ts\":\"{ts}\",\"payload\":{payload}}}"
-        )?;
+        let line = format!("{{\"seq\":{seq},\"ts\":\"{ts}\",\"payload\":{payload}}}");
+        writeln!(file, "{line}")?;
         // Event journal is replayable but not critical for crash recovery —
         // sync only for terminal events or when DEX_DURABLE=1. (The old sniff
         // grepped for the Rust variant names, which never appear in the
         // serialized `type` field, so it never fired without DEX_DURABLE.)
-        let durable = std::env::var("DEX_DURABLE").as_deref() == Ok("1")
+        let durable = durable_journal()
             || payload.contains("\"type\":\"turn_complete\"")
             || payload.contains("\"type\":\"turn_failed\"");
         if durable {
             file.sync_data()?;
         }
+        if let Some(events_path) = self.events_path() {
+            events_cache_touched(&events_path, seq, line.len() as u64 + 1);
+        }
         Ok(())
     }
 
-    /// Replay stream events with `seq > since`, in order. `path` is the
+    /// Replay stream events with `seq >= since`, in order (`since` is the
+    /// next seq to serve, inclusive — `next_seq` chains without loss or
+    /// duplication). `path` is the
     /// SESSION file; the journal lives at `<session>.events.jsonl`.
-    pub(crate) fn load_events(path: &Path, since: u64) -> io::Result<Vec<(u64, String)>> {
+    /// Served from the steady-state cursor when the journal hasn't grown
+    /// (one `stat`, no file open — perf doc §12), otherwise scanned from
+    /// the newest checkpoint at or before `since`.
+    pub(crate) fn load_events(
+        path: &Path,
+        since: u64,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, String)>> {
         let events_path = path.with_extension("events.jsonl");
-        // Streamed line by line via `for_each_line`: the journal is the hot
-        // file (one line per stream delta) and replay drops everything with
-        // `seq <= since`, so don't slurp it into memory first.
-        let mut out = Vec::new();
-        for_each_line(&events_path, |line| {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
-                return;
-            };
-            let Some(seq) = value.get("seq").and_then(Value::as_u64) else {
-                return;
-            };
-            if seq <= since {
-                return;
-            }
-            if let Some(payload) = value.get("payload") {
-                out.push((seq, payload.to_string()));
-            }
-        })?;
-        Ok(out)
+        Ok(scan_events(&events_path, since, true, limit)?.0)
     }
 
     /// Highest event seq recorded for a session (`None` when no seq is
     /// journaled yet — distinct from a journal holding exactly seq 0).
+    /// Served from the cursor without opening the file when the journal
+    /// hasn't grown (perf doc §12).
     pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
         let events_path = path.with_extension("events.jsonl");
-        // Streamed via `for_each_line`: the journal is the hot file (one line
-        // per stream delta) and this only needs the max seq, not the text.
-        // Open failure still yields `None`; mid-read errors stop the scan
-        // inside the helper like EOF.
-        let mut max: Option<u64> = None;
-        let _ = for_each_line(&events_path, |line| {
-            // append_event writes {"seq":N,...}; skip parsing other shapes.
-            if !line.contains("\"seq\":") {
-                return;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
-                if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
-                    max = Some(max.map_or(seq, |m| m.max(seq)));
-                }
-            }
-        });
-        max
+        // The tip query must see the whole file (a limit here would corrupt
+        // seq seeding) — only serving scans page (§1).
+        scan_events(&events_path, u64::MAX, false, usize::MAX)
+            .ok()
+            .and_then(|(_, max)| max)
     }
 
     /// Terminal state of the most recent turn: "complete", "failed", or
@@ -862,6 +1477,79 @@ impl Session {
         }
         state
     }
+
+    /// Single-pass listing summary (perf doc §31): `(message_count,
+    /// turn_state)` with `load_messages_from_session` / `last_turn_state`
+    /// semantics — one open, one scan. Lines that can carry neither (effect,
+    /// state and header entries) skip parsing via a compact-spelling
+    /// substring prefilter; anything with a `type` key that misses the
+    /// prefilter (non-compact spacing) is classified by parsing, so the
+    /// count stays exact. `message_count` matches a full load
+    /// (malformed lines excluded the same way, `clear` folds, System role
+    /// skipped); open failure is an `Err` (callers map it to `unknown` / 0
+    /// as today). Stays quiet on malformed lines — unlike the loader, this
+    /// runs per file per listing.
+    pub(crate) fn scan_summary(path: &Path) -> io::Result<(usize, String)> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut count = 0usize;
+        let mut state = "none";
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let text = line.trim_end();
+            if text.is_empty() {
+                continue;
+            }
+            // 0 = message, 1 = clear, 2 = turn marker.
+            let kind: Option<u8> = if text.contains("\"type\":\"message\"") {
+                Some(0)
+            } else if text.contains("\"type\":\"clear\"") {
+                Some(1)
+            } else if text.contains("\"type\":\"turn_") {
+                Some(2)
+            } else if text.contains("\"type\"") {
+                match serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+                {
+                    Some(s) if s == "message" => Some(0),
+                    Some(s) if s == "clear" => Some(1),
+                    Some(s) if s.starts_with("turn_") => Some(2),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match kind {
+                // Same exclusion rules as the loader: unparsable lines and
+                // the System role (kept out of the transcript) don't count.
+                Some(0) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(text) {
+                        match serde_json::from_value::<ChatMessage>(value) {
+                            Ok(msg) if msg.role != Role::System => count += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                Some(1) => count = 0,
+                Some(2) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(text) {
+                        match value.get("type").and_then(Value::as_str) {
+                            Some("turn_start") => state = "interrupted",
+                            Some("turn_complete") => state = "complete",
+                            Some("turn_failed") => state = "failed",
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((count, state.to_string()))
+    }
 }
 
 /// Serialize discovered skills for the session-start `skills` state entry:
@@ -881,17 +1569,57 @@ fn skills_state_value(skills: &[crate::core::types::Skill]) -> String {
 }
 
 pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
+    // Snapshot hit: byte-identical to a previous parse — no file IO at all.
+    if let Some(mut messages) = history_cache_get(path) {
+        repair_dangling_tool_calls(&mut messages);
+        return Ok(messages);
+    }
+    let (mut messages, _) = scan_history(path)?;
+    repair_dangling_tool_calls(&mut messages);
+    Ok(messages)
+}
+
+/// Same single scan as [`load_messages_from_session`] plus the stored plan
+/// (perf doc §1): reattach used to re-scan the whole file for the plan
+/// right after loading messages. On a snapshot hit this degrades to today's
+/// two passes (the snapshot stores messages only); the cold path — the one
+/// that blocks first paint — pays one.
+pub(crate) fn load_messages_and_plan(
+    path: &Path,
+) -> io::Result<(Vec<ChatMessage>, crate::core::types::Plan)> {
+    if let Some(mut messages) = history_cache_get(path) {
+        repair_dangling_tool_calls(&mut messages);
+        return Ok((messages, load_plan(path)));
+    }
+    let (mut messages, plan) = scan_history(path)?;
+    repair_dangling_tool_calls(&mut messages);
+    Ok((
+        messages,
+        plan.map(|s| crate::core::types::Plan::from_json(&s))
+            .unwrap_or_default(),
+    ))
+}
+
+/// Streaming history scan shared by the message loaders: message/clear
+/// folding plus the last stored `plan` value (last write wins, like
+/// `load_session_state`). Returns pre-repair messages; the caller repairs
+/// its own copy so snapshot hits stay byte-identical to fresh parses.
+fn scan_history(path: &Path) -> io::Result<(Vec<ChatMessage>, Option<String>)> {
     // Stream line by line: session files grow with history and only the
     // post-`clear` tail is kept.
     let mut reader = BufReader::new(File::open(path)?);
     let mut messages = Vec::new();
+    let mut plan: Option<String> = None;
     let mut line = String::new();
     let mut line_no = 1; // header; matches the old skip(1) numbering
+    let mut consumed = 0u64;
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
             break;
         }
+        consumed += n as u64;
         line_no += 1;
         if line.trim().is_empty() {
             continue;
@@ -908,6 +1636,16 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
                 continue;
             }
         };
+        // The plan rides the same scan for free: this line is already
+        // parsed as `Value` above, so two map lookups capture it — no
+        // second full pass like the old `load_plan`-after-`load_messages`.
+        if value.get("type").and_then(Value::as_str) == Some("session_state")
+            && value.get("key").and_then(Value::as_str) == Some("plan")
+        {
+            if let Some(text) = value.get("value").and_then(Value::as_str) {
+                plan = Some(text.to_string());
+            }
+        }
         if value.get("type").and_then(Value::as_str) == Some("clear") {
             messages.clear();
         } else if value.get("type").and_then(Value::as_str) == Some("message") {
@@ -923,8 +1661,15 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
             }
         }
     }
-    repair_dangling_tool_calls(&mut messages);
-    Ok(messages)
+    // Cache the pre-repair snapshot when the file didn't grow mid-parse —
+    // an append racing the scan would make the identity stale, so that
+    // parse stays correct but uncached.
+    if let Some(id) = file_id(path) {
+        if id.len == consumed {
+            history_cache_put(path, id, messages.clone());
+        }
+    }
+    Ok((messages, plan))
 }
 
 /// Model-bound history: the full journal minus `!!` shell runs (saved
@@ -1348,7 +2093,7 @@ mod tests {
         s.append_event(3, r#"{"type":"assistant_text","data":"c"}"#)
             .unwrap();
         let path = s.path().unwrap().to_path_buf();
-        let after = Session::load_events(&path, 1).unwrap();
+        let after = Session::load_events(&path, 2, usize::MAX).unwrap();
         let seqs: Vec<u64> = after.iter().map(|(seq, _)| *seq).collect();
         let texts: Vec<String> = after
             .iter()
@@ -1359,6 +2104,292 @@ mod tests {
         assert_eq!(Session::max_event_seq(&path), Some(3));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("events.jsonl"));
+    }
+
+    #[test]
+    fn history_cache_serves_appends_without_rescan() {
+        let path = unique_path("dex-history-cache");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        s.append_message(&ChatMessage::user("one")).unwrap();
+        // Miss parses; hit serves the snapshot.
+        assert_eq!(load_messages_from_session(&path).unwrap().len(), 1);
+        assert_eq!(load_messages_from_session(&path).unwrap().len(), 1);
+        // The write funnel extends the snapshot: still no re-parse.
+        s.append_message(&ChatMessage::user("two")).unwrap();
+        let two = load_messages_from_session(&path).unwrap();
+        assert_eq!(two.len(), 2);
+        assert!(two[1].content_str().contains("two"));
+        // `clear` folds the snapshot like the loader folds the file.
+        s.clear_messages().unwrap();
+        assert!(load_messages_from_session(&path).unwrap().is_empty());
+        s.append_message(&ChatMessage::user("three")).unwrap();
+        assert_eq!(load_messages_from_session(&path).unwrap().len(), 1);
+        // An out-of-band rewrite misses and re-parses.
+        fs::write(&path, format!("{header}\n")).unwrap();
+        assert!(load_messages_from_session(&path).unwrap().is_empty());
+        // A missing file evicts instead of serving stale rows.
+        fs::remove_file(&path).unwrap();
+        assert!(load_messages_from_session(&path).is_err());
+        assert!(history_cache_get(&path).is_none());
+    }
+
+    #[test]
+    fn history_cache_hit_repairs_dangling_tool_calls_idempotently() {
+        use crate::core::types::{FunctionCall, LlmToolCall};
+        let path = unique_path("dex-history-cache-repair");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        // Assistant tool call whose result never landed (cancelled turn).
+        let dangling = ChatMessage::assistant_calls(
+            Some("calling".into()),
+            vec![LlmToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+        );
+        s.append_message(&dangling).unwrap();
+        // Every load synthesizes the placeholder exactly once — the cached
+        // hit must match a fresh parse, not accumulate duplicates.
+        let first = load_messages_from_session(&path).unwrap();
+        let second = load_messages_from_session(&path).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_cache_touch_evicts_on_foreign_append() {
+        let path = unique_path("dex-history-foreign");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        s.append_message(&ChatMessage::user("one")).unwrap();
+        assert_eq!(load_messages_from_session(&path).unwrap().len(), 1);
+        // A second process appends a message row behind our back...
+        let foreign = ChatMessage::user("foreign");
+        let entry = SessionMessageEntry {
+            entry_type: "message",
+            id: "foreign",
+            timestamp: "2020-01-01T00:00:01Z",
+            message: &foreign,
+        };
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        drop(f);
+        // ...then our own turn marker touches the snapshot: the length delta
+        // no longer matches, so it must evict rather than publish a vector
+        // that silently omits the foreign row.
+        s.turn_event("turn_start").unwrap();
+        let loaded = load_messages_from_session(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|m| m.content_str().contains("foreign")));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewrite_messages_preserves_session_state() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = Session::new("/tmp/dex-rewrite-state".into(), None).unwrap();
+        s.set_state("plan", "the plan").unwrap();
+        s.set_state("changes", "[]").unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        // The turn loop's `messages` carry the system prompt at index 0; the
+        // rewrite skips it and re-emits the rest.
+        let messages = vec![ChatMessage::system("sys"), ChatMessage::user("keep")];
+        s.rewrite_messages(&messages).unwrap();
+        let state = load_session_state(&path).unwrap();
+        assert_eq!(state.get("plan").map(String::as_str), Some("the plan"));
+        assert_eq!(state.get("changes").map(String::as_str), Some("[]"));
+        let after = load_messages_from_session(&path).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].content_str().contains("keep"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn events_page_limit_zero_serves_nothing() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = Session::new("/tmp/dex-events-limit0".into(), None).unwrap();
+        s.append_event(0, r#"{"type":"assistant_text","data":"a"}"#)
+            .unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        assert!(Session::load_events(&path, 0, 0).unwrap().is_empty());
+        // A nonzero page still serves.
+        assert_eq!(Session::load_events(&path, 0, 1).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("events.jsonl"));
+    }
+
+    #[test]
+    fn events_poll_skips_unchanged_journal_and_seeks_checkpoints() {
+        let path = unique_path("dex-events-cache");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        for seq in 0..4u64 {
+            s.append_event(
+                seq,
+                &format!("{{\"type\":\"assistant_text\",\"data\":\"{seq}\"}}"),
+            )
+            .unwrap();
+        }
+        // Miss parses; the idle re-poll serves nothing without file IO.
+        // Cursor is the next seq to serve (inclusive): `since=0` serves seq 0.
+        assert_eq!(Session::load_events(&path, 0, usize::MAX).unwrap().len(), 4);
+        assert!(Session::load_events(&path, 4, usize::MAX)
+            .unwrap()
+            .is_empty());
+        // A behind cursor re-scans and still gets every row exactly once.
+        let behind = Session::load_events(&path, 1, usize::MAX).unwrap();
+        assert_eq!(
+            behind.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        // Appends extend the cursor: only the tail is served.
+        s.append_event(4, r#"{"type":"assistant_text","data":"4"}"#)
+            .unwrap();
+        let tail = Session::load_events(&path, 4, usize::MAX).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].0, 4);
+        assert_eq!(Session::max_event_seq(&path), Some(4));
+        // Grow past one checkpoint and seek to it: same tail, no full scan
+        // by construction (checkpoints anchor the resume offset).
+        for seq in 5..1600u64 {
+            s.append_event(
+                seq,
+                &format!("{{\"type\":\"assistant_text\",\"data\":\"{seq}\"}}"),
+            )
+            .unwrap();
+        }
+        {
+            let cache = events_cache().lock().expect("events cache lock");
+            assert!(!cache
+                .get(&path.with_extension("events.jsonl"))
+                .unwrap()
+                .checkpoints
+                .is_empty());
+        }
+        let tail = Session::load_events(&path, 1591, usize::MAX).unwrap();
+        assert_eq!(tail.len(), 9);
+        assert_eq!(tail[0].0, 1591);
+        assert_eq!(Session::max_event_seq(&path), Some(1599));
+        // Out-of-band truncation falls back to a full scan, never garbage:
+        // the 64-byte stump holds no complete row.
+        let events_path = path.with_extension("events.jsonl");
+        let stump = fs::read(&events_path).unwrap()[..64].to_vec();
+        fs::write(&events_path, stump).unwrap();
+        assert!(Session::load_events(&path, 0, usize::MAX)
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(events_path);
+    }
+
+    #[test]
+    fn events_journal_pages_with_exactly_once_delivery() {
+        // §1: page-limited serving splits the journal across pages; chaining
+        // pages by last served seq delivers every row exactly once, and the
+        // drained tail re-arms the one-stat idle fast path.
+        let path = unique_path("dex-events-pages");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        for seq in 0..7u64 {
+            s.append_event(
+                seq,
+                &format!("{{\"type\":\"assistant_text\",\"data\":\"{seq}\"}}"),
+            )
+            .unwrap();
+        }
+        // Cursor semantics are inclusive (`seq >= since`): `since` is the
+        // next seq to serve, so pages chain with `last + 1` (the daemon's
+        // `next_seq`). Every row lands exactly once, including seq 0.
+        let mut since = 0u64;
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            let page = Session::load_events(&path, since, 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            since = page.last().unwrap().0 + 1;
+            got.extend(page.into_iter().map(|(seq, _)| seq));
+        }
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 6]);
+        // Drained: the idle re-poll serves nothing (fast path, no file open).
+        assert!(Session::load_events(&path, since, 3).unwrap().is_empty());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("events.jsonl"));
+    }
+
+    #[test]
+    fn events_opener_skips_line_count_scan() {
+        let path = unique_path("dex-events-opener");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        s.append_message(&ChatMessage::user("history")).unwrap();
+        // Header-only open: no scan, counter unused — the handle only ever
+        // appends events.
+        let mut journal = Session::from_path_for_events(&path).unwrap();
+        journal
+            .append_event(0, r#"{"type":"assistant_text","data":"a"}"#)
+            .unwrap();
+        // The row landed (max sees seq 0); replay serves it to a `since=0`
+        // poll under the inclusive cursor semantics.
+        assert_eq!(Session::max_event_seq(&path), Some(0));
+        journal
+            .append_event(1, r#"{"type":"assistant_text","data":"b"}"#)
+            .unwrap();
+        let rows = Session::load_events(&path, 0, usize::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[1].0, 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("events.jsonl"));
+    }
+
+    #[test]
+    fn scan_summary_matches_full_load() {
+        let path = unique_path("dex-scan-summary");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        let user = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"hi"}"#;
+        let system = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"system","content":"note"}"#;
+        let bad = r#"{"type":"message","id":"bad","role":"mystery"}"#;
+        let start = r#"{"type":"turn_start","id":"3","timestamp":"2020-01-01T00:00:00Z"}"#;
+        let done = r#"{"type":"turn_complete","id":"4","timestamp":"2020-01-01T00:00:00Z"}"#;
+        let state = r#"{"type":"session_state","id":"5","timestamp":"2020-01-01T00:00:00Z","key":"k","value":"v"}"#;
+        // Non-compact spacing exercises the parse-and-classify fallback.
+        let spaced = r#"{ "type" : "message" , "id" : "6" , "role" : "user" , "content" : "sp" }"#;
+        fs::write(
+            &path,
+            format!("{header}\n{user}\n{system}\n{bad}\n{start}\n{done}\n{state}\n{spaced}\n"),
+        )
+        .unwrap();
+        let loaded = load_messages_from_session(&path).unwrap();
+        let (count, turn) = Session::scan_summary(&path).unwrap();
+        assert_eq!(count, loaded.len());
+        assert_eq!(count, 2);
+        assert_eq!(turn, "complete");
+        // `clear` folds the count like the loader folds the vec.
+        let clear = r#"{"type":"clear","id":"7","timestamp":"2020-01-01T00:00:00Z"}"#;
+        fs::write(&path, format!("{header}\n{user}\n{clear}\n{spaced}\n")).unwrap();
+        let (count, _) = Session::scan_summary(&path).unwrap();
+        assert_eq!(count, load_messages_from_session(&path).unwrap().len());
+        assert_eq!(count, 1);
+        // Missing file is an error (callers map to 0/unknown).
+        let _ = fs::remove_file(&path);
+        assert!(Session::scan_summary(&path).is_err());
     }
 
     #[test]
@@ -1373,6 +2404,65 @@ mod tests {
         fs::write(&path, format!("{}\n{}\n{}\n", header, start, done)).unwrap();
         assert_eq!(Session::last_turn_state(&path), "complete");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_by_id_filename_resolves_exact_and_prefix() {
+        // Sessions live under XDG_DATA_HOME: redirect + serialize against
+        // tests doing the same. Two sessions prove the lookup discriminates
+        // by filename instead of returning the first header parsed.
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+        let dir = std::env::temp_dir().join(format!("dex-find-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let a = Session::new("/tmp/dex-find-a".into(), None).unwrap();
+        let b = Session::new("/tmp/dex-find-b".into(), None).unwrap();
+        let (ida, pa) = (a.id().to_string(), a.path().unwrap().to_path_buf());
+        let (idb, pb) = (b.id().to_string(), b.path().unwrap().to_path_buf());
+        assert_ne!(ida, idb);
+        assert_eq!(Session::find_by_id_filename(&ida), Some(pa.clone()));
+        assert_eq!(Session::find_by_id_filename(&idb), Some(pb.clone()));
+        // Near-full prefix: the 8-char workspace slug collides across
+        // sessions, so abbreviate inside the random suffix instead.
+        assert_eq!(
+            Session::find_by_id_filename(&ida[..ida.len() - 1]),
+            Some(pa.clone())
+        );
+        assert_eq!(Session::find_by_id_filename("no-such-session"), None);
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_messages_and_plan_matches_separate_loads() {
+        let path = unique_path("dex-messages-plan");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        let user = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"hi"}"#;
+        let want = crate::core::types::Plan {
+            goal: Some("g".into()),
+            steps: vec![("s".into(), false)],
+            constraints: Vec::new(),
+            acceptance: Vec::new(),
+        };
+        let state = format!(
+            r#"{{"type":"session_state","id":"2","timestamp":"2020-01-01T00:00:00Z","key":"plan","value":{}}}"#,
+            serde_json::to_string(&want.to_json()).unwrap()
+        );
+        fs::write(&path, format!("{header}\n{user}\n{state}\n")).unwrap();
+        let (messages, plan) = load_messages_and_plan(&path).unwrap();
+        // Same messages as the standalone loader, same plan as the
+        // standalone second pass — from one scan.
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            serde_json::to_string(&load_messages_from_session(&path).unwrap()).unwrap()
+        );
+        assert_eq!(plan, load_plan(&path));
+        assert_eq!(plan, want);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
