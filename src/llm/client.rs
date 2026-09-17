@@ -16,6 +16,10 @@ use crate::llm::protocol::{
 };
 use crate::llm::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
 
+/// Agent-loop model seam: `process_turn` is generic over this so tests run
+/// deterministic doubles; the single production impl is `LlmConfig` (via
+/// `dispatch::complete`). New provider behavior lands in the `call_*`
+/// functions below, not behind this trait.
 pub(crate) trait ModelClient: Clone + Send + Sync {
     async fn complete(
         &self,
@@ -51,6 +55,9 @@ async fn post_with_retry(
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     const MAX_HTTP_RETRIES: u32 = 3;
     let headers = merged_headers(config);
+    // One client per call, not per attempt: clones are an atomic bump, and a
+    // fresh build per retry would re-init TLS + pool each time.
+    let http = config.http_client();
     // 401-refresh scratch: `None` borrows `config` (no clone on the common
     // path — the old code cloned the whole config per call even though only
     // the 401 path mutates). Materialized only when a refreshable provider
@@ -58,7 +65,7 @@ async fn post_with_retry(
     let mut refreshed: Option<LlmConfig> = None;
     for attempt in 0..=MAX_HTTP_RETRIES {
         let active: &LlmConfig = refreshed.as_ref().unwrap_or(config);
-        let request = config.client.post(url);
+        let request = http.post(url);
         crate::log!(
             Debug,
             "POST {url} (model {}, attempt {attempt})",
@@ -110,7 +117,7 @@ async fn post_with_retry(
                 && active.provider.credentials_refreshable()
                 && attempt < MAX_HTTP_RETRIES
             {
-                if let Ok((token, account)) = crate::llm::config::resolve_credentials(
+                if let Ok((token, account)) = crate::llm::auth::resolve_credentials(
                     &active.provider,
                     &active.provider_entries,
                 ) {
@@ -525,7 +532,9 @@ mod tests {
             .insert("not a header".to_string(), "bad".to_string());
         let headers = merged_headers(&config);
         let req = authenticated_request(
-            config.client.get("http://localhost/v1/chat/completions"),
+            config
+                .http_client()
+                .get("http://localhost/v1/chat/completions"),
             &config,
             &headers,
         )
@@ -567,7 +576,9 @@ mod tests {
             .insert("X-Prov".to_string(), "env".to_string());
         let headers = merged_headers(&config);
         let req = authenticated_request(
-            config.client.get("http://localhost/v1/chat/completions"),
+            config
+                .http_client()
+                .get("http://localhost/v1/chat/completions"),
             &config,
             &headers,
         )

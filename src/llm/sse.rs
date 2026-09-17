@@ -2006,7 +2006,7 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         });
-        let response = reqwest::Client::new()
+        let response = crate::client::http::shared_streaming_client()
             .get(format!("http://{addr}/v1/responses"))
             .send()
             .await
@@ -2127,7 +2127,7 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
                 .await;
             // Socket drops here with the body unsent.
         });
-        let response = reqwest::Client::new()
+        let response = crate::client::http::shared_streaming_client()
             .get(format!("http://{addr}/v1/chat/completions"))
             .send()
             .await
@@ -2175,7 +2175,7 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
                 .await;
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
-        let client = reqwest::Client::new();
+        let client = crate::client::http::shared_streaming_client();
         let response = client
             .get(format!("http://{addr}/v1"))
             .send()

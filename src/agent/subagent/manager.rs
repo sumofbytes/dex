@@ -35,14 +35,10 @@ use crate::core::console::CancellationToken;
 use crate::core::unwind::CatchUnwind;
 use crate::session::Session;
 
-use super::context::ContextSeed;
 use super::definition::AgentDefinition;
-use super::exit::{
-    advertised_remaining, resume_note, transcript_holds_progress, ExhaustKind, ExitReason,
-    ResumeHandle,
-};
-use super::instance::{AgentId, AgentInstance, AgentState};
-use super::result::{AgentResult, AgentUsage};
+use super::exit::{transcript_holds_progress, ExhaustKind, ExitReason};
+use super::model::{AgentId, AgentInstance, AgentResult, AgentState, AgentUsage, ContextSeed};
+use super::resume::{advertised_remaining, resume_note, ResumeHandle};
 
 /// Max live children per session (plan §7). The next concurrent spawn
 /// past this rejects fail-fast with the running list, so the model can
