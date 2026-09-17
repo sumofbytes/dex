@@ -238,6 +238,9 @@ pub(crate) struct ExtensionManager {
     /// Token cost of `cached`, precomputed at rebuild: the per-turn budget
     /// reads this instead of re-serializing schemas on every model call.
     cached_tokens: tokio::sync::RwLock<u64>,
+    /// Per-tool token costs, parallel to `cached` names: the `active`-slice
+    /// budget sums these instead of re-serializing the filtered defs live.
+    cached_costs: tokio::sync::RwLock<Arc<[(String, u64)]>>,
     /// Sorted by id: iteration order is hook order (same contract as the
     /// skills dedup — deterministic, first-wins on collision).
     engines: tokio::sync::RwLock<BTreeMap<String, LoadedExtension>>,
@@ -262,6 +265,7 @@ impl ExtensionManager {
         Self {
             cached: tokio::sync::RwLock::new(Arc::new([])),
             cached_tokens: tokio::sync::RwLock::new(0),
+            cached_costs: tokio::sync::RwLock::new(Arc::new([])),
             engines: tokio::sync::RwLock::new(BTreeMap::new()),
             shadowed: tokio::sync::RwLock::new(HashSet::new()),
             active: std::sync::RwLock::new(None),
@@ -500,7 +504,20 @@ impl ExtensionManager {
         if tools.len() > max {
             tools.truncate(max);
         }
+        // Per-tool char shares for the `active`-slice budget (see
+        // `cached_schema_tokens`); the whole-cache total keeps the exact
+        // `schema_token_estimate` formula.
+        let costs: Arc<[(String, u64)]> = tools
+            .iter()
+            .map(|d| {
+                (
+                    d.function.name.clone(),
+                    crate::agent::tokens::schema_chars(std::slice::from_ref(d)) as u64,
+                )
+            })
+            .collect();
         *self.cached_tokens.write().await = crate::agent::tokens::schema_token_estimate(&tools);
+        *self.cached_costs.write().await = costs;
         *self.cached.write().await = Arc::from(tools);
         let shadowed: HashSet<String> = engines
             .values()
@@ -576,8 +593,28 @@ impl ExtensionManager {
             } else {
                 // Same lazy self-heal as `call`: a dispatch racing the
                 // background refresh boots the owner instead of failing.
+                // Scoped candidate-by-candidate (`ensure_loaded_found`),
+                // not a full `refresh()` — the shadow owner is only known
+                // after load (shadows come from Lua exports, not the
+                // manifest), so boot each undiscovered candidate until
+                // one claims the target. A genuinely unknown target pays
+                // one `discover_scoped()` scan plus the remaining boots,
+                // same worst case as before, but the common race heals
+                // with a single VM instead of all of them (§26).
                 drop(engines);
-                self.refresh().await;
+                let found = discover_scoped();
+                for (_, m) in found.clone() {
+                    if self
+                        .engines
+                        .read()
+                        .await
+                        .values()
+                        .any(|e| e.shadows.contains(&target.to_string()))
+                    {
+                        break;
+                    }
+                    let _ = self.ensure_loaded_found(&m.id, found.clone()).await;
+                }
                 let engines = self.engines.read().await;
                 let Some(ext) = engines
                     .values()
@@ -1020,18 +1057,32 @@ pub(crate) fn global_manager() -> std::sync::Arc<ExtensionManager> {
         .clone()
 }
 
+/// Bounded spin on `try_read` (same contract as MCP's `spin_read`): every
+/// writer holds its guard for a bare swap, so contention clears within a
+/// few yields and the never-block guarantee holds.
+fn spin_read<T: Clone>(lock: &tokio::sync::RwLock<T>) -> Option<T> {
+    spin_guard(lock).map(|guard| guard.clone())
+}
+
+/// Guard-returning spin for maps whose values aren't `Clone` (engines):
+/// the caller reads through the guard instead of cloning.
+fn spin_guard<T>(lock: &tokio::sync::RwLock<T>) -> Option<tokio::sync::RwLockReadGuard<'_, T>> {
+    for _ in 0..16 {
+        if let Ok(guard) = lock.try_read() {
+            return Some(guard);
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
 /// Cached extension tools for `tools_schema()` — never blocks, never fails.
 /// Clones the `Arc`, not the defs.
 pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
     let Some(m) = GLOBAL.get() else {
         return Arc::new([]);
     };
-    let all = m
-        .cached
-        .try_read()
-        .ok()
-        .map(|t| t.clone())
-        .unwrap_or_else(|| Arc::new([]));
+    let all = spin_read(&m.cached).unwrap_or_else(|| Arc::new([]));
     match m.active.read().expect("active lock").clone() {
         None => all,
         // Filtered here, not at set time: a load-time `set_active` races
@@ -1049,22 +1100,33 @@ pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
 }
 
 /// Token cost of the cached extension schema slice, for the compaction budget.
-/// Precomputed at rebuild — a cached load, never a re-serialize. (With an
-/// `active` slice the filtered set is estimated live; slicing is rare.)
-/// Like MCP: `try_read` never blocks the loop — contention returns 0 once,
-/// self-correcting on the next call.
+/// Precomputed at rebuild — a cached load, never a re-serialize. With an
+/// `active` slice the filtered set sums the precomputed per-tool costs (no
+/// live serialization of the filtered defs). Never blocks the loop;
+/// contention spins (see `spin_read`), and a still-contended costs read
+/// falls back to the whole-cache total (conservative: compacts earlier,
+/// never later).
 pub(crate) fn cached_schema_tokens() -> u64 {
     let Some(m) = GLOBAL.get() else {
         return 0;
     };
-    if m.active.read().expect("active lock").is_some() {
-        return crate::agent::tokens::schema_token_estimate(&cached_tools());
+    if let Some(active) = m.active.read().expect("active lock").clone() {
+        let wanted: HashSet<String> = active.into_iter().collect();
+        if let Some(costs) = spin_read(&m.cached_costs) {
+            // Same sum-then-divide formula as `schema_token_estimate`, on
+            // the subset: bit-identical to estimating the sliced defs.
+            let mut chars = 0u64;
+            let mut count = 0u64;
+            for (name, cost) in costs.iter() {
+                if wanted.contains(name) {
+                    chars += cost;
+                    count += 1;
+                }
+            }
+            return chars / 4 + count * crate::agent::tokens::PER_MESSAGE_OVERHEAD;
+        }
     }
-    m.cached_tokens
-        .try_read()
-        .ok()
-        .map(|n| *n)
-        .unwrap_or_default()
+    spin_read(&m.cached_tokens).unwrap_or_default()
 }
 
 /// Dispatch `ext__<ext>__<tool>`. All errors are plain strings; the caller
@@ -1533,7 +1595,7 @@ pub(crate) fn command_list() -> Vec<(String, String, String)> {
     GLOBAL
         .get()
         .and_then(|m| {
-            m.engines.try_read().ok().map(|engines| {
+            spin_guard(&m.engines).map(|engines| {
                 engines
                     .values()
                     .flat_map(|e| {
@@ -1923,7 +1985,7 @@ pub(crate) fn has_event_handlers(event: &str) -> bool {
     GLOBAL
         .get()
         .and_then(|m| {
-            m.engines.try_read().ok().map(|e| {
+            spin_guard(&m.engines).map(|e| {
                 e.values()
                     .any(|ext| ext.events.contains(&event.to_string()))
             })
@@ -1949,6 +2011,8 @@ pub(crate) mod tests {
         pub(crate) async fn reset_for_tests(&self) {
             self.engines.write().await.clear();
             *self.cached.write().await = Arc::new([]);
+            *self.cached_tokens.write().await = 0;
+            *self.cached_costs.write().await = Arc::new([]);
             *self.shadowed.write().await = HashSet::new();
             *self.active.write().expect("active lock") = None;
             *LAST_MODEL.lock().expect("served model lock") = None;

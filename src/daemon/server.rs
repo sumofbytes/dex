@@ -585,7 +585,7 @@ async fn chat(
     // append-only session log stays consistent. A replay must not hold the
     // active-turn slot, so it is checked before registration.
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry_async(&state, &session_id).await.is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     // Pre-create per-turn channels so `POST /steer` / `POST /followup`
@@ -1043,6 +1043,16 @@ async fn run_turn_inner(
                 let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
                 if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
                     slot.model_persisted = Some((value, at));
+                    // The idle-wake path reads `wake_*` with no turn running:
+                    // a persist-only `/provider` switch must refresh them
+                    // here, not just at the next turn start below, or the
+                    // wake runs on the old endpoint.
+                    slot.wake_provider = Some(provider_name.clone());
+                    slot.wake_base_url = if config.base_url.trim().is_empty() {
+                        None
+                    } else {
+                        Some(config.base_url.clone())
+                    };
                 }
             }
         }
@@ -1827,7 +1837,7 @@ async fn steer(
     }
     // Session must exist; steering only valid while a turn is active.
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry_async(&state, &session_id).await.is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, false).ok_or(StatusCode::CONFLICT)?;
@@ -1847,7 +1857,7 @@ async fn followup(
         return Err(StatusCode::BAD_REQUEST);
     }
     // Disk fallback: the session may predate the background rebuild scan.
-    if lookup_entry_async(&state, &session_id).await.is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, true).ok_or(StatusCode::CONFLICT)?;
@@ -1871,7 +1881,7 @@ async fn recall(
     if content.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if lookup_entry_async(&state, &session_id).await.is_none() {
+    if lookup_entry_async(&state, &session_id).await.is_err() {
         return Err(StatusCode::NOT_FOUND);
     }
     let tx = queue_tx(&state, &session_id, req.followup).ok_or(StatusCode::CONFLICT)?;
@@ -1907,8 +1917,37 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
     if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
-    if missing_hit(state, session_id) {
+    // Stale-negative self-heal + typo-storm guard (§27): the filename probe
+    // is readdir-only (no header opens), so a negative hit re-probes cheaply
+    // — an out-of-band create (CLI/TUI writing the file directly, which
+    // never clears this set) becomes visible on the next request instead of
+    // after `NEGATIVE_TTL`, while a true typo still avoids the full
+    // `list_all` open+parse walk on every request. The probe doubles as the
+    // fast path below (perf doc §1).
+    let probed = session::Session::find_by_id_filename(session_id);
+    if missing_hit(state, session_id) && probed.is_none() {
         return None;
+    }
+    lock_map(&state.missing_sessions).remove(session_id);
+    // Fast path first (perf doc §1): the session id is the JSONL filename,
+    // so a filename match + one header read replaces the workspace-wide
+    // open+parse of every session. The `list_all` scan below only serves
+    // renamed/legacy files whose stem no longer names the id.
+    if let Some(path) = probed {
+        if let Ok(entry_session) = session::Session::from_path(&path) {
+            let entry = SessionEntry {
+                path: path.clone(),
+                name: entry_session.name().map(ToOwned::to_owned),
+                cwd: entry_session.cwd().to_string(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
+            };
+            lock_map(&state.sessions).insert(session_id.to_string(), entry.clone());
+            return Some(entry);
+        }
     }
     let found = session::Session::list_all()
         .unwrap_or_default()
@@ -1944,6 +1983,10 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
 /// file moved under us — the mtime guard, because the co-located TUI can
 /// write the same file directly, so an entry-only comparison could skip a
 /// needed restore. A missing file also forces the write (same as before).
+/// `==` on `SystemTime` is brittle on coarse-granularity filesystems
+/// (1 s FAT/NFS ticks: a same-tick out-of-band write compares equal and is
+/// missed) — accepted: sessions live on local disks (ns ext4/APFS), and a
+/// miss only re-appends an identical value, never a wrong one.
 fn persisted_current<T: PartialEq>(
     persisted: &Option<(T, std::time::SystemTime)>,
     value: &T,
@@ -1962,18 +2005,24 @@ fn persisted_current<T: PartialEq>(
 /// §27): `Session::list_all` walks the workspace, so the scan +
 /// registration run in `spawn_blocking`. In-memory hits (and post-rebuild
 /// negative hits) stay inline — only a true registry miss pays the hop.
-async fn lookup_entry_async(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
+async fn lookup_entry_async(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<SessionEntry, StatusCode> {
     if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
-        return Some(entry);
+        return Ok(entry);
     }
     if missing_hit(state, session_id) {
-        return None;
+        return Err(StatusCode::NOT_FOUND);
     }
     let state = Arc::clone(state);
     let session_id = session_id.to_string();
+    // A JoinError (panic/cancel) is an internal failure, not an absent
+    // session: surfacing 500 instead of folding into `None` → 404.
     tokio::task::spawn_blocking(move || lookup_entry(&state, &session_id))
         .await
-        .ok()?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Resolve a session file path from the registry (with disk fallback), or 404.
@@ -1981,11 +2030,12 @@ async fn session_path(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<std::path::PathBuf, StatusCode> {
-    lookup_entry_async(state, session_id)
-        .await
-        .map(|e| e.path)
-        .filter(|p| p.exists())
-        .ok_or(StatusCode::NOT_FOUND)
+    let path = lookup_entry_async(state, session_id).await?.path;
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 /// Take the session's active-turn slot; `false` when a live turn holds it.
@@ -2069,9 +2119,7 @@ async fn reattach(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ReattachResponse>, StatusCode> {
-    let entry = lookup_entry_async(&state, &session_id)
-        .await
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let entry = lookup_entry_async(&state, &session_id).await?;
     if !entry.path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }

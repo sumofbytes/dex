@@ -740,12 +740,16 @@ impl DaemonClient {
         session_id: &str,
         since: u64,
     ) -> Result<EventsResponse, Box<dyn std::error::Error>> {
+        // Explicit page limit: old daemons ignore it (their unbounded reply
+        // still drains via the `next_seq` no-progress backup in the replay
+        // loop), new ones bound the page.
         let resp = self
             .http
             .get(format!(
-                "{}?since={}",
+                "{}?since={}&limit={}",
                 self.session_url(session_id, "events"),
-                since
+                since,
+                crate::session::EVENTS_PAGE_LIMIT,
             ))
             .headers(self.api_headers())
             .send()
