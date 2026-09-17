@@ -1,10 +1,10 @@
 manifest_version: 1
 id: web
 version: 0.1.0
-capabilities: [tools, tools.override, model, net]
+capabilities: [tools, tools.override, model, net, net.providers]
 tools:
     - name: search
-      description: Search the web with the current provider's native search API and return cited results.
+      description: Search the web with provider-native search APIs — the current model's family, or the search override model set with /search-model — and return cited results. Requires a Gemini, OpenAI-Responses, or Anthropic-Messages target; unavailable otherwise.
       parameters:
         type: object
         properties:
@@ -17,7 +17,7 @@ tools:
         required: [query]
       timeout: 120
     - name: fetch
-      description: Fetch and summarize the given URLs (Gemini models only).
+      description: Fetch and summarize the given URLs via Gemini's url_context tool — served by the current Gemini model, or the Gemini override model set with /search-model.
       parameters:
         type: object
         properties:
