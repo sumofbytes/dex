@@ -1366,6 +1366,104 @@ pub(crate) fn extension_model_auth() -> Result<ExtensionModelAuth, String> {
     extension_model_auth_for(provider.name(), &base_url)
 }
 
+/// The current model's wire protocol, same resolution as
+/// `extension_model_snapshot` — so `dex.model.auth()` can also say which
+/// API the key+endpoint speak without a served snapshot.
+pub(crate) fn extension_model_api() -> Result<String, String> {
+    let (_, _, _, api, _) = extension_model_parts()?;
+    Ok(api.name().to_string())
+}
+
+/// `dex.model.auth(provider)`: credentials for an arbitrary configured
+/// provider — the model-independent extension vocabulary (a fallback search
+/// calls another provider's endpoint with that provider's own key).
+/// Endpoint: the entry's `base_url:` > the catalog landing (builtin) / the
+/// catalog `api` URL (generic). Wire: the entry's `api:` pin > provider
+/// default. Auth: the standard deposit order.
+pub(crate) struct ExtensionProviderAuth {
+    pub(crate) auth: ExtensionModelAuth,
+    pub(crate) api: String,
+}
+
+pub(crate) fn extension_provider_auth(
+    provider_name: &str,
+) -> Result<ExtensionProviderAuth, String> {
+    let file = load_config_file();
+    let entries = load_provider_entries(&file);
+    let known = known_providers(&entries);
+    let provider = Provider::parse_known(provider_name, &known).ok_or_else(|| {
+        format!(
+            "unsupported provider '{provider_name}'; add it under 'providers:' (e.g. providers.{provider_name}: {{base_url: ..., api_key: ...}})"
+        )
+    })?;
+    let resolved = resolve_provider(&provider, &entries);
+    let base_url = resolved
+        .landing
+        .clone()
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "provider '{}' has no endpoint: set base_url under providers.{} or run `dex update --models`",
+                provider.name(),
+                provider.name()
+            )
+        })?;
+    let auth = extension_model_auth_for(provider_name, &base_url)?;
+    let (api, _) = base_protocol(&provider, resolved.api_pin, &file);
+    Ok(ExtensionProviderAuth {
+        auth,
+        api: api.name().to_string(),
+    })
+}
+
+/// A provider with resolvable credentials and a usable endpoint — the
+/// `net.providers` vocabulary: `dex.net.fetch` may target these endpoints
+/// (each with its own key) when the manifest declares `net.providers`;
+/// everything else stays confined to the model's own endpoint.
+pub(crate) struct ConfiguredProviderEndpoint {
+    pub(crate) provider: String,
+    pub(crate) base_url: String,
+}
+
+/// Every configured provider that could actually authenticate: builtins
+/// count when their key deposits resolve, generics with a file entry count
+/// when theirs do (file key or the catalog env var). Sorted by provider
+/// spelling (alias spellings dedupe to one canonical entry below). Shared
+/// by the `net.providers` fetch allowlist and `dex.model.providers()`.
+pub(crate) fn extension_configured_providers() -> Vec<ConfiguredProviderEndpoint> {
+    let file = load_config_file();
+    let entries = load_provider_entries(&file);
+    let known = known_providers(&entries);
+    let mut names: BTreeSet<String> = entries.keys().cloned().collect();
+    // Builtins need no file entry — the single list lives on `Provider`.
+    names.extend(Provider::BUILTINS.iter().map(ToString::to_string));
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for name in names {
+        let Some(provider) = Provider::parse_known(&name, &known) else {
+            continue;
+        };
+        // Alias spellings ("codex"/"openai-codex") resolve to one provider.
+        let canonical = provider.name().to_string();
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        if resolve_credentials(&provider, &entries).is_err() {
+            continue;
+        }
+        if let Some(base_url) = resolve_provider(&provider, &entries)
+            .landing
+            .filter(|u| !u.trim().is_empty())
+        {
+            out.push(ConfiguredProviderEndpoint {
+                provider: canonical,
+                base_url,
+            });
+        }
+    }
+    out
+}
+
 /// Auth for an explicit provider + endpoint: what the worker calls with the
 /// served snapshot when a turn recorded one (a per-request override the
 /// file never sees — the key still resolves from the configured deposits).
@@ -6628,6 +6726,113 @@ pub(crate) mod tests {
             .headers
             .keys()
             .all(|k| !k.eq_ignore_ascii_case("authorization")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_provider_names_stay_in_sync_with_parse_known() {
+        // `extension_configured_providers` seeds discovery from this list; every
+        // entry must resolve without any file entry, or builtins silently drop
+        // out of `net.providers` / `dex.model.providers()`.
+        let known = std::collections::BTreeSet::new();
+        for name in crate::core::types::Provider::BUILTINS {
+            assert!(
+                crate::core::types::Provider::parse_known(name, &known).is_some(),
+                "BUILTINS entry '{name}' must parse without any file entry"
+            );
+        }
+        // Alias spellings land on one canonical provider.
+        assert_eq!(
+            crate::core::types::Provider::parse_known("codex", &known)
+                .map(|p| p.name().to_string()),
+            crate::core::types::Provider::parse_known("openai-codex", &known)
+                .map(|p| p.name().to_string()),
+        );
+    }
+
+    #[test]
+    fn extension_provider_auth_resolves_explicit_provider() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-provauth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  anthropic:\n    base_url: https://anthropic.example\n    api_key: k-ant\n    api: anthropic-messages\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_MODEL_APIS"] {
+            std::env::remove_var(key);
+        }
+        // A configured provider with its own endpoint, key and wire pin.
+        let resolved = super::extension_provider_auth("anthropic").unwrap();
+        assert_eq!(resolved.auth.api_key, "k-ant");
+        assert_eq!(resolved.auth.base_url, "https://anthropic.example");
+        assert_eq!(resolved.api, "anthropic-messages");
+        // Unknown provider: the error names the deposit place.
+        let unknown = match super::extension_provider_auth("ghostprov") {
+            Err(e) => e,
+            Ok(_) => panic!("ghostprov has no deposits and must not resolve"),
+        };
+        assert!(
+            unknown.contains("add it under 'providers:'"),
+            "got: {unknown}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extension_configured_providers_lists_resolvable_endpoints() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_PROVIDER",
+            "DEX_MODEL_APIS",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-provlist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  nokey:\n    base_url: https://nokey.example\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_MODEL_APIS"] {
+            std::env::remove_var(key);
+        }
+        let providers: Vec<String> = super::extension_configured_providers()
+            .into_iter()
+            .map(|e| e.provider)
+            .collect();
+        // `myprov` has key + endpoint; `nokey` has no key deposit and is
+        // skipped — the list only names providers that could actually
+        // authenticate. (Builtins appear when this machine holds their
+        // credentials, so the assertion is membership, not equality.)
+        assert!(
+            providers.contains(&"myprov".to_string()),
+            "got: {providers:?}"
+        );
+        assert!(
+            !providers.contains(&"nokey".to_string()),
+            "got: {providers:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

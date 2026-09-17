@@ -1,12 +1,22 @@
--- web: provider-native web search + URL fetch for the current model.
+-- web: provider-native web search + URL fetch, model-independent.
 --
 -- Reference extension for model-aware Lua extensions: it registers
--- provider-native tools (`search` everywhere, `fetch` on Gemini
--- only — the model sees them as `ext__web__search` / `ext__web__fetch`;
--- extension code uses the short names and the host resolves them),
--- reuses the *current* model's endpoint + key (`dex.model`), hides tools
--- the model cannot serve (`model_select` + `dex.tools.set_active`), and
--- never switches the model silently (cost safety — switch with /model).
+-- provider-native tools (`search` wherever a target exists, `fetch` when a
+-- Gemini target exists — the model sees them as `ext__web__search` /
+-- `ext__web__fetch`; extension code uses the short names and the host
+-- resolves them), reuses the current model's endpoint + key (`dex.model`),
+-- falls back to a configured override provider (`/search-model`) when the
+-- current model cannot serve search, hides tools no target can serve
+-- (`model_select` + `dex.tools.set_active`), and never switches the served
+-- model silently (cost safety — switch with /model).
+--
+-- Target: the current model when its family serves search, else the
+-- `override_model` (dex.state, set with /search-model) — the extension
+-- calls that provider's configured endpoint with that provider's own
+-- key (`dex.model.auth(provider)` + the `net.providers` capability),
+-- so search works even when the served model has no search API. Never
+-- both: a served attempt bills, so a transient failure on the current
+-- model errors instead of retrying cross-provider (cost safety).
 --
 -- Copy this directory to `$XDG_CONFIG_HOME/dex/extensions/web`
 -- (or `dex extensions install <dir>`) to use it.
@@ -22,34 +32,144 @@ return function(dex)
   -- Provider-side search/grounding rounds run ~40s+ non-streamed; keep
   -- this under the manifest per-tool `timeout` (120s).
   local NET_TIMEOUT_MS = 100000
+  -- dex.state key holding the override model as "provider/model" (false =
+  -- unset; dex.state has no delete, so `off` writes false).
+  local OVERRIDE_KEY = "override_model"
 
-  -- Which provider family serves this model. Gemini speaks its own search
-  -- + url_context tools; OpenAI-Responses and Anthropic-Messages wires
-  -- carry a web_search tool; anything else errors loudly at call time
-  -- (never a silent model switch).
-  local function provider_kind(provider, api)
-    provider = string.lower(provider or "")
-    api = api or ""
-    if provider == "gemini" or provider == "google" then
-      return "gemini"
+    -- Which provider family serves a model. Gemini speaks its own search +
+    -- url_context tools; OpenAI-Responses and Anthropic-Messages wires carry
+    -- a web_search tool; anything else is unsupported (and the tool is then
+    -- hidden, not offered-and-broken). Order matters: the codex deny comes
+    -- first (it rides the OpenAI wire but its backend-api serves no search
+    -- tool), Gemini stays name-first (generics default to the
+    -- openai-responses wire string even when their endpoint speaks the
+    -- Gemini API), and otherwise the wire wins over the name — a re-pinned
+    -- provider (e.g. anthropic on openai-responses) serves its wire's tool.
+    local function provider_kind(provider, api)
+      provider = string.lower(provider or "")
+      api = api or ""
+      if provider == "openai-codex" or provider == "codex" then
+        return "unsupported"
+      end
+      if provider == "gemini" or provider == "google" then
+        return "gemini"
+      end
+      if api == "anthropic-messages" then
+        return "anthropic"
+      end
+      if api == "openai-responses" then
+        return "openai"
+      end
+      if provider == "anthropic" then
+        return "anthropic"
+      end
+      return "unsupported"
     end
-    if provider == "anthropic" or api == "anthropic-messages" then
-      return "anthropic"
+
+    -- Family for a *named* provider from its configured wire
+    -- (`dex.model.auth(provider)` reports the provider's `api:` pin /
+    -- default — a re-pin beats the name). Never errors — unknown or
+    -- keyless providers simply don't become targets (the /search-model
+    -- command surfaces the auth error itself, at set time).
+    local function kind_for_provider(provider)
+      local ok, auth = pcall(dex.model.auth, provider)
+      if ok and type(auth) == "table" and type(auth.api) == "string" then
+        return provider_kind(provider, auth.api)
+      end
+      if ok then
+        return provider_kind(provider, nil)
+      end
+      return "unsupported"
     end
-    if api == "openai-responses" then
-      return "openai"
-    end
-    return "unsupported"
-  end
 
   -- Current model (never a silent switch: the extension serves whatever
   -- dex serves — change it with /model).
   local function current_model()
     local ok, current = pcall(dex.model.current)
     if not ok or type(current) ~= "table" then
-      error("web: no model configured (set model: <provider>/<model>)")
+      error("web: no model configured (set model: <provider>/<model>)", 0)
     end
     return current.id, current
+  end
+
+    -- Split + canonicalize an override value: trimmed model, lowercased
+    -- provider (host resolution is case-insensitive, but target dedup
+    -- compares exact strings — normalize once, here). One helper for both
+    -- the reader and the /search-model writer.
+    local function split_override(text)
+      if type(text) ~= "string" then
+        return nil
+      end
+      local provider, model = string.match(text, "^%s*([%w%-]+)/(.+)%s*$")
+      if not provider then
+        return nil
+      end
+      model = string.gsub(model, "%s+$", "")
+      if model == "" then
+        return nil
+      end
+      return string.lower(provider), model
+    end
+
+    local function parse_override()
+      return split_override(dex.state.get(OVERRIDE_KEY))
+    end
+
+    -- The single serving target: the current model when its family serves
+    -- search, else the override (never both — a served attempt bills, so a
+    -- transient failure must not retry cross-provider; see the header).
+    local function search_targets(current)
+    local targets = {}
+    local function add(kind, provider, model, origin, is_current)
+      for _, t in ipairs(targets) do
+        if t.provider == provider and t.model == model then
+          return
+        end
+      end
+      targets[#targets + 1] = {
+        kind = kind,
+        provider = provider,
+        model = model,
+        origin = origin,
+        current = is_current,
+      }
+    end
+      local ck = provider_kind(current.provider, current.api)
+      if ck ~= "unsupported" then
+        add(ck, current.provider, current.model, "current model " .. current.id, true)
+        return targets
+      end
+      local provider, model = parse_override()
+    if provider then
+      local kind = kind_for_provider(provider)
+      if kind ~= "unsupported" then
+        add(kind, provider, model, "override " .. provider .. "/" .. model, false)
+      end
+    end
+    return targets
+  end
+
+  local function auth_for(target)
+    local ok, auth = pcall(dex.model.auth, target.current and nil or target.provider)
+    if ok and type(auth) == "table" then
+      return auth
+    end
+    return nil, tostring(auth)
+  end
+
+  -- Actionable guidance as a tool *result*, not an error: the agent reads
+  -- it, relays the options, and does not retry.
+  local function unavailable(id)
+    return "web: no provider-native search is available for '" .. id .. "'.\n"
+      .. "Served wire families with a search tool: gemini (google_search), "
+      .. "openai-responses (web_search), anthropic-messages (web_search).\n"
+      .. "Fixes, in preference order:\n"
+      .. "1. /model <provider>/<model> — switch to a model with native search.\n"
+      .. "2. /search-model <provider>/<model> — set an override; the extension then "
+      .. "calls that provider's configured endpoint and key (the provider must exist "
+      .. "under 'providers:' in config.yaml). Works across providers.\n"
+      .. "3. /search-model off — clear an override.\n"
+      .. "Do not retry search as-is; tell the user about the options instead."
   end
 
   local function urlencode(text)
@@ -72,18 +192,18 @@ return function(dex)
 
   local function check_response(res, what)
     if type(res) ~= "table" then
-      error("web: " .. what .. " failed (no response)")
+      error("web: " .. what .. " failed (no response)", 0)
     end
     if res.status ~= 200 then
       local detail = ""
       if type(res.body) == "string" and res.body ~= "" then
         detail = ": " .. string.sub(res.body, 1, 300)
       end
-      error("web: " .. what .. " failed (status " .. tostring(res.status) .. ")" .. detail)
+      error("web: " .. what .. " failed (status " .. tostring(res.status) .. ")" .. detail, 0)
     end
     local ok, data = pcall(dex.json.decode, res.body)
     if not ok or type(data) ~= "table" then
-      error("web: " .. what .. " returned a non-JSON body")
+      error("web: " .. what .. " returned a non-JSON body", 0)
     end
     return data
   end
@@ -266,28 +386,60 @@ return function(dex)
     return table.concat(texts, "\n"), sources
   end
 
-  local function unsupported(id)
-    error("web: model '" .. id .. "' has no search API "
-      .. "(supported: gemini, openai-responses, anthropic-messages). "
-      .. "Switch with /model to a supported one.")
+  local FAMILY = {
+    gemini = gemini_search,
+    openai = openai_search,
+    anthropic = anthropic_search,
+  }
+
+  -- One attempt against one target: run(auth, target.model, ...) on
+  -- success, or a "<origin>: <why>" failure line.
+  local function attempt(target, run, ...)
+    local auth, auth_err = auth_for(target)
+    if not auth then
+      return nil, nil, target.origin .. ": " .. (auth_err or "no credentials")
+    end
+    local ok, a, b, c = pcall(run, auth, target.model, ...)
+    if ok then
+      return a, b, c
+    end
+    return nil, nil, target.origin .. ": " .. tostring(a)
   end
 
   -- -- visibility --------------------------------------------------------
-  -- Gemini serves both tools; every other supported family serves search
-  -- only. Synced on `model_select` (fired on every first turn, and on every
-  -- switch after) — never at load, where host calls are unavailable. The
-  -- tools enforce the same gate at call time, so a stale slice fails
-  -- loudly instead of mis-serving.
+    -- Tools are hidden when no target can serve them — a tool that always
+    -- errors must never enter the model's schema. Synced on `model_select`
+    -- (fired on every first turn, and on every switch after) and by the
+    -- /search-model command itself (model_select only fires on change, so
+    -- an override set under the same served model would otherwise stay
+    -- hidden) — never at load, where host calls are unavailable. The tools
+    -- enforce the same gate at call time, so a stale slice fails loudly
+    -- instead of mis-serving.
   local function sync_visibility()
     local ok, current = pcall(dex.model.current)
     if not ok or type(current) ~= "table" then
       return
     end
-    if provider_kind(current.provider, current.api) == "gemini" then
-      dex.tools.set_active({ SEARCH_TOOL, FETCH_TOOL })
-    else
-      dex.tools.set_active({ SEARCH_TOOL })
+    local ck = provider_kind(current.provider, current.api)
+    local active = {}
+    if ck ~= "unsupported" then
+      active[#active + 1] = SEARCH_TOOL
     end
+    if ck == "gemini" then
+      active[#active + 1] = FETCH_TOOL
+    end
+    local provider = parse_override()
+    if provider then
+      local kind = kind_for_provider(provider)
+      if kind == "gemini" then
+        -- The override serves both tools even when the current model can
+        -- serve neither.
+        active = { SEARCH_TOOL, FETCH_TOOL }
+      elseif kind ~= "unsupported" and ck == "unsupported" then
+        active[#active + 1] = SEARCH_TOOL
+      end
+    end
+    dex.tools.set_active(active)
   end
 
   -- -- tools --------------------------------------------------------------
@@ -296,30 +448,37 @@ return function(dex)
     execute = function(ctx, args)
       local query = args.query
       if type(query) ~= "string" or query == "" then
-        error("search: query must be a non-empty string")
+        error("search: query must be a non-empty string", 0)
       end
       local count = args.count or 5
       if type(count) ~= "number" or count < 1 then
         count = 5
       end
       local id, current = current_model()
-      local model = current.model
-      local kind = provider_kind(current.provider, current.api)
-      local auth = dex.model.auth()
-      local text, sources
-      if kind == "gemini" then
-        text, sources = gemini_search(auth, model, query)
-      elseif kind == "openai" then
-        text, sources = openai_search(auth, model, query)
-      elseif kind == "anthropic" then
-        text, sources = anthropic_search(auth, model, query)
-      else
-        unsupported(id)
+      local targets = search_targets(current)
+      if #targets == 0 then
+        return unavailable(id)
       end
-      if text == "" then
-        text = "(no answer text returned)"
+      local failures = {}
+      for _, target in ipairs(targets) do
+        local text, sources, failure = attempt(target, FAMILY[target.kind], query)
+        if text then
+          if text == "" then
+            text = "(no answer text returned)"
+          end
+          return render(text, sources, nil, count)
+        end
+        failures[#failures + 1] = failure
       end
-      return render(text, sources, nil, count)
+        -- A served failure is guidance, not an error — like fetch below
+        -- and the no-target path above: the agent relays the options
+        -- instead of retrying.
+        return "web: search failed for '"
+          .. id
+          .. "' — "
+          .. table.concat(failures, "; ")
+          .. ".\n"
+          .. unavailable(id)
     end,
   })
 
@@ -327,32 +486,101 @@ return function(dex)
     name = "fetch",
     execute = function(ctx, args)
       if type(args.urls) ~= "table" or #args.urls == 0 then
-        error("fetch: urls must be a non-empty array of strings")
+        error("fetch: urls must be a non-empty array of strings", 0)
       end
       local query = args.query or ""
       local id, current = current_model()
-      if provider_kind(current.provider, current.api) ~= "gemini" then
-        error("fetch: model '" .. id .. "' cannot fetch URLs (Gemini models only)")
+      -- URL context is Gemini's url_context tool: current gemini, else a
+      -- gemini override.
+      local targets = {}
+      for _, target in ipairs(search_targets(current)) do
+        if target.kind == "gemini" then
+          targets[#targets + 1] = target
+        end
       end
-      local auth = dex.model.auth()
+      if #targets == 0 then
+        return unavailable(id)
+      end
       local texts, sources, failed = {}, {}, {}
       local seen = {}
       for _, url in ipairs(args.urls) do
         if type(url) ~= "string" or url == "" then
           failed[#failed + 1] = "(empty url skipped)"
         else
-          local ok, text, page_sources = pcall(gemini_fetch_url, auth, current.model, url, query)
-          if ok then
-            texts[#texts + 1] = "## " .. url .. "\n" .. text
-            for _, s in ipairs(page_sources) do
-              push_source(sources, seen, s.url, s.title)
+          local served = false
+          local attempts = {}
+          for _, target in ipairs(targets) do
+            local text, page_sources, failure =
+              attempt(target, gemini_fetch_url, url, query)
+            if text then
+              texts[#texts + 1] = "## " .. url .. "\n" .. text
+              for _, s in ipairs(page_sources) do
+                push_source(sources, seen, s.url, s.title)
+              end
+              served = true
+              break
             end
-          else
-            failed[#failed + 1] = url .. " (" .. tostring(text) .. ")"
+            attempts[#attempts + 1] = failure
+          end
+          if not served then
+            failed[#failed + 1] = url .. " (" .. table.concat(attempts, "; ") .. ")"
           end
         end
       end
+      if #texts == 0 and #failed == #args.urls then
+        -- Nothing worked at all: surface the guidance instead of a bare
+        -- failure list.
+        return unavailable(id) .. "\nFailed:\n- " .. table.concat(failed, "\n- ")
+      end
       return render(table.concat(texts, "\n\n"), sources, failed, #args.urls)
+    end,
+  })
+
+  -- -- /search-model: the user-facing override knob -----------------------
+  dex.commands.register({
+    name = "search-model",
+    description = "web: set the search/fetch override model (<provider>/<model>, or 'off')",
+    execute = function(ctx, arg)
+      local text = string.gsub(string.gsub(arg or "", "^%s+", ""), "%s+$", "")
+        if text == "" or string.lower(text) == "off" or string.lower(text) == "false" then
+          dex.state.set(OVERRIDE_KEY, false)
+          sync_visibility()
+          return "web: search override cleared — search serves the current model only"
+        end
+        local provider, model = split_override(text)
+        if not provider then
+          error(
+            "web: /search-model needs '<provider>/<model>' (e.g. anthropic/claude-sonnet-4-5) or 'off'",
+            0
+          )
+        end
+        -- Validate now, not at search time: the provider must exist (its
+        -- auth error says where to declare it), and its wire must actually
+        -- carry a search tool.
+        local ok, auth = pcall(dex.model.auth, provider)
+        if not ok then
+          error("web: unknown search provider '" .. provider .. "': " .. tostring(auth), 0)
+        end
+        local kind = provider_kind(
+          provider,
+          type(auth) == "table" and type(auth.api) == "string" and auth.api or nil
+        )
+        if kind == "unsupported" then
+        error(
+          "web: provider '" .. provider
+            .. "' has no provider-native search to override with (need gemini, "
+            .. "anthropic, or an openai-responses provider)",
+          0
+        )
+      end
+        dex.state.set(OVERRIDE_KEY, provider .. "/" .. model)
+        -- Re-sync here: model_select only fires on provider/model change,
+        -- so without this the tools would stay hidden until a /model
+        -- switch.
+        sync_visibility()
+        return "web: search override set to " .. provider .. "/" .. model
+        .. " (family " .. kind .. ") — search/fetch now fall back to it "
+        .. "when the current model has no native search"
     end,
   })
 
