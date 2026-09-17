@@ -1426,15 +1426,17 @@ pub(crate) struct ConfiguredProviderEndpoint {
 }
 
 /// Every configured provider that could actually authenticate: builtins
-/// count when their key deposits resolve, generics when their entry has a
-/// key (or the catalog env var is set). Sorted by provider name. Shared by
-/// the `net.providers` fetch allowlist and `dex.model.providers()`.
+/// count when their key deposits resolve, generics with a file entry count
+/// when theirs do (file key or the catalog env var). Sorted by provider
+/// spelling (alias spellings dedupe to one canonical entry below). Shared
+/// by the `net.providers` fetch allowlist and `dex.model.providers()`.
 pub(crate) fn extension_configured_providers() -> Vec<ConfiguredProviderEndpoint> {
     let file = load_config_file();
     let entries = load_provider_entries(&file);
     let known = known_providers(&entries);
     let mut names: BTreeSet<String> = entries.keys().cloned().collect();
-    names.extend(["opencode", "openai-codex", "codex", "anthropic"].map(String::from));
+    // Builtins need no file entry — the single list lives on `Provider`.
+    names.extend(Provider::BUILTINS.iter().map(ToString::to_string));
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for name in names {
@@ -6725,6 +6727,27 @@ pub(crate) mod tests {
             .keys()
             .all(|k| !k.eq_ignore_ascii_case("authorization")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_provider_names_stay_in_sync_with_parse_known() {
+        // `extension_configured_providers` seeds discovery from this list; every
+        // entry must resolve without any file entry, or builtins silently drop
+        // out of `net.providers` / `dex.model.providers()`.
+        let known = std::collections::BTreeSet::new();
+        for name in crate::core::types::Provider::BUILTINS {
+            assert!(
+                crate::core::types::Provider::parse_known(name, &known).is_some(),
+                "BUILTINS entry '{name}' must parse without any file entry"
+            );
+        }
+        // Alias spellings land on one canonical provider.
+        assert_eq!(
+            crate::core::types::Provider::parse_known("codex", &known)
+                .map(|p| p.name().to_string()),
+            crate::core::types::Provider::parse_known("openai-codex", &known)
+                .map(|p| p.name().to_string()),
+        );
     }
 
     #[test]
