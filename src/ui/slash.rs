@@ -95,6 +95,13 @@ struct SlashKey {
     provider: String,
     models_hash: u64,
     skills_hash: u64,
+    /// Registered extension slash commands: `/extensions reload` (or a
+    /// daemon push) changes what the popup may offer without touching
+    /// the input, model list, or sessions dir.
+    ext_hash: u64,
+    /// Workspace the `/resume` listing was read from: a cwd switch with an
+    /// identical sessions-dir mtime must still miss.
+    cwd: String,
     resume_mtime: Option<std::time::SystemTime>,
 }
 
@@ -137,6 +144,13 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
                 .map(|s| s.name.clone())
                 .collect::<Vec<_>>(),
         ),
+        ext_hash: str_list_hash(
+            &crate::extensions::command_list()
+                .into_iter()
+                .map(|(_, name, _)| name)
+                .collect::<Vec<_>>(),
+        ),
+        cwd: app.cwd.clone(),
         // One stat per input change; a sessions-dir rewrite (new/removed
         // session) invalidates the `/resume` listing.
         resume_mtime: Session::list_dir_mtime(&app.cwd),

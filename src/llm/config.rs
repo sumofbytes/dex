@@ -42,42 +42,56 @@ fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathB
 /// unchanged.
 struct FileCache<T> {
     path: std::path::PathBuf,
-    mtime: SystemTime,
-    len: u64,
+    /// FNV-1a of the file bytes: identity is content, not (mtime, len),
+    /// so same-length rewrites within one mtime tick and mtime-preserving
+    /// copies still miss. Reads are per call (these files are KBs, the
+    /// catalog parse below stays cached); the hit saves the parse.
+    hash: u64,
     value: T,
 }
 
-/// Stat `path` and serve `cache`'s stored parse while (path, mtime, len) is
-/// unchanged; on a miss, read the file and hand the text to `parse`, storing
-/// the result. `parse` gets `None` when the read failed and returns `None`
-/// when nothing should be cached (stat/read/parse failure) — the caller
-/// decides what that means (empty default vs hard failure).
+fn fnv_bytes(text: &str) -> u64 {
+    let mut h = 14695981039346656037u64;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
+}
+
+/// Read `path` and serve `cache`'s stored parse while the content hash is
+/// unchanged; on a miss, hand the text to `parse`, storing the result.
+/// `parse` gets `None` when the read failed and returns `None` when nothing
+/// should be cached (read/parse failure) — the caller decides what that
+/// means (empty default vs hard failure). Identity is the content hash
+/// rather than (mtime, len): a same-length rewrite inside one mtime tick
+/// (FAT/NFS 1–2 s granularity, `cp -p`, checkout preserving mtime) still
+/// misses instead of serving stale config/endpoints indefinitely.
 /// Poisoned-mutex recovery matches the rest of the daemon: keep the value.
 fn cached_parse<T: Clone>(
     cache: &OnceLock<Mutex<Option<FileCache<T>>>>,
     path: &std::path::Path,
     parse: impl FnOnce(Option<String>) -> Option<T>,
 ) -> Option<T> {
-    let meta = std::fs::metadata(path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    let text = std::fs::read_to_string(path).ok()?;
+    let hash = fnv_bytes(&text);
     if let Some(hit) = cache
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .filter(|cached| cached.path == path && cached.mtime == mtime && cached.len == len)
+        .filter(|cached| cached.path == path && cached.hash == hash)
     {
         return Some(hit.value.clone());
     }
-    let value = parse(std::fs::read_to_string(path).ok())?;
+    let value = parse(Some(text))?;
     cache
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .replace(FileCache {
             path: path.to_path_buf(),
-            mtime,
-            len,
+            hash,
             value: value.clone(),
         });
     Some(value)
@@ -813,16 +827,18 @@ fn with_catalog_index<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
         }
     }
     let catalog = load_dex_catalog()?;
-    let fresh = build_catalog_index(path, mtime, len, &catalog);
+    let fresh = build_catalog_index(path.clone(), mtime, len, &catalog);
     let guard = CATALOG_INDEX
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // A concurrent turn may have rebuilt while this one parsed — serve the
     // newest generation either way (same file identity, same content).
+    // The path check stays: an `XDG_CACHE_HOME` switch between the two
+    // locks must not serve the other cache dir's index as this path's.
     if let Some(index) = guard
         .as_ref()
-        .filter(|index| index.mtime == mtime && index.len == len)
+        .filter(|index| index.path == path && index.mtime == mtime && index.len == len)
     {
         return Some(f(index));
     }

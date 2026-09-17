@@ -25,20 +25,6 @@ pub(crate) fn estimate_ephemeral_tokens(parts: &[Option<String>]) -> u64 {
     (chars as u64) / 4 + (parts.len() as u64 * PER_MESSAGE_OVERHEAD)
 }
 
-/// Byte-counting sink for `serde_json::to_writer`: measures the serialized
-/// length without materializing the item text.
-struct ByteCounter(usize);
-
-impl std::io::Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 += buf.len();
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Byte length of a message's replayed payload (content, tool calls,
 /// reasoning, framing) — the shared body of the token estimator, used by
 /// `estimate_tokens` and the cut-point walk.
@@ -56,11 +42,7 @@ pub(crate) fn message_char_len(message: &ChatMessage) -> usize {
         + message.reasoning_items.as_ref().map_or(0, |items| {
             items
                 .iter()
-                .map(|item| {
-                    let mut counter = ByteCounter(0);
-                    let _ = serde_json::to_writer(&mut counter, item);
-                    counter.0
-                })
+                .map(|item| serde_json::to_string(item).map_or(0, |s| s.len()))
                 .sum()
         });
     // Role and name framing
@@ -149,15 +131,20 @@ pub(crate) fn schema_budget_tokens() -> u64 {
 /// Same ~4-chars-per-token heuristic as [`estimate_tokens`]: namespaced
 /// name + description + serialized parameters per definition.
 pub(crate) fn schema_token_estimate(defs: &[crate::core::types::ToolDefinition]) -> u64 {
-    let chars: usize = defs
-        .iter()
+    (schema_chars(defs) as u64) / 4 + (defs.len() as u64 * PER_MESSAGE_OVERHEAD)
+}
+
+/// Raw char count behind [`schema_token_estimate`]: per-tool shares for the
+/// extension `active`-slice budget, which replicates the sum-then-divide
+/// formula on the subset so whole-cache and sliced totals stay bit-identical.
+pub(crate) fn schema_chars(defs: &[crate::core::types::ToolDefinition]) -> usize {
+    defs.iter()
         .map(|d| {
             d.function.name.len()
                 + d.function.description.len()
                 + d.function.parameters.to_string().len()
         })
-        .sum();
-    (chars as u64) / 4 + (defs.len() as u64 * PER_MESSAGE_OVERHEAD)
+        .sum()
 }
 
 #[cfg(test)]

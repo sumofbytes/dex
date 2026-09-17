@@ -1072,6 +1072,15 @@ impl TranscriptView {
                 expanded: false,
             });
         }
+        // Every transcript mutation must extend/truncate `wrapped_cache`
+        // alongside (or clear both, like `reset_session_state`): a missed
+        // site serves stale rows with no other signal. The tail-append path
+        // below only ever pushes, so this holds on entry to the wrap loop.
+        debug_assert_eq!(
+            app.wrapped_cache.len(),
+            app.transcript.len(),
+            "wrapped_cache drifted from transcript — new mutation site missed the parallel cache"
+        );
         for (idx, block) in app.transcript.iter().enumerate() {
             if app.wrapped_cache[idx].stamp == block.stamp() {
                 continue;
@@ -2358,7 +2367,7 @@ mod tests {
             transcript_area: None,
             selection: None,
             notice: None,
-            status_tokens_cache: std::cell::Cell::new((0, 0, 0, 0)),
+            status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
             slash_cache: std::cell::RefCell::new(None),
         }
     }

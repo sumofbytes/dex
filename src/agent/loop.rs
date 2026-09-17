@@ -107,20 +107,19 @@ pub(crate) fn persist_pending(
     Ok(())
 }
 
-/// Re-persist the (compacted) history: clear the session file and rewrite
-/// every message after the system prompt. Single-sources the journal
-/// invariant that the file mirrors `messages` after any compaction
-/// rewrites it (threshold gate, emergency, online boundary).
+/// Re-persist the (compacted) history: atomically replace the session file
+/// with header + `clear` + every message after the system prompt.
+/// Single-sources the journal invariant that the file mirrors `messages`
+/// after any compaction rewrites it (threshold gate, emergency, online
+/// boundary). Atomic (`Session::rewrite_messages`): readers never see a
+/// torn clear-plus-partial-tail.
 fn rewrite_session(
     session: Option<&mut Session>,
     messages: &[ChatMessage],
     persisted_cursor: &mut usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(session) = session {
-        session.clear_messages()?;
-        for message in messages.iter().skip(1) {
-            session.append_message(message)?;
-        }
+        session.rewrite_messages(messages)?;
     }
     *persisted_cursor = messages.len();
     Ok(())
@@ -370,19 +369,25 @@ pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
 }
 
 /// Proactive compaction gate, run before every model call: compact while
-/// the (projected) context exceeds the token threshold or — without online
+/// the stored context exceeds the token threshold or — without online
 /// compaction — the message-count cap, at most three attempts. Threshold
 /// compactions carry their cache re-write as debt the boundary economics
 /// repay (math moved verbatim from the original inline block).
+/// The budget is re-derived from the ledger after every cut: re-checking a
+/// stale pre-cut number forces up to three compactions even when the first
+/// already fit. Stored (not projected): the gate guards the window AND the
+/// journal — a projected-only reading defers while the stored history grows
+/// unbounded — matching the boundary economics and the pre-pack behavior.
+/// The per-request sampler keeps the projected number (bytes actually sent).
 #[allow(clippy::too_many_arguments)]
 async fn compaction_gate(
     config: &LlmConfig,
     console: &Console,
     messages: &mut Vec<ChatMessage>,
-    // Precomputed prompt budget for this iteration (ledger/projected +
-    // ephemeral + schema): the gate re-checks the same number each attempt
-    // — only the message-count fallback changes as compaction cuts.
-    eff: u64,
+    // Ephemeral + schema overhead for this iteration (call-time preamble +
+    // tool schemas, never stored): the gate adds the ledger's stored total
+    // fresh each attempt.
+    budget_overhead: u64,
     cancel: &(dyn CancellationSource + Send + Sync),
     mut session: Option<&mut Session>,
     persisted_cursor: &mut usize,
@@ -391,6 +396,7 @@ async fn compaction_gate(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut compaction_attempts = 0;
     while compaction_attempts < 3 {
+        let eff = ledger.stored_tokens() + budget_overhead;
         let need_by_tokens = eff > config.compaction_threshold();
         // The message-count fallback is a global cap — exactly what the
         // online compaction economics replace. With the experiment on,
@@ -1111,11 +1117,15 @@ where
             None => ledger.stored_tokens(),
         } + estimate_ephemeral_tokens(&ephemerals)
             + schema_budget_tokens();
+        // Stored-budget overhead for the gate: the gate re-derives
+        // ledger + overhead per attempt (see `compaction_gate`); the
+        // sampler below keeps the projected `eff` (bytes actually sent).
+        let budget_overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
         compaction_gate(
             config,
             console,
             messages,
-            eff,
+            budget_overhead,
             cancellation,
             session.as_deref_mut(),
             &mut persisted_cursor,
