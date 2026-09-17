@@ -3,7 +3,8 @@
 
 use crate::core::types::{ApiProtocol, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
-use crate::llm::stream::Turn;
+use crate::llm::sse::is_mid_stream;
+use crate::llm::sse::Turn;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -16,19 +17,6 @@ use std::sync::{Mutex, OnceLock};
 fn probed_apis() -> &'static Mutex<HashMap<(String, String), ApiProtocol>> {
     static MAP: OnceLock<Mutex<HashMap<(String, String), ApiProtocol>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Failure raised after output already streamed; defined in `stream.rs` (the
-/// stream driver knows when output actually flowed), re-exported here where
-/// the protocol-fallback gate consumes it.
-pub(crate) use crate::llm::stream::MidStreamError;
-
-/// Only a failure with no streamed output (HTTP status, connect failure,
-/// drop before the first delta) qualifies for protocol fallback; a
-/// mid-stream failure may have already put partial text on the transcript,
-/// and a retried call would duplicate it.
-pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
-    err.downcast_ref::<MidStreamError>().is_some()
 }
 
 /// Wire protocol for this call: an explicit pin (config-file `api:` or the
@@ -71,16 +59,16 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if !config.provider.has_protocol_fallback() {
         return false; // codex backend-api has no /chat/completions
     }
-    if crate::llm::client::is_rate_limited(err) {
+    if crate::llm::http::is_rate_limited(err) {
         return false; // transient capacity — retry the same protocol instead
     }
-    if crate::llm::stream::is_stream_idle_error(err) {
+    if crate::llm::sse::is_stream_idle_error(err) {
         return false; // transient stall — retried same-protocol, not a mismatch
     }
-    if crate::llm::stream::is_dropped_connection(err) {
+    if crate::llm::sse::is_dropped_connection(err) {
         return false; // dead socket — retried same-protocol, not a mismatch
     }
-    !err.contains("cancelled")
+    !crate::llm::http::is_cancelled_message(err)
 }
 
 pub(crate) async fn complete(
@@ -169,6 +157,7 @@ mod tests {
     use super::*;
     use crate::core::types::Provider;
     use crate::llm::config::tests::test_cfg;
+    use crate::llm::sse::MidStreamError;
 
     /// Set/restore env around gate tests (local copy of config's EnvRestore).
     struct EnvGuard {
