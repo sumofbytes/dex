@@ -2109,16 +2109,19 @@ pub(crate) mod tests {
         );
     }
 
+    /// Fresh temp root for a fixture, unique per process. The system clock
+    /// is too coarse (50 ns here) for parallel tests: two `#[tokio::test]`s
+    /// starting together got the same `subsec_nanos` and clobbered each
+    /// other's `extension.lua`, deleting the dir mid-test.
+    fn fixture_root(prefix: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
+    }
+
     /// Write a fixture extension dir; returns the parent temp dir.
     pub(crate) fn fixture_ext(manifest: &str, lua: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "dex-ext-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let root = fixture_root("dex-ext-test");
         let dir = root.join("ext");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("manifest.yaml"), manifest).unwrap();
@@ -2282,14 +2285,7 @@ end
     /// Write several fixture extensions under one parent; each item is
     /// (id, manifest, lua). Returns the parent dir for `refresh_with`.
     pub(crate) fn fixture_exts(items: &[(&str, &str, &str)]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "dex-exts-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let root = fixture_root("dex-exts-test");
         for (id, manifest, lua) in items {
             let dir = root.join(id);
             std::fs::create_dir_all(&dir).unwrap();
