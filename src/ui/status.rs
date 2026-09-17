@@ -169,6 +169,62 @@ fn branch_pieces(app: &App) -> Vec<Piece> {
 /// `↑42k ↓1.2k` (cumulative in/out), `123 tok/s`. Redundant detail is
 /// dropped, never information: the cached absolute is the ctx number times
 /// its %, and a trailing `.0` on scaled tokens says nothing.
+/// Context size for the status bar: provider-reported prompt tokens once
+/// the first `Usage` event lands, else a cached transcript estimate (perf
+/// doc §29). The estimate is served from `App::status_tokens_cache` while
+/// the history fingerprint is unchanged, so per-frame callers (keystrokes,
+/// SSE batches, busy ticks) pay one O(messages) sample per history change
+/// instead of a full char walk per frame. Display-only — a stale read would
+/// merely lag the ctx % by a frame.
+pub(super) fn status_tokens(app: &App) -> u64 {
+    if let Some(usage) = app.tool_state.last_usage {
+        return usage;
+    }
+    let key = (app.messages.len(), history_fingerprint(&app.messages));
+    let (n, f, tokens) = app.status_tokens_cache.get();
+    if (n, f) == key {
+        return tokens;
+    }
+    let tokens = crate::agent::compaction::estimate_tokens(&app.messages);
+    app.status_tokens_cache.set((key.0, key.1, tokens));
+    tokens
+}
+
+/// Cheap history identity: FNV-1a over per-message (role, byte lengths,
+/// head/tail samples). A same-length middle edit or tail replace changes
+/// sampled bytes and misses — the old (len, tail-len) key collided on
+/// those. O(messages) pointer/len reads, never a full char walk, so a hit
+/// still avoids the estimator's walk.
+fn history_fingerprint(messages: &[crate::core::types::ChatMessage]) -> u64 {
+    let mut h = 14695981039346656037u64;
+    let mut mix = |b: u8| {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(1099511628211);
+    };
+    for m in messages {
+        for b in m.role.as_str().as_bytes() {
+            mix(*b);
+        }
+        sample_text(&mut mix, m.content.as_deref().unwrap_or_default());
+        sample_text(&mut mix, m.reasoning_content.as_deref().unwrap_or_default());
+        mix((m.reasoning_items.as_ref().map_or(0, Vec::len) & 0xff) as u8);
+    }
+    h
+}
+
+/// Length + first/last 32 bytes: catches same-length swaps anywhere except
+/// a mid-body change with identical endpoints — vanishingly rare, and the
+/// miss only lags a display number by a frame.
+fn sample_text(mix: &mut impl FnMut(u8), text: &str) {
+    let bytes = text.as_bytes();
+    for b in (bytes.len() as u64).to_le_bytes() {
+        mix(b);
+    }
+    for b in bytes.iter().take(32).chain(bytes.iter().rev().take(32)) {
+        mix(*b);
+    }
+}
+
 pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     // Transient notice (copy confirmation) takes over the line until it
     // expires: unmissable feedback beats the quiet facts for two seconds.
@@ -177,10 +233,7 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
             return vec![(text.clone(), Style::default().fg(Color::Green))];
         }
     }
-    let tokens = app
-        .tool_state
-        .last_usage
-        .unwrap_or_else(|| crate::agent::compaction::estimate_tokens(&app.messages));
+    let tokens = status_tokens(app);
     let context_pct = if app.config.context_window == 0 {
         0
     } else {
@@ -403,14 +456,17 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
     let hint = hint_pieces(app);
     let conn = conn_piece(app);
     let conn_w = pieces_width(std::slice::from_ref(&conn));
-    let candidates = [
-        status_pieces(app, true),
-        status_pieces(app, false),
-        compact_pieces(app),
-        bare_pieces(app),
-    ];
+    // Tier candidates build lazily, widest first: the full line almost
+    // always fits, so on a wide terminal the narrower tiers (and their
+    // transcript walks) never build at all.
     let mut left_only: Option<Vec<Piece>> = None;
-    for candidate in candidates {
+    for tier in 0..4 {
+        let candidate = match tier {
+            0 => status_pieces(app, true),
+            1 => status_pieces(app, false),
+            2 => compact_pieces(app),
+            _ => bare_pieces(app),
+        };
         let mut left = hint.clone();
         left.extend(candidate);
         let lw = pieces_width(&left);
