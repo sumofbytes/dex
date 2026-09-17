@@ -142,14 +142,17 @@ pub(crate) enum HostOp {
     /// prefix.
     SetActive { ext: String, tools: Vec<String> },
     /// `dex.net.fetch(spec)`: one HTTP request confined to the current
-    /// model's own endpoint (the task side checks the origin). The worker
-    /// never touches the network; the awaiting task performs the request.
+    /// model's own endpoint (the task side checks the origin) — plus the
+    /// configured provider endpoints when the manifest declares
+    /// `net.providers`. The worker never touches the network; the awaiting
+    /// task performs the request.
     NetFetch {
         url: String,
         method: String,
         headers: Vec<(String, String)>,
         body: Option<String>,
         timeout_ms: u64,
+        allow_providers: bool,
     },
 }
 
@@ -410,7 +413,11 @@ async fn answer_hostcall(
             headers,
             body,
             timeout_ms,
-        } => crate::extensions::net_fetch(url, method, headers, body, timeout_ms).await,
+            allow_providers,
+        } => {
+            crate::extensions::net_fetch(url, method, headers, body, timeout_ms, allow_providers)
+                .await
+        }
         HostOp::CallOriginal { target, args } => {
             let Some(slot) = shadow.as_mut() else {
                 return Err("call_original outside a shadow has no original".to_string());
@@ -1042,12 +1049,16 @@ fn prompt_table(lua: &Lua, manifest: &Manifest) -> Table {
     prompt
 }
 
-/// `dex.model.current()/auth()`: the current model + its credentials, so a
-/// model-aware extension (provider-native search, …) can reuse the
-/// endpoint and key instead of configuring its own. Reads file+env on
-/// the worker (sync, no secrets cross into logs); the daemon records
-/// the served snapshot per turn, which wins when set. Gated on the
-/// `model` capability like `workspace.read`.
+/// `dex.model.current()/auth([provider])/providers()`: the current model +
+/// its credentials — or, with an explicit provider, that provider's
+/// credentials — so a model-aware extension (provider-native search, …) can
+/// reuse endpoints and keys instead of configuring its own, and enumerate
+/// the configured fallback vocabulary. Reads file+env on the worker (sync,
+/// no secrets cross into logs); the daemon records the served snapshot per
+/// turn, which wins when set. Gated on the `model` capability like
+/// `workspace.read` — and the explicit-provider form additionally needs
+/// `net.providers` (a bare `model` extension may read only the current
+/// model's key; every other provider's key stays out of its reach).
 fn model_table(lua: &Lua, manifest: &Manifest) -> Table {
     let ext_id = manifest.id.clone();
     let model = lua.create_table().expect("dex.model table");
@@ -1094,31 +1105,61 @@ fn model_table(lua: &Lua, manifest: &Manifest) -> Table {
         model
             .set(
                 "auth",
-                lua.create_function(move |lua, _: ()| {
+                lua.create_function(move |lua, provider: Option<String>| {
                     if !manifest.has_capability("model") {
                         return Err(LuaError::RuntimeError(format!(
                             "extension '{ext_id}' reads model auth without the model capability"
                         )));
                     }
-                    // The drive's pinned model wins when this call carries one
-                    // (this turn's model, even under concurrent turns); then
-                    // the task-side fallback (a per-request override the file
-                    // never sees); the key still resolves from the configured
-                    // deposits.
-                    let auth = match worker_drive_model()
-                        .and_then(|drive| drive.snapshot)
-                        .or_else(crate::extensions::served_model_snapshot)
-                    {
-                        Some(served) => crate::llm::config::extension_model_auth_for(
-                            &served.provider,
-                            &served.base_url,
-                        ),
-                        None => crate::llm::config::extension_model_auth(),
-                    }
-                    .map_err(LuaError::RuntimeError)?;
+                    // No argument: the current model — the drive's pinned
+                    // model wins when this call carries one (this turn's
+                    // model, even under concurrent turns); then the task-side
+                    // fallback (a per-request override the file never sees);
+                    // the key still resolves from the configured deposits.
+                      // With an explicit provider: that provider's configured
+                      // deposits instead — the model-independent vocabulary a
+                      // fallback search rides on. Gated on `net.providers`:
+                      // cross-provider keys are as sensitive as the fetches
+                      // they enable, so a bare `model` extension sees only
+                      // the current model's key.
+                      let (auth, api) =
+                          match provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                              Some(name) => {
+                                  if !manifest.has_capability("net.providers") {
+                                      return Err(LuaError::RuntimeError(format!(
+                                          "extension '{ext_id}' reads another provider's auth without the net.providers capability"
+                                      )));
+                                  }
+                                  let resolved = crate::llm::config::extension_provider_auth(name)
+                                      .map_err(LuaError::RuntimeError)?;
+                                  (resolved.auth, resolved.api)
+                              }
+                            None => {
+                                match worker_drive_model()
+                                    .and_then(|drive| drive.snapshot)
+                                    .or_else(crate::extensions::served_model_snapshot)
+                                {
+                                    Some(served) => (
+                                        crate::llm::config::extension_model_auth_for(
+                                            &served.provider,
+                                            &served.base_url,
+                                        )
+                                        .map_err(LuaError::RuntimeError)?,
+                                        served.api,
+                                    ),
+                                    None => (
+                                        crate::llm::config::extension_model_auth()
+                                            .map_err(LuaError::RuntimeError)?,
+                                        crate::llm::config::extension_model_api()
+                                            .map_err(LuaError::RuntimeError)?,
+                                    ),
+                                }
+                            }
+                        };
                     let table = lua.create_table()?;
                     table.set("api_key", auth.api_key)?;
                     table.set("base_url", auth.base_url)?;
+                    table.set("api", api)?;
                     let headers = lua.create_table()?;
                     for (name, value) in &auth.headers {
                         headers.set(name.clone(), value.clone())?;
@@ -1130,13 +1171,45 @@ fn model_table(lua: &Lua, manifest: &Manifest) -> Table {
             )
             .expect("model.auth slot");
     }
+    {
+        let ext_id = ext_id.clone();
+        let manifest = manifest.clone();
+        model
+            .set(
+                "providers",
+                lua.create_function(move |lua, _: ()| {
+                    if !manifest.has_capability("model") {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' lists providers without the model capability"
+                        )));
+                    }
+                    // Configured providers with resolvable credentials — the
+                    // fallback vocabulary. Names + endpoints only, never keys.
+                    let list = lua.create_table()?;
+                    for (index, entry) in crate::llm::config::extension_configured_providers()
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let item = lua.create_table()?;
+                        item.set("provider", entry.provider)?;
+                        item.set("base_url", entry.base_url)?;
+                        list.set(index + 1, item)?;
+                    }
+                    Ok(list)
+                })
+                .expect("model.providers fn"),
+            )
+            .expect("model.providers slot");
+    }
     model
 }
 
 /// `dex.net.fetch(spec)`: one HTTP request confined to the model's own
-/// endpoint (scheme+host+port must match `dex.model.auth().base_url`).
-/// Non-2xx is a value (`{status, headers, body}`), not a Lua error. Gated
-/// on the `net` capability (which itself requires `model`).
+/// endpoint (scheme+host+port must match `dex.model.auth().base_url`),
+/// widened to the configured provider endpoints when the manifest declares
+/// `net.providers`. Non-2xx is a value (`{status, headers, body}`), not a
+/// Lua error. Gated on the `net` capability (which itself requires
+/// `model`).
 fn net_table(lua: &Lua, manifest: &Manifest) -> Table {
     let ext_id = manifest.id.clone();
     let net = lua.create_table().expect("dex.net table");
@@ -1215,6 +1288,7 @@ fn net_table(lua: &Lua, manifest: &Manifest) -> Table {
                         headers,
                         body,
                         timeout_ms,
+                        allow_providers: manifest.has_capability("net.providers"),
                     },
                 )?;
                 let value: Json = serde_json::from_str(&json).map_err(|e| {
