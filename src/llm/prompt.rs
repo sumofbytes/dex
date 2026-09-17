@@ -56,30 +56,45 @@ pub(crate) fn project_context() -> Option<String> {
 pub(crate) fn project_context_for(dir: &Path) -> Option<String> {
     let cwd = dir.to_path_buf();
     let path = project_file_from(&cwd)?;
-    // stat → read → stat: a writer racing the read leaves mismatched
-    // identities, and the torn bytes are served once WITHOUT caching —
-    // caching post-read bytes under a pre-read identity (or vice versa)
-    // would pin stale project instructions until the *next* change.
-    let meta_before = fs::metadata(&path).ok()?;
-    let (mtime_b, len_b) = (meta_before.modified().ok()?, meta_before.len());
-    let content = fs::read_to_string(&path).ok();
+    // Cache first: the daemon rebuilds the prompt every turn, so reading the
+    // file each time was the whole cost this cache exists to remove. Identity
+    // is (mtime, len) — the same-length-rewrite hole the config caches close
+    // with a content hash is accepted here: hashing needs the read the cache
+    // avoids, and project files are hand-edited, not machine-rewritten.
+    let key = (cwd, path.clone());
+    let meta = fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    {
+        let cache = project_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            if hit.mtime == mtime && hit.len == len {
+                return hit.content.clone();
+            }
+        }
+    }
+    // Miss: read, then re-stat to reject a torn read (a writer raced us).
+    // Torn bytes are served once WITHOUT caching — caching post-read bytes
+    // under a pre-read identity would pin stale instructions until the next
+    // change — and a FAILED read is never cached, or a transient EACCES/
+    // EMFILE would hide the file for the rest of the process lifetime.
+    let content = fs::read_to_string(&path).ok()?;
     let meta_after = fs::metadata(&path).ok()?;
-    let (mtime, len) = (meta_after.modified().ok()?, meta_after.len());
-    if mtime_b != mtime || len_b != len {
-        return content;
+    let (mtime_after, len_after) = (meta_after.modified().ok()?, meta_after.len());
+    if mtime_after != mtime || len_after != len {
+        return Some(content);
     }
     let mut cache = project_cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(hit) = cache.get(&(cwd.clone(), path.clone())) {
+    if let Some(hit) = cache.get(&key) {
         if hit.mtime == mtime && hit.len == len {
             return hit.content.clone();
         }
     }
     cache.insert(
-        (cwd, path),
+        key,
         ProjectContextCache {
             mtime,
             len,
-            content: content.clone(),
+            content: Some(content.clone()),
         },
     );
     // Bounded-cap: project files are few, but a daemon serving many
@@ -91,7 +106,7 @@ pub(crate) fn project_context_for(dir: &Path) -> Option<String> {
             cache.remove(&k);
         }
     }
-    content
+    Some(content)
 }
 
 /// Base system prompt: identity plus imperative working rules.

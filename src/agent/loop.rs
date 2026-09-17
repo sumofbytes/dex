@@ -1078,18 +1078,36 @@ where
         // in the schema before bootstrap either, so the budget stays exact
         // and a budget probe never spawns the background refresh.
         let ephemerals = [crate::mcp::ephemeral_line()];
+        // Stored-budget overhead for the gate: the gate re-derives
+        // ledger + overhead per attempt (see `compaction_gate`); the
+        // sampler below keeps the projected `eff` (bytes actually sent).
+        let budget_overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
+        compaction_gate(
+            config,
+            console,
+            messages,
+            budget_overhead,
+            cancellation,
+            session.as_deref_mut(),
+            &mut persisted_cursor,
+            state,
+            &mut ledger,
+        )
+        .await?;
+
         // Observation pack projection: the provider-bound view replaces
-        // stale large tool results with placeholders. Built fresh from
-        // the intact history on every request; the stored session never
-        // changes. Token accounting (compaction threshold, online
-        // sampling) reads this view too — archived payloads must not
-        // pressure the window estimate after their grace period expires.
+        // stale large tool results with placeholders. Built fresh from the
+        // intact history on every request — and only AFTER the gate, so a
+        // compaction that rewrote `messages` this iteration is what the
+        // projection (and the sampler below) sees. Building it before the
+        // gate sent the pre-compaction history once the pack was on. The
+        // stored session never changes. Token accounting (online sampling)
+        // reads this view too — archived payloads must not pressure the
+        // window estimate after their grace period expires.
         let obs_session = policy.agent.as_ref().map(|ctx| ctx.session_path.clone());
         // Owned projection only when the pack is on: when off the
-        // provider-bound view IS `messages` (borrowed at the call site), and
-        // holding a borrow here would freeze `messages` across the gate's
-        // `&mut` below. `into_owned` moves without cloning on the `Owned`
-        // arm this branch always takes.
+        // provider-bound view IS `messages` (borrowed at the call site).
+        // Held after the gate's `&mut` so no borrow freezes `messages`.
         let projected_owned: Option<Vec<ChatMessage>> =
             if crate::agent::obs_pack::observation_pack_enabled() {
                 Some(
@@ -1108,31 +1126,14 @@ where
         for note in state.obs_projection.take_notes() {
             system_note(console, &note).await;
         }
-        // One budget computation per iteration, shared by the gate and the
-        // sampler below: with the pack off the ledger total is exact (the
-        // wire view is history); with it on, one walk over the projected
-        // view replaces the 3–4 full walks the loop used to pay.
+        // Projected budget for the sampler below: with the pack off the
+        // ledger total is exact (the wire view is history); with it on, one
+        // walk over the projected view replaces the 3–4 full walks the loop
+        // used to pay.
         let eff = match &projected_owned {
             Some(projected) => estimate_tokens(projected),
             None => ledger.stored_tokens(),
-        } + estimate_ephemeral_tokens(&ephemerals)
-            + schema_budget_tokens();
-        // Stored-budget overhead for the gate: the gate re-derives
-        // ledger + overhead per attempt (see `compaction_gate`); the
-        // sampler below keeps the projected `eff` (bytes actually sent).
-        let budget_overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
-        compaction_gate(
-            config,
-            console,
-            messages,
-            budget_overhead,
-            cancellation,
-            session.as_deref_mut(),
-            &mut persisted_cursor,
-            state,
-            &mut ledger,
-        )
-        .await?;
+        } + budget_overhead;
 
         // Online compaction bookkeeping: sample the context size of
         // every provider request — the growth rate and the

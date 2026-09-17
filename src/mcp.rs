@@ -943,22 +943,22 @@ impl HttpTransport {
         // parse at EOF. `buf` is capped: a malicious infinite `:keep-alive`
         // stream can't OOM before the result arrives.
         let mut buf: Vec<u8> = Vec::new();
+        // The non-SSE fallback parses the whole body, but the scan above
+        // drains every completed line out of `buf` (including non-`data:`
+        // ones). Keep the raw bytes separately so a plain-JSON reply that
+        // ends in a newline (very common: `json.NewEncoder`, `print`) is
+        // still parseable at EOF instead of looking empty. Head-capped: an
+        // RPC reply is small, and a bigger SSE body is never JSON anyway.
+        let mut raw: Vec<u8> = Vec::new();
         const SSE_BUF_CAP: usize = 1024 * 1024;
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() > SSE_BUF_CAP {
-                        // Progress/` :keep-alive` spam can't OOM the call:
-                        // keep the tail (a split `data:` line lives at the
-                        // end) and resync to the next newline so a torn head
-                        // never poisons the scan.
-                        let excess = buf.len() - SSE_BUF_CAP;
-                        buf.drain(..excess);
-                        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                            buf.drain(..=pos);
-                        }
+                    if raw.len() < SSE_BUF_CAP {
+                        let room = SSE_BUF_CAP - raw.len();
+                        raw.extend_from_slice(&chunk[..chunk.len().min(room)]);
                     }
+                    buf.extend_from_slice(&chunk);
                     if let Some(r) = sse_scan_buffered_id(&mut buf, id) {
                         // Early exit drops `resp`, closing the stream: the
                         // server's post-result broadcasts lose one listener.
@@ -966,20 +966,30 @@ impl HttpTransport {
                         // call re-establishes the stream.
                         return Ok(r);
                     }
+                    // After the scan `buf` holds only the unterminated tail:
+                    // progress/`:keep-alive` spam can't OOM the call, and a
+                    // single line bigger than the cap could never be parsed,
+                    // so fail loudly instead of silently dropping it.
+                    if buf.len() > SSE_BUF_CAP {
+                        return Err(fail(format!(
+                            "mcp http response line exceeded the {SSE_BUF_CAP}-byte framing cap"
+                        )));
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => return Err(fail(e.to_string())),
             }
         }
-        // Trailing line without a newline, then the plain-JSON fallback for
-        // non-SSE responses (as before).
+        // Trailing line without a newline (SSE), then the plain-JSON
+        // fallback for non-SSE responses — parsed from `raw`, since the
+        // scan consumed the completed lines above.
         if !buf.is_empty() {
             let line = String::from_utf8_lossy(&buf);
             if let Some(r) = sse_result_id(&line, id) {
                 return Ok(r);
             }
         }
-        let text = String::from_utf8_lossy(&buf);
+        let text = String::from_utf8_lossy(&raw);
         if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
             if v.get("id").is_none_or(|v| v.as_u64() == Some(id)) {
                 if let Some(r) = extract_rpc_result(&v) {

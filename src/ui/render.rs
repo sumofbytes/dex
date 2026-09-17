@@ -1050,6 +1050,9 @@ impl TranscriptView {
             app.wrapped_cache.clear();
             app.display_cache.clear();
             app.wrapped_width = area.width;
+            // Every row is re-wrapped at the new width, so the old selection's
+            // row coordinates (and the text they'd copy) are gone too.
+            app.selection = None;
             mark(0);
         }
         // Keep the cache parallel to the transcript. A shorter transcript

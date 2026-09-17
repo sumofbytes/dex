@@ -342,11 +342,26 @@ fn history_cache_put(path: &Path, id: FileId, messages: Vec<ChatMessage>) {
 /// The message vector itself is extended by `append_message` /
 /// `clear_messages` — the only message-shape writers — while every other
 /// entry type (turn markers, effects, state) only moves the identity.
-fn history_cache_touch(path: &Path) {
+///
+/// `appended` is the byte count this handle just wrote. The bump is only
+/// valid when the file grew by exactly that much since the cached parse:
+/// a second process (TUI + spawned daemon, or a hand edit) appending a
+/// message row in between would otherwise make the entry claim a length it
+/// never parsed, serving a history silently missing those rows — and every
+/// later marker append would keep re-bumping it. Foreign growth evicts.
+fn history_cache_touch(path: &Path, appended: u64) {
     let Some(id) = file_id(path) else { return };
     let mut cache = history_cache().lock().expect("history cache lock");
-    if let Some(entry) = cache.get_mut(path) {
-        entry.0 = id;
+    let foreign = match cache.get_mut(path) {
+        Some(entry) if entry.0.len.saturating_add(appended) == id.len => {
+            entry.0 = id;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if foreign {
+        cache.evict(path);
     }
 }
 
@@ -387,25 +402,37 @@ fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
 }
 
 /// Refresh the events cursor after one of our own appends (perf doc §12):
-/// the common case keeps a poll from ever re-scanning.
-fn events_cache_touched(events_path: &Path, seq: u64) {
+/// the common case keeps a poll from ever re-scanning. `written` is the byte
+/// count this handle just appended; a foreign writer (another handle/task)
+/// interleaving a row between our write and this stat would make the recorded
+/// tip and checkpoints describe bytes we didn't write — a tip below the
+/// foreign row would then starve a poller parked at that row. Detect it by
+/// the length delta and drop the cursor rather than publish it.
+fn events_cache_touched(events_path: &Path, seq: u64, written: u64) {
     let Some(id) = file_id(events_path) else {
         return;
     };
     let mut cache = events_cache().lock().expect("events cache lock");
-    let Some(entry) = cache.get_mut(events_path) else {
-        return;
-    };
-    let prev_len = entry.id.len;
-    entry.id = id;
-    entry.max_seq = Some(entry.max_seq.map_or(seq, |m| m.max(seq)));
-    let base = entry.checkpoints.last().map(|&(_, off)| off).unwrap_or(0);
-    if id.len.saturating_sub(base) >= EVENTS_CHECKPOINT_BYTES {
-        entry.checkpoints.push((seq, prev_len));
-        if entry.checkpoints.len() > EVENTS_CHECKPOINT_CAP {
-            let excess = entry.checkpoints.len() - EVENTS_CHECKPOINT_CAP;
-            entry.checkpoints.drain(..excess);
+    let foreign = match cache.get_mut(events_path) {
+        Some(entry) if entry.id.len.saturating_add(written) == id.len => {
+            let prev_len = entry.id.len;
+            entry.id = id;
+            entry.max_seq = Some(entry.max_seq.map_or(seq, |m| m.max(seq)));
+            let base = entry.checkpoints.last().map(|&(_, off)| off).unwrap_or(0);
+            if id.len.saturating_sub(base) >= EVENTS_CHECKPOINT_BYTES {
+                entry.checkpoints.push((seq, prev_len));
+                if entry.checkpoints.len() > EVENTS_CHECKPOINT_CAP {
+                    let excess = entry.checkpoints.len() - EVENTS_CHECKPOINT_CAP;
+                    entry.checkpoints.drain(..excess);
+                }
+            }
+            false
         }
+        Some(_) => true,
+        None => false,
+    };
+    if foreign {
+        cache.evict(events_path);
     }
 }
 
@@ -430,6 +457,11 @@ fn scan_events(
     collect: bool,
     limit: usize,
 ) -> io::Result<EventsScan> {
+    // A zero page serves nothing: without this the `out.len() >= limit`
+    // check below runs only after the first push and returns one row.
+    if collect && limit == 0 {
+        return Ok((Vec::new(), None));
+    }
     // Cursor is the next seq to serve (inclusive): initial 0 serves seq 0,
     // and `next_seq = max + 1` resumes without loss or duplication.
     // Fast path: the journal is byte-identical to a previous scan and the
@@ -492,6 +524,11 @@ fn scan_events(
         }
         file.seek(SeekFrom::Start(seek_to))?;
     }
+    // Checkpoints from before the resume point would interleave with the
+    // fresh ones appended during the scan, leaving the vector unsorted and
+    // breaking `iter().rev().find(...)` and `events_cache_touched`'s
+    // `last()` base. A checkpoint at or before the resume point is kept.
+    checkpoints.retain(|&(_, off)| off <= seek_to);
     let mut reader = BufReader::new(file);
     // Highest seq below the resume point, so the cached max covers the
     // whole file, not just the scanned tail.
@@ -1122,6 +1159,13 @@ impl Session {
             "{}",
             serde_json::to_string(&clear).map_err(io::Error::other)?
         )?;
+        // Preserve the non-message tail: `session_state` rows (plan, model,
+        // skills, verify, last_error, and the change ledger `/undo` reads)
+        // are not part of `messages`, but the append path kept them and the
+        // loaders read the whole file last-write-wins. Reload the surviving
+        // values before the rename and re-emit them, or every compaction
+        // silently empties `/undo` and drops the persisted plan.
+        let preserved = load_session_state(&path).unwrap_or_default();
         for message in messages.iter().skip(1) {
             let entry = SessionMessageEntry {
                 entry_type: "message",
@@ -1133,6 +1177,22 @@ impl Session {
                 tmp_file,
                 "{}",
                 serde_json::to_string(&entry).map_err(io::Error::other)?
+            )?;
+        }
+        let mut preserved: Vec<(String, String)> = preserved.into_iter().collect();
+        preserved.sort();
+        for (key, value) in preserved {
+            let state_entry = SessionStateEntry {
+                entry_type: "session_state".into(),
+                id: Self::random_suffix(8),
+                timestamp: Self::now_iso(),
+                key,
+                value,
+            };
+            writeln!(
+                tmp_file,
+                "{}",
+                serde_json::to_string(&state_entry).map_err(io::Error::other)?
             )?;
         }
         tmp_file.flush()?;
@@ -1254,7 +1314,7 @@ impl Session {
         // under one lock instead.
         if touch {
             if let Some(path) = self.path.as_deref() {
-                history_cache_touch(path);
+                history_cache_touch(path, line.len() as u64 + 1);
             }
         }
         Ok(())
@@ -1342,10 +1402,8 @@ impl Session {
         // line stays parseable for replay.
         let payload = if payload.is_empty() { "\"\"" } else { payload };
         let ts = Self::now_iso();
-        writeln!(
-            file,
-            "{{\"seq\":{seq},\"ts\":\"{ts}\",\"payload\":{payload}}}"
-        )?;
+        let line = format!("{{\"seq\":{seq},\"ts\":\"{ts}\",\"payload\":{payload}}}");
+        writeln!(file, "{line}")?;
         // Event journal is replayable but not critical for crash recovery —
         // sync only for terminal events or when DEX_DURABLE=1. (The old sniff
         // grepped for the Rust variant names, which never appear in the
@@ -1357,7 +1415,7 @@ impl Session {
             file.sync_data()?;
         }
         if let Some(events_path) = self.events_path() {
-            events_cache_touched(&events_path, seq);
+            events_cache_touched(&events_path, seq, line.len() as u64 + 1);
         }
         Ok(())
     }
@@ -2104,6 +2162,73 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 2);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_cache_touch_evicts_on_foreign_append() {
+        let path = unique_path("dex-history-foreign");
+        let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+        fs::write(&path, format!("{header}\n")).unwrap();
+        let mut s = Session::from_path(&path).unwrap();
+        s.append_message(&ChatMessage::user("one")).unwrap();
+        assert_eq!(load_messages_from_session(&path).unwrap().len(), 1);
+        // A second process appends a message row behind our back...
+        let foreign = ChatMessage::user("foreign");
+        let entry = SessionMessageEntry {
+            entry_type: "message",
+            id: "foreign",
+            timestamp: "2020-01-01T00:00:01Z",
+            message: &foreign,
+        };
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        drop(f);
+        // ...then our own turn marker touches the snapshot: the length delta
+        // no longer matches, so it must evict rather than publish a vector
+        // that silently omits the foreign row.
+        s.turn_event("turn_start").unwrap();
+        let loaded = load_messages_from_session(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|m| m.content_str().contains("foreign")));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewrite_messages_preserves_session_state() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = Session::new("/tmp/dex-rewrite-state".into(), None).unwrap();
+        s.set_state("plan", "the plan").unwrap();
+        s.set_state("changes", "[]").unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        // The turn loop's `messages` carry the system prompt at index 0; the
+        // rewrite skips it and re-emits the rest.
+        let messages = vec![ChatMessage::system("sys"), ChatMessage::user("keep")];
+        s.rewrite_messages(&messages).unwrap();
+        let state = load_session_state(&path).unwrap();
+        assert_eq!(state.get("plan").map(String::as_str), Some("the plan"));
+        assert_eq!(state.get("changes").map(String::as_str), Some("[]"));
+        let after = load_messages_from_session(&path).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].content_str().contains("keep"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn events_page_limit_zero_serves_nothing() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = Session::new("/tmp/dex-events-limit0".into(), None).unwrap();
+        s.append_event(0, r#"{"type":"assistant_text","data":"a"}"#)
+            .unwrap();
+        let path = s.path().unwrap().to_path_buf();
+        assert!(Session::load_events(&path, 0, 0).unwrap().is_empty());
+        // A nonzero page still serves.
+        assert_eq!(Session::load_events(&path, 0, 1).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("events.jsonl"));
     }
 
     #[test]
