@@ -202,7 +202,7 @@ pub(crate) fn config_file_value() -> Option<serde_yaml::Value> {
     load_config_file()
 }
 
-fn load_config_file() -> Option<serde_yaml::Value> {
+pub(crate) fn load_config_file() -> Option<serde_yaml::Value> {
     let path = config_file_path()?;
     cached_parse(&CONFIG_CACHE, &path, |text| {
         // Unknown keys are almost always typos; name them instead of
@@ -685,29 +685,6 @@ pub(crate) fn jev_min_confidence() -> f64 {
         .unwrap_or(DEFAULT)
 }
 
-/// Resolve the shared Jev capability for every caller (routing today,
-/// skill selection next): key from `providers.typesafe.api_key` (else
-/// `TYPESAFE_API_KEY`), explicit `providers.typesafe.base_url` else the
-/// TypeSafe default, model from [`jev_model_name`]. One resolver so the
-/// setup error names the deposit places exactly once.
-pub(crate) fn resolve_jev() -> Result<crate::jev::JevConfig, Box<dyn std::error::Error>> {
-    let file = load_config_file();
-    let entries = load_provider_entries(&file);
-    let provider = Provider::Generic(crate::jev::PROVIDER_NAME.to_string());
-    let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| format!("jev: {e}"))?;
-    let base_url = entries
-        .get(crate::jev::PROVIDER_NAME)
-        .and_then(|e| e.base_url.clone())
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| crate::jev::DEFAULT_BASE_URL.to_string());
-    Ok(crate::jev::JevConfig {
-        base_url,
-        api_key,
-        model: jev_model_name(),
-        timeout: Duration::from_secs(crate::jev::DEFAULT_TIMEOUT_SECS),
-    })
-}
-
 /// Classify one turn: Jev's tier-Choice when gated on and confident,
 /// otherwise the deterministic classifier. The fallback is silent on low
 /// confidence (routine) but loud once per process on errors (setup worth
@@ -741,7 +718,7 @@ async fn jev_tier(
     signal: &TaskSignal,
     prompt: &str,
 ) -> Result<(Tier, f64), Box<dyn std::error::Error>> {
-    let cfg = resolve_jev()?;
+    let cfg = crate::jev::resolve()?;
     let state = serde_json::json!(format!(
         "{prompt}\n\n[turn context: prompt_chars={} history_tokens={} history_tool_calls={}]",
         signal.prompt_chars, signal.history_tokens, signal.history_tool_calls
@@ -958,7 +935,9 @@ pub(crate) struct ProviderEntry {
     pub(crate) headers: BTreeMap<String, String>,
 }
 
-fn load_provider_entries(file: &Option<serde_yaml::Value>) -> BTreeMap<String, ProviderEntry> {
+pub(crate) fn load_provider_entries(
+    file: &Option<serde_yaml::Value>,
+) -> BTreeMap<String, ProviderEntry> {
     let Some(map) = file
         .as_ref()
         .and_then(|f| f.get("providers"))
@@ -2562,13 +2541,13 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
                 .get(url)
                 .send()
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?
                 .error_for_status()
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             let text = resp
                 .text()
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             if serde_json::from_str::<serde_json::Value>(&text).is_err() {
                 return Err("response is not valid JSON".to_string());
             }
@@ -2585,10 +2564,10 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
             let tmp = unique_tmp_path(&path);
             tokio::fs::write(&tmp, text)
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             tokio::fs::rename(&tmp, &path)
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             println!("cached models.dev {} to {}", url, path.display());
             Ok(())
         }
@@ -4936,7 +4915,7 @@ pub(crate) mod tests {
         assert!(!cfg.extra_headers.contains_key("X-File"));
         // The wire merge orders the layers: CLI wins over both config-file
         // spellings, file keys survive where nothing above them speaks.
-        let merged: BTreeMap<String, String> = crate::llm::client::merged_headers(&cfg)
+        let merged: BTreeMap<String, String> = crate::llm::http::merged_headers(&cfg)
             .into_iter()
             .map(|(name, value)| {
                 (
@@ -7109,54 +7088,6 @@ pub(crate) mod tests {
             std::env::set_var("DEX_JEV_MIN_CONFIDENCE", v);
             assert_eq!(super::jev_min_confidence(), 0.6, "{v}");
         }
-    }
-
-    #[test]
-    fn resolve_jev_reads_key_endpoint_and_model() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "TYPESAFE_API_KEY",
-            "DEX_JEV_MODEL",
-            "XDG_CACHE_HOME",
-        ]);
-        let dir = std::env::temp_dir().join(format!("dex-jev-resolve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-        // Env key + file endpoint + env model.
-        std::fs::write(
-            dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    base_url: http://127.0.0.1:9\n",
-        )
-        .unwrap();
-        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("TYPESAFE_API_KEY", "env-key");
-        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
-        let cfg = super::resolve_jev().unwrap();
-        assert_eq!(cfg.base_url, "http://127.0.0.1:9");
-        assert_eq!(cfg.api_key, "env-key");
-        assert_eq!(cfg.model, "jev-1.13.0");
-        // File key beats env; missing endpoint falls back to TypeSafe.
-        std::fs::write(
-            dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    api_key: file-key\n",
-        )
-        .unwrap();
-        std::env::remove_var("DEX_JEV_MODEL");
-        let cfg = super::resolve_jev().unwrap();
-        assert_eq!(cfg.api_key, "file-key");
-        assert_eq!(cfg.base_url, "https://api.typesafe.ai");
-        assert_eq!(cfg.model, "jev-latest");
-        // No key anywhere errors naming the deposit places.
-        std::env::remove_var("TYPESAFE_API_KEY");
-        std::env::set_var("DEX_CONFIG", dir.join("missing.yaml"));
-        let err = super::resolve_jev().unwrap_err().to_string();
-        assert!(err.contains("providers.typesafe.api_key"), "{err}");
-        assert!(err.contains("TYPESAFE_API_KEY"), "{err}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `route_turn_async` with `DEX_ROUTING_CLASSIFIER=jev`: a confident
