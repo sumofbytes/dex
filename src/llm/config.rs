@@ -38,7 +38,7 @@ fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathB
 }
 
 /// File-identity cache entry shared by the config file, learned-apis map,
-/// and models.dev catalog: the parse is served while (path, mtime, len) is
+/// and models.dev catalog: the parse is served while the content hash is
 /// unchanged.
 struct FileCache<T> {
     path: std::path::PathBuf,
@@ -186,9 +186,8 @@ fn config_file_path() -> Option<std::path::PathBuf> {
 
 /// Raw config file as YAML. Parsed as an untyped `Value` so unknown keys
 /// survive the `/model` write-back. Missing/invalid file → None (env rules).
-/// Cached process-wide and invalidated by file identity (path + mtime +
-/// length): `from_env` runs per chat turn on the daemon, and each call was
-/// re-reading + re-parsing the file.
+/// Cached process-wide and invalidated by content hash: `from_env` runs per
+/// chat turn on the daemon, and each call was re-reading + re-parsing the file.
 static CONFIG_CACHE: OnceLock<Mutex<Option<FileCache<Option<serde_yaml::Value>>>>> =
     OnceLock::new();
 
@@ -647,6 +646,11 @@ struct CatalogIndex {
     path: std::path::PathBuf,
     mtime: SystemTime,
     len: u64,
+    /// FNV-1a of the catalog text this index was built from. (mtime, len)
+    /// alone can't tell a mtime-preserving copy or a same-content rewrite
+    /// from real new data; on a metadata miss this hash decides re-parse
+    /// vs. refresh-without-reparse (see `with_catalog_index`).
+    hash: u64,
     /// Lowercased model id → entries in catalog iteration order.
     by_id: HashMap<String, Vec<IndexedModel>>,
     provider_api: HashMap<String, String>,
@@ -662,6 +666,18 @@ struct CatalogIndex {
 }
 
 static CATALOG_INDEX: OnceLock<Mutex<Option<CatalogIndex>>> = OnceLock::new();
+
+/// Serve `f` from the in-process catalog index only when it is already warm:
+/// a mutex lock + one lookup, never a file read or rebuild. Used for
+/// cross-checks (see `ctx_from_index`) that must not turn the KB-slim
+/// fast path into a 4MB parse.
+fn if_catalog_index_warm<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
+    let guard = CATALOG_INDEX
+        .get()?
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(f)
+}
 
 /// Advertised reasoning-effort values of one model entry (models.dev
 /// `reasoning_options`, e.g. glm-5.3-flash: low/high/max).
@@ -734,12 +750,14 @@ fn build_catalog_index(
     path: std::path::PathBuf,
     mtime: SystemTime,
     len: u64,
+    hash: u64,
     catalog: &serde_json::Value,
 ) -> CatalogIndex {
     let mut index = CatalogIndex {
         path,
         mtime,
         len,
+        hash,
         by_id: HashMap::new(),
         provider_api: HashMap::new(),
         provider_env: HashMap::new(),
@@ -810,6 +828,16 @@ fn build_catalog_index(
 /// Run `f` against the current catalog index, rebuilding it when the catalog
 /// file changed since. `None` when no catalog is cached — every caller falls
 /// back exactly as before (config error, silent skip, or default).
+/// Run `f` against the current catalog index, rebuilding it when the catalog
+/// file changed since. `None` when no catalog is cached — every caller falls
+/// back exactly as before (config error, silent skip, or default).
+///
+/// Hot path stays metadata-only (`fs::metadata`, no read). On a metadata
+/// miss, identity is content: the 4MB read + FNV hash turns a
+/// mtime-preserving copy or a same-content rewrite into a cheap metadata
+/// refresh instead of a full re-parse. A same-length rewrite inside one
+/// mtime tick still serves the previous generation until the next metadata
+/// change — hashing per call would cost more than the index saves.
 fn with_catalog_index<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
     let path = dex_catalog_cache_path()?;
     let meta = std::fs::metadata(&path).ok()?;
@@ -826,27 +854,40 @@ fn with_catalog_index<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
             return Some(f(index));
         }
     }
-    let catalog = load_dex_catalog()?;
-    let fresh = build_catalog_index(path.clone(), mtime, len, &catalog);
-    let guard = CATALOG_INDEX
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // A concurrent turn may have rebuilt while this one parsed — serve the
-    // newest generation either way (same file identity, same content).
-    // The path check stays: an `XDG_CACHE_HOME` switch between the two
-    // locks must not serve the other cache dir's index as this path's.
-    if let Some(index) = guard
-        .as_ref()
-        .filter(|index| index.path == path && index.mtime == mtime && index.len == len)
+    let text = std::fs::read_to_string(&path).ok()?;
+    let hash = fnv_bytes(&text);
     {
-        return Some(f(index));
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = (*guard)
+            .as_mut()
+            .filter(|index| index.path == path && index.hash == hash)
+        {
+            // Same bytes under fresh metadata: the parsed index is still
+            // valid; just record the identity the next hot-path check sees.
+            index.mtime = mtime;
+            index.len = len;
+            return Some(f(index));
+        }
     }
-    drop(guard);
+    let catalog = load_dex_catalog()?;
+    let fresh = build_catalog_index(path.clone(), mtime, len, hash, &catalog);
     let mut guard = CATALOG_INDEX
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A concurrent turn may have rebuilt while this one parsed — serve the
+    // newest generation either way (same content hash, same conclusions).
+    // The path check stays: an `XDG_CACHE_HOME` switch between the two
+    // locks must not serve the other cache dir's index as this path's.
+    if let Some(index) = guard
+        .as_ref()
+        .filter(|index| index.path == path && index.hash == hash)
+    {
+        return Some(f(index));
+    }
     *guard = Some(fresh);
     Some(f(guard.as_ref()?))
 }
@@ -869,19 +910,46 @@ fn with_catalog_index_mut<T>(f: impl FnOnce(&mut CatalogIndex) -> T) -> Option<T
             return Some(f(guard.as_mut()?));
         }
     }
+    // Metadata miss — identity is content, same contract as
+    // `with_catalog_index`: same bytes under fresh metadata refresh the
+    // recorded identity without a re-parse; different bytes rebuild.
+    let text = std::fs::read_to_string(&path).ok()?;
+    let hash = fnv_bytes(&text);
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = (*guard)
+            .as_mut()
+            .filter(|index| index.path == path && index.hash == hash)
+        {
+            index.mtime = mtime;
+            index.len = len;
+            return Some(f(index));
+        }
+    }
     // Parsed outside the lock (like `cached_parse`): the 4MB walk never
     // blocks concurrent readers serving the previous generation.
     let catalog = load_dex_catalog()?;
+    let fresh_index = build_catalog_index(path.clone(), mtime, len, hash, &catalog);
     let mut guard = CATALOG_INDEX
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let stale = guard
         .as_ref()
-        .map(|index| index.path != path || index.mtime != mtime || index.len != len)
+        .map(|index| index.path != path || index.hash != hash)
         .unwrap_or(true);
     if stale {
-        *guard = Some(build_catalog_index(path, mtime, len, &catalog));
+        *guard = Some(fresh_index);
+    } else {
+        // Same content (another turn rebuilt it while we parsed): refresh
+        // the recorded metadata so the hot path hits.
+        if let Some(index) = (*guard).as_mut() {
+            index.mtime = mtime;
+            index.len = len;
+        }
     }
     Some(f(guard.as_mut()?))
 }
@@ -1421,7 +1489,13 @@ fn write_thinking_map(map: &serde_json::Map<String, serde_json::Value>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_string_pretty(map) {
-        let _ = std::fs::write(path, text);
+        // Atomic (unique tmp + rename): the daemon re-reads this file per
+        // turn; a direct write can hand it torn JSON that then sticks as a
+        // cached parse failure until the next write.
+        let tmp = unique_tmp_path(&path);
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -1507,7 +1581,13 @@ fn persist_selection(
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_yaml::to_string(&root) {
-        let _ = std::fs::write(path, text);
+        // Atomic (unique tmp + rename): a co-located reader caches the file
+        // by content hash — a direct write can hand it torn YAML, which
+        // then sticks as a parse error until the next write.
+        let tmp = unique_tmp_path(&path);
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
         invalidate_config_cache();
     }
 }
@@ -1540,9 +1620,47 @@ fn ctx_from_index(model: &str) -> Option<u64> {
     let path = dex_ctx_index_path()?;
     let text = std::fs::read_to_string(&path).ok()?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
-    map.get(model.to_ascii_lowercase().as_str())?
-        .as_u64()
-        .filter(|ctx| *ctx > 0)
+    let from_index = map
+        .get(model.to_ascii_lowercase().as_str())
+        .and_then(|v| v.as_u64())
+        .filter(|ctx| *ctx > 0)?;
+    // Cross-check against a warm in-process catalog index (a lock + one
+    // lookup, never a file read — `if_catalog_index_warm`): the KB file can
+    // lag the catalog it was derived from (upstream re-sized a model; the
+    // catalog was rewritten between the index write and this read). A
+    // mismatch prefers the catalog and rewrites the whole file from the
+    // warm index, so one wrong answer self-corrects without paying a cold
+    // 4MB parse on the hot path.
+    let from_catalog = if_catalog_index_warm(|index| {
+        index
+            .by_id
+            .get(model.to_ascii_lowercase().as_str())
+            .and_then(|entries| entries.iter().find_map(|e| e.context))
+    })
+    .flatten();
+    match from_catalog {
+        Some(ctx) if ctx != from_index => {
+            if_catalog_index_warm(|index| write_ctx_index(&ctx_map_from_index(index)));
+            Some(ctx)
+        }
+        _ => Some(from_index),
+    }
+}
+
+/// The full model→context table from the warm catalog index — the repair
+/// `ctx_from_index` writes when the slim file disagrees with the catalog,
+/// instead of re-parsing the 4MB catalog to rebuild it.
+fn ctx_map_from_index(index: &CatalogIndex) -> BTreeMap<String, u64> {
+    index
+        .by_id
+        .iter()
+        .filter_map(|(id, entries)| {
+            entries
+                .iter()
+                .find_map(|e| e.context)
+                .map(|ctx| (id.clone(), ctx))
+        })
+        .collect()
 }
 
 /// Collect every known `model id → context` pair from the catalog (both the
@@ -2225,7 +2343,8 @@ pub(crate) struct LlmConfig {
     /// per-provider keys plus optional base_url/`api:` overrides.
     pub(crate) provider_entries: BTreeMap<String, ProviderEntry>,
     /// The active provider's scoped `headers:`, refreshed on every provider
-    /// switch. Applied under the global/env/CLI extras, which win.
+    /// Switch. Provider-scoped beats the global file table per key; env
+    /// and `--header` extras still win over both.
     pub(crate) provider_headers: BTreeMap<String, String>,
     pub(crate) api: ApiProtocol,
     /// True when the user pinned the wire protocol globally: a top-level
@@ -2244,11 +2363,18 @@ pub(crate) struct LlmConfig {
     pub(crate) permission: PermissionMode,
     pub(crate) verify_command: Option<String>,
     /// Extra HTTP headers sent on every provider request (gateway auth,
-    /// routing, attribution). Config `headers:`/`http_headers:` < env
-    /// (`ANTHROPIC_CUSTOM_HEADERS`/`OPENAI_HEADERS`/`DEX_HEADERS`) <
-    /// `--header` / per-request overrides. Never carries `authorization`
-    /// (the api key owns that) — it is dropped at send time.
+    /// routing, attribution). env (`ANTHROPIC_CUSTOM_HEADERS`/`OPENAI_HEADERS`/
+    /// `DEX_HEADERS`) < `--header` / per-request overrides — these beat both
+    /// file layers on the wire (see `merged_headers`). The global file
+    /// `headers:`/`http_headers:` table lives in `global_headers`. Never
+    /// carries `authorization` (the api key owns that) — dropped at send time.
     pub(crate) extra_headers: BTreeMap<String, String>,
+    /// Global config-file `headers:`/`http_headers:` (the lowest precedence
+    /// layer: provider-scoped file headers and env/CLI extras both beat it,
+    /// per key). Split from `extra_headers` so the wire merge in
+    /// `merged_headers` can order the three layers exactly like
+    /// `extension_model_auth_for` does.
+    pub(crate) global_headers: BTreeMap<String, String>,
     pub(crate) client: reqwest::Client,
 }
 
@@ -2285,8 +2411,13 @@ impl LlmConfig {
             None => permission_from_env()?,
         };
         let file = load_config_file();
-        // Custom provider headers: config file < env < CLI flags.
-        let mut extra_headers = load_config_headers(&file);
+        // Custom headers, three layers so the wire merge can order them like
+        // `extension_model_auth_for` (AGENTS.md precedence): global file table
+        // < provider-scoped < env < CLI. `extra_headers` carries env+CLI (and
+        // later per-request overrides); the file's global table rides in
+        // `global_headers`.
+        let global_headers = load_config_headers(&file);
+        let mut extra_headers = BTreeMap::new();
         for (k, v) in custom_headers_from_env() {
             insert_extra_header(&mut extra_headers, &k, &v);
         }
@@ -2499,6 +2630,7 @@ impl LlmConfig {
             verify_command: env::var("DEX_VERIFY").ok(),
             permission,
             extra_headers,
+            global_headers,
             client,
             endpoints: resolved.endpoints,
             provider_entries,
@@ -3601,6 +3733,7 @@ pub(crate) mod tests {
             permission: PermissionMode::AskWrites,
             verify_command: None,
             extra_headers: Default::default(),
+            global_headers: Default::default(),
             client: reqwest::Client::new(),
             provider_entries: Default::default(),
             provider_headers: Default::default(),
@@ -3930,6 +4063,8 @@ pub(crate) mod tests {
 
     #[test]
     fn custom_headers_layer_file_env_cli() {
+        use std::collections::BTreeMap;
+
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3965,10 +4100,17 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(cfg.model, "m-h");
+        // File layers land in `global_headers` (lowest precedence on the
+        // wire); `http_headers:` loses to `headers:` per key inside that map.
         assert_eq!(
-            cfg.extra_headers.get("X-File").map(String::as_str),
+            cfg.global_headers.get("X-File").map(String::as_str),
             Some("file")
         );
+        assert_eq!(
+            cfg.global_headers.get("X-Shared").map(String::as_str),
+            Some("file")
+        );
+        // Env / CLI land in `extra_headers` — above both file layers.
         assert_eq!(
             cfg.extra_headers.get("X-Env").map(String::as_str),
             Some("env")
@@ -3985,11 +4127,20 @@ pub(crate) mod tests {
             cfg.extra_headers.get("X-Cli").map(String::as_str),
             Some("cli")
         );
-        // CLI wins over both config-file spellings.
-        assert_eq!(
-            cfg.extra_headers.get("X-Shared").map(String::as_str),
-            Some("cli")
-        );
+        assert!(!cfg.extra_headers.contains_key("X-File"));
+        // The wire merge orders the layers: CLI wins over both config-file
+        // spellings, file keys survive where nothing above them speaks.
+        let merged: BTreeMap<String, String> = crate::llm::client::merged_headers(&cfg)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(merged.get("x-shared").map(String::as_str), Some("cli"));
+        assert_eq!(merged.get("x-file").map(String::as_str), Some("file"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

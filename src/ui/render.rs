@@ -2320,6 +2320,7 @@ mod tests {
                 permission: PermissionMode::Trusted,
                 verify_command: None,
                 extra_headers: Default::default(),
+                global_headers: Default::default(),
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
