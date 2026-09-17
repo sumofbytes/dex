@@ -673,7 +673,9 @@ permission gates as a model-issued call.
 Model-aware extensions declare the `model` capability
 (`dex.model.current()` for the served `{provider, model, id, api, base_url}`,
 `dex.model.auth()` for its key + endpoint + merged extra headers — or
-`dex.model.auth("<provider>")` for another configured provider's deposits,
+`dex.model.auth("<provider>")` for another configured provider's deposits
+(needs `net.providers`: cross-provider keys are gated like the fetches
+they enable),
 and `dex.model.providers()` for the configured list with resolvable keys)
 and the `net` capability (`dex.net.fetch({url, method, headers, body,
 timeout_ms})`, HTTP confined to that model's own endpoint —

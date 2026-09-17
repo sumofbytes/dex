@@ -3332,14 +3332,17 @@ end
         let root = fixture_exts(&[
             (
                 "capped",
-                "manifest_version: 1\nid: capped\nversion: 0.1.0\ncapabilities: [tools, model]\ntools:\n  - name: who\n    description: Who.\n    parameters: {\"type\": \"object\"}\n  - name: key\n    description: Key.\n    parameters: {\"type\": \"object\"}\n",
+                "manifest_version: 1\nid: capped\nversion: 0.1.0\ncapabilities: [tools, model]\ntools:\n  - name: who\n    description: Who.\n    parameters: {\"type\": \"object\"}\n  - name: key\n    description: Key.\n    parameters: {\"type\": \"object\"}\n  - name: xkey\n    description: Xkey.\n    parameters: {\"type\": \"object\"}\n",
                 r#"return function(dex)
   dex.tools.register({ name = "who", execute = function(ctx, args)
     return dex.json.encode(dex.model.current())
   end })
   dex.tools.register({ name = "key", execute = function(ctx, args)
-    return (dex.model.auth()).api_key
-  end })
+      return (dex.model.auth()).api_key
+    end })
+    dex.tools.register({ name = "xkey", execute = function(ctx, args)
+      return (dex.model.auth("anthropic")).api_key
+    end })
 end
 "#,
             ),
@@ -3385,6 +3388,12 @@ end
             key.contains("no API key for provider 'myprov'"),
             "got: {key}"
         );
+        // Cross-provider keys need `net.providers` on top of `model`.
+        let xkey = mgr
+            .call("ext__capped__xkey", &empty, &host)
+            .await
+            .unwrap_err();
+        assert!(xkey.contains("net.providers"), "got: {xkey}");
         let err = mgr
             .call("ext__nocap__peek", &empty, &host)
             .await
@@ -3751,6 +3760,8 @@ end
     /// API) gets no tools at all, while `/search-model` arms a configured
     /// override provider — `search` then becomes visible again and serves
     /// through that provider's endpoint + key over `net.providers`.
+    /// Visibility re-syncs inside the command itself (no `model_select`
+    /// round-trip — that event only fires on provider/model change).
     #[tokio::test]
     async fn web_example_falls_back_to_override_model() {
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
@@ -3892,12 +3903,8 @@ end
             out.contains("override set to anthropic/claude-fallback"),
             "got: {out}"
         );
-        mgr.fire_event(
-            "model_select",
-            serde_json::json!({"model": "glmprov/glm-5", "previous": null}),
-            &host,
-        )
-        .await;
+        // No `model_select` fire: the command re-syncs visibility itself
+        // (that event only fires on provider/model change).
         assert_eq!(
             active(&mgr).await,
             vec!["ext__web__search".to_string()],
@@ -3927,24 +3934,20 @@ end
         //    model serves neither. Then clear it (no state leaks). The
         //    engines stay loaded here — `ensure_loaded` would otherwise
         //    boot `web` from the installed dirs, not the example.
+        //    (The override must be a configured provider — set-time
+        //    validation rejects keyless ones, so declare gemini here.)
         std::fs::write(
-            root.join("config.yaml"),
-            format!(
-                "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n"
-            ),
-        )
-        .unwrap();
+              root.join("config.yaml"),
+              format!(
+                  "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n  gemini:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-gemini\n"
+              ),
+          )
+          .unwrap();
         let out =
             crate::extensions::run_command_global("web", "search-model", "gemini/gm-1", &cancel)
                 .await
                 .unwrap();
         assert!(out.contains("family gemini"), "got: {out}");
-        mgr.fire_event(
-            "model_select",
-            serde_json::json!({"model": "glmprov/glm-5", "previous": null}),
-            &host,
-        )
-        .await;
         assert_eq!(
             active(&mgr).await,
             vec![
@@ -3957,12 +3960,6 @@ end
             .await
             .unwrap();
         assert!(off.contains("cleared"), "got: {off}");
-        mgr.fire_event(
-            "model_select",
-            serde_json::json!({"model": "glmprov/glm-5", "previous": null}),
-            &host,
-        )
-        .await;
         assert!(
             active(&mgr).await.is_empty(),
             "cleared override hides the tools again, got: {:?}",
