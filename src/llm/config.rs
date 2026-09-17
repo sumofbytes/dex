@@ -2447,6 +2447,104 @@ fn base_protocol(
     (api, file_pin.is_some() || api_pin.is_some())
 }
 
+/// Nothing anywhere names a provider/model/endpoint: the "no provider
+/// configured" guide is the honest error then, not "opencode is broken".
+/// Shares `from_env`'s own check so the setup error and resolution agree.
+fn selection_is_unconfigured(
+    model_override: Option<&str>,
+    base_url_override: Option<&str>,
+    file: &Option<serde_yaml::Value>,
+) -> bool {
+    model_override.map(|m| m.trim().is_empty()).unwrap_or(true)
+        && env::var("DEX_MODEL")
+            .ok()
+            .filter(|m| !m.trim().is_empty())
+            .is_none()
+        && load_config_str(file, "model").is_none()
+        && env::var("DEX_PROVIDER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+        && load_provider_name(file).is_none()
+        // `--base-url` is a setup pointer too: the user configured an endpoint,
+        // so a missing key names providers.custom, not the generic guide.
+        && base_url_override.is_none()
+}
+
+/// A provider name as configured: a known provider, or the URL-backed
+/// `custom` pseudo-provider (a bare `--base-url` route lands there).
+fn provider_from_name(name: &str, known: &BTreeSet<String>) -> Option<Provider> {
+    Provider::parse_known(name, known)
+        .or_else(|| (name == "custom").then(|| Provider::Generic("custom".to_string())))
+}
+
+/// The `provider`/`model` pair for the selection. When nothing selected a
+/// model, still resolve the provider the same way `from_env` would (deprecated
+/// pointer > the `--base-url` custom route > the opencode landing default) so
+/// the key/endpoint error names the right deposit; the missing-model guide
+/// comes last.
+fn selection_provider_and_model(
+    selection: &Result<Resolved<String>, String>,
+    known: &BTreeSet<String>,
+    file: &Option<serde_yaml::Value>,
+    base_url_override: Option<&str>,
+    provider_entries: &BTreeMap<String, ProviderEntry>,
+    using_builtin_default: bool,
+) -> Result<(Option<String>, String), Box<dyn std::error::Error>> {
+    let Ok(resolved) = selection else {
+        let guide = selection.as_ref().err().expect("selection is Err");
+        let (fallback, origin) = provider_fallback_with_origin(file);
+        let name = provider_without_prefix((fallback, origin), base_url_override);
+        let provider = provider_from_name(&name, known).ok_or_else(|| guide.clone())?;
+        let key_err = resolve_credentials(&provider, provider_entries)
+            .err()
+            .map(|e| {
+                if using_builtin_default {
+                    guide.clone()
+                } else {
+                    e.to_string()
+                }
+            });
+        return Err(key_err.unwrap_or_else(|| guide.clone()).into());
+    };
+    let (provider, model) = split_selection(&resolved.value, known)?;
+    Ok((provider, model))
+}
+
+/// `DEX_MODELS` (comma list) as the starting served-model list.
+fn env_models() -> Vec<String> {
+    env::var("DEX_MODELS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Streaming generations must not have a total request timeout: reqwest's
+/// `.timeout()` covers the whole SSE body, killing long generations with
+/// `error decoding response body`. The default shares the process-wide
+/// streaming client (connect timeout only); an explicit
+/// DEX_HTTP_REQUEST_TIMEOUT_SECS still builds a bounded backstop client.
+fn http_client(connect_secs: u64, request_secs: u64) -> Result<reqwest::Client, reqwest::Error> {
+    if connect_secs == 10 && request_secs == 300 {
+        Ok(crate::client::http::shared_streaming_client())
+    } else {
+        reqwest::Client::builder()
+            .user_agent(crate::client::http::USER_AGENT)
+            .connect_timeout(Duration::from_secs(connect_secs))
+            .timeout(Duration::from_secs(request_secs))
+            // Same dead-socket detection as the shared streaming client.
+            .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
+            .build()
+    }
+}
+
 impl LlmConfig {
     pub(crate) fn from_env(
         base_url_override: Option<String>,
@@ -2479,24 +2577,11 @@ impl LlmConfig {
         // a missing key then means "nothing configured", not "opencode
         // is broken" — the error guides setup instead of endorsing one
         // provider.
-        let using_builtin_default = model_override
-            .as_ref()
-            .map(|m| m.trim().is_empty())
-            .unwrap_or(true)
-            && env::var("DEX_MODEL")
-                .ok()
-                .filter(|m| !m.trim().is_empty())
-                .is_none()
-            && load_config_str(&file, "model").is_none()
-            && env::var("DEX_PROVIDER")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .is_none()
-            && load_provider_name(&file).is_none()
-            // `--base-url` is a setup pointer too: the user configured an
-            // endpoint, so a missing key names providers.custom, not the
-            // generic "no provider configured" guide.
-            && base_url_override.is_none();
+        let using_builtin_default = selection_is_unconfigured(
+            model_override.as_deref(),
+            base_url_override.as_deref(),
+            &file,
+        );
         // One selection knob names provider *and* model: `provider/model`
         // (`endpoint/model` or a bare provider name work too). Precedence:
         // `--model` > `DEX_MODEL` > file `model:` — nothing set anywhere is
@@ -2506,41 +2591,14 @@ impl LlmConfig {
         // before the build: credential/endpoint problems are reported
         // first, they are the more actionable fix.
         let selection = resolve_selection(model_override, &file);
-        let (selection_provider, model) = match &selection {
-            Ok(r) => split_selection(&r.value, &known).map_err(|e| {
-                if using_builtin_default {
-                    e.clone()
-                } else {
-                    e
-                }
-            })?,
-            // No selection anywhere: keep building the provider/URL below so
-            // a misconfigured endpoint or key is named first; the missing
-            // model id is the last error before the build.
-            Err(guide) => {
-                // Nothing selected a model. Still resolve the provider the
-                // same way `from_env` would (deprecated pointer > the
-                // --base-url custom route > the opencode landing default)
-                // so the key/endpoint error names the right deposit; the
-                // missing-model guide comes last.
-                let (fallback, origin) = provider_fallback_with_origin(&file);
-                let name =
-                    provider_without_prefix((fallback, origin), base_url_override.as_deref());
-                let provider = Provider::parse_known(&name, &known)
-                    .or_else(|| (name == "custom").then(|| Provider::Generic("custom".into())))
-                    .ok_or_else(|| guide.clone())?;
-                let key_err = resolve_credentials(&provider, &provider_entries)
-                    .err()
-                    .map(|e| {
-                        if using_builtin_default {
-                            guide.clone()
-                        } else {
-                            e.to_string()
-                        }
-                    });
-                return Err(key_err.unwrap_or_else(|| guide.clone()).into());
-            }
-        };
+        let (selection_provider, model) = selection_provider_and_model(
+            &selection,
+            &known,
+            &file,
+            base_url_override.as_deref(),
+            &provider_entries,
+            using_builtin_default,
+        )?;
         let provider_name = match selection_provider.as_deref() {
             Some(name) => name.to_string(),
             None => provider_without_prefix(
@@ -2552,26 +2610,12 @@ impl LlmConfig {
         // no `providers.custom:` entry exists yet; parse_known already
         // covers the configured case, this catches the bare `--base-url`
         // route so the key error names the right deposit.
-        let provider = Provider::parse_known(&provider_name, &known)
-            .or_else(|| {
-                (provider_name == "custom").then(|| Provider::Generic("custom".to_string()))
-            })
-            .ok_or_else(|| {
-                format!(
-                    "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic, or add it under 'providers:' (e.g. providers.custom: {{base_url: ..., api_key: ...}})"
-                )
-            })?;
-        let mut available_models = env::var("DEX_MODELS")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let provider = provider_from_name(&provider_name, &known).ok_or_else(|| {
+            format!(
+                "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic, or add it under 'providers:' (e.g. providers.custom: {{base_url: ..., api_key: ...}})"
+            )
+        })?;
+        let mut available_models = env_models();
         let file_base_url = load_config_str(&file, "base_url");
         if file_base_url.is_some() {
             warn_once(
@@ -2631,23 +2675,7 @@ impl LlmConfig {
         let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
         let connect_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
         let request_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
-        // Streaming generations must not have a total request timeout:
-        // reqwest's `.timeout()` covers the whole SSE body, killing long
-        // generations with `error decoding response body`. The default path
-        // shares the process-wide streaming client (connect timeout only);
-        // an explicit DEX_HTTP_REQUEST_TIMEOUT_SECS still builds a bounded
-        // client for those who want a backstop.
-        let client = if connect_secs == 10 && request_secs == 300 {
-            crate::client::http::shared_streaming_client()
-        } else {
-            reqwest::Client::builder()
-                .user_agent(crate::client::http::USER_AGENT)
-                .connect_timeout(Duration::from_secs(connect_secs))
-                .timeout(Duration::from_secs(request_secs))
-                // Same dead-socket detection as the shared streaming client.
-                .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
-                .build()?
-        };
+        let client = http_client(connect_secs, request_secs)?;
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
@@ -3023,6 +3051,489 @@ impl LlmConfig {
     }
 }
 
+/// One `dex doctor` row: three fixed columns — key (KEY_COLS), value
+/// (VALUE_COLS), origin. Widths count display columns (CJK chars render 2
+/// wide), so padded values still line up. A value that overflows its column
+/// wraps: the value prints in full on its own line and the origin hangs at the
+/// origin column, so long paths never run into the origin text.
+fn row(out: &mut String, key: &str, value: &str, source: &str) {
+    const KEY_COLS: usize = 18;
+    const VALUE_COLS: usize = 46;
+    // A key wider than its column would collapse the padding and shift every
+    // origin column: fail in debug builds instead.
+    debug_assert!(
+        UnicodeWidthStr::width(key) <= KEY_COLS,
+        "doctor key {key:?} exceeds its {KEY_COLS}-column field"
+    );
+    let origin_indent = " ".repeat(KEY_COLS + VALUE_COLS);
+    let fits = UnicodeWidthStr::width(value) <= VALUE_COLS;
+    let mut origin_lines = source.split('\n');
+    let inline = if fits {
+        origin_lines.next().unwrap_or_default()
+    } else {
+        ""
+    };
+    if inline.is_empty() {
+        out.push_str(&format!("{key:<KEY_COLS$}{value}\n"));
+    } else {
+        let pad = " ".repeat(VALUE_COLS - UnicodeWidthStr::width(value));
+        out.push_str(&format!("{key:<KEY_COLS$}{value}{pad}{inline}\n"));
+    }
+    for line in origin_lines {
+        if !line.is_empty() {
+            out.push_str(&format!("{origin_indent}{line}\n"));
+        }
+    }
+}
+
+fn permission_name(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::ReadOnly => "read-only",
+        PermissionMode::AskWrites => "ask-writes",
+        PermissionMode::AskShell => "ask-shell",
+        PermissionMode::Trusted => "trusted",
+    }
+}
+
+/// Everything `doctor`'s provider section needs: the resolved selection, the
+/// live build (when it succeeded), and the raw config sources it explains.
+struct ProviderDoctor<'a> {
+    file: &'a Option<serde_yaml::Value>,
+    provider_entries: &'a BTreeMap<String, ProviderEntry>,
+    known: &'a BTreeSet<String>,
+    provider_name: &'a str,
+    provider_source: &'a str,
+    selection_source: &'a str,
+    has_selection: bool,
+    pre_model: &'a str,
+    cfg_result: &'a Result<LlmConfig, Box<dyn std::error::Error>>,
+    flag_base_url: Option<&'a str>,
+    permission_override: Option<PermissionMode>,
+    header_overrides: &'a [String],
+    custom_route: bool,
+}
+
+/// Where the resolved `base_url` came from: an explicit pin wins, then catalog
+/// routing, then the provider entry, then the built-in/catalog default.
+fn base_url_source(
+    flag_base_url: Option<&str>,
+    file_base_url: Option<&str>,
+    live: Option<&LlmConfig>,
+    landing: Option<&str>,
+    base_url: &str,
+    entry: Option<&ProviderEntry>,
+    provider: &Provider,
+) -> String {
+    if flag_base_url.is_some() {
+        "--base-url (pins endpoint)".to_string()
+    } else if file_base_url.is_some() {
+        "config base_url: (deprecated)".to_string()
+    } else if live.is_some() && landing != Some(base_url) {
+        match live.and_then(|c| {
+            c.endpoints
+                .iter()
+                .find(|(_, url)| url.as_str() == base_url)
+                .map(|(name, _)| name.clone())
+        }) {
+            Some(name) => format!("endpoint {name} (models.dev routing)"),
+            None => "models.dev catalog routing".to_string(),
+        }
+    } else if entry.and_then(|e| e.base_url.clone()).is_some() {
+        "config providers.<name>.base_url".to_string()
+    } else if matches!(
+        provider,
+        Provider::OpenCode | Provider::OpenAiCodex | Provider::Anthropic
+    ) {
+        "built-in default".to_string()
+    } else {
+        "models.dev catalog".to_string()
+    }
+}
+
+/// Where the API key resolves from — the deposit place, never the value.
+fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String {
+    if matches!(provider, Provider::OpenAiCodex) {
+        if env::var_os("CODEX_ACCESS_TOKEN").is_some() {
+            "CODEX_ACCESS_TOKEN".to_string()
+        } else {
+            let home = env::var_os("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")))
+                .unwrap_or_default();
+            format!("{} (codex auth)", home.join("auth.json").display())
+        }
+    } else if entry
+        .and_then(|e| e.api_key.clone())
+        .filter(|k| !k.is_empty())
+        .is_some()
+    {
+        format!("config providers.{}.api_key", provider.name())
+    } else {
+        let mut names = catalog_env_vars(provider.name());
+        // Mirror `resolve_credentials`: pinned builtin vars resolve cache-less,
+        // ahead of any catalog `env` discovery.
+        if let Some(pinned) = pinned_key_env(provider) {
+            if !names.iter().any(|v| v == pinned) {
+                names.insert(0, pinned.to_string());
+            }
+        }
+        match names
+            .iter()
+            .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
+        {
+            Some(name) => format!("{name} (environment)"),
+            None => "MISSING — set providers.<name>.api_key or the provider's env var".to_string(),
+        }
+    }
+}
+
+/// The wire protocol and where it came from. Lookup keys mirror `from_env`:
+/// the post-split remainder first, then the stripped model.
+fn protocol_source(
+    entry: Option<&ProviderEntry>,
+    file: &Option<serde_yaml::Value>,
+    model_api: Option<ApiProtocol>,
+    base_url: &str,
+    model: &str,
+    provider: &Provider,
+) -> (String, &'static str) {
+    if let Some(api) = entry.and_then(|e| e.api) {
+        (api.name().to_string(), "config providers.<name>.api")
+    } else if let Some(name) = load_config_str(file, "api") {
+        (
+            ApiProtocol::parse(&name)
+                .map(|a| a.name().to_string())
+                .unwrap_or_else(|| format!("INVALID '{name}'")),
+            "config api: (deprecated)",
+        )
+    } else if let Some(api) = model_api {
+        (api.name().to_string(), "DEX_MODEL_APIS")
+    } else if let Some(api) = learned_api(base_url, model) {
+        (api.name().to_string(), "learned (learned-apis.json)")
+    } else if let Some(api) = provider.default_api() {
+        (api.name().to_string(), "built-in provider default")
+    } else {
+        (
+            "openai-responses".to_string(),
+            "default (auto-fallback to completions)",
+        )
+    }
+}
+
+/// Context window and its origin: env > file > index > catalog (no built-in
+/// default — a model nothing sizes is a config error, not a 128k guess).
+fn context_source(file: &Option<serde_yaml::Value>, model: &str) -> (String, &'static str) {
+    if let Some(v) = context_window_from_env() {
+        (v.to_string(), "DEX_CONTEXT_WINDOW")
+    } else if let Some(ctx) = load_config_num(file, "context_window") {
+        (ctx.to_string(), "config context_window:")
+    } else if let Some(ctx) = ctx_from_index(model) {
+        (ctx.to_string(), "cached context index")
+    } else {
+        match catalog_context_window(model) {
+            Some(ctx) => (ctx.to_string(), "models.dev catalog"),
+            None => (
+                "UNKNOWN".to_string(),
+                "no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW",
+            ),
+        }
+    }
+}
+
+/// Thinking-effort and its origin: stored choice > env > file > model default.
+fn thinking_source(
+    file: &Option<serde_yaml::Value>,
+    base_url: &str,
+    model: &str,
+) -> (String, &'static str) {
+    if let Some(e) = stored_thinking_effort(base_url, model) {
+        (e, "stored /thinking choice")
+    } else if let Some(e) = env::var("DEX_THINKING_EFFORT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        (e, "DEX_THINKING_EFFORT")
+    } else if let Some(e) = load_config_str(file, "thinking_effort") {
+        (e, "config thinking_effort:")
+    } else {
+        ("(unset)".to_string(), "model default")
+    }
+}
+
+/// The provider/model/endpoint/key/protocol rows. Values come from the live
+/// build when it succeeds; otherwise the derived values still explain the
+/// setup (e.g. missing key). Origins mirror `from_env` exactly.
+fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
+    let provider_opt = Provider::parse_known(d.provider_name, d.known).or_else(|| {
+        d.custom_route
+            .then(|| Provider::Generic("custom".to_string()))
+    });
+    let Some(provider) = provider_opt else {
+        row(
+            out,
+            "provider",
+            d.provider_name,
+            "UNSUPPORTED — use opencode, openai-codex, anthropic, or add it under 'providers:'",
+        );
+        return;
+    };
+    let live = d
+        .cfg_result
+        .as_ref()
+        .ok()
+        .filter(|c| c.provider == provider);
+    row(out, "provider", provider.name(), d.provider_source);
+    let model = live.map(|c| c.model.clone()).unwrap_or_else(|| {
+        if d.pre_model.is_empty() {
+            "(unset)".to_string()
+        } else {
+            d.pre_model.to_string()
+        }
+    });
+    // An unset model despite a selection is a bare provider pick: name the
+    // selection as origin and why the row is empty (the resolve row carries
+    // the fix).
+    let model_source = if d.has_selection && d.pre_model.is_empty() {
+        format!("{} (no model id)", d.selection_source)
+    } else {
+        d.selection_source.to_string()
+    };
+    row(out, "model", &model, &model_source);
+
+    let resolved = resolve_provider(&provider, d.provider_entries);
+    let entry = d.provider_entries.get(provider.name());
+    let file_base_url = load_config_str(d.file, "base_url");
+    let derived_base = d
+        .flag_base_url
+        .map(str::to_string)
+        .or(file_base_url.clone())
+        .or(resolved.landing.clone())
+        .unwrap_or_default();
+    let base_url = live.map(|c| c.base_url.clone()).unwrap_or(derived_base);
+    let base_source = base_url_source(
+        d.flag_base_url,
+        file_base_url.as_deref(),
+        live,
+        resolved.landing.as_deref(),
+        &base_url,
+        entry,
+        &provider,
+    );
+    row(out, "base_url", &base_url, &base_source);
+
+    // Credentials — name the deposit place, never the value.
+    let key_source = api_key_source(&provider, entry);
+    row(out, "api key", "(hidden)", &key_source);
+
+    // Wire protocol and its origin. Lookup keys mirror `from_env`: the
+    // post-split remainder first, then the stripped model.
+    let model_api = model_api_from_env(d.pre_model, &model);
+    let (chain_api, api_source) =
+        protocol_source(entry, d.file, model_api, &base_url, &model, &provider);
+    let api = live.map(|c| c.api.name().to_string()).unwrap_or(chain_api);
+    row(out, "protocol", &api, api_source);
+    let (chain_ctx, ctx_source) = context_source(d.file, &model);
+    let ctx = live
+        .map(|c| c.context_window.to_string())
+        .unwrap_or(chain_ctx);
+    row(out, "context", &format!("{ctx} tokens"), ctx_source);
+
+    // Experiment rows (online compaction, obs pack, evidence reducer): owned
+    // by each experiment module and rendered through the experiment registry
+    // — config.rs never names a gate or its env var. Order follows the
+    // registry.
+    for r in crate::agent::experiments::doctor_rows(crate::agent::experiments::DoctorCtx {
+        live,
+        model: &model,
+    }) {
+        row(out, r.label, &r.value, &r.source);
+    }
+
+    let (chain_effort, effort_source) = thinking_source(d.file, &base_url, &model);
+    let effort = live
+        .and_then(|c| c.thinking_effort.clone())
+        .unwrap_or(chain_effort);
+    row(out, "thinking", &effort, effort_source);
+
+    let (perm, perm_source) = match live.map(|c| c.permission) {
+        Some(mode) => {
+            let source = if d.permission_override.is_some() {
+                "--permission"
+            } else if env::var("DEX_PERMISSION")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_some()
+            {
+                "DEX_PERMISSION"
+            } else {
+                "built-in default"
+            };
+            (permission_name(mode).to_string(), source.to_string())
+        }
+        // The build failed (e.g. missing key): still show the origin.
+        None => match env::var("DEX_PERMISSION")
+            .ok()
+            .filter(|v| PermissionMode::parse(v).is_ok())
+        {
+            Some(v) => (v, "DEX_PERMISSION".to_string()),
+            None => ("trusted".to_string(), "built-in default".to_string()),
+        },
+    };
+    row(out, "permission", &perm, &perm_source);
+    let (wake, wake_source) = agent_wake_origin();
+    row(
+        out,
+        "agent wake",
+        if wake { "on" } else { "off" },
+        wake_source,
+    );
+
+    // Headers: count per layer, sources joined.
+    let mut header_count = 0;
+    let mut header_sources: Vec<&str> = Vec::new();
+    let http_headers = config_headers_map(d.file, "http_headers");
+    let file_headers = config_headers_map(d.file, "headers");
+    let entry_headers = entry.map(|e| e.headers.clone()).unwrap_or_default();
+    let env_headers = custom_headers_from_env();
+    let mut cli_headers = BTreeMap::new();
+    for raw in d.header_overrides {
+        insert_parsed_headers(&mut cli_headers, raw);
+    }
+    for (headers, source) in [
+        (&http_headers, "config http_headers: (deprecated)"),
+        (&file_headers, "config headers: (deprecated)"),
+        (&entry_headers, "config providers.<name>.headers"),
+        (&env_headers, "DEX_HEADERS"),
+        (&cli_headers, "--header"),
+    ] {
+        header_count += headers.len();
+        if !headers.is_empty() {
+            header_sources.push(source);
+        }
+    }
+    row(
+        out,
+        "headers",
+        &header_count.to_string(),
+        &if header_sources.is_empty() {
+            "none".to_string()
+        } else {
+            header_sources.join(" + ")
+        },
+    );
+
+    if !resolved.endpoints.is_empty() {
+        let names: Vec<&str> = resolved.endpoints.keys().map(String::as_str).collect();
+        row(
+            out,
+            "endpoints",
+            &names.join(", "),
+            "available to /model routing",
+        );
+    }
+    if !d.provider_entries.is_empty() {
+        let names: Vec<&str> = d.provider_entries.keys().map(String::as_str).collect();
+        row(
+            out,
+            "providers",
+            &names.join(", "),
+            "configured in providers:",
+        );
+    }
+}
+
+/// `doctor`'s view of the selection: (provider prefix, pre-routing model id,
+/// bare-provider-pick flag). A bare provider pick (`--model anthropic`) or
+/// provider-only prefix (`model: zai/`) is not a model id — `split_selection`
+/// rejects both, so surface the provider on the provider row and leave the
+/// model row unset instead of reading the provider name as a model id (the
+/// resolve row carries the fix).
+fn doctor_selection_parts(
+    selection: Option<&str>,
+    known: &BTreeSet<String>,
+) -> (Option<String>, String, bool) {
+    let Some(selection) = selection else {
+        return (None, String::new(), false);
+    };
+    match split_selection(selection, known) {
+        Ok((provider, model)) => (provider, model, false),
+        Err(_) => match classify_selection(selection, known) {
+            SelectionRoute::BareProvider { provider } => (Some(provider), String::new(), true),
+            SelectionRoute::ProviderQualified { provider, .. } => {
+                (Some(provider), String::new(), false)
+            }
+            // Not a provider shape: echo the raw selection as the model id
+            // (endpoint prefixes, gateway model ids).
+            SelectionRoute::Model(_) => (None, selection.to_string(), false),
+        },
+    }
+}
+
+/// Provider-independent `doctor` rows: system prompt, discovered extensions,
+/// extra extension dirs, and the final build status.
+fn tail_rows(
+    out: &mut String,
+    system_prompt_override: &Option<(String, &'static str)>,
+    cfg_result: &Result<LlmConfig, Box<dyn std::error::Error>>,
+) {
+    // Base system prompt override (DEX-13): provider-independent, so it prints
+    // even when the provider row is unsupported. Value is a char count — the
+    // full text would flood doctor — with the same origin
+    // `system_prompt_origin` reports at runtime.
+    let (text, label) = match system_prompt_override {
+        Some((text, label)) => (Some(text.as_str()), *label),
+        None => (None, "--system-prompt"),
+    };
+    let (custom, origin) = system_prompt_origin_with_label(text, label);
+    let value = match custom {
+        Some(text) => format!("custom ({} chars)", text.chars().count()),
+        None => "default".to_string(),
+    };
+    row(out, "system prompt", &value, origin);
+    // Lua extensions: disk discovery + consent state (deterministic — the
+    // load-state detail lives in `dex extensions list`).
+    let discovered = crate::extensions::discovered_extensions();
+    if discovered.is_empty() {
+        row(out, "extensions", "none", "cwd/.dex, XDG config dirs");
+    } else {
+        for (id, version, scope, state) in &discovered {
+            row(
+                out,
+                "extensions",
+                &format!("{id} {version}"),
+                &format!("{scope}, {state}"),
+            );
+        }
+    }
+    // Extra dirs from config/env (origin per the precedence rules).
+    let ext_paths = crate::extensions::config_extension_paths();
+    if !ext_paths.is_empty() {
+        let origin = if std::env::var("DEX_EXTENSIONS_PATHS")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            "DEX_EXTENSIONS_PATHS (environment)"
+        } else {
+            "extensions.paths (config)"
+        };
+        row(
+            out,
+            "ext paths",
+            &ext_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            origin,
+        );
+    }
+    out.push('\n');
+    match cfg_result {
+        Ok(_) => row(out, "resolve", "OK", "config builds cleanly"),
+        Err(e) => row(out, "resolve", "ERROR", &e.to_string()),
+    }
+}
+
 /// `dex doctor`: print the resolved provider/model/endpoint/protocol/key
 /// configuration and where each value came from — `git config
 /// --show-origin` for the LLM wiring. Read-only, no network, no daemon;
@@ -3037,48 +3548,6 @@ pub(crate) fn doctor(
     header_overrides: &[String],
     system_prompt_override: Option<(String, &'static str)>,
 ) -> String {
-    fn row(out: &mut String, key: &str, value: &str, source: &str) {
-        // Three fixed columns — key (KEY_COLS), value (VALUE_COLS), origin. Widths count
-        // display columns (CJK chars render 2 wide), so padded values still
-        // line up. A value that overflows its column wraps: the value
-        // prints in full on its own line and the origin hangs at the origin
-        // column, so long paths never run into the origin text.
-        const KEY_COLS: usize = 18;
-        const VALUE_COLS: usize = 46;
-        // A key wider than its column would collapse the padding and
-        // shift every origin column: fail in debug builds instead.
-        debug_assert!(
-            UnicodeWidthStr::width(key) <= KEY_COLS,
-            "doctor key {key:?} exceeds its {KEY_COLS}-column field"
-        );
-        let origin_indent = " ".repeat(KEY_COLS + VALUE_COLS);
-        let fits = UnicodeWidthStr::width(value) <= VALUE_COLS;
-        let mut origin_lines = source.split('\n');
-        let inline = if fits {
-            origin_lines.next().unwrap_or_default()
-        } else {
-            ""
-        };
-        if inline.is_empty() {
-            out.push_str(&format!("{key:<KEY_COLS$}{value}\n"));
-        } else {
-            let pad = " ".repeat(VALUE_COLS - UnicodeWidthStr::width(value));
-            out.push_str(&format!("{key:<KEY_COLS$}{value}{pad}{inline}\n"));
-        }
-        for line in origin_lines {
-            if !line.is_empty() {
-                out.push_str(&format!("{origin_indent}{line}\n"));
-            }
-        }
-    }
-    fn permission_name(mode: PermissionMode) -> &'static str {
-        match mode {
-            PermissionMode::ReadOnly => "read-only",
-            PermissionMode::AskWrites => "ask-writes",
-            PermissionMode::AskShell => "ask-shell",
-            PermissionMode::Trusted => "trusted",
-        }
-    }
     let mut out = String::new();
     out.push_str(&format!("dex {}\n\n", env!("CARGO_PKG_VERSION")));
 
@@ -3126,26 +3595,8 @@ pub(crate) fn doctor(
         // Short form here: the resolve row prints the full setup guide.
         Err(_) => "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
     };
-    // A bare provider pick (`--model anthropic`) or provider-only prefix
-    // (`model: zai/`) is not a model id — `split_selection` rejects both,
-    // so surface the provider on the provider row and leave the model row
-    // unset instead of reading the provider name as a model id (the
-    // resolve row carries the fix).
-    let (selection_provider, pre_model, bare_pick) = match &selection {
-        Some(selection) => match split_selection(selection, &known) {
-            Ok((provider, model)) => (provider, model, false),
-            Err(_) => match classify_selection(selection, &known) {
-                SelectionRoute::BareProvider { provider } => (Some(provider), String::new(), true),
-                SelectionRoute::ProviderQualified { provider, .. } => {
-                    (Some(provider), String::new(), false)
-                }
-                // Not a provider shape: echo the raw selection as the model
-                // id (endpoint prefixes, gateway model ids).
-                SelectionRoute::Model(_) => (None, selection.clone(), false),
-            },
-        },
-        None => (None, String::new(), false),
-    };
+    let (selection_provider, pre_model, bare_pick) =
+        doctor_selection_parts(selection.as_deref(), &known);
     // Provider fallback shares `from_env`'s chain (and its deprecation
     // warning, deduped) so the origin row cannot drift from routing.
     let (fallback_provider, fallback_origin) = provider_fallback_with_origin(&file);
@@ -3175,333 +3626,25 @@ pub(crate) fn doctor(
     );
     // The `--base-url` route can land on `custom` before the entry exists;
     // it is a real (user-URL-backed) provider then, not a typo.
-    let custom_route = selection_provider.is_none() && provider_name == "custom";
-    let provider_opt = Provider::parse_known(&provider_name, &known)
-        .or_else(|| custom_route.then(|| Provider::Generic("custom".to_string())));
-    match provider_opt {
-        None => row(
-            &mut out,
-            "provider",
-            &provider_name,
-            "UNSUPPORTED — use opencode, openai-codex, anthropic, or add it under 'providers:'",
-        ),
-        Some(provider) => {
-            // Values come from the live build when it succeeds; otherwise
-            // the derived values still explain the setup (e.g. missing key).
-            let live = cfg_result.as_ref().ok().filter(|c| c.provider == provider);
-            row(&mut out, "provider", provider.name(), &provider_source);
-            let model = live.map(|c| c.model.clone()).unwrap_or_else(|| {
-                if pre_model.is_empty() {
-                    "(unset)".to_string()
-                } else {
-                    pre_model.clone()
-                }
-            });
-            // An unset model despite a selection is a bare provider pick:
-            // name the selection as origin and why the row is empty (the
-            // resolve row carries the fix).
-            let model_source = if selection.is_some() && pre_model.is_empty() {
-                format!("{selection_source} (no model id)")
-            } else {
-                selection_source.clone()
-            };
-            row(&mut out, "model", &model, &model_source);
-
-            let resolved = resolve_provider(&provider, &provider_entries);
-            let entry = provider_entries.get(provider.name());
-            let file_base_url = load_config_str(&file, "base_url");
-            let derived_base = flag_base_url
-                .clone()
-                .or(file_base_url.clone())
-                .or(resolved.landing.clone())
-                .unwrap_or_default();
-            let base_url = live.map(|c| c.base_url.clone()).unwrap_or(derived_base);
-            let base_source = if flag_base_url.is_some() {
-                "--base-url (pins endpoint)".to_string()
-            } else if file_base_url.is_some() {
-                "config base_url: (deprecated)".to_string()
-            } else if live.is_some() && resolved.landing.as_deref() != Some(base_url.as_str()) {
-                match live.and_then(|c| {
-                    c.endpoints
-                        .iter()
-                        .find(|(_, url)| *url == &base_url)
-                        .map(|(name, _)| name.clone())
-                }) {
-                    Some(name) => format!("endpoint {name} (models.dev routing)"),
-                    None => "models.dev catalog routing".to_string(),
-                }
-            } else if entry.and_then(|e| e.base_url.clone()).is_some() {
-                "config providers.<name>.base_url".to_string()
-            } else if matches!(
-                provider,
-                Provider::OpenCode | Provider::OpenAiCodex | Provider::Anthropic
-            ) {
-                "built-in default".to_string()
-            } else {
-                "models.dev catalog".to_string()
-            };
-            row(&mut out, "base_url", &base_url, &base_source);
-
-            // Credentials — name the deposit place, never the value.
-            let key_source = if matches!(provider, Provider::OpenAiCodex) {
-                if env::var_os("CODEX_ACCESS_TOKEN").is_some() {
-                    "CODEX_ACCESS_TOKEN".to_string()
-                } else {
-                    let home = env::var_os("CODEX_HOME")
-                        .map(std::path::PathBuf::from)
-                        .or_else(|| {
-                            env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex"))
-                        })
-                        .unwrap_or_default();
-                    format!("{} (codex auth)", home.join("auth.json").display())
-                }
-            } else if entry
-                .and_then(|e| e.api_key.clone())
-                .filter(|k| !k.is_empty())
-                .is_some()
-            {
-                format!("config providers.{}.api_key", provider.name())
-            } else {
-                let mut names = catalog_env_vars(provider.name());
-                // Mirror `resolve_credentials`: pinned builtin vars resolve
-                // cache-less, ahead of any catalog `env` discovery.
-                if let Some(pinned) = pinned_key_env(&provider) {
-                    if !names.iter().any(|v| v == pinned) {
-                        names.insert(0, pinned.to_string());
-                    }
-                }
-                match names
-                    .iter()
-                    .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
-                {
-                    Some(name) => format!("{name} (environment)"),
-                    None => "MISSING — set providers.<name>.api_key or the provider's env var"
-                        .to_string(),
-                }
-            };
-            row(&mut out, "api key", "(hidden)", &key_source);
-
-            // Wire protocol and its origin. Lookup keys mirror `from_env`:
-            // the post-split remainder first, then the stripped model.
-            let model_api = model_api_from_env(&pre_model, &model);
-            let (chain_api, api_source) = if let Some(api) = entry.and_then(|e| e.api) {
-                (api.name().to_string(), "config providers.<name>.api")
-            } else if let Some(name) = load_config_str(&file, "api") {
-                (
-                    ApiProtocol::parse(&name)
-                        .map(|a| a.name().to_string())
-                        .unwrap_or_else(|| format!("INVALID '{name}'")),
-                    "config api: (deprecated)",
-                )
-            } else if let Some(api) = model_api {
-                (api.name().to_string(), "DEX_MODEL_APIS")
-            } else if let Some(api) = learned_api(&base_url, &model) {
-                (api.name().to_string(), "learned (learned-apis.json)")
-            } else if let Some(api) = provider.default_api() {
-                (api.name().to_string(), "built-in provider default")
-            } else {
-                (
-                    "openai-responses".to_string(),
-                    "default (auto-fallback to completions)",
-                )
-            };
-            let api = live.map(|c| c.api.name().to_string()).unwrap_or(chain_api);
-            row(&mut out, "protocol", &api, api_source);
-            let (chain_ctx, ctx_source) = if let Some(v) = context_window_from_env() {
-                (v.to_string(), "DEX_CONTEXT_WINDOW".to_string())
-            } else if let Some(ctx) = load_config_num(&file, "context_window") {
-                (ctx.to_string(), "config context_window:".to_string())
-            } else if let Some(ctx) = ctx_from_index(&model) {
-                (ctx.to_string(), "cached context index".to_string())
-            } else {
-                match catalog_context_window(&model) {
-                    Some(ctx) => (ctx.to_string(), "models.dev catalog".to_string()),
-                    None => (
-                        "UNKNOWN".to_string(),
-                        "no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW"
-                            .to_string(),
-                    ),
-                }
-            };
-            let ctx = live
-                .map(|c| c.context_window.to_string())
-                .unwrap_or(chain_ctx);
-            row(&mut out, "context", &format!("{ctx} tokens"), &ctx_source);
-
-            // Experiment rows (online compaction, obs pack, evidence
-            // reducer): owned by each experiment module and rendered
-            // through the experiment registry — config.rs never names a
-            // gate or its env var. Order follows the registry.
-            for r in crate::agent::experiments::doctor_rows(crate::agent::experiments::DoctorCtx {
-                live,
-                model: &model,
-            }) {
-                row(&mut out, r.label, &r.value, &r.source);
-            }
-
-            let (chain_effort, effort_source) =
-                if let Some(e) = stored_thinking_effort(&base_url, &model) {
-                    (e, "stored /thinking choice".to_string())
-                } else if let Some(e) = env::var("DEX_THINKING_EFFORT")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                {
-                    (e, "DEX_THINKING_EFFORT".to_string())
-                } else if let Some(e) = load_config_str(&file, "thinking_effort") {
-                    (e, "config thinking_effort:".to_string())
-                } else {
-                    ("(unset)".to_string(), "model default".to_string())
-                };
-            let effort = live
-                .and_then(|c| c.thinking_effort.clone())
-                .unwrap_or(chain_effort);
-            row(&mut out, "thinking", &effort, &effort_source);
-
-            let (perm, perm_source) = match live.map(|c| c.permission) {
-                Some(mode) => {
-                    let source = if permission_override.is_some() {
-                        "--permission"
-                    } else if env::var("DEX_PERMISSION")
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                        .is_some()
-                    {
-                        "DEX_PERMISSION"
-                    } else {
-                        "built-in default"
-                    };
-                    (permission_name(mode).to_string(), source.to_string())
-                }
-                // The build failed (e.g. missing key): still show the origin.
-                None => match env::var("DEX_PERMISSION")
-                    .ok()
-                    .filter(|v| PermissionMode::parse(v).is_ok())
-                {
-                    Some(v) => (v, "DEX_PERMISSION".to_string()),
-                    None => ("trusted".to_string(), "built-in default".to_string()),
-                },
-            };
-            row(&mut out, "permission", &perm, &perm_source);
-            let (wake, wake_source) = agent_wake_origin();
-            row(
-                &mut out,
-                "agent wake",
-                if wake { "on" } else { "off" },
-                wake_source,
-            );
-
-            // Headers: count per layer, sources joined.
-            let mut header_count = 0;
-            let mut header_sources: Vec<&str> = Vec::new();
-            let http_headers = config_headers_map(&file, "http_headers");
-            let file_headers = config_headers_map(&file, "headers");
-            let entry_headers = entry.map(|e| e.headers.clone()).unwrap_or_default();
-            let env_headers = custom_headers_from_env();
-            let mut cli_headers = BTreeMap::new();
-            for raw in header_overrides {
-                insert_parsed_headers(&mut cli_headers, raw);
-            }
-            for (headers, source) in [
-                (&http_headers, "config http_headers: (deprecated)"),
-                (&file_headers, "config headers: (deprecated)"),
-                (&entry_headers, "config providers.<name>.headers"),
-                (&env_headers, "DEX_HEADERS"),
-                (&cli_headers, "--header"),
-            ] {
-                header_count += headers.len();
-                if !headers.is_empty() {
-                    header_sources.push(source);
-                }
-            }
-            row(
-                &mut out,
-                "headers",
-                &header_count.to_string(),
-                &if header_sources.is_empty() {
-                    "none".to_string()
-                } else {
-                    header_sources.join(" + ")
-                },
-            );
-
-            if !resolved.endpoints.is_empty() {
-                let names: Vec<&str> = resolved.endpoints.keys().map(String::as_str).collect();
-                row(
-                    &mut out,
-                    "endpoints",
-                    &names.join(", "),
-                    "available to /model routing",
-                );
-            }
-            if !provider_entries.is_empty() {
-                let names: Vec<&str> = provider_entries.keys().map(String::as_str).collect();
-                row(
-                    &mut out,
-                    "providers",
-                    &names.join(", "),
-                    "configured in providers:",
-                );
-            }
-        }
-    }
-    // Base system prompt override (DEX-13): provider-independent, so it
-    // prints even when the provider row is unsupported. Value is a char
-    // count — the full text would flood doctor — with the same origin
-    // `system_prompt_origin` reports at runtime.
-    {
-        let (text, label) = match &system_prompt_override {
-            Some((text, label)) => (Some(text.as_str()), *label),
-            None => (None, "--system-prompt"),
-        };
-        let (custom, origin) = system_prompt_origin_with_label(text, label);
-        let value = match custom {
-            Some(text) => format!("custom ({} chars)", text.chars().count()),
-            None => "default".to_string(),
-        };
-        row(&mut out, "system prompt", &value, origin);
-    }
-    // Lua extensions: disk discovery + consent state (deterministic — the
-    // load-state detail lives in `dex extensions list`).
-    let discovered = crate::extensions::discovered_extensions();
-    if discovered.is_empty() {
-        row(&mut out, "extensions", "none", "cwd/.dex, XDG config dirs");
-    } else {
-        for (id, version, scope, state) in &discovered {
-            row(
-                &mut out,
-                "extensions",
-                &format!("{id} {version}"),
-                &format!("{scope}, {state}"),
-            );
-        }
-    }
-    // Extra dirs from config/env (origin per the precedence rules).
-    let ext_paths = crate::extensions::config_extension_paths();
-    if !ext_paths.is_empty() {
-        let origin = if std::env::var("DEX_EXTENSIONS_PATHS")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            "DEX_EXTENSIONS_PATHS (environment)"
-        } else {
-            "extensions.paths (config)"
-        };
-        row(
-            &mut out,
-            "ext paths",
-            &ext_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            origin,
-        );
-    }
-    out.push('\n');
-    match &cfg_result {
-        Ok(_) => row(&mut out, "resolve", "OK", "config builds cleanly"),
-        Err(e) => row(&mut out, "resolve", "ERROR", &e.to_string()),
-    }
+    provider_section(
+        &mut out,
+        &ProviderDoctor {
+            file: &file,
+            provider_entries: &provider_entries,
+            known: &known,
+            provider_name: &provider_name,
+            provider_source: &provider_source,
+            selection_source: &selection_source,
+            has_selection: selection.is_some(),
+            pre_model: &pre_model,
+            cfg_result: &cfg_result,
+            flag_base_url: flag_base_url.as_deref(),
+            permission_override,
+            header_overrides,
+            custom_route: selection_provider.is_none() && provider_name == "custom",
+        },
+    );
+    tail_rows(&mut out, &system_prompt_override, &cfg_result);
     out
 }
 

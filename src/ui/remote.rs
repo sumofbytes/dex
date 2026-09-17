@@ -349,14 +349,18 @@ fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     )])
 }
 
-/// `daemon_is_local` says whether this process owns the daemon it talks to
-/// (`Mode::Default`) rather than connecting to one it does not (`Mode::Connect`).
-/// It decides the quit-time resume command — see `resume_command`.
-pub(crate) fn run_ratatui_repl_with_remote(
-    args: &Args,
-    daemon_url: &str,
-    daemon_is_local: bool,
-) -> std::io::Result<()> {
+/// Whatever the render/event loop needs after boot: live app state plus the
+/// initialized terminal (raw mode entered, alternate screen on) and its restore
+/// guard.
+struct Boot {
+    remote: RemoteApp,
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    cleanup: TerminalCleanup,
+}
+
+/// Boot half of the remote REPL: connect, fan out the config/session/skills
+/// fetches, build the app, replay a reattach, and prime the terminal.
+fn bootstrap(args: &Args, daemon_url: &str, daemon_is_local: bool) -> std::io::Result<Boot> {
     if !std::io::stdout().is_terminal() {
         return Err(std::io::Error::other(
             "interactive UI requires a terminal (TTY); use `dex connect <url> \"prompt\"` for one-shot",
@@ -711,6 +715,29 @@ pub(crate) fn run_ratatui_repl_with_remote(
         push_info(&mut remote.app, format!("dex: {warning}"));
     }
 
+    Ok(Boot {
+        remote,
+        terminal,
+        cleanup,
+    })
+}
+
+/// `daemon_is_local` says whether this process owns the daemon it talks to
+/// (`Mode::Default`) rather than connecting to one it does not (`Mode::Connect`).
+/// It decides the quit-time resume command — see `resume_command`.
+///
+/// Render/event-loop half of the remote REPL: `bootstrap` owns terminal setup,
+/// this owns the draw/poll loop and the restore + resume hint on the way out.
+pub(crate) fn run_ratatui_repl_with_remote(
+    args: &Args,
+    daemon_url: &str,
+    daemon_is_local: bool,
+) -> std::io::Result<()> {
+    let Boot {
+        mut remote,
+        mut terminal,
+        cleanup,
+    } = bootstrap(args, daemon_url, daemon_is_local)?;
     // Report lifecycle state to the enclosing Herdr pane, if any.
     let mut herdr = super::herdr::Reporter::new();
     let mut run = || -> std::io::Result<()> {
@@ -1721,54 +1748,13 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     // `busy` but cancels the same way (Esc cancels it).
     let shell_running = remote.shell_running;
     let shell_cancel_requested = remote.shell_cancel_requested;
-    let app = &mut remote.app;
 
     // Approval overlay takes precedence: the worker is blocked until a
     // decision arrives.
-    if !app.pending_approvals.is_empty() {
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Deny the pending approval and cancel the turn; another
-                // Ctrl+C once idle quits.
-                resolve_approval(app, CoreApprovalDecision::Deny);
-                request_cancel(remote);
-            }
-            KeyCode::Up | KeyCode::Left => {
-                if let Some(approval) = app.pending_approvals.first_mut() {
-                    approval.selected = approval.selected.saturating_sub(1);
-                }
-            }
-            KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
-                if let Some(approval) = app.pending_approvals.first_mut() {
-                    approval.selected = (approval.selected + 1).min(2);
-                }
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                resolve_approval(app, CoreApprovalDecision::Once);
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                resolve_approval(app, CoreApprovalDecision::Session);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                resolve_approval(app, CoreApprovalDecision::Deny);
-            }
-            KeyCode::Enter => {
-                let decision =
-                    app.pending_approvals
-                        .first()
-                        .map(|approval| match approval.selected {
-                            0 => CoreApprovalDecision::Once,
-                            1 => CoreApprovalDecision::Session,
-                            _ => CoreApprovalDecision::Deny,
-                        });
-                if let Some(decision) = decision {
-                    resolve_approval(app, decision);
-                }
-            }
-            _ => {}
-        }
+    if handle_approval_key(remote, key) {
         return;
     }
+    let app = &mut remote.app;
 
     // Idle double Ctrl+C guard: any non-Ctrl+C key cancels the pending quit.
     let is_ctrl_c =
@@ -1779,44 +1765,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.busy || shell_running {
-                if app.cancel_requested || shell_cancel_requested {
-                    // Cancel already in flight: stay idempotent. Only the
-                    // third press force-quits (stuck daemon/shell) — a slow
-                    // turn must never die to an impatient double-tap.
-                    app.cancel_presses = app.cancel_presses.saturating_add(1);
-                    if app.cancel_presses >= 3 {
-                        app.quit = true;
-                    } else {
-                        push_info(
-                            app,
-                            "still cancelling... (Ctrl+C again to force quit)".to_string(),
-                        );
-                    }
-                } else {
-                    request_cancel(remote);
-                    remote.app.cancel_presses = 1;
-                }
-            } else if !app.input.text().is_empty() {
-                // First press with a drafted prompt just clears the composer
-                // quitting needs an empty line.
-                app.input.reset();
-                app.slash_selected = 0;
-                app.last_ctrl_c = None;
-            } else {
-                // Double Ctrl+C to exit when idle (avoid accidental quit).
-                const DOUBLE_WINDOW: Duration = Duration::from_secs(2);
-                let now = Instant::now();
-                let should_quit = app
-                    .last_ctrl_c
-                    .is_some_and(|t| now.duration_since(t) <= DOUBLE_WINDOW);
-                if should_quit {
-                    app.quit = true;
-                } else {
-                    app.last_ctrl_c = Some(now);
-                    push_info(app, "Press Ctrl+C again to exit".to_string());
-                }
-            }
+            handle_ctrl_c(remote, shell_running, shell_cancel_requested);
         }
         KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1855,66 +1804,7 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         {
             recall_queued(remote);
         }
-        _ if popup_open(app) => match key.code {
-            KeyCode::Esc => {
-                // Discard the drafted slash command and close the popup
-                // without completing anything (busy+Esc still cancels).
-                dismiss_slash(app);
-            }
-            KeyCode::Up => {
-                app.slash_selected = app.slash_selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                let last = slash_suggestions(app).len().saturating_sub(1);
-                app.slash_selected = (app.slash_selected + 1).min(last);
-            }
-            KeyCode::Tab => {
-                if !expand_bare_command(app) {
-                    complete_slash(app);
-                }
-            }
-            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // Bare picker command (`/model`, `/provider`, `/resume`):
-                // first Enter expands to `"<cmd> "` and shows the popup
-                // instead of submitting the bare form (which would only
-                // print info into the transcript). Same expansion applies
-                // to a bare picker command recalled from history — the
-                // recalled line is the text, so expand it here too.
-                if expand_bare_command(app) {
-                    return;
-                }
-                // Command-name completion without an argument yet (`/mod` →
-                // `/model `): complete but don't submit while the result is
-                // still a bare picker command. Argument-less commands
-                // (`/clear`) still submit immediately, and argument
-                // completions (`/model foo`, `/resume 0`) complete + submit
-                // the highlighted choice as before.
-                let before = app.input.text();
-                if !before.contains(' ') && !before.contains('\n') {
-                    let before_bare = before.trim().to_string();
-                    if complete_slash(app) {
-                        let bare = app.input.text().trim().to_string();
-                        if EXPAND_ON_ENTER.contains(&bare.as_str()) && before_bare != bare {
-                            app.slash_selected = 0;
-                            return;
-                        }
-                    }
-                } else {
-                    complete_slash(app);
-                }
-                let is_followup = key.modifiers.contains(KeyModifiers::ALT);
-                submit_prompt(remote, is_followup);
-            }
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => {
-                // Typing narrows the popup list: feed the keystroke to the
-                // composer and jump back to the top match so the highlight
-                // never strands past the filtered results (e.g. `/` + `r`
-                // lands on `/resume` instead of a stale arrow position).
-                app.input.handle_key(key);
-                app.slash_selected = 0;
-            }
-            _ => app.input.handle_key(key),
-        },
+        _ if popup_open(app) => handle_popup_key(remote, key),
         KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             let is_followup = key.modifiers.contains(KeyModifiers::ALT);
             submit_prompt(remote, is_followup);
@@ -1925,43 +1815,214 @@ fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
         KeyCode::PageDown => {
             scroll_transcript(app, 20);
         }
-        KeyCode::Up => {
-            if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
-                scroll_transcript(app, -1);
-            } else if app.input.lines.len() <= 1
-                || (app.history_index.is_some() && composer_at_end(app))
-                || app.input.row == 0
-            {
-                app.history_up();
-            } else {
-                app.input.handle_key(key);
+        KeyCode::Up => handle_up_key(app, key),
+        KeyCode::Down => handle_down_key(app, key),
+        _ => handle_composer_key(app, key),
+    }
+}
+
+/// Approval overlay: the worker is blocked until a decision arrives, so this
+/// owns every key while an approval is pending. Returns true when one was
+/// showing (the caller then returns without touching the composer).
+fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
+    if remote.app.pending_approvals.is_empty() {
+        return false;
+    }
+    let app = &mut remote.app;
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Deny the pending approval and cancel the turn; another Ctrl+C
+            // once idle quits.
+            resolve_approval(app, CoreApprovalDecision::Deny);
+            request_cancel(remote);
+        }
+        KeyCode::Up | KeyCode::Left => {
+            if let Some(approval) = app.pending_approvals.first_mut() {
+                approval.selected = approval.selected.saturating_sub(1);
             }
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+            if let Some(approval) = app.pending_approvals.first_mut() {
+                approval.selected = (approval.selected + 1).min(2);
+            }
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            resolve_approval(app, CoreApprovalDecision::Once);
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            resolve_approval(app, CoreApprovalDecision::Session);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            resolve_approval(app, CoreApprovalDecision::Deny);
+        }
+        KeyCode::Enter => {
+            let decision = app
+                .pending_approvals
+                .first()
+                .map(|approval| match approval.selected {
+                    0 => CoreApprovalDecision::Once,
+                    1 => CoreApprovalDecision::Session,
+                    _ => CoreApprovalDecision::Deny,
+                });
+            if let Some(decision) = decision {
+                resolve_approval(app, decision);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Ctrl+C: cancel a running turn/shell (with the force-quit guard), clear a
+/// drafted prompt, or arm the double-press quit when idle.
+fn handle_ctrl_c(remote: &mut RemoteApp, shell_running: bool, shell_cancel_requested: bool) {
+    let app = &mut remote.app;
+    if app.busy || shell_running {
+        if app.cancel_requested || shell_cancel_requested {
+            // Cancel already in flight: stay idempotent. Only the third press
+            // force-quits (stuck daemon/shell) — a slow turn must never die to
+            // an impatient double-tap.
+            app.cancel_presses = app.cancel_presses.saturating_add(1);
+            if app.cancel_presses >= 3 {
+                app.quit = true;
+            } else {
+                push_info(
+                    app,
+                    "still cancelling... (Ctrl+C again to force quit)".to_string(),
+                );
+            }
+        } else {
+            request_cancel(remote);
+            remote.app.cancel_presses = 1;
+        }
+    } else if !app.input.text().is_empty() {
+        // First press with a drafted prompt just clears the composer;
+        // quitting needs an empty line.
+        app.input.reset();
+        app.slash_selected = 0;
+        app.last_ctrl_c = None;
+    } else {
+        // Double Ctrl+C to exit when idle (avoid accidental quit).
+        const DOUBLE_WINDOW: Duration = Duration::from_secs(2);
+        let now = Instant::now();
+        let should_quit = app
+            .last_ctrl_c
+            .is_some_and(|t| now.duration_since(t) <= DOUBLE_WINDOW);
+        if should_quit {
+            app.quit = true;
+        } else {
+            app.last_ctrl_c = Some(now);
+            push_info(app, "Press Ctrl+C again to exit".to_string());
+        }
+    }
+}
+
+/// Slash-command popup: owns Up/Down/Tab/Enter/Esc and feeds typing through to
+/// the composer so the highlight tracks the filtered list.
+fn handle_popup_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
+    let app = &mut remote.app;
+    match key.code {
+        KeyCode::Esc => {
+            // Discard the drafted slash command and close the popup without
+            // completing anything (busy+Esc still cancels).
+            dismiss_slash(app);
+        }
+        KeyCode::Up => {
+            app.slash_selected = app.slash_selected.saturating_sub(1);
         }
         KeyCode::Down => {
-            if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
-                scroll_transcript(app, 1);
-            } else if app.input.lines.len() <= 1 || app.input.row + 1 >= app.input.lines.len() {
-                app.history_down();
-            } else {
-                app.input.handle_key(key);
+            let last = slash_suggestions(app).len().saturating_sub(1);
+            app.slash_selected = (app.slash_selected + 1).min(last);
+        }
+        KeyCode::Tab => {
+            if !expand_bare_command(app) {
+                complete_slash(app);
             }
         }
-        _ => {
-            // A mutating keystroke turns the recalled line into a fresh
-            // draft (next `Up` saves the edited text); cursor-only keys keep
-            // the walk so `Left` + `Up` moves within the recalled prompt.
-            // The text comparison keeps no-op `Backspace`/`Delete` on the
-            // walk instead of detaching for an unchanged buffer.
-            if app.history_index.is_some() && history_detaching_key(key) {
-                let before = app.input.text();
-                app.input.handle_key(key);
-                if app.input.text() != before {
-                    app.history_index = None;
+        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Bare picker command (`/model`, `/provider`, `/resume`): first
+            // Enter expands to `"<cmd> "` and shows the popup instead of
+            // submitting the bare form (which would only print info into the
+            // transcript). Same expansion applies to a bare picker command
+            // recalled from history — the recalled line is the text, so expand
+            // it here too.
+            if expand_bare_command(app) {
+                return;
+            }
+            // Command-name completion without an argument yet (`/mod` →
+            // `/model `): complete but don't submit while the result is still a
+            // bare picker command. Argument-less commands (`/clear`) still
+            // submit immediately, and argument completions (`/model foo`,
+            // `/resume 0`) complete + submit the highlighted choice as before.
+            let before = app.input.text();
+            if !before.contains(' ') && !before.contains('\n') {
+                let before_bare = before.trim().to_string();
+                if complete_slash(app) {
+                    let bare = app.input.text().trim().to_string();
+                    if EXPAND_ON_ENTER.contains(&bare.as_str()) && before_bare != bare {
+                        app.slash_selected = 0;
+                        return;
+                    }
                 }
             } else {
-                app.input.handle_key(key);
+                complete_slash(app);
             }
+            let is_followup = key.modifiers.contains(KeyModifiers::ALT);
+            submit_prompt(remote, is_followup);
         }
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete => {
+            // Typing narrows the popup list: feed the keystroke to the
+            // composer and jump back to the top match so the highlight never
+            // strands past the filtered results (e.g. `/` + `r` lands on
+            // `/resume` instead of a stale arrow position).
+            app.input.handle_key(key);
+            app.slash_selected = 0;
+        }
+        _ => app.input.handle_key(key),
+    }
+}
+
+/// Up: scroll while busy/Shift, walk history at a single-line composer, else
+/// move the composer cursor.
+fn handle_up_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
+        scroll_transcript(app, -1);
+    } else if app.input.lines.len() <= 1
+        || (app.history_index.is_some() && composer_at_end(app))
+        || app.input.row == 0
+    {
+        app.history_up();
+    } else {
+        app.input.handle_key(key);
+    }
+}
+
+/// Down: scroll while busy/Shift, walk history at the last line, else move the
+/// composer cursor.
+fn handle_down_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
+        scroll_transcript(app, 1);
+    } else if app.input.lines.len() <= 1 || app.input.row + 1 >= app.input.lines.len() {
+        app.history_down();
+    } else {
+        app.input.handle_key(key);
+    }
+}
+
+/// Default composer path: a mutating keystroke turns a recalled line into a
+/// fresh draft (next Up saves the edited text); cursor-only keys keep the walk
+/// so Left + Up moves within the recalled prompt. The text comparison keeps
+/// no-op Backspace/Delete on the walk instead of detaching for an unchanged
+/// buffer.
+fn handle_composer_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    if app.history_index.is_some() && history_detaching_key(key) {
+        let before = app.input.text();
+        app.input.handle_key(key);
+        if app.input.text() != before {
+            app.history_index = None;
+        }
+    } else {
+        app.input.handle_key(key);
     }
 }
 
@@ -2444,79 +2505,147 @@ async fn try_reconnect(
 }
 
 /// Slash commands for remote mode. Locally-answered commands are handled
-/// here; everything else defers to the shared `slash` module. Returns true
-/// when the app should quit.
+/// here; everything else defers to the shared `slash` module's `handle_slash`
+/// (with the client-side config deltas the daemon needs re-synced). Returns
+/// true when the app should quit.
 fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
-    match line {
-        "/quit" => return true,
-        "/clear" | "/new" => {
-            if remote.app.busy {
-                let what = if line == "/clear" {
-                    "clear history"
-                } else {
-                    "start a new session"
-                };
-                push_info(
-                    &mut remote.app,
-                    format!("cannot {what} while a turn is running."),
-                );
-            } else {
-                let label = if line == "/clear" {
-                    "history cleared."
-                } else {
-                    "new session started."
-                };
-                let cwd = remote.app.cwd.clone();
-                let name = Session::default_session_name(&cwd);
-                match remote.client.create_session(&cwd, Some(&name)) {
-                    Ok(session) => {
-                        remote.session_id = session.session_id;
-                        reset_session_state(&mut remote.app);
-                        remote.options.plan = None;
-                        let mut fresh = Session::in_memory(cwd);
-                        fresh.set_name(name).ok();
-                        remote.app.session = fresh;
-                        push_info(&mut remote.app, label.to_string());
-                        push_skills_listing(&mut remote.app);
-                    }
-                    Err(e) => {
-                        push_info(&mut remote.app, format!("could not start new session: {e}"))
-                    }
-                }
-            }
-        }
-        "/session" => {
+    use super::slash::{cmd_help, parse, SlashCommand};
+
+    match parse(line) {
+        SlashCommand::Quit => return true,
+        SlashCommand::Clear => remote_reset(remote, false),
+        SlashCommand::New => remote_reset(remote, true),
+        SlashCommand::Session => {
             let id = remote.session_id.clone();
             push_info(&mut remote.app, format!("session: {id} (on daemon)"));
         }
-        "/undo" => {
-            let sid = remote.session_id.clone();
-            match remote.client.undo(&sid) {
-                Ok(true) => push_info(&mut remote.app, "last change undone.".to_string()),
-                Ok(false) | Err(_) => push_info(
-                    &mut remote.app,
-                    "nothing to undo (or undo refused).".to_string(),
-                ),
+        SlashCommand::Undo => remote_undo(remote),
+        SlashCommand::Mcp(arg) => remote_mcp(remote, arg),
+        SlashCommand::Help => cmd_help(&mut remote.app, true),
+        SlashCommand::Skill(name) => remote_skill(remote, name),
+        SlashCommand::Waive(reason) => remote_waive(remote, reason),
+        SlashCommand::Name(name) => remote_name(remote, name),
+        SlashCommand::Thinking(arg) => remote_thinking(remote, arg),
+        SlashCommand::Extension(full) => {
+            let owned = full.to_string();
+            remote_extension_line(remote, &owned);
+        }
+        SlashCommand::Provider(Some(name)) if !name.trim().is_empty() => push_info(
+            &mut remote.app,
+            "provider is configured on the daemon host; not switchable from a remote client"
+                .to_string(),
+        ),
+        SlashCommand::Resume(selector) => remote_resume(remote, selector),
+        SlashCommand::Unknown => {
+            if !remote_unknown_or_extension(remote, line) {
+                push_info(&mut remote.app, format!("unknown command: {line}"));
             }
         }
-        _ if line.starts_with("/mcp ") => {
+        _ => {
+            let had_model = remote.app.config.model.clone();
+            let had_permission = remote.app.config.permission;
+            let had_plan = remote.app.plan.clone();
+            // Raw `/model <selection>` argument: the daemon routes endpoint
+            // prefixes (`go/…`) against its own endpoint table, so it must
+            // see the un-stripped selection — the client's `config.model` is
+            // already resolved to the bare id.
+            let raw_model = line.strip_prefix("/model ").map(|s| s.trim().to_string());
+            let quit = handle_slash(&mut remote.app, line);
+            if remote.app.config.model != had_model {
+                remote.options.model = Some(match raw_model {
+                    Some(raw) if !raw.is_empty() => raw,
+                    _ => remote.app.config.model.clone(),
+                });
+                // A new endpoint+model has its own effort: drop the old
+                // override so the next turn uses the daemon default instead
+                // of pinning the previous model's level.
+                remote.options.thinking_effort = None;
+            }
+            if remote.app.config.permission != had_permission {
+                remote.options.permission = Some(match remote.app.config.permission {
+                    PermissionMode::ReadOnly => "read-only".to_string(),
+                    PermissionMode::AskWrites => "ask-writes".to_string(),
+                    PermissionMode::AskShell => "ask-shell".to_string(),
+                    PermissionMode::Trusted => "trusted".to_string(),
+                });
+            }
+            if remote.app.plan != had_plan {
+                if remote.app.plan.is_empty() {
+                    remote.options.plan = Some(String::new());
+                } else {
+                    remote.options.plan = Some(remote.app.plan.to_json());
+                }
+            }
+            return quit;
+        }
+    }
+    false
+}
+
+/// `/clear` and `/new` both start a fresh daemon session (the daemon owns the
+/// conversation); `new_session` only picks the wording.
+fn remote_reset(remote: &mut RemoteApp, new_session: bool) {
+    if remote.app.busy {
+        let what = if new_session {
+            "start a new session"
+        } else {
+            "clear history"
+        };
+        push_info(
+            &mut remote.app,
+            format!("cannot {what} while a turn is running."),
+        );
+        return;
+    }
+    let label = if new_session {
+        "new session started."
+    } else {
+        "history cleared."
+    };
+    let cwd = remote.app.cwd.clone();
+    let name = Session::default_session_name(&cwd);
+    match remote.client.create_session(&cwd, Some(&name)) {
+        Ok(session) => {
+            remote.session_id = session.session_id;
+            reset_session_state(&mut remote.app);
+            remote.options.plan = None;
+            let mut fresh = Session::in_memory(cwd);
+            fresh.set_name(name).ok();
+            remote.app.session = fresh;
+            push_info(&mut remote.app, label.to_string());
+            push_skills_listing(&mut remote.app);
+        }
+        Err(e) => push_info(&mut remote.app, format!("could not start new session: {e}")),
+    }
+}
+
+fn remote_undo(remote: &mut RemoteApp) {
+    let sid = remote.session_id.clone();
+    match remote.client.undo(&sid) {
+        Ok(true) => push_info(&mut remote.app, "last change undone.".to_string()),
+        Ok(false) | Err(_) => push_info(
+            &mut remote.app,
+            "nothing to undo (or undo refused).".to_string(),
+        ),
+    }
+}
+
+fn remote_mcp(remote: &mut RemoteApp, arg: Option<&str>) {
+    match arg {
+        Some("help") => {
             // Same grammar as local `/mcp`: only `help` is valid; anything
             // else is usage (login itself runs in the CLI on the daemon host).
-            match line["/mcp ".len()..].trim() {
-                "help" => {
-                    push_info(
-                        &mut remote.app,
-                        "/mcp shows server status including auth.".to_string(),
-                    );
-                    push_info(
-                        &mut remote.app,
-                        "MCP OAuth runs in the CLI: `dex mcp login <server>` (on the daemon host when remote).".to_string(),
-                    );
-                }
-                _ => push_info(&mut remote.app, "usage: /mcp [help]".to_string()),
-            }
+            push_info(
+                &mut remote.app,
+                "/mcp shows server status including auth.".to_string(),
+            );
+            push_info(
+                &mut remote.app,
+                "MCP OAuth runs in the CLI: `dex mcp login <server>` (on the daemon host when remote).".to_string(),
+            );
         }
-        "/mcp" => {
+        Some(_) => push_info(&mut remote.app, "usage: /mcp [help]".to_string()),
+        None => {
             // Explicit arm (not the `handle_slash` fallthrough below): the
             // daemon owns the MCP connections, so status must come from
             // `/api/mcp` — the client process's own manager was never
@@ -2550,352 +2679,452 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                 Err(e) => push_info(&mut remote.app, format!("could not fetch MCP status: {e}")),
             }
         }
-        "/help" => {
-            push_info(
-                &mut remote.app,
-                "commands: /quit /clear /new /session /undo /mcp /waive <reason> /permissions /model [<m>] /skill:<name> /goal <text> /plan [add|done|clear] /constraint [add|clear] /accept [add|done|clear]"
-                    .to_string(),
-            );
-            push_info(
-                &mut remote.app,
-                "prefix: !<command> runs shell directly, output feeds the next turn.".to_string(),
-            );
-            push_info(
-                &mut remote.app,
-                "prefix: !!<command> keeps the output out of model context.".to_string(),
-            );
-            push_info(
-                &mut remote.app,
-                "keys: Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
-                    .to_string(),
-            );
-            push_info(
-                &mut remote.app,
-                "mouse: drag, double/triple-click to select and copy · wheel scrolls".to_string(),
-            );
-            push_info(
-                &mut remote.app,
-                "while working: Enter queues steer · Alt+Enter queues follow-up · Alt+Up recalls the newest queued message for editing · Esc/Ctrl+C cancels and restores queued input"
-                    .to_string(),
-            );
+    }
+}
+
+fn remote_skill(remote: &mut RemoteApp, name: Option<&str>) {
+    let name = name.unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        push_info(&mut remote.app, "usage: /skill:<name>".to_string());
+        return;
+    }
+    let sid = remote.session_id.clone();
+    let dirs = remote.options.skill_dirs.clone();
+    match remote.client.load_skill(&sid, &name, &dirs) {
+        Ok(resp) => {
+            push_info(&mut remote.app, format!("loaded skill: {}", resp.name));
         }
-        _ if line.starts_with("/skill:") => {
-            let name = line["/skill:".len()..].trim().to_string();
-            if name.is_empty() {
-                push_info(&mut remote.app, "usage: /skill:<name>".to_string());
-            } else {
-                let sid = remote.session_id.clone();
-                let dirs = remote.options.skill_dirs.clone();
-                let res = remote.client.load_skill(&sid, &name, &dirs);
-                match res {
-                    Ok(resp) => {
-                        push_info(&mut remote.app, format!("loaded skill: {}", resp.name));
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("404") {
-                            push_info(&mut remote.app, format!("skill not found: {name}"));
-                            let needs_refresh = remote.app.skills.is_empty();
-                            if needs_refresh {
-                                if let Ok(fresh) = remote.client.list_skills() {
-                                    remote.app.skills = fresh
-                                        .into_iter()
-                                        .map(|info| crate::core::types::Skill {
-                                            name: info.name,
-                                            description: info.description,
-                                            path: std::path::PathBuf::from(""),
-                                        })
-                                        .collect();
-                                }
-                            }
-                            let names: Vec<String> =
-                                remote.app.skills.iter().map(|s| s.name.clone()).collect();
-                            if !names.is_empty() {
-                                push_info(&mut remote.app, "available skills:".to_string());
-                                for n in names {
-                                    push_info(&mut remote.app, format!("  - {n}"));
-                                }
-                            }
-                        } else {
-                            push_info(
-                                &mut remote.app,
-                                format!("could not load skill '{name}': {e}"),
-                            );
-                        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("404") {
+                push_info(&mut remote.app, format!("skill not found: {name}"));
+                let needs_refresh = remote.app.skills.is_empty();
+                if needs_refresh {
+                    if let Ok(fresh) = remote.client.list_skills() {
+                        remote.app.skills = fresh
+                            .into_iter()
+                            .map(|info| crate::core::types::Skill {
+                                name: info.name,
+                                description: info.description,
+                                path: std::path::PathBuf::from(""),
+                            })
+                            .collect();
                     }
                 }
-            }
-        }
-        _ if line.starts_with("/waive ") => {
-            let reason = line["/waive ".len()..].trim().to_string();
-            if reason.is_empty() {
-                push_info(&mut remote.app, "usage: /waive <reason>".to_string());
-            } else {
-                let sid = remote.session_id.clone();
-                match remote.client.waive(&sid, &reason) {
-                    Ok(()) => push_info(
-                        &mut remote.app,
-                        "verification waived (recorded for this session).".to_string(),
-                    ),
-                    Err(e) => push_info(
-                        &mut remote.app,
-                        format!("could not waive verification: {e}"),
-                    ),
-                }
-            }
-        }
-        _ if line.starts_with("/name ") => {
-            let name = line["/name ".len()..].trim().to_string();
-            if name.is_empty() {
-                push_info(&mut remote.app, "usage: /name <name>".to_string());
-            } else {
-                let sid = remote.session_id.clone();
-                match remote.client.rename_session(&sid, &name) {
-                    Ok(()) => push_info(&mut remote.app, format!("session name: {name}")),
-                    Err(e) => push_info(&mut remote.app, format!("could not rename: {e}")),
-                }
-            }
-        }
-        l if l.starts_with("/provider ") => {
-            push_info(
-                &mut remote.app,
-                "provider is configured on the daemon host; not switchable from a remote client"
-                    .to_string(),
-            );
-        }
-        "/resume" => {
-            // Prefer daemon listing (works over network); fall back to local files for offline.
-            let daemon_sessions = remote.client.list_sessions().ok();
-            if let Some(mut sessions) = daemon_sessions {
-                sessions.retain(|s| {
-                    s.cwd == remote.app.cwd
-                        && s.session_id != remote.session_id
-                        && s.message_count > 0
-                });
-                if sessions.is_empty() {
-                    push_info(&mut remote.app, "no sessions found.".to_string());
-                } else {
-                    push_info(&mut remote.app, "sessions:".to_string());
-                    for (i, s) in sessions.iter().enumerate() {
-                        let name = s.name.as_deref().unwrap_or("(unnamed)");
-                        let mut row = format!("  {}: {} ({})", i, name, s.session_id);
-                        if s.child_agents > 0 {
-                            row.push_str(&format!(" · {} agent run(s)", s.child_agents));
-                        }
-                        if s.interrupted_children > 0 {
-                            row.push_str(&format!(" · {} interrupted", s.interrupted_children));
-                        }
-                        push_info(&mut remote.app, row);
+                let names: Vec<String> = remote.app.skills.iter().map(|s| s.name.clone()).collect();
+                if !names.is_empty() {
+                    push_info(&mut remote.app, "available skills:".to_string());
+                    for n in names {
+                        push_info(&mut remote.app, format!("  - {n}"));
                     }
-                    push_info(
-                        &mut remote.app,
-                        "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
-                    );
                 }
             } else {
-                let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
-                let filtered: Vec<_> = sessions
-                    .into_iter()
-                    .filter(|(path, header)| {
-                        if header.id() == remote.app.session.id() {
-                            return false;
-                        }
-                        matches!(
-                            crate::session::load_messages_from_session(path),
-                            Ok(msgs) if !msgs.is_empty()
-                        )
-                    })
-                    .collect();
-                if filtered.is_empty() {
-                    push_info(&mut remote.app, "no sessions found.".to_string());
-                } else {
-                    push_info(&mut remote.app, "sessions:".to_string());
-                    for (i, (path, header)) in filtered.iter().enumerate() {
-                        let name = header.name().unwrap_or("(unnamed)");
-                        push_info(
-                            &mut remote.app,
-                            format!("  {}: {} ({})", i, name, path.display()),
-                        );
-                    }
-                    push_info(
-                        &mut remote.app,
-                        "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
-                    );
-                }
-            }
-        }
-        _ if line.starts_with("/resume ") => {
-            if remote.app.busy {
                 push_info(
                     &mut remote.app,
-                    "cannot resume a session while a turn is running.".to_string(),
+                    format!("could not load skill '{name}': {e}"),
                 );
-                return false;
             }
-            let selector = line["/resume ".len()..].trim().to_string();
-            // Resolve selector to a daemon session_id + server-side path: index
-            // or id prefix. Filter the same way as the listing so indices line
-            // up. The daemon path doubles as the local file when co-located.
-            let resolved: Option<(String, Option<String>)> = remote
-                .client
-                .list_sessions()
-                .ok()
-                .and_then(|mut sessions| {
-                    sessions.retain(|s| {
-                        s.cwd == remote.app.cwd
-                            && s.session_id != remote.session_id
-                            && s.message_count > 0
-                    });
-                    if let Ok(idx) = selector.parse::<usize>() {
-                        return sessions
-                            .get(idx)
-                            .map(|s| (s.session_id.clone(), Some(s.path.clone())));
-                    }
-                    // prefix or exact id/name match
-                    let q = selector.to_ascii_lowercase();
-                    sessions
-                        .iter()
-                        .find(|s| {
-                            s.session_id.to_ascii_lowercase().starts_with(&q)
-                                || s.name
-                                    .as_deref()
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase()
-                                    .contains(&q)
-                        })
-                        .map(|s| (s.session_id.clone(), Some(s.path.clone())))
-                })
-                .or_else(|| {
-                    let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
-                    let filtered: Vec<_> = sessions
-                        .into_iter()
-                        .filter(|(path, header)| {
-                            if header.id() == remote.app.session.id() {
-                                return false;
-                            }
-                            matches!(
-                                crate::session::load_messages_from_session(path),
-                                Ok(msgs) if !msgs.is_empty()
-                            )
-                        })
-                        .collect();
-                    if let Ok(idx) = selector.parse::<usize>() {
-                        return filtered.get(idx).and_then(|(p, _)| {
-                            // Resolve id from file header for local fallback.
-                            crate::session::Session::from_path(p)
-                                .ok()
-                                .map(|s| (s.id().to_string(), Some(p.display().to_string())))
-                        });
-                    }
-                    let q = selector.to_ascii_lowercase();
-                    filtered
-                        .iter()
-                        .find(|(p, h)| {
-                            h.id().to_ascii_lowercase().starts_with(&q)
-                                || h.name().unwrap_or("").to_ascii_lowercase().contains(&q)
-                                || p.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase()
-                                    .starts_with(&q)
-                        })
-                        .and_then(|(p, _)| crate::session::Session::from_path(p).ok())
-                        .map(|s| {
-                            let path = s.path().map(|p| p.display().to_string());
-                            (s.id().to_string(), path)
-                        })
-                });
-            let Some((sid, daemon_path)) = resolved else {
-                push_info(
-                    &mut remote.app,
-                    format!("could not resume session: {selector} not found"),
-                );
-                return false;
-            };
-            // Local JSONL when files are shared (default co-located daemon):
-            // daemon path first, then an id lookup (Session::resume only
-            // handles index/path, so an id through it silently misses).
-            let local_path: Option<std::path::PathBuf> = daemon_path
-                .map(std::path::PathBuf::from)
-                .filter(|p| p.is_file())
-                .or_else(|| find_local_session_file(&sid));
-            // Reattach before touching the transcript: a failed reattach must
-            // leave the current view intact instead of blanking it.
-            match remote.client.reattach(&sid) {
-                Ok(resp) => {
-                    remote.session_id = resp.session_id.clone();
-                    // Full per-session reset (transcript, usage, plan, scroll,
-                    // pending steering/approvals) so the old conversation
-                    // doesn't leak into the resumed one.
-                    reset_session_state(&mut remote.app);
-                    remote.options.plan = None;
-                    if let Some(p) = local_path.as_deref() {
-                        if let Ok(s) = Session::from_path(p) {
-                            remote.app.session = s;
-                        }
-                    }
-                    // Prefer JSONL messages (complete, includes user prompts
-                    // the events journal never records); replay events only
-                    // when no local file is available (true remote).
-                    let mut rebuilt = false;
-                    if let Some(p) = local_path.as_deref() {
-                        rebuilt = rebuild_remote_from_messages(remote, p, no_paint);
-                    }
-                    if !rebuilt {
-                        let sid = remote.session_id.clone();
-                        replay_remote_events(remote, &sid, no_paint);
-                        if remote.app.transcript.is_empty()
-                            && remote.app.assistant_pending.is_empty()
-                        {
-                            push_info(
-                                &mut remote.app,
-                                "resumed session has no replayable history.".to_string(),
-                            );
-                        }
-                    }
-                    push_info(
-                        &mut remote.app,
-                        format!("resumed session: {}", remote.session_id),
-                    );
-                }
-                Err(e) => push_info(&mut remote.app, format!("could not reattach session: {e}")),
-            }
-        }
-        _ => {
-            let had_model = remote.app.config.model.clone();
-            let had_permission = remote.app.config.permission;
-            let had_plan = remote.app.plan.clone();
-            // Raw `/model <selection>` argument: the daemon routes endpoint
-            // prefixes (`go/…`) against its own endpoint table, so it must
-            // see the un-stripped selection — the client's `config.model` is
-            // already resolved to the bare id.
-            let raw_model = line.strip_prefix("/model ").map(|s| s.trim().to_string());
-            let quit = handle_slash(&mut remote.app, line);
-            if remote.app.config.model != had_model {
-                remote.options.model = Some(match raw_model {
-                    Some(raw) if !raw.is_empty() => raw,
-                    _ => remote.app.config.model.clone(),
-                });
-            }
-            if remote.app.config.permission != had_permission {
-                remote.options.permission = Some(match remote.app.config.permission {
-                    PermissionMode::ReadOnly => "read-only".to_string(),
-                    PermissionMode::AskWrites => "ask-writes".to_string(),
-                    PermissionMode::AskShell => "ask-shell".to_string(),
-                    PermissionMode::Trusted => "trusted".to_string(),
-                });
-            }
-            if remote.app.plan != had_plan {
-                if remote.app.plan.is_empty() {
-                    remote.options.plan = Some(String::new());
-                } else {
-                    remote.options.plan = Some(remote.app.plan.to_json());
-                }
-            }
-            return quit;
         }
     }
-    false
+}
+
+fn remote_waive(remote: &mut RemoteApp, reason: Option<&str>) {
+    let reason = reason.unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        push_info(&mut remote.app, "usage: /waive <reason>".to_string());
+        return;
+    }
+    let sid = remote.session_id.clone();
+    match remote.client.waive(&sid, &reason) {
+        Ok(()) => push_info(
+            &mut remote.app,
+            "verification waived (recorded for this session).".to_string(),
+        ),
+        Err(e) => push_info(
+            &mut remote.app,
+            format!("could not waive verification: {e}"),
+        ),
+    }
+}
+
+fn remote_name(remote: &mut RemoteApp, name: Option<&str>) {
+    let name = name.unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        push_info(&mut remote.app, "usage: /name <name>".to_string());
+        return;
+    }
+    let sid = remote.session_id.clone();
+    match remote.client.rename_session(&sid, &name) {
+        Ok(()) => push_info(&mut remote.app, format!("session name: {name}")),
+        Err(e) => push_info(&mut remote.app, format!("could not rename: {e}")),
+    }
+}
+
+/// Remote `/thinking`: same grammar as local, but the choice lives on the
+/// daemon (it runs the turns). Never touches the client's
+/// `thinking-effort.json` — that file is keyed by `base_url|model` and the
+/// display copy's `base_url` is empty, so a local write would key wrong and
+/// the daemon would silently ignore it. Instead the display copy and the
+/// per-turn override move together, so what `/thinking` shows is what the
+/// next turn uses. `Some("")` is the explicit-clear override (unset).
+fn remote_thinking(remote: &mut RemoteApp, arg: Option<&str>) {
+    let model = remote.app.config.model.clone();
+    let Some(arg) = arg else {
+        let advertised = crate::llm::config::reasoning_options_for(&model);
+        let effort = remote.app.config.thinking_effort.clone();
+        let text = match (&effort, advertised) {
+            (Some(effort), Some(options)) => {
+                format!(
+                    "thinking effort: {effort} (options: {})",
+                    options.join(", ")
+                )
+            }
+            (Some(effort), None) => format!("thinking effort: {effort}"),
+            (None, Some(options)) => {
+                format!("thinking effort: unset (options: {})", options.join(", "))
+            }
+            (None, None) => "thinking effort: unset".to_string(),
+        };
+        push_info(&mut remote.app, text);
+        return;
+    };
+    let arg = arg.trim();
+    if arg.is_empty() {
+        push_info(
+            &mut remote.app,
+            "usage: /thinking <level>|clear".to_string(),
+        );
+    } else if ["clear", "auto", "off"]
+        .iter()
+        .any(|w| w.eq_ignore_ascii_case(arg))
+    {
+        remote.app.config.thinking_effort = None;
+        remote.options.thinking_effort = Some(String::new());
+        push_info(&mut remote.app, "thinking effort cleared".to_string());
+    } else {
+        match crate::llm::config::validate_thinking_effort(&model, arg) {
+            Ok(level) => {
+                remote.app.config.thinking_effort = Some(level.clone());
+                remote.options.thinking_effort = Some(level.clone());
+                push_info(
+                    &mut remote.app,
+                    format!("thinking effort: {level} for {model}"),
+                );
+            }
+            Err(options) => push_info(
+                &mut remote.app,
+                format!(
+                    "unknown thinking effort '{arg}' for {model} (options: {})",
+                    options.join(", ")
+                ),
+            ),
+        }
+    }
+}
+
+/// Split `/<name> [args]` without consulting the client's extension list
+/// (empty when remote — the daemon owns the manager). `None` when the line
+/// is not a plausible command word, so built-in usage errors keep their
+/// local messages instead of paying a daemon round trip.
+fn split_remote_extension(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('/')?;
+    if rest.contains('\n') {
+        return None;
+    }
+    let mut parts = rest.splitn(2, ' ');
+    let name = parts.next()?.trim().to_string();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    Some((name, arg))
+}
+
+/// Built-in command words: an `Unknown` line naming one is a usage error,
+/// never a daemon extension (avoids a round trip for typos like `/quit x`).
+fn is_builtin_command(name: &str) -> bool {
+    matches!(
+        name,
+        "quit"
+            | "clear"
+            | "new"
+            | "session"
+            | "permissions"
+            | "resume"
+            | "name"
+            | "model"
+            | "provider"
+            | "thinking"
+            | "waive"
+            | "undo"
+            | "mcp"
+            | "extensions"
+            | "help"
+            | "skill"
+    ) || name.starts_with("skill:")
+}
+
+/// Run one extension command on the daemon. Returns true when the daemon
+/// knew the command (dispatched or handler-failed — both are answered, not
+/// unknown); false on 404 so the caller falls back to "unknown command".
+fn remote_extension_run(remote: &mut RemoteApp, name: &str, arg: &str) -> bool {
+    match remote.client.extensions_run(name, arg) {
+        Ok(body) => {
+            if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                push_info(&mut remote.app, format!("command '/{name}' failed: {err}"));
+            } else {
+                let ext = body
+                    .get("extension")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                push_info(
+                    &mut remote.app,
+                    format!("command '{name}@{ext}' dispatched (output → log)"),
+                );
+                if let Some(out) = body.get("output").and_then(|v| v.as_str()) {
+                    eprintln!("dex: [extensions] /{name}: {out}");
+                }
+            }
+            true
+        }
+        Err(e) => {
+            if e.to_string().contains("404") {
+                false
+            } else {
+                push_info(
+                    &mut remote.app,
+                    format!("could not run command '/{name}': {e}"),
+                );
+                true
+            }
+        }
+    }
+}
+
+/// An `Extension` line from the shared parser (client list non-empty when
+/// co-located): still dispatch on the daemon, which owns the workspace.
+fn remote_extension_line(remote: &mut RemoteApp, line: &str) {
+    match split_remote_extension(line) {
+        Some((name, arg)) => {
+            if !remote_extension_run(remote, &name, &arg) {
+                push_info(&mut remote.app, format!("unknown command: {line}"));
+            }
+        }
+        None => push_info(&mut remote.app, format!("unknown command: {line}")),
+    }
+}
+
+/// An `Unknown` line may be a daemon extension the client's empty list could
+/// not classify. Returns true when handled (dispatched or answered); false
+/// when still unknown so the caller prints "unknown command".
+fn remote_unknown_or_extension(remote: &mut RemoteApp, line: &str) -> bool {
+    let Some((name, arg)) = split_remote_extension(line) else {
+        return false;
+    };
+    if is_builtin_command(&name) {
+        return false;
+    }
+    remote_extension_run(remote, &name, &arg)
+}
+
+/// `/resume` lists daemon sessions (local files as an offline fallback);
+/// `/resume <index|id>` reattaches. `selector` is `None` for the bare form.
+fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
+    let Some(selector) = selector.filter(|s| !s.trim().is_empty()) else {
+        // Prefer daemon listing (works over network); fall back to local files for offline.
+        let daemon_sessions = remote.client.list_sessions().ok();
+        if let Some(mut sessions) = daemon_sessions {
+            sessions.retain(|s| {
+                s.cwd == remote.app.cwd && s.session_id != remote.session_id && s.message_count > 0
+            });
+            if sessions.is_empty() {
+                push_info(&mut remote.app, "no sessions found.".to_string());
+            } else {
+                push_info(&mut remote.app, "sessions:".to_string());
+                for (i, s) in sessions.iter().enumerate() {
+                    let name = s.name.as_deref().unwrap_or("(unnamed)");
+                    let mut row = format!("  {}: {} ({})", i, name, s.session_id);
+                    if s.child_agents > 0 {
+                        row.push_str(&format!(" · {} agent run(s)", s.child_agents));
+                    }
+                    if s.interrupted_children > 0 {
+                        row.push_str(&format!(" · {} interrupted", s.interrupted_children));
+                    }
+                    push_info(&mut remote.app, row);
+                }
+                push_info(
+                    &mut remote.app,
+                    "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
+                );
+            }
+        } else {
+            let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
+            let filtered: Vec<_> = sessions
+                .into_iter()
+                .filter(|(path, header)| {
+                    if header.id() == remote.app.session.id() {
+                        return false;
+                    }
+                    matches!(
+                        crate::session::load_messages_from_session(path),
+                        Ok(msgs) if !msgs.is_empty()
+                    )
+                })
+                .collect();
+            if filtered.is_empty() {
+                push_info(&mut remote.app, "no sessions found.".to_string());
+            } else {
+                push_info(&mut remote.app, "sessions:".to_string());
+                for (i, (path, header)) in filtered.iter().enumerate() {
+                    let name = header.name().unwrap_or("(unnamed)");
+                    push_info(
+                        &mut remote.app,
+                        format!("  {}: {} ({})", i, name, path.display()),
+                    );
+                }
+                push_info(
+                    &mut remote.app,
+                    "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
+                );
+            }
+        }
+        return;
+    };
+    if remote.app.busy {
+        push_info(
+            &mut remote.app,
+            "cannot resume a session while a turn is running.".to_string(),
+        );
+        return;
+    }
+    let selector = selector.trim().to_string();
+    // Resolve selector to a daemon session_id + server-side path: index
+    // or id prefix. Filter the same way as the listing so indices line
+    // up. The daemon path doubles as the local file when co-located.
+    let resolved: Option<(String, Option<String>)> = remote
+        .client
+        .list_sessions()
+        .ok()
+        .and_then(|mut sessions| {
+            sessions.retain(|s| {
+                s.cwd == remote.app.cwd && s.session_id != remote.session_id && s.message_count > 0
+            });
+            if let Ok(idx) = selector.parse::<usize>() {
+                return sessions
+                    .get(idx)
+                    .map(|s| (s.session_id.clone(), Some(s.path.clone())));
+            }
+            // prefix or exact id/name match
+            let q = selector.to_ascii_lowercase();
+            sessions
+                .iter()
+                .find(|s| {
+                    s.session_id.to_ascii_lowercase().starts_with(&q)
+                        || s.name
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .contains(&q)
+                })
+                .map(|s| (s.session_id.clone(), Some(s.path.clone())))
+        })
+        .or_else(|| {
+            let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
+            let filtered: Vec<_> = sessions
+                .into_iter()
+                .filter(|(path, header)| {
+                    if header.id() == remote.app.session.id() {
+                        return false;
+                    }
+                    matches!(
+                        crate::session::load_messages_from_session(path),
+                        Ok(msgs) if !msgs.is_empty()
+                    )
+                })
+                .collect();
+            if let Ok(idx) = selector.parse::<usize>() {
+                return filtered.get(idx).and_then(|(p, _)| {
+                    // Resolve id from file header for local fallback.
+                    crate::session::Session::from_path(p)
+                        .ok()
+                        .map(|s| (s.id().to_string(), Some(p.display().to_string())))
+                });
+            }
+            let q = selector.to_ascii_lowercase();
+            filtered
+                .iter()
+                .find(|(p, h)| {
+                    h.id().to_ascii_lowercase().starts_with(&q)
+                        || h.name().unwrap_or("").to_ascii_lowercase().contains(&q)
+                        || p.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .starts_with(&q)
+                })
+                .and_then(|(p, _)| crate::session::Session::from_path(p).ok())
+                .map(|s| {
+                    let path = s.path().map(|p| p.display().to_string());
+                    (s.id().to_string(), path)
+                })
+        });
+    let Some((sid, daemon_path)) = resolved else {
+        push_info(
+            &mut remote.app,
+            format!("could not resume session: {selector} not found"),
+        );
+        return;
+    };
+    // Local JSONL when files are shared (default co-located daemon):
+    // daemon path first, then an id lookup (Session::resume only
+    // handles index/path, so an id through it silently misses).
+    let local_path: Option<std::path::PathBuf> = daemon_path
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| find_local_session_file(&sid));
+    // Reattach before touching the transcript: a failed reattach must
+    // leave the current view intact instead of blanking it.
+    match remote.client.reattach(&sid) {
+        Ok(resp) => {
+            remote.session_id = resp.session_id.clone();
+            // Full per-session reset (transcript, usage, plan, scroll,
+            // pending steering/approvals) so the old conversation
+            // doesn't leak into the resumed one.
+            reset_session_state(&mut remote.app);
+            remote.options.plan = None;
+            if let Some(p) = local_path.as_deref() {
+                if let Ok(s) = Session::from_path(p) {
+                    remote.app.session = s;
+                }
+            }
+            // Prefer JSONL messages (complete, includes user prompts
+            // the events journal never records); replay events only
+            // when no local file is available (true remote).
+            let mut rebuilt = false;
+            if let Some(p) = local_path.as_deref() {
+                rebuilt = rebuild_remote_from_messages(remote, p, no_paint);
+            }
+            if !rebuilt {
+                let sid = remote.session_id.clone();
+                replay_remote_events(remote, &sid, no_paint);
+                if remote.app.transcript.is_empty() && remote.app.assistant_pending.is_empty() {
+                    push_info(
+                        &mut remote.app,
+                        "resumed session has no replayable history.".to_string(),
+                    );
+                }
+            }
+            push_info(
+                &mut remote.app,
+                format!("resumed session: {}", remote.session_id),
+            );
+        }
+        Err(e) => push_info(&mut remote.app, format!("could not reattach session: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -3652,5 +3881,120 @@ mod tests {
             Some(0),
             "empty paste keeps the walk"
         );
+    }
+
+    #[test]
+    fn remote_thinking_sets_override_without_touching_client_file() {
+        // Regression: remote `/thinking` wrote the client's
+        // `thinking-effort.json` (keyed `|model`) while the daemon turn used
+        // its own config — a silent no-op. Now display + per-turn override
+        // move together and no local file write happens here.
+        let mut remote = test_remote();
+        assert!(remote.options.thinking_effort.is_none());
+        handle_remote_slash(&mut remote, "/thinking high");
+        assert_eq!(remote.app.config.thinking_effort.as_deref(), Some("high"));
+        assert_eq!(
+            remote.options.thinking_effort.as_deref(),
+            Some("high"),
+            "next turn must carry the choice to the daemon"
+        );
+        handle_remote_slash(&mut remote, "/thinking clear");
+        assert!(remote.app.config.thinking_effort.is_none());
+        assert_eq!(
+            remote.options.thinking_effort.as_deref(),
+            Some(""),
+            "clear is an explicit unset override, not no-override"
+        );
+        handle_remote_slash(&mut remote, "/thinking");
+        let text: String = remote
+            .app
+            .transcript
+            .iter()
+            .filter_map(|b| match b {
+                crate::ui::TranscriptBlock::Info { line, .. } => Some(
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(text.contains("unset"), "show reflects the clear: {text}");
+    }
+
+    #[test]
+    fn remote_model_switch_drops_stale_thinking_override() {
+        // A level pinned for the old model must not leak onto the new one.
+        let mut remote = test_remote();
+        handle_remote_slash(&mut remote, "/thinking high");
+        assert!(remote.options.thinking_effort.is_some());
+        handle_remote_slash(&mut remote, "/model other-model");
+        assert!(
+            remote.options.thinking_effort.is_none(),
+            "model switch clears the old override so the daemon default applies"
+        );
+        assert!(remote.options.model.is_some(), "model still forwards");
+    }
+
+    #[test]
+    fn remote_extension_split_and_builtin_gate() {
+        assert_eq!(
+            split_remote_extension("/deploy prod"),
+            Some(("deploy".into(), "prod".into()))
+        );
+        assert_eq!(
+            split_remote_extension("/deploy"),
+            Some(("deploy".into(), String::new()))
+        );
+        assert!(split_remote_extension("/a-command!").is_none());
+        assert!(split_remote_extension("plain").is_none());
+        assert!(is_builtin_command("quit"));
+        assert!(is_builtin_command("model"));
+        assert!(!is_builtin_command("deploy"));
+        // Built-ins never reach the daemon: Unknown stays unknown locally.
+        let mut remote = test_remote();
+        assert!(!remote_unknown_or_extension(&mut remote, "/quit x"));
+    }
+
+    #[test]
+    fn every_documented_command_is_handled_remotely() {
+        // The remote entry point answers some commands itself and defers the
+        // rest to the shared `handle_slash`; either way no documented command
+        // may reach the local "unknown command" arm. Uses the bare command
+        // name (the table's `[<m>]`-style usages are not literal invocations).
+        fn info_text(remote: &RemoteApp) -> String {
+            remote
+                .app
+                .transcript
+                .iter()
+                .filter_map(|b| match b {
+                    crate::ui::TranscriptBlock::Info { line, .. } => Some(
+                        line.spans
+                            .iter()
+                            .map(|s| s.content.to_string())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+        for spec in crate::ui::slash::COMMANDS {
+            let name = spec
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or(spec.command);
+            let mut remote = test_remote();
+            let quit = handle_remote_slash(&mut remote, name);
+            assert_eq!(quit, name == "/quit", "{name} quit flag");
+            let text = info_text(&remote);
+            assert!(
+                !text.contains("unknown command"),
+                "{name} fell through to the local unknown-command arm: {text}"
+            );
+        }
     }
 }

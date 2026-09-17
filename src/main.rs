@@ -74,6 +74,7 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
         },
         plan: None,
         system_prompt: cli_system_prompt(args).map(|(text, _)| text),
+        thinking_effort: None,
         idempotency_key: None,
     }
 }
@@ -457,6 +458,130 @@ fn run_or_exit(result: Option<Result<String, String>>, usage: &str, fail_prefix:
     }
 }
 
+/// `dex run <tool>`: extension tools resolve from the manager cache —
+/// lazy-load just the addressed extension (§26) so `dex run ext__...` boots
+/// one Lua VM instead of every installed one (MCP tools have the same race;
+/// out of scope here). The deprecated `lua__` alias preloads too, so old
+/// one-liners keep working. A name that doesn't split keeps the old full
+/// refresh so the dispatch error below stays the authority on what exists.
+fn run_run_tool(name: &str, raw_args: &[String]) {
+    let parsed = match cli::parse_tool_args(raw_args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    if crate::extensions::is_extension_tool(name) {
+        let normalized = crate::extensions::normalize_tool_name(name);
+        match crate::extensions::split_ext_name(&normalized) {
+            Some((ext, _)) => {
+                if let Err(e) = crate::client::http::block_on(
+                    crate::extensions::global_manager().ensure_loaded(ext),
+                ) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                crate::client::http::block_on(crate::extensions::global_manager().refresh());
+            }
+        }
+    }
+    match execute(name, &parsed, &GlobalCancellation) {
+        Ok(out) => print!("{out}"),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `dex extensions <action>` — list, toggle, install, remove.
+fn run_extensions(action: &str, name: Option<&str>) {
+    match action {
+        "list" => {
+            crate::client::http::block_on(crate::extensions::global_manager().refresh());
+            crate::extensions::list_command();
+        }
+        "enable" | "disable" => {
+            let Some(id) = name else {
+                eprintln!("usage: dex extensions {action} <id>");
+                std::process::exit(2);
+            };
+            match crate::extensions::set_enabled(id, action == "enable") {
+                Ok(()) => println!("{action}d extension '{id}' (takes effect on next load)"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "install" => {
+            let Some(src) = name else {
+                eprintln!("usage: dex extensions install <dir>");
+                std::process::exit(2);
+            };
+            match crate::extensions::install(src) {
+                Ok(id) => println!("installed '{id}' — run `dex extensions list`"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "remove" => {
+            let Some(id) = name else {
+                eprintln!("usage: dex extensions remove <id>");
+                std::process::exit(2);
+            };
+            match crate::extensions::remove(id) {
+                Ok(()) => println!("removed '{id}'"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "usage: dex extensions [list|enable <id>|disable <id>|install <dir>|remove <id>]"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `dex mcp <action>` — OAuth status/login/logout.
+fn run_mcp(action: &str, server: Option<&str>) {
+    match action {
+        "status" => {
+            let lines = crate::mcp::oauth::auth_lines();
+            if lines.is_empty() {
+                println!("no HTTP MCP servers configured");
+            }
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        "login" => run_or_exit(
+            server.map(|server| crate::client::http::block_on(crate::mcp::oauth::login(server))),
+            "usage: dex mcp login <server>",
+            "mcp login failed: ",
+        ),
+        "logout" => run_or_exit(
+            server.map(crate::mcp::oauth::logout),
+            "usage: dex mcp logout <server>",
+            "mcp logout failed: ",
+        ),
+        _ => run_or_exit(
+            None,
+            "usage: dex mcp [status|login <server>|logout <server>]",
+            "",
+        ),
+    }
+}
+
 fn main() {
     crate::core::logging::init();
     crate::ui::mark_launch_start();
@@ -585,126 +710,9 @@ fn main() {
         Mode::Tool => {
             run_interactive();
         }
-        Mode::RunTool { name, args } => {
-            let parsed = match cli::parse_tool_args(&args) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            // Extension tools resolve from the manager cache: lazy-load just
-            // the addressed extension (§26) so `dex run ext__...` boots one
-            // Lua VM instead of every installed one (MCP tools have the same
-            // race; out of scope here). The deprecated `lua__` alias preloads
-            // too, so old one-liners keep working. A name that doesn't split
-            // keeps the old full refresh so the dispatch error below stays
-            // the authority on what exists.
-            if crate::extensions::is_extension_tool(&name) {
-                let normalized = crate::extensions::normalize_tool_name(&name);
-                match crate::extensions::split_ext_name(&normalized) {
-                    Some((ext, _)) => {
-                        if let Err(e) = crate::client::http::block_on(
-                            crate::extensions::global_manager().ensure_loaded(ext),
-                        ) {
-                            eprintln!("error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                    None => {
-                        crate::client::http::block_on(
-                            crate::extensions::global_manager().refresh(),
-                        );
-                    }
-                }
-            }
-            match execute(&name, &parsed, &GlobalCancellation) {
-                Ok(out) => print!("{out}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Mode::Extensions { action, name } => match action.as_str() {
-            "list" => {
-                crate::client::http::block_on(crate::extensions::global_manager().refresh());
-                crate::extensions::list_command();
-            }
-            "enable" | "disable" => {
-                let Some(id) = name.as_deref() else {
-                    eprintln!("usage: dex extensions {action} <id>");
-                    std::process::exit(2);
-                };
-                match crate::extensions::set_enabled(id, action == "enable") {
-                    Ok(()) => println!("{action}d extension '{id}' (takes effect on next load)"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "install" => {
-                let Some(src) = name.as_deref() else {
-                    eprintln!("usage: dex extensions install <dir>");
-                    std::process::exit(2);
-                };
-                match crate::extensions::install(src) {
-                    Ok(id) => println!("installed '{id}' — run `dex extensions list`"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "remove" => {
-                let Some(id) = name.as_deref() else {
-                    eprintln!("usage: dex extensions remove <id>");
-                    std::process::exit(2);
-                };
-                match crate::extensions::remove(id) {
-                    Ok(()) => println!("removed '{id}'"),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            _ => {
-                eprintln!(
-                    "usage: dex extensions [list|enable <id>|disable <id>|install <dir>|remove <id>]"
-                );
-                std::process::exit(2);
-            }
-        },
-        Mode::Mcp { action, server } => match action.as_str() {
-            "status" => {
-                let lines = crate::mcp::oauth::auth_lines();
-                if lines.is_empty() {
-                    println!("no HTTP MCP servers configured");
-                }
-                for line in lines {
-                    println!("{line}");
-                }
-            }
-            "login" => run_or_exit(
-                server
-                    .as_deref()
-                    .map(|server| crate::client::http::block_on(crate::mcp::oauth::login(server))),
-                "usage: dex mcp login <server>",
-                "mcp login failed: ",
-            ),
-            "logout" => run_or_exit(
-                server.as_deref().map(crate::mcp::oauth::logout),
-                "usage: dex mcp logout <server>",
-                "mcp logout failed: ",
-            ),
-            _ => run_or_exit(
-                None,
-                "usage: dex mcp [status|login <server>|logout <server>]",
-                "",
-            ),
-        },
+        Mode::RunTool { name, args } => run_run_tool(&name, &args),
+        Mode::Extensions { action, name } => run_extensions(&action, name.as_deref()),
+        Mode::Mcp { action, server } => run_mcp(&action, server.as_deref()),
     }
 }
 
