@@ -594,23 +594,6 @@ pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<Routed
     ))
 }
 
-/// Jev-aware routing: same contract as [`route_turn`], but the tier
-/// decision goes through [`classify_turn_async`] — Jev's tier-Choice when
-/// `DEX_ROUTING_CLASSIFIER=jev`, else the deterministic classifier.
-/// Async because the Jev call is network; the daemon (TUI + `serve`
-/// clients) uses this, while the sync one-shot path stays deterministic.
-pub(crate) async fn route_turn_async(prompt: &str, history: &[ChatMessage]) -> Option<RoutedTurn> {
-    let file = load_config_file();
-    let routing = routing_resolution(&file);
-    if !routing.enabled {
-        return None;
-    }
-    let selection = resolve_selection(None, &file).ok()?;
-    let signal = routing_signal(prompt, history);
-    let (tier, reason) = classify_turn_async(&signal, prompt).await;
-    Some(finish_route(&selection.value, &routing.tiers, tier, reason))
-}
-
 /// The shared routing signal: prompt size plus history token size and the
 /// real tool-call count, so a deep session weighs in without prompt words.
 /// The daemon reuses the turn's own history load, so routing sees exactly
@@ -640,165 +623,28 @@ fn finish_route(
     }
 }
 
-/// Routing classifier knob: `DEX_ROUTING_CLASSIFIER=jev` sends each routed
-/// turn's tier decision to Jev (one SystemOne Choice per turn, confidence-
-/// gated with deterministic fallback); unset or anything else keeps the
-/// deterministic stem/weight classifier. Unknown values warn once — the
-/// deterministic default must never change silently.
-pub(crate) fn routing_classifier_is_jev() -> bool {
-    match env::var("DEX_ROUTING_CLASSIFIER") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("jev") => true,
-        Ok(v) if v.trim().is_empty() => false,
-        Ok(other) => {
-            warn_once(
-                "env:DEX_ROUTING_CLASSIFIER",
-                &format!(
-                    "ignoring DEX_ROUTING_CLASSIFIER='{other}': only 'jev' is supported (deterministic stays default)"
-                ),
-            );
-            false
-        }
-        Err(_) => false,
-    }
-}
-
-/// Jev model id: `DEX_JEV_MODEL`, else the `jev-latest` alias. Pin a
-/// versioned id once confidence thresholds are tuned against a release
-/// (aliases move under you).
-pub(crate) fn jev_model_name() -> String {
-    env::var("DEX_JEV_MODEL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| crate::jev::DEFAULT_MODEL.to_string())
-}
-
-/// Minimum Jev Choice confidence that routes on Jev's answer
-/// (`DEX_JEV_MIN_CONFIDENCE`, default 0.6): below it — or on any Jev
-/// error — the deterministic classifier decides instead. Out-of-range or
-/// unparsable values fall back to the default.
-pub(crate) fn jev_min_confidence() -> f64 {
-    const DEFAULT: f64 = 0.6;
-    env::var("DEX_JEV_MIN_CONFIDENCE")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|c| (0.0..=1.0).contains(c))
-        .unwrap_or(DEFAULT)
-}
-
-/// Classify one turn: Jev's tier-Choice when gated on and confident,
-/// otherwise the deterministic classifier. The fallback is silent on low
-/// confidence (routine) but loud once per process on errors (setup worth
-/// fixing) — either way the turn still routes.
-async fn classify_turn_async(signal: &TaskSignal, prompt: &str) -> (Tier, &'static str) {
-    let deterministic = || {
-        let decision = classify_with_reasons(signal, prompt);
-        (decision.tier, decision.top_reason())
-    };
-    if !routing_classifier_is_jev() {
-        return deterministic();
-    }
-    match jev_tier(signal, prompt).await {
-        Ok((tier, confidence)) if confidence >= jev_min_confidence() => (tier, "jev classifier"),
-        Ok(_) => deterministic(),
-        Err(e) => {
-            warn_once(
-                "jev-classifier",
-                &format!("jev classifier unavailable ({e}); deterministic fallback"),
-            );
-            deterministic()
-        }
-    }
-}
-
-/// One SystemOne call asking for the turn's tier. The state is the prompt
-/// plus a one-line turn-context trailer (prompt/history size, real session
-/// tool activity) so Jev weighs session depth the deterministic classifier
-/// sees. Returns the tier plus the Choice confidence for gating.
-async fn jev_tier(
-    signal: &TaskSignal,
-    prompt: &str,
-) -> Result<(Tier, f64), Box<dyn std::error::Error>> {
-    let cfg = crate::jev::resolve()?;
-    let state = serde_json::json!(format!(
-        "{prompt}\n\n[turn context: prompt_chars={} history_tokens={} history_tool_calls={}]",
-        signal.prompt_chars, signal.history_tokens, signal.history_tool_calls
-    ));
-    let eval = crate::jev::evaluate(&cfg, state, &[tier_choice_question()])
-        .await
-        .map_err(|e| format!("{e}"))?;
-    let answer = eval
-        .answers
-        .get("tier")
-        .ok_or("jev: response missing 'tier' answer")?;
-    match answer {
-        crate::jev::Answer::Choice {
-            value, confidence, ..
-        } => value
-            .parse::<Tier>()
-            .map(|tier| (tier, *confidence))
-            .map_err(|e| format!("jev: unknown tier '{value}': {e}").into()),
-        other => Err(format!("jev: 'tier' answer is not a Choice ({other:?})").into()),
-    }
-}
-
-/// The routing tier-Choice: option descriptions mirror
-/// `agent::router`'s tier contract so both classifiers pick from the same
-/// three buckets. Single question today; complexity-Score / Noul probes
-/// can join this same call later without another round trip.
-fn tier_choice_question() -> crate::jev::Question {
-    crate::jev::Question {
-        id: "tier".to_string(),
-        kind: crate::jev::QuestionKind::Choice {
-            instructions: "Which model tier should handle this coding turn?".to_string(),
-            options: vec![
-                (
-                    Tier::Fast.key().to_string(),
-                    "Typos, single-file reads, trivial Q&A — the smallest capable model."
-                        .to_string(),
-                ),
-                (
-                    Tier::Balanced.key().to_string(),
-                    "Normal feature work and single-scope edits.".to_string(),
-                ),
-                (
-                    Tier::Powerful.key().to_string(),
-                    "Multi-file refactors, auth or data paths, ambiguous specs, migrations, security, irreversible changes."
-                        .to_string(),
-                ),
-            ],
-        },
-    }
-}
-
-/// What `doctor` shows per tier: the tier's own selection, else
-/// `routing.balanced:`, else the top-level selection — the same chain
-/// `model_for` applies at runtime, so the row explains the turn's model.
+/// What `doctor` shows per tier: the tier's effective selection through
+/// [`model_for`] (tier miss → `balanced` → top-level `model:`) plus where
+/// that selection came from, so the row explains the turn's model.
 fn routing_tier_display(
     tier: Tier,
     routing: &RoutingResolution,
     selection: Option<&str>,
     selection_source: &str,
 ) -> (String, String) {
-    let value = routing.tiers.get(tier);
-    if !value.is_empty() {
-        return (
-            value.to_string(),
-            routing.tier_origins.get(tier).to_string(),
-        );
-    }
-    if tier != Tier::Balanced && !routing.tiers.balanced.is_empty() {
-        return (
-            routing.tiers.balanced.clone(),
-            routing.tier_origins.balanced.to_string(),
-        );
-    }
-    match selection {
-        Some(value) => (value.to_string(), selection_source.to_string()),
-        None => (
-            "(unset)".to_string(),
-            "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
-        ),
-    }
+    let fallback = selection.unwrap_or("(unset)");
+    let value = model_for(tier, &routing.tiers, fallback).to_string();
+    let origin = if !routing.tiers.get(tier).is_empty() {
+        routing.tier_origins.get(tier)
+    } else if tier != Tier::Balanced && !routing.tiers.balanced.is_empty() {
+        routing.tier_origins.balanced
+    } else {
+        match selection {
+            Some(_) => selection_source,
+            None => "UNCONFIGURED — set 'model: <provider>/<model>'",
+        }
+    };
+    (value, origin.to_string())
 }
 
 /// Read a system-prompt file for the env/file layers: a miss warns once and
@@ -1483,12 +1329,6 @@ fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
     match provider {
         Provider::OpenCode => Some("OPENCODE_API_KEY"),
         Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
-        // The provider's own SDK env var (TypeSafe SDKs read it), honored
-        // cache-less like the other pins — the models.dev catalog has no
-        // typesafe entry, so this is the only env deposit for the Jev key.
-        Provider::Generic(name) if name.as_str() == crate::jev::PROVIDER_NAME => {
-            Some("TYPESAFE_API_KEY")
-        }
         _ => None,
     }
 }
@@ -3933,52 +3773,6 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
             d.routing_selection_source,
         );
         row(out, &format!("routing {}", tier.key()), &value, &origin);
-    }
-    // Routing classifier: deterministic default, Jev behind
-    // `DEX_ROUTING_CLASSIFIER=jev` (one SystemOne tier-Choice per turn,
-    // confidence-gated with deterministic fallback). Model/threshold rows
-    // only show under Jev — they resolve nothing otherwise.
-    let classifier_env = env::var("DEX_ROUTING_CLASSIFIER")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let classifier_jev = routing_classifier_is_jev();
-    row(
-        out,
-        "routing classifier",
-        if classifier_jev {
-            "jev"
-        } else {
-            "deterministic"
-        },
-        classifier_env
-            .as_deref()
-            .map(|_| "DEX_ROUTING_CLASSIFIER")
-            .unwrap_or("built-in default"),
-    );
-    if classifier_jev {
-        row(
-            out,
-            "jev model",
-            &jev_model_name(),
-            if env::var("DEX_JEV_MODEL")
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-            {
-                "DEX_JEV_MODEL"
-            } else {
-                "built-in default (jev-latest)"
-            },
-        );
-        row(
-            out,
-            "jev min confidence",
-            &format!("{:.2}", jev_min_confidence()),
-            if env::var("DEX_JEV_MIN_CONFIDENCE").is_ok() {
-                "DEX_JEV_MIN_CONFIDENCE"
-            } else {
-                "built-in default (0.60)"
-            },
-        );
     }
 
     // Headers: count per layer, sources joined.
@@ -6810,9 +6604,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
             "OPENCODE_API_KEY",
@@ -6833,9 +6624,6 @@ pub(crate) mod tests {
         std::env::remove_var("DEX_ROUTING_FAST");
         std::env::remove_var("DEX_ROUTING_BALANCED");
         std::env::remove_var("DEX_ROUTING_POWERFUL");
-        std::env::remove_var("DEX_ROUTING_CLASSIFIER");
-        std::env::remove_var("DEX_JEV_MODEL");
-        std::env::remove_var("DEX_JEV_MIN_CONFIDENCE");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -6882,7 +6670,6 @@ pub(crate) mod tests {
                 "routing fast      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
                 "routing balanced  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
                 "routing powerful  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing classifierdeterministic                                 built-in default\n",
                 "headers           0                                             none\n",
                 "endpoints         go, zen                                       available to /model routing\n",
                 "system prompt     default                                       built-in default\n",
@@ -6967,308 +6754,6 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SystemOne mock answering every requested id with one canned Choice;
-    /// returns the base URL for `providers.typesafe.base_url`.
-    async fn spawn_jev_mock(choice: &str, confidence: f64) -> String {
-        use axum::extract::State as AxumState;
-        use axum::routing::post;
-        use axum::Router;
-
-        let choice = choice.to_string();
-
-        #[derive(Clone)]
-        struct Mock {
-            choice: String,
-            confidence: f64,
-        }
-
-        async fn handler(
-            AxumState(mock): AxumState<Mock>,
-            body: axum::Json<serde_json::Value>,
-        ) -> axum::Json<serde_json::Value> {
-            let empty = serde_json::Map::new();
-            let asked = body
-                .get("questions")
-                .and_then(|q| q.as_object())
-                .unwrap_or(&empty);
-            let mut out = serde_json::Map::new();
-            for id in asked.keys() {
-                out.insert(
-                    id.clone(),
-                    serde_json::json!({
-                        "type": "choice",
-                        "choice": mock.choice,
-                        "probabilities": {mock.choice.clone(): 1.0},
-                        "confidence": mock.confidence,
-                    }),
-                );
-            }
-            axum::Json(serde_json::json!({
-                "model": "jev-1.13.0",
-                "answers": out,
-                "usage": {"input_tokens": 10, "output_tokens": 2},
-            }))
-        }
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/v1/systemone", post(handler))
-                    .with_state(Mock {
-                        choice: choice.to_string(),
-                        confidence,
-                    }),
-            )
-            .await
-            .unwrap();
-        });
-        format!("http://{addr}")
-    }
-
-    /// Hermetic routing setup with a Jev endpoint: returns the temp dir
-    /// (removed by the caller) after pointing `DEX_CONFIG` at a config with
-    /// routing on plus `myprov` tiers and a `typesafe` base_url.
-    fn write_jev_routing_config(jev_base_url: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dex-jev-routing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.yaml"),
-            format!(
-                "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    base_url: {jev_base_url}\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/m-7\n",
-            ),
-        )
-        .unwrap();
-        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-        dir
-    }
-
-    #[test]
-    fn routing_classifier_gate_defaults_off_parses_jev() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_ROUTING_CLASSIFIER"]);
-        std::env::remove_var("DEX_ROUTING_CLASSIFIER");
-        assert!(!super::routing_classifier_is_jev());
-        for v in ["jev", "JEV", " jev "] {
-            std::env::set_var("DEX_ROUTING_CLASSIFIER", v);
-            assert!(super::routing_classifier_is_jev(), "{v}");
-        }
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "");
-        assert!(!super::routing_classifier_is_jev());
-        // Unknown values warn once and stay deterministic.
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "llm");
-        assert!(!super::routing_classifier_is_jev());
-    }
-
-    #[test]
-    fn jev_model_and_confidence_knobs_default_and_parse() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_JEV_MODEL", "DEX_JEV_MIN_CONFIDENCE"]);
-        std::env::remove_var("DEX_JEV_MODEL");
-        std::env::remove_var("DEX_JEV_MIN_CONFIDENCE");
-        assert_eq!(super::jev_model_name(), "jev-latest");
-        assert_eq!(super::jev_min_confidence(), 0.6);
-        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
-        assert_eq!(super::jev_model_name(), "jev-1.13.0");
-        std::env::set_var("DEX_JEV_MODEL", "  ");
-        assert_eq!(super::jev_model_name(), "jev-latest");
-        std::env::set_var("DEX_JEV_MIN_CONFIDENCE", "0.8");
-        assert_eq!(super::jev_min_confidence(), 0.8);
-        for v in ["high", "2", "-0.1", ""] {
-            std::env::set_var("DEX_JEV_MIN_CONFIDENCE", v);
-            assert_eq!(super::jev_min_confidence(), 0.6, "{v}");
-        }
-    }
-
-    /// `route_turn_async` with `DEX_ROUTING_CLASSIFIER=jev`: a confident
-    /// Jev Choice routes — even against the deterministic grain
-    /// ("migration" is Powerful-shaped; Jev says fast here).
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env stays redirected for the whole turn
-    async fn route_turn_async_uses_jev_when_gated() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-            "TYPESAFE_API_KEY",
-            "XDG_CACHE_HOME",
-        ]);
-        for key in [
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-        ] {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
-        std::env::set_var("TYPESAFE_API_KEY", "test-key");
-        let base = spawn_jev_mock("fast", 0.95).await;
-        let dir = write_jev_routing_config(&base);
-        let routed = super::route_turn_async("run the database migration", &[])
-            .await
-            .expect("routing on");
-        assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
-        assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
-        assert_eq!(routed.reason, "jev classifier");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Below the confidence threshold — or when Jev is unreachable — the
-    /// deterministic classifier decides, so the turn still routes.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env stays redirected for the whole turn
-    async fn route_turn_async_falls_back_below_confidence_and_on_error() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-            "TYPESAFE_API_KEY",
-            "XDG_CACHE_HOME",
-        ]);
-        for key in [
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-        ] {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
-        std::env::set_var("TYPESAFE_API_KEY", "test-key");
-        // Timid Jev: the migration prompt falls back to Powerful.
-        let base = spawn_jev_mock("fast", 0.1).await;
-        let dir = write_jev_routing_config(&base);
-        let routed = super::route_turn_async("run the database migration", &[])
-            .await
-            .expect("routing on");
-        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
-        assert_ne!(routed.reason, "jev classifier");
-        // Dead endpoint: same fallback, no panic.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
-        let dir2 = write_jev_routing_config(&format!("http://127.0.0.1:{port}"));
-        let routed = super::route_turn_async("run the database migration", &[])
-            .await
-            .expect("routing on");
-        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    /// `dex doctor` shows the classifier plus, under Jev, the model and
-    /// threshold with origins.
-    #[test]
-    fn doctor_shows_jev_classifier_rows() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-            "XDG_CACHE_HOME",
-        ]);
-        for key in [
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-        ] {
-            std::env::remove_var(key);
-        }
-        let dir = std::env::temp_dir().join(format!("dex-jev-doctor-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n",
-        )
-        .unwrap();
-        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-        let out = super::doctor(None, None, None, &[], None);
-        let classifier: Vec<&str> = out
-            .lines()
-            .filter(|l| l.starts_with("routing classifier"))
-            .collect();
-        assert_eq!(classifier.len(), 1, "{out}");
-        assert!(classifier[0].contains("deterministic"), "{}", classifier[0]);
-        assert!(
-            classifier[0].contains("built-in default"),
-            "{}",
-            classifier[0]
-        );
-        assert!(!out.contains("jev model"), "{out}");
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
-        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
-        std::env::set_var("DEX_JEV_MIN_CONFIDENCE", "0.75");
-        let out = super::doctor(None, None, None, &[], None);
-        assert!(
-            out.lines()
-                .any(|l| l.starts_with("routing classifier") && l.contains("jev")),
-            "{out}"
-        );
-        assert!(
-            out.lines().any(|l| l.starts_with("jev model")
-                && l.contains("jev-1.13.0")
-                && l.contains("DEX_JEV_MODEL")),
-            "{out}"
-        );
-        assert!(
-            out.lines().any(|l| l.starts_with("jev min confidence")
-                && l.contains("0.75")
-                && l.contains("DEX_JEV_MIN_CONFIDENCE")),
-            "{out}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// `route_turn`: `None` when routing is off; otherwise the classified
     /// tier resolves through `routing.balanced:` → `model:`, overriding only
     /// when the tier names a different selection (no pointless rebuilds).
@@ -7346,7 +6831,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
             "OPENCODE_API_KEY",
             "XDG_CACHE_HOME",
         ]);
@@ -7356,7 +6840,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
         ] {
             std::env::remove_var(key);
         }
@@ -7371,9 +6854,9 @@ pub(crate) mod tests {
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
         let out = super::doctor(None, None, None, &[], None);
-        // Four tier rows plus the classifier row (deterministic here).
+        // One switch row plus three tier rows.
         let routing: Vec<&str> = out.lines().filter(|l| l.starts_with("routing")).collect();
-        assert_eq!(routing.len(), 5, "{out}");
+        assert_eq!(routing.len(), 4, "{out}");
         assert!(routing[0].contains("on"), "{}", routing[0]);
         assert!(
             routing[0].contains("config routing.enabled:"),
