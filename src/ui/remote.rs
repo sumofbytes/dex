@@ -152,14 +152,10 @@ fn spawn_events_poller(
     cursor: Arc<AtomicU64>,
 ) {
     crate::client::http::spawn_task(async move {
-        // Seed the cursor from the daemon's journal so rows rendered by the
-        // initial replay (or by a local JSONL rebuild) are never re-fetched.
-        // Async form: this task runs on the shared runtime, and the sync
-        // wrapper's `block_on` would panic ("cannot start a runtime from
-        // within a runtime") on a worker thread.
-        if let Ok(resp) = client.reattach_async(&session_id).await {
-            cursor.fetch_max(resp.seq, Ordering::SeqCst);
-        }
+        // No tip seed here: the boot flow seeds the cursor (§4 — the replay
+        // drain advances it per page, the local-JSONL path from the local
+        // journal tip), so this task only advances it past rows it serves.
+        // Replay holds `busy` so a slow drain can't race the first polls.
         loop {
             tokio::time::sleep(EVENTS_POLL_INTERVAL).await;
             if busy.load(Ordering::SeqCst) || !live.load(Ordering::SeqCst) {
@@ -293,6 +289,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
         verify_command: None,
         extra_headers: Default::default(),
+        global_headers: Default::default(),
         provider_entries: Default::default(),
         provider_headers: Default::default(),
         api_pinned: false,
@@ -399,6 +396,13 @@ pub(crate) fn run_ratatui_repl_with_remote(
     let skills_handle = crate::client::http::spawn_task(async move {
         skills_client.list_skills_async().await.unwrap_or_default()
     });
+    // §2: warm the one-time OSC 11 palette query alongside the session RTT
+    // instead of serially before first paint. The `block_on` before the
+    // skills listing (the first consumer of colors) is instant when the
+    // probe finished in flight.
+    let palette_handle = crate::client::http::spawn_task(async move {
+        super::theme::detect_background();
+    });
     // The daemon owns the model/provider/permission and the workspace; mirror
     // its state so the UI shows what turns will actually use.
     let config_client = client.clone();
@@ -458,17 +462,9 @@ pub(crate) fn run_ratatui_repl_with_remote(
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
         (resp.session_id, false, info, Some(session_name))
     };
-    let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
-    // Skills live on the daemon (its workspace); a stale list is harmless —
-    // the load call re-discovers on the daemon side.
-    let tui_skills: Vec<crate::core::types::Skill> = daemon_skills
-        .into_iter()
-        .map(|info| crate::core::types::Skill {
-            name: info.name,
-            description: info.description,
-            path: std::path::PathBuf::from(""),
-        })
-        .collect();
+    // §3: the skills future flies with the boot fan-out (spawned above) but
+    // is collected after replay below — neither App construction nor replay
+    // needs skills, only the session-start listing does.
 
     // Per-request overrides so client flags keep working in remote mode.
     let options = crate::chat_options_from_args(args);
@@ -484,7 +480,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
         tool_state: crate::agent::state::ToolState::default(),
         session: Session::in_memory(info.cwd.clone()),
         plan: crate::core::types::Plan::default(),
-        skills: tui_skills,
+        skills: Vec::new(),
         turn_start: 0,
         cwd: info.cwd.clone(),
         git_branch: info.git_branch.clone(),
@@ -522,6 +518,8 @@ pub(crate) fn run_ratatui_repl_with_remote(
         transcript_area: None,
         selection: None,
         notice: None,
+        status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
+        slash_cache: std::cell::RefCell::new(None),
     };
 
     // Shared poller gates (§15 V1b): children live → poll the journal;
@@ -568,70 +566,18 @@ pub(crate) fn run_ratatui_repl_with_remote(
         remote.app.session.set_name(name).ok();
     }
 
-    // P10: reconstruct the transcript for a reattached session. Prefer the
-    // persisted JSONL messages (complete, includes user prompts the events
-    // journal never records); fall back to the events journal when the file
-    // isn't shared (true remote). Idempotent replays skip stale approvals
-    // (parked approvals die with their turn on the daemon).
-    if is_reattach {
-        let local = find_local_session_file(&remote.session_id);
-        let mut rebuilt = false;
-        if let Some(p) = local.as_deref() {
-            if let Ok(s) = Session::from_path(p) {
-                remote.app.session = s;
-            }
-            if let Some(p) = local.as_deref() {
-                rebuilt = rebuild_remote_from_messages(&mut remote, p);
-            }
-        }
-        if !rebuilt {
-            let sid = remote.session_id.clone();
-            replay_remote_events(&mut remote, &sid);
-        }
-        push_info(
-            &mut remote.app,
-            format!("reattached to session {session_id}"),
-        );
-        // The daemon resolves the tool workspace from its own cwd, not the
-        // session header (`create_session` records the daemon cwd for exactly
-        // that reason). Reattaching across directories therefore replays this
-        // session while `read`/`write`/`bash` land in *this* tree — say so
-        // instead of surprising them mid-turn.
-        let session_cwd = remote.app.session.cwd().to_string();
-        let workspace_cwd = remote.app.cwd.clone();
-        if !same_workspace(&session_cwd, &workspace_cwd) {
-            push_info(
-                &mut remote.app,
-                format!(
-                    "dex: this session came from {session_cwd}; tools run in {workspace_cwd} \
-                     (the daemon workspace) — `cd {session_cwd}` to reattach there"
-                ),
-            );
-        }
-    }
-
+    // §1: first paint before replay. The terminal comes up on an empty frame
+    // here; the reattach replay below then streams history in with a paint
+    // per chunk/page. Time-to-first-paint no longer includes the full
+    // history render.
     // Detect the terminal background before raw mode / the alternate screen
     // take over; surface colors (including the skills listing below) are
-    // resolved from this once.
-    super::theme::detect_background();
-
-    // Session-start view: the DEX art, then the skills the daemon discovered,
-    // then how fast the TUI was ready to use.
-    push_banner(&mut remote.app);
-    push_skills_listing(&mut remote.app);
-    push_info_line(
-        &mut remote.app,
-        launch_time_line(launch_start.elapsed().as_secs_f64()),
-    );
-    // A mismatched `thinking_effort:` (config.yaml names a level the model
-    // doesn't advertise) used to `eprintln!` from the daemon thread here —
-    // mid OSC theme query / alternate screen — corrupting the display and
-    // leaking into the composer. It now arrives as data and renders as a
-    // transcript line inside the TUI.
-    if let Some(warning) = info.thinking_warning.clone() {
-        push_info(&mut remote.app, format!("dex: {warning}"));
-    }
-
+    // resolved from this once. The probe flew with the boot fan-out (§2);
+    // this is instant when it finished alongside the session RTT. The probe
+    // warms a memoized query; a panic in it must not take down startup.
+    // (Moved up with the terminal init: the palette must resolve before raw
+    // mode, and first paint precedes replay now.)
+    let _ = crate::client::http::block_on(palette_handle);
     enable_raw_mode()?;
     // No startup drain here: a blind deadline cuts OSC reply bursts in half
     // and leaks the tail (sans lead-in) into the composer. Late replies —
@@ -666,6 +612,104 @@ pub(crate) fn run_ratatui_repl_with_remote(
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // First paint: empty transcript + composer. History streams in below.
+    terminal.draw(|f| view(f, &mut remote.app))?;
+
+    // P10: reconstruct the transcript for a reattached session. Prefer the
+    // persisted JSONL messages (complete, includes user prompts the events
+    // journal never records); fall back to the events journal when the file
+    // isn't shared (true remote). Idempotent replays skip stale approvals
+    // (parked approvals die with their turn on the daemon).
+    if is_reattach {
+        // §4: hold the idle poller paused across the replay — a drain past
+        // the first 2s tick would otherwise serve rows the replay hasn't
+        // reached yet and duplicate them in the transcript. (The event loop
+        // recomputes this flag every iteration, so boot is the only window
+        // it covers.)
+        remote.busy_poll.store(true, Ordering::SeqCst);
+        // Progressive paints (§1): each replay chunk/page draws, so history
+        // streams into the already-painted frame. Best-effort: the event
+        // loop's draws remain authoritative.
+        let mut paint = |remote: &mut RemoteApp| {
+            let _ = terminal.draw(|f| view(f, &mut remote.app));
+        };
+        let local = find_local_session_file(&remote.session_id);
+        let mut rebuilt = false;
+        if let Some(p) = local.as_deref() {
+            if let Ok(s) = Session::from_path(p) {
+                remote.app.session = s;
+            }
+            if let Some(p) = local.as_deref() {
+                rebuilt = rebuild_remote_from_messages(&mut remote, p, &mut paint);
+            }
+            if rebuilt {
+                // The drain path seeds the cursor per page; the local path
+                // seeds it from the local journal tip (no HTTP round trip —
+                // the file is right here). Cursor is the next seq to serve
+                // (inclusive), so seed max + 1. Either way the poller resumes
+                // past replayed rows without its own reattach scan.
+                let next = Session::max_event_seq(p).map_or(0, |m| m.saturating_add(1));
+                remote.events_cursor.fetch_max(next, Ordering::SeqCst);
+            }
+        }
+        if !rebuilt {
+            let sid = remote.session_id.clone();
+            replay_remote_events(&mut remote, &sid, &mut paint);
+        }
+        remote.busy_poll.store(false, Ordering::SeqCst);
+        push_info(
+            &mut remote.app,
+            format!("reattached to session {session_id}"),
+        );
+        // The daemon resolves the tool workspace from its own cwd, not the
+        // session header (`create_session` records the daemon cwd for exactly
+        // that reason). Reattaching across directories therefore replays this
+        // session while `read`/`write`/`bash` land in *this* tree — say so
+        // instead of surprising them mid-turn.
+        let session_cwd = remote.app.session.cwd().to_string();
+        let workspace_cwd = remote.app.cwd.clone();
+        if !same_workspace(&session_cwd, &workspace_cwd) {
+            push_info(
+                &mut remote.app,
+                format!(
+                    "dex: this session came from {session_cwd}; tools run in {workspace_cwd} \
+                     (the daemon workspace) — `cd {session_cwd}` to reattach there"
+                ),
+            );
+        }
+    }
+
+    // §3: collect the skills future here — after replay, before the
+    // session-start listing (its only consumer) — so a slow daemon dir scan
+    // never delays replay or first paint.
+    let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
+    // Skills live on the daemon (its workspace); a stale list is harmless —
+    // the load call re-discovers on the daemon side.
+    remote.app.skills = daemon_skills
+        .into_iter()
+        .map(|info| crate::core::types::Skill {
+            name: info.name,
+            description: info.description,
+            path: std::path::PathBuf::from(""),
+        })
+        .collect();
+
+    // Session-start view: the DEX art, then the skills the daemon discovered,
+    // then how fast the TUI was ready to use.
+    push_banner(&mut remote.app);
+    push_skills_listing(&mut remote.app);
+    push_info_line(
+        &mut remote.app,
+        launch_time_line(launch_start.elapsed().as_secs_f64()),
+    );
+    // A mismatched `thinking_effort:` (config.yaml names a level the model
+    // doesn't advertise) used to `eprintln!` from the daemon thread here —
+    // mid OSC theme query / alternate screen — corrupting the display and
+    // leaking into the composer. It now arrives as data and renders as a
+    // transcript line inside the TUI.
+    if let Some(warning) = info.thinking_warning.clone() {
+        push_info(&mut remote.app, format!("dex: {warning}"));
+    }
 
     // Report lifecycle state to the enclosing Herdr pane, if any.
     let mut herdr = super::herdr::Reporter::new();
@@ -1054,14 +1098,13 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             // the parent turn, so several can be answerable at once. The
             // overlay resolves the front; each entry POSTs its own decision.
             let (response, decision_rx) = mpsc::channel::<CoreApprovalDecision>(1);
-            remote.app.pending_approvals.push(PendingApproval {
+            remote.app.pending_approvals.push(PendingApproval::new(
                 name,
                 input,
                 response,
-                selected: 0,
-                request_id: request_id.clone(),
+                request_id.clone(),
                 agent,
-            });
+            ));
             spawn_approval_poster(
                 remote.client.clone(),
                 remote.session_id.clone(),
@@ -1156,6 +1199,13 @@ fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
 /// lookup through it silently misses and left `/resume` with no file to
 /// rebuild from (blank terminal).
 fn find_local_session_file(sid: &str) -> Option<std::path::PathBuf> {
+    // Fast path first: the id is the JSONL filename, so filename matching
+    // (one header read per hit) replaces the workspace-wide open+parse of
+    // every session (§1). The legacy scan below only serves renamed/legacy
+    // files whose stem no longer names the id.
+    if let Some(path) = Session::find_by_id_filename(sid) {
+        return Some(path);
+    }
     let all = Session::list_all().unwrap_or_default();
     if let Some((p, _)) = all.iter().find(|(_, h)| h.id() == sid) {
         return Some(p.clone());
@@ -1175,11 +1225,31 @@ fn find_local_session_file(sid: &str) -> Option<std::path::PathBuf> {
         .map(|(p, _)| p)
 }
 
+/// Messages rendered per paint during a chunked startup replay (§1).
+const REPLAY_PAINT_CHUNK: usize = 200;
+
 /// Rebuild the transcript from the persisted JSONL messages (complete:
 /// includes the user prompts the events journal never records). Returns
 /// true when anything was rendered. Mirrors the local `/resume` path.
-fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) -> bool {
-    let Ok(loaded) = crate::session::load_messages_from_session(path) else {
+/// Progressive (§1): renders head→tail in chunks with a `paint` between,
+/// so a huge history streams into the already-painted frame instead of
+/// blocking first paint. `render_message_slice` threads ids across chunks
+/// with no mid flush, so the final transcript is byte-identical to one-shot
+/// (`app.messages` is taken for the render and restored after — the footer
+/// token estimate reads it, so mid-replay frames show a stale count that
+/// corrects on the final paint).
+/// No-op replay paint for the mid-loop `/resume` path (the event loop's
+/// own draws pick the rebuilt transcript up).
+fn no_paint(_: &mut RemoteApp) {}
+
+fn rebuild_remote_from_messages(
+    remote: &mut RemoteApp,
+    path: &std::path::Path,
+    mut paint: impl for<'r> FnMut(&'r mut RemoteApp),
+) -> bool {
+    // Messages + plan ride one scan (§1): the plan used to cost a second
+    // full pass right after the messages load.
+    let Ok((loaded, plan)) = crate::session::load_messages_and_plan(path) else {
         return false;
     };
     if loaded.is_empty() {
@@ -1194,17 +1264,29 @@ fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) 
     remote.app.messages.clear();
     remote.app.messages.push(system);
     remote.app.messages.extend(loaded);
-    super::rebuild_transcript(&mut remote.app);
-    if let Some(p) = remote.app.session.path() {
-        let plan = crate::session::load_plan(p);
-        if !plan.is_empty() {
-            remote.app.plan = plan;
+    let msgs = std::mem::take(&mut remote.app.messages);
+    remote.app.transcript.clear();
+    // Stamps restart at 0 — drop cached rows + selection (see `reset_session_state`).
+    remote.app.wrapped_cache.clear();
+    remote.app.display_cache.clear();
+    remote.app.selection = None;
+    remote.app.assistant_pending.clear();
+    remote.app.assistant_gap.reset();
+    remote.app.assistant_open = false;
+    remote.app.thinking_open = false;
+    let mut opened = std::collections::HashSet::new();
+    if msgs.len() > 1 {
+        // Skip the leading system message (never rendered).
+        for chunk in msgs[1..].chunks(REPLAY_PAINT_CHUNK) {
+            super::render_message_slice(&mut remote.app, chunk, &mut opened);
+            paint(remote);
         }
-    } else {
-        let plan = crate::session::load_plan(path);
-        if !plan.is_empty() {
-            remote.app.plan = plan;
-        }
+    }
+    remote.app.messages = msgs;
+    super::flush_assistant(&mut remote.app);
+    remote.app.autoscroll = true;
+    if !plan.is_empty() {
+        remote.app.plan = plan;
     }
     true
 }
@@ -1212,7 +1294,14 @@ fn rebuild_remote_from_messages(remote: &mut RemoteApp, path: &std::path::Path) 
 /// Replay the daemon's events journal into the transcript (best effort when
 /// no local file is available, e.g. true remote). Skips parked approvals;
 /// flushes the throttled assistant buffer so the replay is visible.
-fn replay_remote_events(remote: &mut RemoteApp, session_id: &str) {
+/// Paged (§1): the server caps pages, so each iteration is one bounded RTT
+/// plus a render with a `paint` between — a giant journal streams in
+/// instead of arriving as one huge slurp, and pages always advance.
+fn replay_remote_events(
+    remote: &mut RemoteApp,
+    session_id: &str,
+    mut paint: impl for<'r> FnMut(&'r mut RemoteApp),
+) {
     let mut since = 0u64;
     loop {
         let prev = since;
@@ -1231,7 +1320,14 @@ fn replay_remote_events(remote: &mut RemoteApp, session_id: &str) {
                 remote
                     .events_cursor
                     .fetch_max(resp.next_seq, Ordering::SeqCst);
-                // No forward progress means the journal is drained.
+                paint(remote);
+                // EOF is raw-journal progress (`next_seq` advances on raw
+                // rows, even unknown-type ones the filter above skips), not
+                // the filtered count: a full page of unknown rows serves 0
+                // events while the tail is unfetched, so `served < LIMIT`
+                // would break early. No progress means drained — the extra
+                // empty fetch this costs old daemons on exact-divide totals
+                // is the documented backup, not a bug.
                 if since <= prev {
                     break;
                 }
@@ -2743,11 +2839,11 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     // when no local file is available (true remote).
                     let mut rebuilt = false;
                     if let Some(p) = local_path.as_deref() {
-                        rebuilt = rebuild_remote_from_messages(remote, p);
+                        rebuilt = rebuild_remote_from_messages(remote, p, no_paint);
                     }
                     if !rebuilt {
                         let sid = remote.session_id.clone();
-                        replay_remote_events(remote, &sid);
+                        replay_remote_events(remote, &sid, no_paint);
                         if remote.app.transcript.is_empty()
                             && remote.app.assistant_pending.is_empty()
                         {
@@ -3121,6 +3217,7 @@ mod tests {
                 permission: PermissionMode::Trusted,
                 verify_command: None,
                 extra_headers: Default::default(),
+                global_headers: Default::default(),
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
@@ -3168,6 +3265,8 @@ mod tests {
             transcript_area: None,
             selection: None,
             notice: None,
+            status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
+            slash_cache: std::cell::RefCell::new(None),
         };
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(16);
         RemoteApp {

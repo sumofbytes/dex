@@ -15,6 +15,10 @@ pub(crate) use engine::{CallKind, ExtensionEngine, HostCtx, ShadowCtx, HOOK_TIME
 /// [`HOOK_TIMEOUT_SECS`] as a `Duration` for the event drive loop.
 pub(crate) const HOOK_TIMEOUT_SECS_DURATION: std::time::Duration =
     std::time::Duration::from_secs(HOOK_TIMEOUT_SECS);
+/// Slow-hook warning threshold: a hook call slower than this logs a warning
+/// (perf doc §9). Hooks run inline on the dispatch path, so anything near
+/// the 10s hook timeout is per-turn latency; 500ms flags the offender early.
+const SLOW_HOOK_WARN: std::time::Duration = std::time::Duration::from_millis(500);
 /// `dex.net.fetch` ceilings: per-request timeout cap (matches the tool
 /// budget) and response-body cap (a runaway body fails the call, not the
 /// daemon).
@@ -25,7 +29,7 @@ pub(crate) use manifest::Manifest;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::core::types::{FunctionDef, ToolDefinition};
@@ -229,7 +233,14 @@ struct LoadedExtension {
 }
 
 pub(crate) struct ExtensionManager {
-    cached: tokio::sync::RwLock<Vec<ToolDefinition>>,
+    /// Schema cache behind `Arc`: readers clone the `Arc`, never the defs.
+    cached: tokio::sync::RwLock<Arc<[ToolDefinition]>>,
+    /// Token cost of `cached`, precomputed at rebuild: the per-turn budget
+    /// reads this instead of re-serializing schemas on every model call.
+    cached_tokens: tokio::sync::RwLock<u64>,
+    /// Per-tool token costs, parallel to `cached` names: the `active`-slice
+    /// budget sums these instead of re-serializing the filtered defs live.
+    cached_costs: tokio::sync::RwLock<Arc<[(String, u64)]>>,
     /// Sorted by id: iteration order is hook order (same contract as the
     /// skills dedup — deterministic, first-wins on collision).
     engines: tokio::sync::RwLock<BTreeMap<String, LoadedExtension>>,
@@ -252,7 +263,9 @@ pub(crate) struct ExtensionManager {
 impl ExtensionManager {
     fn fresh() -> Self {
         Self {
-            cached: tokio::sync::RwLock::new(Vec::new()),
+            cached: tokio::sync::RwLock::new(Arc::new([])),
+            cached_tokens: tokio::sync::RwLock::new(0),
+            cached_costs: tokio::sync::RwLock::new(Arc::new([])),
             engines: tokio::sync::RwLock::new(BTreeMap::new()),
             shadowed: tokio::sync::RwLock::new(HashSet::new()),
             active: std::sync::RwLock::new(None),
@@ -381,6 +394,42 @@ impl ExtensionManager {
         self.refresh_found(discover_scoped()).await;
     }
 
+    /// Ensure one extension is loaded, booting just it on first use (§26):
+    /// `dex run ext__foo__bar` boots one Lua VM instead of every installed
+    /// extension, and a dispatch racing the background refresh self-heals
+    /// instead of failing "unknown tool". No-op when already loaded.
+    /// Collision rejection still applies (see `load_one`): an explicitly
+    /// addressed latecomer whose tool name is already registered fails
+    /// instead of silently renaming.
+    pub(crate) async fn ensure_loaded(&self, ext_id: &str) -> Result<(), String> {
+        if self.engines.read().await.contains_key(ext_id) {
+            return Ok(());
+        }
+        self.ensure_loaded_found(ext_id, discover_scoped()).await
+    }
+
+    async fn ensure_loaded_found(
+        &self,
+        ext_id: &str,
+        found: Vec<(PathBuf, Manifest)>,
+    ) -> Result<(), String> {
+        if self.engines.read().await.contains_key(ext_id) {
+            return Ok(());
+        }
+        let Some((dir, m)) = found.into_iter().find(|(_, m)| m.id == ext_id) else {
+            return Err(format!("unknown extension '{ext_id}'"));
+        };
+        // Same serialized core as `refresh_found` (load + cache rebuild),
+        // minus the scan — concurrent refreshes can't double-load.
+        let _guard = self.refresh_lock.lock().await;
+        if self.engines.read().await.contains_key(&m.id) {
+            return Ok(());
+        }
+        self.load_one(&dir, m).await?;
+        self.rebuild_cache().await;
+        Ok(())
+    }
+
     /// Explicit reload (`/extensions reload`): like [`refresh`], plus the
     /// reconcile — extensions that vanished from disk or lost consent
     /// unload, so disable/remove takes effect in the running process
@@ -453,9 +502,25 @@ impl ExtensionManager {
         // count recorded. (P0: truncate; the count surfaces in P2 doctor.)
         let max = max_extension_tools();
         if tools.len() > max {
+            let dropped = tools.len() - max;
             tools.truncate(max);
+            warn_hidden_tools(dropped, max);
         }
-        *self.cached.write().await = tools;
+        // Per-tool char shares for the `active`-slice budget (see
+        // `cached_schema_tokens`); the whole-cache total keeps the exact
+        // `schema_token_estimate` formula.
+        let costs: Arc<[(String, u64)]> = tools
+            .iter()
+            .map(|d| {
+                (
+                    d.function.name.clone(),
+                    crate::agent::tokens::schema_chars(std::slice::from_ref(d)) as u64,
+                )
+            })
+            .collect();
+        *self.cached_tokens.write().await = crate::agent::tokens::schema_token_estimate(&tools);
+        *self.cached_costs.write().await = costs;
+        *self.cached.write().await = Arc::from(tools);
         let shadowed: HashSet<String> = engines
             .values()
             .flat_map(|e| e.shadows.iter().cloned())
@@ -477,10 +542,23 @@ impl ExtensionManager {
         // state is held across the `.await` below.
         let (engine, timeout) = {
             let engines = self.engines.read().await;
-            let Some(ext) = engines.get(ext_id) else {
-                return Err(format!("unknown tool '{full_name}'"));
-            };
-            (ext.engine.clone(), ext.engine.tool_timeout(tool))
+            if let Some(ext) = engines.get(ext_id) {
+                (ext.engine.clone(), ext.engine.tool_timeout(tool))
+            } else {
+                // Lazy (§26): the background refresh may still be running
+                // (or this process never refreshed) — boot the addressed
+                // extension on first use. A genuinely unknown tool keeps
+                // the same error.
+                drop(engines);
+                self.ensure_loaded(ext_id)
+                    .await
+                    .map_err(|_| format!("unknown tool '{full_name}'"))?;
+                let engines = self.engines.read().await;
+                let Some(ext) = engines.get(ext_id) else {
+                    return Err(format!("unknown tool '{full_name}'"));
+                };
+                (ext.engine.clone(), ext.engine.tool_timeout(tool))
+            }
         };
         engine
             .drive(
@@ -509,13 +587,45 @@ impl ExtensionManager {
     ) -> Result<String, String> {
         let (engine, timeout) = {
             let engines = self.engines.read().await;
-            let Some(ext) = engines
+            if let Some(ext) = engines
                 .values()
                 .find(|e| e.shadows.contains(&target.to_string()))
-            else {
-                return Err(format!("no shadow registered for '{target}'"));
-            };
-            (ext.engine.clone(), ext.engine.tool_timeout(target))
+            {
+                (ext.engine.clone(), ext.engine.tool_timeout(target))
+            } else {
+                // Same lazy self-heal as `call`: a dispatch racing the
+                // background refresh boots the owner instead of failing.
+                // Scoped candidate-by-candidate (`ensure_loaded_found`),
+                // not a full `refresh()` — the shadow owner is only known
+                // after load (shadows come from Lua exports, not the
+                // manifest), so boot each undiscovered candidate until
+                // one claims the target. A genuinely unknown target pays
+                // one `discover_scoped()` scan plus the remaining boots,
+                // same worst case as before, but the common race heals
+                // with a single VM instead of all of them (§26).
+                drop(engines);
+                let found = discover_scoped();
+                for (_, m) in found.clone() {
+                    if self
+                        .engines
+                        .read()
+                        .await
+                        .values()
+                        .any(|e| e.shadows.contains(&target.to_string()))
+                    {
+                        break;
+                    }
+                    let _ = self.ensure_loaded_found(&m.id, found.clone()).await;
+                }
+                let engines = self.engines.read().await;
+                let Some(ext) = engines
+                    .values()
+                    .find(|e| e.shadows.contains(&target.to_string()))
+                else {
+                    return Err(format!("no shadow registered for '{target}'"));
+                };
+                (ext.engine.clone(), ext.engine.tool_timeout(target))
+            }
         };
         engine
             .drive(
@@ -533,7 +643,9 @@ impl ExtensionManager {
 
     /// Run one extension's handlers for `event`, returning the directive
     /// envelope JSON. The manager does not interpret it — the typed runners
-    /// in [`hooks`] do.
+    /// in [`hooks`] do. Calls slower than [`SLOW_HOOK_WARN`] log a warning:
+    /// hooks run inline on the dispatch path (perf doc §9), so a slow hook
+    /// is per-turn latency with no other signal.
     async fn run_event(
         &self,
         ext_id: &str,
@@ -551,7 +663,8 @@ impl ExtensionManager {
             }
             ext.engine.clone()
         };
-        engine
+        let started = std::time::Instant::now();
+        let out = engine
             .drive(
                 CallKind::Event {
                     event: event.to_string(),
@@ -562,7 +675,15 @@ impl ExtensionManager {
                 *host,
                 None,
             )
-            .await
+            .await;
+        let elapsed = started.elapsed();
+        if elapsed >= SLOW_HOOK_WARN {
+            eprintln!(
+                "dex: [extensions] '{ext_id}' {event} took {}ms (slow hook adds per-turn latency)",
+                elapsed.as_millis()
+            );
+        }
+        out
     }
 
     /// `tool.before` chain (H1, plan §8): run in load order, each handler
@@ -814,13 +935,14 @@ impl ExtensionManager {
     pub(crate) async fn active_cached(&self) -> Vec<ToolDefinition> {
         let all = self.cached.read().await.clone();
         match self.active.read().expect("active lock").clone() {
-            None => all,
+            None => all.iter().cloned().collect(),
             Some(active) => {
                 let known: HashSet<String> = all.iter().map(|d| d.function.name.clone()).collect();
                 let wanted: HashSet<String> =
                     active.into_iter().filter(|t| known.contains(t)).collect();
-                all.into_iter()
+                all.iter()
                     .filter(|d| wanted.contains(&d.function.name))
+                    .cloned()
                     .collect()
             }
         }
@@ -917,6 +1039,19 @@ fn max_extension_tools() -> usize {
         .unwrap_or(64)
 }
 
+/// One-time diagnostic for the schema cap. Dropped extension tools are
+/// silently absent from the model's view and answer "unknown tool" otherwise;
+/// unlike MCP there is no `/mcp`-style panel count to surface them.
+fn warn_hidden_tools(dropped: usize, max: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "dex: [extensions] {dropped} tools hidden by the schema cap ({max} max — raise DEX_MAX_EXTENSION_TOOLS)"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global (process-wide) manager: sync reads for schema + dispatch paths
 // ---------------------------------------------------------------------------
@@ -937,17 +1072,32 @@ pub(crate) fn global_manager() -> std::sync::Arc<ExtensionManager> {
         .clone()
 }
 
+/// Bounded spin on `try_read` (same contract as MCP's `spin_read`): every
+/// writer holds its guard for a bare swap, so contention clears within a
+/// few yields and the never-block guarantee holds.
+fn spin_read<T: Clone>(lock: &tokio::sync::RwLock<T>) -> Option<T> {
+    spin_guard(lock).map(|guard| guard.clone())
+}
+
+/// Guard-returning spin for maps whose values aren't `Clone` (engines):
+/// the caller reads through the guard instead of cloning.
+fn spin_guard<T>(lock: &tokio::sync::RwLock<T>) -> Option<tokio::sync::RwLockReadGuard<'_, T>> {
+    for _ in 0..16 {
+        if let Ok(guard) = lock.try_read() {
+            return Some(guard);
+        }
+        std::thread::yield_now();
+    }
+    None
+}
+
 /// Cached extension tools for `tools_schema()` — never blocks, never fails.
-pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
+/// Clones the `Arc`, not the defs.
+pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
     let Some(m) = GLOBAL.get() else {
-        return Vec::new();
+        return Arc::new([]);
     };
-    let all = m
-        .cached
-        .try_read()
-        .ok()
-        .map(|t| t.clone())
-        .unwrap_or_default();
+    let all = spin_read(&m.cached).unwrap_or_else(|| Arc::new([]));
     match m.active.read().expect("active lock").clone() {
         None => all,
         // Filtered here, not at set time: a load-time `set_active` races
@@ -955,24 +1105,43 @@ pub(crate) fn cached_tools() -> Vec<ToolDefinition> {
         // a fresh process to an empty schema.
         Some(active) => {
             let wanted: HashSet<String> = active.into_iter().collect();
-            all.into_iter()
+            all.iter()
                 .filter(|d| wanted.contains(&d.function.name))
-                .collect()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into()
         }
     }
 }
 
 /// Token cost of the cached extension schema slice, for the compaction budget.
+/// Precomputed at rebuild — a cached load, never a re-serialize. With an
+/// `active` slice the filtered set sums the precomputed per-tool costs (no
+/// live serialization of the filtered defs). Never blocks the loop;
+/// contention spins (see `spin_read`), and a still-contended costs read
+/// falls back to the whole-cache total (conservative: compacts earlier,
+/// never later).
 pub(crate) fn cached_schema_tokens() -> u64 {
-    GLOBAL
-        .get()
-        .and_then(|m| {
-            m.cached
-                .try_read()
-                .ok()
-                .map(|t| crate::agent::tokens::schema_token_estimate(&t))
-        })
-        .unwrap_or_default()
+    let Some(m) = GLOBAL.get() else {
+        return 0;
+    };
+    if let Some(active) = m.active.read().expect("active lock").clone() {
+        let wanted: HashSet<String> = active.into_iter().collect();
+        if let Some(costs) = spin_read(&m.cached_costs) {
+            // Same sum-then-divide formula as `schema_token_estimate`, on
+            // the subset: bit-identical to estimating the sliced defs.
+            let mut chars = 0u64;
+            let mut count = 0u64;
+            for (name, cost) in costs.iter() {
+                if wanted.contains(name) {
+                    chars += cost;
+                    count += 1;
+                }
+            }
+            return chars / 4 + count * crate::agent::tokens::PER_MESSAGE_OVERHEAD;
+        }
+    }
+    spin_read(&m.cached_tokens).unwrap_or_default()
 }
 
 /// Dispatch `ext__<ext>__<tool>`. All errors are plain strings; the caller
@@ -1101,7 +1270,7 @@ tokio::task_local! {
 pub(crate) fn drive_model_for(config: &crate::llm::config::LlmConfig) -> DriveModel {
     DriveModel {
         snapshot: Some(served_snapshot_for(config)),
-        routing: harvest_routing_headers(&config.extra_headers),
+        routing: harvest_routing_headers(&config_header_layers(config)),
     }
 }
 
@@ -1154,20 +1323,32 @@ static LAST_MODEL: Mutex<Option<ExtensionModelSnapshot>> = Mutex::new(None);
 /// [`LAST_MODEL`]: inside a turn the drive context carries them.
 static LAST_ROUTING_HEADERS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
-/// The routing-affinity subset of a turn's resolved `extra_headers`: only
-/// the `x-opencode-*` pair dex injects per turn (session id the file never
-/// sees), canonicalized to lowercase names. Everything else is already
-/// visible to Lua via `dex.model.auth()`.
-fn harvest_routing_headers(extra: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+/// The routing-affinity subset of a turn's resolved headers: only the
+/// `x-opencode-*` pair, canonicalized to lowercase names. Layers are scanned
+/// in wire precedence (global file < provider file < env/CLI), so a later
+/// layer wins per key — a file-level pin must reach Lua's `dex.net.fetch`,
+/// not just the injected per-turn values.
+fn harvest_routing_headers(layers: &[&BTreeMap<String, String>]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for (name, value) in extra {
-        if name.eq_ignore_ascii_case("x-opencode-session") {
-            out.insert("x-opencode-session".to_string(), value.clone());
-        } else if name.eq_ignore_ascii_case("x-opencode-client") {
-            out.insert("x-opencode-client".to_string(), value.clone());
+    for layer in layers {
+        for (name, value) in *layer {
+            if name.eq_ignore_ascii_case("x-opencode-session") {
+                out.insert("x-opencode-session".to_string(), value.clone());
+            } else if name.eq_ignore_ascii_case("x-opencode-client") {
+                out.insert("x-opencode-client".to_string(), value.clone());
+            }
         }
     }
     out
+}
+
+/// The three header layers of a resolved config, in wire precedence.
+fn config_header_layers(config: &crate::llm::config::LlmConfig) -> [&BTreeMap<String, String>; 3] {
+    [
+        &config.global_headers,
+        &config.provider_headers,
+        &config.extra_headers,
+    ]
 }
 
 /// Merge the recorded routing headers under Lua-explicit ones
@@ -1243,7 +1424,7 @@ pub(crate) async fn fire_model_select_if_changed(
     // endpoint without tripping `MissingSessionID`.
     {
         let mut guard = LAST_ROUTING_HEADERS.lock().expect("routing headers lock");
-        *guard = harvest_routing_headers(&config.extra_headers);
+        *guard = harvest_routing_headers(&config_header_layers(config));
     }
     if previous.as_deref() == Some(id.as_str()) || !has_event_handlers("model_select") {
         return;
@@ -1441,7 +1622,7 @@ pub(crate) fn command_list() -> Vec<(String, String, String)> {
     GLOBAL
         .get()
         .and_then(|m| {
-            m.engines.try_read().ok().map(|engines| {
+            spin_guard(&m.engines).map(|engines| {
                 engines
                     .values()
                     .flat_map(|e| {
@@ -1475,13 +1656,25 @@ pub(crate) async fn run_command_global(
         policy: &policy,
         filter: None,
     };
+    let manager = global_manager();
     let engine = {
-        let manager = global_manager();
         let engines = manager.engines.read().await;
-        engines
-            .get(ext_id)
-            .map(|e| e.engine.clone())
-            .ok_or_else(|| format!("extension '{ext_id}' is not loaded"))?
+        if let Some(e) = engines.get(ext_id) {
+            e.engine.clone()
+        } else {
+            // Lazy self-heal like `call`: boot the addressed extension when
+            // a command races the background refresh.
+            drop(engines);
+            manager
+                .ensure_loaded(ext_id)
+                .await
+                .map_err(|_| format!("extension '{ext_id}' is not loaded"))?;
+            let engines = manager.engines.read().await;
+            engines
+                .get(ext_id)
+                .map(|e| e.engine.clone())
+                .ok_or_else(|| format!("extension '{ext_id}' is not loaded"))?
+        }
     };
     engine
         .drive(
@@ -1819,7 +2012,7 @@ pub(crate) fn has_event_handlers(event: &str) -> bool {
     GLOBAL
         .get()
         .and_then(|m| {
-            m.engines.try_read().ok().map(|e| {
+            spin_guard(&m.engines).map(|e| {
                 e.values()
                     .any(|ext| ext.events.contains(&event.to_string()))
             })
@@ -1844,7 +2037,9 @@ pub(crate) mod tests {
         /// included).
         pub(crate) async fn reset_for_tests(&self) {
             self.engines.write().await.clear();
-            *self.cached.write().await = Vec::new();
+            *self.cached.write().await = Arc::new([]);
+            *self.cached_tokens.write().await = 0;
+            *self.cached_costs.write().await = Arc::new([]);
             *self.shadowed.write().await = HashSet::new();
             *self.active.write().expect("active lock") = None;
             *LAST_MODEL.lock().expect("served model lock") = None;
@@ -1914,16 +2109,19 @@ pub(crate) mod tests {
         );
     }
 
+    /// Fresh temp root for a fixture, unique per process. The system clock
+    /// is too coarse (50 ns here) for parallel tests: two `#[tokio::test]`s
+    /// starting together got the same `subsec_nanos` and clobbered each
+    /// other's `extension.lua`, deleting the dir mid-test.
+    fn fixture_root(prefix: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()))
+    }
+
     /// Write a fixture extension dir; returns the parent temp dir.
     pub(crate) fn fixture_ext(manifest: &str, lua: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "dex-ext-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let root = fixture_root("dex-ext-test");
         let dir = root.join("ext");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("manifest.yaml"), manifest).unwrap();
@@ -2087,14 +2285,7 @@ end
     /// Write several fixture extensions under one parent; each item is
     /// (id, manifest, lua). Returns the parent dir for `refresh_with`.
     pub(crate) fn fixture_exts(items: &[(&str, &str, &str)]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "dex-exts-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
+        let root = fixture_root("dex-exts-test");
         for (id, manifest, lua) in items {
             let dir = root.join(id);
             std::fs::create_dir_all(&dir).unwrap();
@@ -2318,6 +2509,23 @@ end
         mgr.refresh_with(std::slice::from_ref(&root)).await;
         assert!(mgr.cached.try_read().unwrap().is_empty());
         assert!(mgr.engines.read().await.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_boots_one_extension_lazily() {
+        // §26: no refresh — the first addressed load boots just this
+        // extension; repeats are no-ops; unknown ids error without parking.
+        let root = fixture_ext(hello_manifest(), hello_lua());
+        let mgr = ExtensionManager::fresh();
+        let m = crate::extensions::manifest::parse_manifest(hello_manifest()).unwrap();
+        mgr.ensure_loaded_found("hello", vec![(root.join("ext"), m)])
+            .await
+            .unwrap();
+        assert!(mgr.engines.read().await.contains_key("hello"));
+        mgr.ensure_loaded_found("hello", vec![]).await.unwrap();
+        assert!(mgr.ensure_loaded_found("nope", vec![]).await.is_err());
+        assert!(!mgr.engines.read().await.contains_key("nope"));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2773,6 +2981,7 @@ end
             permission: crate::core::types::PermissionMode::Trusted,
             verify_command: None,
             extra_headers: Default::default(),
+            global_headers: Default::default(),
             client: reqwest::Client::new(),
             provider_entries: Default::default(),
             provider_headers: Default::default(),
@@ -2905,7 +3114,7 @@ end
             ("X-OPENCODE-SESSION".to_string(), "s".to_string()),
             ("Authorization".to_string(), "Bearer k".to_string()),
         ]);
-        let out = harvest_routing_headers(&extra);
+        let out = harvest_routing_headers(&[&extra]);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("x-opencode-session").map(String::as_str), Some("s"));
     }

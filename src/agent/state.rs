@@ -48,6 +48,11 @@ pub(crate) fn cache_file_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn cache_fingerprint(name: &str, input: &str) -> String {
+    // Always computed: `DEX_TOOL_CACHE` gates only the on-disk cache
+    // (`ToolState::load`/`save`), never the in-process `state.cache`, which
+    // serves hits for the whole session. Blanking this suffix when the env
+    // var is unset (the default) would make a cached read of a path match
+    // after a `bash` command rewrote it, serving stale bytes.
     let mut fingerprint = String::new();
     if matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls") {
         if let Ok(args) = serde_json::from_str::<Value>(input) {
