@@ -641,8 +641,10 @@ struct CatalogIndex {
     /// flat shape, whose key is `""`); one id may repeat across providers
     /// (each contributes its own endpoint prefix at expansion time).
     bare: Vec<(String, String)>,
-    /// Fully expanded `available_models` list for a configured-provider set.
-    expanded_for: Option<(BTreeSet<String>, Vec<String>)>,
+    /// Fully expanded `available_models` lists by configured-provider set
+    /// (capped): concurrent turns with differing sets each hit instead of
+    /// thrashing a single-entry cache.
+    expanded_for: HashMap<BTreeSet<String>, Vec<String>>,
 }
 
 static CATALOG_INDEX: OnceLock<Mutex<Option<CatalogIndex>>> = OnceLock::new();
@@ -728,7 +730,7 @@ fn build_catalog_index(
         provider_api: HashMap::new(),
         provider_env: HashMap::new(),
         bare: Vec::new(),
-        expanded_for: None,
+        expanded_for: HashMap::new(),
     };
     // Top-level provider entries (api.json shape). The `models`/`providers`
     // keys hold model/provider maps, not provider entries — the old walks
@@ -839,6 +841,18 @@ fn with_catalog_index_mut<T>(f: impl FnOnce(&mut CatalogIndex) -> T) -> Option<T
     let path = dex_catalog_cache_path()?;
     let meta = std::fs::metadata(&path).ok()?;
     let (mtime, len) = (meta.modified().ok()?, meta.len());
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|index| index.path == path && index.mtime == mtime && index.len == len);
+        if fresh {
+            return Some(f(guard.as_mut()?));
+        }
+    }
     // Parsed outside the lock (like `cached_parse`): the 4MB walk never
     // blocks concurrent readers serving the previous generation.
     let catalog = load_dex_catalog()?;
@@ -1259,9 +1273,11 @@ pub(crate) fn extension_model_auth_for(
         .unwrap_or_else(|| Provider::Generic(provider_name.to_string()));
     let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| e.to_string())?;
     let mut headers = load_config_headers(&file);
+    // Provider-scoped entries beat the global table per key (AGENTS.md
+    // precedence): overwrite, don't `or_insert`.
     if let Some(entry) = entries.get(provider.name()) {
         for (name, value) in &entry.headers {
-            headers.entry(name.clone()).or_insert_with(|| value.clone());
+            headers.insert(name.clone(), value.clone());
         }
     }
     for (name, value) in custom_headers_from_env() {
@@ -1771,10 +1787,8 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
         .into_keys()
         .collect();
     with_catalog_index_mut(|index| {
-        if let Some((set, ids)) = index.expanded_for.as_ref() {
-            if *set == configured {
-                return Some(ids.clone());
-            }
+        if let Some(ids) = index.expanded_for.get(&configured) {
+            return Some(ids.clone());
         }
         if index.bare.is_empty() {
             return None;
@@ -1800,7 +1814,10 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
         }
         ids.sort();
         ids.dedup();
-        index.expanded_for = Some((configured, ids.clone()));
+        if index.expanded_for.len() >= 4 {
+            index.expanded_for.clear();
+        }
+        index.expanded_for.insert(configured, ids.clone());
         Some(ids)
     })
     .flatten()
@@ -6245,9 +6262,10 @@ pub(crate) mod tests {
             std::env::remove_var(key);
         }
         let auth = super::extension_model_auth().unwrap();
-        // Global file headers win over provider-scoped ones; `authorization`
-        // never travels with the headers (the key goes separately).
-        assert_eq!(auth.headers.get("X-A").map(String::as_str), Some("global"));
+        // Provider-scoped entries beat the global table per key (AGENTS.md
+        // precedence); `authorization` never travels with the headers (the
+        // key goes separately).
+        assert_eq!(auth.headers.get("X-A").map(String::as_str), Some("scoped"));
         assert_eq!(auth.headers.get("X-B").map(String::as_str), Some("scoped"));
         assert!(auth
             .headers

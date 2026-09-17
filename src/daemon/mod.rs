@@ -213,9 +213,14 @@ pub(crate) struct DaemonState {
     /// one full `list_all` walk, then hits this instead of re-walking per
     /// request. Populated only after the startup rebuild completes (during
     /// the rebuild window a miss may simply be unscanned-yet, so the disk
-    /// fallback always runs); cleared on explicit registration.
-    pub missing_sessions: Mutex<HashSet<String>>,
+    /// fallback always runs); cleared on explicit registration. Entries
+    /// expire after `NEGATIVE_TTL` so a session created out-of-band (CLI/TUI
+    /// direct file) after a miss becomes visible without a restart.
+    pub missing_sessions: Mutex<HashMap<String, Instant>>,
 }
+
+/// Negative-cache TTL for absent session ids (see `missing_sessions`).
+pub(crate) const NEGATIVE_TTL: Duration = Duration::from_secs(60);
 
 /// 60-second window during which an `Idempotency-Key` replays its recorded
 /// turn instead of running it again.
@@ -232,6 +237,12 @@ pub(crate) struct SessionEntry {
     /// turn (registry rebuilds only read headers) — the wake falls back to
     /// the file scan then.
     pub model: Option<String>,
+    /// Provider + base URL the stashed model resolved to: a bare model id
+    /// alone re-resolves on the default provider/endpoint, so the wake
+    /// would run on the wrong endpoint after a `/provider` switch or a
+    /// custom `--base-url` turn. `None` until the first turn, like `model`.
+    pub wake_provider: Option<String>,
+    pub wake_base_url: Option<String>,
     /// Last `plan` JSON this daemon persisted + the session file's mtime
     /// right after the write (perf doc §28): a re-sent identical plan
     /// skips the append when the mtime proves nobody else touched the file
@@ -261,7 +272,7 @@ impl DaemonState {
             active_streams: Mutex::new(HashMap::new()),
             wakes: Mutex::new(HashMap::new()),
             last_client_seen: Mutex::new(HashMap::new()),
-            missing_sessions: Mutex::new(HashSet::new()),
+            missing_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -285,7 +296,9 @@ impl DaemonState {
 
     /// Push one journal event to every attached stream, best effort: the
     /// journal is the source of truth; the push is a latency nicety and a
-    /// full/closed channel is harmless.
+    /// full/closed channel is harmless. One struct clone per stream — no
+    /// per-receiver serialization (the envelope is already typed, never
+    /// re-encoded to JSON here); streams per session are typically one.
     pub(crate) fn broadcast_event(&self, session_id: &str, env: &StreamEnvelope) {
         let senders = lock_map(&self.active_streams)
             .get(session_id)
@@ -557,6 +570,8 @@ impl DaemonState {
                     name,
                     cwd,
                     model: None,
+                    wake_provider: None,
+                    wake_base_url: None,
                     plan_persisted: None,
                     model_persisted: None,
                 },
@@ -1148,6 +1163,8 @@ mod tests {
             name: None,
             cwd: "/tmp".into(),
             model: None,
+            wake_provider: None,
+            wake_base_url: None,
             plan_persisted: None,
             model_persisted: None,
         };

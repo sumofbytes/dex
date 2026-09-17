@@ -936,14 +936,34 @@ impl HttpTransport {
         // the result (server-initiated messages) — waiting for the full body
         // then meant hanging until the call timeout even though the reply
         // had arrived. Decode `data:` lines incrementally and return on the
-        // first envelope carrying a result/error (same "first wins" rule as
-        // the old full-body scan). A non-SSE plain-JSON body falls back to a
-        // whole-body parse at EOF.
+        // envelope carrying this call's `id` with a result/error (same
+        // "first wins" rule as the old full-body scan, now id-matched like
+        // `StdioTransport` so a notification carrying `result` can't
+        // early-exit). A non-SSE plain-JSON body falls back to a whole-body
+        // parse at EOF. `buf` is capped: a malicious infinite `:keep-alive`
+        // stream can't OOM before the result arrives.
         let mut buf: Vec<u8> = Vec::new();
+        const SSE_BUF_CAP: usize = 1024 * 1024;
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
-                    if let Some(r) = sse_scan_chunk(&mut buf, &chunk) {
+                    buf.extend_from_slice(&chunk);
+                    if buf.len() > SSE_BUF_CAP {
+                        // Progress/` :keep-alive` spam can't OOM the call:
+                        // keep the tail (a split `data:` line lives at the
+                        // end) and resync to the next newline so a torn head
+                        // never poisons the scan.
+                        let excess = buf.len() - SSE_BUF_CAP;
+                        buf.drain(..excess);
+                        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                            buf.drain(..=pos);
+                        }
+                    }
+                    if let Some(r) = sse_scan_buffered_id(&mut buf, id) {
+                        // Early exit drops `resp`, closing the stream: the
+                        // server's post-result broadcasts lose one listener.
+                        // Correctness first (was: hang to timeout); the next
+                        // call re-establishes the stream.
                         return Ok(r);
                     }
                 }
@@ -955,13 +975,13 @@ impl HttpTransport {
         // non-SSE responses (as before).
         if !buf.is_empty() {
             let line = String::from_utf8_lossy(&buf);
-            if let Some(r) = sse_result(&line) {
+            if let Some(r) = sse_result_id(&line, id) {
                 return Ok(r);
             }
         }
         let text = String::from_utf8_lossy(&buf);
         if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
-            if v.is_object() {
+            if v.get("id").is_none_or(|v| v.as_u64() == Some(id)) {
                 if let Some(r) = extract_rpc_result(&v) {
                     return Ok(r);
                 }
@@ -971,25 +991,32 @@ impl HttpTransport {
     }
 }
 
-/// One SSE `data:` line → RPC result/error, if it carries one. Progress
-/// notifications (no `result`/`error`) return `None` so the scan continues.
-fn sse_result(line: &str) -> Option<Value> {
+/// One SSE `data:` line → RPC result/error for `id`, if it carries one.
+/// Progress notifications (no `result`/`error`, or a different `id`) return
+/// `None` so the scan continues. An envelope without an `id` that carries a
+/// result is accepted (back-compat with servers that omit it); one with a
+/// mismatched `id` is skipped.
+fn sse_result_id(line: &str, id: u64) -> Option<Value> {
     let data = line.trim().strip_prefix("data:").unwrap_or("").trim();
     if data.is_empty() || data == "[DONE]" {
         return None;
     }
-    serde_json::from_str::<Value>(data)
-        .ok()
-        .and_then(|v| extract_rpc_result(&v))
+    let v: Value = serde_json::from_str(data).ok()?;
+    if let Some(got) = v.get("id").and_then(|v| v.as_u64()) {
+        if got != id {
+            return None;
+        }
+    }
+    extract_rpc_result(&v)
 }
 
-/// Append one body chunk and scan the newly completed lines (§20): a `data:`
-/// line split across chunks stays buffered until its newline arrives.
-fn sse_scan_chunk(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Value> {
-    buf.extend_from_slice(chunk);
+/// Scan newly completed lines in `buf` for this call's result (§20): a
+/// `data:` line split across chunks stays buffered until its newline
+/// arrives. Completed non-result lines are dropped; the partial tail stays.
+fn sse_scan_buffered_id(buf: &mut Vec<u8>, id: u64) -> Option<Value> {
     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = buf.drain(..=pos).collect();
-        if let Some(r) = sse_result(&String::from_utf8_lossy(&line)) {
+        if let Some(r) = sse_result_id(&String::from_utf8_lossy(&line), id) {
             return Some(r);
         }
     }
@@ -1621,6 +1648,9 @@ pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
 
 /// Token cost of the cached MCP schema slice, for the compaction budget.
 /// Precomputed at cache-swap time — a cached load, never a re-serialize.
+/// `try_read` (never block the loop): contention returns 0, underestimating
+/// the budget once and delaying compaction by one check — self-corrects on
+/// the next call when the rebuild lock releases.
 pub(crate) fn cached_schema_tokens() -> u64 {
     GLOBAL
         .get()
@@ -1737,20 +1767,24 @@ mod tests {
         // §20: notifications and blanks scan past; a result split across
         // chunks still matches once its newline arrives.
         let mut buf = Vec::new();
-        assert!(sse_scan_chunk(&mut buf, b": keep-alive\n\n").is_none());
-        assert!(sse_scan_chunk(
+        let scan = |buf: &mut Vec<u8>, chunk: &[u8]| {
+            buf.extend_from_slice(chunk);
+            sse_scan_buffered_id(buf, 1)
+        };
+        assert!(scan(&mut buf, b": keep-alive\n\n").is_none());
+        assert!(scan(
             &mut buf,
             b"data: {\"jsonrpc\":\"2.0\",\"method\":\"progress\"}\n"
         )
         .is_none());
-        assert!(sse_scan_chunk(&mut buf, b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"res").is_none());
-        let r = sse_scan_chunk(&mut buf, b"ult\":{\"ok\":true}}\n").expect("split result matches");
+        assert!(scan(&mut buf, b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"res").is_none());
+        let r = scan(&mut buf, b"ult\":{\"ok\":true}}\n").expect("split result matches");
         assert_eq!(r, serde_json::json!({"ok": true}));
         // Error envelopes match too; [DONE] and blanks don't.
-        assert!(sse_result("data: [DONE]").is_none());
-        assert!(sse_result("").is_none());
-        assert!(sse_result(": comment").is_none());
-        let e = sse_result("data: {\"error\":{\"code\":-1}}").expect("error matches");
+        assert!(sse_result_id("data: [DONE]", 1).is_none());
+        assert!(sse_result_id("", 1).is_none());
+        assert!(sse_result_id(": comment", 1).is_none());
+        let e = sse_result_id("data: {\"error\":{\"code\":-1}}", 1).expect("error matches");
         assert!(e.get("__mcp_error").is_some());
     }
 
