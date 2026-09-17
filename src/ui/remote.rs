@@ -2525,12 +2525,22 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         SlashCommand::Skill(name) => remote_skill(remote, name),
         SlashCommand::Waive(reason) => remote_waive(remote, reason),
         SlashCommand::Name(name) => remote_name(remote, name),
-        SlashCommand::Provider(Some(_)) => push_info(
+        SlashCommand::Thinking(arg) => remote_thinking(remote, arg),
+        SlashCommand::Extension(full) => {
+            let owned = full.to_string();
+            remote_extension_line(remote, &owned);
+        }
+        SlashCommand::Provider(Some(name)) if !name.trim().is_empty() => push_info(
             &mut remote.app,
             "provider is configured on the daemon host; not switchable from a remote client"
                 .to_string(),
         ),
         SlashCommand::Resume(selector) => remote_resume(remote, selector),
+        SlashCommand::Unknown => {
+            if !remote_unknown_or_extension(remote, line) {
+                push_info(&mut remote.app, format!("unknown command: {line}"));
+            }
+        }
         _ => {
             let had_model = remote.app.config.model.clone();
             let had_permission = remote.app.config.permission;
@@ -2546,6 +2556,10 @@ fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                     Some(raw) if !raw.is_empty() => raw,
                     _ => remote.app.config.model.clone(),
                 });
+                // A new endpoint+model has its own effort: drop the old
+                // override so the next turn uses the daemon default instead
+                // of pinning the previous model's level.
+                remote.options.thinking_effort = None;
             }
             if remote.app.config.permission != had_permission {
                 remote.options.permission = Some(match remote.app.config.permission {
@@ -2746,10 +2760,181 @@ fn remote_name(remote: &mut RemoteApp, name: Option<&str>) {
     }
 }
 
+/// Remote `/thinking`: same grammar as local, but the choice lives on the
+/// daemon (it runs the turns). Never touches the client's
+/// `thinking-effort.json` — that file is keyed by `base_url|model` and the
+/// display copy's `base_url` is empty, so a local write would key wrong and
+/// the daemon would silently ignore it. Instead the display copy and the
+/// per-turn override move together, so what `/thinking` shows is what the
+/// next turn uses. `Some("")` is the explicit-clear override (unset).
+fn remote_thinking(remote: &mut RemoteApp, arg: Option<&str>) {
+    let model = remote.app.config.model.clone();
+    let Some(arg) = arg else {
+        let advertised = crate::llm::config::reasoning_options_for(&model);
+        let effort = remote.app.config.thinking_effort.clone();
+        let text = match (&effort, advertised) {
+            (Some(effort), Some(options)) => {
+                format!(
+                    "thinking effort: {effort} (options: {})",
+                    options.join(", ")
+                )
+            }
+            (Some(effort), None) => format!("thinking effort: {effort}"),
+            (None, Some(options)) => {
+                format!("thinking effort: unset (options: {})", options.join(", "))
+            }
+            (None, None) => "thinking effort: unset".to_string(),
+        };
+        push_info(&mut remote.app, text);
+        return;
+    };
+    let arg = arg.trim();
+    if arg.is_empty() {
+        push_info(
+            &mut remote.app,
+            "usage: /thinking <level>|clear".to_string(),
+        );
+    } else if ["clear", "auto", "off"]
+        .iter()
+        .any(|w| w.eq_ignore_ascii_case(arg))
+    {
+        remote.app.config.thinking_effort = None;
+        remote.options.thinking_effort = Some(String::new());
+        push_info(&mut remote.app, "thinking effort cleared".to_string());
+    } else {
+        match crate::llm::config::validate_thinking_effort(&model, arg) {
+            Ok(level) => {
+                remote.app.config.thinking_effort = Some(level.clone());
+                remote.options.thinking_effort = Some(level.clone());
+                push_info(
+                    &mut remote.app,
+                    format!("thinking effort: {level} for {model}"),
+                );
+            }
+            Err(options) => push_info(
+                &mut remote.app,
+                format!(
+                    "unknown thinking effort '{arg}' for {model} (options: {})",
+                    options.join(", ")
+                ),
+            ),
+        }
+    }
+}
+
+/// Split `/<name> [args]` without consulting the client's extension list
+/// (empty when remote — the daemon owns the manager). `None` when the line
+/// is not a plausible command word, so built-in usage errors keep their
+/// local messages instead of paying a daemon round trip.
+fn split_remote_extension(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('/')?;
+    if rest.contains('\n') {
+        return None;
+    }
+    let mut parts = rest.splitn(2, ' ');
+    let name = parts.next()?.trim().to_string();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    Some((name, arg))
+}
+
+/// Built-in command words: an `Unknown` line naming one is a usage error,
+/// never a daemon extension (avoids a round trip for typos like `/quit x`).
+fn is_builtin_command(name: &str) -> bool {
+    matches!(
+        name,
+        "quit"
+            | "clear"
+            | "new"
+            | "session"
+            | "permissions"
+            | "resume"
+            | "name"
+            | "model"
+            | "provider"
+            | "thinking"
+            | "waive"
+            | "undo"
+            | "mcp"
+            | "extensions"
+            | "help"
+            | "skill"
+    ) || name.starts_with("skill:")
+}
+
+/// Run one extension command on the daemon. Returns true when the daemon
+/// knew the command (dispatched or handler-failed — both are answered, not
+/// unknown); false on 404 so the caller falls back to "unknown command".
+fn remote_extension_run(remote: &mut RemoteApp, name: &str, arg: &str) -> bool {
+    match remote.client.extensions_run(name, arg) {
+        Ok(body) => {
+            if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                push_info(&mut remote.app, format!("command '/{name}' failed: {err}"));
+            } else {
+                let ext = body
+                    .get("extension")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                push_info(
+                    &mut remote.app,
+                    format!("command '{name}@{ext}' dispatched (output → log)"),
+                );
+                if let Some(out) = body.get("output").and_then(|v| v.as_str()) {
+                    eprintln!("dex: [extensions] /{name}: {out}");
+                }
+            }
+            true
+        }
+        Err(e) => {
+            if e.to_string().contains("404") {
+                false
+            } else {
+                push_info(
+                    &mut remote.app,
+                    format!("could not run command '/{name}': {e}"),
+                );
+                true
+            }
+        }
+    }
+}
+
+/// An `Extension` line from the shared parser (client list non-empty when
+/// co-located): still dispatch on the daemon, which owns the workspace.
+fn remote_extension_line(remote: &mut RemoteApp, line: &str) {
+    match split_remote_extension(line) {
+        Some((name, arg)) => {
+            if !remote_extension_run(remote, &name, &arg) {
+                push_info(&mut remote.app, format!("unknown command: {line}"));
+            }
+        }
+        None => push_info(&mut remote.app, format!("unknown command: {line}")),
+    }
+}
+
+/// An `Unknown` line may be a daemon extension the client's empty list could
+/// not classify. Returns true when handled (dispatched or answered); false
+/// when still unknown so the caller prints "unknown command".
+fn remote_unknown_or_extension(remote: &mut RemoteApp, line: &str) -> bool {
+    let Some((name, arg)) = split_remote_extension(line) else {
+        return false;
+    };
+    if is_builtin_command(&name) {
+        return false;
+    }
+    remote_extension_run(remote, &name, &arg)
+}
+
 /// `/resume` lists daemon sessions (local files as an offline fallback);
 /// `/resume <index|id>` reattaches. `selector` is `None` for the bare form.
 fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
-    let Some(selector) = selector else {
+    let Some(selector) = selector.filter(|s| !s.trim().is_empty()) else {
         // Prefer daemon listing (works over network); fall back to local files for offline.
         let daemon_sessions = remote.client.list_sessions().ok();
         if let Some(mut sessions) = daemon_sessions {
@@ -3696,6 +3881,81 @@ mod tests {
             Some(0),
             "empty paste keeps the walk"
         );
+    }
+
+    #[test]
+    fn remote_thinking_sets_override_without_touching_client_file() {
+        // Regression: remote `/thinking` wrote the client's
+        // `thinking-effort.json` (keyed `|model`) while the daemon turn used
+        // its own config — a silent no-op. Now display + per-turn override
+        // move together and no local file write happens here.
+        let mut remote = test_remote();
+        assert!(remote.options.thinking_effort.is_none());
+        handle_remote_slash(&mut remote, "/thinking high");
+        assert_eq!(remote.app.config.thinking_effort.as_deref(), Some("high"));
+        assert_eq!(
+            remote.options.thinking_effort.as_deref(),
+            Some("high"),
+            "next turn must carry the choice to the daemon"
+        );
+        handle_remote_slash(&mut remote, "/thinking clear");
+        assert!(remote.app.config.thinking_effort.is_none());
+        assert_eq!(
+            remote.options.thinking_effort.as_deref(),
+            Some(""),
+            "clear is an explicit unset override, not no-override"
+        );
+        handle_remote_slash(&mut remote, "/thinking");
+        let text: String = remote
+            .app
+            .transcript
+            .iter()
+            .filter_map(|b| match b {
+                crate::ui::TranscriptBlock::Info { line, .. } => Some(
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(text.contains("unset"), "show reflects the clear: {text}");
+    }
+
+    #[test]
+    fn remote_model_switch_drops_stale_thinking_override() {
+        // A level pinned for the old model must not leak onto the new one.
+        let mut remote = test_remote();
+        handle_remote_slash(&mut remote, "/thinking high");
+        assert!(remote.options.thinking_effort.is_some());
+        handle_remote_slash(&mut remote, "/model other-model");
+        assert!(
+            remote.options.thinking_effort.is_none(),
+            "model switch clears the old override so the daemon default applies"
+        );
+        assert!(remote.options.model.is_some(), "model still forwards");
+    }
+
+    #[test]
+    fn remote_extension_split_and_builtin_gate() {
+        assert_eq!(
+            split_remote_extension("/deploy prod"),
+            Some(("deploy".into(), "prod".into()))
+        );
+        assert_eq!(
+            split_remote_extension("/deploy"),
+            Some(("deploy".into(), String::new()))
+        );
+        assert!(split_remote_extension("/a-command!").is_none());
+        assert!(split_remote_extension("plain").is_none());
+        assert!(is_builtin_command("quit"));
+        assert!(is_builtin_command("model"));
+        assert!(!is_builtin_command("deploy"));
+        // Built-ins never reach the daemon: Unknown stays unknown locally.
+        let mut remote = test_remote();
+        assert!(!remote_unknown_or_extension(&mut remote, "/quit x"));
     }
 
     #[test]

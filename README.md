@@ -440,8 +440,9 @@ touching config or network.
 | ---------------------------- | --------------------------------------------------------- |
 | `/quit`                      | Exit the REPL.                                            |
 | `/permissions`               | Show permission mode and workspace.                       |
-| `/mcp`                       | Show MCP servers, tools, and connection errors.           |
-| `/clear`                     | Clear the conversation history (keeps the system prompt). |
+  | `/mcp`                       | Show MCP servers, tools, and connection errors.           |
+  | `/extensions [reload]`       | Show loaded Lua extensions (`reload` rescans).            |
+  | `/clear`                     | Clear the conversation history (keeps the system prompt). |
 | `/new`                       | Start a new session and clear history.                    |
 | `/session`                   | Show the current session id, path, and turn count.        |
 | `/resume [index\|path]`      | List sessions, or resume one by index/path.               |
