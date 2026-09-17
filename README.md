@@ -196,26 +196,39 @@ ones above). Other keys are preserved untouched.
 
 `DEX_ROUTING=1` (or file `routing:` with `enabled: true`) routes each turn
 to a tiered model by prompt complexity — cheap models for typos and trivial
-Q&A, stronger ones for migrations and security-sensitive work.
-Classification is deterministic keyword/length heuristics (no LLM call);
-`dex doctor` shows the switch plus each tier's resolved model and origin.
+Q&A, stronger ones for refactors, migrations and security-sensitive work.
+Classification is deterministic word/length heuristics (no LLM call);
+the routed tier is shown per turn and journaled on the turn's `turn_start`
+marker. `dex doctor` shows the switch plus each tier's resolved model and
+origin.
+
+Tiers mirror the vendors' three capability buckets (`fast` ≈ OpenAI
+`nano`/`Luna` and Anthropic `Haiku`; `balanced` ≈ `mini`/`Terra` and
+`Sonnet`; `powerful` ≈ flagship/`Sol` and `Opus`):
 
 ```yaml
 routing:
   enabled: true
-  low: myprov/cheap-model # trivial prompts
-  medium: myprov/workhorse # normal work (also the fallback tier)
-  high: myprov/strong # multi-file, auth, ambiguous specs
-  critical: myprov/best # migrations, security, irreversible changes
+  fast: myprov/cheap-model # trivial prompts
+  balanced: myprov/workhorse # normal work (also the fallback tier)
+  powerful: myprov/best # multi-file, auth, migrations, security
 ```
 
 Each tier takes a full `provider/model` selection, so catalog endpoints and
 `providers.<name>.api:` pins keep working.
-`DEX_ROUTING_<LOW|MEDIUM|HIGH|CRITICAL>` overrides one tier. A tier with
-neither falls back to `routing.medium:`, then to `model:` — so setting only
-`medium` (or nothing, keeping `model:`) is a valid setup. An explicit
-`--model` flag / per-request model always wins, and the routed tier is
-journaled on the turn's `turn_start` session marker.
+`DEX_ROUTING_<FAST|BALANCED|POWERFUL>` overrides one tier. A tier with
+neither falls back to `routing.balanced:`, then to `model:` — so setting only
+`balanced` (or nothing, keeping `model:`) is a valid setup.
+
+Explicit picks always win: `--model` / a per-request model skips routing,
+and `/model` sets top-level `model:`, which is the fallback every tier
+resolves to — routing keeps classifying, but every tier lands on the picked
+model until per-tier selections are set. To turn routing off: `DEX_ROUTING=0`.
+
+The old four-tier keys (`routing.low/medium/high/critical`,
+`DEX_ROUTING_<LOW|MEDIUM|HIGH|CRITICAL>`) still work and map onto
+`fast`/`balanced`/`powerful` (`high` and `critical` both feed `powerful`,
+`critical` winning), with a deprecation pointer — rename when convenient.
 
 ### System prompt
 
@@ -781,8 +794,8 @@ discovered extension with its consent state.
 | `DEX_EXTRA_TOOLS`                                             | `1` to expose `git`+`chain` to the model (default 7 tools).                                                                                                                                                                                                                                                                                                                                                     |
 | `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate`/`delegate_output`/`delegate_stop`/`delegate_list` tools (default on in daemon sessions).                                                                                                                                                                                                                                                                                                       |
 | `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
-| `DEX_ROUTING`                                                 | `1` to route each turn to a tiered model by complexity (default off). Tiers classify the prompt deterministically (no LLM call): `low` (typos, trivial Q&A), `medium` (normal work), `high` (multi-file, auth, ambiguous specs), `critical` (migrations, security, irreversible changes). An explicit `--model` / per-request model always wins; `dex doctor` shows each tier and where its model came from.    |
-| `DEX_ROUTING_<LOW|MEDIUM|HIGH|CRITICAL>`                      | Per-tier `provider/model` selection (same syntax as `DEX_MODEL`); wins over file `routing.<tier>:` for that tier. A tier with neither falls back to `routing.medium:`, then to `model:`.                                                                                                                                                                                                                        |
+| `DEX_ROUTING`                                                 | `1` to route each turn to a tiered model by complexity (default off). Tiers classify the prompt deterministically (no LLM call): `fast` (typos, trivial Q&A), `balanced` (normal work), `powerful` (multi-file, auth, migrations, security). An explicit `--model` / per-request model always wins; the routed tier is shown per turn, journaled on `turn_start`, and `dex doctor` shows each tier and where its model came from.                                                                                                   |
+| `DEX_ROUTING_<FAST|BALANCED|POWERFUL>`                        | Per-tier `provider/model` selection (same syntax as `DEX_MODEL`); wins over file `routing.<tier>:` for that tier. A tier with neither falls back to `routing.balanced:`, then to `model:`. Old `DEX_ROUTING_<LOW|MEDIUM|HIGH|CRITICAL>` still honored (deprecated).                                                                                                                                             |
 | `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
 | `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
 | `DEX_MCP_MAX_TOOLS`                                           | Cap on merged MCP schema tools (default 200; head kept sorted by name).                                                                                                                                                                                                                                                                                                                                         |

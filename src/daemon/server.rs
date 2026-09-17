@@ -1060,7 +1060,7 @@ async fn run_turn_inner(
         Vec::new()
     };
     // Complexity router (V1): an explicit per-request model always wins;
-    // otherwise the classified tier resolves through routing.medium: →
+    // otherwise the classified tier resolves through routing.balanced: →
     // top-level model:.
     let explicit_model = req.model.clone().filter(|v| !v.is_empty());
     let routed = if explicit_model.is_none() {
@@ -1244,6 +1244,15 @@ async fn run_turn_inner(
     let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>(256);
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(16);
     let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
+    // Surface the routed tier in the transcript: daemon users get no other
+    // signal that the model changed under them (the tier is also journaled
+    // on `turn_start`).
+    if let Some(tier) = routed_tier.as_deref() {
+        console.emit(SinkLine::System(format!(
+            "routing → {tier} (model {})",
+            config.model
+        )));
+    }
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
     if let Some(set) = lock_map(&state.session_approvals).get(session_id).cloned() {

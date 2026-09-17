@@ -232,7 +232,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     });
     let mut config = config_result?;
     // Complexity router (V1): an explicit `--model` always wins;
-    // otherwise the classified tier resolves through routing.medium: →
+    // otherwise the classified tier resolves through routing.balanced: →
     // top-level model:, rebuilding once with the tier's model.
     let routed = if args.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
         None
@@ -248,6 +248,11 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             &args.headers,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    }
+    // Surface the routed tier: headless users get no other signal that the
+    // model changed under them (the tier is also journaled on `turn_start`).
+    if let Some(tier) = routed_tier.as_deref() {
+        eprintln!("dex: routing → {tier} (model {})", config.model);
     }
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
     if let Some(warning) = config.thinking_mismatch_warning() {

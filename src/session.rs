@@ -2596,11 +2596,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut s = Session::new("/tmp/dex-tier-test".into(), None).unwrap();
-        s.turn_event_with_tier("turn_start", Some("high")).unwrap();
+        s.turn_event_with_tier("turn_start", Some("powerful"))
+            .unwrap();
         s.turn_event("turn_complete").unwrap();
         let text = fs::read_to_string(s.path().unwrap()).unwrap();
         assert!(text.contains(r#""type":"turn_start""#), "{text}");
-        assert!(text.contains(r#""tier":"high""#), "{text}");
+        assert!(text.contains(r#""tier":"powerful""#), "{text}");
         assert!(Session::last_turn_state(s.path().unwrap()) == "complete");
         if let Some(p) = s.path() {
             let _ = fs::remove_file(p);
