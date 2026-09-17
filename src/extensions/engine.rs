@@ -1056,7 +1056,9 @@ fn prompt_table(lua: &Lua, manifest: &Manifest) -> Table {
 /// the configured fallback vocabulary. Reads file+env on the worker (sync,
 /// no secrets cross into logs); the daemon records the served snapshot per
 /// turn, which wins when set. Gated on the `model` capability like
-/// `workspace.read`.
+/// `workspace.read` — and the explicit-provider form additionally needs
+/// `net.providers` (a bare `model` extension may read only the current
+/// model's key; every other provider's key stays out of its reach).
 fn model_table(lua: &Lua, manifest: &Manifest) -> Table {
     let ext_id = manifest.id.clone();
     let model = lua.create_table().expect("dex.model table");
@@ -1114,16 +1116,24 @@ fn model_table(lua: &Lua, manifest: &Manifest) -> Table {
                     // model, even under concurrent turns); then the task-side
                     // fallback (a per-request override the file never sees);
                     // the key still resolves from the configured deposits.
-                    // With an explicit provider: that provider's configured
-                    // deposits instead — the model-independent vocabulary a
-                    // fallback search rides on.
-                    let (auth, api) =
-                        match provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-                            Some(name) => {
-                                let resolved = crate::llm::config::extension_provider_auth(name)
-                                    .map_err(LuaError::RuntimeError)?;
-                                (resolved.auth, resolved.api)
-                            }
+                      // With an explicit provider: that provider's configured
+                      // deposits instead — the model-independent vocabulary a
+                      // fallback search rides on. Gated on `net.providers`:
+                      // cross-provider keys are as sensitive as the fetches
+                      // they enable, so a bare `model` extension sees only
+                      // the current model's key.
+                      let (auth, api) =
+                          match provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                              Some(name) => {
+                                  if !manifest.has_capability("net.providers") {
+                                      return Err(LuaError::RuntimeError(format!(
+                                          "extension '{ext_id}' reads another provider's auth without the net.providers capability"
+                                      )));
+                                  }
+                                  let resolved = crate::llm::config::extension_provider_auth(name)
+                                      .map_err(LuaError::RuntimeError)?;
+                                  (resolved.auth, resolved.api)
+                              }
                             None => {
                                 match worker_drive_model()
                                     .and_then(|drive| drive.snapshot)

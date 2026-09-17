@@ -23,7 +23,8 @@ pub(crate) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
 /// HTTP confined to that model's own endpoint (`dex.net.fetch`) and
 /// requires `model` (confinement needs the endpoint); `net.providers`
 /// additionally widens the confinement to the configured provider
-/// endpoints (each with its own key) and requires `net`.
+/// endpoints (each with its own key), gates `dex.model.auth("<provider>")`
+/// (cross-provider keys ride the same capability), and requires `net`.
 const KNOWN_CAPABILITIES: &[&str] = &[
     "tools",
     "tools.override",
