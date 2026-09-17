@@ -2134,18 +2134,25 @@ pub(crate) mod tests {
     #[test]
     fn prompt_appendix_composes_sorted_by_id() {
         // Prompt-cache stability: system bytes must not depend on push order.
-        let mut guard = PROMPT_APPENDIX.lock().expect("prompt appendix lock");
-        let saved = guard.clone();
-        guard.clear();
-        guard.push(("zeta".to_string(), "second".to_string()));
-        guard.push(("alpha".to_string(), "first".to_string()));
-        drop(guard);
+        // Unique ids + push/remove (no clear/save/restore) so parallel tests
+        // sharing the process-global appendix never observe a wiped state.
+        remove_prompt_appendix("__prompt_cache_zeta__");
+        remove_prompt_appendix("__prompt_cache_alpha__");
+        push_prompt_appendix(
+            "__prompt_cache_zeta__",
+            "second-__prompt_cache__".to_string(),
+        );
+        push_prompt_appendix(
+            "__prompt_cache_alpha__",
+            "first-__prompt_cache__".to_string(),
+        );
         let composed = prompt_appendix();
-        // Restore before asserting so a failure can't leak into other tests.
-        let mut guard = PROMPT_APPENDIX.lock().expect("prompt appendix lock");
-        *guard = saved;
-        drop(guard);
-        assert!(composed.find("first").unwrap() < composed.find("second").unwrap());
+        remove_prompt_appendix("__prompt_cache_zeta__");
+        remove_prompt_appendix("__prompt_cache_alpha__");
+        assert!(
+            composed.find("first-__prompt_cache__").unwrap()
+                < composed.find("second-__prompt_cache__").unwrap()
+        );
     }
 
     #[test]
