@@ -131,9 +131,9 @@ pub(crate) enum TranscriptBlock {
         stamp: u64,
         line: Line<'static>,
     },
-    /// Multi-line pre-rendered block (the session-start DEX art). One block,
-    /// so its rows render back-to-back — separate blocks would each get a
-    /// blank gap line from `TranscriptView` and shred the art.
+    /// Pre-rendered block for the session-start DEX banner. One block, so it
+    /// renders without the blank gap line `TranscriptView` inserts between
+    /// blocks.
     Banner {
         stamp: u64,
         lines: Vec<Line<'static>>,
@@ -270,7 +270,7 @@ pub(crate) struct App {
     pub(crate) slash_selected: usize,
     /// How this TUI reached its agent engine, e.g. "[L] 127.0.0.1" (local
     /// loopback) or "[R] daemon.internal" (remote). Pinned to the right edge
-    /// of the status bar; the only other session-start block is the DEX art.
+    /// of the status bar; the only other session-start block is the DEX banner.
     pub(crate) connection: Option<String>,
     /// Base URL of the backing daemon, when this TUI is remote: extension
     /// status/reload must reach the process that dispatches (`/extensions`
@@ -893,31 +893,24 @@ pub(super) fn push_info(app: &mut App, text: String) {
     );
 }
 
-/// Session-start ASCII art ("DEX"), pushed as the transcript's first block.
-const DEX_ART: &str = "\
-██████╗ ███████╗██╗  ██╗
-██╔══██╗██╔════╝╚██╗██╔╝
-██║  ██║█████╗   ╚███╔╝
-██║  ██║██╔══╝   ██╔██╗
-██████╔╝███████╗██╔╝ ██╗
-╚═════╝ ╚══════╝╚═╝  ╚═╝";
+/// Session-start banner: the "DEX" wordmark with its version in
+/// parentheses. One short row, so this fits even the narrowest transcripts
+/// without wrapping.
+const BANNER: &str = concat!("DEX (v", env!("CARGO_PKG_VERSION"), ")");
 
-/// Push the session-start DEX art. One `Banner` block (not per-row Info
-/// blocks) so `TranscriptView` renders the rows back-to-back without the
-/// blank gap it inserts between blocks.
+/// Push the session-start banner (wordmark plus version). One `Banner` block
+/// (not an Info block) so `TranscriptView` treats it as session chrome.
 pub(super) fn push_banner(app: &mut App) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
-    let lines = DEX_ART
-        .lines()
-        .map(|row| {
-            indent_transcript_line(Line::from(Span::styled(
-                row.trim_end().to_string(),
-                Style::default().fg(Color::Cyan),
-            )))
-        })
-        .collect();
+    // Subtle by design: the theme-aware muted foreground instead of a bright
+    // accent, so the banner reads as quiet chrome on light/dark terminals.
+    let style = Style::default().fg(theme::muted_fg());
+    let lines = vec![indent_transcript_line(Line::from(Span::styled(
+        BANNER.to_string(),
+        style,
+    )))];
     app.transcript
         .push(TranscriptBlock::Banner { stamp: 0, lines });
 }
@@ -1889,35 +1882,29 @@ mod tests {
     }
 
     #[test]
-    fn banner_is_one_block_of_six_art_rows() {
-        // One Banner block, not per-row Info blocks: TranscriptView inserts a
-        // blank gap line between blocks, which would shred the art apart.
+    fn banner_is_one_block_of_wordmark_rows() {
+        // One Banner block holding the wordmark row, not an Info block:
+        // TranscriptView inserts a blank gap line between blocks, which
+        // would split the banner apart.
         let mut app = test_app();
         push_banner(&mut app);
         assert_eq!(app.transcript.len(), 1);
         let lines = app.transcript[0].lines();
-        assert_eq!(lines.len(), 6);
-        let art = [
-            "██████╗ ███████╗██╗  ██╗",
-            "██╔══██╗██╔════╝╚██╗██╔╝",
-            "██║  ██║█████╗   ╚███╔╝",
-            "██║  ██║██╔══╝   ██╔██╗",
-            "██████╔╝███████╗██╔╝ ██╗",
-            "╚═════╝ ╚══════╝╚═╝  ╚═╝",
-        ];
-        for (line, row) in lines.iter().zip(art) {
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert_eq!(
-                text,
-                format!("{}{row}", transcript_indent()),
-                "indent + art row, in order"
-            );
-        }
-        // Art rows carry the info color (the indent span is unstyled).
-        assert!(lines.iter().all(|l| l
-            .spans
-            .last()
-            .is_some_and(|s| s.style.fg == Some(Color::Cyan))));
+        assert_eq!(lines.len(), 1);
+        let muted = theme::muted_fg();
+        let line = &lines[0];
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            format!("{}{BANNER}", transcript_indent()),
+            "indent + banner row"
+        );
+        // Banner row is subtle chrome (the indent span is unstyled).
+        assert!(line.spans.len() == 2 && line.spans[1].style.fg == Some(muted));
+        assert!(
+            text.contains("DEX (v") && text.ends_with(')'),
+            "wordmark first, version after in parens"
+        );
     }
 
     #[test]
