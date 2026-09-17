@@ -1064,11 +1064,15 @@ async fn run_turn_inner(
     // top-level model:.
     let explicit_model = req.model.clone().filter(|v| !v.is_empty());
     let routed = if explicit_model.is_none() {
-        crate::llm::config::route_turn(&req.prompt, crate::agent::tokens::estimate_tokens(&history))
+        // The history load above doubles as the routing signal (token size
+        // plus real tool-call counts) and is reused for the turn below, so
+        // routing sees exactly what the turn will send at no extra load.
+        crate::llm::config::route_turn(&req.prompt, &history)
     } else {
         None
     };
     let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
+    let routed_reason = routed.as_ref().map(|r| r.reason);
     let model_override = explicit_model.or_else(|| routed.and_then(|r| r.model_override));
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
@@ -1248,8 +1252,9 @@ async fn run_turn_inner(
     // signal that the model changed under them (the tier is also journaled
     // on `turn_start`).
     if let Some(tier) = routed_tier.as_deref() {
+        let why = routed_reason.unwrap_or("ordinary work");
         console.emit(SinkLine::System(format!(
-            "routing → {tier} (model {})",
+            "routing → {tier} ({why}; model {})",
             config.model
         )));
     }

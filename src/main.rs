@@ -237,9 +237,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     let routed = if args.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
         None
     } else {
-        crate::llm::config::route_turn(prompt, crate::agent::tokens::estimate_tokens(&history))
+        crate::llm::config::route_turn(prompt, &history)
     };
     let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
+    let routed_reason = routed.as_ref().map(|r| r.reason);
     if let Some(model) = routed.and_then(|r| r.model_override) {
         config = LlmConfig::from_env(
             args.base_url.clone(),
@@ -252,7 +253,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // Surface the routed tier: headless users get no other signal that the
     // model changed under them (the tier is also journaled on `turn_start`).
     if let Some(tier) = routed_tier.as_deref() {
-        eprintln!("dex: routing → {tier} (model {})", config.model);
+        let why = routed_reason.unwrap_or("ordinary work");
+        eprintln!("dex: routing → {tier} ({why}; model {})", config.model);
     }
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
     if let Some(warning) = config.thinking_mismatch_warning() {
