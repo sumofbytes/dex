@@ -23,13 +23,10 @@ use serde_json::{Map, Value as Json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::Manifest;
+use super::MAX_TOOL_TIMEOUT_SECS;
 use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::tools::{resolve_workspace_path, Policy, ShellEvidence, ToolFilter};
 
-/// Default per-call Lua budget (manifest `timeout_secs`, clamped to
-/// [`MAX_TOOL_TIMEOUT_SECS`]).
-/// Hard ceiling for a manifest `timeout_secs`.
-pub(crate) const MAX_TOOL_TIMEOUT_SECS: u64 = 120;
 /// Budget for one extension's handlers of a single hook event: hooks are an
 /// observing layer, so a wedged hook stalls dispatch at most this long
 /// before the fail-open default (§8) skips it.
@@ -38,6 +35,10 @@ pub(crate) const HOOK_TIMEOUT_SECS: u64 = 10;
 /// setup function must not hang the refresh — and one-shot startup blocks
 /// on it (`main.rs`), so an unbounded load would hang the whole process.
 pub(crate) const LOAD_TIMEOUT: Duration = Duration::from_secs(HOOK_TIMEOUT_SECS);
+/// Slow-hook warning threshold: a hook call slower than this logs a warning
+/// (perf doc §9). Hooks run inline on the dispatch path, so anything near
+/// the 10s hook timeout is per-turn latency; 500ms flags the offender early.
+pub(crate) const SLOW_HOOK_WARN: Duration = Duration::from_millis(500);
 /// Per-VM memory ceiling: without it `string.rep`/table growth OOM-aborts
 /// the whole daemon instead of failing one extension call.
 const LUA_MEMORY_LIMIT: usize = 64 * 1024 * 1024;

@@ -5,19 +5,6 @@ use crate::core::types::{ApiProtocol, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::sse::is_mid_stream;
 use crate::llm::sse::Turn;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
-/// Models empirically switched to chat-completions after the responses API
-/// rejected them (e.g. glm-5.3-flash on zen/go 500s on `/responses`, 200s on
-/// `/chat/completions`). Keyed by (base_url, model); per-process, so the
-/// one-time cost of learning is a single failed call per model per run.
-/// ponytail: in-memory only — re-learned on restart; persist to the cache dir
-/// if cold-start latency for completions-only models ever matters.
-fn probed_apis() -> &'static Mutex<HashMap<(String, String), ApiProtocol>> {
-    static MAP: OnceLock<Mutex<HashMap<(String, String), ApiProtocol>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 /// Wire protocol for this call: an explicit pin (config-file `api:` or the
 /// provider entry's, baked into `config.api_pinned`) or a `DEX_MODEL_APIS`
@@ -33,12 +20,7 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
     if let Some(api) = crate::llm::config::model_api_from_env(&config.model, &config.model) {
         return api;
     }
-    probed_apis()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(config.base_url.clone(), config.model.clone()))
-        .copied()
-        .unwrap_or(config.api)
+    crate::llm::learned::lookup(&config.base_url, &config.model).unwrap_or(config.api)
 }
 
 /// May we infer the protocol by retrying a failed `/responses` call as
@@ -46,7 +28,7 @@ fn effective_api(config: &LlmConfig) -> ApiProtocol {
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
 /// A rate limit is transient capacity, not a protocol mismatch: falling back
 /// would double load on the provider and could permanently learn the wrong
-/// protocol for the model via `remember_learned_api`. A stalled stream is the
+/// protocol for the model via `learned::remember`. A stalled stream is the
 /// same (transient transport, retried same-protocol by the caller) — it must
 /// never trigger or learn a fallback either.
 fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
@@ -119,15 +101,9 @@ pub(crate) async fn complete(
                     .await
                     {
                         Ok(ok) => {
-                            probed_apis()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(
-                                    (config.base_url.clone(), config.model.clone()),
-                                    ApiProtocol::ChatCompletions,
-                                );
-                            // Survive restarts / one-shot runs.
-                            crate::llm::config::remember_learned_api(
+                            // One write owns both layers: this process and
+                            // future runs skip the failed protocol.
+                            crate::llm::learned::remember(
                                 &config.base_url,
                                 &config.model,
                                 ApiProtocol::ChatCompletions,
@@ -201,7 +177,10 @@ mod tests {
         {
             // Hermetic: no real env pins and no developer config.yaml.
             let absent = std::env::temp_dir().join("dex-gate-test-absent.yaml");
-            let _env = EnvGuard::clear(&["DEX_MODEL_APIS"]).set("DEX_CONFIG", &absent);
+            let hermetic_xdg = std::env::temp_dir().join("dex-learned-hermetic");
+            let _env = EnvGuard::clear(&["DEX_MODEL_APIS", "XDG_CACHE_HOME"])
+                .set("DEX_CONFIG", &absent)
+                .set("XDG_CACHE_HOME", &hermetic_xdg);
             // Unpinned opencode model: fallback allowed.
             assert!(try_responses_fallback(&cfg, "500 Internal server error"));
             // Never on cancellation.
@@ -244,22 +223,17 @@ mod tests {
             cfg.provider = Provider::OpenCode;
             // Learned protocol overrides the configured default.
             assert_eq!(effective_api(&cfg), ApiProtocol::Responses);
-            probed_apis()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    (cfg.base_url.clone(), cfg.model.clone()),
-                    ApiProtocol::ChatCompletions,
-                );
+            crate::llm::learned::remember_memory(
+                &cfg.base_url,
+                &cfg.model,
+                ApiProtocol::ChatCompletions,
+            );
             assert_eq!(effective_api(&cfg), ApiProtocol::ChatCompletions);
             // But an explicit table entry still wins over what we learned.
             std::env::set_var("DEX_MODEL_APIS", "m-r=openai-responses");
             assert_eq!(effective_api(&cfg), ApiProtocol::Responses);
         }
-        probed_apis()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        crate::llm::learned::clear_memory();
     }
 
     #[test]
@@ -270,19 +244,15 @@ mod tests {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvGuard::clear(&["DEX_MODEL_APIS"]);
-        probed_apis()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let hermetic_xdg = std::env::temp_dir().join("dex-learned-hermetic");
+        let _env = EnvGuard::clear(&["DEX_MODEL_APIS", "XDG_CACHE_HOME"])
+            .set("XDG_CACHE_HOME", &hermetic_xdg);
+        crate::llm::learned::clear_memory();
         let cfg = test_cfg();
         assert_eq!(cfg.api, ApiProtocol::Responses);
         std::env::set_var("DEX_MODEL_APIS", "m-r=openai-completions");
         assert_eq!(effective_api(&cfg), ApiProtocol::ChatCompletions);
-        probed_apis()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        crate::llm::learned::clear_memory();
     }
 
     #[test]

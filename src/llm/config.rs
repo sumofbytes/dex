@@ -12,7 +12,6 @@ use crate::agent::router::{
 };
 use crate::agent::tokens::estimate_tokens;
 use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
-use crate::llm::auth::load_codex_credentials;
 
 /// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
 /// unset or unparseable. Single-sources the
@@ -29,78 +28,10 @@ fn env_parse_opt<T: FromStr>(name: &str) -> Option<T> {
     env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
-/// Shared XDG-vs-HOME directory resolution: `$<env_var>/dex/<rel>` when the
-/// XDG variable is set, else `$HOME/<home_sub>/dex/<rel>`, else `None` (no
-/// `HOME`). Pure re-expression of the layout every config/cache path below
-/// uses; the env var is a parameter because the sites use three different
-/// ones (`DEX_CONFIG` overrides the whole config path, so its check stays
-/// at that call site).
-fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathBuf> {
-    if let Some(dir) = env::var_os(env_var) {
-        return Some(std::path::PathBuf::from(dir).join(rel));
-    }
-    env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(home_sub).join(rel))
-}
-
-/// File-identity cache entry shared by the config file, learned-apis map,
-/// and models.dev catalog: the parse is served while the content hash is
-/// unchanged.
-struct FileCache<T> {
-    path: std::path::PathBuf,
-    /// FNV-1a of the file bytes: identity is content, not (mtime, len),
-    /// so same-length rewrites within one mtime tick and mtime-preserving
-    /// copies still miss. Reads are per call (these files are KBs, the
-    /// catalog parse below stays cached); the hit saves the parse.
-    hash: u64,
-    value: T,
-}
-
-fn fnv_bytes(text: &str) -> u64 {
-    let mut h = 14695981039346656037u64;
-    for b in text.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(1099511628211);
-    }
-    h
-}
-
-/// Read `path` and serve `cache`'s stored parse while the content hash is
-/// unchanged; on a miss, hand the text to `parse`, storing the result.
-/// `parse` gets `None` when the read failed and returns `None` when nothing
-/// should be cached (read/parse failure) — the caller decides what that
-/// means (empty default vs hard failure). Identity is the content hash
-/// rather than (mtime, len): a same-length rewrite inside one mtime tick
-/// (FAT/NFS 1–2 s granularity, `cp -p`, checkout preserving mtime) still
-/// misses instead of serving stale config/endpoints indefinitely.
-/// Poisoned-mutex recovery matches the rest of the daemon: keep the value.
-fn cached_parse<T: Clone>(
-    cache: &OnceLock<Mutex<Option<FileCache<T>>>>,
-    path: &std::path::Path,
-    parse: impl FnOnce(Option<String>) -> Option<T>,
-) -> Option<T> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let hash = fnv_bytes(&text);
-    if let Some(hit) = cache
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.hash == hash)
-    {
-        return Some(hit.value.clone());
-    }
-    let value = parse(Some(text))?;
-    cache
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(FileCache {
-            path: path.to_path_buf(),
-            hash,
-            value: value.clone(),
-        });
-    Some(value)
-}
+// Filesystem helpers live in `core::fs` (one owner for XDG paths, atomic
+// tmp files, and content-identity caching); re-exported here so existing
+// `config::...` paths (and tests) keep working.
+pub(crate) use crate::core::fs::{cached_parse, fnv_bytes, unique_tmp_path, xdg_path, FileCache};
 
 /// One resolved knob: the value that `from_env` applies and the origin
 /// that `doctor` reports. Both sides consume the same resolution, so the
@@ -1313,7 +1244,7 @@ fn warn_provider_like_selection(selection: &str, provider_name: &str, served: &[
 /// `env` map: e.g. ZHIPU_API_KEY, OPENROUTER_API_KEY, …), sorted so the
 /// resolution order never depends on JSON key order. Tried in order — a
 /// provider documenting several names accepts any of them.
-fn catalog_env_vars(key: &str) -> Vec<String> {
+pub(crate) fn catalog_env_vars(key: &str) -> Vec<String> {
     // api.json shape is a list of names; older catalog.json used an object
     // (name → description). Accept both — only the names matter here.
     // Sorted at index time so resolution never depends on JSON key order.
@@ -1322,16 +1253,10 @@ fn catalog_env_vars(key: &str) -> Vec<String> {
 }
 
 /// Builtin providers whose canonical key env var is pinned in dex rather
-/// than catalog-discovered, so key resolution works cache-less on a fresh
-/// install (no `dex update --models` needed first). Mirrored in `doctor`'s
-/// key-origin row.
-fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
-    match provider {
-        Provider::OpenCode => Some("OPENCODE_API_KEY"),
-        Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
-        _ => None,
-    }
-}
+/// than catalog-discovered — see `llm::auth::pinned_key_env` (single owner
+/// of key resolution); re-exported here so existing `config::...` paths
+/// keep working.
+pub(crate) use super::auth::{pinned_key_env, resolve_credentials};
 
 /// Landing base URL when nothing explicit (`--base-url`, top-level
 /// `base_url:`) is set: the provider's config entry override, then the
@@ -1423,56 +1348,6 @@ fn setup_guide_error() -> String {
          \u{20}\u{20}codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"
     )
-}
-
-/// Per-provider credentials — the uniform deposit order for every provider
-/// except codex (which reads its own credential file):
-/// 1. `providers.<name>.api_key` in config.yaml,
-/// 2. the provider's own conventional env vars from the catalog `env` map
-///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …).
-///
-/// Then a loud error naming the deposit places.
-pub(crate) fn resolve_credentials(
-    provider: &Provider,
-    entries: &BTreeMap<String, ProviderEntry>,
-) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    if matches!(provider, Provider::OpenAiCodex) {
-        return load_codex_credentials();
-    }
-    let name = provider.name();
-    if let Some(key) = entries
-        .get(name)
-        .and_then(|e| e.api_key.clone())
-        .filter(|k| !k.is_empty())
-    {
-        return Ok((key, None));
-    }
-    // The provider's own documented env vars; pinned builtin vars (see
-    // `pinned_key_env`) work cache-less — the catalog is the source for
-    // every other provider.
-    let mut env_names: Vec<String> = catalog_env_vars(name);
-    if let Some(pinned) = pinned_key_env(provider) {
-        if !env_names.iter().any(|v| v == pinned) {
-            env_names.insert(0, pinned.to_string());
-        }
-    }
-    for var in &env_names {
-        if let Ok(key) = env::var(var) {
-            if !key.trim().is_empty() {
-                return Ok((key, None));
-            }
-        }
-    }
-    Err(format!(
-        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
-        if env_names.is_empty() {
-            " or export the provider's key env var (run `dex update --models` to learn its name)"
-                .to_string()
-        } else {
-            format!(" or export {}", env_names.join(", "))
-        }
-    )
-    .into())
 }
 
 /// CLI overrides for the extension snapshot below (`--model`, `--base-url`,
@@ -1608,7 +1483,7 @@ fn extension_model_parts() -> Result<ExtensionModelParts, String> {
     }
     let (base_api, _) = base_protocol(&provider, resolved.api_pin, &file);
     let api = model_api_from_env(&raw_selection, &model)
-        .or_else(|| learned_api(&base_url, &model))
+        .or_else(|| crate::llm::learned::lookup(&base_url, &model))
         .unwrap_or(base_api);
     Ok((provider, entries, base_url, api, model))
 }
@@ -1748,93 +1623,23 @@ pub(crate) fn extension_model_auth_for(
     let provider = Provider::parse_known(provider_name, &known)
         .unwrap_or_else(|| Provider::Generic(provider_name.to_string()));
     let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| e.to_string())?;
-    let mut headers = load_config_headers(&file);
-    // Provider-scoped entries beat the global table per key (AGENTS.md
-    // precedence): overwrite, don't `or_insert`.
-    if let Some(entry) = entries.get(provider.name()) {
-        for (name, value) in &entry.headers {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
-    for (name, value) in custom_headers_from_env() {
-        insert_extra_header(&mut headers, &name, &value);
-    }
+    // Same merge as the wire path — one function, so the Lua view and the
+    // request headers can never drift apart.
+    let global = load_config_headers(&file);
+    let scoped = entries
+        .get(provider.name())
+        .map(|entry| entry.headers.clone())
+        .unwrap_or_default();
+    let mut extra = custom_headers_from_env();
     for raw in &cli_headers {
-        insert_parsed_headers(&mut headers, raw);
+        insert_parsed_headers(&mut extra, raw);
     }
-    headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    let headers = merge_header_layers(&global, &scoped, &extra);
     Ok(ExtensionModelAuth {
         api_key,
         base_url: base_url.to_string(),
         headers,
     })
-}
-
-/// Persisted wire protocols learned empirically at runtime
-/// (`XDG_CACHE_HOME/dex/learned-apis.json`): models that rejected
-/// `/responses` and succeeded over `/chat/completions`. Keyed
-/// `"<base_url>|<model>"`. Only consulted when nothing explicit pins the
-/// protocol. ponytail: no expiry — a model that speaks completions keeps
-/// working even after the provider adds responses support.
-fn learned_apis_path() -> Option<std::path::PathBuf> {
-    xdg_path("XDG_CACHE_HOME", ".cache", "dex/learned-apis.json")
-}
-
-/// Learned wire protocols, cached process-wide and invalidated by file
-/// identity. `from_env` consulted this file on every turn (one read + parse
-/// per turn); hits are now a mutex bump.
-type LearnedApiMap = serde_json::Map<String, serde_json::Value>;
-
-static LEARNED_CACHE: OnceLock<Mutex<Option<FileCache<LearnedApiMap>>>> = OnceLock::new();
-
-fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
-    let Some(path) = learned_apis_path() else {
-        return Default::default();
-    };
-    // A missing or unparseable file is an empty map (and gets cached as
-    // one): learning simply starts over.
-    cached_parse(&LEARNED_CACHE, &path, |text| {
-        Some(
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                &text.unwrap_or_default(),
-            )
-            .unwrap_or_default(),
-        )
-    })
-    .unwrap_or_default()
-}
-
-fn learned_api(base_url: &str, model: &str) -> Option<ApiProtocol> {
-    learned_api_map()
-        .get(format!("{base_url}|{model}").as_str())?
-        .as_str()
-        .and_then(ApiProtocol::parse)
-}
-
-/// Best-effort write; a lost race between concurrent learners just re-learns.
-pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol) {
-    let Some(path) = learned_apis_path() else {
-        return;
-    };
-    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    map.insert(
-        format!("{base_url}|{model}"),
-        serde_json::Value::from(api.name()),
-    );
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(path, text);
-        // The file changed under us; drop the cached map so the next
-        // lookup re-reads instead of serving the pre-write copy.
-        if let Some(cache) = LEARNED_CACHE.get() {
-            cache.lock().unwrap_or_else(|e| e.into_inner()).take();
-        }
-    }
 }
 
 /// Reasoning-effort options the selected model advertises (models.dev
@@ -1856,64 +1661,10 @@ pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
     .flatten()
 }
 
-/// Per-model reasoning effort chosen via `/thinking`
-/// (`XDG_CACHE_HOME/dex/thinking-effort.json`): `"<base_url>|<model>"` →
-/// effort. Wins over `DEX_THINKING_EFFORT` (a stored choice is more specific
-/// than a global). `None` clears the entry.
-/// ponytail: read-through, no process cache — the file holds a handful of
-/// entries; add file-identity caching like `learned-apis.json` if it grows.
-fn thinking_path() -> Option<std::path::PathBuf> {
-    xdg_path("XDG_CACHE_HOME", ".cache", "dex/thinking-effort.json")
-}
-
-fn thinking_map() -> serde_json::Map<String, serde_json::Value> {
-    thinking_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-fn write_thinking_map(map: &serde_json::Map<String, serde_json::Value>) {
-    let Some(path) = thinking_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(map) {
-        // Atomic (unique tmp + rename): the daemon re-reads this file per
-        // turn; a direct write can hand it torn JSON that then sticks as a
-        // cached parse failure until the next write.
-        let tmp = unique_tmp_path(&path);
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-}
-
-pub(crate) fn stored_thinking_effort(base_url: &str, model: &str) -> Option<String> {
-    thinking_map()
-        .get(format!("{base_url}|{model}").as_str())?
-        .as_str()
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-}
-
-/// Remember (`Some`) or clear (`None`) the `/thinking` choice for one
-/// endpoint+model. Best-effort.
-pub(crate) fn remember_thinking_effort(base_url: &str, model: &str, effort: Option<&str>) {
-    let mut map = thinking_map();
-    let key = format!("{base_url}|{model}");
-    match effort.filter(|e| !e.is_empty()) {
-        Some(effort) => {
-            map.insert(key, serde_json::Value::from(effort));
-        }
-        None => {
-            map.remove(&key);
-        }
-    }
-    write_thinking_map(&map);
-}
+/// Per-model reasoning effort — see `llm::thinking` (single owner of
+/// `thinking-effort.json`); re-exported here so existing `config::...`
+/// paths keep working.
+pub(crate) use super::thinking::{remember_thinking_effort, stored_thinking_effort};
 
 /// Validate a `/thinking` pick against the model's advertised options: the
 /// catalog's own casing on match, the raw pick for unknown models (a stale
@@ -2093,21 +1844,6 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
         }
     }
     map
-}
-
-/// Unique tmp path for an atomic write: PID plus a per-call counter, so
-/// concurrent writers (daemon fetch vs `dex update --models`, or two
-/// in-process rebuilds) never share a tmp file — a shared name lets one
-/// writer's rename publish another writer's half-written bytes, which is
-/// exactly the torn state the rename was meant to prevent. Readers ignore
-/// tmp files, so a crashed write just litters one stale file.
-fn unique_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    path.with_extension(format!(
-        "json.tmp.{}.{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
 }
 
 /// Best-effort index write; failures just mean the next launch re-parses.
@@ -2363,12 +2099,10 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
 /// and autocomplete without network. Falls back to opencode /models if needed.
 pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::builder()
-        .user_agent(crate::client::http::USER_AGENT)
-        // 30s total: api.json is a ~4MB body; the old 10s cap failed on
-        // normal slow links while curl (no timeout) succeeded.
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    // Shared client (pool reuse): the 30s total rides per-request — api.json
+    // is a ~4MB body, and the old 10s cap failed on normal slow links while
+    // curl (no timeout) succeeded.
+    let client = crate::client::http::shared_async_client();
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
     let mut fetched = false;
     let mut last_err = String::from("no fetch attempted");
@@ -2379,6 +2113,7 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
         let outcome = async {
             let resp = client
                 .get(url)
+                .timeout(Duration::from_secs(30))
                 .send()
                 .await
                 .map_err(|e| crate::llm::http::error_chain_message(&e))?
@@ -2605,6 +2340,27 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
     out.insert(name.to_string(), value.to_string());
 }
 
+/// One merge for the AGENTS.md header precedence (global file `headers:` <
+/// provider-scoped file `headers:` < env/CLI extras, per key): later layers
+/// overwrite earlier ones, `authorization` never survives (the api key owns
+/// it). Shared by the wire merge (`llm::http::merged_headers`) and the
+/// extension auth view (`extension_model_auth_for`) so the two can never
+/// drift apart by re-implementing the same order.
+pub(crate) fn merge_header_layers(
+    global: &BTreeMap<String, String>,
+    scoped: &BTreeMap<String, String>,
+    extra: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = global.clone();
+    for (name, value) in scoped {
+        insert_extra_header(&mut out, name, value);
+    }
+    for (name, value) in extra {
+        insert_extra_header(&mut out, name, value);
+    }
+    out
+}
+
 /// Console Go routing affinity: the zen/go endpoint rejects requests without
 /// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
 /// base URL, filled from the dex session id. Keys already present (any
@@ -2790,7 +2546,13 @@ pub(crate) struct LlmConfig {
     /// `merged_headers` can order the three layers exactly like
     /// `extension_model_auth_for` does.
     pub(crate) global_headers: BTreeMap<String, String>,
-    pub(crate) client: reqwest::Client,
+    /// Timeout knobs, not a client: the wire goes through
+    /// [`LlmConfig::http_client`], which shares the process-wide streaming
+    /// client on defaults and builds a bounded one only when
+    /// `DEX_HTTP_*_TIMEOUT_SECS` overrides say otherwise. Carrying a
+    /// `reqwest::Client` here duplicated the shared pool per config.
+    pub(crate) connect_timeout_secs: u64,
+    pub(crate) request_timeout_secs: u64,
 }
 
 /// Base wire protocol + baked pin from the provider entry's `api:` pin and
@@ -2897,21 +2659,27 @@ fn env_models() -> Vec<String> {
 /// `error decoding response body`. The default shares the process-wide
 /// streaming client (connect timeout only); an explicit
 /// DEX_HTTP_REQUEST_TIMEOUT_SECS still builds a bounded backstop client.
-fn http_client(connect_secs: u64, request_secs: u64) -> Result<reqwest::Client, reqwest::Error> {
-    if connect_secs == 10 && request_secs == 300 {
-        Ok(crate::client::http::shared_streaming_client())
-    } else {
-        reqwest::Client::builder()
-            .user_agent(crate::client::http::USER_AGENT)
-            .connect_timeout(Duration::from_secs(connect_secs))
-            .timeout(Duration::from_secs(request_secs))
-            // Same dead-socket detection as the shared streaming client.
-            .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
-            .build()
-    }
-}
-
 impl LlmConfig {
+    /// HTTP client for provider generations: the process-wide streaming
+    /// client (connect timeout only — a total timeout would kill long
+    /// generations) unless explicit `DEX_HTTP_*_TIMEOUT_SECS` overrides
+    /// demand a bounded backstop client. Timeouts ride the config so the
+    /// shared pool isn't duplicated per turn.
+    pub(crate) fn http_client(&self) -> reqwest::Client {
+        if self.connect_timeout_secs == 10 && self.request_timeout_secs == 300 {
+            crate::client::http::shared_streaming_client()
+        } else {
+            reqwest::Client::builder()
+                .user_agent(crate::client::http::USER_AGENT)
+                .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
+                .timeout(Duration::from_secs(self.request_timeout_secs))
+                // Same dead-socket detection as the shared streaming client.
+                .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
+                .build()
+                .unwrap_or_else(|_| crate::client::http::shared_streaming_client())
+        }
+    }
+
     pub(crate) fn from_env(
         base_url_override: Option<String>,
         model_override: Option<String>,
@@ -2924,8 +2692,8 @@ impl LlmConfig {
             None => permission_from_env()?,
         };
         let file = load_config_file();
-        // Custom headers, three layers so the wire merge can order them like
-        // `extension_model_auth_for` (AGENTS.md precedence): global file table
+        // Custom headers, three layers merged by `merge_header_layers`
+        // (AGENTS.md precedence): global file table
         // < provider-scoped < env < CLI. `extra_headers` carries env+CLI (and
         // later per-request overrides); the file's global table rides in
         // `global_headers`.
@@ -3039,9 +2807,8 @@ impl LlmConfig {
         // Reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env_parse("DEX_RESERVE_TOKENS", 16_384);
         let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
-        let connect_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
-        let request_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
-        let client = http_client(connect_secs, request_secs)?;
+        let connect_timeout_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
+        let request_timeout_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
@@ -3074,7 +2841,8 @@ impl LlmConfig {
             permission,
             extra_headers,
             global_headers,
-            client,
+            connect_timeout_secs,
+            request_timeout_secs,
             endpoints: resolved.endpoints,
             provider_entries,
             provider_headers: resolved.headers,
@@ -3139,7 +2907,7 @@ impl LlmConfig {
         if let Some(api) = model_api_from_env(selection, &self.model) {
             return Some(api);
         }
-        learned_api(&self.base_url, &self.model)
+        crate::llm::learned::lookup(&self.base_url, &self.model)
     }
 
     /// Apply a `/model` selection. `provider/model` switches provider (and its
@@ -3576,7 +3344,7 @@ fn protocol_source(
         )
     } else if let Some(api) = model_api {
         (api.name().to_string(), "DEX_MODEL_APIS")
-    } else if let Some(api) = learned_api(base_url, model) {
+    } else if let Some(api) = crate::llm::learned::lookup(base_url, model) {
         (api.name().to_string(), "learned (learned-apis.json)")
     } else if let Some(api) = provider.default_api() {
         (api.name().to_string(), "built-in provider default")
@@ -4042,10 +3810,9 @@ pub(crate) mod tests {
     use super::{
         apply_verify_optin, build_ctx_map, catalog_cache_missing, detect_verify_command, doctor,
         load_config_file, load_dex_models_cache, load_provider_entries, model_api_from_env,
-        persist_selection, reasoning_options_for, remember_learned_api, remember_thinking_effort,
-        stored_thinking_effort, unique_tmp_path, usage_cost, validate_thinking_effort,
-        warn_provider_like_selection, write_ctx_index, ApiProtocol, LlmConfig, PermissionMode,
-        Provider, ProviderEntry,
+        persist_selection, reasoning_options_for, remember_thinking_effort, stored_thinking_effort,
+        unique_tmp_path, usage_cost, validate_thinking_effort, warn_provider_like_selection,
+        write_ctx_index, ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
@@ -4313,7 +4080,8 @@ pub(crate) mod tests {
             verify_command: None,
             extra_headers: Default::default(),
             global_headers: Default::default(),
-            client: reqwest::Client::new(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 300,
             provider_entries: Default::default(),
             provider_headers: Default::default(),
         }
@@ -5288,7 +5056,7 @@ pub(crate) mod tests {
         let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
         let cache = dir.join("cache");
         std::env::set_var("XDG_CACHE_HOME", &cache);
-        remember_learned_api(
+        crate::llm::learned::remember(
             "https://file.example/v1",
             "file-model",
             ApiProtocol::ChatCompletions,
@@ -5737,7 +5505,7 @@ pub(crate) mod tests {
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         // Without the table, the learned fallback decides instead.
         std::env::remove_var("DEX_MODEL_APIS");
-        remember_learned_api(
+        crate::llm::learned::remember(
             "https://opencode.ai/zen/go/v1",
             "m-go",
             ApiProtocol::ChatCompletions,
