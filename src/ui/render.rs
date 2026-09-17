@@ -1021,6 +1021,130 @@ fn wrap_block(
     }
 }
 
+/// Keep `wrapped_cache` parallel to the transcript: width changes clear both
+/// caches, a shorter transcript (reset/resume) drops stale entries, appended
+/// blocks start unwrapped. Every transcript mutation must extend/truncate the
+/// cache alongside (or clear both, like `reset_session_state`): a missed site
+/// serves stale rows with no other signal, so the drift guard lives here.
+fn sync_wrapped_cache(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
+    if app.wrapped_width != area.width {
+        app.wrapped_cache.clear();
+        app.display_cache.clear();
+        app.wrapped_width = area.width;
+        // Every row is re-wrapped at the new width, so the old selection's row
+        // coordinates (and the text they'd copy) are gone too.
+        app.selection = None;
+        mark(0);
+    }
+    if app.wrapped_cache.len() > app.transcript.len() {
+        app.wrapped_cache.truncate(app.transcript.len());
+        // Selection rows refer to the old cache; drop them rather than
+        // highlight or copy rows that no longer exist.
+        app.selection = None;
+        mark(app.transcript.len());
+    }
+    while app.wrapped_cache.len() < app.transcript.len() {
+        mark(app.wrapped_cache.len());
+        app.wrapped_cache.push(WrappedBlock {
+            stamp: u64::MAX,
+            rows: Vec::new(),
+            src_len: 0,
+            open_len: 0,
+            open_rows: 0,
+            expanded: false,
+        });
+    }
+    // The tail-append path only ever pushes, so this holds on entry to the
+    // wrap loop.
+    debug_assert_eq!(
+        app.wrapped_cache.len(),
+        app.transcript.len(),
+        "wrapped_cache drifted from transcript — new mutation site missed the parallel cache"
+    );
+}
+
+/// Re-wrap every block whose content stamp changed — usually only the tail —
+/// and report each via `mark`. Expanded thinking re-wraps only the appended
+/// tail (§29): stored text is append-only below the cap, so rows before the
+/// last source line are final. A head-cut, reset, or rebuild resets stamps and
+/// takes the full wrap.
+fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
+    for (idx, block) in app.transcript.iter().enumerate() {
+        if app.wrapped_cache[idx].stamp == block.stamp() {
+            continue;
+        }
+        if let super::TranscriptBlock::Thinking { text, .. } = block {
+            if app.show_thinking {
+                let stamp = block.stamp();
+                let width = area.width;
+                let wb = &mut app.wrapped_cache[idx];
+                if wb.expanded {
+                    let state = ThinkingWrap {
+                        src_len: wb.src_len,
+                        open_len: wb.open_len,
+                        open_rows: wb.open_rows,
+                    };
+                    if let Some(next) = extend_thinking_rows(&mut wb.rows, state, text, width) {
+                        wb.stamp = stamp;
+                        wb.src_len = next.src_len;
+                        wb.open_len = next.open_len;
+                        wb.open_rows = next.open_rows;
+                        mark(idx);
+                        continue;
+                    }
+                }
+                let (rows, state) = wrap_thinking_full(text, width);
+                *wb = WrappedBlock {
+                    stamp,
+                    rows,
+                    src_len: state.src_len,
+                    open_len: state.open_len,
+                    open_rows: state.open_rows,
+                    expanded: true,
+                };
+                mark(idx);
+                continue;
+            }
+        }
+        let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
+        app.wrapped_cache[idx] = WrappedBlock {
+            stamp: block.stamp(),
+            rows,
+            src_len: 0,
+            open_len: 0,
+            open_rows: 0,
+            expanded: false,
+        };
+        mark(idx);
+    }
+}
+
+/// Re-extend `display_cache` from the first dirty block: truncate to that
+/// block's start offset (gap separators + wrapped-row counts — length
+/// arithmetic, no clones), then re-extend from there. Unchanged leading blocks
+/// keep byte-identical rows, so the offsets line up; this runs only on content
+/// or width changes, never for scroll. Tool steps carry the `surface_bg()` band
+/// themselves, so every gap between blocks stays blank terminal bg.
+fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
+    let Some(dirty) = first_dirty else {
+        return;
+    };
+    let mut start = 0usize;
+    for (idx, wb) in app.wrapped_cache.iter().enumerate().take(dirty) {
+        if idx > 0 && !wb.rows.is_empty() {
+            start += 1;
+        }
+        start += wb.rows.len();
+    }
+    app.display_cache.truncate(start);
+    for (idx, wb) in app.wrapped_cache.iter().enumerate().skip(dirty) {
+        if idx > 0 && !wb.rows.is_empty() {
+            app.display_cache.push(Line::default());
+        }
+        app.display_cache.extend(wb.rows.iter().cloned());
+    }
+}
+
 impl TranscriptView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         // Remember where the transcript lives so mouse events can be
@@ -1046,119 +1170,9 @@ impl TranscriptView {
         let mut mark = |idx: usize| {
             first_dirty = Some(first_dirty.map_or(idx, |first| first.min(idx)));
         };
-        if app.wrapped_width != area.width {
-            app.wrapped_cache.clear();
-            app.display_cache.clear();
-            app.wrapped_width = area.width;
-            // Every row is re-wrapped at the new width, so the old selection's
-            // row coordinates (and the text they'd copy) are gone too.
-            app.selection = None;
-            mark(0);
-        }
-        // Keep the cache parallel to the transcript. A shorter transcript
-        // (reset/resume) drops stale entries; appended blocks start unwrapped.
-        if app.wrapped_cache.len() > app.transcript.len() {
-            app.wrapped_cache.truncate(app.transcript.len());
-            // Selection rows refer to the old cache; drop them rather than
-            // highlight or copy rows that no longer exist.
-            app.selection = None;
-            mark(app.transcript.len());
-        }
-        while app.wrapped_cache.len() < app.transcript.len() {
-            mark(app.wrapped_cache.len());
-            app.wrapped_cache.push(WrappedBlock {
-                stamp: u64::MAX,
-                rows: Vec::new(),
-                src_len: 0,
-                open_len: 0,
-                open_rows: 0,
-                expanded: false,
-            });
-        }
-        // Every transcript mutation must extend/truncate `wrapped_cache`
-        // alongside (or clear both, like `reset_session_state`): a missed
-        // site serves stale rows with no other signal. The tail-append path
-        // below only ever pushes, so this holds on entry to the wrap loop.
-        debug_assert_eq!(
-            app.wrapped_cache.len(),
-            app.transcript.len(),
-            "wrapped_cache drifted from transcript — new mutation site missed the parallel cache"
-        );
-        for (idx, block) in app.transcript.iter().enumerate() {
-            if app.wrapped_cache[idx].stamp == block.stamp() {
-                continue;
-            }
-            // Expanded thinking re-wraps only the appended tail (§29):
-            // stored text is append-only below the cap, so rows before the
-            // last source line are final. A head-cut, reset, or rebuild
-            // resets stamps and takes the full wrap below.
-            if let super::TranscriptBlock::Thinking { text, .. } = block {
-                if app.show_thinking {
-                    let stamp = block.stamp();
-                    let width = area.width;
-                    let wb = &mut app.wrapped_cache[idx];
-                    if wb.expanded {
-                        let state = ThinkingWrap {
-                            src_len: wb.src_len,
-                            open_len: wb.open_len,
-                            open_rows: wb.open_rows,
-                        };
-                        if let Some(next) = extend_thinking_rows(&mut wb.rows, state, text, width) {
-                            wb.stamp = stamp;
-                            wb.src_len = next.src_len;
-                            wb.open_len = next.open_len;
-                            wb.open_rows = next.open_rows;
-                            mark(idx);
-                            continue;
-                        }
-                    }
-                    let (rows, state) = wrap_thinking_full(text, width);
-                    *wb = WrappedBlock {
-                        stamp,
-                        rows,
-                        src_len: state.src_len,
-                        open_len: state.open_len,
-                        open_rows: state.open_rows,
-                        expanded: true,
-                    };
-                    mark(idx);
-                    continue;
-                }
-            }
-            let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
-            app.wrapped_cache[idx] = WrappedBlock {
-                stamp: block.stamp(),
-                rows,
-                src_len: 0,
-                open_len: 0,
-                open_rows: 0,
-                expanded: false,
-            };
-            mark(idx);
-        }
-        if let Some(dirty) = first_dirty {
-            // Truncate the display to the first dirty block's start offset
-            // (gap separators + wrapped-row counts — length arithmetic, no
-            // clones), then re-extend from there. Unchanged leading blocks
-            // keep byte-identical rows, so the offsets line up; this runs
-            // only on content or width changes, never for scroll. Tool
-            // steps carry the `surface_bg()` band themselves, so every gap
-            // between blocks stays blank terminal bg.
-            let mut start = 0usize;
-            for (idx, wb) in app.wrapped_cache.iter().enumerate().take(dirty) {
-                if idx > 0 && !wb.rows.is_empty() {
-                    start += 1;
-                }
-                start += wb.rows.len();
-            }
-            app.display_cache.truncate(start);
-            for (idx, wb) in app.wrapped_cache.iter().enumerate().skip(dirty) {
-                if idx > 0 && !wb.rows.is_empty() {
-                    app.display_cache.push(Line::default());
-                }
-                app.display_cache.extend(wb.rows.iter().cloned());
-            }
-        }
+        sync_wrapped_cache(app, area, &mut mark);
+        wrap_dirty_blocks(app, area, &mut mark);
+        rebuild_display_cache(app, first_dirty);
         // The open thinking / activity rows animate: their lines are overlaid
         // on the rendered window (not written back into `display_cache`), so
         // a later `first_dirty` re-extend from `wrapped_cache` can't resurrect
