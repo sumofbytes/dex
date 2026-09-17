@@ -2444,6 +2444,9 @@ end
 
     #[tokio::test]
     async fn reload_unloads_vanished_extensions_and_their_prompt_appendix() {
+        // The appendix is process-global: serialize against the tests that
+        // `reset_for_tests` (which clears it) like every other asserter.
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let manifest = "manifest_version: 1\nid: fleeting\nversion: 0.1.0\ncapabilities: []\n";
         let root = fixture_ext(
             manifest,
