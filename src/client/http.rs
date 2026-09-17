@@ -20,6 +20,9 @@ pub(crate) struct ChatOptions {
     /// Custom base system prompt text (resolved client-side from
     /// `--system-prompt` / `--system-prompt-file`).
     pub(crate) system_prompt: Option<String>,
+    /// Remote `/thinking` choice: `None` uses the daemon default, `Some("")`
+    /// is an explicit clear, otherwise the level. Mirrors `ChatRequest`.
+    pub(crate) thinking_effort: Option<String>,
     /// P10: replay-safe submission key; the daemon dedups identical keys within 60s.
     pub(crate) idempotency_key: Option<String>,
 }
@@ -380,6 +383,40 @@ impl DaemonClient {
         Ok(body)
     }
 
+    /// Run one registered extension slash command on the daemon
+    /// (`POST /api/extensions/run`). The daemon resolves `name` against its
+    /// own manager; unknown names are a 404 so the caller can fall back to
+    /// "unknown command". Run failures arrive as 200 with an `error` field.
+    pub async fn extensions_run_async(
+        &self,
+        name: &str,
+        arg: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let body = self
+            .http
+            .post(format!("{}/api/extensions/run", self.base_url))
+            .headers(self.api_headers())
+            .json(&crate::protocol::ExtensionRunRequest {
+                name: name.to_string(),
+                arg: arg.to_string(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
+        Ok(body)
+    }
+
+    pub fn extensions_run(
+        &self,
+        name: &str,
+        arg: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        block_on(self.extensions_run_async(name, arg))
+            .map_err(|e| -> Box<dyn std::error::Error> { e })
+    }
+
     /// Poll the daemon workspace's branch/dirty for the status footer.
     /// Short timeout + best-effort: a slow daemon must not hitch the TUI,
     /// the next interval simply retries.
@@ -515,6 +552,7 @@ impl DaemonClient {
                 headers: options.headers,
                 plan: options.plan,
                 system_prompt: options.system_prompt,
+                thinking_effort: options.thinking_effort,
             })
             .send()
             .await
@@ -1261,6 +1299,88 @@ pub(crate) mod tests {
             .expect("chat must succeed");
         assert_eq!(seen, vec![false, true]);
         assert_eq!(*approvals.lock().unwrap(), vec![ApprovalDecision::Deny]);
+    }
+
+    #[tokio::test]
+    async fn extensions_run_forwards_name_and_surfaces_404() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new()
+            .route(
+                "/api/extensions/run",
+                post(
+                    |Json(req): Json<crate::protocol::ExtensionRunRequest>| async move {
+                        if req.name == "known" {
+                            Json(serde_json::json!({"extension": "ext1", "output": "ok"}))
+                        } else {
+                            // Mirror the daemon: unknown names are 404.
+                            Json(serde_json::json!({"error": "not found"}))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/extensions/run-404",
+                post(|| async { (axum::http::StatusCode::NOT_FOUND, "nope") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = DaemonClient::new(&base).unwrap();
+        let body = client.extensions_run_async("known", "arg").await.unwrap();
+        assert_eq!(body["output"].as_str(), Some("ok"));
+        // A real 404 surfaces as an error containing 404 so the remote TUI
+        // can fall back to "unknown command".
+        let err = client
+            .http
+            .post(format!("{base}/api/extensions/run-404"))
+            .headers(client.api_headers())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_carries_thinking_override() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<crate::protocol::ChatRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let app = Router::new().route(
+            "/api/sessions/{id}/chat",
+            post(move |Json(req): Json<crate::protocol::ChatRequest>| {
+                let seen = seen_clone.clone();
+                async move {
+                    seen.lock().unwrap().push(req);
+                    (
+                        axum::http::StatusCode::from_u16(200).unwrap(),
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        String::new(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = DaemonClient::new(&base).unwrap();
+        let options = ChatOptions {
+            thinking_effort: Some("high".into()),
+            ..Default::default()
+        };
+        let mut stream = client.chat_stream("s1", "hi", options).await.unwrap();
+        while stream.next_event().await.is_some() {}
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].thinking_effort.as_deref(), Some("high"));
     }
 
     /// Spawn a router on a loopback port from sync code; returns the base

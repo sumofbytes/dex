@@ -4,7 +4,13 @@ Companion to [complexity-review.md](complexity-review.md) (full rationale, file:
 details, do-not-touch list). This file lists every issue found by the six parallel
 module reviews as discrete, plannable items. Checkboxes track status.
 
-ID scheme: `LLM-`, `AGT-`, `SES-`, `SRV-`, `CLI-`, `MCP-`, `BUG-`.
+ID scheme: `LLM-`, `AGT-`, `SES-`, `SRV-`, `CLI-`, `MCP-`, `BUG-` (waves 1–2);
+`CFG-`, `UI-`, `EXT-`, `SUB-`, `HL-`, `MAIN-` (wave 3, see the section at the end).
+
+> **Wave 3 review** (post-sweep tree, `e5d3c6d`, 2026-09-17) re-measured the repo and
+> appended a second ledger below. New ground the waves 1–2 sweep never scoped:
+> `src/ui/*`, `src/extensions/*`, `src/agent/subagent`. Measure with
+> `python3 scripts/mccabe.py src`.
 
 Legend: Risk = chance of behavior drift (Low / Med / Hi). Effort = S (<1h) / M (hours) / L (>1d).
 
@@ -392,3 +398,208 @@ own separate `DaemonState`s, so a concurrent rebuild from the sibling test can s
 `turn_failed` on the other test's live session. Reproduced 0/3 on pr-10 after the fix
 and 0/3 on base; `daemon::tests` alone is stable. Worth a dedicated test-isolation fix
 (separate hermetic dirs per test) outside this sweep.
+
+## Wave 3 review — post-sweep tree
+
+Re-measurement after waves 1–2 closed. **Reviewed at `e5d3c6d` (2026-09-17).** The
+waves 1–2 sweep covered `llm/config`, `daemon`, `agent`, `session`, `mcp`,
+`core/format`, `tools`. Since then the tree grew ~45% (config 4993→6490 lines, tools
+3439→4214) and whole subsystems landed that the sweep never scoped: `src/ui/*`
+(render/remote/slash/input/wrapping), `src/extensions/*`, `src/agent/subagent`,
+`src/agent/evidence_reducer`, `src/agent/online_compaction`. That is the current
+frontier — **6 of the 13 functions over CC 40 are in the new ground.**
+
+### Method (reproducible)
+
+Two independent metrics, cross-checked (both rank the same top ~15):
+
+```sh
+python3 scripts/mccabe.py src          # TOP=80 for the long list
+cargo clippy --all-targets -- -W clippy::cognitive_complexity 2>&1 | grep cognitive_complexity
+```
+
+`scripts/mccabe.py` counts `if/while/for/loop/match` + match arms (`=>`) +
+`&&`/`||`/`?` per `fn` body. It inflates absolute numbers slightly (every `=>` is a
+point), so use it for ranking, not as strict McCabe; clippy's nesting-weighted
+cognitive score is the second opinion.
+
+### Distribution (2354 fns, sum CC 9352)
+
+| metric | value |
+|---|---|
+| median CC | 2 |
+| mean CC | 4.0 |
+| p90 | 8 |
+| fns CC > 10 | 166 |
+| > 15 | 94 |
+| > 20 | 59 |
+| > 25 | 39 |
+| > 40 | 13 |
+
+Healthy middle: 87% of functions are CC ≤ 10. The cost is a long thin tail; spend
+review budget on the 59 functions over CC 20, not the 166 over 10 (most of those are
+idiomatic `?`/`let…else` plumbing).
+
+### Area concentration
+
+| area | sum CC | %CC | max |
+|---|---|---|---|
+| `src/llm/config.rs` | 810 | 8.7% | **113** |
+| `src/ui/remote.rs` | 591 | 6.3% | **101** |
+| `src/tools/` | 550 | 5.9% | 37 |
+| `src/ui/render.rs` | 494 | 5.3% | 38 |
+| `src/daemon/server.rs` | 443 | 4.7% | **76** |
+| `src/agent/subagent/` | 429 | 4.6% | 43 |
+| `src/session.rs` | 419 | 4.5% | 39 |
+| `src/extensions/` | 390 | 4.2% | **88** |
+| `src/core/format.rs` | 336 | 3.6% | 41 |
+| `src/ui/slash.rs` | 227 | 2.4% | **119** |
+| `src/core/highlight.rs` | 214 | 2.3% | 69 |
+| `src/main.rs` | 155 | 1.7% | 68 |
+
+### Functions over CC 40
+
+| CC | lines | location |
+|---|---|---|
+| 119 | 505 | `src/ui/slash.rs:404 handle_slash` |
+| 113 | 474 | `src/llm/config.rs:3026 doctor` |
+| 101 | 451 | `src/ui/remote.rs:2448 handle_remote_slash` |
+| 88 | 609 | `src/extensions/engine.rs:588 build_dex_table` |
+| 85 | 248 | `src/ui/remote.rs:1718 handle_key` |
+| 76 | 490 | `src/daemon/server.rs:920 run_turn_inner` |
+| 72 | 535 | `src/ui/remote.rs:355 run_ratatui_repl_with_remote` |
+| 69 | 208 | `src/core/highlight.rs:223 fallback_segments` |
+| 68 | 250 | `src/main.rs:440 main` |
+| 52 | 297 | `src/ui.rs:1037 append_sink_line` |
+| 49 | 265 | `src/llm/config.rs:2444 from_env` |
+| 43 | 131 | `src/agent/subagent/definition.rs:76 parse_definition` |
+| 41 | 153 | `src/core/format.rs:510 tool_result_summary` |
+
+### Index (wave 3 — all open)
+
+| ID | Issue | Area | Risk | Effort | Est. win | Status |
+|---|---|---|---|---|---|---|
+| EXT-1 | `build_dex_table` 609-line single fn → per-registrar split | extensions/engine.rs:588 | Low | M | CC 88 → <10, no fn >15 | done |
+| CFG-1 | `doctor` builds rows imperatively (113 CC / 474 L) | llm/config.rs:3026 | Low-Med | M | section builders + row vec | done |
+| CFG-2 | `from_env` precedence chain (49 CC / 265 L) | llm/config.rs:2444 | Low-Med | M | knob row builders | done |
+| UI-1 | Slash command tables duplicated local vs remote | ui/slash.rs:404, ui/remote.rs:2448 | Med | L | ~1000 L, kills drift | done (one `COMMANDS` table → popup + `/help`; `parse`→`SlashCommand`; per-arm `cmd_*`/`remote_*`; handle_slash 119→20, handle_remote_slash 101→28; phantom `/goal /plan /constraint /accept` dropped from help) |
+| UI-2 | `handle_key` big key match (remote 85 / input 39) | ui/remote.rs:1718, ui/input.rs:87 | Med | M | per-group handlers | done (remote 85→32, input 39→23) |
+| UI-3 | `append_sink_line` 297 L → one fn per `SinkLine` variant | ui.rs:1037 | Low | M | 52 CC → split | done |
+| UI-4 | `run_ratatui_repl_with_remote` boot vs event loop | ui/remote.rs:355 | Low | M | `bootstrap() -> Boot` | done (72→39 + bootstrap 35) |
+| UI-5 | `render`: cache-sync + wrap loop + display rebuild | ui/render.rs:1025 | Med-Low | M | 38 CC → ~3 helpers | done (38→22) |
+| SRV-9 | `run_turn_inner` persist-if-changed duplication (plan/model) | daemon/server.rs:920 | Low | S | one `persist_marked` helper | done (`persist_if_stale`) |
+| SES-3 | `scan_events` checkpoint-cache reads → helper | session.rs:454 | Low | S | 39 CC, two blocks | done |
+| MAIN-1 | `main` arms RunTool/Extensions/Mcp inline their plumbing | main.rs:440 | Low | S | 3 `run_*` fns | done (68→35) |
+| HL-1 | `fallback_segments` repeated comment scans | core/highlight.rs:223 | Med | M | `scan_to_eol` + `close_comment` | done (69→63; rest is inherent byte plumbing) |
+| SUB-1 | `parse_definition` duplicated positive-int parse/validate | agent/subagent/definition.rs:76 | Low | S | `positive<T>()` helper | done |
+
+### Issue details (wave 3)
+
+#### EXT-1 — `build_dex_table` (extensions/engine.rs:588, 609 L, CC 88)
+One function registering ~13 Lua APIs, each in its own sibling `{ … }` block
+(`dex.tools.register`/`.call`/`.set_active`, `dex.events.on`, `dex.log`,
+`dex.workspace`, `dex.commands`, `dex.state`, `dex.prompt`, `dex.model`,
+`dex.net.fetch`, `dex.json`). Every block already captures only its own
+`ext_id`/`manifest`/`regs` clones, so this is a **pure move**: `fn tools_table(lua,
+manifest, regs) -> Table`, `fn events_table(...)`, `fn net_table(...)`, then
+`build_dex_table` composes them. Preserve the `expect("…")` strings. Lowest-risk big
+win in the tree — isolated file, no behavior surface.
+
+#### CFG-1 / CFG-2 — `doctor` + `from_env` row emitters
+LLM-8 shared the *resolution* helpers (`resolve_selection`,
+`provider_fallback_with_origin`) but both functions are still giant linear
+row-emitters / precedence chains. Build a `Vec<Row { key, value, origin }>` and render
+in one loop; extract per-section builders (`selection_rows()`, `header_rows()`,
+`credential_rows()`, `env_knob_rows()`). `doctor`'s CC is dominated by
+file/catalog/key-discovery `if let`/`match`, not by the row logic. Guarded by the
+existing `doctor_output_is_byte_stable` + `doctor_reports_selection_and_origins`
+snapshot tests — do it as extraction, same call sequence, `warn_once` fire-order
+identical (the wave-1 warning still stands).
+
+#### UI-1 — slash tables (ui/slash.rs:404 `handle_slash` 119/505; ui/remote.rs:2448 `handle_remote_slash` 101/451)
+Two parallel ~24-arm prefix-matched command tables. Restructure both: parse the first
+token into a `SlashCommand` enum, then one `fn cmd_*(app|remote, rest)` per command.
+The commands present in **both** (`/quit`, `/undo`, `/skill:`, `/resume`, `/mcp`,
+`/help`) belong in one shared module — they have already drifted (`/mcp` help wording
+differs; remote has no `/resume <sel>`). Add a table test asserting every documented
+command is handled in both entry points. Guards: `slash.rs`, `remote.rs`, `ui.rs`
+tests.
+
+#### UI-2 — `handle_key` (ui/remote.rs:1718, 85/248; ui/input.rs:87, 39/95)
+Same shape twice: approval overlay, then one huge `match key.code`. The overlay branch
+already early-returns — lift it to `handle_approval_key`. Then `handle_ctrl_c_key`,
+`handle_nav_keys`, `handle_composer_keys`; the top-level match becomes short routing.
+Check whether remote's arm set is a superset of `ui/input.rs` — likely more shared
+code.
+
+#### UI-3 — `append_sink_line` (ui.rs:1037, 52/297)
+One `fn` per `SinkLine` variant (`append_assistant`, `append_thinking`,
+`append_tool_input`, …); the flush/close head stays at the top.
+
+#### UI-4 — `run_ratatui_repl_with_remote` (ui/remote.rs:355, 72/535)
+Split the ~100-line boot fan-out (skills/palette/config handles, session/reattach) into
+`fn bootstrap(...) -> Boot`; keep the render/event loop separate. The return tuple at
+~423 is already a `Boot` in all but name.
+
+#### UI-5 — `render` (ui/render.rs:1025, 38 CC)
+Three phases in one body: transcript/`wrapped_cache` sync (+ `debug_assert_eq!` drift
+guard), the per-block wrap loop, and the `display_cache` rebuild / paragraph render.
+Extract `sync_wrapped_cache(app, area, &mut mark)` and `rebuild_display_cache(app,
+first_dirty)`. The drift invariant and `first_dirty` marking must stay inside the
+extracted fns.
+
+#### SRV-9 — `run_turn_inner` persist duplication (daemon/server.rs:920)
+The plan (`946-972`) and model (`1020-1050`) blocks repeat one pattern: read entry's
+`*_persisted` slot → `!persisted_current(...)` → `session.set_state(...)` → stat mtime →
+store `Some((value, at))`. `lock_map`/`persisted_current` already exist; extract
+`persist_marked(session, entry, path, key, value, slot_setter)` (the model block also
+refreshes `wake_provider`/`wake_base_url`). The
+`wake_base_url = if trim().is_empty() { None } else { Some(..) }` idiom also repeats at
+`1042-1046` and `1059-1063` → one fn. SRV-2 did the outer cleanup; this is the residue.
+
+#### SES-3 — `scan_events` checkpoint reads (session.rs:454, 39/150)
+Extract the two checkpoint-cache blocks (`484-502` target selection, `535-543` cached
+`max_seq`) into `checkpoint_resume(path, meta_len, since) -> (Vec<(u64,u64)>, u64,
+Option<u64>)`. Low value — the bulk of the CC is inherent `?` plumbing and the
+checkpoint/probe safety logic; do not restructure that.
+
+#### MAIN-1 — `main` arms (main.rs:440, 68/250)
+Only `RunTool` (~40 L), `Extensions` (~40 L), `Mcp` (~40 L) arms are heavy; the pattern
+is already established by `run_serve`/`run_one_shot`/`run_or_exit`. Move each arm to its
+own `fn run_run_tool`/`run_extensions`/`run_mcp`.
+
+#### HL-1 — `fallback_segments` (core/highlight.rs:223, 69/208)
+Four comment scans repeat `while end < len && bytes[end] != b'\n'`; the two
+in-comment scanners (`block_start`/`html_start`) are the same shape with a different
+terminator. Extract `scan_to_eol(bytes, pos) -> usize` and `close_comment(segs, start,
+end)`. Byte/char-boundary correctness is load-bearing — depend on the existing
+highlight tests, and only touch this while already editing the file.
+
+#### SUB-1 — `parse_definition` (agent/subagent/definition.rs:76, 43/131)
+`max_tool_iterations` and `timeout_secs` duplicate a parse-and-validate-positive ladder
+with the same error wording. Extract `fn positive<T: FromStr>(agent, key, raw) ->
+Result<T, String>`.
+
+### Known non-issues (wave 3 addendum)
+
+- `tools/mod.rs:2158 dispatch_tool` (37) and `core/format.rs:510 tool_result_summary`
+  (41) read as intentional per-tool tables — CC overstates them; matches waves 1–2's
+  CLI-2 done / CLI-4 skipped decisions. Leave.
+- `llm/provider.rs:150` — clippy flags it on nesting, but it is below the CC-40 cut;
+  not worth an extraction pass.
+- Everything in the wave-1/2 do-not-touch list still stands (compaction math,
+  `resolve_workspace_path`, `enforce_policy`, `warn_once`, journal durability,
+  `StreamEvent` matches, MCP transport boilerplate).
+
+### Suggested phases (wave 3)
+
+1. **Trivial / isolated:** EXT-1, SUB-1, MAIN-1.
+2. **Snapshot-guarded config:** CFG-1, CFG-2 (doctor byte-stable tests are the gate).
+3. **TUI event loops:** UI-3, UI-4, UI-5.
+4. **Shared slash table:** UI-1 (own PR; touches both entry points + tests).
+5. **Mop-up:** UI-2, SRV-9, SES-3.
+6. **Optional, only while editing the file:** HL-1.
+
+Verification per phase: `cargo fmt -- --check && cargo test --all-targets && cargo
+clippy --all-targets -- -D warnings`, plus the named guards (doctor snapshot, slash/
+remote tests, highlight tests).
