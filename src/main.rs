@@ -74,6 +74,7 @@ pub(crate) fn chat_options_from_args(args: &Args) -> client::http::ChatOptions {
         },
         plan: None,
         system_prompt: cli_system_prompt(args).map(|(text, _)| text),
+        thinking_effort: None,
         idempotency_key: None,
     }
 }

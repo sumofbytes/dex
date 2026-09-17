@@ -516,21 +516,21 @@ pub(super) fn parse(line: &str) -> SlashCommand<'_> {
         None => (rest, None),
     };
     match word {
-        "quit" => SlashCommand::Quit,
-        "clear" => SlashCommand::Clear,
-        "new" => SlashCommand::New,
-        "session" => SlashCommand::Session,
-        "permissions" => SlashCommand::Permissions,
+        "quit" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Quit,
+        "clear" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Clear,
+        "new" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::New,
+        "session" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Session,
+        "permissions" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Permissions,
         "resume" => SlashCommand::Resume(arg),
         "name" => SlashCommand::Name(arg),
         "model" => SlashCommand::Model(arg),
         "provider" => SlashCommand::Provider(arg),
         "thinking" => SlashCommand::Thinking(arg),
         "waive" => SlashCommand::Waive(arg),
-        "undo" => SlashCommand::Undo,
+        "undo" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Undo,
         "mcp" => SlashCommand::Mcp(arg),
         "extensions" => SlashCommand::Extensions(arg),
-        "help" => SlashCommand::Help,
+        "help" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Help,
         _ if is_extension_command(line) => SlashCommand::Extension(line),
         _ => SlashCommand::Unknown,
     }
@@ -785,7 +785,7 @@ fn cmd_extensions(app: &mut App, arg: Option<&str>) {
 }
 
 fn cmd_resume(app: &mut App, selector: Option<&str>) {
-    let Some(selector) = selector else {
+    let Some(selector) = selector.filter(|s| !s.trim().is_empty()) else {
         let sessions = Session::list(&app.cwd).unwrap_or_default();
         let filtered: Vec<(std::path::PathBuf, crate::session::SessionHeader)> = sessions
             .into_iter()
@@ -965,7 +965,7 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
 }
 
 fn cmd_provider(app: &mut App, arg: Option<&str>) {
-    let Some(name) = arg else {
+    let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
         push_info(
             app,
             format!("current provider: {}", app.config.provider.name()),
