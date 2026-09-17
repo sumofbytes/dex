@@ -26,6 +26,22 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "find"];
 /// parsing; they canonicalize here. If `KNOWN_TOOLS` ever drops the legacy
 /// names, the unknown-tool check runs before this mapping — keep both in
 /// sync or old definitions start failing validation.
+/// Parse a frontmatter value that must be a strictly positive integer. `key`
+/// names the field and `want` is the error's human hint, so each key keeps its
+/// own wording (both `max_tool_iterations` and `timeout_secs` gate a ladder).
+fn positive_int<T>(agent: &str, key: &str, raw: &str, want: &str) -> Result<T, String>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    let invalid = || format!("agent '{agent}' has invalid {key} '{raw}': want {want}");
+    let n: T = raw.trim().parse().map_err(|_| invalid())?;
+    if n > T::default() {
+        Ok(n)
+    } else {
+        Err(invalid())
+    }
+}
+
 fn canonical_tool(entry: &str) -> &str {
     match entry {
         "ffgrep" => "grep",
@@ -134,40 +150,21 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
         .ok_or_else(|| format!("agent '{name}' has an empty persona prompt"))?;
     let max_tool_iterations = match max_tool_iterations {
         None => None,
-        Some(raw) => {
-            let n: u32 = raw
-                .trim()
-                .parse()
-                .map_err(|_| {
-                    format!(
-                        "agent '{name}' has invalid max_tool_iterations '{raw}': want a positive integer"
-                    )
-                })
-                .and_then(|n| {
-                    if n > 0 {
-                        Ok(n)
-                    } else {
-                        Err(format!(
-                            "agent '{name}' has invalid max_tool_iterations '{raw}': want a positive integer"
-                        ))
-                    }
-                })?;
-            Some(n)
-        }
+        Some(raw) => Some(positive_int(
+            &name,
+            "max_tool_iterations",
+            &raw,
+            "a positive integer",
+        )?),
     };
     let timeout = match timeout_secs {
         None => DEFAULT_AGENT_TIMEOUT,
-        Some(raw) => {
-            let secs: u64 = raw.trim().parse().map_err(|_| {
-                format!("agent '{name}' has invalid timeout_secs '{raw}': want positive seconds")
-            })?;
-            if secs == 0 {
-                return Err(format!(
-                    "agent '{name}' has invalid timeout_secs '{raw}': want positive seconds"
-                ));
-            }
-            Duration::from_secs(secs)
-        }
+        Some(raw) => Duration::from_secs(positive_int(
+            &name,
+            "timeout_secs",
+            &raw,
+            "positive seconds",
+        )?),
     };
     let tools = match tools {
         None => READ_ONLY_TOOLS.iter().map(|t| t.to_string()).collect(),

@@ -1035,6 +1035,282 @@ fn trim_thinking_head(app: &mut App) {
     }
 }
 
+/// `SinkLine::Assistant`: buffer streaming deltas — markdown runs once per
+/// throttle window, not once per line. Each sink line is one complete markdown
+/// line, so rejoin buffered lines with '\n' to keep paragraph structure.
+/// Normalize blank lines around block-level markdown so dense model output
+/// still renders with air between sections. Gap state survives throttled
+/// flushes (which clear `assistant_pending`): without it a heading/list at a
+/// window edge lost its top air while the bottom air survived via the trailing
+/// blank. A blank line inside the open message keeps the tail block so the
+/// inter-block gutter stays canonical (blank runs collapse to one air row).
+fn append_assistant(app: &mut App, s: String) {
+    if s.trim().is_empty() {
+        if app.assistant_open {
+            flush_assistant(app);
+            if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
+                if !lines.last().is_some_and(line_is_air) {
+                    lines.push(Line::default());
+                    *stamp = stamp.wrapping_add(1);
+                }
+            }
+            app.assistant_gap.note_blank();
+        }
+        return;
+    }
+    if !app.assistant_open && app.assistant_pending.is_empty() {
+        app.assistant_gap.reset();
+    }
+    let chunk = app.assistant_gap.normalize(&s);
+    if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
+        app.assistant_pending.push('\n');
+    }
+    app.assistant_pending.push_str(&chunk);
+    // Tables need header + delimiter + rows in one render window: markdown is
+    // re-parsed per flush, so a table split across windows would fall back to
+    // raw paragraphs. Hold the flush while the buffer ends on a table line;
+    // prose, a blank line or the next non-assistant sink line releases it.
+    let last_line = app
+        .assistant_pending
+        .trim_end()
+        .rsplit('\n')
+        .next()
+        .unwrap_or("");
+    let holding_table = crate::core::markdown::is_table_line(last_line);
+    if stream_flush_due(app) && !holding_table {
+        flush_assistant(app);
+    }
+}
+
+/// `SinkLine::Thinking`: append the delta to the open thinking block (or open
+/// one), trimming the head past the cap. Throttled re-wraps: reasoning arrives
+/// token-by-token and the block settles on close, which bumps unconditionally.
+fn append_thinking(app: &mut App, s: String) {
+    if s.is_empty() {
+        return;
+    }
+    app.assistant_open = false;
+    // (Gate read before the mutable borrow; clock reset after it.)
+    let due = stream_flush_due(app);
+    let mut over_cap = false;
+    if let Some(TranscriptBlock::Thinking { text, stamp, .. }) = content_tail_mut(app) {
+        text.push_str(&s);
+        over_cap = text.len() > THINKING_TEXT_CAP + THINKING_TEXT_SLACK;
+        if due {
+            *stamp = stamp.wrapping_add(1);
+        }
+    } else {
+        app.transcript.push(TranscriptBlock::Thinking {
+            stamp: 0,
+            text: s,
+            started: Instant::now(),
+            elapsed: None,
+        });
+    }
+    if over_cap {
+        trim_thinking_head(app);
+    }
+    if due {
+        note_stream_flush(app);
+    }
+    if !app.thinking_open {
+        // Spinner hides while thinking streams; re-wrap it away.
+        bump_open_activity(app);
+    }
+    app.thinking_open = true;
+}
+
+/// `SinkLine::ToolInput`: start a tool block (glyph line).
+fn append_tool_input(app: &mut App, id: String, input: String) {
+    dim_intermediate_assistant_block(app);
+    app.assistant_open = false;
+    let mut it = input.splitn(2, ' ');
+    let name = it.next().unwrap_or("").to_string();
+    let arg = it.next().unwrap_or("").to_string();
+    let line = render::render_tool_input(&name, &arg);
+    app.transcript.push(TranscriptBlock::Tool {
+        stamp: 0,
+        input: line,
+        output: None,
+        preview: Vec::new(),
+        tool_arg: arg,
+        tool_id: id,
+    });
+}
+
+/// `SinkLine::ToolOutput`: complete the paired tool block (or synthesize one
+/// on replay). Returns true when it completed an open block — the caller then
+/// skips the tail-move, matching the historic early return.
+fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
+    let SinkLine::ToolOutput {
+        id,
+        name,
+        summary,
+        success,
+        preview,
+        duration,
+    } = sl
+    else {
+        return false;
+    };
+    // The glyph line above already names the tool; the └ line leads with the
+    // outcome (glyph + summary) and trails timing in dim.
+    let failed = !success;
+    let color = if failed {
+        Color::LightRed
+    } else {
+        Color::LightGreen
+    };
+    let mut spans = vec![
+        Span::styled("└ ", Style::default().fg(color)),
+        Span::styled(if failed { "✗ " } else { "✓ " }, Style::default().fg(color)),
+        Span::styled(summary, Style::default().fg(color)),
+    ];
+    if duration > 0.0 {
+        spans.push(Span::styled(
+            format!(" · {}", crate::core::format::format_duration(duration)),
+            Style::default().fg(theme::muted_fg()),
+        ));
+    }
+    let output = indent_transcript_line(Line::from(spans));
+    // Pair with the open block for this call: parallel batches interleave
+    // inputs/outputs, so the tail is not necessarily ours. Empty id = legacy
+    // (session rebuild, old journals, shell blocks): keep the old tail
+    // behavior. (Content tail: the open Activity spinner may sit at the
+    // transcript tail while busy; Activity blocks never match the scan below,
+    // so they stay transparent in both paths.)
+    let open_idx = if id.is_empty() {
+        content_tail_idx(app).filter(|&i| {
+            matches!(
+                app.transcript.get(i),
+                Some(TranscriptBlock::Tool { output: None, .. })
+            )
+        })
+    } else {
+        app.transcript.iter().rposition(
+            |b| matches!(b, TranscriptBlock::Tool { tool_id, output: None, .. } if tool_id == &id),
+        )
+    };
+    // write/edit previews are a git diff: color like git does. read previews
+    // keep the numbered gutter dim and highlight the code by extension (one
+    // tree-sitter pass per file section); anything unhighlightable stays dim.
+    let preview_lines: Vec<Line<'static>> = if matches!(name.as_str(), "write" | "edit") {
+        preview
+            .iter()
+            .map(|line| {
+                let style = if line.starts_with('+') && !line.starts_with("+++") {
+                    Style::default().fg(Color::LightGreen)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Style::default().fg(Color::LightRed)
+                } else if line.starts_with("@@") {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(theme::tool_preview_fg())
+                };
+                indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
+            })
+            .collect()
+    } else if matches!(name.as_str(), "read") && success {
+        // Language from the stored `ToolInput` arg (first token is the path:
+        // `src/main.rs:1-20`, a glob, or `N files`). `==> file <==` fan-out
+        // headers inside re-target per section in `render_read_preview`. Read
+        // from the block this output will complete (not the tail: parallel
+        // batches interleave, so the tail may be another call's block).
+        let arg_path = open_idx
+            .and_then(|i| match app.transcript.get(i) {
+                Some(TranscriptBlock::Tool { tool_arg, .. }) => Some(tool_arg.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let path = arg_path.split_whitespace().next().unwrap_or("");
+        let path = path.split(':').next().unwrap_or(path);
+        render::render_read_preview(&preview, crate::core::lang::lang_from_path(path))
+    } else if success && matches!(name.as_str(), "grep" | "ffgrep") {
+        // Content-mode hits are `path:line:code` rows: keep the gutter dim,
+        // highlight the code by path extension (same engine and dim fallback
+        // as read previews).
+        render::render_search_preview(&preview)
+    } else {
+        preview
+            .iter()
+            .map(|line| {
+                indent_transcript_line(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme::tool_preview_fg()),
+                )))
+            })
+            .collect()
+    };
+    app.assistant_open = false;
+    // Complete the tool block started by ToolInput if it is still open.
+    if let Some(i) = open_idx {
+        if let Some(TranscriptBlock::Tool {
+            output: out,
+            preview: prev,
+            stamp,
+            ..
+        }) = app.transcript.get_mut(i)
+        {
+            if out.is_none() {
+                *out = Some(output);
+                *prev = preview_lines;
+                *stamp = stamp.wrapping_add(1);
+                // A mid-transcript completion shifts every display row below
+                // it: drop a live selection reaching past it rather than
+                // highlight/copy shifted rows.
+                drop_shifted_selection(app, i);
+                return true;
+            }
+        }
+    }
+    // Fallback: no open ToolInput (e.g. replay); synthesize a block. No arg is
+    // known here, so previews stay dim — the replay path
+    // (`rebuild_transcript`) always emits `ToolInput` first, which carries the
+    // arg for highlighting.
+    app.transcript.push(TranscriptBlock::Tool {
+        stamp: 0,
+        input: indent_transcript_line(Line::from(Span::styled(
+            "▸ tool",
+            Style::default().fg(Color::Yellow),
+        ))),
+        output: Some(output),
+        preview: preview_lines,
+        tool_arg: String::new(),
+        tool_id: id,
+    });
+    false
+}
+
+/// `SinkLine::System`: a muted system note; child-agent lifecycle lines
+/// (`[agent <name>:<id>] started|finished …`) get their own bold green glyph so
+/// a delegation pops out of the muted notes, like per-tool glyphs do.
+fn append_system(app: &mut App, s: String) {
+    app.assistant_open = false;
+    let line = match agent_lifecycle(&s) {
+        Some((glyph, _)) => indent_transcript_line(Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(Color::Green)),
+            Span::styled(s, Style::default().fg(Color::Green)),
+        ])),
+        None => indent_transcript_line(Line::from(vec![
+            Span::styled("· ", Style::default().fg(theme::muted_fg())),
+            Span::styled(s, Style::default().fg(theme::muted_fg())),
+        ])),
+    };
+    app.transcript
+        .push(TranscriptBlock::System { stamp: 0, line });
+}
+
+fn append_error(app: &mut App, s: String) {
+    app.assistant_open = false;
+    app.transcript.push(TranscriptBlock::Error {
+        stamp: 0,
+        line: indent_transcript_line(Line::from(vec![
+            Span::styled("! ", Style::default().fg(Color::Red)),
+            Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
+        ])),
+    });
+}
+
 /// Route a streamed console line into the transcript with the same styling
 /// the local engine uses, so remote and local turns look identical.
 /// Each `SinkLine` maps to one `TranscriptBlock` (or an extension of the
@@ -1052,285 +1328,22 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
         close_thinking(app);
     }
     match sl {
-        SinkLine::Assistant(s) => {
-            if s.trim().is_empty() {
-                // Blank inside the current assistant message (e.g. streaming
-                // blank line between paragraphs). Keep it inside the tail
-                // Assistant block so the inter-block gutter remains canonical.
-                // Blank runs collapse to one air row (CommonMark):
-                // the model often emits several, and each used to push its
-                // own `Line::default()`.
-                if app.assistant_open {
-                    flush_assistant(app);
-                    if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app)
-                    {
-                        if !lines.last().is_some_and(line_is_air) {
-                            lines.push(Line::default());
-                            *stamp = stamp.wrapping_add(1);
-                        }
-                    }
-                    app.assistant_gap.note_blank();
-                }
+        SinkLine::Assistant(s) => append_assistant(app, s),
+        SinkLine::Thinking(s) => append_thinking(app, s),
+        SinkLine::ToolInput { id, input } => append_tool_input(app, id, input),
+        SinkLine::ToolOutput { .. } => {
+            if append_tool_output(app, sl) {
                 return;
             }
-            // ponytail: buffer deltas — markdown (term-md + tree-sitter) runs
-            // at most once per throttle window instead of once per line. Each
-            // sink line is one complete markdown line (stream.rs trims the
-            // trailing newline), so rejoin buffered lines with '\n' to keep
-            // paragraph structure across the throttle window. Normalize blank
-            // lines around block-level markdown so dense model output still
-            // renders with air between sections. Gap state survives throttled
-            // flushes (which clear `assistant_pending`): without it a
-            // heading/list at a window edge lost its top air while the bottom
-            // air survived via the trailing blank.
-            if !app.assistant_open && app.assistant_pending.is_empty() {
-                app.assistant_gap.reset();
-            }
-            let chunk = app.assistant_gap.normalize(&s);
-            if !app.assistant_pending.is_empty() && !app.assistant_pending.ends_with('\n') {
-                app.assistant_pending.push('\n');
-            }
-            app.assistant_pending.push_str(&chunk);
-            // Tables need header + delimiter + rows in one render window:
-            // markdown is re-parsed per flush, so a table split across
-            // windows would fall back to raw paragraphs. Hold the flush
-            // while the buffer ends on a table line; prose, a blank line or
-            // the next non-assistant sink line releases the whole table.
-            let last_line = app
-                .assistant_pending
-                .trim_end()
-                .rsplit('\n')
-                .next()
-                .unwrap_or("");
-            let holding_table = crate::core::markdown::is_table_line(last_line);
-            if stream_flush_due(app) && !holding_table {
-                flush_assistant(app);
-            }
         }
-        SinkLine::Thinking(s) => {
-            if s.is_empty() {
-                return;
-            }
-            app.assistant_open = false;
-            // ponytail: throttle re-wraps — reasoning arrives token-by-
-            // token; the block settles on close, which bumps unconditionally.
-            // (Gate read before the mutable borrow; clock reset after it.)
-            let due = stream_flush_due(app);
-            let mut over_cap = false;
-            if let Some(TranscriptBlock::Thinking { text, stamp, .. }) = content_tail_mut(app) {
-                text.push_str(&s);
-                over_cap = text.len() > THINKING_TEXT_CAP + THINKING_TEXT_SLACK;
-                if due {
-                    *stamp = stamp.wrapping_add(1);
-                }
-            } else {
-                app.transcript.push(TranscriptBlock::Thinking {
-                    stamp: 0,
-                    text: s,
-                    started: Instant::now(),
-                    elapsed: None,
-                });
-            }
-            if over_cap {
-                trim_thinking_head(app);
-            }
-            if due {
-                note_stream_flush(app);
-            }
-            if !app.thinking_open {
-                // Spinner hides while thinking streams; re-wrap it away.
-                bump_open_activity(app);
-            }
-            app.thinking_open = true;
-        }
-        SinkLine::ToolInput { id, input } => {
-            dim_intermediate_assistant_block(app);
-            app.assistant_open = false;
-            let mut it = input.splitn(2, ' ');
-            let name = it.next().unwrap_or("").to_string();
-            let arg = it.next().unwrap_or("").to_string();
-            let line = render::render_tool_input(&name, &arg);
-            app.transcript.push(TranscriptBlock::Tool {
-                stamp: 0,
-                input: line,
-                output: None,
-                preview: Vec::new(),
-                tool_arg: arg,
-                tool_id: id,
-            });
-        }
-        SinkLine::ToolOutput {
-            id,
-            name,
-            summary,
-            success,
-            preview,
-            duration,
-        } => {
-            // The glyph line above already names the tool; the └ line leads
-            // with the outcome (glyph + summary) and trails timing in dim.
-            let failed = !success;
-            let color = if failed {
-                Color::LightRed
-            } else {
-                Color::LightGreen
-            };
-            let mut spans = vec![
-                Span::styled("└ ", Style::default().fg(color)),
-                Span::styled(if failed { "✗ " } else { "✓ " }, Style::default().fg(color)),
-                Span::styled(summary, Style::default().fg(color)),
-            ];
-            if duration > 0.0 {
-                spans.push(Span::styled(
-                    format!(" · {}", crate::core::format::format_duration(duration)),
-                    Style::default().fg(theme::muted_fg()),
-                ));
-            }
-            let output = indent_transcript_line(Line::from(spans));
-            // write/edit previews are a git diff: color like git does. read
-            // previews keep the numbered gutter dim and highlight the code
-            // by extension (one tree-sitter pass per file section);
-            // anything unhighlightable stays dim.
-            // Pair with the open block for this call: parallel batches
-            // interleave inputs/outputs, so the tail is not necessarily
-            // ours. Empty id = legacy (session rebuild, old journals,
-            // shell blocks): keep the old tail behavior. (Content tail:
-            // the open Activity spinner may sit at the transcript tail
-            // while busy; Activity blocks never match the scan below, so
-            // they stay transparent in both paths.)
-            let open_idx = if id.is_empty() {
-                content_tail_idx(app).filter(|&i| {
-                    matches!(
-                        app.transcript.get(i),
-                        Some(TranscriptBlock::Tool { output: None, .. })
-                    )
-                })
-            } else {
-                app.transcript.iter().rposition(|b| {
-                    matches!(b, TranscriptBlock::Tool { tool_id, output: None, .. } if tool_id == &id)
-                })
-            };
-            let preview_lines: Vec<Line<'static>> = if matches!(name.as_str(), "write" | "edit") {
-                preview
-                    .iter()
-                    .map(|line| {
-                        let style = if line.starts_with('+') && !line.starts_with("+++") {
-                            Style::default().fg(Color::LightGreen)
-                        } else if line.starts_with('-') && !line.starts_with("---") {
-                            Style::default().fg(Color::LightRed)
-                        } else if line.starts_with("@@") {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default().fg(theme::tool_preview_fg())
-                        };
-                        indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
-                    })
-                    .collect()
-            } else if matches!(name.as_str(), "read") && success {
-                // Language from the stored `ToolInput` arg (first token is
-                // the path: `src/main.rs:1-20`, a glob, or `N files`).
-                // `==> file <==` fan-out headers inside re-target per
-                // section in `render_read_preview`. Read from the block this
-                // output will complete (not the tail: parallel batches
-                // interleave, so the tail may be another call's block).
-                let arg_path = open_idx
-                    .and_then(|i| match app.transcript.get(i) {
-                        Some(TranscriptBlock::Tool { tool_arg, .. }) => Some(tool_arg.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let path = arg_path.split_whitespace().next().unwrap_or("");
-                let path = path.split(':').next().unwrap_or(path);
-                render::render_read_preview(&preview, crate::core::lang::lang_from_path(path))
-            } else if success && matches!(name.as_str(), "grep" | "ffgrep") {
-                // Content-mode hits are `path:line:code` rows: keep the
-                // gutter dim, highlight the code by path extension (same
-                // engine and dim fallback as read previews).
-                render::render_search_preview(&preview)
-            } else {
-                preview
-                    .iter()
-                    .map(|line| {
-                        indent_transcript_line(Line::from(Span::styled(
-                            format!("  {line}"),
-                            Style::default().fg(theme::tool_preview_fg()),
-                        )))
-                    })
-                    .collect()
-            };
-            app.assistant_open = false;
-            // Complete the tool block started by ToolInput if it is still open.
-            if let Some(i) = open_idx {
-                if let Some(TranscriptBlock::Tool {
-                    output: out,
-                    preview: prev,
-                    stamp,
-                    ..
-                }) = app.transcript.get_mut(i)
-                {
-                    if out.is_none() {
-                        *out = Some(output);
-                        *prev = preview_lines;
-                        *stamp = stamp.wrapping_add(1);
-                        // A mid-transcript completion shifts every display row
-                        // below it: drop a live selection reaching past it
-                        // rather than highlight/copy shifted rows.
-                        drop_shifted_selection(app, i);
-                        return;
-                    }
-                }
-            }
-            // Fallback: no open ToolInput (e.g. replay); synthesize a block.
-            // No arg is known here, so previews stay dim — the replay path
-            // (`rebuild_transcript`) always emits `ToolInput` first, which
-            // carries the arg for highlighting.
-            app.transcript.push(TranscriptBlock::Tool {
-                stamp: 0,
-                input: indent_transcript_line(Line::from(Span::styled(
-                    "▸ tool",
-                    Style::default().fg(Color::Yellow),
-                ))),
-                output: Some(output),
-                preview: preview_lines,
-                tool_arg: String::new(),
-                tool_id: id,
-            });
-        }
-        SinkLine::System(s) => {
-            app.assistant_open = false;
-            // Child-agent lifecycle lines (`[agent <name>:<id>] started|
-            // finished …`) get their own bold green glyph so a delegation
-            // pops out of the muted system notes, like the per-tool glyphs
-            // do for tool rows.
-            let line = match agent_lifecycle(&s) {
-                Some((glyph, _)) => indent_transcript_line(Line::from(vec![
-                    Span::styled(format!("{glyph} "), Style::default().fg(Color::Green)),
-                    Span::styled(s, Style::default().fg(Color::Green)),
-                ])),
-                None => indent_transcript_line(Line::from(vec![
-                    Span::styled("· ", Style::default().fg(theme::muted_fg())),
-                    Span::styled(s, Style::default().fg(theme::muted_fg())),
-                ])),
-            };
-            app.transcript
-                .push(TranscriptBlock::System { stamp: 0, line });
-        }
+        SinkLine::System(s) => append_system(app, s),
         // Usage updates flow into the status bar via StreamEvent::Usage in
         // the remote handler, not into the transcript.
         SinkLine::Usage { .. } => {}
         SinkLine::Plan(plan) => {
             app.plan = plan;
         }
-        SinkLine::Error(s) => {
-            app.assistant_open = false;
-            app.transcript.push(TranscriptBlock::Error {
-                stamp: 0,
-                line: indent_transcript_line(Line::from(vec![
-                    Span::styled("! ", Style::default().fg(Color::Red)),
-                    Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
-                ])),
-            });
-        }
+        SinkLine::Error(s) => append_error(app, s),
     }
     // ponytail: sticky autoscroll — don't force true on every append;
     // TranscriptView snaps only when already at bottom, so manual scroll

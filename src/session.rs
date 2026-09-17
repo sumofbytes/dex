@@ -451,6 +451,46 @@ struct EventRow<'a> {
 /// `collect` is false payloads are skipped (the `max_event_seq` path).
 type EventsScan = (Vec<(u64, String)>, Option<u64>);
 
+/// Newest checkpoint at or before `since`: the kept checkpoint list, the seek
+/// offset, and the seq that offset should resume at. The file only grows in
+/// production, but a checkpoint is verified against its row before use, so an
+/// out-of-band rewrite falls back to a full scan instead of serving garbage.
+fn checkpoint_resume(
+    events_path: &Path,
+    meta_len: u64,
+    since: u64,
+) -> (Vec<(u64, u64)>, u64, Option<u64>) {
+    let cache = events_cache().lock().expect("events cache lock");
+    match cache.get(events_path) {
+        Some(entry) if meta_len >= entry.id.len => {
+            let kept: Vec<(u64, u64)> = entry
+                .checkpoints
+                .iter()
+                .copied()
+                .filter(|&(_, off)| off <= meta_len)
+                .collect();
+            match kept.iter().rev().find(|&&(seq, _)| seq <= since).copied() {
+                Some((seq, off)) => (kept, off, Some(seq)),
+                None => (Vec::new(), 0, None),
+            }
+        }
+        _ => (Vec::new(), 0, None),
+    }
+}
+
+/// Highest seq already cached below the resume point, so the fresh max covers
+/// the whole file, not just the scanned tail.
+fn cached_max_seq(events_path: &Path, seek_to: u64) -> Option<u64> {
+    if seek_to == 0 {
+        return None;
+    }
+    events_cache()
+        .lock()
+        .expect("events cache lock")
+        .get(events_path)
+        .and_then(|e| e.max_seq)
+}
+
 fn scan_events(
     events_path: &Path,
     since: u64,
@@ -477,29 +517,8 @@ fn scan_events(
         }
     }
     let meta_len = fs::metadata(events_path)?.len();
-    // Resume from the newest checkpoint at or before the cursor. The file
-    // only grows in production, but a checkpoint is verified against its
-    // row before use, so an out-of-band rewrite falls back to a full scan
-    // instead of serving garbage.
-    let (mut checkpoints, mut seek_to, seek_seq) = {
-        let cache = events_cache().lock().expect("events cache lock");
-        match cache.get(events_path) {
-            Some(entry) if meta_len >= entry.id.len => {
-                let kept: Vec<(u64, u64)> = entry
-                    .checkpoints
-                    .iter()
-                    .copied()
-                    .filter(|&(_, off)| off <= meta_len)
-                    .collect();
-                let target = kept.iter().rev().find(|&&(seq, _)| seq <= since).copied();
-                match target {
-                    Some((seq, off)) => (kept, off, Some(seq)),
-                    None => (Vec::new(), 0, None),
-                }
-            }
-            _ => (Vec::new(), 0, None),
-        }
-    };
+    // Resume from the newest checkpoint at or before the cursor.
+    let (mut checkpoints, mut seek_to, seek_seq) = checkpoint_resume(events_path, meta_len, since);
     let mut file = File::open(events_path)?;
     // Checkpoint beyond EOF (a shrink raced the stat): full scan instead.
     if seek_to > meta_len {
@@ -530,17 +549,7 @@ fn scan_events(
     // `last()` base. A checkpoint at or before the resume point is kept.
     checkpoints.retain(|&(_, off)| off <= seek_to);
     let mut reader = BufReader::new(file);
-    // Highest seq below the resume point, so the cached max covers the
-    // whole file, not just the scanned tail.
-    let mut max: Option<u64> = if seek_to > 0 {
-        events_cache()
-            .lock()
-            .expect("events cache lock")
-            .get(events_path)
-            .and_then(|e| e.max_seq)
-    } else {
-        None
-    };
+    let mut max: Option<u64> = cached_max_seq(events_path, seek_to);
     let mut next_chunk_at = seek_to.saturating_add(EVENTS_CHECKPOINT_BYTES);
     let mut out = Vec::new();
     let mut off = seek_to;
