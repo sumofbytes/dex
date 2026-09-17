@@ -154,16 +154,24 @@ impl Decision {
     }
 }
 
-/// Stem-normalize one lowercased alphanumeric token: strip regular
-/// plural/verb endings (`-s`/`-es`/`-ies→y`/`-ed`/`-ing`, with doubled-
-/// consonant collapse) so one table stem covers its inflections —
-/// `migrates`/`migrating` → `migrat`, `vulnerabilities` → `vulnerability`,
-/// `running` → `run`. Nominalizations (`-ion`/`-ation`) are deliberately
-/// left alone: `migration` already starts with `migrat`, while
-/// `authorization` must not fold into `author`, so each family lists the
-/// stem its forms share as a prefix (see `stem_hit`).
+/// Stem-normalize one lowercased alphanumeric token through three small
+/// steps (plural → verb ending → doubled consonant) so one table stem
+/// covers its inflections — `migrates`/`migrating` → `migrat`,
+/// `vulnerabilities` → `vulnerability`, `running` → `run`.
+/// Nominalizations (`-ion`/`-ation`) are deliberately left alone: `migration`
+/// already starts with `migrat`, while `authorization` must not fold into
+/// `author`, so each family lists the stem its forms share as a prefix
+/// (see `stem_hit`).
 fn norm_token(token: &str) -> String {
-    let mut s: String = token.to_ascii_lowercase();
+    let s = token.to_ascii_lowercase();
+    let s = strip_plural(s);
+    let s = strip_verb_ending(s);
+    collapse_double_consonant(s)
+}
+
+/// Strip regular plural endings (`-ies→y`/`-es`/`-s`); the length and
+/// `ss`/`us` guards keep short words, `class`, and `status` intact.
+fn strip_plural(mut s: String) -> String {
     if s.len() > 4 && s.ends_with("ies") {
         s.truncate(s.len() - 3);
         s.push('y');
@@ -172,12 +180,23 @@ fn norm_token(token: &str) -> String {
     } else if s.len() > 3 && s.ends_with('s') && !s.ends_with("ss") && !s.ends_with("us") {
         s.truncate(s.len() - 1);
     }
+    s
+}
+
+/// Strip regular verb endings (`-ing`/`-ed`); length guards keep short
+/// words (`red`, `sing`) intact.
+fn strip_verb_ending(mut s: String) -> String {
     if s.len() > 5 && s.ends_with("ing") {
         s.truncate(s.len() - 3);
     } else if s.len() > 4 && s.ends_with("ed") {
         s.truncate(s.len() - 2);
     }
-    // `running` → `runn` above; collapse the doubled consonant back.
+    s
+}
+
+/// Collapse a doubled trailing consonant left by the steps above:
+/// `running` → `runn` → `run`.
+fn collapse_double_consonant(mut s: String) -> String {
     let b = s.as_bytes();
     if s.len() > 3 && b[s.len() - 1] == b[s.len() - 2] && b[s.len() - 1].is_ascii_alphabetic() {
         s.truncate(s.len() - 1);
@@ -236,29 +255,16 @@ fn word_hit(text: &str, needle: &str) -> bool {
     })
 }
 
-/// Score one stem table against already-tokenized text: each hit adds its
-/// weight with its reason (deduped by the caller). One helper covers all
-/// four tables — stems score via [`stem_hit`], phrases via [`word_hit`].
-fn score_stems(
-    tokens: &[String],
+/// Score one weighted table: each hit adds its weight with its reason
+/// (deduped by the caller). One helper covers all four tables — callers
+/// pass [`stem_hit`] over tokens or [`word_hit`] over lowercased text.
+fn score_hits(
     table: &[(&str, i32, &'static str)],
     push: &mut impl FnMut(i32, &'static str),
+    mut is_hit: impl FnMut(&str) -> bool,
 ) {
-    for (stem, weight, reason) in table {
-        if stem_hit(tokens, stem) {
-            push(*weight, reason);
-        }
-    }
-}
-
-/// Score one literal-phrase table against lowercased hyphen-folded text.
-fn score_phrases(
-    lower: &str,
-    table: &[(&str, i32, &'static str)],
-    push: &mut impl FnMut(i32, &'static str),
-) {
-    for (phrase, weight, reason) in table {
-        if word_hit(lower, phrase) {
+    for (key, weight, reason) in table {
+        if is_hit(key) {
             push(*weight, reason);
         }
     }
@@ -353,7 +359,7 @@ pub(crate) fn count_history_tool_calls(history: &[ChatMessage]) -> u32 {
         .iter()
         .filter_map(|m| m.tool_calls.as_ref())
         .map(|calls| calls.len() as u32)
-        .fold(0u32, |a, b| a.saturating_add(b))
+        .fold(0u32, u32::saturating_add)
 }
 
 /// How many file paths the prompt names: whitespace chunks that are
@@ -361,27 +367,32 @@ pub(crate) fn count_history_tool_calls(history: &[ChatMessage]) -> u32 {
 /// `src/main.rs`). Caps at 9 — ten paths are not wiser than nine.
 fn count_path_refs(text: &str) -> usize {
     text.split_whitespace()
-        .filter(|chunk| {
-            let w =
-                chunk.trim_matches(|c: char| "`\"'()[],;:.!?<>".contains(c) || c.is_whitespace());
-            if w.len() < 3 || w.len() > 120 {
-                return false;
-            }
-            if w.contains('/') && w.chars().any(|c| c.is_ascii_alphanumeric()) {
-                return true;
-            }
-            match w.rfind('.') {
-                Some(i) => {
-                    let (base, ext) = (&w[..i], &w[i + 1..]);
-                    (2..=5).contains(&ext.len())
-                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
-                        && base.chars().any(|c| c.is_ascii_alphanumeric())
-                }
-                None => false,
-            }
-        })
+        .filter(|chunk| is_path_chunk(chunk))
         .take(9)
         .count()
+}
+
+/// One whitespace chunk looks like a path: `a/b`-shaped or `base.ext`
+/// with a 2–5-letter alphanumeric extension. Surrounding punctuation
+/// (backticks, quotes, brackets) is trimmed first; overlong chunks are
+/// never paths.
+fn is_path_chunk(chunk: &str) -> bool {
+    let w = chunk.trim_matches(|c: char| "`\"'()[],;:.!?<>".contains(c) || c.is_whitespace());
+    if w.len() < 3 || w.len() > 120 {
+        return false;
+    }
+    if w.contains('/') && w.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return true;
+    }
+    match w.rfind('.') {
+        Some(i) => {
+            let (base, ext) = (&w[..i], &w[i + 1..]);
+            (2..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && base.chars().any(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
 }
 
 /// Trivial-question shape: opens with an interrogative and either asks
@@ -397,7 +408,7 @@ fn is_trivial_question(text: &str) -> bool {
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .collect();
-    if !OPENERS.iter().any(|o| *o == first) {
+    if !OPENERS.contains(&first.as_str()) {
         return false;
     }
     text.trim_end().ends_with('?') || text.chars().count() < 160
@@ -412,30 +423,11 @@ const FAST_SCORE: i32 = -2;
 /// `Fast` stays short: a pasted dump mentioning a typo is still real work.
 const FAST_MAX_CHARS: usize = 400;
 
-/// Classify one turn with reasons. Single tokenize, then additive weights —
-/// no early `OR → Powerful`: `fix typo in auth` nets to zero (`Balanced`)
-/// instead of escalating on one word, and `explain architecture` stays put
-/// (`explain` −1, `architecture` +1).
-pub(crate) fn classify_with_reasons(signal: &TaskSignal, text: &str) -> Decision {
-    let tokens = tokenize(text);
-    // Hyphens fold to spaces so `multi-file` and `multi file` (likewise
-    // `cross-cutting`) match one phrase entry.
-    let lower = text.to_ascii_lowercase().replace('-', " ");
-    let mut score = 0i32;
-    let mut reasons: Vec<&'static str> = Vec::new();
-    let mut push = |weight: i32, reason: &'static str| {
-        if !reasons.contains(&reason) {
-            score += weight;
-            reasons.push(reason);
-        }
-    };
-
-    score_stems(&tokens, POWERFUL_STEMS, &mut push);
-    score_phrases(&lower, POWERFUL_PHRASES, &mut push);
-    score_stems(&tokens, FAST_STEMS, &mut push);
-    score_phrases(&lower, FAST_PHRASES, &mut push);
-
-    // Structure: what the turn looks like, not what it says.
+/// Structure: what the turn looks like, not what it says — named file
+/// paths, code fences, real session activity, and the legacy decisive
+/// signals (enormous prompt/session/tool count). Push order here is the
+/// reason order callers see, so it stays exactly as classified.
+fn score_structure(signal: &TaskSignal, text: &str, push: &mut impl FnMut(i32, &'static str)) {
     match count_path_refs(text) {
         n if n >= 3 => push(2, "names 3+ files"),
         2 => push(1, "names 2 files"),
@@ -465,6 +457,35 @@ pub(crate) fn classify_with_reasons(signal: &TaskSignal, text: &str) -> Decision
     if is_trivial_question(text) {
         push(-1, "trivial Q&A shape");
     }
+}
+
+/// Classify one turn with reasons. Single tokenize, then additive weights —
+/// no early `OR → Powerful`: `fix typo in auth` nets to zero (`Balanced`)
+/// instead of escalating on one word, and `explain architecture` stays put
+/// (`explain` −1, `architecture` +1).
+pub(crate) fn classify_with_reasons(signal: &TaskSignal, text: &str) -> Decision {
+    let tokens = tokenize(text);
+    // Hyphens fold to spaces so `multi-file` and `multi file` (likewise
+    // `cross-cutting`) match one phrase entry.
+    let lower = text.to_ascii_lowercase().replace('-', " ");
+    let mut score = 0i32;
+    let mut reasons: Vec<&'static str> = Vec::new();
+    let mut push = |weight: i32, reason: &'static str| {
+        if !reasons.contains(&reason) {
+            score += weight;
+            reasons.push(reason);
+        }
+    };
+
+    score_hits(POWERFUL_STEMS, &mut push, |stem| stem_hit(&tokens, stem));
+    score_hits(POWERFUL_PHRASES, &mut push, |phrase| {
+        word_hit(&lower, phrase)
+    });
+    score_hits(FAST_STEMS, &mut push, |stem| stem_hit(&tokens, stem));
+    score_hits(FAST_PHRASES, &mut push, |phrase| word_hit(&lower, phrase));
+
+    // Structure: what the turn looks like, not what it says.
+    score_structure(signal, text, &mut push);
 
     // Insertion order already fronts the strongest signals: powerful
     // stems/phrases score before fast ones, structure last — so
