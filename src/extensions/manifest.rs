@@ -21,8 +21,17 @@ pub(crate) const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 30;
 /// typo fails loudly at load instead of silently granting nothing. `model`
 /// exposes the current model + its credentials (`dex.model`); `net` allows
 /// HTTP confined to that model's own endpoint (`dex.net.fetch`) and
-/// requires `model` (confinement needs the endpoint).
-const KNOWN_CAPABILITIES: &[&str] = &["tools", "tools.override", "workspace.read", "model", "net"];
+/// requires `model` (confinement needs the endpoint); `net.providers`
+/// additionally widens the confinement to the configured provider
+/// endpoints (each with its own key) and requires `net`.
+const KNOWN_CAPABILITIES: &[&str] = &[
+    "tools",
+    "tools.override",
+    "workspace.read",
+    "model",
+    "net",
+    "net.providers",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ManifestTool {
@@ -127,6 +136,9 @@ pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
     }
     if manifest.has_capability("net") && !manifest.has_capability("model") {
         return Err("capability 'net' requires the 'model' capability (fetch is confined to the model's endpoint)".to_string());
+    }
+    if manifest.has_capability("net.providers") && !manifest.has_capability("net") {
+        return Err("capability 'net.providers' requires the 'net' capability".to_string());
     }
     Ok(manifest)
 }
