@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::core::types::{ChatMessage, LlmToolCall, Role};
 use crate::llm::config::LlmConfig;
-use crate::llm::protocol::tools_schema_parts;
+use crate::llm::protocol::{sort_wire_tools_by_name, tools_schema_parts};
 
 /// `anthropic-version` header value pinned by `AuthScheme::Anthropic`.
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -246,9 +246,9 @@ fn tool_result_block(message: &ChatMessage) -> Value {
 /// Shared tool schemas → Anthropic shape (`input_schema` instead of the
 /// OpenAI `function.parameters` wrapper). Borrowed slices: no merged-schema
 /// copy on the wire path. Native order is fixed; the MCP + extension tail is
-/// sorted by name at serialization so the schema prefix is byte-identical no
-/// matter what order the background refreshes landed in (prompt-cache
-/// stability) — the caches already sort, this holds the invariant at the wire.
+/// sorted by name at serialization so refresh completion order can't reorder
+/// the schema (deterministic bytes; adding/removing a tool still shifts the
+/// tail) — the caches already sort, this holds the invariant at the wire.
 pub(crate) fn anthropic_tools() -> Vec<Value> {
     let (native, mcp, ext) = tools_schema_parts();
     let mut out: Vec<Value> = native
@@ -272,7 +272,7 @@ pub(crate) fn anthropic_tools() -> Vec<Value> {
             })
         })
         .collect();
-    tail.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    sort_wire_tools_by_name(&mut tail);
     out.extend(tail);
     out
 }
@@ -379,8 +379,8 @@ mod tests {
 
     #[test]
     fn messages_input_is_append_only_for_cache_stability() {
-        // Prompt-cache stability: extending the history must only append to
-        // the wire view, never rewrite earlier entries. The provider caches
+        // Prompt-cache stability: appending a new user turn only appends to
+        // the wire view, never rewrites earlier entries. The provider caches
         // the prefix; any byte change in it forces a full re-read.
         let mut base = vec![
             ChatMessage::system("sys"),
@@ -404,6 +404,15 @@ mod tests {
         assert_eq!(sys1, sys2);
         assert_eq!(input2.len(), input1.len() + 1);
         assert_eq!(&input2[..input1.len()], &input1[..]);
+        // Known exception: appending another consecutive tool_result merges
+        // into the trailing user message (roles must alternate), rewriting
+        // the last wire entry instead of appending.
+        base.pop();
+        let (_, before) = messages_input(&base);
+        base.push(ChatMessage::tool_result("t2", "out2"));
+        let (_, after) = messages_input(&base);
+        assert_eq!(after.len(), before.len());
+        assert_ne!(after[before.len() - 1], before[before.len() - 1]);
     }
 
     #[test]
