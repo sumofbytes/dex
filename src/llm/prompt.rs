@@ -1,16 +1,17 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::core::types::Skill;
 use crate::skills::format_skills_for_prompt;
 
-/// Nearest project file walking up from the cwd (`AGENTS.md` wins, else
+/// Nearest project file walking up from `dir` (`AGENTS.md` wins, else
 /// `CLAUDE.md`), returned as a path so callers can stat before reading.
-fn project_file() -> Option<PathBuf> {
-    let mut dir = env::current_dir().ok()?;
+fn project_file_from(dir: &Path) -> Option<PathBuf> {
+    let mut dir = dir.to_path_buf();
     loop {
         for name in ["AGENTS.md", "CLAUDE.md"] {
             let candidate = dir.join(name);
@@ -29,43 +30,59 @@ fn project_file() -> Option<PathBuf> {
 /// identity (perf doc §11): the daemon rebuilds the system prompt every
 /// turn, and each rebuild was re-walking ancestors + re-reading AGENTS.md.
 /// A missing project file is NOT cached (a walk is stat-only; caching the
-/// absence would hide a file created mid-process).
-static PROJECT_CONTEXT_CACHE: OnceLock<Mutex<Option<ProjectContextCache>>> = OnceLock::new();
+/// absence would hide a file created mid-process). Keyed by (cwd, path) so
+/// a multi-session daemon serving several workspaces doesn't cross-contaminate.
+static PROJECT_CONTEXT_CACHE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), ProjectContextCache>>> =
+    OnceLock::new();
 
 struct ProjectContextCache {
-    cwd: PathBuf,
-    path: PathBuf,
     mtime: SystemTime,
     len: u64,
     content: Option<String>,
 }
 
+fn project_cache() -> &'static Mutex<HashMap<(PathBuf, PathBuf), ProjectContextCache>> {
+    PROJECT_CONTEXT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub(crate) fn project_context() -> Option<String> {
     let cwd = env::current_dir().ok()?;
-    let path = project_file()?;
+    project_context_for(&cwd)
+}
+
+/// Same as [`project_context`] but rooted at `dir`: daemon turns pass the
+/// session workspace so multi-session daemons don't serve the daemon cwd's
+/// file to every session.
+pub(crate) fn project_context_for(dir: &Path) -> Option<String> {
+    let cwd = dir.to_path_buf();
+    let path = project_file_from(&cwd)?;
+    // Read first, then stat: storing the pre-read identity with post-read
+    // bytes serves stale on a racing writer (TOCTOU). The post-read stat
+    // describes what was actually read; a concurrent change misses next time.
+    let content = fs::read_to_string(&path).ok();
     let meta = fs::metadata(&path).ok()?;
     let (mtime, len) = (meta.modified().ok()?, meta.len());
-    if let Some(hit) = PROJECT_CONTEXT_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("project context cache lock")
-        .as_ref()
-    {
-        if hit.cwd == cwd && hit.path == path && hit.mtime == mtime && hit.len == len {
+    let mut cache = project_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cache.get(&(cwd.clone(), path.clone())) {
+        if hit.mtime == mtime && hit.len == len {
             return hit.content.clone();
         }
     }
-    let content = fs::read_to_string(&path).ok();
-    *PROJECT_CONTEXT_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("project context cache lock") = Some(ProjectContextCache {
-        cwd,
-        path,
-        mtime,
-        len,
-        content: content.clone(),
-    });
+    cache.insert(
+        (cwd, path),
+        ProjectContextCache {
+            mtime,
+            len,
+            content: content.clone(),
+        },
+    );
+    // FIFO-cap: project files are few, but a daemon serving many workspaces
+    // must not grow without bound.
+    if cache.len() > 64 {
+        if let Some(k) = cache.keys().next().cloned() {
+            cache.remove(&k);
+        }
+    }
     content
 }
 
@@ -85,6 +102,17 @@ pub(crate) fn system_prompt(skills: &[Skill]) -> String {
 /// `Some` replaces the built-in base; `None` falls back to the env/file
 /// layers via `system_prompt_origin`.
 pub(crate) fn system_prompt_with_override(skills: &[Skill], explicit: Option<&str>) -> String {
+    system_prompt_with_override_for(skills, explicit, None)
+}
+
+/// Same as [`system_prompt_with_override`] but rooted at `cwd` for the
+/// project-instructions lookup: daemon turns pass the session workspace so
+/// multi-session daemons don't serve the daemon cwd's file to every session.
+pub(crate) fn system_prompt_with_override_for(
+    skills: &[Skill],
+    explicit: Option<&str>,
+    cwd: Option<&Path>,
+) -> String {
     let (custom, _) = crate::llm::config::system_prompt_origin(explicit);
     let mut prompt = custom.unwrap_or_else(|| {
         concat!(
@@ -98,7 +126,11 @@ pub(crate) fn system_prompt_with_override(skills: &[Skill], explicit: Option<&st
         )
         .to_string()
     });
-    if let Some(ctx) = project_context() {
+    let ctx = match cwd {
+        Some(dir) => project_context_for(dir),
+        None => project_context(),
+    };
+    if let Some(ctx) = ctx {
         prompt.push_str("\n\n--- Project instructions ---\n");
         prompt.push_str(&ctx);
     }

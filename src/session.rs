@@ -307,13 +307,21 @@ fn history_cache() -> &'static Mutex<PathCache<HistorySnapshot>> {
 }
 
 /// Snapshot lookup: cloned vec on identity match; a missing file evicts.
+/// Identity is `(mtime, len)`: sufficient on filesystems with
+/// nanosecond mtime granularity (ext4/APFS/NTFS — any same-length
+/// rewrite changes mtime and misses). Coarse-granularity filesystems
+/// (1 s, e.g. FAT) can false-hit on a same-length rewrite within one
+/// tick — accepted: sessions live on local disks, and production
+/// writers only append (len always grows).
 fn history_cache_get(path: &Path) -> Option<Vec<ChatMessage>> {
-    let id = file_id(path);
-    let mut cache = history_cache().lock().expect("history cache lock");
-    let Some(id) = id else {
-        cache.evict(path);
+    let Some(id) = file_id(path) else {
+        history_cache()
+            .lock()
+            .expect("history cache lock")
+            .evict(path);
         return None;
     };
+    let cache = history_cache().lock().expect("history cache lock");
     match cache.get(path) {
         Some((cached_id, messages)) if *cached_id == id => Some(messages.clone()),
         _ => None,
@@ -409,7 +417,7 @@ struct EventRow<'a> {
 }
 
 /// Scan the events journal from the newest checkpoint at or before `since`,
-/// returning `(rows with seq > since, highest seq in the file)`. When
+/// returning `(rows with seq >= since, highest seq in the file)`. When
 /// `collect` is false payloads are skipped (the `max_event_seq` path).
 type EventsScan = (Vec<(u64, String)>, Option<u64>);
 
@@ -419,14 +427,16 @@ fn scan_events(
     collect: bool,
     limit: usize,
 ) -> io::Result<EventsScan> {
+    // Cursor is the next seq to serve (inclusive): initial 0 serves seq 0,
+    // and `next_seq = max + 1` resumes without loss or duplication.
     // Fast path: the journal is byte-identical to a previous scan and the
-    // cursor is at/past everything served — the idle poll. No file open.
+    // cursor is past everything served — the idle poll. No file open.
     // Only a drained scan publishes a servable tip (a page-limited scan
     // stops early, so its `max_seq` is not the file end — §1).
     if let Some(id) = file_id(events_path) {
         let cache = events_cache().lock().expect("events cache lock");
         if let Some(entry) = cache.get(events_path) {
-            if entry.id == id && entry.drained && entry.max_seq.is_none_or(|m| since >= m) {
+            if entry.id == id && entry.drained && entry.max_seq.is_none_or(|m| since > m) {
                 return Ok((Vec::new(), entry.max_seq));
             }
         }
@@ -518,7 +528,7 @@ fn scan_events(
             checkpoints.push((row.seq, row_start));
             next_chunk_at = row_start.saturating_add(EVENTS_CHECKPOINT_BYTES);
         }
-        if collect && row.seq > since {
+        if collect && row.seq >= since {
             out.push((row.seq, row.payload.get().to_owned()));
             // Page-limited serving (§1): stop after `limit` served rows.
             // `max`/checkpoints cover exactly the served prefix, so the
@@ -944,6 +954,9 @@ impl Session {
                 return Some(path);
             }
         }
+        // Deterministic on colliding prefixes: filesystem order is
+        // unspecified, so sort before confirming.
+        prefixed.sort_unstable();
         prefixed.into_iter().find(|path| {
             Self::from_path(path).is_ok_and(|s| {
                 let id = s.id().to_ascii_lowercase();
@@ -1030,19 +1043,29 @@ impl Session {
     pub(crate) fn append_message(&mut self, message: &ChatMessage) -> io::Result<()> {
         let id = self.next_id();
         let timestamp = Self::now_iso();
-        self.append_line(&SessionMessageEntry {
-            entry_type: "message",
-            id: &id,
-            timestamp: &timestamp,
-            message,
-        })?;
+        self.append_line_inner(
+            &SessionMessageEntry {
+                entry_type: "message",
+                id: &id,
+                timestamp: &timestamp,
+                message,
+            },
+            false,
+        )?;
         // Write-through to the parsed-history snapshot (perf doc §11):
-        // mirror the loader, which skips System-role messages.
-        if message.role != Role::System {
-            if let Some(path) = self.path.as_deref() {
-                let mut cache = history_cache().lock().expect("history cache lock");
-                if let Some((_, messages)) = cache.get_mut(path) {
-                    messages.push(message.clone());
+        // mirror the loader, which skips System-role messages. Fused with
+        // the identity refresh under one lock — a separate touch + push
+        // lets a concurrent reader see the new FileId with the old vec and
+        // miss the last message.
+        if let Some(path) = self.path.as_deref() {
+            let Some(id) = file_id(path) else {
+                return Ok(());
+            };
+            let mut cache = history_cache().lock().expect("history cache lock");
+            if let Some(entry) = cache.get_mut(path) {
+                entry.0 = id;
+                if message.role != Role::System {
+                    entry.1.push(message.clone());
                 }
             }
         }
@@ -1055,12 +1078,17 @@ impl Session {
             id: self.next_id(),
             timestamp: Self::now_iso(),
         };
-        self.append_line(&entry)?;
-        // The loader folds everything before a `clear` marker: mirror it.
+        self.append_line_inner(&entry, false)?;
+        // The loader folds everything before a `clear` marker: mirror it
+        // under the same lock as the identity refresh (see above).
         if let Some(path) = self.path.as_deref() {
+            let Some(id) = file_id(path) else {
+                return Ok(());
+            };
             let mut cache = history_cache().lock().expect("history cache lock");
-            if let Some((_, messages)) = cache.get_mut(path) {
-                messages.clear();
+            if let Some(entry) = cache.get_mut(path) {
+                entry.0 = id;
+                entry.1.clear();
             }
         }
         Ok(())
@@ -1126,6 +1154,10 @@ impl Session {
     }
 
     fn append_line<T: Serialize>(&mut self, entry: &T) -> io::Result<()> {
+        self.append_line_inner(entry, true)
+    }
+
+    fn append_line_inner<T: Serialize>(&mut self, entry: &T, touch: bool) -> io::Result<()> {
         // Path is only needed to open the handle — avoid allocating per line.
         if self.journal.is_none() {
             let Some(path) = self.path.as_deref() else {
@@ -1147,9 +1179,13 @@ impl Session {
             file.sync_data()?;
         }
         // Refresh the history snapshot's identity: our own append never
-        // invalidates it (see `history_cache_touch`).
-        if let Some(path) = self.path.as_deref() {
-            history_cache_touch(path);
+        // invalidates it (see `history_cache_touch`). Message/clear writers
+        // pass `touch: false` and fuse the refresh with their vector update
+        // under one lock instead.
+        if touch {
+            if let Some(path) = self.path.as_deref() {
+                history_cache_touch(path);
+            }
         }
         Ok(())
     }
@@ -1256,7 +1292,9 @@ impl Session {
         Ok(())
     }
 
-    /// Replay stream events with `seq > since`, in order. `path` is the
+    /// Replay stream events with `seq >= since`, in order (`since` is the
+    /// next seq to serve, inclusive — `next_seq` chains without loss or
+    /// duplication). `path` is the
     /// SESSION file; the journal lives at `<session>.events.jsonl`.
     /// Served from the steady-state cursor when the journal hasn't grown
     /// (one `stat`, no file open — perf doc §12), otherwise scanned from
@@ -1927,7 +1965,7 @@ mod tests {
         s.append_event(3, r#"{"type":"assistant_text","data":"c"}"#)
             .unwrap();
         let path = s.path().unwrap().to_path_buf();
-        let after = Session::load_events(&path, 1, usize::MAX).unwrap();
+        let after = Session::load_events(&path, 2, usize::MAX).unwrap();
         let seqs: Vec<u64> = after.iter().map(|(seq, _)| *seq).collect();
         let texts: Vec<String> = after
             .iter()
@@ -2012,22 +2050,21 @@ mod tests {
             .unwrap();
         }
         // Miss parses; the idle re-poll serves nothing without file IO.
-        // (Cursor semantics are pre-existing `seq > since`: seq 0 is never
-        // served to a `since=0` poll.)
-        assert_eq!(Session::load_events(&path, 0, usize::MAX).unwrap().len(), 3);
-        assert!(Session::load_events(&path, 3, usize::MAX)
+        // Cursor is the next seq to serve (inclusive): `since=0` serves seq 0.
+        assert_eq!(Session::load_events(&path, 0, usize::MAX).unwrap().len(), 4);
+        assert!(Session::load_events(&path, 4, usize::MAX)
             .unwrap()
             .is_empty());
         // A behind cursor re-scans and still gets every row exactly once.
         let behind = Session::load_events(&path, 1, usize::MAX).unwrap();
         assert_eq!(
             behind.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![1, 2, 3]
         );
         // Appends extend the cursor: only the tail is served.
         s.append_event(4, r#"{"type":"assistant_text","data":"4"}"#)
             .unwrap();
-        let tail = Session::load_events(&path, 3, usize::MAX).unwrap();
+        let tail = Session::load_events(&path, 4, usize::MAX).unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].0, 4);
         assert_eq!(Session::max_event_seq(&path), Some(4));
@@ -2048,7 +2085,7 @@ mod tests {
                 .checkpoints
                 .is_empty());
         }
-        let tail = Session::load_events(&path, 1590, usize::MAX).unwrap();
+        let tail = Session::load_events(&path, 1591, usize::MAX).unwrap();
         assert_eq!(tail.len(), 9);
         assert_eq!(tail[0].0, 1591);
         assert_eq!(Session::max_event_seq(&path), Some(1599));
@@ -2080,8 +2117,9 @@ mod tests {
             )
             .unwrap();
         }
-        // Cursor semantics are pre-existing `seq > since`: seq 0 is never
-        // served to a `since=0` poll.
+        // Cursor semantics are inclusive (`seq >= since`): `since` is the
+        // next seq to serve, so pages chain with `last + 1` (the daemon's
+        // `next_seq`). Every row lands exactly once, including seq 0.
         let mut since = 0u64;
         let mut got = Vec::new();
         for _ in 0..10 {
@@ -2089,10 +2127,10 @@ mod tests {
             if page.is_empty() {
                 break;
             }
-            since = page.last().unwrap().0;
+            since = page.last().unwrap().0 + 1;
             got.extend(page.into_iter().map(|(seq, _)| seq));
         }
-        assert_eq!(got, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 6]);
         // Drained: the idle re-poll serves nothing (fast path, no file open).
         assert!(Session::load_events(&path, since, 3).unwrap().is_empty());
         let _ = fs::remove_file(&path);
@@ -2112,15 +2150,16 @@ mod tests {
         journal
             .append_event(0, r#"{"type":"assistant_text","data":"a"}"#)
             .unwrap();
-        // The row landed (max sees seq 0); replay serves it to any cursor
-        // behind it under the pre-existing `seq > since` semantics.
+        // The row landed (max sees seq 0); replay serves it to a `since=0`
+        // poll under the inclusive cursor semantics.
         assert_eq!(Session::max_event_seq(&path), Some(0));
         journal
             .append_event(1, r#"{"type":"assistant_text","data":"b"}"#)
             .unwrap();
         let rows = Session::load_events(&path, 0, usize::MAX).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[1].0, 1);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("events.jsonl"));
     }

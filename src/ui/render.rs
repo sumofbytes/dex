@@ -1147,12 +1147,12 @@ impl TranscriptView {
                 app.display_cache.extend(wb.rows.iter().cloned());
             }
         }
-        // The open thinking / activity rows animate in place: their cached
-        // lines are rewritten every frame (O(1)) instead of invalidating
-        // the cache, which would re-wrap the whole transcript at animation
-        // rate. Both animated blocks sit at the transcript tail — the open
-        // activity block is the tail block while busy, and the open
-        // thinking block is the last content block (any non-thinking sink
+        // The open thinking / activity rows animate: their lines are overlaid
+        // on the rendered window (not written back into `display_cache`), so
+        // a later `first_dirty` re-extend from `wrapped_cache` can't resurrect
+        // a stale spinner tick. Both animated blocks sit at the transcript
+        // tail — the open activity block is the tail block while busy, and the
+        // open thinking block is the last content block (any non-thinking sink
         // line closes it) — so their display rows derive from the tail
         // instead of walking the cache.
         let mut thinking_row: Option<usize> = None;
@@ -1193,16 +1193,6 @@ impl TranscriptView {
                 }
             }
         }
-        if let Some(row) = thinking_row {
-            if let Some(line) = app.display_cache.get_mut(row) {
-                *line = thinking_indicator_line(true, None, app.tick, area.width);
-            }
-        }
-        if let Some(row) = activity_row {
-            if let Some(line) = app.display_cache.get_mut(row) {
-                *line = activity_indicator_line(app.tick, area.width);
-            }
-        }
         let total = app.display_cache.len();
         let max_scroll = (total.saturating_sub(visible)) as u16;
         if app.autoscroll {
@@ -1227,6 +1217,19 @@ impl TranscriptView {
             .take(visible)
             .cloned()
             .collect();
+        // Animated overlay on the window copy (O(1)): `display_cache` keeps
+        // the un-animated rows so cache re-extends never resurrect a stale tick.
+        let scroll = app.scroll as usize;
+        if let Some(row) = thinking_row {
+            if row >= scroll && row - scroll < window.len() {
+                window[row - scroll] = thinking_indicator_line(true, None, app.tick, area.width);
+            }
+        }
+        if let Some(row) = activity_row {
+            if row >= scroll && row - scroll < window.len() {
+                window[row - scroll] = activity_indicator_line(app.tick, area.width);
+            }
+        }
         if let Some(sel) = app.selection {
             apply_selection(&mut window, app.scroll as usize, sel, area.width);
         }
@@ -2708,12 +2711,18 @@ mod tests {
             started: Instant::now(),
             settled: None,
         }];
-        let draw = |app: &mut super::super::App| {
-            let mut terminal =
-                ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
-            terminal
-                .draw(|frame| view(frame, app))
-                .expect("render should succeed");
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let rendered = |terminal: &ratatui::Terminal<TestBackend>| -> Vec<String> {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim()
+                        .to_string()
+                })
+                .collect()
         };
         let lines = |app: &super::super::App| -> Vec<String> {
             app.display_cache
@@ -2728,16 +2737,16 @@ mod tests {
                 })
                 .collect()
         };
-        draw(&mut app);
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
+        // The live spinner paints onto the window overlay, not back into
+        // `display_cache` (so a later cache re-extend can't resurrect a
+        // stale tick): assert on the painted buffer.
+        let painted = rendered(&terminal);
         assert!(
-            app.display_cache.iter().any(|l| l
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                .contains("● Working ..")),
-            "{:?}",
-            app.display_cache
+            painted.iter().any(|l| l.contains("● Working ..")),
+            "{painted:?}"
         );
 
         app.busy = false;
@@ -2746,7 +2755,9 @@ mod tests {
             started: Instant::now(),
             settled: Some("Worked for 12s · 4.2k tokens".into()),
         };
-        draw(&mut app);
+        terminal
+            .draw(|frame| view(frame, &mut app))
+            .expect("render should succeed");
         let settled = lines(&app);
         assert!(
             settled
@@ -2801,10 +2812,21 @@ mod tests {
             .iter()
             .map(|l| text(l).trim().to_string())
             .collect();
+        let buffer = terminal.backend().buffer();
+        let painted: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
         // The settled block stays at three dots even though a block is open.
         assert!(lines.iter().any(|l| l == "◌ Thinking ..."), "{lines:?}");
-        // The open tail block still animates.
-        assert!(lines.iter().any(|l| l == "◌ Thinking .."), "{lines:?}");
+        // The open tail block still animates — the live tick paints onto the
+        // window overlay, not back into `display_cache`.
+        assert!(painted.iter().any(|l| l == "◌ Thinking .."), "{painted:?}");
     }
 
     #[test]
