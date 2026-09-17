@@ -245,12 +245,24 @@ fn tool_result_block(message: &ChatMessage) -> Value {
 
 /// Shared tool schemas → Anthropic shape (`input_schema` instead of the
 /// OpenAI `function.parameters` wrapper). Borrowed slices: no merged-schema
-/// copy on the wire path.
+/// copy on the wire path. Native order is fixed; the MCP + extension tail is
+/// sorted by name at serialization so the schema prefix is byte-identical no
+/// matter what order the background refreshes landed in (prompt-cache
+/// stability) — the caches already sort, this holds the invariant at the wire.
 pub(crate) fn anthropic_tools() -> Vec<Value> {
     let (native, mcp, ext) = tools_schema_parts();
-    native
+    let mut out: Vec<Value> = native
         .iter()
-        .chain(mcp.iter())
+        .map(|tool| {
+            json!({
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "input_schema": tool.function.parameters,
+            })
+        })
+        .collect();
+    let mut tail: Vec<Value> = mcp
+        .iter()
         .chain(ext.iter())
         .map(|tool| {
             json!({
@@ -259,7 +271,10 @@ pub(crate) fn anthropic_tools() -> Vec<Value> {
                 "input_schema": tool.function.parameters,
             })
         })
-        .collect()
+        .collect();
+    tail.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    out.extend(tail);
+    out
 }
 
 #[cfg(test)]
@@ -360,6 +375,47 @@ mod tests {
         assert_eq!(blocks[1]["type"], "text");
         assert_eq!(blocks[1]["text"], "answer");
         assert_eq!(blocks[2]["type"], "tool_use");
+    }
+
+    #[test]
+    fn messages_input_is_append_only_for_cache_stability() {
+        // Prompt-cache stability: extending the history must only append to
+        // the wire view, never rewrite earlier entries. The provider caches
+        // the prefix; any byte change in it forces a full re-read.
+        let mut base = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant_calls(
+                None,
+                vec![LlmToolCall {
+                    id: "t1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+            ),
+            ChatMessage::tool_result("t1", "out1"),
+        ];
+        let (sys1, input1) = messages_input(&base);
+        base.push(ChatMessage::user("follow-up"));
+        let (sys2, input2) = messages_input(&base);
+        assert_eq!(sys1, sys2);
+        assert_eq!(input2.len(), input1.len() + 1);
+        assert_eq!(&input2[..input1.len()], &input1[..]);
+    }
+
+    #[test]
+    fn messages_body_keeps_system_and_tools_stable_across_appends() {
+        let _catalog = HermeticCatalog::empty("prefix-stable");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut base = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+        let body1 = messages_body(&config, &base, true);
+        base.push(ChatMessage::user("follow-up"));
+        let body2 = messages_body(&config, &base, true);
+        assert_eq!(body1["system"], body2["system"]);
+        assert_eq!(body1["tools"], body2["tools"]);
     }
 
     #[test]
