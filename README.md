@@ -672,10 +672,17 @@ permission gates as a model-issued call.
 
 Model-aware extensions declare the `model` capability
 (`dex.model.current()` for the served `{provider, model, id, api, base_url}`,
-`dex.model.auth()` for its key + endpoint + merged extra headers) and the
-`net` capability (`dex.net.fetch({url, method, headers, body, timeout_ms})`,
-HTTP confined to that model's own endpoint — scheme+host+port must match;
-`net` requires `model`). `dex.json` encodes/decodes request bodies. Non-2xx
+`dex.model.auth()` for its key + endpoint + merged extra headers — or
+`dex.model.auth("<provider>")` for another configured provider's deposits,
+and `dex.model.providers()` for the configured list with resolvable keys)
+and the `net` capability (`dex.net.fetch({url, method, headers, body,
+timeout_ms})`, HTTP confined to that model's own endpoint —
+scheme+host+port must match; `net` requires `model`). Declaring
+`net.providers` additionally allows calls to any *configured provider
+endpoint* — every allowed origin comes from the user's own config, never an
+arbitrary host — which is how a model-independent extension (search, …)
+falls back to another provider. `dex.json` encodes/decodes request
+bodies. Non-2xx
 is a `{status, headers, body}` value, not an error; redirects are never
 followed (a 3xx surfaces as a value instead of escaping the endpoint
 check); per-call `timeout_ms`
@@ -688,11 +695,14 @@ to a gateway endpoint route like dex's own. The host fires `model_select`
 (first turn always, then on `provider/model` change; fail-open) so extensions
 can hide tools the model cannot serve (`dex.tools.set_active` accepts short
 own-tool names). The served model is scoped to the turn — concurrent sessions
-and nested subagent turns each see their own. See `examples/extensions/web` — provider-native web search
-(gemini / openai-responses / anthropic) + URL fetch (Gemini only) that reuses
-the current model's credentials and never switches the model silently — as
-the reference. Copy it to `$XDG_CONFIG_HOME/dex/extensions/web` (or
-`dex extensions install <dir>`) to use it.
+and nested subagent turns each see their own. See `examples/extensions/web` —
+provider-native web search (gemini / openai-responses / anthropic) + URL fetch
+(Gemini only) that reuses the current model's credentials, hides tools no
+target can serve, and falls back to a `/search-model` override provider (per
+extension `dex.state`) when the served model has no search API — never
+switching the model silently. Copy it to
+`$XDG_CONFIG_HOME/dex/extensions/web` (or `dex extensions install <dir>`) to
+use it.
 
 ```yaml
 extensions:
