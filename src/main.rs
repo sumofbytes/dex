@@ -4,6 +4,7 @@ mod client;
 mod core;
 mod daemon;
 mod extensions;
+mod jev;
 mod llm;
 mod mcp;
 mod protocol;

@@ -1067,7 +1067,9 @@ async fn run_turn_inner(
         // The history load above doubles as the routing signal (token size
         // plus real tool-call counts) and is reused for the turn below, so
         // routing sees exactly what the turn will send at no extra load.
-        crate::llm::config::route_turn(&req.prompt, &history)
+        // Async: Jev's tier-Choice classifies here when
+        // `DEX_ROUTING_CLASSIFIER=jev`, else the deterministic default.
+        crate::llm::config::route_turn_async(&req.prompt, &history).await
     } else {
         None
     };
