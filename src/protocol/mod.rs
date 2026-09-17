@@ -126,6 +126,21 @@ pub struct ChatRequest {
     /// omit it and the daemon falls back to its own env/file layers.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Per-turn reasoning effort override from a remote `/thinking` choice.
+    /// `None` (older clients omit it) uses the daemon default; `Some("")`
+    /// is an explicit clear (unset, ignoring env); otherwise the level.
+    #[serde(default)]
+    pub thinking_effort: Option<String>,
+}
+
+/// Request to run one registered extension slash command on the daemon
+/// (`/<name> [args]` in a remote TUI). The daemon resolves `name` against
+/// its own manager — the client never needs the extension id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionRunRequest {
+    pub name: String,
+    #[serde(default)]
+    pub arg: String,
 }
 
 /// Response to approve/deny a tool execution. `request_id` must match the
@@ -572,6 +587,7 @@ mod tests {
         assert!(req.base_url.is_none());
         assert!(req.permission.is_none());
         assert!(req.headers.is_none());
+        assert!(req.thinking_effort.is_none());
     }
 
     #[test]
