@@ -255,7 +255,7 @@ fn invalidate_config_cache() {
 /// then refreshes the index). No built-in default: a model the catalog
 /// doesn't size needs an explicit window, so the miss is an error.
 fn resolve_context_window(model: &str, file: &Option<serde_yaml::Value>) -> Result<u64, String> {
-    env_parse_opt("DEX_CONTEXT_WINDOW")
+    context_window_from_env()
         .or_else(|| load_config_num(file, "context_window"))
         .or_else(|| ctx_from_index(model))
         .or_else(|| {
@@ -270,6 +270,23 @@ fn resolve_context_window(model: &str, file: &Option<serde_yaml::Value>) -> Resu
                 "no context window for model '{model}' — set 'context_window: <tokens>' in the config or DEX_CONTEXT_WINDOW (see `dex doctor`)"
             )
         })
+}
+
+/// `DEX_CONTEXT_WINDOW`, positive integers only — mirrors `load_config_num`:
+/// a zero/garbage value is a warning, never a silent zero-width window that
+/// trips the compaction threshold on every turn.
+fn context_window_from_env() -> Option<u64> {
+    let raw = env::var("DEX_CONTEXT_WINDOW").ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            warn_once(
+                "env:DEX_CONTEXT_WINDOW",
+                "DEX_CONTEXT_WINDOW must be a positive token count — ignoring it",
+            );
+            None
+        }
+    }
 }
 
 /// Numeric config-file key (`context_window:`); positive integers only —
@@ -667,16 +684,25 @@ struct CatalogIndex {
 
 static CATALOG_INDEX: OnceLock<Mutex<Option<CatalogIndex>>> = OnceLock::new();
 
-/// Serve `f` from the in-process catalog index only when it is already warm:
-/// a mutex lock + one lookup, never a file read or rebuild. Used for
-/// cross-checks (see `ctx_from_index`) that must not turn the KB-slim
-/// fast path into a 4MB parse.
+/// Serve `f` from the in-process catalog index only when it is already warm
+/// AND still describes the catalog on disk: a mutex lock + one `stat`, never
+/// a file read or rebuild. Used for cross-checks (see `ctx_from_index`) that
+/// must not turn the KB-slim fast path into a 4MB parse. The metadata check
+/// matters: without it a warm index left over from the previous catalog
+/// generation would be served (and could rewrite `models.ctx.json` from
+/// stale context windows) after `dex update --models`.
 fn if_catalog_index_warm<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
+    let path = dex_catalog_cache_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
     let guard = CATALOG_INDEX
         .get()?
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().map(f)
+    guard
+        .as_ref()
+        .filter(|index| index.path == path && index.mtime == mtime && index.len == len)
+        .map(f)
 }
 
 /// Advertised reasoning-effort values of one model entry (models.dev
@@ -1635,7 +1661,7 @@ fn ctx_from_index(model: &str) -> Option<u64> {
         index
             .by_id
             .get(model.to_ascii_lowercase().as_str())
-            .and_then(|entries| entries.iter().find_map(|e| e.context))
+            .and_then(|entries| indexed_context(entries))
     })
     .flatten();
     match from_catalog {
@@ -1647,6 +1673,18 @@ fn ctx_from_index(model: &str) -> Option<u64> {
     }
 }
 
+/// The context window every reader agrees on: the first non-`endpoint_only`
+/// entry in catalog iteration order with a positive `context`. Shared by the
+/// slim-index reader (`ctx_from_index`), its repair table
+/// (`ctx_map_from_index`) and `build_ctx_map`, so a cold process and a warm
+/// one can't disagree and rewrite `models.ctx.json` back and forth.
+fn indexed_context(entries: &[IndexedModel]) -> Option<u64> {
+    entries
+        .iter()
+        .filter(|e| !e.endpoint_only)
+        .find_map(|e| e.context.filter(|c| *c > 0))
+}
+
 /// The full model→context table from the warm catalog index — the repair
 /// `ctx_from_index` writes when the slim file disagrees with the catalog,
 /// instead of re-parsing the 4MB catalog to rebuild it.
@@ -1654,12 +1692,7 @@ fn ctx_map_from_index(index: &CatalogIndex) -> BTreeMap<String, u64> {
     index
         .by_id
         .iter()
-        .filter_map(|(id, entries)| {
-            entries
-                .iter()
-                .find_map(|e| e.context)
-                .map(|ctx| (id.clone(), ctx))
-        })
+        .filter_map(|(id, entries)| indexed_context(entries).map(|ctx| (id.clone(), ctx)))
         .collect()
 }
 
@@ -1680,7 +1713,7 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
             if let Some(models) = entry.get("models").and_then(|m| m.as_object()) {
                 for (id, m) in models {
                     if let Some(ctx) = context_of(m) {
-                        map.insert(id.to_ascii_lowercase(), ctx);
+                        map.entry(id.to_ascii_lowercase()).or_insert(ctx);
                     }
                 }
             }
@@ -1689,7 +1722,7 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
     if let Some(models) = catalog.get("models").and_then(|m| m.as_object()) {
         for (id, m) in models {
             if let Some(ctx) = context_of(m) {
-                map.insert(id.to_ascii_lowercase(), ctx);
+                map.entry(id.to_ascii_lowercase()).or_insert(ctx);
             }
         }
     }
@@ -1781,6 +1814,7 @@ fn load_dex_catalog() -> Option<std::sync::Arc<serde_json::Value>> {
 /// `output` = generation cap). Matches either cache shape — api.json
 /// (per-provider models) or catalog.json (flat models map) — case-
 /// insensitively. First catalog entry in iteration order wins, as before.
+/// A zero `limit` is no limit, so it is filtered like the slim index does.
 fn catalog_limit(model: &str, key: &str) -> Option<u64> {
     with_catalog_index(|index| {
         index
@@ -1795,6 +1829,7 @@ fn catalog_limit(model: &str, key: &str) -> Option<u64> {
             })
     })
     .flatten()
+    .filter(|v| *v > 0)
 }
 
 fn catalog_context_window(model: &str) -> Option<u64> {
@@ -2207,19 +2242,16 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
 /// Console Go routing affinity: the zen/go endpoint rejects requests without
 /// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
 /// base URL, filled from the dex session id. Keys already present (any
-/// casing) are left alone, so explicit user headers always win regardless
-/// of call order.
-pub(crate) fn apply_opencode_session_headers(
-    out: &mut BTreeMap<String, String>,
-    provider: &Provider,
-    base_url: &str,
-    session_id: &str,
-) {
+/// casing) are left alone — including in the two file layers, which merge
+/// BELOW `extra_headers` on the wire — so explicit user headers always win
+/// regardless of call order.
+pub(crate) fn apply_opencode_session_headers(config: &mut LlmConfig, session_id: &str) {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return;
     }
-    let is_opencode = matches!(provider, Provider::OpenCode)
+    let base_url = config.base_url.as_str();
+    let is_opencode = matches!(config.provider, Provider::OpenCode)
         || reqwest::Url::parse(base_url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
@@ -2227,13 +2259,30 @@ pub(crate) fn apply_opencode_session_headers(
     if !is_opencode {
         return;
     }
-    for (name, value) in [
-        ("x-opencode-session", session_id),
-        ("x-opencode-client", "dex"),
-    ] {
-        if !out.keys().any(|k| k.eq_ignore_ascii_case(name)) {
-            out.insert(name.to_string(), value.to_string());
-        }
+    // A name pinned in ANY layer — file (`global_headers`/`provider_headers`)
+    // or env/CLI/per-request (`extra_headers`) — suppresses the auto-fill:
+    // the function writes into `extra_headers`, which merges last, so a
+    // file-level user header would otherwise lose to it. Resolve both
+    // predicates before mutating (they borrow `config` immutably).
+    let taken = |name: &str| {
+        config
+            .global_headers
+            .keys()
+            .chain(config.provider_headers.keys())
+            .chain(config.extra_headers.keys())
+            .any(|k| k.eq_ignore_ascii_case(name))
+    };
+    let session_taken = taken("x-opencode-session");
+    let client_taken = taken("x-opencode-client");
+    if !session_taken {
+        config
+            .extra_headers
+            .insert("x-opencode-session".to_string(), session_id.to_string());
+    }
+    if !client_taken {
+        config
+            .extra_headers
+            .insert("x-opencode-client".to_string(), "dex".to_string());
     }
 }
 
@@ -3258,18 +3307,16 @@ pub(crate) fn doctor(
             };
             let api = live.map(|c| c.api.name().to_string()).unwrap_or(chain_api);
             row(&mut out, "protocol", &api, api_source);
-            let (chain_ctx, ctx_source) = if let Ok(v) = env::var("DEX_CONTEXT_WINDOW") {
-                (v, "DEX_CONTEXT_WINDOW".to_string())
+            let (chain_ctx, ctx_source) = if let Some(v) = context_window_from_env() {
+                (v.to_string(), "DEX_CONTEXT_WINDOW".to_string())
+            } else if let Some(ctx) = load_config_num(&file, "context_window") {
+                (ctx.to_string(), "config context_window:".to_string())
             } else if let Some(ctx) = ctx_from_index(&model) {
                 (ctx.to_string(), "cached context index".to_string())
             } else {
-                match (
-                    load_config_num(&file, "context_window"),
-                    catalog_context_window(&model),
-                ) {
-                    (_, Some(ctx)) => (ctx.to_string(), "models.dev catalog".to_string()),
-                    (Some(ctx), None) => (ctx.to_string(), "config context_window:".to_string()),
-                    (None, None) => (
+                match catalog_context_window(&model) {
+                    Some(ctx) => (ctx.to_string(), "models.dev catalog".to_string()),
+                    None => (
                         "UNKNOWN".to_string(),
                         "no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW"
                             .to_string(),
@@ -4172,65 +4219,65 @@ pub(crate) mod tests {
     #[test]
     fn opencode_session_headers_gated_and_explicit_wins() {
         use super::apply_opencode_session_headers;
-        use std::collections::BTreeMap;
         // Opencode provider (zen or go endpoint) + session id → both headers.
-        let mut out = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::OpenCode,
-            "https://opencode.ai/zen/go/v1",
-            "sess-1",
-        );
+        let mut cfg = test_cfg();
+        apply_opencode_session_headers(&mut cfg, "sess-1");
         assert_eq!(
-            out.get("x-opencode-session").map(String::as_str),
+            cfg.extra_headers
+                .get("x-opencode-session")
+                .map(String::as_str),
             Some("sess-1")
         );
         assert_eq!(
-            out.get("x-opencode-client").map(String::as_str),
+            cfg.extra_headers
+                .get("x-opencode-client")
+                .map(String::as_str),
             Some("dex")
         );
         // Generic provider on another host → nothing.
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::Generic("other".to_string()),
-            "https://other.example/v1",
-            "sess-1",
-        );
-        assert!(out.is_empty());
+        let mut cfg = test_cfg();
+        cfg.provider = Provider::Generic("other".to_string());
+        cfg.base_url = "https://other.example/v1".into();
+        apply_opencode_session_headers(&mut cfg, "sess-1");
+        assert!(cfg.extra_headers.is_empty());
         // Generic provider pointed at opencode.ai → headers (host fallback).
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::Generic("proxy".to_string()),
-            "https://opencode.ai/zen/v1",
-            "sess-1",
-        );
-        assert_eq!(out.len(), 2);
+        let mut cfg = test_cfg();
+        cfg.provider = Provider::Generic("proxy".to_string());
+        apply_opencode_session_headers(&mut cfg, "sess-1");
+        assert_eq!(cfg.extra_headers.len(), 2);
         // Empty session id → nothing, even for opencode.
-        let mut out: BTreeMap<String, String> = BTreeMap::new();
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::OpenCode,
-            "https://opencode.ai/zen/v1",
-            "  ",
-        );
-        assert!(out.is_empty());
+        let mut cfg = test_cfg();
+        apply_opencode_session_headers(&mut cfg, "  ");
+        assert!(cfg.extra_headers.is_empty());
         // Explicit user header wins (any casing); client header still fills.
-        let mut out: BTreeMap<String, String> =
-            BTreeMap::from([("X-Opencode-Session".to_string(), "mine".to_string())]);
-        apply_opencode_session_headers(
-            &mut out,
-            &Provider::OpenCode,
-            "https://opencode.ai/zen/v1",
-            "sess-1",
-        );
+        let mut cfg = test_cfg();
+        cfg.extra_headers
+            .insert("X-Opencode-Session".to_string(), "mine".to_string());
+        apply_opencode_session_headers(&mut cfg, "sess-1");
         assert_eq!(
-            out.get("X-Opencode-Session").map(String::as_str),
+            cfg.extra_headers
+                .get("X-Opencode-Session")
+                .map(String::as_str),
             Some("mine")
         );
         assert_eq!(
-            out.get("x-opencode-client").map(String::as_str),
+            cfg.extra_headers
+                .get("x-opencode-client")
+                .map(String::as_str),
+            Some("dex")
+        );
+        // A FILE-layer pin must suppress the auto-fill too: `extra_headers`
+        // merges after both file layers, so injecting here would silently
+        // override the user's config-file header.
+        let mut cfg = test_cfg();
+        cfg.provider_headers
+            .insert("x-opencode-session".to_string(), "file".to_string());
+        apply_opencode_session_headers(&mut cfg, "sess-1");
+        assert!(!cfg.extra_headers.contains_key("x-opencode-session"));
+        assert_eq!(
+            cfg.extra_headers
+                .get("x-opencode-client")
+                .map(String::as_str),
             Some("dex")
         );
     }
