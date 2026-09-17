@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::agent::router::{classify, infer_tool_hints, model_for, TaskSignal, Tier, TierMap};
 use crate::core::types::{ApiProtocol, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
 
@@ -326,6 +327,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "system_prompt_file",
     "mcp_servers",
     "agent_wake",
+    "routing",
     "extensions",
     // Deprecated but still honored for old files:
     "active_provider",
@@ -379,6 +381,254 @@ pub(crate) fn agent_wake_origin() -> (bool, &'static str) {
 /// The wake gate read by the scheduler: `true` unless disabled.
 pub(crate) fn agent_wake_enabled() -> bool {
     agent_wake_origin().0
+}
+
+/// Complexity-router switch (`routing.enabled:`) and per-tier env vars.
+/// Env beats file, per the standard precedence; tiers name full
+/// `provider/model` selections, so catalog/learned-API/`api:` pins keep
+/// working through the existing selection path.
+pub(crate) const ROUTING_ENV: &str = "DEX_ROUTING";
+pub(crate) const ROUTING_LOW_ENV: &str = "DEX_ROUTING_LOW";
+pub(crate) const ROUTING_MEDIUM_ENV: &str = "DEX_ROUTING_MEDIUM";
+pub(crate) const ROUTING_HIGH_ENV: &str = "DEX_ROUTING_HIGH";
+pub(crate) const ROUTING_CRITICAL_ENV: &str = "DEX_ROUTING_CRITICAL";
+
+/// Env var holding a tier's selection (`DEX_ROUTING_LOW`…).
+fn routing_tier_env(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Low => ROUTING_LOW_ENV,
+        Tier::Medium => ROUTING_MEDIUM_ENV,
+        Tier::High => ROUTING_HIGH_ENV,
+        Tier::Critical => ROUTING_CRITICAL_ENV,
+    }
+}
+
+/// Origin wording for a tier's file selection (`config routing.low:`…).
+fn routing_file_origin(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Low => "config routing.low:",
+        Tier::Medium => "config routing.medium:",
+        Tier::High => "config routing.high:",
+        Tier::Critical => "config routing.critical:",
+    }
+}
+
+/// Per-tier origins for [`RoutingResolution`]: where each raw selection
+/// came from. A miss falls back at use time (`model_for`: tier miss →
+/// `medium` → top-level `model:`), so the miss origin only says that.
+pub(crate) struct TierOrigins {
+    pub(crate) low: &'static str,
+    pub(crate) medium: &'static str,
+    pub(crate) high: &'static str,
+    pub(crate) critical: &'static str,
+}
+
+impl TierOrigins {
+    fn get(&self, tier: Tier) -> &'static str {
+        match tier {
+            Tier::Low => self.low,
+            Tier::Medium => self.medium,
+            Tier::High => self.high,
+            Tier::Critical => self.critical,
+        }
+    }
+}
+
+/// The resolved `routing:` knob: the switch plus the raw per-tier
+/// selections (empty = unset). `from_env` and `doctor` share this
+/// resolution so the origin rows cannot drift from runtime routing.
+pub(crate) struct RoutingResolution {
+    pub(crate) enabled: bool,
+    pub(crate) enabled_origin: &'static str,
+    pub(crate) tiers: TierMap,
+    pub(crate) tier_origins: TierOrigins,
+}
+
+/// One tier's raw selection: `DEX_ROUTING_<TIER>` > file
+/// `routing.<tier>:`. Empty/missing at both layers is not an error —
+/// `model_for` falls through to `medium`, then to top-level `model:`.
+/// A present-but-empty or non-string file value warns once and falls
+/// through the same way, never a hard error.
+fn routing_tier_value(
+    file: &Option<serde_yaml::Value>,
+    tier: Tier,
+    miss_origin: &'static str,
+) -> (String, &'static str) {
+    let env_var = routing_tier_env(tier);
+    if let Ok(raw) = env::var(env_var) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return (trimmed, env_var);
+        }
+    }
+    let value = file
+        .as_ref()
+        .and_then(|f| f.get("routing"))
+        .and_then(|r| r.as_mapping())
+        .and_then(|m| m.get(tier.key()));
+    match value {
+        None => (String::new(), miss_origin),
+        Some(v) => match v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => (s.to_string(), routing_file_origin(tier)),
+            None => {
+                warn_once(
+                    &format!("config:routing:{}", tier.key()),
+                    &format!(
+                        "ignoring routing.{}: — set a 'provider/model' selection string",
+                        tier.key()
+                    ),
+                );
+                (String::new(), miss_origin)
+            }
+        },
+    }
+}
+
+/// Shared `routing:` resolution: `DEX_ROUTING` > file `routing.enabled:`
+/// > off, plus each tier's selection. Default off — routing is opt-in.
+pub(crate) fn routing_resolution(file: &Option<serde_yaml::Value>) -> RoutingResolution {
+    const MEDIUM_MISS: &str = "unset (falls back to model:)";
+    const TIER_MISS: &str = "unset (falls back to routing.medium:, then model:)";
+    let mut enabled = false;
+    let mut enabled_origin = "built-in default";
+    if let Ok(raw) = env::var(ROUTING_ENV) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => {
+                enabled = false;
+                enabled_origin = ROUTING_ENV;
+            }
+            "1" | "true" | "on" | "yes" => {
+                enabled = true;
+                enabled_origin = ROUTING_ENV;
+            }
+            _ => warn_once(
+                "env:DEX_ROUTING",
+                "DEX_ROUTING must be 0/1 (or true/false, on/off, yes/no) — ignoring it",
+            ),
+        }
+    }
+    if enabled_origin == "built-in default" {
+        let flag = file
+            .as_ref()
+            .and_then(|f| f.get("routing"))
+            .and_then(|r| r.as_mapping())
+            .and_then(|m| m.get("enabled"));
+        match flag {
+            None => {}
+            Some(v) => match v.as_bool() {
+                Some(b) => {
+                    enabled = b;
+                    enabled_origin = "config routing.enabled:";
+                }
+                None => warn_once(
+                    "config:routing:enabled",
+                    "ignoring routing.enabled: — set true or false",
+                ),
+            },
+        }
+    }
+    let mut tiers = TierMap::default();
+    let mut origins = TierOrigins {
+        low: TIER_MISS,
+        medium: MEDIUM_MISS,
+        high: TIER_MISS,
+        critical: TIER_MISS,
+    };
+    for tier in Tier::ALL {
+        let miss = if tier == Tier::Medium {
+            MEDIUM_MISS
+        } else {
+            TIER_MISS
+        };
+        let (value, origin) = routing_tier_value(file, tier, miss);
+        match tier {
+            Tier::Low => {
+                tiers.low = value;
+                origins.low = origin;
+            }
+            Tier::Medium => {
+                tiers.medium = value;
+                origins.medium = origin;
+            }
+            Tier::High => {
+                tiers.high = value;
+                origins.high = origin;
+            }
+            Tier::Critical => {
+                tiers.critical = value;
+                origins.critical = origin;
+            }
+        }
+    }
+    RoutingResolution {
+        enabled,
+        enabled_origin,
+        tiers,
+        tier_origins: origins,
+    }
+}
+
+/// One routed turn: classify the prompt and resolve the tier's model
+/// through `model_for` (tier miss → `medium` → top-level `model:`).
+/// `None` when routing is off or nothing selects a model (the normal
+/// `from_env` setup error then explains itself). `model_override` is
+/// `Some` only when the tier resolves away from the current selection,
+/// so an unrouted turn rebuilds nothing. Callers with an explicit
+/// `--model` / per-request model skip this — the explicit pick wins.
+pub(crate) struct RoutedTurn {
+    pub(crate) tier: Tier,
+    pub(crate) model_override: Option<String>,
+}
+
+pub(crate) fn route_turn(prompt: &str, history_tokens: u64) -> Option<RoutedTurn> {
+    let file = load_config_file();
+    let routing = routing_resolution(&file);
+    if !routing.enabled {
+        return None;
+    }
+    let selection = resolve_selection(None, &file).ok()?;
+    let signal = TaskSignal {
+        prompt_len: prompt.len(),
+        history_tokens,
+        tool_hints: infer_tool_hints(prompt),
+    };
+    let tier = classify(&signal, prompt);
+    let model = model_for(tier, &routing.tiers, &selection.value);
+    Some(RoutedTurn {
+        tier,
+        model_override: (model != selection.value).then(|| model.to_string()),
+    })
+}
+
+/// What `doctor` shows per tier: the tier's own selection, else
+/// `routing.medium:`, else the top-level selection — the same chain
+/// `model_for` applies at runtime, so the row explains the turn's model.
+fn routing_tier_display(
+    tier: Tier,
+    routing: &RoutingResolution,
+    selection: Option<&str>,
+    selection_source: &str,
+) -> (String, String) {
+    let value = routing.tiers.get(tier);
+    if !value.is_empty() {
+        return (
+            value.to_string(),
+            routing.tier_origins.get(tier).to_string(),
+        );
+    }
+    if tier != Tier::Medium && !routing.tiers.medium.is_empty() {
+        return (
+            routing.tiers.medium.clone(),
+            routing.tier_origins.medium.to_string(),
+        );
+    }
+    match selection {
+        Some(value) => (value.to_string(), selection_source.to_string()),
+        None => (
+            "(unset)".to_string(),
+            "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
+        ),
+    }
 }
 
 /// Read a system-prompt file for the env/file layers: a miss warns once and
@@ -3203,6 +3453,8 @@ struct ProviderDoctor<'a> {
     provider_source: &'a str,
     selection_source: &'a str,
     has_selection: bool,
+    routing_selection: Option<&'a str>,
+    routing_selection_source: &'a str,
     pre_model: &'a str,
     cfg_result: &'a Result<LlmConfig, Box<dyn std::error::Error>>,
     flag_base_url: Option<&'a str>,
@@ -3485,6 +3737,25 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
         if wake { "on" } else { "off" },
         wake_source,
     );
+    // Complexity router (V1): one row per value — the switch plus each
+    // tier's resolved selection (tier miss → routing.medium: →
+    // top-level model:), sharing `from_env`'s resolution.
+    let routing = routing_resolution(d.file);
+    row(
+        out,
+        "routing",
+        if routing.enabled { "on" } else { "off" },
+        routing.enabled_origin,
+    );
+    for tier in Tier::ALL {
+        let (value, origin) = routing_tier_display(
+            tier,
+            &routing,
+            d.routing_selection,
+            d.routing_selection_source,
+        );
+        row(out, &format!("routing {}", tier.key()), &value, &origin);
+    }
 
     // Headers: count per layer, sources joined.
     let mut header_count = 0;
@@ -3739,6 +4010,8 @@ pub(crate) fn doctor(
             flag_base_url: flag_base_url.as_deref(),
             permission_override,
             header_overrides,
+            routing_selection: selection.as_deref(),
+            routing_selection_source: &selection_source,
             custom_route: selection_provider.is_none() && provider_name == "custom",
         },
     );
@@ -6309,6 +6582,11 @@ pub(crate) mod tests {
             crate::agent::evidence_reducer::GATE_ENV,
             crate::agent::evidence_reducer::MODEL_ENV,
             "DEX_AGENT_WAKE",
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
             "OPENCODE_API_KEY",
@@ -6325,6 +6603,11 @@ pub(crate) mod tests {
         std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
         std::env::remove_var("DEX_SYSTEM_PROMPT");
         std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
+        std::env::remove_var("DEX_ROUTING");
+        std::env::remove_var("DEX_ROUTING_LOW");
+        std::env::remove_var("DEX_ROUTING_MEDIUM");
+        std::env::remove_var("DEX_ROUTING_HIGH");
+        std::env::remove_var("DEX_ROUTING_CRITICAL");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -6367,6 +6650,11 @@ pub(crate) mod tests {
                 "thinking          (unset)                                       model default\n",
                 "permission        trusted                                       built-in default\n",
                 "agent wake        on                                            built-in default\n",
+                "routing           off                                           built-in default\n",
+                "routing low       (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing medium    (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing high      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing critical  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
                 "headers           0                                             none\n",
                 "endpoints         go, zen                                       available to /model routing\n",
                 "system prompt     default                                       built-in default\n",
@@ -6381,6 +6669,188 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(out, expected, "doctor output drifted");
+    }
+
+    /// Complexity router: off with unset tiers by default; file `routing:`
+    /// parses the switch plus per-tier selections; env beats file per tier;
+    /// an unknown tier key and a non-string tier warn and fall through
+    /// instead of erroring (the typo policy `load_config_file` uses).
+    #[test]
+    fn routing_resolution_reads_switch_tiers_and_env() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
+        ] {
+            std::env::remove_var(key);
+        }
+        // Default: off, every tier unset.
+        let r = super::routing_resolution(&None);
+        assert!(!r.enabled);
+        assert_eq!(r.enabled_origin, "built-in default");
+        assert!(r.tiers.low.is_empty());
+        assert!(r.tiers.medium.is_empty());
+        assert!(r.tiers.high.is_empty());
+        assert!(r.tiers.critical.is_empty());
+        // File switch + tiers; env wins one tier; garbage warns through.
+        let dir = std::env::temp_dir().join(format!("dex-routing-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/mid\n  high: 7\n  bogus: myprov/nope\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("DEX_ROUTING_HIGH", "myprov/fast");
+        let file = super::load_config_file();
+        let r = super::routing_resolution(&file);
+        assert!(r.enabled);
+        assert_eq!(r.enabled_origin, "config routing.enabled:");
+        assert_eq!(r.tiers.low, "myprov/cheap");
+        assert_eq!(r.tier_origins.low, "config routing.low:");
+        assert_eq!(r.tiers.medium, "myprov/mid");
+        // Non-string file tier ignored; env fills the gap with env origin.
+        assert_eq!(r.tiers.high, "myprov/fast");
+        assert_eq!(r.tier_origins.high, "DEX_ROUTING_HIGH");
+        assert!(r.tiers.critical.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `route_turn`: `None` when routing is off; otherwise the classified
+    /// tier resolves through `routing.medium:` → `model:`, overriding only
+    /// when the tier names a different selection (no pointless rebuilds).
+    #[test]
+    fn route_turn_classifies_and_overrides_only_on_change() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
+        ] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-routing-turn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/m-7\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        // Trivial prompt → low tier → override to the cheap model.
+        let routed = super::route_turn("fix typo", 0).expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Low);
+        assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
+        // Ordinary work with history behind it → medium, which already is
+        // the selection → no override, the config never rebuilds.
+        let routed = super::route_turn("add a retry to the fetch call", 5000).expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Medium);
+        assert_eq!(routed.model_override, None);
+        // Critical keyword escalates; unset critical falls back to medium.
+        let routed = super::route_turn("run the database migration", 0).expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Critical);
+        assert_eq!(routed.model_override, None);
+        // Routing off → None even for a critical-shaped prompt.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n",
+        )
+        .unwrap();
+        assert!(super::route_turn("run the database migration", 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dex doctor` shows the routing switch plus each tier's resolved
+    /// model and origin — an unset tier displays the `medium` fallback it
+    /// would actually use at runtime.
+    #[test]
+    fn doctor_shows_routing_tiers_with_origins() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
+            "OPENCODE_API_KEY",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_LOW",
+            "DEX_ROUTING_MEDIUM",
+            "DEX_ROUTING_HIGH",
+            "DEX_ROUTING_CRITICAL",
+        ] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-routing-doc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/mid\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        let out = super::doctor(None, None, None, &[], None);
+        let routing: Vec<&str> = out.lines().filter(|l| l.starts_with("routing")).collect();
+        assert_eq!(routing.len(), 5, "{out}");
+        assert!(routing[0].contains("on"), "{}", routing[0]);
+        assert!(
+            routing[0].contains("config routing.enabled:"),
+            "{}",
+            routing[0]
+        );
+        assert!(routing[1].contains("myprov/cheap"), "{}", routing[1]);
+        assert!(routing[1].contains("config routing.low:"), "{}", routing[1]);
+        // Unset high shows the medium fallback with medium's origin — the
+        // same chain `model_for` applies at runtime.
+        assert!(routing[3].contains("myprov/mid"), "{}", routing[3]);
+        assert!(
+            routing[3].contains("config routing.medium:"),
+            "{}",
+            routing[3]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
