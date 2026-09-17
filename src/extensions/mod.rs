@@ -393,10 +393,10 @@ impl ExtensionManager {
     /// Ensure one extension is loaded, booting just it on first use (§26):
     /// `dex run ext__foo__bar` boots one Lua VM instead of every installed
     /// extension, and a dispatch racing the background refresh self-heals
-    /// instead of failing "unknown tool". No-op when already loaded. An
-    /// explicitly addressed extension loads even if a full refresh would
-    /// have rejected it as a latecomer — no schema ambiguity when the
-    /// caller names the owner.
+    /// instead of failing "unknown tool". No-op when already loaded.
+    /// Collision rejection still applies (see `load_one`): an explicitly
+    /// addressed latecomer whose tool name is already registered fails
+    /// instead of silently renaming.
     pub(crate) async fn ensure_loaded(&self, ext_id: &str) -> Result<(), String> {
         if self.engines.read().await.contains_key(ext_id) {
             return Ok(());
@@ -568,13 +568,25 @@ impl ExtensionManager {
     ) -> Result<String, String> {
         let (engine, timeout) = {
             let engines = self.engines.read().await;
-            let Some(ext) = engines
+            if let Some(ext) = engines
                 .values()
                 .find(|e| e.shadows.contains(&target.to_string()))
-            else {
-                return Err(format!("no shadow registered for '{target}'"));
-            };
-            (ext.engine.clone(), ext.engine.tool_timeout(target))
+            {
+                (ext.engine.clone(), ext.engine.tool_timeout(target))
+            } else {
+                // Same lazy self-heal as `call`: a dispatch racing the
+                // background refresh boots the owner instead of failing.
+                drop(engines);
+                self.refresh().await;
+                let engines = self.engines.read().await;
+                let Some(ext) = engines
+                    .values()
+                    .find(|e| e.shadows.contains(&target.to_string()))
+                else {
+                    return Err(format!("no shadow registered for '{target}'"));
+                };
+                (ext.engine.clone(), ext.engine.tool_timeout(target))
+            }
         };
         engine
             .drive(
@@ -1039,6 +1051,8 @@ pub(crate) fn cached_tools() -> Arc<[ToolDefinition]> {
 /// Token cost of the cached extension schema slice, for the compaction budget.
 /// Precomputed at rebuild — a cached load, never a re-serialize. (With an
 /// `active` slice the filtered set is estimated live; slicing is rare.)
+/// Like MCP: `try_read` never blocks the loop — contention returns 0 once,
+/// self-correcting on the next call.
 pub(crate) fn cached_schema_tokens() -> u64 {
     let Some(m) = GLOBAL.get() else {
         return 0;
@@ -1553,13 +1567,25 @@ pub(crate) async fn run_command_global(
         policy: &policy,
         filter: None,
     };
+    let manager = global_manager();
     let engine = {
-        let manager = global_manager();
         let engines = manager.engines.read().await;
-        engines
-            .get(ext_id)
-            .map(|e| e.engine.clone())
-            .ok_or_else(|| format!("extension '{ext_id}' is not loaded"))?
+        if let Some(e) = engines.get(ext_id) {
+            e.engine.clone()
+        } else {
+            // Lazy self-heal like `call`: boot the addressed extension when
+            // a command races the background refresh.
+            drop(engines);
+            manager
+                .ensure_loaded(ext_id)
+                .await
+                .map_err(|_| format!("extension '{ext_id}' is not loaded"))?;
+            let engines = manager.engines.read().await;
+            engines
+                .get(ext_id)
+                .map(|e| e.engine.clone())
+                .ok_or_else(|| format!("extension '{ext_id}' is not loaded"))?
+        }
     };
     engine
         .drive(

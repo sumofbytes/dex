@@ -772,9 +772,106 @@ async fn expand_glob_in(root: &Path, glob: &str) -> Result<Vec<PathBuf>, ToolErr
     // `find` command through `run_bash`, so a `'` or space in the pattern
     // broke the command — and every call paid the sh spawn + drain tasks +
     // 120 s-timeout machinery for a sub-second directory walk. `find` itself
-    // stays (exact `-prune`/`-path` semantics; serving from the fff index
+    // stays on Unix (exact `-prune`/`-path` semantics; serving from the fff index
     // would miss files never read, and a hand-rolled matcher would drift
-    // from `find`); only the wrapping changes.
+    // from `find`); only the wrapping changes. Windows has no usable `find`
+    // (System32 `find.exe` takes different flags), so it uses the native
+    // walk below directly.
+    #[cfg(windows)]
+    {
+        return expand_glob_native(root, glob).await;
+    }
+    #[cfg(not(windows))]
+    {
+        return expand_glob_via_find(root, glob).await;
+    }
+}
+
+/// Native recursive walk with the same prune + files-only semantics as the
+/// `find` path (Windows fallback; also used when `find` is missing).
+async fn expand_glob_native(root: &Path, glob: &str) -> Result<Vec<PathBuf>, ToolError> {
+    let root_canon = root.canonicalize().map_err(ToolError::Io)?;
+    let mut rels: Vec<String> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root_canon.clone()];
+    // Bound the walk like the `find` path bounds its resolve window.
+    const WALK_CAP: usize = 4096;
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() && !ft.is_symlink() {
+                if matches!(name.as_str(), ".git" | "target" | "node_modules") {
+                    continue;
+                }
+                if rels.len() + stack.len() < WALK_CAP {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&root_canon).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let hit = if glob.contains('/') {
+                glob_match_path(glob, &rel_str)
+            } else {
+                glob_match_path(glob, &name)
+            };
+            if hit {
+                rels.push(format!("./{rel_str}"));
+            }
+            if rels.len() >= READ_FANOUT_GLOB_MAX_FILES * 8 {
+                break;
+            }
+        }
+        if rels.len() >= READ_FANOUT_GLOB_MAX_FILES * 8 {
+            break;
+        }
+    }
+    finish_glob_matches(&root_canon, rels, glob)
+}
+
+/// `*` spans `/` (like `find -path`), `?` matches one char. Minimal — only
+/// the two wildcards `expand_glob` admits.
+fn glob_match_path(pattern: &str, text: &str) -> bool {
+    let (mut px, mut tx) = (0usize, 0usize);
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut star, mut match_tx) = (None::<usize>, 0usize);
+    while tx < t.len() {
+        if px < p.len() && (p[px] == b'?' || p[px] == t[tx]) {
+            px += 1;
+            tx += 1;
+        } else if px < p.len() && p[px] == b'*' {
+            star = Some(px);
+            match_tx = tx;
+            px += 1;
+        } else if let Some(s) = star {
+            px = s + 1;
+            match_tx += 1;
+            tx = match_tx;
+        } else {
+            return false;
+        }
+    }
+    while px < p.len() && p[px] == b'*' {
+        px += 1;
+    }
+    px == p.len()
+}
+
+#[cfg(not(windows))]
+async fn expand_glob_via_find(root: &Path, glob: &str) -> Result<Vec<PathBuf>, ToolError> {
     let mut cmd = tokio::process::Command::new("find");
     cmd.arg(".")
         .arg("(")
@@ -794,20 +891,39 @@ async fn expand_glob_in(root: &Path, glob: &str) -> Result<Vec<PathBuf>, ToolErr
     } else {
         cmd.arg("-name").arg(glob);
     }
-    cmd.arg("-print")
+    // Files only at the source: without this a bare `*` returns directories
+    // (and `.` itself) that then eat the pre-filter truncate window and
+    // starve real files.
+    cmd.arg("-type")
+        .arg("f")
+        .arg("-print")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .current_dir(root);
-    let child = cmd.spawn().map_err(ToolError::Io)?;
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        // No `find` on PATH (minimal containers): same semantics, no error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return expand_glob_native(root, glob).await;
+        }
+        Err(e) => return Err(ToolError::Io(e)),
+    };
     // A pruned walk is bounded, but a wedge (stalled FS) or Ctrl+C must not
-    // park the turn: race the wait against cancellation, like `run_bash`.
+    // park the turn: race the wait against cancellation, like `run_bash`,
+    // with a wall-clock cap so a wedged FS can't park a turn past cancel.
     let output = tokio::select! {
         out = child.wait_with_output() => out.map_err(ToolError::Io)?,
         _ = wait_cancelled(&crate::agent::state::GlobalCancellation) => {
             return Err(ToolError::Shell {
                 output: "Error: shell command cancelled".to_string(),
+                code: None,
+            });
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            return Err(ToolError::Shell {
+                output: "Error: glob walk timed out".to_string(),
                 code: None,
             });
         }
@@ -822,28 +938,40 @@ async fn expand_glob_in(root: &Path, glob: &str) -> Result<Vec<PathBuf>, ToolErr
     // truncate-before-resolve: at most 8 candidates pay the symlink check.
     let root = root.canonicalize().map_err(ToolError::Io)?;
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut rels: Vec<&str> = text
+    let mut rels: Vec<String> = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .map(str::to_owned)
         .collect();
     rels.sort_unstable();
     rels.dedup();
-    // Resolve window before the file filter: directories and rejected
-    // symlinks below still cost a stat, but bounding the window bounds the
-    // stats (was: one root canonicalize + one resolve per match, unbounded).
+    // `find -type f` already excludes directories, so truncating here can't
+    // starve files behind dirs (was: truncate-then-`is_file`).
     rels.truncate(READ_FANOUT_GLOB_MAX_FILES * 8);
+    finish_glob_matches(&root, rels, glob)
+}
+
+/// Shared tail: workspace-confine + symlink check, files-only, cap, error
+/// when nothing survives.
+fn finish_glob_matches(
+    root_canon: &Path,
+    rels: Vec<String>,
+    glob: &str,
+) -> Result<Vec<PathBuf>, ToolError> {
     let mut paths = Vec::new();
-    for rel in rels {
+    for rel in &rels {
         // Directories (and the `.` root itself for a bare `*`) used to ride
         // along and die as per-file read errors in `fanout_read`, eating cap
         // slots real files could have used — keep files only.
-        if let Ok(path) = resolve_workspace_path(&root, rel) {
+        if let Ok(path) = resolve_workspace_path(root_canon, rel) {
             if path.is_file() {
                 paths.push(path);
             }
         }
     }
+    paths.sort_unstable();
+    paths.dedup();
     paths.truncate(READ_FANOUT_GLOB_MAX_FILES);
     if paths.is_empty() {
         return Err(ToolError::InvalidArgument(format!(
@@ -2249,6 +2377,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn expand_glob_lists_pruned_files_only() {
         // Hermetic fixture for the `find -prune` semantics glob expansion
         // relies on: pruned dirs never match, symlinked dirs are listed but
