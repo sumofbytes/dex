@@ -196,28 +196,37 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| e.to_string())
         });
         let sk = s.spawn(|| discover_skills(&skill_dirs));
-        let sess = s.spawn(|| {
-            if args.no_session {
-                return (None, Vec::new());
-            }
-            let session = open_session(args, &cwd);
-            // Model-bound load: `!!` shell runs stay out of the LLM context.
-            let history = session
-                .as_ref()
-                .and_then(|sess| sess.path())
-                .map(load_llm_messages_from_session)
-                .unwrap_or_else(|| Ok(Vec::new()))
-                .unwrap_or_default();
-            (session, history)
-        });
         // Extension refresh is best-effort; a failed join must not fail the turn.
         let _ = ext.join();
         let config_result: Result<LlmConfig, Box<dyn std::error::Error>> = cfg
             .join()
             .unwrap_or_else(|_| Err("config init thread failed".to_string()))
             .map_err(|e| e.into());
+        // Open the session only after the config validates: `Session::new`
+        // writes its header immediately, so resolving config first keeps a
+        // config error (bad key/model) from leaving a stray empty session
+        // that shows up in `/resume`.
+        let sess = if config_result.is_ok() {
+            s.spawn(|| {
+                if args.no_session {
+                    return (None, Vec::new());
+                }
+                let session = open_session(args, &cwd);
+                // Model-bound load: `!!` shell runs stay out of the LLM context.
+                let history = session
+                    .as_ref()
+                    .and_then(|sess| sess.path())
+                    .map(load_llm_messages_from_session)
+                    .unwrap_or_else(|| Ok(Vec::new()))
+                    .unwrap_or_default();
+                (session, history)
+            })
+            .join()
+            .unwrap_or((None, Vec::new()))
+        } else {
+            (None, Vec::new())
+        };
         let skills = sk.join().unwrap_or_default();
-        let sess = sess.join().unwrap_or((None, Vec::new()));
         (config_result, skills, sess)
     });
     let mut config = config_result?;
@@ -250,12 +259,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // Console Go routing requires `x-opencode-session`;
     // explicit `--header` flags already baked into `extra_headers` still win.
     if let Some(session) = session.as_ref() {
-        crate::llm::config::apply_opencode_session_headers(
-            &mut config.extra_headers,
-            &config.provider,
-            &config.base_url,
-            session.id(),
-        );
+        crate::llm::config::apply_opencode_session_headers(&mut config, session.id());
     }
     let mut state = ToolState::load();
     let console = crate::core::console::Console::none();

@@ -339,11 +339,7 @@ async fn load_skill(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let entry = {
-        let sessions = lock_map(&state.sessions);
-        sessions.get(&session_id).cloned()
-    }
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let entry = lookup_entry_async(&state, &session_id).await?;
     let skill_name = req.name.clone();
     let extra_dirs = req.skill_dirs.clone();
     let mut dirs = skill_dirs();
@@ -1007,12 +1003,7 @@ async fn run_turn_inner(
     // Console Go routing requires `x-opencode-session`.
     // Auto-fill from the dex session id; explicit per-request headers
     // below still win on collision.
-    crate::llm::config::apply_opencode_session_headers(
-        &mut config.extra_headers,
-        &config.provider,
-        &config.base_url,
-        session_id,
-    );
+    crate::llm::config::apply_opencode_session_headers(&mut config, session_id);
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
     // `insert_extra_header` drops empties + `authorization` and collapses
@@ -1934,7 +1925,15 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
     // open+parse of every session. The `list_all` scan below only serves
     // renamed/legacy files whose stem no longer names the id.
     if let Some(path) = probed {
-        if let Ok(entry_session) = session::Session::from_path(&path) {
+        // Exact id only: `find_by_id_filename` also resolves unique prefixes
+        // (a CLI convenience). Accepting one here would register — and cache
+        // — a *different* session under the requested key, so every later
+        // request on that key mutates the wrong journal. Prefix selectors
+        // stay a client-side (`/resume`) affordance.
+        if let Some(entry_session) = session::Session::from_path(&path)
+            .ok()
+            .filter(|s| s.id() == session_id)
+        {
             let entry = SessionEntry {
                 path: path.clone(),
                 name: entry_session.name().map(ToOwned::to_owned),

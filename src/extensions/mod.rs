@@ -502,7 +502,9 @@ impl ExtensionManager {
         // count recorded. (P0: truncate; the count surfaces in P2 doctor.)
         let max = max_extension_tools();
         if tools.len() > max {
+            let dropped = tools.len() - max;
             tools.truncate(max);
+            warn_hidden_tools(dropped, max);
         }
         // Per-tool char shares for the `active`-slice budget (see
         // `cached_schema_tokens`); the whole-cache total keeps the exact
@@ -1037,6 +1039,19 @@ fn max_extension_tools() -> usize {
         .unwrap_or(64)
 }
 
+/// One-time diagnostic for the schema cap. Dropped extension tools are
+/// silently absent from the model's view and answer "unknown tool" otherwise;
+/// unlike MCP there is no `/mcp`-style panel count to surface them.
+fn warn_hidden_tools(dropped: usize, max: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "dex: [extensions] {dropped} tools hidden by the schema cap ({max} max — raise DEX_MAX_EXTENSION_TOOLS)"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global (process-wide) manager: sync reads for schema + dispatch paths
 // ---------------------------------------------------------------------------
@@ -1255,7 +1270,7 @@ tokio::task_local! {
 pub(crate) fn drive_model_for(config: &crate::llm::config::LlmConfig) -> DriveModel {
     DriveModel {
         snapshot: Some(served_snapshot_for(config)),
-        routing: harvest_routing_headers(&config.extra_headers),
+        routing: harvest_routing_headers(&config_header_layers(config)),
     }
 }
 
@@ -1308,20 +1323,32 @@ static LAST_MODEL: Mutex<Option<ExtensionModelSnapshot>> = Mutex::new(None);
 /// [`LAST_MODEL`]: inside a turn the drive context carries them.
 static LAST_ROUTING_HEADERS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
-/// The routing-affinity subset of a turn's resolved `extra_headers`: only
-/// the `x-opencode-*` pair dex injects per turn (session id the file never
-/// sees), canonicalized to lowercase names. Everything else is already
-/// visible to Lua via `dex.model.auth()`.
-fn harvest_routing_headers(extra: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+/// The routing-affinity subset of a turn's resolved headers: only the
+/// `x-opencode-*` pair, canonicalized to lowercase names. Layers are scanned
+/// in wire precedence (global file < provider file < env/CLI), so a later
+/// layer wins per key — a file-level pin must reach Lua's `dex.net.fetch`,
+/// not just the injected per-turn values.
+fn harvest_routing_headers(layers: &[&BTreeMap<String, String>]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for (name, value) in extra {
-        if name.eq_ignore_ascii_case("x-opencode-session") {
-            out.insert("x-opencode-session".to_string(), value.clone());
-        } else if name.eq_ignore_ascii_case("x-opencode-client") {
-            out.insert("x-opencode-client".to_string(), value.clone());
+    for layer in layers {
+        for (name, value) in *layer {
+            if name.eq_ignore_ascii_case("x-opencode-session") {
+                out.insert("x-opencode-session".to_string(), value.clone());
+            } else if name.eq_ignore_ascii_case("x-opencode-client") {
+                out.insert("x-opencode-client".to_string(), value.clone());
+            }
         }
     }
     out
+}
+
+/// The three header layers of a resolved config, in wire precedence.
+fn config_header_layers(config: &crate::llm::config::LlmConfig) -> [&BTreeMap<String, String>; 3] {
+    [
+        &config.global_headers,
+        &config.provider_headers,
+        &config.extra_headers,
+    ]
 }
 
 /// Merge the recorded routing headers under Lua-explicit ones
@@ -1397,7 +1424,7 @@ pub(crate) async fn fire_model_select_if_changed(
     // endpoint without tripping `MissingSessionID`.
     {
         let mut guard = LAST_ROUTING_HEADERS.lock().expect("routing headers lock");
-        *guard = harvest_routing_headers(&config.extra_headers);
+        *guard = harvest_routing_headers(&config_header_layers(config));
     }
     if previous.as_deref() == Some(id.as_str()) || !has_event_handlers("model_select") {
         return;
@@ -3091,7 +3118,7 @@ end
             ("X-OPENCODE-SESSION".to_string(), "s".to_string()),
             ("Authorization".to_string(), "Bearer k".to_string()),
         ]);
-        let out = harvest_routing_headers(&extra);
+        let out = harvest_routing_headers(&[&extra]);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("x-opencode-session").map(String::as_str), Some("s"));
     }
