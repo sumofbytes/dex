@@ -15,7 +15,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
@@ -300,22 +300,24 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
 }
 
 /// Show which skills the daemon has loaded. Used at session start and after
-/// `/new`, so the user can see what `/skill:<name>` can load.
+/// `/new`, so the user can see what `/skill:<name>` can load. Muted like the
+/// DEX banner: session-start chrome, not a call to action.
 fn push_skills_listing(app: &mut App) {
     match skills_listing_line(&app.skills) {
         Some(line) => push_info_line(app, line),
-        None => push_info(
+        None => push_info_line(
             app,
-            "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
-                .to_string(),
+            Line::from(Span::styled(
+                "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
+                    .to_string(),
+                Style::default().fg(super::theme::muted_fg()),
+            )),
         ),
     }
 }
 
-/// The session-start skills line: names comma-separated on a single row, in
-/// the terminal's own foreground (`theme::surface_fg`, resolved from the real
-/// palette so it follows the active theme) with the count header and hint
-/// quiet. `None` when no skills are loaded.
+/// The session-start skills line: names comma-separated on a single row, all
+/// muted like the DEX banner above it. `None` when no skills are loaded.
 fn skills_listing_line(skills: &[crate::core::types::Skill]) -> Option<Line<'static>> {
     let (first, rest) = skills.split_first()?;
     let mut names = first.name.clone();
@@ -323,16 +325,11 @@ fn skills_listing_line(skills: &[crate::core::types::Skill]) -> Option<Line<'sta
         names.push_str(", ");
         names.push_str(&skill.name);
     }
+    let muted = Style::default().fg(super::theme::muted_fg());
     Some(Line::from(vec![
-        Span::styled(
-            format!("skills loaded ({}): ", skills.len()),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(names, Style::default().fg(super::theme::surface_fg())),
-        Span::styled(
-            " · /skill:<name> loads one",
-            Style::default().fg(super::theme::muted_fg()),
-        ),
+        Span::styled(format!("skills loaded ({}): ", skills.len()), muted),
+        Span::styled(names, muted),
+        Span::styled(" · /skill:<name> loads one", muted),
     ]))
 }
 
@@ -698,7 +695,7 @@ fn bootstrap(args: &Args, daemon_url: &str, daemon_is_local: bool) -> std::io::R
         })
         .collect();
 
-    // Session-start view: the DEX art, then the skills the daemon discovered,
+    // Session-start view: the DEX banner, then the skills the daemon discovered,
     // then how fast the TUI was ready to use.
     push_banner(&mut remote.app);
     push_skills_listing(&mut remote.app);
@@ -3241,13 +3238,11 @@ mod tests {
             .expect("non-empty skills produce a line");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "skills loaded (3): a, b, c · /skill:<name> loads one");
-        // Skill names use the terminal's theme foreground (Reset when the
-        // theme is unknown), never a fixed ANSI slot the theme may remap.
-        let fg = line.spans[1].style.fg.expect("names span carries a fg");
-        assert!(
-            matches!(fg, Color::Reset | Color::Rgb(..)),
-            "names must follow the theme, got {fg:?}"
-        );
+        // Every span is muted like the DEX banner: session-start chrome.
+        let muted = super::super::theme::muted_fg();
+        for span in &line.spans {
+            assert_eq!(span.style.fg, Some(muted), "span is muted: {span:?}");
+        }
         assert!(skills_listing_line(&[]).is_none());
     }
 
