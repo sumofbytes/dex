@@ -955,7 +955,9 @@ impl ExtensionManager {
 
 static PROMPT_APPENDIX: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
-/// `dex.prompt.append(text)`: one entry per extension, load order.
+/// `dex.prompt.append(text)`: one entry per extension, keyed by id.
+/// Composition sorts by id (`prompt_appendix`), so push order never leaks
+/// into the system prefix.
 pub(crate) fn push_prompt_appendix(ext_id: &str, text: String) {
     let mut guard = PROMPT_APPENDIX.lock().expect("prompt appendix lock");
     match guard.iter_mut().find(|(id, _)| id == ext_id) {
@@ -972,12 +974,19 @@ pub(crate) fn remove_prompt_appendix(ext_id: &str) {
         .retain(|(id, _)| id != ext_id);
 }
 
-/// The composed appendix for `system_prompt()`: each extension's text in
-/// load order, separated by blank lines.
+/// The composed appendix for `system_prompt()`: each extension's text sorted
+/// by extension id, separated by blank lines. Sorted (not load order) so the
+/// system prefix is byte-identical across reload orders — prompt-cache
+/// stability: any reorder would invalidate the cached system prefix.
 pub(crate) fn prompt_appendix() -> String {
     let guard = PROMPT_APPENDIX.lock().expect("prompt appendix lock");
-    guard
+    let mut entries: Vec<(&str, &str)> = guard
         .iter()
+        .map(|(id, text)| (id.as_str(), text.as_str()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .into_iter()
         .map(|(_, text)| text.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
@@ -2120,6 +2129,30 @@ pub(crate) mod tests {
         assert!(!is_extension_tool("read"));
         assert_eq!(normalize_tool_name("lua__web__search"), "ext__web__search");
         assert_eq!(normalize_tool_name("ext__web__search"), "ext__web__search");
+    }
+
+    #[test]
+    fn prompt_appendix_composes_sorted_by_id() {
+        // Prompt-cache stability: system bytes must not depend on push order.
+        // Unique ids + push/remove (no clear/save/restore) so parallel tests
+        // sharing the process-global appendix never observe a wiped state.
+        remove_prompt_appendix("__prompt_cache_zeta__");
+        remove_prompt_appendix("__prompt_cache_alpha__");
+        push_prompt_appendix(
+            "__prompt_cache_zeta__",
+            "second-__prompt_cache__".to_string(),
+        );
+        push_prompt_appendix(
+            "__prompt_cache_alpha__",
+            "first-__prompt_cache__".to_string(),
+        );
+        let composed = prompt_appendix();
+        remove_prompt_appendix("__prompt_cache_zeta__");
+        remove_prompt_appendix("__prompt_cache_alpha__");
+        assert!(
+            composed.find("first-__prompt_cache__").unwrap()
+                < composed.find("second-__prompt_cache__").unwrap()
+        );
     }
 
     #[test]
