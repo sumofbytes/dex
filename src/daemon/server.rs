@@ -21,7 +21,7 @@ use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::core::unwind::CatchUnwind;
 use crate::llm::config::{agent_wake_enabled, LlmConfig};
-use crate::llm::prompt::system_prompt_with_override;
+use crate::llm::prompt::system_prompt_with_override_for;
 use crate::protocol::{
     ApprovalResponse, ChatRequest, CreateSessionRequest, DaemonInfo, EventsResponse,
     FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse, RecallRequest, SkillInfo,
@@ -414,6 +414,8 @@ async fn create_session(
         name: session.name().map(ToString::to_string),
         cwd,
         model: None,
+        wake_provider: None,
+        wake_base_url: None,
         plan_persisted: None,
         model_persisted: None,
     };
@@ -1032,8 +1034,12 @@ async fn run_turn_inner(
                 .and_then(|e| e.model_persisted.clone());
             let value = (raw.clone(), provider_name.clone());
             if !persisted_current(&persisted, &value, &entry.path) {
-                let _ = session.set_state("model", raw);
-                let _ = session.set_state("provider", &provider_name);
+                session
+                    .set_state("model", raw)
+                    .map_err(|e| format!("failed to persist model: {e}"))?;
+                session
+                    .set_state("provider", &provider_name)
+                    .map_err(|e| format!("failed to persist provider: {e}"))?;
                 let at = std::fs::metadata(&entry.path).and_then(|m| m.modified());
                 if let (Ok(at), Some(slot)) = (at, lock_map(&state.sessions).get_mut(session_id)) {
                     slot.model_persisted = Some((value, at));
@@ -1044,9 +1050,16 @@ async fn run_turn_inner(
     // Stash the turn's model on the registry entry (perf doc §30): the
     // idle-wake path reuses it instead of re-scanning the session file.
     // Every turn refreshes it (not just overrides), so the entry tracks
-    // `/model` switches made anywhere.
+    // `/model` switches made anywhere. Provider + base URL ride along: a
+    // bare model id alone would re-resolve on the default provider.
     if let Some(entry) = lock_map(&state.sessions).get_mut(session_id) {
         entry.model = Some(config.model.clone());
+        entry.wake_provider = Some(config.provider.name().to_string());
+        entry.wake_base_url = if config.base_url.trim().is_empty() {
+            None
+        } else {
+            Some(config.base_url.clone())
+        };
     }
     // Verification is opt-in (DEX_VERIFY / config verify_command). No
     // auto-detect by default — auto-running
@@ -1111,9 +1124,10 @@ async fn run_turn_inner(
     // The model-bound load drops `!!` shell runs (saved + shown, never sent
     // to the LLM); the transcript rebuild keeps them.
     let mut messages: Vec<ChatMessage> = Vec::new();
-    messages.push(ChatMessage::system(system_prompt_with_override(
+    messages.push(ChatMessage::system(system_prompt_with_override_for(
         &skills,
         req.system_prompt.as_deref(),
+        Some(std::path::Path::new(&entry.cwd)),
     )));
     if let Some(path) = session.path().map(|p| p.to_path_buf()) {
         let loaded = tokio::task::spawn_blocking(move || {
@@ -1648,23 +1662,46 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             // permission resolves from the daemon's own ceiling. Served
             // from the registry entry (stashed at turn start); the file
             // scan is the fallback for entries registered before their
-            // first turn.
-            let entry_model = lock_map(&state.sessions)
+            // first turn. Provider + base URL ride along so a qualified
+            // `provider/model` turn wakes on the same endpoint.
+            let (model, base_url) = lock_map(&state.sessions)
                 .get(&session_id)
-                .map(|entry| (entry.model.clone(), entry.path.clone()));
-            let model = entry_model
-                .and_then(|(cached, path)| {
-                    cached.filter(|m| !m.trim().is_empty()).or_else(|| {
-                        crate::session::load_session_state(&path)
-                            .ok()
-                            .and_then(|map| map.get("model").cloned())
-                    })
+                .map(|entry| {
+                    let file_state = if entry.model.is_some() {
+                        None
+                    } else {
+                        crate::session::load_session_state(&entry.path).ok()
+                    };
+                    let m = entry
+                        .model
+                        .clone()
+                        .filter(|m| !m.trim().is_empty())
+                        .or_else(|| {
+                            file_state
+                                .as_ref()
+                                .and_then(|map| map.get("model").cloned())
+                        })
+                        .filter(|s| !s.trim().is_empty());
+                    // Re-qualify a bare model with its provider so `from_env`
+                    // resolves the same endpoint the turn ran on.
+                    let provider = entry.wake_provider.clone().or_else(|| {
+                        file_state
+                            .as_ref()
+                            .and_then(|map| map.get("provider").cloned())
+                    });
+                    let m = match (m, provider) {
+                        (Some(m), Some(p)) if !m.contains('/') && !p.is_empty() => {
+                            Some(format!("{p}/{m}"))
+                        }
+                        (m, _) => m,
+                    };
+                    (m, entry.wake_base_url.clone())
                 })
-                .filter(|model| !model.trim().is_empty());
+                .unwrap_or((None, None));
             let request = ChatRequest {
                 prompt: WAKE_PROMPT.to_string(),
                 skill_dirs: Vec::new(),
-                base_url: None,
+                base_url,
                 model,
                 permission: None,
                 headers: None,
@@ -1849,14 +1886,28 @@ async fn recall(
 /// been scanned yet. A disk hit is registered (live entries win over the
 /// later rebuild merge via `or_insert`) so subsequent lookups stay in-memory.
 /// A post-rebuild disk miss is negative-cached (perf doc §27), so a typo'd
-/// id walks the workspace once, not once per request.
+/// id walks the workspace once, not once per request. Negative entries
+/// expire after `NEGATIVE_TTL` so out-of-band creates become visible.
+fn missing_hit(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    if !state.rebuild_complete.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut missing = lock_map(&state.missing_sessions);
+    match missing.get(session_id) {
+        Some(at) if at.elapsed() < crate::daemon::NEGATIVE_TTL => true,
+        Some(_) => {
+            missing.remove(session_id);
+            false
+        }
+        None => false,
+    }
+}
+
 fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEntry> {
     if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
-    if state.rebuild_complete.load(Ordering::Relaxed)
-        && lock_map(&state.missing_sessions).contains(session_id)
-    {
+    if missing_hit(state, session_id) {
         return None;
     }
     let found = session::Session::list_all()
@@ -1867,15 +1918,20 @@ fn lookup_entry(state: &Arc<DaemonState>, session_id: &str) -> Option<SessionEnt
         // Post-rebuild a miss is stable (new ids are server-minted on an
         // explicit registration path that clears this set): remember it.
         if state.rebuild_complete.load(Ordering::Relaxed) {
-            lock_map(&state.missing_sessions).insert(session_id.to_string());
+            lock_map(&state.missing_sessions)
+                .insert(session_id.to_string(), std::time::Instant::now());
         }
         return None;
     };
+    // An out-of-band create after a negative hit must clear the stale miss.
+    lock_map(&state.missing_sessions).remove(session_id);
     let entry = SessionEntry {
         path: path.clone(),
         name: header.name().map(ToOwned::to_owned),
         cwd: header.cwd().to_string(),
         model: None,
+        wake_provider: None,
+        wake_base_url: None,
         plan_persisted: None,
         model_persisted: None,
     };
@@ -1910,9 +1966,7 @@ async fn lookup_entry_async(state: &Arc<DaemonState>, session_id: &str) -> Optio
     if let Some(entry) = lock_map(&state.sessions).get(session_id).cloned() {
         return Some(entry);
     }
-    if state.rebuild_complete.load(Ordering::Relaxed)
-        && lock_map(&state.missing_sessions).contains(session_id)
-    {
+    if missing_hit(state, session_id) {
         return None;
     }
     let state = Arc::clone(state);
@@ -1986,9 +2040,9 @@ async fn session_events(
         .unwrap_or(crate::session::EVENTS_PAGE_LIMIT);
     let events = tokio::task::spawn_blocking(move || {
         let mut events = Vec::new();
-        let mut last_raw = since;
+        let mut last_raw: Option<u64> = None;
         for (seq, payload) in Session::load_events(&path, since, limit).unwrap_or_default() {
-            last_raw = last_raw.max(seq);
+            last_raw = Some(last_raw.map_or(seq, |m: u64| m.max(seq)));
             // Unknown event types are skipped for the payload (the client's
             // fallback rule) but still advance the cursor — otherwise a
             // poller would re-fetch the same range forever.
@@ -1997,16 +2051,11 @@ async fn session_events(
             }
         }
         // next_seq follows the raw journal rows (even unknown types), so the
-        // client cursor keeps moving; with no rows past `since` the cursor
-        // stays put so a later row can never be skipped.
-        (
-            events,
-            if last_raw > since {
-                last_raw + 1
-            } else {
-                since
-            },
-        )
+        // client cursor keeps moving; with no rows at/after `since` the cursor
+        // stays put so a later row can never be skipped. Cursor is the next
+        // seq to serve (inclusive): `since=0` serves seq 0.
+        let next_seq = last_raw.map_or(since, |m| m.saturating_add(1));
+        (events, next_seq)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2028,8 +2077,8 @@ async fn reattach(
     }
     state.seed_seq(&session_id, &entry.path);
     // Prune stale idempotency-recorded seq: reattach hands the client the
-    // cursor to resume from.
-    let seq = Session::max_event_seq(&entry.path).unwrap_or(0);
+    // cursor to resume from (next seq to serve: max + 1, 0 when empty).
+    let seq = Session::max_event_seq(&entry.path).map_or(0, |m| m.saturating_add(1));
     Ok(Json(ReattachResponse {
         session_id: session_id.clone(),
         seq,
@@ -2315,6 +2364,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp/dex-test-cwd".into(),
                 model: None,
+                wake_provider: None,
+                wake_base_url: None,
                 plan_persisted: None,
                 model_persisted: None,
             },
@@ -2604,6 +2655,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                wake_provider: None,
+                wake_base_url: None,
                 plan_persisted: None,
                 model_persisted: None,
             },
@@ -2925,22 +2978,24 @@ mod handler_tests {
 
         let mut params = std::collections::HashMap::new();
         params.insert("since".to_string(), "0".to_string());
-        // `since` is exclusive: seq 0 is skipped, seq 1 replays.
+        // `since` is the next seq to serve (inclusive): seq 0 replays.
         let r = session_events(State(state.clone()), Path(id.clone()), Query(params))
             .await
             .unwrap();
-        assert_eq!(r.events.len(), 1);
-        assert_eq!(r.events[0].seq, 1);
+        assert_eq!(r.events.len(), 2);
+        assert_eq!(r.events[0].seq, 0);
+        assert_eq!(r.events[1].seq, 1);
         assert_eq!(r.next_seq, 2);
-        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "two"));
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "one"));
+        assert!(matches!(r.events[1].event, StreamEvent::System(ref s) if s == "two"));
 
         let mut params = std::collections::HashMap::new();
-        params.insert("since".to_string(), "1".to_string());
+        params.insert("since".to_string(), "2".to_string());
         let r = session_events(State(state), Path(id), Query(params))
             .await
             .unwrap();
         assert!(r.events.is_empty(), "fully consumed cursor replays nothing");
-        assert_eq!(r.next_seq, 1);
+        assert_eq!(r.next_seq, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2996,6 +3051,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                wake_provider: None,
+                wake_base_url: None,
                 plan_persisted: None,
                 model_persisted: None,
             },
@@ -3043,6 +3100,8 @@ mod handler_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                wake_provider: None,
+                wake_base_url: None,
                 plan_persisted: None,
                 model_persisted: None,
             },
@@ -3279,13 +3338,15 @@ this line is torn and not json
             .await
             .unwrap();
         // Unknown event types are skipped for the payload but still advance
-        // the cursor, and torn lines are dropped. (`since` is exclusive, so
-        // seq 0 is skipped here. `agent_recovered` is the wire type the
-        // supervision removal deleted — old journals carrying it replay
-        // cleanly.)
-        assert_eq!(r.events.len(), 1, "{:?}", r.events);
-        assert_eq!(r.events[0].seq, 3);
-        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "three"));
+        // the cursor, and torn lines are dropped. (`since` is the inclusive
+        // next-seq-to-serve cursor, so `since=0` serves seq 0 too.
+        // `agent_recovered` is the wire type the supervision removal
+        // deleted — old journals carrying it replay cleanly.)
+        assert_eq!(r.events.len(), 2, "{:?}", r.events);
+        assert_eq!(r.events[0].seq, 0);
+        assert!(matches!(r.events[0].event, StreamEvent::System(ref s) if s == "one"));
+        assert_eq!(r.events[1].seq, 3);
+        assert!(matches!(r.events[1].event, StreamEvent::System(ref s) if s == "three"));
         assert_eq!(r.next_seq, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3367,15 +3428,15 @@ this line is torn and not json
         // the workspace on every probe.
         state.rebuild_complete.store(true, Ordering::Relaxed);
         assert!(lookup_entry(&state, "fb-2").is_none());
-        assert!(lock_map(&state.missing_sessions).contains("fb-2"));
+        assert!(lock_map(&state.missing_sessions).contains_key("fb-2"));
 
         // Reattach resolves the same disk fallback and returns the replay
-        // cursor: the highest journaled seq.
+        // cursor: the next seq to serve (max + 1, 0 when empty).
         let r = reattach(State(state.clone()), Path("fb-1".into()))
             .await
             .expect("reattach");
         assert_eq!(r.session_id, "fb-1");
-        assert_eq!(r.seq, 3);
+        assert_eq!(r.seq, 4);
         assert!(matches!(
             reattach(State(state), Path("fb-2".into())).await,
             Err(StatusCode::NOT_FOUND)
@@ -3692,6 +3753,8 @@ mod permission_gate_tests {
                 name: None,
                 cwd: "/tmp".into(),
                 model: None,
+                wake_provider: None,
+                wake_base_url: None,
                 plan_persisted: None,
                 model_persisted: None,
             },
@@ -4690,6 +4753,8 @@ mod async_parallel_tests {
                     name: Some(format!("n{i}")),
                     cwd: format!("/tmp/cwd-{i}"),
                     model: None,
+                    wake_provider: None,
+                    wake_base_url: None,
                     plan_persisted: None,
                     model_persisted: None,
                 },

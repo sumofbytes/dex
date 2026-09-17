@@ -92,9 +92,24 @@ pub(super) fn popup_open(app: &App) -> bool {
 struct SlashKey {
     input: String,
     model: String,
-    models_len: usize,
-    skills_len: usize,
+    provider: String,
+    models_hash: u64,
+    skills_hash: u64,
     resume_mtime: Option<std::time::SystemTime>,
+}
+
+fn str_list_hash(items: &[String]) -> u64 {
+    // FNV-1a over lengths + bytes: a same-length content swap still misses.
+    let mut h = 14695981039346656037u64;
+    for s in items {
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(1099511628211);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
 }
 
 pub(crate) struct SlashCache {
@@ -114,8 +129,14 @@ pub(super) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     let key = SlashKey {
         input: input.clone(),
         model: app.config.model.clone(),
-        models_len: app.config.available_models.len(),
-        skills_len: app.skills.len(),
+        provider: app.config.provider.name().to_string(),
+        models_hash: str_list_hash(&app.config.available_models),
+        skills_hash: str_list_hash(
+            &app.skills
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+        ),
         // One stat per input change; a sessions-dir rewrite (new/removed
         // session) invalidates the `/resume` listing.
         resume_mtime: Session::list_dir_mtime(&app.cwd),
@@ -352,6 +373,12 @@ pub(super) fn reset_session_state(app: &mut App) {
     app.tool_state.verify_dirty = false;
     app.plan = crate::core::types::Plan::default();
     app.transcript.clear();
+    // Wrapped/display caches are keyed by block stamps: a cleared transcript
+    // reuses stamp 0, so stale rows would hit. Drop both (and any selection
+    // into them) alongside the transcript.
+    app.wrapped_cache.clear();
+    app.display_cache.clear();
+    app.selection = None;
     app.assistant_pending.clear();
     app.assistant_gap.reset();
     app.assistant_open = false;

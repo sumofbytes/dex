@@ -522,10 +522,12 @@ impl PendingApproval {
         request_id: String,
         agent: Option<String>,
     ) -> Self {
-        let title = crate::core::format::approval_title(&name, &input);
+        let has_then_run = crate::core::format::input_has_then_run(&input);
+        let title = crate::core::format::approval_title_with_then_run(&name, has_then_run);
         let summary = crate::core::format::approval_summary(&name, &input);
         let details = crate::core::format::approval_details(&name, &input);
-        let (risk_label, risk_color) = crate::core::format::approval_risk(&name, &input);
+        let (risk_label, risk_color) =
+            crate::core::format::approval_risk_with_then_run(&name, has_then_run);
         Self {
             name,
             input,
@@ -1001,20 +1003,31 @@ fn flush_assistant(app: &mut App) {
 /// Drop the oldest stored thinking past [`THINKING_TEXT_CAP`] (§29). The cut
 /// shifts bytes, so every wrapped block's stamp resets — the incremental
 /// tail-wrap state rebuilds from scratch on the next frame instead of
-/// grafting onto shifted rows.
+/// grafting onto shifted rows. Every over-cap `Thinking` block is trimmed
+/// (not just the tail — a multi-tool turn leaves older closed blocks
+/// unbounded otherwise), and a cut inserts a `[truncated]` marker so the
+/// expanded view never silently shows partial reasoning.
 fn trim_thinking_head(app: &mut App) {
+    const MARKER: &str = "[truncated]…\n";
     let mut cut = false;
-    if let Some(idx) = content_tail_idx(app) {
-        if let Some(TranscriptBlock::Thinking { text, .. }) = app.transcript.get_mut(idx) {
-            let target = text.len().saturating_sub(THINKING_TEXT_CAP);
-            let mut at = target;
-            while at < text.len() && !text.is_char_boundary(at) {
-                at += 1;
+    for block in &mut app.transcript {
+        let TranscriptBlock::Thinking { text, .. } = block else {
+            continue;
+        };
+        if text.len() <= THINKING_TEXT_CAP {
+            continue;
+        }
+        let target = text.len().saturating_sub(THINKING_TEXT_CAP);
+        let mut at = target;
+        while at < text.len() && !text.is_char_boundary(at) {
+            at += 1;
+        }
+        if at > 0 {
+            text.drain(..at);
+            if !text.starts_with("[truncated]") {
+                text.insert_str(0, MARKER);
             }
-            if at > 0 {
-                text.drain(..at);
-                cut = true;
-            }
+            cut = true;
         }
     }
     if cut {
@@ -1261,6 +1274,10 @@ pub(super) fn append_sink_line(app: &mut App, sl: SinkLine) {
                         *out = Some(output);
                         *prev = preview_lines;
                         *stamp = stamp.wrapping_add(1);
+                        // A mid-transcript completion shifts every display row
+                        // below it: drop a live selection reaching past it
+                        // rather than highlight/copy shifted rows.
+                        drop_shifted_selection(app, i);
                         return;
                     }
                 }
@@ -1530,6 +1547,10 @@ pub(super) fn render_user_prompt(app: &mut App, line: &str) {
 
 pub(crate) fn rebuild_transcript(app: &mut App) {
     app.transcript.clear();
+    // See `reset_session_state`: stamps restart at 0, so cached rows must go.
+    app.wrapped_cache.clear();
+    app.display_cache.clear();
+    app.selection = None;
     app.assistant_pending.clear();
     app.assistant_gap.reset();
     app.assistant_open = false;

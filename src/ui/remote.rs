@@ -644,11 +644,11 @@ pub(crate) fn run_ratatui_repl_with_remote(
             if rebuilt {
                 // The drain path seeds the cursor per page; the local path
                 // seeds it from the local journal tip (no HTTP round trip —
-                // the file is right here). Either way the poller resumes
+                // the file is right here). Cursor is the next seq to serve
+                // (inclusive), so seed max + 1. Either way the poller resumes
                 // past replayed rows without its own reattach scan.
-                if let Some(max) = Session::max_event_seq(p) {
-                    remote.events_cursor.fetch_max(max, Ordering::SeqCst);
-                }
+                let next = Session::max_event_seq(p).map_or(0, |m| m.saturating_add(1));
+                remote.events_cursor.fetch_max(next, Ordering::SeqCst);
             }
         }
         if !rebuilt {
@@ -1265,6 +1265,10 @@ fn rebuild_remote_from_messages(
     remote.app.messages.extend(loaded);
     let msgs = std::mem::take(&mut remote.app.messages);
     remote.app.transcript.clear();
+    // Stamps restart at 0 — drop cached rows + selection (see `reset_session_state`).
+    remote.app.wrapped_cache.clear();
+    remote.app.display_cache.clear();
+    remote.app.selection = None;
     remote.app.assistant_pending.clear();
     remote.app.assistant_gap.reset();
     remote.app.assistant_open = false;
