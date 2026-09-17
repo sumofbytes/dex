@@ -517,7 +517,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
         transcript_area: None,
         selection: None,
         notice: None,
-        status_tokens_cache: std::cell::Cell::new((0, 0, 0, 0)),
+        status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
         slash_cache: std::cell::RefCell::new(None),
     };
 
@@ -1306,7 +1306,6 @@ fn replay_remote_events(
         let prev = since;
         match remote.client.events(session_id, since) {
             Ok(resp) => {
-                let served = resp.events.len();
                 for env in resp.events {
                     // A parked parent-turn approval is dead (denied at its
                     // turn's teardown); a child approval (V1b) stays
@@ -1321,11 +1320,14 @@ fn replay_remote_events(
                     .events_cursor
                     .fetch_max(resp.next_seq, Ordering::SeqCst);
                 paint(remote);
-                // No forward progress means the journal is drained. A short
-                // page means EOF (saves the extra empty fetch); the
-                // no-progress break stays as backup for old daemons without
-                // page limits.
-                if since <= prev || served < crate::session::EVENTS_PAGE_LIMIT {
+                // EOF is raw-journal progress (`next_seq` advances on raw
+                // rows, even unknown-type ones the filter above skips), not
+                // the filtered count: a full page of unknown rows serves 0
+                // events while the tail is unfetched, so `served < LIMIT`
+                // would break early. No progress means drained — the extra
+                // empty fetch this costs old daemons on exact-divide totals
+                // is the documented backup, not a bug.
+                if since <= prev {
                     break;
                 }
             }
@@ -3261,7 +3263,7 @@ mod tests {
             transcript_area: None,
             selection: None,
             notice: None,
-            status_tokens_cache: std::cell::Cell::new((0, 0, 0, 0)),
+            status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
             slash_cache: std::cell::RefCell::new(None),
         };
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(16);

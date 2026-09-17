@@ -320,14 +320,11 @@ pub(crate) struct App {
     /// [`NOTICE_LIFETIME`]; the event loop redraws once on expiry.
     pub(crate) notice: Option<(String, Instant)>,
     /// Cached fallback context estimate for the status bar (perf doc §29):
-    /// `status::status_tokens()` serves it while `messages` is unchanged,
+    /// `status::status_tokens()` serves it while the history fingerprint
+    /// (count + per-message role/length/head-tail samples) is unchanged,
     /// so frames (keystrokes, SSE batches, 8fps busy ticks) never re-walk
     /// the transcript until the first provider-reported `Usage` arrives.
-    /// Keyed on (message count, tail content/reasoning sizes) — the TUI
-    /// never mutates messages in place (streaming lands in transcript
-    /// blocks; history changes are pushes/truncations/reloads), so the key
-    /// is exact.
-    pub(crate) status_tokens_cache: Cell<(usize, usize, usize, u64)>,
+    pub(crate) status_tokens_cache: Cell<(usize, u64, u64)>,
     /// Cached slash-popup listing, keyed per input change (§29) — see
     /// `slash::SlashCache`. `RefCell` (not a plain field) so the
     /// `&App` render path can memoize without signature ripples; never
@@ -406,7 +403,7 @@ impl App {
             transcript_area: None,
             selection: None,
             notice: None,
-            status_tokens_cache: Cell::new((0, 0, 0, 0)),
+            status_tokens_cache: Cell::new((0, 0, 0)),
             slash_cache: std::cell::RefCell::new(None),
         }
     }

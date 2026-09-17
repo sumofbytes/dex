@@ -64,15 +64,26 @@ pub(crate) fn tool_defs() -> Vec<ToolDefinition> {
 }
 
 /// Host-facing projection seam: the provider-bound message list, or a
-/// borrow of the history unchanged when the experiment is off. `loop.rs`
-/// calls this instead of naming the gate. Borrowed when off so the common
-/// path pays no `to_vec` clone per model call.
+/// borrow of the history unchanged when the experiment is off — or when
+/// it is on but nothing is packable. `loop.rs` calls this instead of
+/// naming the gate. Borrowed when off so the common path pays no
+/// `to_vec` clone per model call.
 pub(crate) fn project_messages<'a>(
     projection: &ProjectionState,
     session_path: Option<&Path>,
     messages: &'a [ChatMessage],
 ) -> std::borrow::Cow<'a, [ChatMessage]> {
     if !observation_pack_enabled() {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    // Borrowed fast path: with no Tool-role messages there are no
+    // placeholders to substitute, so the provider-bound view IS the
+    // history — skip the per-message clone plus the lock probes and
+    // archive IO inside `project` entirely.
+    if !messages
+        .iter()
+        .any(|m| m.role == crate::core::types::Role::Tool)
+    {
         return std::borrow::Cow::Borrowed(messages);
     }
     std::borrow::Cow::Owned(project(projection, session_path, messages))

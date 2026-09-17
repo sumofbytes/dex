@@ -56,12 +56,18 @@ pub(crate) fn project_context() -> Option<String> {
 pub(crate) fn project_context_for(dir: &Path) -> Option<String> {
     let cwd = dir.to_path_buf();
     let path = project_file_from(&cwd)?;
-    // Read first, then stat: storing the pre-read identity with post-read
-    // bytes serves stale on a racing writer (TOCTOU). The post-read stat
-    // describes what was actually read; a concurrent change misses next time.
+    // stat → read → stat: a writer racing the read leaves mismatched
+    // identities, and the torn bytes are served once WITHOUT caching —
+    // caching post-read bytes under a pre-read identity (or vice versa)
+    // would pin stale project instructions until the *next* change.
+    let meta_before = fs::metadata(&path).ok()?;
+    let (mtime_b, len_b) = (meta_before.modified().ok()?, meta_before.len());
     let content = fs::read_to_string(&path).ok();
-    let meta = fs::metadata(&path).ok()?;
-    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    let meta_after = fs::metadata(&path).ok()?;
+    let (mtime, len) = (meta_after.modified().ok()?, meta_after.len());
+    if mtime_b != mtime || len_b != len {
+        return content;
+    }
     let mut cache = project_cache().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(hit) = cache.get(&(cwd.clone(), path.clone())) {
         if hit.mtime == mtime && hit.len == len {
@@ -76,8 +82,10 @@ pub(crate) fn project_context_for(dir: &Path) -> Option<String> {
             content: content.clone(),
         },
     );
-    // FIFO-cap: project files are few, but a daemon serving many workspaces
-    // must not grow without bound.
+    // Bounded-cap: project files are few, but a daemon serving many
+    // workspaces must not grow without bound. Eviction is arbitrary
+    // (`HashMap` order), not FIFO — the cap is a safety net, and any live
+    // entry re-caches on next use.
     if cache.len() > 64 {
         if let Some(k) = cache.keys().next().cloned() {
             cache.remove(&k);
