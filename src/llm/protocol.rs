@@ -33,13 +33,29 @@ pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamTo
     }
 }
 
+pub(crate) fn sort_tool_defs_by_name(tail: &mut [ToolDefinition]) {
+    tail.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+}
+
+pub(crate) fn sort_wire_tools_by_name(tail: &mut [Value]) {
+    tail.sort_by(|a, b| {
+        a.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
+    });
+}
+
 pub(crate) fn tools_schema() -> Vec<ToolDefinition> {
     // One merged copy per request: `ChatRequest.tools` owns its vec. Callers
     // that serialize straight to `Value` use `tools_schema_parts` and skip
-    // even this copy.
+    // even this copy. Native order is fixed; the MCP + extension tail is
+    // sorted by name so refresh completion order can't reorder the schema
+    // (deterministic bytes; adding/removing a tool still shifts the tail).
     let (mut tools, mcp, ext) = tools_schema_parts();
-    tools.extend(mcp.iter().cloned());
-    tools.extend(ext.iter().cloned());
+    let mut tail: Vec<ToolDefinition> = mcp.iter().cloned().chain(ext.iter().cloned()).collect();
+    sort_tool_defs_by_name(&mut tail);
+    tools.extend(tail);
     tools
 }
 
@@ -379,11 +395,24 @@ pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<
 }
 
 pub(crate) fn responses_tools() -> Vec<Value> {
-    // Borrowed slices: no merged-schema copy on the wire path.
+    // Borrowed slices: no merged-schema copy on the wire path. Native order
+    // is fixed; the MCP + extension tail is sorted by name so refresh
+    // completion order can't reorder the schema (deterministic bytes;
+    // adding/removing a tool still shifts the tail).
     let (native, mcp, ext) = tools_schema_parts();
-    native
+    let mut out: Vec<Value> = native
         .iter()
-        .chain(mcp.iter())
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "parameters": tool.function.parameters,
+            })
+        })
+        .collect();
+    let mut tail: Vec<Value> = mcp
+        .iter()
         .chain(ext.iter())
         .map(|tool| {
             json!({
@@ -393,7 +422,10 @@ pub(crate) fn responses_tools() -> Vec<Value> {
                 "parameters": tool.function.parameters,
             })
         })
-        .collect()
+        .collect();
+    sort_wire_tools_by_name(&mut tail);
+    out.extend(tail);
+    out
 }
 
 pub(crate) fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) {
@@ -578,6 +610,85 @@ mod tests {
         assert_eq!(input[0]["encrypted_content"], "blob1");
         assert_eq!(input[1]["role"], "assistant");
         assert_eq!(input[2]["type"], "function_call");
+    }
+
+    /// Prompt-cache stability: extending the history only appends to these
+    /// wire views (no message merging on this path), never rewrites earlier
+    /// entries — the provider caches the prefix, and any byte change in it
+    /// forces a full re-read.
+    #[test]
+    fn wire_views_are_append_only() {
+        let mut base = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hi"),
+            ChatMessage::tool_result("call_1", "out"),
+        ];
+        let (instr1, input1) = responses_input(&base);
+        let wire1: Vec<serde_json::Value> = chat_completions_messages(&base)
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        base.push(ChatMessage::user("follow-up"));
+        let (instr2, input2) = responses_input(&base);
+        let wire2: Vec<serde_json::Value> = chat_completions_messages(&base)
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(instr1, instr2);
+        assert_eq!(input2.len(), input1.len() + 1);
+        assert_eq!(&input2[..input1.len()], &input1[..]);
+        assert_eq!(wire2.len(), wire1.len() + 1);
+        assert_eq!(&wire2[..wire1.len()], &wire1[..]);
+    }
+
+    #[test]
+    fn wire_tools_serialize_deterministically() {
+        // Consecutive serializations agree exactly: background MCP/extension
+        // refreshes landing between calls must not reorder the schema.
+        let a = super::responses_tools();
+        let b = super::responses_tools();
+        assert_eq!(a, b);
+        let c = super::tools_schema();
+        let d = super::tools_schema();
+        let names_c: Vec<&str> = c.iter().map(|t| t.function.name.as_str()).collect();
+        let names_d: Vec<&str> = d.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names_c, names_d);
+        // Native head order is fixed (MCP/extension tail sorts behind it).
+        assert!(names_c.starts_with(&["read", "bash", "write", "edit", "grep", "find", "ls"]));
+    }
+
+    #[test]
+    fn wire_tool_tail_sort_is_order_independent() {
+        // The production sort helpers must yield identical bytes regardless
+        // of cache fill order — not just agree across consecutive calls with
+        // unchanged caches.
+        use crate::core::types::{FunctionDef, ToolDefinition};
+        fn def(name: &str) -> ToolDefinition {
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDef {
+                    name: name.to_string(),
+                    description: String::new(),
+                    parameters: json!({}),
+                },
+            }
+        }
+        let mut fwd = vec![def("mcp__b__x"), def("ext__a__y"), def("mcp__a__z")];
+        let mut rev = fwd.clone();
+        rev.reverse();
+        super::sort_tool_defs_by_name(&mut fwd);
+        super::sort_tool_defs_by_name(&mut rev);
+        let names_fwd: Vec<&str> = fwd.iter().map(|t| t.function.name.as_str()).collect();
+        let names_rev: Vec<&str> = rev.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names_fwd, names_rev);
+        assert_eq!(names_fwd, vec!["ext__a__y", "mcp__a__z", "mcp__b__x"]);
+        // Wire JSON form: missing names sort first, never panic.
+        let mut a = vec![json!({"name": "b"}), json!({}), json!({"name": "a"})];
+        let mut b = a.clone();
+        b.reverse();
+        super::sort_wire_tools_by_name(&mut a);
+        super::sort_wire_tools_by_name(&mut b);
+        assert_eq!(a, b);
     }
 
     #[test]
