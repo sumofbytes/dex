@@ -6,8 +6,12 @@ use std::time::{Duration, SystemTime};
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::agent::router::{classify, infer_tool_hints, model_for, TaskSignal, Tier, TierMap};
-use crate::core::types::{ApiProtocol, PermissionMode, Provider};
+use crate::agent::router::{
+    classify_with_reasons, count_history_tool_calls, infer_tool_hints, model_for, TaskSignal, Tier,
+    TierMap,
+};
+use crate::agent::tokens::estimate_tokens;
+use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
 
 /// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
@@ -391,44 +395,12 @@ pub(crate) const ROUTING_ENV: &str = "DEX_ROUTING";
 pub(crate) const ROUTING_FAST_ENV: &str = "DEX_ROUTING_FAST";
 pub(crate) const ROUTING_BALANCED_ENV: &str = "DEX_ROUTING_BALANCED";
 pub(crate) const ROUTING_POWERFUL_ENV: &str = "DEX_ROUTING_POWERFUL";
-/// Deprecated tier envs from the four-tier names: still honored, each
-/// pointing at its replacement (`high` and `critical` both feed
-/// `powerful`).
-pub(crate) const ROUTING_LOW_ENV: &str = "DEX_ROUTING_LOW";
-pub(crate) const ROUTING_MEDIUM_ENV: &str = "DEX_ROUTING_MEDIUM";
-pub(crate) const ROUTING_HIGH_ENV: &str = "DEX_ROUTING_HIGH";
-pub(crate) const ROUTING_CRITICAL_ENV: &str = "DEX_ROUTING_CRITICAL";
-
 /// Env var holding a tier's selection (`DEX_ROUTING_FAST`…).
 fn routing_tier_env(tier: Tier) -> &'static str {
     match tier {
         Tier::Fast => ROUTING_FAST_ENV,
         Tier::Balanced => ROUTING_BALANCED_ENV,
         Tier::Powerful => ROUTING_POWERFUL_ENV,
-    }
-}
-
-/// Deprecated env alias(es) for a tier, highest precedence first.
-/// `critical` outranks `high`: both fed `powerful`'s bucket, and the
-/// higher tier's model is the closer intent.
-fn routing_tier_deprecated_envs(tier: Tier) -> &'static [&'static str] {
-    match tier {
-        Tier::Fast => &[ROUTING_LOW_ENV],
-        Tier::Balanced => &[ROUTING_MEDIUM_ENV],
-        Tier::Powerful => &[ROUTING_CRITICAL_ENV, ROUTING_HIGH_ENV],
-    }
-}
-
-/// Origin wording for a deprecated env alias, pointing at its replacement.
-fn deprecated_env_origin(var: &str) -> &'static str {
-    if var == ROUTING_LOW_ENV {
-        "DEX_ROUTING_LOW (deprecated — use DEX_ROUTING_FAST)"
-    } else if var == ROUTING_MEDIUM_ENV {
-        "DEX_ROUTING_MEDIUM (deprecated — use DEX_ROUTING_BALANCED)"
-    } else if var == ROUTING_HIGH_ENV {
-        "DEX_ROUTING_HIGH (deprecated — use DEX_ROUTING_POWERFUL)"
-    } else {
-        "DEX_ROUTING_CRITICAL (deprecated — use DEX_ROUTING_POWERFUL)"
     }
 }
 
@@ -441,29 +413,9 @@ fn routing_file_origin(tier: Tier) -> &'static str {
     }
 }
 
-/// Deprecated file key(s) for a tier, highest precedence first (same
-/// `critical`-over-`high` rule as the env aliases).
-fn routing_tier_deprecated_keys(tier: Tier) -> &'static [&'static str] {
-    match tier {
-        Tier::Fast => &["low"],
-        Tier::Balanced => &["medium"],
-        Tier::Powerful => &["critical", "high"],
-    }
-}
-
-/// Origin wording for a deprecated file key, pointing at its replacement.
-fn deprecated_file_origin(key: &str) -> &'static str {
-    match key {
-        "low" => "config routing.low: (deprecated — use routing.fast:)",
-        "medium" => "config routing.medium: (deprecated — use routing.balanced:)",
-        "high" => "config routing.high: (deprecated — use routing.powerful:)",
-        _ => "config routing.critical: (deprecated — use routing.powerful:)",
-    }
-}
-
 /// Per-tier origins for [`RoutingResolution`]: where each raw selection
 /// came from. A miss falls back at use time (`model_for`: tier miss →
-/// `medium` → top-level `model:`), so the miss origin only says that.
+/// `balanced` → top-level `model:`), so the miss origin only says that.
 pub(crate) struct TierOrigins {
     pub(crate) fast: &'static str,
     pub(crate) balanced: &'static str,
@@ -511,8 +463,7 @@ fn routing_file_key(file: &Option<serde_yaml::Value>, key: &str) -> Option<Strin
     }
 }
 
-/// One tier's raw selection: `DEX_ROUTING_<TIER>` > deprecated env
-/// alias(es) > file `routing.<tier>:` > deprecated file key(s).
+/// One tier's raw selection: `DEX_ROUTING_<TIER>` > file `routing.<tier>:`.
 /// Empty/missing at every layer is not an error — `model_for` falls
 /// through to `balanced`, then to top-level `model:`.
 fn routing_tier_value(
@@ -527,32 +478,8 @@ fn routing_tier_value(
             return (trimmed, env_var);
         }
     }
-    for &old in routing_tier_deprecated_envs(tier) {
-        if let Ok(raw) = env::var(old) {
-            let trimmed = raw.trim().to_string();
-            if !trimmed.is_empty() {
-                warn_once(
-                    &format!("env:{old}"),
-                    &format!("{old} is deprecated — use {env_var} instead"),
-                );
-                return (trimmed, deprecated_env_origin(old));
-            }
-        }
-    }
     if let Some(selection) = routing_file_key(file, tier.key()) {
         return (selection, routing_file_origin(tier));
-    }
-    for &old in routing_tier_deprecated_keys(tier) {
-        if let Some(selection) = routing_file_key(file, old) {
-            warn_once(
-                &format!("config:routing:{old}"),
-                &format!(
-                    "config key 'routing.{old}:' is deprecated — use 'routing.{}:' instead",
-                    tier.key()
-                ),
-            );
-            return (selection, deprecated_file_origin(old));
-        }
     }
     (String::new(), miss_origin)
 }
@@ -646,25 +573,33 @@ pub(crate) fn routing_resolution(file: &Option<serde_yaml::Value>) -> RoutingRes
 pub(crate) struct RoutedTurn {
     pub(crate) tier: Tier,
     pub(crate) model_override: Option<String>,
+    /// Strongest classification signal, for the per-turn log line.
+    pub(crate) reason: &'static str,
 }
 
-pub(crate) fn route_turn(prompt: &str, history_tokens: u64) -> Option<RoutedTurn> {
+pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<RoutedTurn> {
     let file = load_config_file();
     let routing = routing_resolution(&file);
     if !routing.enabled {
         return None;
     }
     let selection = resolve_selection(None, &file).ok()?;
+    // History doubles as the routing signal: token size plus the real
+    // tool-call count, so a deep session weighs in without prompt words.
+    // The daemon reuses this same load for the turn itself, so routing
+    // sees exactly what the turn will send.
     let signal = TaskSignal {
-        prompt_len: prompt.len(),
-        history_tokens,
+        prompt_chars: prompt.chars().count(),
+        history_tokens: estimate_tokens(history),
+        history_tool_calls: count_history_tool_calls(history),
         tool_hints: infer_tool_hints(prompt),
     };
-    let tier = classify(&signal, prompt);
-    let model = model_for(tier, &routing.tiers, &selection.value);
+    let decision = classify_with_reasons(&signal, prompt);
+    let model = model_for(decision.tier, &routing.tiers, &selection.value);
     Some(RoutedTurn {
-        tier,
+        tier: decision.tier,
         model_override: (model != selection.value).then(|| model.to_string()),
+        reason: decision.top_reason(),
     })
 }
 
@@ -6654,10 +6589,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
             "OPENCODE_API_KEY",
@@ -6678,10 +6609,6 @@ pub(crate) mod tests {
         std::env::remove_var("DEX_ROUTING_FAST");
         std::env::remove_var("DEX_ROUTING_BALANCED");
         std::env::remove_var("DEX_ROUTING_POWERFUL");
-        std::env::remove_var("DEX_ROUTING_LOW");
-        std::env::remove_var("DEX_ROUTING_MEDIUM");
-        std::env::remove_var("DEX_ROUTING_HIGH");
-        std::env::remove_var("DEX_ROUTING_CRITICAL");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -6746,9 +6673,8 @@ pub(crate) mod tests {
 
     /// Complexity router: off with unset tiers by default; file `routing:`
     /// parses the switch plus per-tier selections; env beats file per tier;
-    /// deprecated four-tier keys/envs map onto the new tiers; an unknown
-    /// tier key and a non-string tier warn and fall through instead of
-    /// erroring (the typo policy `load_config_file` uses).
+    /// an unknown tier key and a non-string tier warn and fall through
+    /// instead of erroring (the typo policy `load_config_file` uses).
     #[test]
     fn routing_resolution_reads_switch_tiers_and_env() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -6760,10 +6686,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
             "XDG_CACHE_HOME",
         ]);
         for key in [
@@ -6771,10 +6693,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
         ] {
             std::env::remove_var(key);
         }
@@ -6807,44 +6725,17 @@ pub(crate) mod tests {
         assert_eq!(r.tiers.powerful, "myprov/fast");
         assert_eq!(r.tier_origins.powerful, "DEX_ROUTING_POWERFUL");
         std::env::remove_var("DEX_ROUTING_POWERFUL");
-        // Deprecated four-tier keys land on their replacements (`critical`
-        // outranks `high`: both fed `powerful`).
+        // Unknown tier keys are ignored: only fast/balanced/powerful exist.
         std::fs::write(
             dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/mid\n  high: myprov/strong\n  critical: myprov/best\n",
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/mid\n",
         )
         .unwrap();
         let file = super::load_config_file();
         let r = super::routing_resolution(&file);
-        assert_eq!(r.tiers.fast, "myprov/cheap");
-        assert_eq!(
-            r.tier_origins.fast,
-            "config routing.low: (deprecated — use routing.fast:)"
-        );
-        assert_eq!(r.tiers.balanced, "myprov/mid");
-        assert_eq!(
-            r.tier_origins.balanced,
-            "config routing.medium: (deprecated — use routing.balanced:)"
-        );
-        assert_eq!(r.tiers.powerful, "myprov/best");
-        assert_eq!(
-            r.tier_origins.powerful,
-            "config routing.critical: (deprecated — use routing.powerful:)"
-        );
-        // Deprecated env aliases work too; the new name wins when both set.
-        std::env::set_var("DEX_ROUTING_LOW", "myprov/old-cheap");
-        let r = super::routing_resolution(&file);
-        assert_eq!(r.tiers.fast, "myprov/old-cheap");
-        assert_eq!(
-            r.tier_origins.fast,
-            "DEX_ROUTING_LOW (deprecated — use DEX_ROUTING_FAST)"
-        );
-        std::env::set_var("DEX_ROUTING_FAST", "myprov/new-cheap");
-        let r = super::routing_resolution(&file);
-        assert_eq!(r.tiers.fast, "myprov/new-cheap");
-        assert_eq!(r.tier_origins.fast, "DEX_ROUTING_FAST");
-        std::env::remove_var("DEX_ROUTING_LOW");
-        std::env::remove_var("DEX_ROUTING_FAST");
+        assert!(r.tiers.fast.is_empty());
+        assert!(r.tiers.balanced.is_empty());
+        assert!(r.tiers.powerful.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6863,10 +6754,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
             "XDG_CACHE_HOME",
         ]);
         for key in [
@@ -6875,10 +6762,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
         ] {
             std::env::remove_var(key);
         }
@@ -6893,16 +6776,19 @@ pub(crate) mod tests {
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
         // Trivial prompt → fast tier → override to the cheap model.
-        let routed = super::route_turn("fix typo", 0).expect("routing on");
+        let routed = super::route_turn("fix typo", &[]).expect("routing on");
         assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
         assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
+        assert!(!routed.reason.is_empty());
         // Ordinary work with history behind it → balanced, which already is
         // the selection → no override, the config never rebuilds.
-        let routed = super::route_turn("add a retry to the fetch call", 5000).expect("routing on");
+        let history = vec![crate::core::types::ChatMessage::user("x".repeat(20_000))];
+        let routed =
+            super::route_turn("add a retry to the fetch call", &history).expect("routing on");
         assert_eq!(routed.tier, crate::agent::router::Tier::Balanced);
         assert_eq!(routed.model_override, None);
-        // Migration keyword escalates; unset powerful falls back to balanced.
-        let routed = super::route_turn("run the database migration", 0).expect("routing on");
+        // Migration work escalates; unset powerful falls back to balanced.
+        let routed = super::route_turn("run the database migration", &[]).expect("routing on");
         assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
         assert_eq!(routed.model_override, None);
         // Routing off → None even for a powerful-shaped prompt.
@@ -6911,12 +6797,12 @@ pub(crate) mod tests {
             "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n",
         )
         .unwrap();
-        assert!(super::route_turn("run the database migration", 0).is_none());
+        assert!(super::route_turn("run the database migration", &[]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `dex doctor` shows the routing switch plus each tier's resolved
-    /// model and origin — an unset tier displays the `medium` fallback it
+    /// model and origin — an unset tier displays the `balanced` fallback it
     /// would actually use at runtime.
     #[test]
     fn doctor_shows_routing_tiers_with_origins() {
@@ -6930,10 +6816,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
             "OPENCODE_API_KEY",
             "XDG_CACHE_HOME",
         ]);
@@ -6943,10 +6825,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_LOW",
-            "DEX_ROUTING_MEDIUM",
-            "DEX_ROUTING_HIGH",
-            "DEX_ROUTING_CRITICAL",
         ] {
             std::env::remove_var(key);
         }
