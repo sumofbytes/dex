@@ -11,11 +11,13 @@
 //! tier-Choice today, skill selection will ask a skill-Choice later — both
 //! go through [`evaluate`]. Caller policy (which questions, confidence
 //! thresholds, deterministic fallback) lives with the callers, key/endpoint
-//! resolution lives in `llm::config::resolve_jev`, so setup is documented
-//! once.
+//! resolution lives in [`resolve`], so setup is documented once.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+use crate::core::types::Provider;
+use crate::llm::http::error_head;
 
 /// Provider-map name: the key lands in `providers.typesafe.api_key` (or
 /// the `TYPESAFE_API_KEY` env var) and an explicit
@@ -32,14 +34,43 @@ pub(crate) const SYSTEMONE_PATH: &str = "/v1/systemone";
 /// answers land in 70–500ms); callers fall back past this.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 15;
 
-/// Resolved Jev setup, built once per call site by
-/// `llm::config::resolve_jev` (key → endpoint → model precedence).
+/// Resolved Jev setup, built once per call site by [`resolve`] (key →
+/// endpoint → model precedence).
 #[derive(Debug, Clone)]
 pub(crate) struct JevConfig {
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) model: String,
     pub(crate) timeout: Duration,
+}
+
+/// Resolve the shared Jev capability for every caller (routing today, skill
+/// selection next): key from `providers.typesafe.api_key` (else
+/// `TYPESAFE_API_KEY`), explicit `providers.typesafe.base_url` else the
+/// TypeSafe default, model from `DEX_JEV_MODEL`. One resolver so the setup
+/// error names the deposit places exactly once. Lives here (not
+/// `llm::config`) so config stays pure data + precedence and the Jev layer
+/// owns its wiring.
+pub(crate) fn resolve() -> Result<JevConfig, Box<dyn std::error::Error>> {
+    use crate::llm::config::{
+        jev_model_name, load_config_file, load_provider_entries, resolve_credentials,
+    };
+
+    let file = load_config_file();
+    let entries = load_provider_entries(&file);
+    let provider = Provider::Generic(PROVIDER_NAME.to_string());
+    let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| format!("jev: {e}"))?;
+    let base_url = entries
+        .get(PROVIDER_NAME)
+        .and_then(|e| e.base_url.clone())
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    Ok(JevConfig {
+        base_url,
+        api_key,
+        model: jev_model_name(),
+        timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+    })
 }
 
 /// One named SystemOne question. The `id` is caller-chosen and never sent
@@ -188,9 +219,12 @@ pub(crate) async fn evaluate(
         .timeout(cfg.timeout)
         .build()
         .map_err(|e| format!("jev: building client: {e}"))?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
+    // Same auth seam as the chat path: the provider's `AuthScheme` owns the
+    // headers (`Bearer` for typesafe), so a scheme change lands once in
+    // `provider.rs`, not per call site.
+    let resp = Provider::Generic(PROVIDER_NAME.to_string())
+        .auth_scheme()
+        .apply(client.post(&url), &cfg.api_key, None)
         .json(&body)
         .send()
         .await
@@ -201,7 +235,7 @@ pub(crate) async fn evaluate(
         .await
         .map_err(|e| format!("jev: reading response: {e}"))?;
     if !status.is_success() {
-        return Err(format!("jev: HTTP {status}: {}", truncate(&text, 500)).into());
+        return Err(format!("jev: HTTP {status}: {}", error_head(&text, 500)).into());
     }
     let parsed: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("jev: invalid JSON: {e}"))?;
@@ -318,14 +352,6 @@ fn parse_answer(
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +451,79 @@ mod tests {
 
     fn seen() -> std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> {
         std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// Save/restore process env around resolver tests (local copy of the
+    /// same helper in `config::tests`).
+    struct EnvRestore {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn take(keys: &[&'static str]) -> Self {
+            Self {
+                vars: keys.iter().map(|k| (*k, std::env::var_os(k))).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, prev) in self.vars.drain(..) {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_reads_key_endpoint_and_model() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "TYPESAFE_API_KEY",
+            "DEX_JEV_MODEL",
+            "XDG_CACHE_HOME",
+        ]);
+        let dir = std::env::temp_dir().join(format!("dex-jev-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        // Env key + file endpoint + env model.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    base_url: http://127.0.0.1:9\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("TYPESAFE_API_KEY", "env-key");
+        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
+        let cfg = super::resolve().unwrap();
+        assert_eq!(cfg.base_url, "http://127.0.0.1:9");
+        assert_eq!(cfg.api_key, "env-key");
+        assert_eq!(cfg.model, "jev-1.13.0");
+        // File key beats env; missing endpoint falls back to TypeSafe.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    api_key: file-key\n",
+        )
+        .unwrap();
+        std::env::remove_var("DEX_JEV_MODEL");
+        let cfg = super::resolve().unwrap();
+        assert_eq!(cfg.api_key, "file-key");
+        assert_eq!(cfg.base_url, "https://api.typesafe.ai");
+        assert_eq!(cfg.model, "jev-latest");
+        // No key anywhere errors naming the deposit places.
+        std::env::remove_var("TYPESAFE_API_KEY");
+        std::env::set_var("DEX_CONFIG", dir.join("missing.yaml"));
+        let err = super::resolve().unwrap_err().to_string();
+        assert!(err.contains("providers.typesafe.api_key"), "{err}");
+        assert!(err.contains("TYPESAFE_API_KEY"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
