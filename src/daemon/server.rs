@@ -1046,6 +1046,36 @@ async fn run_turn_inner(
             ));
         }
     }
+    // Complexity-router signal: history tokens come from the same
+    // model-bound load the turn rebuilds below, so routing sees what the
+    // turn will send. Loaded before the config build so the routed model
+    // rides the single `from_env_async` — no second build.
+    let history = if let Some(path) = session.path().map(|p| p.to_path_buf()) {
+        tokio::task::spawn_blocking(move || {
+            session::load_llm_messages_from_session(&path).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // Complexity router (V1): an explicit per-request model always wins;
+    // otherwise the classified tier resolves through routing.balanced: →
+    // top-level model:.
+    let explicit_model = req.model.clone().filter(|v| !v.is_empty());
+    let routed = if explicit_model.is_none() {
+        // The history load above doubles as the routing signal (token size
+        // plus real tool-call counts) and is reused for the turn below, so
+        // routing sees exactly what the turn will send at no extra load.
+        // Async: Jev's tier-Choice classifies here when
+        // `DEX_ROUTING_CLASSIFIER=jev`, else the deterministic default.
+        crate::llm::config::route_turn_async(&req.prompt, &history).await
+    } else {
+        None
+    };
+    let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
+    let routed_reason = routed.as_ref().map(|r| r.reason);
+    let model_override = explicit_model.or_else(|| routed.and_then(|r| r.model_override));
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
     // Async: cache hits are a mutex bump inline; misses parse the 4MB catalog
@@ -1057,7 +1087,7 @@ async fn run_turn_inner(
         .transpose()?;
     let mut config = LlmConfig::from_env_async(
         req.base_url.clone().filter(|v| !v.is_empty()),
-        req.model.clone().filter(|v| !v.is_empty()),
+        model_override,
         perm_override,
         Vec::new(),
     )
@@ -1191,14 +1221,9 @@ async fn run_turn_inner(
         req.system_prompt.as_deref(),
         Some(std::path::Path::new(&entry.cwd)),
     )));
-    if let Some(path) = session.path().map(|p| p.to_path_buf()) {
-        let loaded = tokio::task::spawn_blocking(move || {
-            session::load_llm_messages_from_session(&path).unwrap_or_default()
-        })
-        .await
-        .unwrap_or_default();
-        messages.extend(loaded);
-    }
+    // History was loaded up front for the routing signal; reuse it here
+    // so the turn sends exactly what routing saw.
+    messages.extend(history);
     let user_message = ChatMessage::user(req.prompt.clone());
     // §10b V1a: completion notices queued while no turn was live drain at
     // the next real turn boundary — the start of this one. They ride the
@@ -1207,7 +1232,7 @@ async fn run_turn_inner(
     // Durable journal (P8): a turn only exists once turn_start is recorded,
     // and an io::Error here fails the turn instead of being swallowed.
     session
-        .turn_event("turn_start")
+        .turn_event_with_tier("turn_start", routed_tier.as_deref())
         .map_err(|e| format!("failed to record turn_start: {e}"))?;
     session
         .append_message(&user_message)
@@ -1225,6 +1250,16 @@ async fn run_turn_inner(
     let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>(256);
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(16);
     let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
+    // Surface the routed tier in the transcript: daemon users get no other
+    // signal that the model changed under them (the tier is also journaled
+    // on `turn_start`).
+    if let Some(tier) = routed_tier.as_deref() {
+        let why = routed_reason.unwrap_or("ordinary work");
+        console.emit(SinkLine::System(format!(
+            "routing → {tier} ({why}; model {})",
+            config.model
+        )));
+    }
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
     if let Some(set) = lock_map(&state.session_approvals).get(session_id).cloned() {

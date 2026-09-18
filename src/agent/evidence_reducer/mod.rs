@@ -39,7 +39,7 @@ use crate::agent::experiments::{DoctorCtx, DoctorRow};
 use crate::core::types::ToolDefinition;
 use crate::core::types::{ChatMessage, Usage};
 use crate::llm::config::LlmConfig;
-use crate::llm::streaming::complete as call_llm;
+use crate::llm::dispatch::complete as call_llm;
 use crate::tools::ShellEvidence;
 
 pub(crate) const GATE_ENV: &str = "DEX_EVIDENCE_REDUCER";

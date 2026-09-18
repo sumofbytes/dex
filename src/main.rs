@@ -4,6 +4,7 @@ mod client;
 mod core;
 mod daemon;
 mod extensions;
+mod jev;
 mod llm;
 mod mcp;
 mod protocol;
@@ -231,6 +232,31 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         (config_result, skills, sess)
     });
     let mut config = config_result?;
+    // Complexity router (V1): an explicit `--model` always wins;
+    // otherwise the classified tier resolves through routing.balanced: →
+    // top-level model:, rebuilding once with the tier's model.
+    let routed = if args.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
+        None
+    } else {
+        crate::llm::config::route_turn(prompt, &history)
+    };
+    let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
+    let routed_reason = routed.as_ref().map(|r| r.reason);
+    if let Some(model) = routed.and_then(|r| r.model_override) {
+        config = LlmConfig::from_env(
+            args.base_url.clone(),
+            Some(model),
+            args.permission,
+            &args.headers,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+    }
+    // Surface the routed tier: headless users get no other signal that the
+    // model changed under them (the tier is also journaled on `turn_start`).
+    if let Some(tier) = routed_tier.as_deref() {
+        let why = routed_reason.unwrap_or("ordinary work");
+        eprintln!("dex: routing → {tier} ({why}; model {})", config.model);
+    }
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
     if let Some(warning) = config.thinking_mismatch_warning() {
         eprintln!("dex: {warning}");
@@ -253,7 +279,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     messages.extend(history);
     let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {
-        let _ = session.turn_event("turn_start");
+        let _ = session.turn_event_with_tier("turn_start", routed_tier.as_deref());
         let _ = session.append_message(&user);
     }
     messages.push(user);

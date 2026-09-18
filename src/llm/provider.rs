@@ -101,6 +101,11 @@ impl Provider {
     }
 }
 
+/// `anthropic-version` header value pinned by `AuthScheme::Anthropic`.
+/// Lives here (not `anthropic.rs`) so the generic auth layer doesn't import
+/// the concrete protocol module for one constant.
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// Request authentication scheme, resolved per provider by
 /// [`Provider::auth_scheme`] and applied in exactly one place
 /// (`client::authenticated_request`).
@@ -125,10 +130,9 @@ impl AuthScheme {
     ) -> reqwest::RequestBuilder {
         match self {
             Self::Bearer => request.bearer_auth(api_key),
-            Self::Anthropic => request.header("x-api-key", api_key).header(
-                "anthropic-version",
-                crate::llm::anthropic::ANTHROPIC_VERSION,
-            ),
+            Self::Anthropic => request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION),
             Self::Codex => {
                 let mut request = request
                     .bearer_auth(api_key)
@@ -218,7 +222,7 @@ mod tests {
             req.headers()
                 .get("anthropic-version")
                 .map(|v| v.to_str().unwrap()),
-            Some(crate::llm::anthropic::ANTHROPIC_VERSION)
+            Some(ANTHROPIC_VERSION)
         );
         assert!(req.headers().get("authorization").is_none());
         assert_eq!(
