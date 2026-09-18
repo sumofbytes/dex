@@ -27,7 +27,7 @@ impl CancellationSource for GlobalCancellation {
 pub(crate) const CACHE_FILE_NAME: &str = "dex-tool-cache.json";
 
 pub(crate) fn cache_file_path() -> Option<PathBuf> {
-    crate::core::fs::xdg_path("XDG_CACHE_HOME", ".cache", CACHE_FILE_NAME)
+    crate::workspace::xdg_path("XDG_CACHE_HOME", ".cache", CACHE_FILE_NAME)
 }
 
 pub(crate) fn cache_fingerprint(name: &str, input: &str) -> String {
