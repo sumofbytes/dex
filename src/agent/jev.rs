@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::core::types::{ChatMessage, Role};
+use crate::llm::config::warn_once;
 
 /// Value of [`COMPACTION_LLM_ENV`] /
 /// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`] selecting
@@ -40,7 +41,15 @@ pub(crate) const JEV_TRUNCATE_HEAD_CHARS: usize = 300;
 pub(crate) const JEV_MIN_REDUCTION_RATIO: f64 = 0.25;
 
 /// Memo estimate for the boundary economics when Jev prunes instead of
-/// summarizing: a few truncated heads, not a 1k summary.
+/// summarizing: a few truncated heads, not a 1k summary. A deliberate
+/// pre-decision floor, not a measurement: each truncated head leaves behind
+/// ~90 tokens (300 chars + trailer), so a prune with many truncations leaves
+/// more than 200 behind and the saving (`archive - memo`) is overstated.
+/// Bounded in practice: the worthwhile gate needs ≥25% reduction, so a
+/// many-truncation prune always frees thousands of tokens and the few-hundred
+/// memo error barely moves the breakeven — and the carried-debt gate prices
+/// the next compaction against the same floor, so the error cannot compound
+/// into a compaction spiral.
 pub(crate) const JEV_MEMO_TOKEN_ESTIMATE: u64 = 200;
 
 /// Medium results are truncated; huge ones from re-runnable tools are dropped.
@@ -58,24 +67,52 @@ pub(crate) enum SummaryMode {
 }
 
 /// Parse `DEX_COMPACTION_LLM`: `jev` (any case) → [`SummaryMode::Jev`],
-/// `1` → [`SummaryMode::Llm`], anything else (unset included) →
+/// `1` → [`SummaryMode::Llm`], unset/explicit offs →
 /// [`SummaryMode::Deterministic`]. Only `1` selects the LLM so existing
-/// `=1` setups keep working byte-for-byte.
+/// `=1` setups keep working byte-for-byte. A non-empty unrecognized value
+/// warns once (a typo like `=jve` must not silently degrade to
+/// deterministic) and likewise falls back to deterministic.
 pub(crate) fn summary_mode() -> SummaryMode {
-    match std::env::var(COMPACTION_LLM_ENV)
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Ok(JEV_VALUE) => SummaryMode::Jev,
-        Ok("1") => SummaryMode::Llm,
-        _ => SummaryMode::Deterministic,
+    let raw = std::env::var(COMPACTION_LLM_ENV).unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        JEV_VALUE => SummaryMode::Jev,
+        "1" => SummaryMode::Llm,
+        "" | "0" | "false" | "off" | "no" => SummaryMode::Deterministic,
+        _ => {
+            let short: String = raw.trim().chars().take(32).collect();
+            warn_once(
+                "env:DEX_COMPACTION_LLM",
+                &format!("ignoring DEX_COMPACTION_LLM={short:?} — expected '1' or 'jev'"),
+            );
+            SummaryMode::Deterministic
+        }
     }
 }
 
 pub(crate) fn summary_mode_is_jev() -> bool {
     summary_mode() == SummaryMode::Jev
+}
+
+/// `dex doctor` origin row for the threshold-compaction knob: the value
+/// names the mode that runs, the source names the env var whenever it is
+/// set (even to an explicit off or a warned-about typo — the value still
+/// reports what runs), or the built-in default when unset/empty.
+pub(crate) fn compaction_doctor() -> (String, String) {
+    let value = match summary_mode() {
+        SummaryMode::Jev => "verbatim prune (jev)",
+        SummaryMode::Llm => "LLM summary",
+        SummaryMode::Deterministic => "deterministic",
+    }
+    .to_string();
+    let source = if std::env::var(COMPACTION_LLM_ENV)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        COMPACTION_LLM_ENV.to_string()
+    } else {
+        "built-in default".to_string()
+    };
+    (value, source)
 }
 
 /// Outcome counts for one [`prune_span`] pass.
@@ -105,12 +142,11 @@ pub(crate) fn is_worthwhile(stats: &JevStats) -> bool {
 
 /// Tools whose output can be reproduced by re-running them — safe to drop
 /// verbatim when old and large. Mutating / delegating tools are only ever
-/// truncated, so file-op evidence and child answers survive.
+/// truncated, so file-op evidence and child answers survive. `bash` is
+/// mutating (no re-run restores a side effect), so it truncates even when
+/// huge — never drops.
 fn is_rerunnable(tool: &str) -> bool {
-    matches!(
-        tool,
-        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "bash"
-    )
+    matches!(tool, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls")
 }
 
 /// Anchors that must survive verbatim: plan snapshots orient the next plan,
@@ -134,7 +170,9 @@ fn decide(tool: &str, result: &str) -> (bool, bool) {
     if is_anchor(tool) {
         return (true, true);
     }
-    let len = result.len();
+    // Chars, not bytes: the thresholds are named `_CHARS` and the truncate
+    // head is 300 chars, so a multibyte result must clear the same bar.
+    let len = result.chars().count();
     if len < KEEP_BELOW_CHARS {
         return (true, true);
     }
@@ -150,6 +188,10 @@ fn decide(tool: &str, result: &str) -> (bool, bool) {
     (true, true)
 }
 
+/// Byte length of the span (content + tool-call framing). Bytes, not
+/// chars, deliberately: both sides of the reduction ratio use the same
+/// unit so it cancels, and it matches the estimator's byte basis — while
+/// the per-result keep/truncate/drop gates above are true chars.
 fn span_chars(messages: &[ChatMessage], start: usize, end: usize) -> usize {
     let mut total = 0;
     for msg in &messages[start..end] {
@@ -341,6 +383,24 @@ mod tests {
     }
 
     #[test]
+    fn large_bash_output_truncates_but_never_drops() {
+        // `bash` is mutating: no re-run restores a side effect, so even a
+        // huge result only truncates — the call and its evidence survive.
+        let mut msgs = vec![ChatMessage::system("sys")];
+        msgs.push(ChatMessage::assistant_calls(None, vec![call("b1", "bash")]));
+        msgs.push(ChatMessage::tool_result("b1", "z".repeat(50_000)));
+        msgs.push(ChatMessage::user("tail"));
+        let stats = prune_span(&mut msgs, 1, 3);
+        assert_eq!(stats.dropped, 0, "{stats:?}");
+        assert_eq!(stats.truncated, 1, "{stats:?}");
+        let kept = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("b1"))
+            .expect("bash result stays");
+        assert!(kept.content_str().contains("jev: truncated"));
+    }
+
+    #[test]
     fn anchors_and_errors_are_never_dropped() {
         let mut msgs = vec![ChatMessage::system("sys")];
         msgs.push(ChatMessage::assistant_calls(
@@ -396,6 +456,16 @@ mod tests {
         assert_eq!(summary_mode(), SummaryMode::Jev);
         std::env::set_var(COMPACTION_LLM_ENV, "1");
         assert_eq!(summary_mode(), SummaryMode::Llm);
+        assert!(!summary_mode_is_jev());
+        // Explicit offs stay silent and deterministic.
+        for off in ["0", "false", "off", "no", ""] {
+            std::env::set_var(COMPACTION_LLM_ENV, off);
+            assert_eq!(summary_mode(), SummaryMode::Deterministic);
+        }
+        // Garbage warns once (see `warn_once`) and stays deterministic —
+        // a typo must never silently disable the selected mode.
+        std::env::set_var(COMPACTION_LLM_ENV, "jve");
+        assert_eq!(summary_mode(), SummaryMode::Deterministic);
         assert!(!summary_mode_is_jev());
         std::env::remove_var(COMPACTION_LLM_ENV);
         assert_eq!(summary_mode(), SummaryMode::Deterministic);
