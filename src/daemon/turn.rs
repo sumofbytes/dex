@@ -379,7 +379,7 @@ pub(crate) async fn run_turn_inner(
         None
     };
     let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
-    let routed_reason = routed.as_ref().map(|r| r.reason);
+    let routed_why = routed.as_ref().map(|r| r.reason_label());
     let model_override = explicit_model.or_else(|| routed.and_then(|r| r.model_override));
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
@@ -559,7 +559,7 @@ pub(crate) async fn run_turn_inner(
     // signal that the model changed under them (the tier is also journaled
     // on `turn_start`).
     if let Some(tier) = routed_tier.as_deref() {
-        let why = routed_reason.unwrap_or("ordinary work");
+        let why = routed_why.as_deref().unwrap_or("ordinary work");
         console.emit(SinkLine::System(format!(
             "routing → {tier} ({why}; model {})",
             config.model
