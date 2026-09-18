@@ -41,7 +41,7 @@ build, test, and submit changes. Please follow the
   demand via `/skill:<name>`.
 - **History compaction** — when the context window is exceeded, older turns are
   summarized deterministically (no LLM call) to keep requests bounded. Set
-  `DEX_COMPACTION_LLM=1` for model summarization, or `=jev` to prune stale
+  `DEX_COMPACTION=llm` for model summarization (`1` also accepted), or `=jev` to prune stale
   tool outputs verbatim instead (drops/truncates old results, keeps text;
   falls back to the deterministic summary when pruning doesn't pay). It runs
   at compaction time over the intact history, after inline evidence reduction
@@ -790,7 +790,7 @@ discovered extension with its consent state.
 | `DEX_PERMISSION`                                              | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`).                                                                                                                                                                                                                                                                                                                 |
 | `DEX_LOG`                                                     | Runtime log level: `off`, `error`, `warn` (default), `info`, `debug`, `trace` — works on release builds. Logs go to stderr, or to `$XDG_DATA_HOME/dex/dex.log` while the TUI runs. `debug` covers provider requests/responses and tool runs; `trace` adds raw provider SSE lines.                                                                                                                               |
 | `DEX_VERIFY`                                                  | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default.                                                                                                                                                                                                                                                                                                     |
-| `DEX_COMPACTION_LLM`                                          | `1` for LLM summarization, `jev` for verbatim tool-output pruning (default deterministic; `jev` falls back to deterministic when pruning doesn't pay).                                                                                                                                                                                                                                                         |
+| `DEX_COMPACTION`                                              | `llm` for LLM summarization (`1` accepted), `jev` for verbatim tool-output pruning (default deterministic; `jev` falls back to deterministic when pruning doesn't pay).                                                                                                                                                                                                                                                         |
 | `DEX_ONLINE_COMPACTION`                                       | `1` for summary compaction at completed plan steps, `jev` for verbatim pruning at the same boundaries: adds the `update_plan` tool and compacts when the cache re-write pays for itself. While on, the fixed message-count cap is suspended (the token threshold still bounds growth).                                                                                                                                  |
 | `DEX_OBSERVATION_PACK`                                        | `1` to enable the observation pack: tool results > 10 KB stop being re-sent after a 2-request grace period and are replaced with placeholders; `obs_recall` pages the archived original back. Compaction, resume, and fork still see intact history. The first time a result is placeholdered, an `obs pack:` system line notes it in the transcript. `obs_recall`'s own output is exempt from re-packing — recalled pages stay in context so the model never has to recall its recall.                                                           |
 | `DEX_EVIDENCE_REDUCER`                                        | `1` to enable the evidence-preserving reducer: large diagnostic tool results (`cargo`/`pytest`/`go test`/`make`/…) are reduced to a receipt whose quotes are verified byte for byte against the archived raw output; an uncheckable receipt falls back to the raw result. Requires a daemon session and the observation pack (`DEX_OBSERVATION_PACK=1`), so a receipt always keeps a recallable source archive. |
@@ -819,7 +819,7 @@ discovered extension with its consent state.
 | `HOME`                                                        | Fallback when XDG vars are unset.                                                                                                                                                                                                                                                                                                                                                                               |
 
 Restore strict harness:
-`DEX_DURABLE=1 DEX_AUDIT=1 DEX_EXTRA_TOOLS=1 DEX_VERIFY=1 DEX_COMPACTION_LLM=1 dex`
+`DEX_DURABLE=1 DEX_AUDIT=1 DEX_EXTRA_TOOLS=1 DEX_VERIFY=1 DEX_COMPACTION=llm dex`
 
 ## Project structure
 
