@@ -537,8 +537,22 @@ pub(crate) fn routing_resolution(file: &Option<serde_yaml::Value>) -> RoutingRes
 pub(crate) struct RoutedTurn {
     pub(crate) tier: Tier,
     pub(crate) model_override: Option<String>,
-    /// Strongest classification signal, for the per-turn log line.
-    pub(crate) reason: &'static str,
+    /// Classification hits in classification order, for the per-turn log
+    /// line (see [`reason_label`][Self::reason_label]).
+    pub(crate) reasons: Vec<&'static str>,
+}
+
+impl RoutedTurn {
+    /// Log label: every classification hit joined, or `"ordinary work"`
+    /// when nothing fired — the first hit alone may not name the heaviest
+    /// driver, so the line carries the whole list.
+    pub(crate) fn reason_label(&self) -> String {
+        if self.reasons.is_empty() {
+            "ordinary work".to_string()
+        } else {
+            self.reasons.join(", ")
+        }
+    }
 }
 
 pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<RoutedTurn> {
@@ -554,7 +568,7 @@ pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<Routed
         &selection.value,
         &routing.tiers,
         decision.tier,
-        decision.top_reason(),
+        decision.reasons,
     ))
 }
 
@@ -577,13 +591,13 @@ fn finish_route(
     selection_value: &str,
     tiers: &TierMap,
     tier: Tier,
-    reason: &'static str,
+    reasons: Vec<&'static str>,
 ) -> RoutedTurn {
     let model = model_for(tier, tiers, selection_value);
     RoutedTurn {
         tier,
         model_override: (model != selection_value).then(|| model.to_string()),
-        reason,
+        reasons,
     }
 }
 
@@ -6610,6 +6624,54 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Tier env vars: empty/whitespace counts as unset (the file wins); a
+    /// set tier beats the file, per the standard env-beats-file precedence.
+    #[test]
+    fn routing_tier_env_empty_falls_through_to_file() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+        ] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-routing-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nrouting:\n  enabled: true\n  fast: myprov/file-fast\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        // Empty/whitespace env is unset: the file tier wins.
+        std::env::set_var("DEX_ROUTING_FAST", "");
+        let r = super::routing_resolution(&super::load_config_file());
+        assert_eq!(r.tiers.fast, "myprov/file-fast");
+        assert_eq!(r.tier_origins.fast, "config routing.fast:");
+        std::env::set_var("DEX_ROUTING_FAST", "   ");
+        let r = super::routing_resolution(&super::load_config_file());
+        assert_eq!(r.tiers.fast, "myprov/file-fast");
+        // A set tier env beats the file.
+        std::env::set_var("DEX_ROUTING_FAST", "myprov/env-fast");
+        let r = super::routing_resolution(&super::load_config_file());
+        assert_eq!(r.tiers.fast, "myprov/env-fast");
+        assert_eq!(r.tier_origins.fast, "DEX_ROUTING_FAST");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `route_turn`: `None` when routing is off; otherwise the classified
     /// tier resolves through `routing.balanced:` → `model:`, overriding only
     /// when the tier names a different selection (no pointless rebuilds).
@@ -6650,7 +6712,8 @@ pub(crate) mod tests {
         let routed = super::route_turn("fix typo", &[]).expect("routing on");
         assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
         assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
-        assert!(!routed.reason.is_empty());
+        assert_eq!(routed.reasons, vec!["typo"]);
+        assert_eq!(routed.reason_label(), "typo");
         // Ordinary work with history behind it → balanced, which already is
         // the selection → no override, the config never rebuilds.
         let history = vec![crate::core::types::ChatMessage::user("x".repeat(20_000))];
@@ -6658,6 +6721,7 @@ pub(crate) mod tests {
             super::route_turn("add a retry to the fetch call", &history).expect("routing on");
         assert_eq!(routed.tier, crate::agent::router::Tier::Balanced);
         assert_eq!(routed.model_override, None);
+        assert_eq!(routed.reason_label(), "ordinary work");
         // Migration work escalates; unset powerful falls back to balanced.
         let routed = super::route_turn("run the database migration", &[]).expect("routing on");
         assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
