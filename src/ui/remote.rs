@@ -293,9 +293,9 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         provider_entries: Default::default(),
         provider_headers: Default::default(),
         api_pinned: false,
-        // Display-only copy never talks to a provider; share the
-        // process-wide client instead of initializing TLS + pool.
-        client: crate::client::http::shared_async_client(),
+        // Display-only copy never talks to a provider (timeouts inert).
+        connect_timeout_secs: 10,
+        request_timeout_secs: 300,
     }
 }
 
@@ -2207,7 +2207,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     // the agent loop, so there is no turn to steer — and it may run
     // alongside one (only one shell at a time per session; Esc cancels it).
     // A bare `!`/`!!` falls through to the agent.
-    if let Some((command, excluded)) = crate::protocol::parse_shell_escape(&line) {
+    if let Some((command, excluded)) = crate::tools::parse_shell_escape(&line) {
         remote.app.history_push(line.clone());
         remote.app.input.reset();
         if remote.shell_running {
@@ -3445,7 +3445,8 @@ mod tests {
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
-                client: reqwest::Client::new(),
+                connect_timeout_secs: 10,
+                request_timeout_secs: 300,
             },
             messages: Vec::new(),
             tool_state: crate::agent::state::ToolState::default(),

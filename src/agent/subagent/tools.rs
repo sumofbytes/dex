@@ -33,12 +33,11 @@ use crate::llm::config::LlmConfig;
 use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::{Policy, ToolError, ToolFilter};
 
-use super::context::ContextSeed;
 use super::definition::AgentDefinition;
-use super::exit::{classify_body_error, ExitReason, ResumeHandle, ResumeRequest};
-use super::instance::{AgentId, AgentState};
+use super::exit::{classify_body_error, ExitReason};
 use super::manager::{AgentManager, ProgressReporter, WaitOutcome};
-use super::result::{AgentResult, AgentUsage};
+use super::model::{AgentId, AgentResult, AgentState, AgentUsage, ContextSeed};
+use super::resume::{ResumeHandle, ResumeRequest};
 use super::SpawnMeta;
 
 /// The four model-facing delegation tools (§10, §24.3). Background is the

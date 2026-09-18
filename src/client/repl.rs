@@ -161,7 +161,7 @@ pub(crate) fn one_shot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `!`/`!!` shell escape: run directly on the daemon, no agent
     // turn. The daemon saves the run to the new session's history.
-    if let Some((command, excluded)) = crate::protocol::parse_shell_escape(prompt.trim()) {
+    if let Some((command, excluded)) = crate::tools::parse_shell_escape(prompt.trim()) {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -269,7 +269,7 @@ pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::
         }
         // `!`/`!!` shell escape: run directly, no agent turn. A
         // bare `!`/`!!` falls through to the agent.
-        if let Some((command, excluded)) = crate::protocol::parse_shell_escape(input) {
+        if let Some((command, excluded)) = crate::tools::parse_shell_escape(input) {
             match client.shell(&session.session_id, &command, excluded) {
                 Ok(resp) => {
                     if resp.success {
