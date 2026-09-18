@@ -2,7 +2,7 @@
 //!
 //! Single home for the classifiers, gap rule and language map used by the
 //! TUI transcript (`ui/render.rs`), the headless console
-//! (`core/highlight.rs`, `llm/stream.rs`) and the streaming throttle
+//! (`core/highlight.rs`, `llm/sse.rs`) and the streaming throttle
 //! (`ui.rs`). One definition — previously three duplicated copies drifted
 //! (headings kept `#` in one path, `+` bullets and `[X]` tasks parsed in
 //! another, table detection loose in a third).

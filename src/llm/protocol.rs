@@ -395,34 +395,27 @@ pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<
 }
 
 pub(crate) fn responses_tools() -> Vec<Value> {
-    // Borrowed slices: no merged-schema copy on the wire path. Native order
-    // is fixed; the MCP + extension tail is sorted by name so refresh
-    // completion order can't reorder the schema (deterministic bytes;
-    // adding/removing a tool still shifts the tail).
+    wire_tools(|tool| {
+        json!({
+            "type": "function",
+            "name": tool.function.name,
+            "description": tool.function.description,
+            "parameters": tool.function.parameters,
+        })
+    })
+}
+
+/// Native + MCP + extension schemas mapped to one wire shape: native order
+/// is fixed, the MCP + extension tail is sorted by name so refresh
+/// completion order can't reorder the schema (deterministic bytes;
+/// adding/removing a tool still shifts the tail). Borrowed slices: no
+/// merged-schema copy on the wire path. Shared by the OpenAI
+/// (`responses_tools`) and Anthropic (`anthropic_tools`) wire shapes — the
+/// only difference is the per-tool mapping.
+pub(crate) fn wire_tools(map: impl Fn(&ToolDefinition) -> Value) -> Vec<Value> {
     let (native, mcp, ext) = tools_schema_parts();
-    let mut out: Vec<Value> = native
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "parameters": tool.function.parameters,
-            })
-        })
-        .collect();
-    let mut tail: Vec<Value> = mcp
-        .iter()
-        .chain(ext.iter())
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "parameters": tool.function.parameters,
-            })
-        })
-        .collect();
+    let mut out: Vec<Value> = native.iter().map(&map).collect();
+    let mut tail: Vec<Value> = mcp.iter().chain(ext.iter()).map(map).collect();
     sort_wire_tools_by_name(&mut tail);
     out.extend(tail);
     out
