@@ -232,6 +232,15 @@ fn tool_update_plan(args: &Map<String, Value>) -> Result<String, ToolError> {
     Ok(format_plan_snapshot(&steps, &progress))
 }
 
+impl From<crate::workspace::WorkspaceError> for ToolError {
+    fn from(e: crate::workspace::WorkspaceError) -> Self {
+        match e {
+            crate::workspace::WorkspaceError::Io(io) => Self::Io(io),
+            crate::workspace::WorkspaceError::OutsideWorkspace(p) => Self::OutsideWorkspace(p),
+        }
+    }
+}
+
 impl std::fmt::Display for ToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1727,7 +1736,7 @@ mod tests {
             .starts_with(&root));
         assert!(matches!(
             resolve_workspace_path(&root, "../outside.txt"),
-            Err(ToolError::OutsideWorkspace(_))
+            Err(crate::workspace::WorkspaceError::OutsideWorkspace(_))
         ));
         let _ = fs::remove_dir_all(root);
     }

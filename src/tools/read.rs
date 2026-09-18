@@ -75,11 +75,14 @@ fn parse_path_list(paths: &[Value]) -> Result<Vec<PathBuf>, ToolError> {
     paths
         .iter()
         .map(|value| {
-            value.as_str().map(workspace_path).unwrap_or_else(|| {
-                Err(ToolError::InvalidArgument(
-                    "paths entries must be strings".to_string(),
-                ))
-            })
+            value
+                .as_str()
+                .map(|s| workspace_path(s).map_err(ToolError::from))
+                .unwrap_or_else(|| {
+                    Err(ToolError::InvalidArgument(
+                        "paths entries must be strings".to_string(),
+                    ))
+                })
         })
         .collect()
 }
