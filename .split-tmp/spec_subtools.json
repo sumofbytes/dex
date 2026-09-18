@@ -1,0 +1,46 @@
+{
+  "file": "src/agent/subagent/tools.rs",
+  "decl": "mod",
+  "drops": [
+    [
+      17,
+      41
+    ]
+  ],
+  "head": [
+    [
+      1,
+      16
+    ]
+  ],
+  "keep": [],
+  "stay": [
+    {
+      "range": [
+        1039,
+        1790
+      ],
+      "test": true
+    }
+  ],
+  "children": [
+    {
+      "name": "schema",
+      "ranges": [
+        [
+          42,
+          132
+        ]
+      ]
+    },
+    {
+      "name": "exec",
+      "ranges": [
+        [
+          133,
+          1038
+        ]
+      ]
+    }
+  ]
+}
