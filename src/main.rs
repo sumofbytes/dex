@@ -233,7 +233,14 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     let mut config = config_result?;
     // Complexity router (V1): an explicit `--model` always wins;
     // otherwise the classified tier resolves through routing.balanced: →
-    // top-level model:, rebuilding once with the tier's model.
+    // top-level model:, rebuilding once with the tier's model. The first
+    // build above is still needed on the routed path: it validates the
+    // top-level selection in parallel with the session load (and gates
+    // session creation), while routing needs that load's history as its
+    // signal — so a routed turn builds twice, an unrouted turn once. Both
+    // builds share the catalog cache, so the second is cheap. (The daemon
+    // loads history before its single `from_env_async`, so it always builds
+    // once.)
     let routed = if args.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
         None
     } else {
