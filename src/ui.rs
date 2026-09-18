@@ -360,7 +360,8 @@ impl App {
                 provider_entries: Default::default(),
                 provider_headers: Default::default(),
                 api_pinned: false,
-                client: reqwest::Client::new(),
+                connect_timeout_secs: 10,
+                request_timeout_secs: 300,
             },
             messages: Vec::new(),
             tool_state: crate::agent::state::ToolState::default(),
@@ -1217,7 +1218,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
             .unwrap_or_default();
         let path = arg_path.split_whitespace().next().unwrap_or("");
         let path = path.split(':').next().unwrap_or(path);
-        render::render_read_preview(&preview, crate::core::lang::lang_from_path(path))
+        render::render_read_preview(&preview, crate::core::highlight::lang_from_path(path))
     } else if success && matches!(name.as_str(), "grep" | "ffgrep") {
         // Content-mode hits are `path:line:code` rows: keep the gutter dim,
         // highlight the code by path extension (same engine and dim fallback

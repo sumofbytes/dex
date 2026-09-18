@@ -1,4 +1,15 @@
 #![allow(dead_code, unused_variables, unused_imports)]
+pub(crate) mod changes;
+pub(crate) mod discovery;
+pub(crate) mod events;
+
+// The undo ledger lives in `changes.rs`, the events journal in `events.rs`;
+// re-exported here so existing `session::...` paths keep working.
+pub(crate) use changes::{
+    load_changes, make_change_record, record_change, save_changes, undo_last_change, ChangeRecord,
+};
+pub(crate) use events::{events_cache, EVENTS_PAGE_LIMIT};
+
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -123,28 +134,6 @@ struct SessionEffectEntry {
     ok: Option<bool>,
 }
 
-/// One entry in the per-session change ledger (`session_state "changes"`).
-/// `before`/`after` hold file content (capped) so `/undo` can restore the
-/// previous state; hashes always recorded even when content was too big.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct ChangeRecord {
-    pub path: String,
-    pub tool: String,
-    pub before_hash: String,
-    pub after_hash: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-    pub timestamp: String,
-}
-
-/// Cap for content stored in a change record; larger files record hashes
-/// only (undo unavailable for them).
-const CHANGE_CONTENT_CAP: usize = 64 * 1024;
-/// Keep at most this many change records per session (FIFO).
-const CHANGE_RECORD_CAP: usize = 50;
-
 #[derive(Serialize)]
 struct SessionStateEntry {
     #[serde(rename = "type")]
@@ -165,34 +154,6 @@ pub(crate) struct Session {
     journal: Option<File>,
     /// Same for the events journal: the hot path, one line per stream delta.
     events_journal: Option<File>,
-}
-
-/// Shared directory scan behind every session listing (SES-1): each direct
-/// `*.jsonl` file under `dir` whose first line parses as a session header.
-/// Unreadable directories are skipped and per-file failures (open, empty,
-/// bad JSON) drop the entry — only the header is needed, and session files
-/// grow large, so listings stream just the first line. Callers apply
-/// `sort_newest_first` for the canonical newest-first order.
-fn scan_jsonl_dir(dir: &Path) -> Vec<(PathBuf, SessionHeader)> {
-    let mut sessions = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                if let Some(first) = read_first_line(&path) {
-                    if let Ok(header) = serde_json::from_str::<SessionHeader>(first.trim_end()) {
-                        sessions.push((path, header));
-                    }
-                }
-            }
-        }
-    }
-    sessions
-}
-
-/// Canonical listing order: header timestamp, newest first.
-fn sort_newest_first(sessions: &mut [(PathBuf, SessionHeader)]) {
-    sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
 }
 
 /// Stream a file line by line, handing each line (newline included) to `f`
@@ -235,14 +196,15 @@ fn for_each_line(path: &Path, mut f: impl FnMut(&str)) -> io::Result<()> {
 // missing file evicts. Paths are unique per session and entries are
 // FIFO-capped, so a long-lived daemon can't accumulate dead sessions.
 
-/// `(mtime, len)` identity for a journal snapshot.
+/// `(mtime, len)` identity for a journal snapshot. Shared by the history
+/// and events caches (`events.rs`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileId {
-    mtime: SystemTime,
-    len: u64,
+pub(crate) struct FileId {
+    pub(crate) mtime: SystemTime,
+    pub(crate) len: u64,
 }
 
-fn file_id(path: &Path) -> Option<FileId> {
+pub(crate) fn file_id(path: &Path) -> Option<FileId> {
     fs::metadata(path).ok().and_then(|m| {
         m.modified().ok().map(|mtime| FileId {
             mtime,
@@ -251,8 +213,9 @@ fn file_id(path: &Path) -> Option<FileId> {
     })
 }
 
-/// FIFO-capped process-global cache keyed by journal path.
-struct PathCache<V> {
+/// FIFO-capped process-global cache keyed by journal path. Shared by the
+/// history and events caches (`events.rs`).
+pub(crate) struct PathCache<V> {
     map: HashMap<PathBuf, V>,
     order: VecDeque<PathBuf>,
 }
@@ -260,7 +223,7 @@ struct PathCache<V> {
 impl<V> PathCache<V> {
     const CAP: usize = 32;
 
-    fn insert(&mut self, path: &Path, value: V) {
+    pub(crate) fn insert(&mut self, path: &Path, value: V) {
         if !self.map.contains_key(path) {
             self.order.push_back(path.to_path_buf());
             while self.order.len() > Self::CAP {
@@ -277,15 +240,15 @@ impl<V> PathCache<V> {
         self.map.insert(path.to_path_buf(), value);
     }
 
-    fn get(&self, path: &Path) -> Option<&V> {
+    pub(crate) fn get(&self, path: &Path) -> Option<&V> {
         self.map.get(path)
     }
 
-    fn get_mut(&mut self, path: &Path) -> Option<&mut V> {
+    pub(crate) fn get_mut(&mut self, path: &Path) -> Option<&mut V> {
         self.map.get_mut(path)
     }
 
-    fn evict(&mut self, path: &Path) {
+    pub(crate) fn evict(&mut self, path: &Path) {
         self.map.remove(path);
     }
 }
@@ -370,254 +333,8 @@ fn history_cache_touch(path: &Path, appended: u64) {
     }
 }
 
-/// Steady-state events cursor (perf doc §12): per events-journal path, the
-/// exact parsed-end identity, highest seq served, and byte-offset
-/// checkpoints (first seq per 64 KiB chunk) so a poll seeks past
-/// already-served rows. The idle 2 s poll with no new rows is then one
-/// `stat` and no file open.
-struct EventsCursor {
-    id: FileId,
-    max_seq: Option<u64>,
-    checkpoints: Vec<(u64, u64)>,
-    /// The scan that published this entry reached EOF. A page-limited scan
-    /// (§1) stops early, so the fast path must not treat its `max_seq` as
-    /// the file tip — the next poll re-scans from its checkpoint instead.
-    drained: bool,
-}
-
-/// Byte spacing of events checkpoints: a poll seeks to the newest chunk at
-/// or before its cursor and parses only the tail.
-const EVENTS_CHECKPOINT_BYTES: u64 = 64 * 1024;
-/// Checkpoint count cap per journal (perf-only: ancient cursors scan more).
-const EVENTS_CHECKPOINT_CAP: usize = 4096;
-/// Rows served per events-journal page (§1): the startup replay loops pages
-/// with a paint between instead of slurping a giant journal in one HTTP
-/// round trip, and the idle poller self-paces on reconnect backlogs.
-/// Absent `?limit=` means this (old clients keep working, now bounded).
-pub(crate) const EVENTS_PAGE_LIMIT: usize = 1000;
-
-fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
-    static CACHE: OnceLock<Mutex<PathCache<EventsCursor>>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(PathCache {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        })
-    })
-}
-
-/// Refresh the events cursor after one of our own appends (perf doc §12):
-/// the common case keeps a poll from ever re-scanning. `written` is the byte
-/// count this handle just appended; a foreign writer (another handle/task)
-/// interleaving a row between our write and this stat would make the recorded
-/// tip and checkpoints describe bytes we didn't write — a tip below the
-/// foreign row would then starve a poller parked at that row. Detect it by
-/// the length delta and drop the cursor rather than publish it.
-fn events_cache_touched(events_path: &Path, seq: u64, written: u64) {
-    let Some(id) = file_id(events_path) else {
-        return;
-    };
-    let mut cache = events_cache().lock().expect("events cache lock");
-    let foreign = match cache.get_mut(events_path) {
-        Some(entry) if entry.id.len.saturating_add(written) == id.len => {
-            let prev_len = entry.id.len;
-            entry.id = id;
-            entry.max_seq = Some(entry.max_seq.map_or(seq, |m| m.max(seq)));
-            let base = entry.checkpoints.last().map(|&(_, off)| off).unwrap_or(0);
-            if id.len.saturating_sub(base) >= EVENTS_CHECKPOINT_BYTES {
-                entry.checkpoints.push((seq, prev_len));
-                if entry.checkpoints.len() > EVENTS_CHECKPOINT_CAP {
-                    let excess = entry.checkpoints.len() - EVENTS_CHECKPOINT_CAP;
-                    entry.checkpoints.drain(..excess);
-                }
-            }
-            false
-        }
-        Some(_) => true,
-        None => false,
-    };
-    if foreign {
-        cache.evict(events_path);
-    }
-}
-
-/// One events-journal row: `seq` drives the replay cursor, `payload`
-/// borrows the raw JSON — no parse → re-serialize round trip on the hot
-/// poll path (perf doc §12).
-#[derive(Deserialize)]
-struct EventRow<'a> {
-    seq: u64,
-    #[serde(borrow)]
-    payload: &'a RawValue,
-}
-
-/// Scan the events journal from the newest checkpoint at or before `since`,
-/// returning `(rows with seq >= since, highest seq in the file)`. When
-/// `collect` is false payloads are skipped (the `max_event_seq` path).
-type EventsScan = (Vec<(u64, String)>, Option<u64>);
-
-/// Newest checkpoint at or before `since`: the kept checkpoint list, the seek
-/// offset, and the seq that offset should resume at. The file only grows in
-/// production, but a checkpoint is verified against its row before use, so an
-/// out-of-band rewrite falls back to a full scan instead of serving garbage.
-fn checkpoint_resume(
-    events_path: &Path,
-    meta_len: u64,
-    since: u64,
-) -> (Vec<(u64, u64)>, u64, Option<u64>) {
-    let cache = events_cache().lock().expect("events cache lock");
-    match cache.get(events_path) {
-        Some(entry) if meta_len >= entry.id.len => {
-            let kept: Vec<(u64, u64)> = entry
-                .checkpoints
-                .iter()
-                .copied()
-                .filter(|&(_, off)| off <= meta_len)
-                .collect();
-            match kept.iter().rev().find(|&&(seq, _)| seq <= since).copied() {
-                Some((seq, off)) => (kept, off, Some(seq)),
-                None => (Vec::new(), 0, None),
-            }
-        }
-        _ => (Vec::new(), 0, None),
-    }
-}
-
-/// Highest seq already cached below the resume point, so the fresh max covers
-/// the whole file, not just the scanned tail.
-fn cached_max_seq(events_path: &Path, seek_to: u64) -> Option<u64> {
-    if seek_to == 0 {
-        return None;
-    }
-    events_cache()
-        .lock()
-        .expect("events cache lock")
-        .get(events_path)
-        .and_then(|e| e.max_seq)
-}
-
-fn scan_events(
-    events_path: &Path,
-    since: u64,
-    collect: bool,
-    limit: usize,
-) -> io::Result<EventsScan> {
-    // A zero page serves nothing: without this the `out.len() >= limit`
-    // check below runs only after the first push and returns one row.
-    if collect && limit == 0 {
-        return Ok((Vec::new(), None));
-    }
-    // Cursor is the next seq to serve (inclusive): initial 0 serves seq 0,
-    // and `next_seq = max + 1` resumes without loss or duplication.
-    // Fast path: the journal is byte-identical to a previous scan and the
-    // cursor is past everything served — the idle poll. No file open.
-    // Only a drained scan publishes a servable tip (a page-limited scan
-    // stops early, so its `max_seq` is not the file end — §1).
-    if let Some(id) = file_id(events_path) {
-        let cache = events_cache().lock().expect("events cache lock");
-        if let Some(entry) = cache.get(events_path) {
-            if entry.id == id && entry.drained && entry.max_seq.is_none_or(|m| since > m) {
-                return Ok((Vec::new(), entry.max_seq));
-            }
-        }
-    }
-    let meta_len = fs::metadata(events_path)?.len();
-    // Resume from the newest checkpoint at or before the cursor.
-    let (mut checkpoints, mut seek_to, seek_seq) = checkpoint_resume(events_path, meta_len, since);
-    let mut file = File::open(events_path)?;
-    // Checkpoint beyond EOF (a shrink raced the stat): full scan instead.
-    if seek_to > meta_len {
-        seek_to = 0;
-        checkpoints.clear();
-    }
-    if seek_to > 0 {
-        file.seek(SeekFrom::Start(seek_to))?;
-        let probe = {
-            let mut probe_reader = BufReader::new(&file);
-            let mut probe = String::new();
-            match probe_reader.read_line(&mut probe) {
-                Ok(_) => serde_json::from_str::<EventRow<'_>>(&probe)
-                    .ok()
-                    .map(|r| r.seq),
-                Err(_) => None,
-            }
-        };
-        if probe != seek_seq {
-            seek_to = 0;
-            checkpoints.clear();
-        }
-        file.seek(SeekFrom::Start(seek_to))?;
-    }
-    // Checkpoints from before the resume point would interleave with the
-    // fresh ones appended during the scan, leaving the vector unsorted and
-    // breaking `iter().rev().find(...)` and `events_cache_touched`'s
-    // `last()` base. A checkpoint at or before the resume point is kept.
-    checkpoints.retain(|&(_, off)| off <= seek_to);
-    let mut reader = BufReader::new(file);
-    let mut max: Option<u64> = cached_max_seq(events_path, seek_to);
-    let mut next_chunk_at = seek_to.saturating_add(EVENTS_CHECKPOINT_BYTES);
-    let mut out = Vec::new();
-    let mut off = seek_to;
-    let mut line = String::new();
-    let mut drained = false;
-    loop {
-        line.clear();
-        let n = match reader.read_line(&mut line) {
-            Ok(0) => {
-                drained = true;
-                break;
-            }
-            Ok(n) => n,
-            // Torn read: stop like EOF (matches `for_each_line`), but the
-            // end wasn't reached — don't publish a servable tip.
-            Err(_) => break,
-        };
-        let row_start = off;
-        off += n as u64;
-        let Ok(row) = serde_json::from_str::<EventRow<'_>>(line.trim_end()) else {
-            continue;
-        };
-        max = Some(max.map_or(row.seq, |m| m.max(row.seq)));
-        if row_start >= next_chunk_at {
-            checkpoints.push((row.seq, row_start));
-            next_chunk_at = row_start.saturating_add(EVENTS_CHECKPOINT_BYTES);
-        }
-        if collect && row.seq >= since {
-            out.push((row.seq, row.payload.get().to_owned()));
-            // Page-limited serving (§1): stop after `limit` served rows.
-            // `max`/checkpoints cover exactly the served prefix, so the
-            // next page resumes from its checkpoint; `drained` stays false
-            // so the fast path can't mistake this tip for EOF.
-            if out.len() >= limit {
-                break;
-            }
-        }
-    }
-    if let Some(id) = file_id(events_path) {
-        // Publish only when the identity still describes what was parsed:
-        // an append racing past the scan end would make `max` stale, and
-        // the next poll then re-scans from its checkpoint instead.
-        if id.len == off {
-            if checkpoints.len() > EVENTS_CHECKPOINT_CAP {
-                let excess = checkpoints.len() - EVENTS_CHECKPOINT_CAP;
-                checkpoints.drain(..excess);
-            }
-            events_cache().lock().expect("events cache lock").insert(
-                events_path,
-                EventsCursor {
-                    id,
-                    max_seq: max,
-                    checkpoints,
-                    drained,
-                },
-            );
-        }
-    }
-    Ok((out, max))
-}
-
 impl Session {
-    fn session_dir() -> PathBuf {
+    pub(crate) fn session_dir() -> PathBuf {
         if let Some(dir) = env::var_os("XDG_DATA_HOME") {
             return PathBuf::from(dir).join("dex/sessions");
         }
@@ -626,7 +343,7 @@ impl Session {
             .unwrap_or_else(|| PathBuf::from(".dex/sessions"))
     }
 
-    fn cwd_slug(cwd: &str) -> String {
+    pub(crate) fn cwd_slug(cwd: &str) -> String {
         let mut hash = 2166136261u64;
         for byte in cwd.as_bytes() {
             hash = (hash ^ u64::from(*byte)).wrapping_mul(16777619);
@@ -925,38 +642,20 @@ impl Session {
     }
 
     pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
-        let dir = Self::session_dir().join(Self::cwd_slug(cwd));
-        let mut sessions = scan_jsonl_dir(&dir);
-        sort_newest_first(&mut sessions);
-        Ok(sessions)
+        discovery::list(cwd)
     }
 
     /// mtime of one workspace's sessions dir, for the slash-popup cache key
     /// (perf doc §29): one stat instead of a readdir + header parses per
     /// frame while `/resume ...` sits in the composer.
     pub(crate) fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
-        std::fs::metadata(Self::session_dir().join(Self::cwd_slug(cwd)))
-            .ok()?
-            .modified()
-            .ok()
+        discovery::list_dir_mtime(cwd)
     }
 
     /// List every persisted session across all workspaces (registry rebuild
     /// and disk-backed `GET /api/sessions`).
     pub(crate) fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
-        let base = Self::session_dir();
-        let mut sessions = Vec::new();
-        if let Ok(entries) = fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                if !dir.is_dir() {
-                    continue;
-                }
-                sessions.extend(scan_jsonl_dir(&dir));
-            }
-        }
-        sort_newest_first(&mut sessions);
-        Ok(sessions)
+        discovery::list_all()
     }
 
     /// Fast id→path lookup (perf doc §1): the session id is the JSONL
@@ -966,57 +665,7 @@ impl Session {
     /// header-only `from_path` read; anything unconfirmed (renamed stems,
     /// legacy files) falls through to the `list_all` scan at the caller.
     pub(crate) fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
-        let q = sid.to_ascii_lowercase();
-        let mut exact: Option<PathBuf> = None;
-        let mut prefixed: Vec<PathBuf> = Vec::new();
-        if let Ok(slugs) = fs::read_dir(Self::session_dir()) {
-            for slug in slugs.flatten() {
-                let dir = slug.path();
-                if !dir.is_dir() {
-                    continue;
-                }
-                let Ok(files) = fs::read_dir(&dir) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let path = file.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                        continue;
-                    }
-                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    if stem == sid {
-                        exact = Some(path);
-                        break;
-                    }
-                    let lower = stem.to_ascii_lowercase();
-                    if lower.starts_with(&q) || q.starts_with(&lower) {
-                        prefixed.push(path);
-                    }
-                }
-                if exact.is_some() {
-                    break;
-                }
-            }
-        }
-        // An exact filename with a foreign header (a stale same-named file)
-        // must not shadow the real session: confirm before returning, else
-        // keep scanning like the legacy path would.
-        if let Some(path) = exact {
-            if Self::from_path(&path).is_ok_and(|s| s.id() == sid) {
-                return Some(path);
-            }
-        }
-        // Deterministic on colliding prefixes: filesystem order is
-        // unspecified, so sort before confirming.
-        prefixed.sort_unstable();
-        prefixed.into_iter().find(|path| {
-            Self::from_path(path).is_ok_and(|s| {
-                let id = s.id().to_ascii_lowercase();
-                id.starts_with(&q) || q.starts_with(&id)
-            })
-        })
+        discovery::find_by_id_filename(sid)
     }
 
     /// List one session's child runs (§16): every JSONL under the session's
@@ -1029,8 +678,8 @@ impl Session {
         parent_path: &Path,
     ) -> io::Result<Vec<(PathBuf, SessionHeader, &'static str)>> {
         let dir = Self::agents_dir(parent_path);
-        let mut children = scan_jsonl_dir(&dir);
-        sort_newest_first(&mut children);
+        let mut children = discovery::scan_jsonl_dir(&dir);
+        discovery::sort_newest_first(&mut children);
         // Enrich with the turn state after the shared scan/sort: the state
         // is derived per path, so the newest-first order is unaffected.
         Ok(children
@@ -1057,7 +706,7 @@ impl Session {
     /// turn-state scan per child; `list_sessions` calls it once per distinct
     /// dir instead of once per session file.
     pub(crate) fn count_children(dir: &Path) -> (usize, usize) {
-        let children = scan_jsonl_dir(dir);
+        let children = discovery::scan_jsonl_dir(dir);
         let interrupted = children
             .iter()
             .filter(|(path, _)| Self::last_turn_state(path) == "interrupted")
@@ -1066,21 +715,7 @@ impl Session {
     }
 
     pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Self> {
-        let sessions = Self::list(cwd)?;
-        let path = if let Ok(index) = selector.parse::<usize>() {
-            sessions.get(index).map(|(path, _)| path.clone())
-        } else {
-            let candidate = PathBuf::from(selector);
-            sessions
-                .iter()
-                .find(|(path, _)| {
-                    path == &candidate
-                        || path.file_name().and_then(|n| n.to_str()) == Some(selector)
-                })
-                .map(|(path, _)| path.clone())
-        }
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session not found"))?;
-        Self::from_path(&path)
+        discovery::resume(cwd, selector)
     }
 
     pub(crate) fn set_name(&mut self, name: String) -> io::Result<()> {
@@ -1443,38 +1078,23 @@ impl Session {
             file.sync_data()?;
         }
         if let Some(events_path) = self.events_path() {
-            events_cache_touched(&events_path, seq, line.len() as u64 + 1);
+            events::events_cache_touched(&events_path, seq, line.len() as u64 + 1);
         }
         Ok(())
     }
 
-    /// Replay stream events with `seq >= since`, in order (`since` is the
-    /// next seq to serve, inclusive — `next_seq` chains without loss or
-    /// duplication). `path` is the
-    /// SESSION file; the journal lives at `<session>.events.jsonl`.
-    /// Served from the steady-state cursor when the journal hasn't grown
-    /// (one `stat`, no file open — perf doc §12), otherwise scanned from
-    /// the newest checkpoint at or before `since`.
+    /// Replay stream events with `seq >= since` — see `events::load_events`.
     pub(crate) fn load_events(
         path: &Path,
         since: u64,
         limit: usize,
     ) -> io::Result<Vec<(u64, String)>> {
-        let events_path = path.with_extension("events.jsonl");
-        Ok(scan_events(&events_path, since, true, limit)?.0)
+        events::load_events(path, since, limit)
     }
 
-    /// Highest event seq recorded for a session (`None` when no seq is
-    /// journaled yet — distinct from a journal holding exactly seq 0).
-    /// Served from the cursor without opening the file when the journal
-    /// hasn't grown (perf doc §12).
+    /// Highest event seq recorded for a session — see `events::max_event_seq`.
     pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
-        let events_path = path.with_extension("events.jsonl");
-        // The tip query must see the whole file (a limit here would corrupt
-        // seq seeding) — only serving scans page (§1).
-        scan_events(&events_path, u64::MAX, false, usize::MAX)
-            .ok()
-            .and_then(|(_, max)| max)
+        events::max_event_seq(path)
     }
 
     /// Terminal state of the most recent turn: "complete", "failed", or
@@ -1761,28 +1381,6 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
     }
 }
 
-/// Read only the first line of a file: session listings only ever need the
-/// header, and session files grow with the message history.
-fn read_first_line(path: &Path) -> Option<String> {
-    let mut reader = BufReader::new(File::open(path).ok()?);
-    let mut first = String::new();
-    match reader.read_line(&mut first) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(first),
-    }
-}
-
-async fn read_first_line_async(path: PathBuf) -> Option<String> {
-    use tokio::io::AsyncBufReadExt as _;
-    let file = tokio::fs::File::open(&path).await.ok()?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut first = String::new();
-    match reader.read_line(&mut first).await {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(first),
-    }
-}
-
 /// Async full-history load: streaming file, fast — short `spawn_blocking`.
 pub(crate) async fn load_messages_from_session_async(
     path: PathBuf,
@@ -1796,34 +1394,7 @@ impl Session {
     /// Async `list_all`: `JoinSet` (`spawn_blocking` per file, join, sort) —
     /// fixes the linear scan (S2 cold-start 50x10ms ~500ms → ~50ms parallel).
     pub(crate) async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
-        let base = Self::session_dir();
-        let mut dirs = Vec::new();
-        if let Ok(mut rd) = tokio::fs::read_dir(&base).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let dir = entry.path();
-                // Prefer async file_type; fallback to sync is_dir for races.
-                let is_dir = entry
-                    .file_type()
-                    .await
-                    .map(|ft| ft.is_dir())
-                    .unwrap_or_else(|_| dir.is_dir());
-                if is_dir {
-                    dirs.push(dir);
-                }
-            }
-        }
-        let mut set = tokio::task::JoinSet::new();
-        for dir in dirs {
-            set.spawn(tokio::task::spawn_blocking(move || scan_jsonl_dir(&dir)));
-        }
-        let mut sessions = Vec::new();
-        while let Some(r) = set.join_next().await {
-            if let Ok(Ok(mut v)) = r {
-                sessions.append(&mut v);
-            }
-        }
-        sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
-        Ok(sessions)
+        discovery::list_all_async().await
     }
 }
 
@@ -1867,96 +1438,6 @@ pub(crate) fn load_session_state(
         }
     })?;
     Ok(state)
-}
-
-/// Load the change ledger (FIFO, newest last).
-pub(crate) fn load_changes(path: &Path) -> Vec<ChangeRecord> {
-    load_session_state(path)
-        .ok()
-        .and_then(|m| m.get("changes").cloned())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Replace the change ledger.
-pub(crate) fn save_changes(session: &mut Session, changes: &[ChangeRecord]) -> io::Result<()> {
-    let json = serde_json::to_string(changes).map_err(io::Error::other)?;
-    session.set_state("changes", &json)
-}
-
-/// Record one change (FIFO-capped). Returns the updated ledger.
-pub(crate) fn record_change(
-    session: &mut Session,
-    record: ChangeRecord,
-) -> io::Result<Vec<ChangeRecord>> {
-    let mut changes = session.path().map(load_changes).unwrap_or_default();
-    changes.push(record);
-    while changes.len() > CHANGE_RECORD_CAP {
-        changes.remove(0);
-    }
-    save_changes(session, &changes)?;
-    Ok(changes)
-}
-
-/// Undo the most recent change: the target file must still match
-/// `after_hash` (no concurrent edit since), otherwise refuse. Returns a
-/// human-readable summary for the caller to surface.
-pub(crate) fn undo_last_change(session: &mut Session) -> io::Result<String> {
-    let Some(path) = session.path().map(|p| p.to_path_buf()) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session is not persisted",
-        ));
-    };
-    let mut changes = load_changes(&path);
-    let Some(record) = changes.pop() else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no changes to undo",
-        ));
-    };
-    if crate::tools::hash_file(&record.path) != record.after_hash {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} was modified since the change; refusing to undo",
-                record.path
-            ),
-        ));
-    }
-    let Some(before) = &record.before else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is too large for undo", record.path),
-        ));
-    };
-    fs::write(&record.path, before).map_err(io::Error::other)?;
-    save_changes(session, &changes)?;
-    Ok(format!(
-        "undid {} on {} ({})",
-        record.tool, record.path, record.timestamp
-    ))
-}
-
-/// Build a change record from a completed write/edit.
-pub(crate) fn make_change_record(
-    tool: &str,
-    path: &str,
-    before: Option<&str>,
-    after: Option<&str>,
-    before_hash: &str,
-    after_hash: &str,
-) -> ChangeRecord {
-    let cap = |s: &str| (s.len() <= CHANGE_CONTENT_CAP).then(|| s.to_string());
-    ChangeRecord {
-        path: path.to_string(),
-        tool: tool.to_string(),
-        before_hash: before_hash.to_string(),
-        after_hash: after_hash.to_string(),
-        before: before.and_then(cap),
-        after: after.and_then(cap),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    }
 }
 
 #[cfg(test)]
