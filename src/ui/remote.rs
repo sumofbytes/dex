@@ -1650,21 +1650,31 @@ fn resume_command(
     }
 }
 
+/// Pure formatter for the resume hint: label on one line, command on the next
+/// so the command is triple-click copyable. Label-only dim keeps the command
+/// bright; redirected output stays plain so each line stays greppable.
+fn format_resume_hint(command: &str, styled: bool) -> String {
+    if styled {
+        format!("\n{DIM}To resume this session:{RESET}\n{command}")
+    } else {
+        format!("\nTo resume this session:\n{command}")
+    }
+}
+
 /// Show the resume command after the alternate screen is gone so it lands in
 /// the shell's scrollback next to the prompt. Must be the last write to the
 /// terminal: any escape sequence after it (a stray `CSI ?1049l`) restores the
 /// cursor onto this line and the shell's next prompt overwrites it. The one
-/// exception is the SGR pair around the text, which neither moves the cursor
-/// nor ends the line — and `RESET` before the closing newline keeps the
-/// shell's next prompt in its own colors.
+/// exception is the SGR pair around the label, which neither moves the cursor
+/// nor ends the line — and no styling after the command keeps the shell's
+/// next prompt in its own colors.
 fn print_resume_hint(daemon_url: &str, session_id: &str, session_cwd: &str, daemon_is_local: bool) {
     let command = resume_command(daemon_url, session_id, session_cwd, daemon_is_local);
     // Dim only on a terminal: redirected stderr should stay greppable.
-    if io::stderr().is_terminal() {
-        eprintln!("\n{DIM}To resume this session: {command}{RESET}");
-    } else {
-        eprintln!("\nTo resume this session: {command}");
-    }
+    eprintln!(
+        "{}",
+        format_resume_hint(&command, io::stderr().is_terminal())
+    );
 }
 
 /// Body grammar of an OSC 10/11 color report: `10;rgb:` / `11;rgb:` plus at
@@ -3207,6 +3217,23 @@ mod tests {
             "'/srv/my repo'",
             "a cwd with a space must survive one shell round trip"
         );
+    }
+
+    #[test]
+    fn resume_hint_puts_command_on_own_line() {
+        let cmd = "dex --reattach sess-1";
+        // Redirected stderr stays plain so each line stays greppable.
+        assert_eq!(
+            format_resume_hint(cmd, false),
+            "\nTo resume this session:\ndex --reattach sess-1"
+        );
+        // Label-only dim: the command stays bright for copy-paste, and no
+        // trailing SGR leaks into the shell's next prompt.
+        assert_eq!(
+            format_resume_hint(cmd, true),
+            format!("\n{DIM}To resume this session:{RESET}\n{cmd}")
+        );
+        assert!(format_resume_hint(cmd, true).ends_with(cmd));
     }
 
     #[test]
