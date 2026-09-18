@@ -1,4 +1,5 @@
 #![allow(clippy::doc_lazy_continuation)]
+mod audit;
 mod edit;
 pub(crate) mod error;
 mod meta;
@@ -13,6 +14,7 @@ mod write;
 
 // Workspace confinement lives in `sandbox.rs`; re-exported here so existing
 // `tools::...` paths keep working.
+use audit::audit;
 pub(crate) use error::ToolError;
 pub(crate) use outcome::{ShellEvidence, ToolOutcome};
 pub(crate) use policy::{metadata, metadata_native, PermissionRequirement};
@@ -39,9 +41,6 @@ use write::tool_write;
 use self::search::{tool_fffind, tool_ffgrep};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
-use std::env;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -76,40 +75,6 @@ fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolE
         Some(Value::String(s)) => Ok(s.clone()),
         Some(_) => Err(ToolError::NotString(key)),
         None => Err(ToolError::Missing(key)),
-    }
-}
-
-fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
-    // Audit writes are sync open+write per
-    // tool call which blocks the loop thread on fs. Gate behind DEX_AUDIT=1
-    // for strict auditing, otherwise skip (session.jsonl already journals).
-    if std::env::var("DEX_AUDIT").as_deref() != Ok("1") {
-        return;
-    }
-    let Some(base) = env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-    else {
-        return;
-    };
-    let path = base.join("dex/audit.jsonl");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let record = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "cwd": env::current_dir().ok().map(|p| p.display().to_string()),
-        "tool": name,
-        "args": args,
-        "outcome": outcome,
-    });
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        // One write syscall per record: parallel tool executions append to
-        // this file concurrently, and a multi-syscall formatted write would
-        // interleave mid-record.
-        let mut line = record.to_string();
-        line.push('\n');
-        let _ = file.write_all(line.as_bytes());
     }
 }
 
