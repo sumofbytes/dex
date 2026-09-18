@@ -5,9 +5,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
 use crate::agent::online_compaction::{
-    cache_debt_for_memo, cache_debt_for_ratio, decide_compaction, online_compaction_enabled,
+    cache_debt_for_memo, decide_compaction, memo_estimate, online_compaction_enabled,
     online_compaction_jev, post_compaction_reminder, CompactionEconomics,
-    DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
+    DEFAULT_COMPACTION_ECONOMICS,
 };
 use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::{
@@ -304,13 +304,16 @@ async fn emergency_compact(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
     for _ in 0..3 {
-        // Emergency cuts follow the threshold summarizer choice.
+        // Emergency cuts follow the threshold knob (`DEX_COMPACTION_LLM`):
+        // one parse selects both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
         match compact_history(
             config,
             messages,
             cancel,
             true,
-            crate::agent::jev::summary_mode_is_jev(),
+            summarizer.prunes_jev(),
+            summarizer,
         )
         .await
         {
@@ -427,13 +430,16 @@ async fn compaction_gate(
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
             )
         });
-        // Threshold cuts follow the threshold knob (`DEX_COMPACTION_LLM`).
+        // Threshold cuts follow the threshold knob (`DEX_COMPACTION_LLM`):
+        // one parse selects both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
         match compact_history(
             config,
             messages,
             cancel,
             false,
-            crate::agent::jev::summary_mode_is_jev(),
+            summarizer.prunes_jev(),
+            summarizer,
         )
         .await
         {
@@ -462,16 +468,12 @@ async fn compaction_gate(
                     // measurements: the retained prefix only shrinks, so
                     // the debt is slightly overstated — conservative, and
                     // shared with the summary path.
-                    let (debt, repayment) = if crate::agent::jev::summary_mode_is_jev() {
-                        cache_debt_for_memo(
-                            write,
-                            archive,
-                            Some(config.cache_write_read_ratio()),
-                            crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE,
-                        )
-                    } else {
-                        cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()))
-                    };
+                    let (debt, repayment) = cache_debt_for_memo(
+                        write,
+                        archive,
+                        Some(config.cache_write_read_ratio()),
+                        memo_estimate(crate::agent::jev::summary_mode_is_jev()),
+                    );
                     state
                         .online_compaction
                         .record_threshold_compaction(debt, repayment);
@@ -834,11 +836,7 @@ async fn process_tool_result(
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
                 // Jev prunes leave truncated heads (~200 tokens), not a 1k
                 // summary, behind — the same archive repays faster.
-                if online_compaction_jev() {
-                    crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE
-                } else {
-                    NATIVE_SUMMARY_TOKEN_ESTIMATE
-                },
+                memo_estimate(online_compaction_jev()),
                 context_tokens,
                 &state.online_compaction,
                 Some(config.context_window),
@@ -853,10 +851,18 @@ async fn process_tool_result(
                 decision.archive_tokens
             );
             if decision.compact {
-                // Boundary cuts follow the boundary knob
-                // (`DEX_ONLINE_COMPACTION`).
-                match compact_history(config, messages, cancel, false, online_compaction_jev())
-                    .await
+                // Boundary cuts follow the boundary knob for the prune
+                // (`DEX_ONLINE_COMPACTION`) and the threshold knob for the
+                // fallback summarizer.
+                match compact_history(
+                    config,
+                    messages,
+                    cancel,
+                    false,
+                    online_compaction_jev(),
+                    crate::agent::jev::summary_mode(),
+                )
+                .await
                 {
                     Ok((true, usage)) => {
                         if let Some(u) = usage {
