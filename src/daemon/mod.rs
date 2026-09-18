@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::agent::subagent::{AgentEvent, AgentManager};
-use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
+use crate::runtime::console::CancellationToken;
 
 /// Poison-recovery lock for every daemon state mutex: a panicking thread
 /// must not take the daemon down — grab the (possibly poisoned) guard and
@@ -365,14 +365,14 @@ impl DaemonState {
     /// so daemon and console agree on scope. `write`/`edit` → path, `bash` →
     /// command, else full input hash.
     pub(crate) fn is_session_approved(&self, session_id: &str, name: &str, input: &str) -> bool {
-        let key = crate::core::console::Console::approval_key(name, input);
+        let key = crate::runtime::console::Console::approval_key(name, input);
         lock_map(&self.session_approvals)
             .get(session_id)
             .is_some_and(|set| set.contains(&key))
     }
 
     pub(crate) fn record_session_approval(&self, session_id: &str, name: &str, input: &str) {
-        let key = crate::core::console::Console::approval_key(name, input);
+        let key = crate::runtime::console::Console::approval_key(name, input);
         lock_map(&self.session_approvals)
             .entry(session_id.to_string())
             .or_default()

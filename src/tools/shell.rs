@@ -9,8 +9,8 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tokio::io::AsyncReadExt as _;
 
-use crate::agent::state::{wait_cancelled, CancellationSource};
 use crate::core::format::clamp_lines_checked;
+use crate::runtime::cancel::{wait_cancelled, CancellationSource};
 
 use super::{arg_str, ShellEvidence, ToolError, CONFIGURED_OUTPUT_LIMIT};
 
