@@ -1,9 +1,9 @@
 #![allow(clippy::doc_lazy_continuation)]
 mod edit;
-mod fff;
 mod meta;
 mod read;
 pub(crate) mod sandbox;
+mod search;
 mod shell;
 mod write;
 
@@ -29,7 +29,7 @@ use shell::{run_bash, tool_bash, BASH_CLAMP_BYTES, BASH_CLAMP_LINES};
 pub(crate) use write::hash_file;
 use write::tool_write;
 
-use self::fff::{tool_fffind, tool_ffgrep};
+use self::search::{tool_fffind, tool_ffgrep};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::env;
@@ -1894,7 +1894,7 @@ mod tests {
             let body: String = (0..20).map(|_| format!("{needle}\n")).collect();
             fs::write(root.join(format!("f{f}.rs")), body).unwrap();
         }
-        super::fff::rescan();
+        super::search::rescan();
 
         // Files mode: 3 of 6 files shown, next page starts at file_offset 3.
         let mut args = Map::new();
@@ -1956,7 +1956,7 @@ mod tests {
             format!("top\nbefore\n{needle} here\nafter\nbottom\n"),
         )
         .unwrap();
-        super::fff::rescan();
+        super::search::rescan();
 
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String(needle.clone()));
@@ -1989,7 +1989,7 @@ mod tests {
             "struct UserAccountController { field: u32 }\n",
         )
         .unwrap();
-        super::fff::rescan();
+        super::search::rescan();
 
         // Exact query misses (the token has a transposed 'lr'), fuzzy retry hits.
         // Assembled at runtime so the query text does not appear verbatim in
@@ -2043,7 +2043,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.rs"), format!("{needle} in one\n")).unwrap();
         fs::write(root.join("two.rs"), "nothing here\n").unwrap();
-        super::fff::rescan();
+        super::search::rescan();
 
         let args = json!({
             "steps": [
@@ -2179,7 +2179,7 @@ mod tests {
 
     #[tokio::test]
     async fn fffind_finds_paths_fuzzily() {
-        super::fff::rescan();
+        super::search::rescan();
         let mut args = Map::new();
         args.insert("pattern".into(), Value::String("tools mod".into()));
         let outcome = execute_outcome(
