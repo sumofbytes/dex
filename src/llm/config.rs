@@ -28,10 +28,10 @@ fn env_parse_opt<T: FromStr>(name: &str) -> Option<T> {
     env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
-// Filesystem helpers live in `core::fs` (one owner for XDG paths, atomic
+// Filesystem helpers live in `workspace` (one owner for XDG paths, atomic
 // tmp files, and content-identity caching); re-exported here so existing
 // `config::...` paths (and tests) keep working.
-pub(crate) use crate::core::fs::{cached_parse, fnv_bytes, unique_tmp_path, xdg_path, FileCache};
+pub(crate) use crate::workspace::{cached_parse, fnv_bytes, unique_tmp_path, xdg_path, FileCache};
 
 /// One resolved knob: the value that `from_env` applies and the origin
 /// that `doctor` reports. Both sides consume the same resolution, so the
