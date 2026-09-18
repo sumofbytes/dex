@@ -652,12 +652,17 @@ pub(crate) async fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &(dyn CancellationSource + Send + Sync),
     emergency: bool,
-    // Whether a worthwhile verbatim prune beats the summary. Passed by
-    // the caller because the two knobs are independent: the threshold
-    // path passes `summary_mode_is_jev()` (`DEX_COMPACTION_LLM=jev`),
-    // the boundary path passes `online_compaction_jev()`
-    // (`DEX_ONLINE_COMPACTION=jev`).
+    // Whether a worthwhile verbatim prune beats the summary. Threaded
+    // separately from `summarizer` because the two knobs are independent:
+    // the threshold path derives both from `summary_mode()`
+    // (`DEX_COMPACTION_LLM`), the boundary path passes
+    // `online_compaction_jev()` (`DEX_ONLINE_COMPACTION=jev`) here while
+    // still taking the fallback summarizer from the threshold knob.
     jev_prune: bool,
+    // Fallback summarizer when no hook summary applies and the prune is
+    // skipped or does not pay — always the threshold knob's choice, parsed
+    // once by the caller instead of re-read here.
+    summarizer: crate::agent::jev::SummaryMode,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -774,7 +779,7 @@ pub(crate) async fn compact_history(
     let mut usage_total: Option<Usage> = None;
     let summarized = if let Some(summary) = &hook.summary {
         summary.clone()
-    } else if crate::agent::jev::summary_mode() == crate::agent::jev::SummaryMode::Llm {
+    } else if summarizer == crate::agent::jev::SummaryMode::Llm {
         llm_summary(
             _config,
             _cancel,
@@ -1066,6 +1071,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1081,6 +1087,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1124,6 +1131,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1188,6 +1196,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             true,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap_err();
@@ -1200,6 +1209,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1242,6 +1252,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1252,6 +1263,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             true,
             false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1306,13 +1318,16 @@ mod tests {
             messages.push(msg(Role::User, &format!("recent {i}")));
         }
         let before = messages.len();
+        // Mirrors the threshold caller in `loop.rs`: one parse selects
+        // both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
         let (compacted, usage) = compact_history(
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            // Mirrors the threshold caller in `loop.rs`.
-            crate::agent::jev::summary_mode_is_jev(),
+            summarizer.prunes_jev(),
+            summarizer,
         )
         .await
         .unwrap();
@@ -1358,13 +1373,16 @@ mod tests {
             messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
             messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
         }
+        // Mirrors the threshold caller in `loop.rs`: one parse selects
+        // both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
         let (compacted, _) = compact_history(
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            // Mirrors the threshold caller in `loop.rs`.
-            crate::agent::jev::summary_mode_is_jev(),
+            summarizer.prunes_jev(),
+            summarizer,
         )
         .await
         .unwrap();
@@ -1413,13 +1431,16 @@ mod tests {
         for i in 0..KEEP_RECENT_MESSAGES {
             messages.push(msg(Role::User, &format!("recent {i}")));
         }
+        // Mirrors the threshold caller in `loop.rs`: one parse selects
+        // both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
         let (compacted, _) = compact_history(
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            // Mirrors the threshold caller in `loop.rs`.
-            crate::agent::jev::summary_mode_is_jev(),
+            summarizer.prunes_jev(),
+            summarizer,
         )
         .await
         .unwrap();

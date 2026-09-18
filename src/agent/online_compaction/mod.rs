@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
-use crate::agent::jev::JEV_VALUE;
+use crate::agent::jev::{parse_compaction_knob, CompactionKnob, JEV_VALUE};
 use crate::core::types::{FunctionDef, ToolDefinition};
 use crate::llm::config::warn_once;
 
@@ -29,11 +29,11 @@ pub(crate) const ONLINE_COMPACTION_ENV: &str = "DEX_ONLINE_COMPACTION";
 /// likewise disables.
 fn online_compaction_mode() -> Option<String> {
     let raw = std::env::var(ONLINE_COMPACTION_ENV).ok()?;
-    let mode = raw.trim().to_ascii_lowercase();
-    match mode.as_str() {
-        "1" | JEV_VALUE => Some(mode),
-        "" | "0" | "false" | "off" | "no" => None,
-        _ => {
+    match parse_compaction_knob(&raw) {
+        CompactionKnob::Jev => Some(JEV_VALUE.to_string()),
+        CompactionKnob::One => Some("1".to_string()),
+        CompactionKnob::Off => None,
+        CompactionKnob::Unrecognized => {
             let short: String = raw.trim().chars().take(32).collect();
             warn_once(
                 "env:DEX_ONLINE_COMPACTION",
@@ -184,6 +184,17 @@ pub(crate) fn doctor_row(ctx: &DoctorCtx<'_>) -> Option<DoctorRow> {
 
 /// Rough token estimate for the summary a compaction leaves behind.
 pub(crate) const NATIVE_SUMMARY_TOKEN_ESTIMATE: u64 = 1_000;
+
+/// Memo left behind by a compaction: a Jev prune keeps truncated heads
+/// (~200 tokens), a summary keeps ~1k. One helper for the decision site
+/// and the threshold-debt site so the two cannot drift apart.
+pub(crate) fn memo_estimate(jev_prune: bool) -> u64 {
+    if jev_prune {
+        crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE
+    } else {
+        NATIVE_SUMMARY_TOKEN_ESTIMATE
+    }
+}
 
 /// Fallback cache-write/read ratio when the catalog prices no caching at
 /// all. Measured cross-provider median of `input / cache_read` over the
@@ -666,22 +677,10 @@ impl CompactionDecision {
 
 /// Cache re-write debt for a compaction archiving `archive_tokens` of a
 /// `write_tokens` prefix, at a full `cache_write_read_ratio` (`None` → no
-/// surcharge). Shared by the boundary economics and the threshold path.
-pub(crate) fn cache_debt_for_ratio(
-    write_tokens: u64,
-    archive_tokens: u64,
-    cache_write_read_ratio: Option<f64>,
-) -> (f64, f64) {
-    cache_debt_for_memo(
-        write_tokens,
-        archive_tokens,
-        cache_write_read_ratio,
-        NATIVE_SUMMARY_TOKEN_ESTIMATE,
-    )
-}
-
-/// Memo-aware variant: Jev prunes leave ~200 tokens of truncated heads
-/// behind, not a 1k summary, so the same archive repays faster.
+/// surcharge), repaying `archive - memo` per request. A Jev prune leaves
+/// ~200 tokens of truncated heads behind (see [`memo_estimate`]), not a 1k
+/// summary, so the same archive repays faster. Shared by the boundary
+/// economics and the threshold path.
 pub(crate) fn cache_debt_for_memo(
     write_tokens: u64,
     archive_tokens: u64,
@@ -971,15 +970,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_debt_for_ratio_matches_the_decision_path() {
+    fn memo_debt_matches_the_decision_path() {
+        // The memo helper maps prune → Jev floor, summary → native estimate.
+        assert_eq!(memo_estimate(false), NATIVE_SUMMARY_TOKEN_ESTIMATE);
+        assert_eq!(
+            memo_estimate(true),
+            crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE
+        );
         // Explicit surcharge: write * (ratio - 1).
-        let (debt, repayment) = cache_debt_for_ratio(40_000, 20_000, Some(12.5));
+        let (debt, repayment) =
+            cache_debt_for_memo(40_000, 20_000, Some(12.5), memo_estimate(false));
         assert!((debt - 40_000.0 * 11.5).abs() < 1e-9);
         assert!((repayment - 19_000.0).abs() < 1e-9);
         // No ratio (or ratio 1.0): no surcharge to amortize.
-        let (debt, _) = cache_debt_for_ratio(40_000, 20_000, None);
+        let (debt, _) = cache_debt_for_memo(40_000, 20_000, None, memo_estimate(false));
         assert_eq!(debt, 0.0);
-        let (debt, _) = cache_debt_for_ratio(40_000, 20_000, Some(1.0));
+        let (debt, _) = cache_debt_for_memo(40_000, 20_000, Some(1.0), memo_estimate(false));
         assert_eq!(debt, 0.0);
     }
 
@@ -1339,7 +1345,8 @@ mod tests {
         assert!(jev.compact);
         assert_eq!(jev.reason, "window_protection");
         // The debt carried matches the memo left behind.
-        let (_, native_repay) = cache_debt_for_ratio(40_000, 20_000, Some(12.5));
+        let (_, native_repay) =
+            cache_debt_for_memo(40_000, 20_000, Some(12.5), memo_estimate(false));
         let (debt, jev_repay) = cache_debt_for_memo(
             40_000,
             20_000,
