@@ -652,6 +652,12 @@ pub(crate) async fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &(dyn CancellationSource + Send + Sync),
     emergency: bool,
+    // Whether a worthwhile verbatim prune beats the summary. Passed by
+    // the caller because the two knobs are independent: the threshold
+    // path passes `summary_mode_is_jev()` (`DEX_COMPACTION_LLM=jev`),
+    // the boundary path passes `online_compaction_jev()`
+    // (`DEX_ONLINE_COMPACTION=jev`).
+    jev_prune: bool,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -742,15 +748,11 @@ pub(crate) async fn compact_history(
         extract_file_ops_from_message(msg, &mut file_ops);
     }
 
-    // Jev verbatim prune (`DEX_COMPACTION_LLM=jev` threshold mode, or
-    // `DEX_ONLINE_COMPACTION=jev` boundaries): drop/truncate stale tool
-    // outputs in place, no summary message, no LLM spend. Tried on a clone
-    // so an insufficient prune discards cleanly and the summarizer below
-    // still sees the original span. An explicit hook summary always wins.
-    if hook.summary.is_none()
-        && (crate::agent::jev::summary_mode_is_jev()
-            || crate::agent::online_compaction::online_compaction_jev())
-    {
+    // Jev verbatim prune: drop/truncate stale tool outputs in place, no
+    // summary message, no LLM spend. Tried on a clone so an insufficient
+    // prune discards cleanly and the summarizer below still sees the
+    // original span. An explicit hook summary always wins.
+    if hook.summary.is_none() && jev_prune {
         let mut candidate = messages.clone();
         let stats = crate::agent::jev::prune_span(&mut candidate, boundary_start, first_kept);
         if crate::agent::jev::is_worthwhile(&stats) {
@@ -1063,6 +1065,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1076,6 +1079,7 @@ mod tests {
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
+            false,
             false,
         )
         .await
@@ -1118,6 +1122,7 @@ mod tests {
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
+            false,
             false,
         )
         .await
@@ -1182,6 +1187,7 @@ mod tests {
             &mut messages.clone(),
             &crate::agent::state::GlobalCancellation,
             true,
+            false,
         )
         .await
         .unwrap_err();
@@ -1192,6 +1198,7 @@ mod tests {
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
+            false,
             false,
         )
         .await
@@ -1234,6 +1241,7 @@ mod tests {
             &mut messages.clone(),
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1243,6 +1251,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -1302,6 +1311,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            // Mirrors the threshold caller in `loop.rs`.
+            crate::agent::jev::summary_mode_is_jev(),
         )
         .await
         .unwrap();
@@ -1352,6 +1363,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            // Mirrors the threshold caller in `loop.rs`.
+            crate::agent::jev::summary_mode_is_jev(),
         )
         .await
         .unwrap();
@@ -1361,6 +1374,61 @@ mod tests {
                 .iter()
                 .any(|m| m.name.as_deref() == Some("summary")),
             "insufficient prune must fall back to a summary"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env must stay set across the compaction await
+    async fn online_jev_alone_does_not_prune_the_threshold_path() {
+        // The knobs are independent: `DEX_ONLINE_COMPACTION=jev` governs
+        // boundary compactions (the loop passes `online_compaction_jev()`
+        // there); the threshold path passes `summary_mode_is_jev()`, so
+        // with only the online knob set a tool-heavy span still
+        // summarizes instead of pruning.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::take(&[
+            "DEX_COMPACTION_LLM",
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+        ]);
+        std::env::remove_var("DEX_COMPACTION_LLM");
+        std::env::set_var(
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+            "jev",
+        );
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..10 {
+            messages.push(ChatMessage::assistant_calls(
+                None,
+                vec![jev_call(&format!("c{i}"))],
+            ));
+            messages.push(ChatMessage::tool_result(
+                format!("c{i}"),
+                "x".repeat(12_000),
+            ));
+        }
+        for i in 0..KEEP_RECENT_MESSAGES {
+            messages.push(msg(Role::User, &format!("recent {i}")));
+        }
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+            // Mirrors the threshold caller in `loop.rs`.
+            crate::agent::jev::summary_mode_is_jev(),
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "threshold compaction must still run");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.name.as_deref() == Some("summary")),
+            "threshold without DEX_COMPACTION_LLM=jev must summarize, not prune"
         );
     }
 }
