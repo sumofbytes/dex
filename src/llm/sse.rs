@@ -226,6 +226,16 @@ impl std::fmt::Display for MidStreamError {
 
 impl std::error::Error for MidStreamError {}
 
+/// Only a failure with no streamed output (HTTP status, connect failure,
+/// drop before the first delta) qualifies for protocol fallback or a
+/// same-protocol re-issue; a mid-stream failure may have already put partial
+/// text on the transcript, and a retried call would duplicate it. Defined
+/// here with the marker so the retry gates (`client`) and the fallback gate
+/// (`dispatch`) share one owner instead of importing each other.
+pub(crate) fn is_mid_stream(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<MidStreamError>().is_some()
+}
+
 /// Wrap a stream failure as [`MidStreamError`] only once output has flowed;
 /// a failure before any output is retryable (protocol fallback may re-run
 /// the turn without duplicating anything).
@@ -1294,13 +1304,12 @@ impl StreamParser for AnthropicParser {
 #[cfg(test)]
 mod tests {
     use super::{
-        delta_thought, driver_err, is_dropped_connection, is_transport_error, read_stream,
-        stream_err, stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta, StreamPrinter,
-        Usage,
+        delta_thought, driver_err, is_dropped_connection, is_mid_stream, is_transport_error,
+        read_stream, stream_err, stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta,
+        StreamPrinter, Usage,
     };
     use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
-    use crate::llm::streaming::is_mid_stream;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -2135,7 +2144,7 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
         // `is_decode` on this reqwest version (`is_body` on others), so the
         // gate matches the marker `run_sse` attached, not the taxonomy.
         assert!(is_transport_error(&*err));
-        assert!(!crate::llm::streaming::is_mid_stream(&*err));
+        assert!(!is_mid_stream(&*err));
         // The marker preserves the transport cause for logs and notices.
         let mut source = std::error::Error::source(&*err);
         let mut found_cause = false;

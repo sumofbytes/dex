@@ -22,7 +22,7 @@ use crate::core::format::{
 use crate::core::types::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
-use crate::llm::stream::Turn;
+use crate::llm::sse::Turn;
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
