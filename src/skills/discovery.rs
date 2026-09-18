@@ -198,6 +198,7 @@ pub(crate) fn skill_dirs() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn discover_skills_sorts_and_dedups() {

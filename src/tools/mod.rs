@@ -61,18 +61,6 @@ pub(crate) fn set_output_limit(limit: usize) {
     }
 }
 
-/// A tool result together with whether the call actually succeeded. Success
-/// is decided where the exit status is known — never inferred from the
-/// output text, which may legitimately contain markers like `[exit 1]`.
-/// `diff` carries the display-only git diff for write/edit, captured before
-/// the file was mutated; it never reaches the model.
-/// Out-of-band shell facts a tool result carries beside its text: the
-/// archive id `evidence_reducer::capture` stored for the raw output, and the
-/// exit code it observed. Both travel outside the text on purpose — untrusted
-/// tool output must not be able to point verification at a different
-/// archive, or re-label a run's outcome. `None` for tools that ran no shell
-/// command (or ran one without the reducer gate on, in the id's case).
-
 /// `update_plan`: validate the full plan replacement and echo the snapshot.
 /// Pure — the boundary bookkeeping and the compaction decision live in the
 /// agent loop ([`crate::agent::online_compaction`]).
