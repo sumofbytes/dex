@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
 use crate::agent::online_compaction::{
-    cache_debt_for_ratio, decide_compaction, online_compaction_enabled, post_compaction_reminder,
-    CompactionEconomics, DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
+    cache_debt_for_memo, cache_debt_for_ratio, decide_compaction, online_compaction_enabled,
+    online_compaction_jev, post_compaction_reminder, CompactionEconomics,
+    DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
 };
 use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::{
@@ -434,8 +435,20 @@ async fn compaction_gate(
                     // pressure samples reset, the re-write is carried
                     // as debt the next boundary repays, and the plan
                     // survives (the model was not asked to re-plan).
-                    let (debt, repayment) =
-                        cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()));
+                    // Memo-aware: a Jev threshold prune repays `archive -
+                    // 200`, a summary `archive - 1000`.
+                    let (debt, repayment) = if online_compaction_jev()
+                        || crate::agent::jev::summary_mode_is_jev()
+                    {
+                        cache_debt_for_memo(
+                            write,
+                            archive,
+                            Some(config.cache_write_read_ratio()),
+                            crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE,
+                        )
+                    } else {
+                        cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()))
+                    };
                     state
                         .online_compaction
                         .record_threshold_compaction(debt, repayment);
@@ -796,7 +809,13 @@ async fn process_tool_result(
                 // archived, and the ephemeral preamble + tool
                 // schema are re-sent on every request.
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
-                NATIVE_SUMMARY_TOKEN_ESTIMATE,
+                // Jev prunes leave truncated heads (~200 tokens), not a 1k
+                // summary, behind — the same archive repays faster.
+                if online_compaction_jev() {
+                    crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE
+                } else {
+                    NATIVE_SUMMARY_TOKEN_ESTIMATE
+                },
                 context_tokens,
                 &state.online_compaction,
                 Some(config.context_window),
@@ -839,14 +858,18 @@ async fn process_tool_result(
                         // The boundary fired silently before; a
                         // system line is the only user-visible
                         // proof the economics paid out.
-                        system_note(
-                            console,
-                            &format!(
+                        let note = if online_compaction_jev() {
+                            format!(
+                                "online compaction (jev): pruned stale tool outputs at plan boundary (~{} tokens archived)",
+                                decision.archive_tokens
+                            )
+                        } else {
+                            format!(
                                 "online compaction: history compacted at plan boundary (~{} tokens archived)",
                                 decision.archive_tokens
-                            ),
-                        )
-                        .await;
+                            )
+                        };
+                        system_note(console, &note).await;
                     }
                     // Below the summarize floor (e.g. a boundary
                     // right after the previous compaction) or a
