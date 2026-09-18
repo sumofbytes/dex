@@ -27,9 +27,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::{CancellationSource, ToolState};
-use crate::core::console::{CancellationToken, Console};
 use crate::core::types::{ApprovalRequest, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
+use crate::runtime::console::{CancellationToken, Console};
 use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::{Policy, ToolError, ToolFilter};
 
@@ -128,7 +128,7 @@ pub(crate) struct AgentTurnContext {
     /// §12 V1b: live "allow for session" lookup against the daemon's map,
     /// so a decision granted after a child spawned still applies to it.
     /// `None` outside the daemon.
-    pub(crate) live_approvals: Option<crate::core::console::LiveApprovalCheck>,
+    pub(crate) live_approvals: Option<crate::runtime::console::LiveApprovalCheck>,
 }
 
 /// Dispatch the delegation tools from [`crate::tools::execute`]. The

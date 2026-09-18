@@ -1,8 +1,8 @@
 use std::io::{self, IsTerminal, Write};
 
-use crate::core::console::{AGENT_COLOR, RESET};
 use crate::core::format::agent_lifecycle;
 use crate::protocol::{ApprovalDecision, StreamEvent};
+use crate::runtime::console::{AGENT_COLOR, RESET};
 
 use super::http::{ChatOptions, DaemonClient};
 

@@ -19,7 +19,7 @@ use crate::session::Session;
 
 use super::lookup::session_path;
 use super::{lock_map, DaemonState};
-use crate::core::console::CancellationToken;
+use crate::runtime::console::CancellationToken;
 
 /// `POST /api/sessions/{id}/shell` with `{"command": ...}` — run a shell
 /// command directly in the daemon workspace (`!`/`!!` prefix in the TUI).

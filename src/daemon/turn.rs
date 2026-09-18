@@ -9,12 +9,12 @@ use tokio::sync::mpsc;
 use crate::agent::r#loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
 use crate::agent::subagent::{AgentTurnContext, WaitOutcome};
-use crate::core::console::{CancellationToken, Console, TraceWriter};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
-use crate::core::unwind::CatchUnwind;
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override_for;
 use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
+use crate::runtime::console::{CancellationToken, Console, TraceWriter};
+use crate::runtime::unwind::CatchUnwind;
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, skill_dirs};
 

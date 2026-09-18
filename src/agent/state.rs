@@ -5,23 +5,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-pub(crate) trait CancellationSource: Send + Sync {
-    fn is_cancelled(&self) -> bool;
-    fn take_cancelled(&self) -> bool;
-}
+pub(crate) use crate::runtime::cancel::CancellationSource;
 
-/// Async wait for cancellation on the sync trait: polls with async sleep
-/// (10ms) so `select!` wakes within ~10ms. One path covers
-/// `CancellationToken`, `GlobalCancellation` and test doubles while keeping
-/// `CancellationSource` sync per plan.
-pub(crate) async fn wait_cancelled(cancel: &(dyn CancellationSource + Send + Sync)) {
-    loop {
-        if cancel.is_cancelled() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
+pub(crate) use crate::runtime::cancel::wait_cancelled;
 
 /// Process-global cancellation (Ctrl+C) used by the non-TUI paths
 /// (`dex "prompt"` and `dex --tool`). The TUI/daemon paths use a per-session
@@ -31,10 +17,10 @@ pub(crate) struct GlobalCancellation;
 
 impl CancellationSource for GlobalCancellation {
     fn is_cancelled(&self) -> bool {
-        crate::core::console::is_interrupted()
+        crate::runtime::console::is_interrupted()
     }
     fn take_cancelled(&self) -> bool {
-        crate::core::console::take_interrupt()
+        crate::runtime::console::take_interrupt()
     }
 }
 

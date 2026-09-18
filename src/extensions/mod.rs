@@ -593,7 +593,7 @@ end
         .to_string();
         assert!(err.contains("unknown tool"), "got: {err}");
         // ReadOnly denies before dispatch.
-        let console = crate::core::console::Console::none();
+        let console = crate::runtime::console::Console::none();
         let err = crate::tools::execute(
             "ext__noext__notool",
             &args,
@@ -1222,7 +1222,7 @@ end
         global_manager()
             .refresh_with(std::slice::from_ref(&root))
             .await;
-        let console = crate::core::console::Console::none();
+        let console = crate::runtime::console::Console::none();
         console.record_session_approval("bash", r#"{"command":"echo rewritten"}"#);
         let policy =
             crate::tools::Policy::turn(crate::core::types::PermissionMode::AskShell, &console);
