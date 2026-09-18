@@ -30,7 +30,7 @@
 //! signals — file paths named in the prompt, code fences, real tool-call
 //! counts from session history (not tool words in the prompt) — add their
 //! own weight. Every hit records a `reason`, so a decision explains itself
-//! (`Decision::top_reason`, journaled per turn by the caller).
+//! (the joined `reasons` list, journaled per turn by the caller).
 
 use std::str::FromStr;
 
@@ -115,25 +115,45 @@ impl TierMap {
     }
 }
 
+/// Which layer [`model_for`] resolves from: the tier's own selection, the
+/// `balanced` fallback, or the top-level `model:` selection. [`model_for`]
+/// and config's `routing_tier_display` share this so the doctor origin can
+/// never drift from the runtime fallback chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelForSource {
+    Tier,
+    Balanced,
+    Fallback,
+}
+
+pub(crate) fn model_for_source(tier: Tier, map: &TierMap) -> ModelForSource {
+    if !map.get(tier).is_empty() {
+        ModelForSource::Tier
+    } else if tier != Tier::Balanced && !map.balanced.is_empty() {
+        ModelForSource::Balanced
+    } else {
+        ModelForSource::Fallback
+    }
+}
+
 /// Resolve the model selection for a tier. Full `provider/model` strings ride
 /// through untouched, so the existing `split_selection`/`resolve_selection`
 /// path (catalog, `learned-apis.json`, `providers.<name>.api:` pins) keeps
 /// working. Fallback chain: tier miss → `balanced` → top-level `model:`
 /// (`fallback`).
 pub(crate) fn model_for<'a>(tier: Tier, map: &'a TierMap, fallback: &'a str) -> &'a str {
-    let hit = map.get(tier);
-    if !hit.is_empty() {
-        return hit;
+    match model_for_source(tier, map) {
+        ModelForSource::Tier => map.get(tier),
+        ModelForSource::Balanced => &map.balanced,
+        ModelForSource::Fallback => fallback,
     }
-    if tier != Tier::Balanced && !map.balanced.is_empty() {
-        return &map.balanced;
-    }
-    fallback
 }
 
 /// One classified turn: the tier, its corroborated score, and why.
-/// `reasons` is empty for a featureless prompt (ordinary work); the first
-/// entry is the strongest signal and doubles as the per-turn log label.
+/// `reasons` is empty for a featureless prompt (ordinary work); entries are
+/// in classification order (powerful stems/phrases, then fast ones, then
+/// structure). Callers log the whole list joined — the first entry alone
+/// may not name the heaviest driver (see [`classify_with_reasons`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Decision {
     pub(crate) tier: Tier,
@@ -148,12 +168,6 @@ impl Decision {
             score,
             reasons,
         }
-    }
-
-    /// Strongest signal first; `"ordinary work"` when nothing fired, so
-    /// callers can always print something truthful.
-    pub(crate) fn top_reason(&self) -> &'static str {
-        self.reasons.first().copied().unwrap_or("ordinary work")
     }
 }
 
@@ -218,11 +232,22 @@ const FAST_PHRASES: &[(&str, i32, &str)] = &[
 ];
 
 /// Closed-class tool verbs for [`infer_tool_hints`], in normalized form
-/// (see [`norm_token`]: `reads`→`read`, `running`→`run`, `writes`→`writ`).
+/// (see [`norm_token`]: `reads`→`read`, `running`→`run`). One entry per
+/// verb; entries with aliases count once no matter how many inflections
+/// appear — `write`/`writes` normalize to `write` but `writing` to `writ`,
+/// so the family shares one entry and `write writing` is one verb, not two.
 /// Scope words (`refactor`, `auth`, …) score in the stem tables instead —
 /// counting them here too would double-count one mention into escalation.
-const TOOL_STEMS: &[&str] = &[
-    "read", "edit", "writ", "write", "bash", "run", "test", "grep", "find", "file",
+const TOOL_VERBS: &[&[&str]] = &[
+    &["read"],
+    &["edit"],
+    &["writ", "write"],
+    &["bash"],
+    &["run"],
+    &["test"],
+    &["grep"],
+    &["find"],
+    &["file"],
 ];
 
 /// Rough "how tool-heavy does this prompt sound" count, saturating at 9:
@@ -231,9 +256,9 @@ const TOOL_STEMS: &[&str] = &[
 /// (`history_tool_calls`) outranks it.
 pub(crate) fn infer_tool_hints(text: &str) -> u8 {
     let tokens = tokenize(text);
-    TOOL_STEMS
+    TOOL_VERBS
         .iter()
-        .filter(|stem| tokens.iter().any(|t| t == **stem))
+        .filter(|aliases| aliases.iter().any(|stem| tokens.iter().any(|t| t == *stem)))
         .count()
         .min(9) as u8
 }
@@ -266,6 +291,10 @@ fn count_path_refs(text: &str) -> usize {
 fn is_path_chunk(chunk: &str) -> bool {
     let w = chunk.trim_matches(|c: char| "`\"'()[],;:.!?<>".contains(c) || c.is_whitespace());
     if w.len() < 3 || w.len() > 120 {
+        return false;
+    }
+    // Bare English slash-conjunctions (`and/or`) are prose, not paths.
+    if w.eq_ignore_ascii_case("and/or") {
         return false;
     }
     if w.contains('/') && w.chars().any(|c| c.is_ascii_alphanumeric()) {
@@ -357,10 +386,20 @@ pub(crate) fn classify_with_reasons(signal: &TaskSignal, text: &str) -> Decision
     let lower = text.to_ascii_lowercase().replace('-', " ");
     let mut score = 0i32;
     let mut reasons: Vec<&'static str> = Vec::new();
+    let mut reason_weights: Vec<i32> = Vec::new();
+    // Reasons dedupe by string with max-weight-wins: one concept, one vote
+    // (`drop table` + `drop database` is a single destructive-SQL signal,
+    // +3 once, not twice; `deadlock` +2 under `race condition` +3 keeps +3).
     let mut push = |weight: i32, reason: &'static str| {
-        if !reasons.contains(&reason) {
+        if let Some(i) = reasons.iter().position(|r| *r == reason) {
+            if weight > reason_weights[i] {
+                score += weight - reason_weights[i];
+                reason_weights[i] = weight;
+            }
+        } else {
             score += weight;
             reasons.push(reason);
+            reason_weights.push(weight);
         }
     };
 
@@ -374,9 +413,12 @@ pub(crate) fn classify_with_reasons(signal: &TaskSignal, text: &str) -> Decision
     // Structure: what the turn looks like, not what it says.
     score_structure(signal, text, &mut push);
 
-    // Insertion order already fronts the strongest signals: powerful
-    // stems/phrases score before fast ones, structure last — so
-    // `top_reason` labels the turn with what drove it.
+    // Reason order is classification order: powerful stems/phrases score
+    // before fast ones, structure last — so the first entry usually names
+    // what drove the tier, but a later +3 piling onto an earlier +1 keeps
+    // the earlier entry first (pinned by
+    // `first_reason_is_first_hit_in_classification_order`); callers log the
+    // whole list, so no driver is lost.
     if score >= POWERFUL_SCORE {
         Decision::new(Tier::Powerful, score, reasons)
     } else if score <= FAST_SCORE && signal.prompt_chars < FAST_MAX_CHARS {
@@ -559,12 +601,12 @@ mod tests {
         assert!(d.score >= 3, "score {}", d.score);
         assert!(d.reasons.contains(&"refactor"));
         assert!(d.reasons.contains(&"auth"));
-        assert!(!d.top_reason().is_empty());
+        assert!(!d.reasons.is_empty());
 
         let (s, _) = plain("add a retry to the fetch call");
         let d = classify_with_reasons(&s, "add a retry to the fetch call");
         assert_eq!(d.tier, Tier::Balanced);
-        assert_eq!(d.top_reason(), "ordinary work");
+        assert!(d.reasons.is_empty());
     }
 
     #[test]
@@ -638,5 +680,74 @@ mod tests {
         ];
         assert_eq!(count_history_tool_calls(&history), 2);
         assert_eq!(count_history_tool_calls(&[]), 0);
+    }
+
+    #[test]
+    fn first_reason_is_first_hit_in_classification_order() {
+        // A +2 stem hit plus a later +3 structure signal keeps the stem
+        // first in `reasons` — order is classification order, not weight —
+        // while the log label joins the whole list, so the +3 still shows.
+        let long = format!("refactor the loader {}", "x".repeat(7000));
+        let s = signal(long.chars().count(), 0, 0, infer_tool_hints(&long));
+        let d = classify_with_reasons(&s, &long);
+        assert_eq!(d.tier, Tier::Powerful);
+        assert_eq!(d.reasons.first(), Some(&"refactor"));
+        assert!(d.reasons.contains(&"very long prompt"));
+    }
+
+    #[test]
+    fn duplicate_reasons_count_once() {
+        // One concept, one vote: two destructive-SQL phrases add +3 once.
+        let prompt = "drop table sessions and drop database prod";
+        let (s, _) = plain(prompt);
+        let d = classify_with_reasons(&s, prompt);
+        assert_eq!(d.tier, Tier::Powerful);
+        assert_eq!(d.score, 3);
+        assert_eq!(d.reasons, vec!["destructive SQL"]);
+    }
+
+    #[test]
+    fn duplicate_reasons_keep_max_weight() {
+        // `deadlock` (+2) and `race condition` (+3) share one reason: one
+        // vote, max weight wins.
+        let prompt = "deadlock in the pool, looks like a race condition";
+        let (s, _) = plain(prompt);
+        let d = classify_with_reasons(&s, prompt);
+        assert_eq!(d.tier, Tier::Powerful);
+        assert_eq!(d.score, 3);
+        assert_eq!(d.reasons, vec!["concurrency hazard"]);
+    }
+
+    #[test]
+    fn slash_conjunctions_are_not_paths() {
+        assert!(!is_path_chunk("and/or"));
+        assert!(!is_path_chunk("`and/or`,"));
+        // Real slash paths still count.
+        assert!(is_path_chunk("src/main.rs"));
+        assert!(is_path_chunk("a/b"));
+        let (s, _) = plain("use this and/or that approach");
+        assert_eq!(
+            classify(&s, "use this and/or that approach"),
+            Tier::Balanced
+        );
+        // Boundary: two real paths plus `and/or` are two paths (+1), not
+        // three (+2) — miscounting would escalate below.
+        assert_eq!(count_path_refs("src/main.rs src/lib.rs and/or"), 2);
+        // `auth` (+2) plus one file point stays Balanced; with `and/or`
+        // miscounted as a second path it would reach Powerful.
+        let (s, _) = plain("auth src/main.rs and/or");
+        assert_eq!(classify(&s, "auth src/main.rs and/or"), Tier::Balanced);
+    }
+
+    #[test]
+    fn write_inflections_count_as_one_verb() {
+        // `write`/`writes`→`write` but `writing`→`writ`: one shared entry,
+        // one vote. (`write writes` would pass even without the alias —
+        // both normalize to `write` — so the regression case is
+        // `write writing`.)
+        assert_eq!(infer_tool_hints("write it"), 1);
+        assert_eq!(infer_tool_hints("writes it"), 1);
+        assert_eq!(infer_tool_hints("writing it"), 1);
+        assert_eq!(infer_tool_hints("write writing"), 1);
     }
 }

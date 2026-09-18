@@ -223,10 +223,12 @@ Each tier takes a full `provider/model` selection, so catalog endpoints and
 neither falls back to `routing.balanced:`, then to `model:` — so setting only
 `balanced` (or nothing, keeping `model:`) is a valid setup.
 
-Explicit picks always win: `--model` / a per-request model skips routing,
-and `/model` sets top-level `model:`, which is the fallback every tier
-resolves to — routing keeps classifying, but every tier lands on the picked
-model until per-tier selections are set. To turn routing off: `DEX_ROUTING=0`.
+  Explicit picks always win: `--model` / a per-request model skips routing
+  entirely (no classification runs), and `/model` sets top-level `model:`,
+  which is the fallback every tier resolves to — so with an explicit pick
+  every tier would land on the picked model until per-tier selections are
+  set. (`dex doctor` still shows each tier's resolved row as the hypothetical
+  routing outcome.) To turn routing off: `DEX_ROUTING=0`.
 
 ### System prompt
 
