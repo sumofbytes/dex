@@ -32,15 +32,16 @@ use std::collections::{HashMap, HashSet};
 use crate::core::types::{ChatMessage, Role};
 use crate::llm::config::warn_once;
 
-/// Value of [`COMPACTION_LLM_ENV`] /
+/// Value of [`COMPACTION_ENV`] /
 /// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`] selecting
 /// verbatim pruning instead of summarization.
 pub(crate) const JEV_VALUE: &str = "jev";
 
-/// `DEX_COMPACTION_LLM` selects the threshold-compaction summarizer
-/// (`1` = LLM, `jev` = verbatim prune, default deterministic). Lives here —
-/// next to the mode enum — so both readers share one parse.
-pub(crate) const COMPACTION_LLM_ENV: &str = "DEX_COMPACTION_LLM";
+/// `DEX_COMPACTION` selects the threshold-compaction summarizer
+/// (`llm` = model summary, `jev` = verbatim prune, default deterministic;
+/// `1` still selects the LLM as an alias). Lives here — next to the mode
+/// enum — so both readers share one parse.
+pub(crate) const COMPACTION_ENV: &str = "DEX_COMPACTION";
 
 /// Characters of a truncated result kept as head context.
 pub(crate) const JEV_TRUNCATE_HEAD_CHARS: usize = 300;
@@ -82,10 +83,10 @@ impl SummaryMode {
     }
 }
 
-/// One knob shape shared by [`COMPACTION_LLM_ENV`] and
+/// One knob shape shared by [`COMPACTION_ENV`] and
 /// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`]: `jev`
-/// selects verbatim pruning, `1` selects the LLM/summary behavior, unset
-/// and explicit offs disable, anything else is a typo.
+/// selects verbatim pruning, `llm` (or `1`) selects the LLM/summary
+/// behavior, unset and explicit offs disable, anything else is a typo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactionKnob {
     Jev,
@@ -94,26 +95,25 @@ pub(crate) enum CompactionKnob {
     Unrecognized,
 }
 
-/// Case-insensitive parse of the shared `1`/`jev` knob shape. Returns the
-/// selection without warning — callers warn with their own env var name on
-/// [`CompactionKnob::Unrecognized`].
+/// Case-insensitive parse of the shared `llm`/`1`/`jev` knob shape.
+/// Returns the selection without warning — callers warn with their own env
+/// var name on [`CompactionKnob::Unrecognized`].
 pub(crate) fn parse_compaction_knob(raw: &str) -> CompactionKnob {
     match raw.trim().to_ascii_lowercase().as_str() {
         JEV_VALUE => CompactionKnob::Jev,
-        "1" => CompactionKnob::One,
+        "llm" | "1" => CompactionKnob::One,
         "" | "0" | "false" | "off" | "no" => CompactionKnob::Off,
         _ => CompactionKnob::Unrecognized,
     }
 }
 
-/// Parse `DEX_COMPACTION_LLM`: `jev` (any case) → [`SummaryMode::Jev`],
-/// `1` → [`SummaryMode::Llm`], unset/explicit offs →
-/// [`SummaryMode::Deterministic`]. Only `1` selects the LLM so existing
-/// `=1` setups keep working byte-for-byte. A non-empty unrecognized value
-/// warns once (a typo like `=jve` must not silently degrade to
-/// deterministic) and likewise falls back to deterministic.
+/// Parse `DEX_COMPACTION`: `jev` (any case) → [`SummaryMode::Jev`],
+/// `llm` (any case; `1` accepted as an alias) → [`SummaryMode::Llm`],
+/// unset/explicit offs → [`SummaryMode::Deterministic`]. A non-empty
+/// unrecognized value warns once (a typo like `=jve` must not silently
+/// degrade to deterministic) and likewise falls back to deterministic.
 pub(crate) fn summary_mode() -> SummaryMode {
-    let raw = std::env::var(COMPACTION_LLM_ENV).unwrap_or_default();
+    let raw = std::env::var(COMPACTION_ENV).unwrap_or_default();
     match parse_compaction_knob(&raw) {
         CompactionKnob::Jev => SummaryMode::Jev,
         CompactionKnob::One => SummaryMode::Llm,
@@ -121,8 +121,8 @@ pub(crate) fn summary_mode() -> SummaryMode {
         CompactionKnob::Unrecognized => {
             let short: String = raw.trim().chars().take(32).collect();
             warn_once(
-                "env:DEX_COMPACTION_LLM",
-                &format!("ignoring DEX_COMPACTION_LLM={short:?} — expected '1' or 'jev'"),
+                "env:DEX_COMPACTION",
+                &format!("ignoring DEX_COMPACTION={short:?} — expected 'llm', 'jev', or '0'"),
             );
             SummaryMode::Deterministic
         }
@@ -144,11 +144,11 @@ pub(crate) fn compaction_doctor() -> (String, String) {
         SummaryMode::Deterministic => "deterministic",
     }
     .to_string();
-    let source = if std::env::var(COMPACTION_LLM_ENV)
+    let source = if std::env::var(COMPACTION_ENV)
         .ok()
         .is_some_and(|v| !v.trim().is_empty())
     {
-        COMPACTION_LLM_ENV.to_string()
+        COMPACTION_ENV.to_string()
     } else {
         "built-in default".to_string()
     };
@@ -493,34 +493,39 @@ mod tests {
     }
 
     #[test]
-    fn summary_mode_parses_jev_and_one() {
+    fn summary_mode_parses_compaction_knob() {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os(COMPACTION_LLM_ENV);
-        std::env::set_var(COMPACTION_LLM_ENV, "jev");
+        let prev = std::env::var_os(COMPACTION_ENV);
+        std::env::set_var(COMPACTION_ENV, "jev");
         assert_eq!(summary_mode(), SummaryMode::Jev);
         assert!(summary_mode_is_jev());
-        std::env::set_var(COMPACTION_LLM_ENV, "JEV");
+        std::env::set_var(COMPACTION_ENV, "JEV");
         assert_eq!(summary_mode(), SummaryMode::Jev);
-        std::env::set_var(COMPACTION_LLM_ENV, "1");
+        std::env::set_var(COMPACTION_ENV, "llm");
         assert_eq!(summary_mode(), SummaryMode::Llm);
         assert!(!summary_mode_is_jev());
+        std::env::set_var(COMPACTION_ENV, "LLM");
+        assert_eq!(summary_mode(), SummaryMode::Llm);
+        // `1` stays accepted as an alias for the LLM mode.
+        std::env::set_var(COMPACTION_ENV, "1");
+        assert_eq!(summary_mode(), SummaryMode::Llm);
         // Explicit offs stay silent and deterministic.
         for off in ["0", "false", "off", "no", ""] {
-            std::env::set_var(COMPACTION_LLM_ENV, off);
+            std::env::set_var(COMPACTION_ENV, off);
             assert_eq!(summary_mode(), SummaryMode::Deterministic);
         }
         // Garbage warns once (see `warn_once`) and stays deterministic —
         // a typo must never silently disable the selected mode.
-        std::env::set_var(COMPACTION_LLM_ENV, "jve");
+        std::env::set_var(COMPACTION_ENV, "jve");
         assert_eq!(summary_mode(), SummaryMode::Deterministic);
         assert!(!summary_mode_is_jev());
-        std::env::remove_var(COMPACTION_LLM_ENV);
+        std::env::remove_var(COMPACTION_ENV);
         assert_eq!(summary_mode(), SummaryMode::Deterministic);
         match prev {
-            Some(v) => std::env::set_var(COMPACTION_LLM_ENV, v),
-            None => std::env::remove_var(COMPACTION_LLM_ENV),
+            Some(v) => std::env::set_var(COMPACTION_ENV, v),
+            None => std::env::remove_var(COMPACTION_ENV),
         }
     }
 }

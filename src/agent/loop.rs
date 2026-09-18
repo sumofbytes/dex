@@ -304,7 +304,7 @@ async fn emergency_compact(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
     for _ in 0..3 {
-        // Emergency cuts follow the threshold knob (`DEX_COMPACTION_LLM`):
+        // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
         // one parse selects both the prune and the fallback summarizer.
         let summarizer = crate::agent::jev::summary_mode();
         match compact_history(
@@ -430,7 +430,7 @@ async fn compaction_gate(
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
             )
         });
-        // Threshold cuts follow the threshold knob (`DEX_COMPACTION_LLM`):
+        // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
         // one parse selects both the prune and the fallback summarizer.
         let summarizer = crate::agent::jev::summary_mode();
         match compact_history(
@@ -462,7 +462,7 @@ async fn compaction_gate(
                     // Memo-aware: a Jev threshold prune repays `archive -
                     // 200`, a summary `archive - 1000`. The threshold
                     // path follows the threshold knob only
-                    // (`DEX_COMPACTION_LLM`); the boundary path carries
+                    // (`DEX_COMPACTION`); the boundary path carries
                     // its own memo through `decision.cache_debt()`.
                     // `write`/`archive` are pre-compaction ledger
                     // measurements: the retained prefix only shrinks, so
