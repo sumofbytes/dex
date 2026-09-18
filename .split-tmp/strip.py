@@ -6,6 +6,8 @@ import sys
 
 import os
 
+DOT_RE = re.compile(r"\\.\\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*")
+
 touched = sys.argv[1:]
 
 STR_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
@@ -44,7 +46,7 @@ def name_used_in_code(fp, name):
             t = ln.strip()
             if re.match(r"^(pub(\(crate\))?\s+)?use\s", t):
                 continue
-            if pat.search(code_text(ln)):
+            if pat.search(DOT_RE.sub(".", code_text(ln))):
                 return True
     return False
 

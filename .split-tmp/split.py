@@ -86,6 +86,11 @@ def expand_use(path):
         part = part.strip()
         if not part:
             continue
+        if part == "self":
+            # `use a::b::{self}` imports name `b` for path `a::b`.
+            parent_path = (pre + post).rstrip(":")
+            out.append((parent_path, parent_path.split("::")[-1]))
+            continue
         for p, n in expand_use(part):
             out.append((pre + p + post, n))
     return out
