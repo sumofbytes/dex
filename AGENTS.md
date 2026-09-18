@@ -53,7 +53,7 @@ All of this lives in `src/llm/config.rs` — don't add a second way to express a
 - Keep `src/llm/prompt.rs` minimal; tool behavior belongs in `src/llm/protocol.rs` tool descriptions, not the prompt.
 - Skills: directory with `SKILL.md` frontmatter (`name`, `description`). Discovered via `skill_dirs()` — cwd `.dex/skills`, `.agents/skills`, then `$XDG_CONFIG_HOME/dex/skills`. Sorted, first `name` wins, duplicates warned.
 - Permissions default `trusted` (`read-only`/`ask-writes`/`ask-shell`/`trusted`); `bash` is mutating. `DEX_EXTRA_TOOLS=1` adds `git`/`chain`.
-- Compaction is deterministic by default (`DEX_COMPACTION_LLM=1` for LLM). Keep `tokens > contextWindow - reserveTokens` logic intact.
+- Compaction is deterministic by default (`DEX_COMPACTION_LLM=1` for LLM, `=jev` for verbatim tool-output pruning). Keep `tokens > contextWindow - reserveTokens` logic intact.
 
 ## Release
 

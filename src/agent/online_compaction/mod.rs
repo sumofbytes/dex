@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
+use crate::agent::jev::JEV_VALUE;
 use crate::core::types::{FunctionDef, ToolDefinition};
+use crate::llm::config::warn_once;
 
 /// Opt-in switch: `DEX_ONLINE_COMPACTION=1` registers `update_plan` and
 /// enables boundary economics with summary compaction; `=jev` keeps the
@@ -21,12 +23,25 @@ use crate::core::types::{FunctionDef, ToolDefinition};
 /// every request and only pays off on long-horizon work.
 pub(crate) const ONLINE_COMPACTION_ENV: &str = "DEX_ONLINE_COMPACTION";
 
-/// Case-insensitive raw mode (`1`, `jev`, …) for the online gate.
+/// Case-insensitive mode (`1`, `jev`) for the online gate. Unset and
+/// explicit offs disable silently; a non-empty unrecognized value warns
+/// once (a typo like `=jve` must not silently disable the gate) and
+/// likewise disables.
 fn online_compaction_mode() -> Option<String> {
-    std::env::var(ONLINE_COMPACTION_ENV)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
+    let raw = std::env::var(ONLINE_COMPACTION_ENV).ok()?;
+    let mode = raw.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "1" | JEV_VALUE => Some(mode),
+        "" | "0" | "false" | "off" | "no" => None,
+        _ => {
+            let short: String = raw.trim().chars().take(32).collect();
+            warn_once(
+                "env:DEX_ONLINE_COMPACTION",
+                &format!("ignoring DEX_ONLINE_COMPACTION={short:?} — expected '1' or 'jev'"),
+            );
+            None
+        }
+    }
 }
 
 pub(crate) fn online_compaction_enabled() -> bool {
@@ -1253,6 +1268,17 @@ mod tests {
         assert!(online_compaction_jev());
         std::env::set_var(ONLINE_COMPACTION_ENV, "1");
         assert!(online_compaction_enabled());
+        assert!(!online_compaction_jev());
+        // Explicit offs disable silently.
+        for off in ["0", "false", "off", "no", ""] {
+            std::env::set_var(ONLINE_COMPACTION_ENV, off);
+            assert!(!online_compaction_enabled());
+            assert!(!online_compaction_jev());
+        }
+        // Garbage warns once (see `warn_once`) and disables — a typo
+        // must never silently pass as a valid mode.
+        std::env::set_var(ONLINE_COMPACTION_ENV, "jve");
+        assert!(!online_compaction_enabled());
         assert!(!online_compaction_jev());
         std::env::remove_var(ONLINE_COMPACTION_ENV);
         assert!(!online_compaction_enabled());
