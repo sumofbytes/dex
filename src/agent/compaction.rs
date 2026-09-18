@@ -567,7 +567,7 @@ fn attach_file_section(file_ops: &FileOps) -> String {
     format_file_operations(&read_files, &modified_files)
 }
 
-/// LLM summarization path (`DEX_COMPACTION_LLM=1`): summarize the history
+/// LLM summarization path (`DEX_COMPACTION=llm`): summarize the history
 /// and — for split turns — the turn prefix with the configured model,
 /// folding the summarizer spend into `usage_total`. Empty or failed replies
 /// fall back to the deterministic summary; a cancelled summarizer fails the
@@ -655,7 +655,7 @@ pub(crate) async fn compact_history(
     // Whether a worthwhile verbatim prune beats the summary. Threaded
     // separately from `summarizer` because the two knobs are independent:
     // the threshold path derives both from `summary_mode()`
-    // (`DEX_COMPACTION_LLM`), the boundary path passes
+    // (`DEX_COMPACTION`), the boundary path passes
     // `online_compaction_jev()` (`DEX_ONLINE_COMPACTION=jev`) here while
     // still taking the fallback summarizer from the threshold knob.
     jev_prune: bool,
@@ -1056,8 +1056,8 @@ mod tests {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "goal: build the thing"));
@@ -1110,8 +1110,8 @@ mod tests {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         let mut s1 = msg(Role::User, "old checkpoint");
@@ -1171,8 +1171,8 @@ mod tests {
         let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "goal: build the thing"));
@@ -1235,8 +1235,8 @@ mod tests {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         // A history the normal path would refuse to cut: 12 messages, under
         // the fallback window (1 + 12 kept) it requires.
@@ -1296,10 +1296,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&[
-            "DEX_COMPACTION_LLM",
+            "DEX_COMPACTION",
             crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
         ]);
-        std::env::set_var("DEX_COMPACTION_LLM", "jev");
+        std::env::set_var("DEX_COMPACTION", "jev");
         std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
@@ -1359,10 +1359,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&[
-            "DEX_COMPACTION_LLM",
+            "DEX_COMPACTION",
             crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
         ]);
-        std::env::set_var("DEX_COMPACTION_LLM", "jev");
+        std::env::set_var("DEX_COMPACTION", "jev");
         std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
         let config = crate::llm::config::tests::test_cfg();
         // Tool-light history the normal path still cuts: nothing to prune,
@@ -1407,10 +1407,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&[
-            "DEX_COMPACTION_LLM",
+            "DEX_COMPACTION",
             crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
         ]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        std::env::remove_var("DEX_COMPACTION");
         std::env::set_var(
             crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
             "jev",
@@ -1449,7 +1449,7 @@ mod tests {
             messages
                 .iter()
                 .any(|m| m.name.as_deref() == Some("summary")),
-            "threshold without DEX_COMPACTION_LLM=jev must summarize, not prune"
+            "threshold without DEX_COMPACTION=jev must summarize, not prune"
         );
     }
 }

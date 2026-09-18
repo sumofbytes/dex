@@ -6245,10 +6245,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The compaction row reflects `DEX_COMPACTION_LLM=jev` and names the
+    /// The compaction row reflects `DEX_COMPACTION=jev` and names the
     /// env var as its origin; unset it reports the deterministic default.
     #[test]
-    fn doctor_reports_compaction_llm_env() {
+    fn doctor_reports_compaction_env() {
         let _env = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6257,22 +6257,22 @@ pub(crate) mod tests {
             "DEX_PROVIDER",
             "DEX_MODEL",
             "OPENCODE_API_KEY",
-            crate::agent::jev::COMPACTION_LLM_ENV,
+            crate::agent::jev::COMPACTION_ENV,
         ]);
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var(
             "DEX_CONFIG",
             std::env::temp_dir().join(format!("dex-compaction-doctor-{}", std::process::id())),
         );
-        std::env::set_var(crate::agent::jev::COMPACTION_LLM_ENV, "jev");
+        std::env::set_var(crate::agent::jev::COMPACTION_ENV, "jev");
         let out = doctor(None, None, None, &[], None);
         let jev = out
             .lines()
             .find(|l| l.starts_with("compaction "))
             .expect("compaction row");
         assert!(jev.contains("jev"), "{jev}");
-        assert!(jev.contains(crate::agent::jev::COMPACTION_LLM_ENV), "{jev}");
-        std::env::remove_var(crate::agent::jev::COMPACTION_LLM_ENV);
+        assert!(jev.contains(crate::agent::jev::COMPACTION_ENV), "{jev}");
+        std::env::remove_var(crate::agent::jev::COMPACTION_ENV);
         let out = doctor(None, None, None, &[], None);
         let off = out
             .lines()
