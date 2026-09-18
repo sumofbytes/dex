@@ -1,8 +1,8 @@
 //! Shared HTTP transport core for provider calls: auth + header merging,
 //! retry/backoff taxonomy, provider logging, and error-message helpers.
-//! Both the chat/streaming path (`client`, `dispatch`, `sse`) and the typed
-//! Jev path (`jev`) build on this, so a new scheme (e.g. an Azure-style
-//! `api-key` header) lands in one place: [`Provider::auth_scheme`].
+//! The chat/streaming path (`client`, `dispatch`, `sse`) builds on this, so
+//! a new scheme (e.g. an Azure-style `api-key` header) lands in one place:
+//! [`Provider::auth_scheme`].
 
 use std::env;
 use std::fs;
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::llm::config::{insert_extra_header, LlmConfig};
+use crate::llm::config::{merge_header_layers, LlmConfig};
 
 pub(crate) fn error_chain_message(e: &(dyn std::error::Error + 'static)) -> String {
     let mut msg = e.to_string();
@@ -40,24 +40,22 @@ pub(crate) fn error_head(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-/// Merged + validated custom headers for one request. Precedence is the
-/// AGENTS.md rule (provider-scoped file `headers:` > global file, per-key;
-/// env < `--header` above both — the same order `extension_model_auth_for`
-/// serves to Lua). `authorization` is never overridable — the api key owns
+/// Merged + validated custom headers for one request: the same
+/// `merge_header_layers` merge `extension_model_auth_for` serves to Lua
+/// (provider-scoped file `headers:` > global file, per-key; env < `--header`
+/// above both). `authorization` is never overridable — the api key owns
 /// it. Malformed names/values are skipped so one bad header can't fail the
 /// turn. Computed once per model call, not once per HTTP attempt.
 pub(crate) fn merged_headers(
     config: &LlmConfig,
 ) -> Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
-    let mut merged = config.global_headers.clone();
-    for (name, value) in &config.provider_headers {
-        // Provider-scoped beats the global table per key: overwrite.
-        insert_extra_header(&mut merged, name, value);
-    }
-    for (name, value) in &config.extra_headers {
-        // Env / `--header` / per-request overrides beat both file layers.
-        insert_extra_header(&mut merged, name, value);
-    }
+    // One merge with the extension auth view, so the wire and Lua can never
+    // drift apart by re-implementing the same precedence.
+    let merged = merge_header_layers(
+        &config.global_headers,
+        &config.provider_headers,
+        &config.extra_headers,
+    );
     let mut out = Vec::with_capacity(merged.len());
     for (name, value) in &merged {
         if name.eq_ignore_ascii_case("authorization") {

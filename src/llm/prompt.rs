@@ -6,7 +6,22 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use crate::core::types::Skill;
-use crate::skills::format_skills_for_prompt;
+
+/// Format discovered skills as a system-prompt section. Sorted by name so
+/// the system prefix is byte-identical no matter what order the caller
+/// discovered them in (prompt-cache stability); callers already sort, this
+/// holds the invariant at the format boundary.
+pub(crate) fn format_skills_for_prompt(skills: &[Skill]) -> String {
+    let mut sorted: Vec<&Skill> = skills.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = String::new();
+    out.push_str("\n\nAvailable skills:\n");
+    for skill in sorted {
+        out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+    }
+    out.push_str("\nTo use a skill, type /skill:<name> or ask about it.\n");
+    out
+}
 
 /// Nearest project file walking up from `dir` (`AGENTS.md` wins, else
 /// `CLAUDE.md`), returned as a path so callers can stat before reading.
@@ -173,6 +188,35 @@ pub(crate) fn system_prompt_with_override_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_skills_for_prompt_contains_names() {
+        let skills = vec![Skill {
+            name: "x".into(),
+            description: "does x".into(),
+            path: PathBuf::from("/tmp"),
+        }];
+        let out = format_skills_for_prompt(&skills);
+        assert!(out.contains("x: does x"));
+        assert!(out.contains("/skill:"));
+    }
+
+    #[test]
+    fn format_skills_for_prompt_sorts_by_name() {
+        // Prompt-cache stability: system bytes must not depend on the order
+        // the caller discovered skills in.
+        let mk = |name: &str| Skill {
+            name: name.into(),
+            description: "d".into(),
+            path: PathBuf::from("/tmp"),
+        };
+        let shuffled = vec![mk("zeta"), mk("alpha"), mk("mid")];
+        let sorted = vec![mk("alpha"), mk("mid"), mk("zeta")];
+        assert_eq!(
+            format_skills_for_prompt(&shuffled),
+            format_skills_for_prompt(&sorted)
+        );
+    }
 
     #[test]
     fn base_prompt_lines_have_no_ragged_indentation() {
