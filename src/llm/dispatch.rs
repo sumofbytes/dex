@@ -3,8 +3,8 @@
 
 use crate::core::types::{ApiProtocol, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
-use crate::llm::sse::is_mid_stream;
-use crate::llm::sse::Turn;
+use crate::llm::transport::sse::is_mid_stream;
+use crate::llm::transport::sse::Turn;
 
 /// Wire protocol for this call: an explicit pin (config-file `api:` or the
 /// provider entry's, baked into `config.api_pinned`) or a `DEX_MODEL_APIS`
@@ -44,10 +44,10 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if crate::llm::http::is_rate_limited(err) {
         return false; // transient capacity — retry the same protocol instead
     }
-    if crate::llm::sse::is_stream_idle_error(err) {
+    if crate::llm::transport::sse::is_stream_idle_error(err) {
         return false; // transient stall — retried same-protocol, not a mismatch
     }
-    if crate::llm::sse::is_dropped_connection(err) {
+    if crate::llm::transport::sse::is_dropped_connection(err) {
         return false; // dead socket — retried same-protocol, not a mismatch
     }
     !crate::llm::http::is_cancelled_message(err)
@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use crate::core::types::Provider;
     use crate::llm::config::tests::test_cfg;
-    use crate::llm::sse::MidStreamError;
+    use crate::llm::transport::sse::MidStreamError;
 
     /// Set/restore env around gate tests (local copy of config's EnvRestore).
     struct EnvGuard {

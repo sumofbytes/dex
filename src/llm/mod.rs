@@ -8,5 +8,5 @@ pub(crate) mod learned;
 pub(crate) mod prompt;
 pub(crate) mod protocol;
 pub(crate) mod provider;
-pub(crate) mod sse;
 pub(crate) mod thinking;
+pub(crate) mod transport;
