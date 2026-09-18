@@ -54,7 +54,7 @@ pub(crate) use global::{
 };
 #[cfg(test)]
 use global::{current_routing_headers, harvest_routing_headers, with_routing_headers};
-use global::{spin_guard, GLOBAL};
+use global::{spin_guard, spin_read, GLOBAL};
 #[cfg(test)]
 use global::{LAST_MODEL, LAST_ROUTING_HEADERS};
 #[cfg(test)]
@@ -62,14 +62,13 @@ use state::STATE;
 pub(crate) use state::{state_get, state_set};
 
 /// `dex.tools.list()`: the extension tool names (full `ext__` names).
+/// Spins under contention like every other sync cache read (see
+/// `global::spin_read`) instead of failing open to an empty list.
 pub(crate) fn tools_list() -> Vec<String> {
     GLOBAL
         .get()
         .and_then(|m| {
-            m.cached
-                .try_read()
-                .ok()
-                .map(|t| t.iter().map(|d| d.function.name.clone()).collect())
+            spin_read(&m.cached).map(|t| t.iter().map(|d| d.function.name.clone()).collect())
         })
         .unwrap_or_default()
 }
@@ -229,7 +228,7 @@ pub(crate) fn loaded_summaries() -> Vec<(String, String, Vec<String>, Vec<String
     GLOBAL
         .get()
         .and_then(|m| {
-            m.engines.try_read().ok().map(|engines| {
+            spin_guard(&m.engines).map(|engines| {
                 engines
                     .values()
                     .map(|e| {
@@ -312,7 +311,7 @@ pub(crate) fn list_command() {
 pub(crate) fn is_shadowed(name: &str) -> bool {
     GLOBAL
         .get()
-        .and_then(|m| m.shadowed.try_read().ok().map(|s| s.contains(name)))
+        .and_then(|m| spin_read(&m.shadowed).map(|s| s.contains(name)))
         .unwrap_or(false)
 }
 
