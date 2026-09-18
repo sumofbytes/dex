@@ -5,8 +5,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
 use crate::agent::online_compaction::{
-    cache_debt_for_ratio, decide_compaction, online_compaction_enabled, post_compaction_reminder,
-    CompactionEconomics, DEFAULT_COMPACTION_ECONOMICS, NATIVE_SUMMARY_TOKEN_ESTIMATE,
+    cache_debt_for_memo, decide_compaction, memo_estimate, online_compaction_enabled,
+    online_compaction_jev, post_compaction_reminder, CompactionEconomics,
+    DEFAULT_COMPACTION_ECONOMICS,
 };
 use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::{
@@ -303,7 +304,19 @@ async fn emergency_compact(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
     for _ in 0..3 {
-        match compact_history(config, messages, cancel, true).await {
+        // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
+        // one parse selects both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
+        match compact_history(
+            config,
+            messages,
+            cancel,
+            true,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        {
             Ok((true, usage)) => {
                 compacted_any = true;
                 if let Some(u) = usage {
@@ -417,7 +430,19 @@ async fn compaction_gate(
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
             )
         });
-        match compact_history(config, messages, cancel, false).await {
+        // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
+        // one parse selects both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
+        match compact_history(
+            config,
+            messages,
+            cancel,
+            false,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        {
             Ok((true, compacted)) => {
                 compaction_attempts += 1;
                 // History was rewritten: re-measure once for the next attempt.
@@ -434,8 +459,21 @@ async fn compaction_gate(
                     // pressure samples reset, the re-write is carried
                     // as debt the next boundary repays, and the plan
                     // survives (the model was not asked to re-plan).
-                    let (debt, repayment) =
-                        cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()));
+                    // Memo-aware: a Jev threshold prune repays `archive -
+                    // 200`, a summary `archive - 1000`. The threshold
+                    // path follows the threshold knob only
+                    // (`DEX_COMPACTION`); the boundary path carries
+                    // its own memo through `decision.cache_debt()`.
+                    // `write`/`archive` are pre-compaction ledger
+                    // measurements: the retained prefix only shrinks, so
+                    // the debt is slightly overstated — conservative, and
+                    // shared with the summary path.
+                    let (debt, repayment) = cache_debt_for_memo(
+                        write,
+                        archive,
+                        Some(config.cache_write_read_ratio()),
+                        memo_estimate(summarizer.prunes_jev()),
+                    );
                     state
                         .online_compaction
                         .record_threshold_compaction(debt, repayment);
@@ -796,7 +834,9 @@ async fn process_tool_result(
                 // archived, and the ephemeral preamble + tool
                 // schema are re-sent on every request.
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
-                NATIVE_SUMMARY_TOKEN_ESTIMATE,
+                // Jev prunes leave truncated heads (~200 tokens), not a 1k
+                // summary, behind — the same archive repays faster.
+                memo_estimate(online_compaction_jev()),
                 context_tokens,
                 &state.online_compaction,
                 Some(config.context_window),
@@ -811,7 +851,19 @@ async fn process_tool_result(
                 decision.archive_tokens
             );
             if decision.compact {
-                match compact_history(config, messages, cancel, false).await {
+                // Boundary cuts follow the boundary knob for the prune
+                // (`DEX_ONLINE_COMPACTION`) and the threshold knob for the
+                // fallback summarizer.
+                match compact_history(
+                    config,
+                    messages,
+                    cancel,
+                    false,
+                    online_compaction_jev(),
+                    crate::agent::jev::summary_mode(),
+                )
+                .await
+                {
                     Ok((true, usage)) => {
                         if let Some(u) = usage {
                             record_usage(config, state, console, u, None).await;
@@ -839,14 +891,18 @@ async fn process_tool_result(
                         // The boundary fired silently before; a
                         // system line is the only user-visible
                         // proof the economics paid out.
-                        system_note(
-                            console,
-                            &format!(
+                        let note = if online_compaction_jev() {
+                            format!(
+                                "online compaction (jev): pruned stale tool outputs at plan boundary (~{} tokens archived)",
+                                decision.archive_tokens
+                            )
+                        } else {
+                            format!(
                                 "online compaction: history compacted at plan boundary (~{} tokens archived)",
                                 decision.archive_tokens
-                            ),
-                        )
-                        .await;
+                            )
+                        };
+                        system_note(console, &note).await;
                     }
                     // Below the summarize floor (e.g. a boundary
                     // right after the previous compaction) or a
