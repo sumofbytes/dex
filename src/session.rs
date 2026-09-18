@@ -100,6 +100,11 @@ struct SessionEventEntry {
     entry_type: String,
     id: String,
     timestamp: String,
+    /// Complexity-router tier that chose this turn's model (`turn_start`
+    /// only, routing enabled). Absent otherwise, so unrouted journals
+    /// stay byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<String>,
 }
 
 /// Durable record of one side effect: intent (before execution) and outcome
@@ -1231,10 +1236,24 @@ impl Session {
     }
 
     pub(crate) fn turn_event(&mut self, event: &str) -> io::Result<()> {
+        self.turn_event_with_tier(event, None)
+    }
+
+    /// `turn_start` carrying the complexity-router tier that chose the
+    /// turn's model (`None` = routing off or an explicit model pick).
+    /// The tier rides the existing event — no new log — and recovery
+    /// still keys on the `turn_start` type alone, so a crash loses at
+    /// most the in-flight event.
+    pub(crate) fn turn_event_with_tier(
+        &mut self,
+        event: &str,
+        tier: Option<&str>,
+    ) -> io::Result<()> {
         let entry = SessionEventEntry {
             entry_type: event.to_string(),
             id: self.next_id(),
             timestamp: Self::now_iso(),
+            tier: tier.map(str::to_string),
         };
         self.append_line(&entry)
     }
@@ -2562,6 +2581,27 @@ mod tests {
         assert!(text.contains("call-1"));
         assert!(text.contains("effect_result"));
         assert!(text.contains("\"ok\":true"));
+        assert!(Session::last_turn_state(s.path().unwrap()) == "complete");
+        if let Some(p) = s.path() {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    /// The routed tier rides the `turn_start` marker (`None` serializes to
+    /// nothing, so unrouted journals stay byte-identical), and recovery
+    /// still keys on the marker type alone.
+    #[test]
+    fn turn_start_carries_routing_tier() {
+        let _lock = TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut s = Session::new("/tmp/dex-tier-test".into(), None).unwrap();
+        s.turn_event_with_tier("turn_start", Some("powerful"))
+            .unwrap();
+        s.turn_event("turn_complete").unwrap();
+        let text = fs::read_to_string(s.path().unwrap()).unwrap();
+        assert!(text.contains(r#""type":"turn_start""#), "{text}");
+        assert!(text.contains(r#""tier":"powerful""#), "{text}");
         assert!(Session::last_turn_state(s.path().unwrap()) == "complete");
         if let Some(p) = s.path() {
             let _ = fs::remove_file(p);
