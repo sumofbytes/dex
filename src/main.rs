@@ -237,7 +237,8 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // build above is still needed on the routed path: it validates the
     // top-level selection in parallel with the session load (and gates
     // session creation), while routing needs that load's history as its
-    // signal — so a routed turn builds twice, an unrouted turn once. Both
+    // signal — so a routed turn builds twice (plus routing's own
+    // lightweight file read inside `route_turn`), an unrouted turn once. Both
     // builds share the catalog cache, so the second is cheap. (The daemon
     // loads history before its single `from_env_async`, so it always builds
     // once.)
@@ -247,7 +248,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         crate::llm::config::route_turn(prompt, &history)
     };
     let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
-    let routed_reason = routed.as_ref().map(|r| r.reason);
+    let routed_why = routed.as_ref().map(|r| r.reason_label());
     if let Some(model) = routed.and_then(|r| r.model_override) {
         config = LlmConfig::from_env(
             args.base_url.clone(),
@@ -260,7 +261,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // Surface the routed tier: headless users get no other signal that the
     // model changed under them (the tier is also journaled on `turn_start`).
     if let Some(tier) = routed_tier.as_deref() {
-        let why = routed_reason.unwrap_or("ordinary work");
+        let why = routed_why.as_deref().unwrap_or("ordinary work");
         eprintln!("dex: routing → {tier} ({why}; model {})", config.model);
     }
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
