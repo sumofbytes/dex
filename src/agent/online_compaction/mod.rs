@@ -12,15 +12,51 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
+use crate::agent::jev::{parse_compaction_knob, CompactionKnob};
 use crate::core::types::{FunctionDef, ToolDefinition};
+use crate::llm::config::warn_once;
 
 /// Opt-in switch: `DEX_ONLINE_COMPACTION=1` registers `update_plan` and
-/// enables boundary economics. Off by default — the tool costs prompt tokens
+/// enables boundary economics with summary compaction; `=jev` keeps the
+/// same boundaries and tool but prunes stale tool outputs verbatim instead
+/// of summarizing. Off by default — the tool costs prompt tokens
 /// every request and only pays off on long-horizon work.
 pub(crate) const ONLINE_COMPACTION_ENV: &str = "DEX_ONLINE_COMPACTION";
 
+/// Case-insensitive mode (`1`/`llm`, `jev`) for the online gate. Unset and
+/// explicit offs disable silently; a non-empty unrecognized value warns
+/// once (a typo like `=jve` must not silently disable the gate) and
+/// likewise disables. Returns the parsed knob (never allocates) so the
+/// per-request gate stays cheap.
+fn online_compaction_knob() -> CompactionKnob {
+    let Some(raw) = std::env::var(ONLINE_COMPACTION_ENV).ok() else {
+        return CompactionKnob::Off;
+    };
+    match parse_compaction_knob(&raw) {
+        CompactionKnob::Unrecognized => {
+            let short: String = raw.trim().chars().take(32).collect();
+            warn_once(
+                "env:DEX_ONLINE_COMPACTION",
+                &format!(
+                    "ignoring DEX_ONLINE_COMPACTION={short:?} — expected '1', 'jev', or 'llm'"
+                ),
+            );
+            CompactionKnob::Off
+        }
+        knob => knob,
+    }
+}
+
 pub(crate) fn online_compaction_enabled() -> bool {
-    std::env::var(ONLINE_COMPACTION_ENV).as_deref() == Ok("1")
+    matches!(
+        online_compaction_knob(),
+        CompactionKnob::Jev | CompactionKnob::One
+    )
+}
+
+/// True when boundaries should prune verbatim (Jev) instead of summarizing.
+pub(crate) fn online_compaction_jev() -> bool {
+    online_compaction_knob() == CompactionKnob::Jev
 }
 
 /// Tool schema for the working-plan tool whose completed steps are
@@ -122,16 +158,20 @@ pub(crate) fn capture_plan_update(
 /// doctor output); when off, the value says so.
 pub(crate) fn doctor_row(ctx: &DoctorCtx<'_>) -> Option<DoctorRow> {
     let on = online_compaction_enabled();
+    let jev = online_compaction_jev();
     let (value, source) = if on {
-        (
-            format!(
-                "cache write/read ratio {:.2} ({ONLINE_COMPACTION_ENV})",
-                ctx.live
-                    .map(|c| c.cache_write_read_ratio())
-                    .unwrap_or(DEFAULT_CACHE_WRITE_READ_RATIO)
-            ),
-            "models.dev catalog / measured fallback".to_string(),
-        )
+        // `=1` keeps the historical string byte-identical (doctor snapshot
+        // stability); `=jev` names the mode so the origin is never a mystery.
+        let ratio = ctx
+            .live
+            .map(|c| c.cache_write_read_ratio())
+            .unwrap_or(DEFAULT_CACHE_WRITE_READ_RATIO);
+        let value = if jev {
+            format!("cache write/read ratio {ratio:.2} (jev, {ONLINE_COMPACTION_ENV})")
+        } else {
+            format!("cache write/read ratio {ratio:.2} ({ONLINE_COMPACTION_ENV})")
+        };
+        (value, "models.dev catalog / measured fallback".to_string())
     } else {
         (
             format!("off (set {ONLINE_COMPACTION_ENV}=1)"),
@@ -147,6 +187,17 @@ pub(crate) fn doctor_row(ctx: &DoctorCtx<'_>) -> Option<DoctorRow> {
 
 /// Rough token estimate for the summary a compaction leaves behind.
 pub(crate) const NATIVE_SUMMARY_TOKEN_ESTIMATE: u64 = 1_000;
+
+/// Memo left behind by a compaction: a Jev prune keeps truncated heads
+/// (~200 tokens), a summary keeps ~1k. One helper for the decision site
+/// and the threshold-debt site so the two cannot drift apart.
+pub(crate) fn memo_estimate(jev_prune: bool) -> u64 {
+    if jev_prune {
+        crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE
+    } else {
+        NATIVE_SUMMARY_TOKEN_ESTIMATE
+    }
+}
 
 /// Fallback cache-write/read ratio when the catalog prices no caching at
 /// all. Measured cross-provider median of `input / cache_read` over the
@@ -604,6 +655,9 @@ pub(crate) struct CompactionDecision {
     pub(crate) reason: &'static str,
     pub(crate) write_tokens: u64,
     pub(crate) archive_tokens: u64,
+    /// Memo left behind by the compaction (summary ≈1k, Jev prune ≈200):
+    /// the per-request saving repays `archive - memo`.
+    pub(crate) memo_tokens: u64,
     /// `cacheWriteReadRatio - 1`: the extra per-request cost of re-writing
     /// the retained prefix at cache-write price instead of cache-read price.
     pub(crate) incremental_cache_cost_ratio: Option<f64>,
@@ -619,22 +673,28 @@ impl CompactionDecision {
             self.write_tokens,
             self.archive_tokens,
             self.incremental_cache_cost_ratio,
+            self.memo_tokens,
         )
     }
 }
 
 /// Cache re-write debt for a compaction archiving `archive_tokens` of a
 /// `write_tokens` prefix, at a full `cache_write_read_ratio` (`None` → no
-/// surcharge). Shared by the boundary economics and the threshold path.
-pub(crate) fn cache_debt_for_ratio(
+/// surcharge), repaying `archive - memo` per request. A Jev prune leaves
+/// ~200 tokens of truncated heads behind (see [`memo_estimate`]), not a 1k
+/// summary, so the same archive repays faster. Shared by the boundary
+/// economics and the threshold path.
+pub(crate) fn cache_debt_for_memo(
     write_tokens: u64,
     archive_tokens: u64,
     cache_write_read_ratio: Option<f64>,
+    memo_tokens: u64,
 ) -> (f64, f64) {
     cache_debt_for(
         write_tokens,
         archive_tokens,
         cache_write_read_ratio.map(|ratio| (ratio - 1.0).max(0.0)),
+        memo_tokens,
     )
 }
 
@@ -642,11 +702,12 @@ fn cache_debt_for(
     write_tokens: u64,
     archive_tokens: u64,
     incremental_cache_cost_ratio: Option<f64>,
+    memo_tokens: u64,
 ) -> (f64, f64) {
     #[allow(clippy::cast_precision_loss)]
     let debt = write_tokens as f64 * incremental_cache_cost_ratio.unwrap_or(0.0);
     #[allow(clippy::cast_precision_loss)]
-    let repayment = archive_tokens.saturating_sub(NATIVE_SUMMARY_TOKEN_ESTIMATE) as f64;
+    let repayment = archive_tokens.saturating_sub(memo_tokens) as f64;
     (debt, repayment)
 }
 
@@ -742,6 +803,7 @@ pub(crate) fn decide_compaction(
         reason,
         write_tokens,
         archive_tokens,
+        memo_tokens,
         incremental_cache_cost_ratio,
     }
 }
@@ -911,15 +973,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_debt_for_ratio_matches_the_decision_path() {
+    fn memo_debt_matches_the_decision_path() {
+        // The memo helper maps prune → Jev floor, summary → native estimate.
+        assert_eq!(memo_estimate(false), NATIVE_SUMMARY_TOKEN_ESTIMATE);
+        assert_eq!(
+            memo_estimate(true),
+            crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE
+        );
         // Explicit surcharge: write * (ratio - 1).
-        let (debt, repayment) = cache_debt_for_ratio(40_000, 20_000, Some(12.5));
+        let (debt, repayment) =
+            cache_debt_for_memo(40_000, 20_000, Some(12.5), memo_estimate(false));
         assert!((debt - 40_000.0 * 11.5).abs() < 1e-9);
         assert!((repayment - 19_000.0).abs() < 1e-9);
         // No ratio (or ratio 1.0): no surcharge to amortize.
-        let (debt, _) = cache_debt_for_ratio(40_000, 20_000, None);
+        let (debt, _) = cache_debt_for_memo(40_000, 20_000, None, memo_estimate(false));
         assert_eq!(debt, 0.0);
-        let (debt, _) = cache_debt_for_ratio(40_000, 20_000, Some(1.0));
+        let (debt, _) = cache_debt_for_memo(40_000, 20_000, Some(1.0), memo_estimate(false));
         assert_eq!(debt, 0.0);
     }
 
@@ -1189,5 +1258,106 @@ mod tests {
         );
         assert!(with.contains(r#""progress":"#));
         assert!(with.contains("x.rs"));
+    }
+
+    #[test]
+    fn jev_mode_enables_the_gate() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::session::EnvGuard(vec![(
+            ONLINE_COMPACTION_ENV,
+            std::env::var_os(ONLINE_COMPACTION_ENV),
+        )]);
+        std::env::set_var(ONLINE_COMPACTION_ENV, "jev");
+        assert!(online_compaction_enabled());
+        assert!(online_compaction_jev());
+        std::env::set_var(ONLINE_COMPACTION_ENV, "JEV");
+        assert!(online_compaction_enabled());
+        assert!(online_compaction_jev());
+        std::env::set_var(ONLINE_COMPACTION_ENV, "1");
+        assert!(online_compaction_enabled());
+        assert!(!online_compaction_jev());
+        // Explicit offs disable silently.
+        for off in ["0", "false", "off", "no", ""] {
+            std::env::set_var(ONLINE_COMPACTION_ENV, off);
+            assert!(!online_compaction_enabled());
+            assert!(!online_compaction_jev());
+        }
+        // Garbage warns once (see `warn_once`) and disables — a typo
+        // must never silently pass as a valid mode.
+        std::env::set_var(ONLINE_COMPACTION_ENV, "jve");
+        assert!(!online_compaction_enabled());
+        assert!(!online_compaction_jev());
+        std::env::remove_var(ONLINE_COMPACTION_ENV);
+        assert!(!online_compaction_enabled());
+        assert!(!online_compaction_jev());
+    }
+
+    #[test]
+    fn jev_doctor_row_names_the_mode() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::session::EnvGuard(vec![(
+            ONLINE_COMPACTION_ENV,
+            std::env::var_os(ONLINE_COMPACTION_ENV),
+        )]);
+        let ctx = DoctorCtx {
+            live: None,
+            model: "m",
+        };
+        // `=1` keeps the historical string byte-identical.
+        std::env::set_var(ONLINE_COMPACTION_ENV, "1");
+        let one = doctor_row(&ctx).expect("row always prints");
+        assert!(!one.value.contains("jev"), "got: {}", one.value);
+        std::env::set_var(ONLINE_COMPACTION_ENV, "jev");
+        let jev = doctor_row(&ctx).expect("row always prints");
+        assert!(jev.value.contains("jev"), "got: {}", jev.value);
+        assert!(jev.value.contains("5.00"), "got: {}", jev.value);
+    }
+
+    #[test]
+    fn jev_memo_compacts_where_a_summary_cannot() {
+        // Archive smaller than a summary memo: a summary saves nothing, so
+        // even window protection declines — while a prune still saves.
+        let state = OnlineState::default();
+        let window = Some(128_000);
+        let native = decide_compaction(
+            1_000,
+            500,
+            NATIVE_SUMMARY_TOKEN_ESTIMATE,
+            120_000,
+            &state,
+            window,
+            Some(12.5),
+            &DEFAULT_COMPACTION_ECONOMICS,
+        );
+        assert!(!native.compact);
+        assert_eq!(native.reason, "non_positive_saving");
+        let jev = decide_compaction(
+            1_000,
+            500,
+            crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE,
+            120_000,
+            &state,
+            window,
+            Some(12.5),
+            &DEFAULT_COMPACTION_ECONOMICS,
+        );
+        assert!(jev.compact);
+        assert_eq!(jev.reason, "window_protection");
+        // The debt carried matches the memo left behind.
+        let (_, native_repay) =
+            cache_debt_for_memo(40_000, 20_000, Some(12.5), memo_estimate(false));
+        let (debt, jev_repay) = cache_debt_for_memo(
+            40_000,
+            20_000,
+            Some(12.5),
+            crate::agent::jev::JEV_MEMO_TOKEN_ESTIMATE,
+        );
+        assert!(debt > 0.0);
+        assert!(jev_repay > native_repay);
+        assert_eq!(jev_repay, 20_000.0 - 200.0);
     }
 }
