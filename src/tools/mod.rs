@@ -15,7 +15,7 @@ mod write;
 // `tools::...` paths keep working.
 pub(crate) use error::ToolError;
 pub(crate) use outcome::{ShellEvidence, ToolOutcome};
-pub(crate) use policy::{metadata, metadata_native, PermissionRequirement, ToolMetadata};
+pub(crate) use policy::{metadata, metadata_native, PermissionRequirement};
 pub(crate) use sandbox::{
     normalize_conflict_path, resolve_workspace_path, workspace_path, workspace_root,
 };
