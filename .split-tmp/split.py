@@ -445,8 +445,17 @@ def main():
                     names.append(nm)
         if pubs:
             parent.append(f"pub use {ch['name']}::{{{', '.join(pubs)}}};")
-        if names:
-            parent.append(f"pub(crate) use {ch['name']}::{{{', '.join(names)}}};")
+        # preserve narrower visibility (pub(super)/pub(in ..)) on re-exports
+        narrow = {}
+        for s, e in ch["ranges"]:
+            for nm, (ln, vis) in top_defs(lines, s, e).items():
+                if vis and vis != "pub" and vis != "pub(crate)" and (nm in names or nm in upgraded):
+                    narrow.setdefault(vis, []).append(nm)
+        main_names = [n for n in names if n not in {x for v in narrow.values() for x in v}]
+        if main_names:
+            parent.append(f"pub(crate) use {ch['name']}::{{{', '.join(main_names)}}};")
+        for vis, nms in narrow.items():
+            parent.append(f"{vis} use {ch['name']}::{{{', '.join(nms)}}};")
     for st in spec.get("stay", []):
         parent.append("")
         s, e = st["range"]
