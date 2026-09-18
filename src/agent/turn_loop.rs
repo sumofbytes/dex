@@ -15,10 +15,6 @@ use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource,
 use crate::agent::tokens::{
     estimate_ephemeral_tokens, estimate_tokens, schema_budget_tokens, TokenLedger,
 };
-use crate::core::console::{
-    with_console, Console, SpinnerGuard, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK,
-    TOOL_OUTPUT_COLOR,
-};
 use crate::core::format::{
     model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
 };
@@ -26,6 +22,10 @@ use crate::core::types::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, Sto
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::sse::Turn;
+use crate::runtime::console::{
+    with_console, Console, SpinnerGuard, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK,
+    TOOL_OUTPUT_COLOR,
+};
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
@@ -1523,7 +1523,7 @@ pub(crate) mod tests {
             session: None,
             client: &MockModel,
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -1596,7 +1596,7 @@ pub(crate) mod tests {
             session: None,
             client: &CaptureModel(captured.clone()),
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -1634,7 +1634,7 @@ pub(crate) mod tests {
             session: None,
             client: &MockModel,
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -1713,7 +1713,7 @@ pub(crate) mod tests {
             session: None,
             client: &ToolThenAnswer::new(),
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::daemon(sink_tx, approval_tx),
+            console: &crate::runtime::console::Console::daemon(sink_tx, approval_tx),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -1869,7 +1869,7 @@ pub(crate) mod tests {
                 big_path: big_path.to_string(),
             },
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: Some(64),
@@ -1967,7 +1967,7 @@ pub(crate) mod tests {
         assert!(!tool_calls_conflict(&calls));
         let (sink_tx, mut sink_rx) = mpsc::channel(32);
         let (approval_tx, _approval_rx) = mpsc::channel(16);
-        let console = crate::core::console::Console::daemon(sink_tx, approval_tx);
+        let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
         let results =
             run_tool_batch(&calls, &NeverCancel, &Policy::trusted(), None, &console).await;
         assert_eq!(results.len(), 2);
@@ -2109,7 +2109,7 @@ pub(crate) mod tests {
             session: None,
             client: &AlwaysTool,
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -2193,7 +2193,7 @@ pub(crate) mod tests {
                 round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -2235,7 +2235,7 @@ pub(crate) mod tests {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
-        let cancel = crate::core::console::CancellationToken::new();
+        let cancel = crate::runtime::console::CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2251,7 +2251,7 @@ pub(crate) mod tests {
             session: None,
             client: &Hanging,
             cancel: &cancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -2313,7 +2313,7 @@ pub(crate) mod tests {
         let config = test_config();
         let mut messages = vec![ChatMessage::system("sys")];
         let mut state = ToolState::default();
-        let cancel = crate::core::console::CancellationToken::new();
+        let cancel = crate::runtime::console::CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2331,7 +2331,7 @@ pub(crate) mod tests {
                 round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
             cancel: &cancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -2431,7 +2431,7 @@ pub(crate) mod tests {
                 "echo repeat-probe",
             ]),
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -2466,7 +2466,7 @@ pub(crate) mod tests {
             session: None,
             client: &RepeatedGuardScript::new(vec!["echo probe", "echo probe", "echo probe"]),
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: None,
             agent_ctx: None,
             tool_budget: None,
@@ -2571,7 +2571,7 @@ pub(crate) mod tests {
             session: None,
             client: &FilterProbe::new(),
             cancel: &NeverCancel,
-            console: &crate::core::console::Console::none(),
+            console: &crate::runtime::console::Console::none(),
             filter: Some(&filter),
             agent_ctx: None,
             tool_budget: None,

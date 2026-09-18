@@ -593,7 +593,7 @@ pub(crate) async fn apply_before_compact(
     }
     let policy = crate::tools::Policy::turn(
         crate::core::types::PermissionMode::ReadOnly,
-        &crate::core::console::Console::none(),
+        &crate::runtime::console::Console::none(),
     );
     let host = HostCtx {
         cancel,
@@ -638,7 +638,7 @@ pub(crate) async fn run_command_global(
 ) -> Result<String, String> {
     let policy = crate::tools::Policy::turn(
         crate::core::types::PermissionMode::ReadOnly,
-        &crate::core::console::Console::none(),
+        &crate::runtime::console::Console::none(),
     );
     let host = HostCtx {
         cancel,

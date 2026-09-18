@@ -21,13 +21,13 @@ use ratatui::Terminal;
 
 use crate::cli::Args;
 use crate::client::http::{ChatOptions, ChatStream, DaemonClient};
-use crate::core::console::{DIM, RESET};
 use crate::core::types::{
     ApiProtocol, ApprovalDecision as CoreApprovalDecision, PermissionMode, Provider, SinkLine,
 };
 use crate::protocol::{
     ApprovalDecision as ProtocolApprovalDecision, DaemonInfo, EventsResponse, StreamEvent,
 };
+use crate::runtime::console::{DIM, RESET};
 use crate::session::Session;
 
 use super::slash::{
@@ -366,7 +366,7 @@ fn bootstrap(args: &Args, daemon_url: &str, daemon_is_local: bool) -> std::io::R
     // The TUI owns the terminal from here on: move runtime logs to the file
     // sink so DEX_LOG output can't garble the alt screen. The notice (if any)
     // prints while the terminal is still the normal screen.
-    if let Some(notice) = crate::core::logging::redirect_to_file() {
+    if let Some(notice) = crate::runtime::logging::redirect_to_file() {
         eprintln!("{notice}");
     }
     let launch_start = *LAUNCH_START.get_or_init(Instant::now);

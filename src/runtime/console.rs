@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, Notify};
 
-use crate::agent::state::CancellationSource;
+use crate::runtime::cancel::CancellationSource;
 
 use crate::core::types::{ApprovalRequest, SinkLine};
 

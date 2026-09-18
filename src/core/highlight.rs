@@ -6,7 +6,7 @@ use ratatui_markdown::highlight::{CodeHighlighter, StyleSegment, TreeSitterHighl
 use ratatui_markdown::CodeColors;
 
 use super::palette::{fg_rgb, muted_rgb};
-use crate::core::console::RESET;
+use crate::runtime::console::RESET;
 
 const DIM: &str = "\x1b[2m";
 

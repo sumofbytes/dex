@@ -14,7 +14,6 @@ use futures_core::Stream;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::core::console::CancellationToken;
 use crate::core::types::{ApprovalDecision, ChatMessage, QueueMsg};
 use crate::llm::config::LlmConfig;
 use crate::protocol::{
@@ -22,6 +21,7 @@ use crate::protocol::{
     ExtensionRunRequest, FollowupRequest, GitInfo, LoadSkillRequest, ReattachResponse,
     RecallRequest, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
 };
+use crate::runtime::console::CancellationToken;
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, discover_skills_fresh_async, skill_dirs};
 
@@ -86,7 +86,7 @@ async fn log_requests(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if !crate::core::logging::enabled(crate::core::logging::Level::Info) {
+    if !crate::runtime::logging::enabled(crate::runtime::logging::Level::Info) {
         return next.run(request).await;
     }
     let method = request.method().clone();
@@ -1153,11 +1153,10 @@ mod handler_tests {
         let (state, id) = state_with_session(&path);
         // A registered in-flight run makes a second one 409 (one bash
         // at a time; Esc cancels the first).
-        state
-            .shell_tokens
-            .lock()
-            .unwrap()
-            .insert(id.clone(), crate::core::console::CancellationToken::new());
+        state.shell_tokens.lock().unwrap().insert(
+            id.clone(),
+            crate::runtime::console::CancellationToken::new(),
+        );
         let r = session_shell(
             State(state.clone()),
             Path(id.clone()),
@@ -1217,7 +1216,7 @@ mod handler_tests {
             .any(|m| m.content_str().contains("Ran `echo hi`")));
         assert!(!llm.iter().any(|m| m.content_str().contains("secret")));
         // /cancel signals an in-flight shell run too (Esc cancels it).
-        let token = crate::core::console::CancellationToken::new();
+        let token = crate::runtime::console::CancellationToken::new();
         state
             .shell_tokens
             .lock()
@@ -3312,7 +3311,7 @@ mod e2e_tests {
         }
         // Exercise the per-request log line too (`DEX_LOG=info dex serve`).
         std::env::set_var("DEX_LOG", "info");
-        crate::core::logging::init();
+        crate::runtime::logging::init();
 
         std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
         crate::daemon::prepare_daemon_token(&"127.0.0.1:9".parse().unwrap());
@@ -3384,7 +3383,7 @@ mod e2e_tests {
         // is reset by the drop guard above; the env guard restores the
         // variables it pinned).
         drop(_env);
-        crate::core::logging::init();
+        crate::runtime::logging::init();
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
