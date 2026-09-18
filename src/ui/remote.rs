@@ -1661,9 +1661,9 @@ fn print_resume_hint(daemon_url: &str, session_id: &str, session_cwd: &str, daem
     let command = resume_command(daemon_url, session_id, session_cwd, daemon_is_local);
     // Dim only on a terminal: redirected stderr should stay greppable.
     if io::stderr().is_terminal() {
-        eprintln!("\n{DIM}To resume this session: {command}{RESET}");
+        eprintln!("\n{DIM}To resume this session:\n{command}{RESET}");
     } else {
-        eprintln!("\nTo resume this session: {command}");
+        eprintln!("\nTo resume this session:\n{command}");
     }
 }
 
