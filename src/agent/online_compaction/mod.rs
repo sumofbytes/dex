@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
-use crate::agent::jev::{parse_compaction_knob, CompactionKnob, JEV_VALUE};
+use crate::agent::jev::{parse_compaction_knob, CompactionKnob};
 use crate::core::types::{FunctionDef, ToolDefinition};
 use crate::llm::config::warn_once;
 
@@ -26,13 +26,13 @@ pub(crate) const ONLINE_COMPACTION_ENV: &str = "DEX_ONLINE_COMPACTION";
 /// Case-insensitive mode (`1`/`llm`, `jev`) for the online gate. Unset and
 /// explicit offs disable silently; a non-empty unrecognized value warns
 /// once (a typo like `=jve` must not silently disable the gate) and
-/// likewise disables.
-fn online_compaction_mode() -> Option<String> {
-    let raw = std::env::var(ONLINE_COMPACTION_ENV).ok()?;
+/// likewise disables. Returns the parsed knob (never allocates) so the
+/// per-request gate stays cheap.
+fn online_compaction_knob() -> CompactionKnob {
+    let Some(raw) = std::env::var(ONLINE_COMPACTION_ENV).ok() else {
+        return CompactionKnob::Off;
+    };
     match parse_compaction_knob(&raw) {
-        CompactionKnob::Jev => Some(JEV_VALUE.to_string()),
-        CompactionKnob::One => Some("1".to_string()),
-        CompactionKnob::Off => None,
         CompactionKnob::Unrecognized => {
             let short: String = raw.trim().chars().take(32).collect();
             warn_once(
@@ -41,21 +41,22 @@ fn online_compaction_mode() -> Option<String> {
                     "ignoring DEX_ONLINE_COMPACTION={short:?} — expected '1', 'jev', or 'llm'"
                 ),
             );
-            None
+            CompactionKnob::Off
         }
+        knob => knob,
     }
 }
 
 pub(crate) fn online_compaction_enabled() -> bool {
     matches!(
-        online_compaction_mode().as_deref(),
-        Some("1") | Some(crate::agent::jev::JEV_VALUE)
+        online_compaction_knob(),
+        CompactionKnob::Jev | CompactionKnob::One
     )
 }
 
 /// True when boundaries should prune verbatim (Jev) instead of summarizing.
 pub(crate) fn online_compaction_jev() -> bool {
-    online_compaction_mode().as_deref() == Some(crate::agent::jev::JEV_VALUE)
+    online_compaction_knob() == CompactionKnob::Jev
 }
 
 /// Tool schema for the working-plan tool whose completed steps are
