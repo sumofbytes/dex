@@ -111,6 +111,8 @@ mod tests {
         SpawnMeta, WaitOutcome,
     };
     use crate::runtime::console::CancellationToken;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
         let mut def = crate::agent::subagent::builtin_definitions()
