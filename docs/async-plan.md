@@ -209,7 +209,7 @@ Files: `src/llm/config.rs:1204,1351,912`, `src/llm/client.rs:39-176,178-246`,
   over `&str` — no rewrite). Cancel via
   `tokio::select! { _ = cancel.cancelled() => …, chunk = stream.next() => … }`.
   Preserve `MidStreamError` semantics exactly (only mark after output flowed).
-- `call_chat_completions` / `call_responses` / `streaming::complete` → async.
+- `call_chat_completions` / `call_responses` / `dispatch::complete` → async.
   Keep the responses→completions fallback gate (`is_mid_stream`,
   `try_responses_fallback`, `probed_apis`, `remember_learned_api`) identical.
 - `refresh_models_cache` (blocking GET today, `config.rs:912`) → async GET.
