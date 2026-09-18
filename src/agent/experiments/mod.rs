@@ -137,13 +137,16 @@ mod tests {
         let schema = crate::llm::protocol::tools_schema();
         let names: Vec<_> = schema.iter().map(|t| t.function.name.as_str()).collect();
         let expected: Vec<&str> = vec!["read", "bash", "write", "edit", "grep", "find", "ls"];
-        // Natives lead; the MCP + extension tail (process-global `GLOBAL`
-        // cache populated by extensions tests running in parallel) is
-        // ignored here — this test pins native + experiment gates only.
-        assert!(
-            names.starts_with(&expected),
-            "native prefix mismatch: {names:?}"
-        );
+        // Natives lead; the MCP + extension tail (process-global caches
+        // populated by tests running in parallel) is filtered out here —
+        // this test pins the native set exactly (order + length), not just
+        // a prefix, so a dropped/reordered native still fails.
+        let native: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| !n.starts_with("mcp__") && !n.starts_with("ext__"))
+            .collect();
+        assert_eq!(native, expected, "native schema drifted: {names:?}");
 
         // The online compaction gate adds the plan tool.
         std::env::set_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV, "1");
