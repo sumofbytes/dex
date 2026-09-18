@@ -1,4 +1,4 @@
-use crate::core::types::PermissionMode;
+use crate::protocol::PermissionMode;
 
 use std::env;
 

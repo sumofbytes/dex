@@ -1138,7 +1138,7 @@ pub(crate) fn mcp_status_line(statuses: &[crate::mcp::ServerStatus]) -> Option<S
 /// over snapshots so both TUIs share the render.
 pub(crate) fn render_mcp_panel(
     statuses: &[crate::mcp::ServerStatus],
-    tools: &[crate::core::types::ToolDefinition],
+    tools: &[crate::protocol::ToolDefinition],
     truncated: usize,
 ) -> Vec<String> {
     if statuses.is_empty() {
@@ -1887,8 +1887,8 @@ mod tests {
 
     #[test]
     fn render_mcp_panel_lists_tools_and_down_servers() {
-        use crate::core::types::{FunctionDef, ToolDefinition};
         use crate::mcp::ServerStatus;
+        use crate::protocol::{FunctionDef, ToolDefinition};
         let tool = |name: &str, description: &str| ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {

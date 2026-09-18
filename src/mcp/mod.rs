@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::agent::state::{wait_cancelled, CancellationSource};
-use crate::core::types::ToolDefinition;
+use crate::protocol::ToolDefinition;
 
 pub(crate) mod config;
 pub(crate) mod mapping;

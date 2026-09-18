@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::core::types::Skill;
+use crate::protocol::Skill;
 
 pub(crate) fn parse_skill(path: &Path) -> Option<Skill> {
     let content = fs::read_to_string(path).ok()?;

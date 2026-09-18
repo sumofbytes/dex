@@ -1,4 +1,4 @@
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 
 /// Token overhead per message (role, formatting, turn boundary).
 pub(crate) const PER_MESSAGE_OVERHEAD: u64 = 12;
@@ -130,14 +130,14 @@ pub(crate) fn schema_budget_tokens() -> u64 {
 /// Token cost of the live MCP tool-schema slice (`mcp.rs:cached_tools`).
 /// Same ~4-chars-per-token heuristic as [`estimate_tokens`]: namespaced
 /// name + description + serialized parameters per definition.
-pub(crate) fn schema_token_estimate(defs: &[crate::core::types::ToolDefinition]) -> u64 {
+pub(crate) fn schema_token_estimate(defs: &[crate::protocol::ToolDefinition]) -> u64 {
     (schema_chars(defs) as u64) / 4 + (defs.len() as u64 * PER_MESSAGE_OVERHEAD)
 }
 
 /// Raw char count behind [`schema_token_estimate`]: per-tool shares for the
 /// extension `active`-slice budget, which replicates the sum-then-divide
 /// formula on the subset so whole-cache and sliced totals stay bit-identical.
-pub(crate) fn schema_chars(defs: &[crate::core::types::ToolDefinition]) -> usize {
+pub(crate) fn schema_chars(defs: &[crate::protocol::ToolDefinition]) -> usize {
     defs.iter()
         .map(|d| {
             d.function.name.len()
@@ -150,7 +150,7 @@ pub(crate) fn schema_chars(defs: &[crate::core::types::ToolDefinition]) -> usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::ChatMessage;
+    use crate::protocol::ChatMessage;
 
     fn sample_history() -> Vec<ChatMessage> {
         vec![

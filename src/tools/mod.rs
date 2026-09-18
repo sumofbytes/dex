@@ -1680,16 +1680,16 @@ mod tests {
     // approval prompt for mutating calls under ask modes, and blocks for
     // the verdict. Files land under `target/` (unique per test) with
     // best-effort cleanup, mirroring the existing tests in this module.
-    use crate::core::types::{ApprovalDecision, PermissionMode};
+    use crate::protocol::{ApprovalDecision, PermissionMode};
     use crate::runtime::console::Console;
 
     fn phase0_console() -> (
         Console,
-        tokio::sync::mpsc::Receiver<crate::core::types::ApprovalRequest>,
+        tokio::sync::mpsc::Receiver<crate::protocol::ApprovalRequest>,
     ) {
-        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel::<crate::core::types::SinkLine>(16);
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel::<crate::protocol::SinkLine>(16);
         let (approval_tx, approval_rx) =
-            tokio::sync::mpsc::channel::<crate::core::types::ApprovalRequest>(16);
+            tokio::sync::mpsc::channel::<crate::protocol::ApprovalRequest>(16);
         (Console::new(sink_tx, approval_tx), approval_rx)
     }
 
@@ -1727,7 +1727,7 @@ mod tests {
         assert_eq!(request.input, expected_input);
         request
             .response
-            .send(ApprovalDecision::Once)
+            .send(ApprovalDecision::AllowOnce)
             .await
             .expect("agent must still be waiting");
         let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
@@ -1810,7 +1810,7 @@ mod tests {
             .expect("approval channel must stay open");
         request2
             .response
-            .send(ApprovalDecision::Session)
+            .send(ApprovalDecision::AllowSession)
             .await
             .expect("agent must still be waiting");
         let outcome2 = tokio::time::timeout(Duration::from_secs(10), second)
@@ -1904,7 +1904,7 @@ mod tests {
         assert_eq!(request.name, "bash");
         request
             .response
-            .send(ApprovalDecision::Once)
+            .send(ApprovalDecision::AllowOnce)
             .await
             .expect("agent must still be waiting");
         let outcome = tokio::time::timeout(Duration::from_secs(15), handle)

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::agent::subagent::{AgentEvent, AgentManager};
-use crate::core::types::{ApprovalDecision, QueueMsg};
+use crate::protocol::{ApprovalDecision, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 use crate::runtime::console::CancellationToken;
 

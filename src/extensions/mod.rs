@@ -313,7 +313,7 @@ end
 
     #[tokio::test]
     async fn lua_tools_are_shell_gated_and_filtered() {
-        use crate::core::types::PermissionMode;
+        use crate::protocol::PermissionMode;
         use crate::tools::{Policy, ToolFilter};
         // Static metadata arm: Shell requirement, like mcp__.
         let meta = crate::tools::metadata("ext__anything__tool").unwrap();
@@ -966,7 +966,7 @@ end
         let console = crate::runtime::console::Console::none();
         console.record_session_approval("bash", r#"{"command":"echo rewritten"}"#);
         let policy =
-            crate::tools::Policy::turn(crate::core::types::PermissionMode::AskShell, &console);
+            crate::tools::Policy::turn(crate::protocol::PermissionMode::AskShell, &console);
         let mut args = serde_json::Map::new();
         args.insert(
             "command".to_string(),
@@ -1054,19 +1054,19 @@ end
         base_url: &str,
     ) -> crate::llm::config::LlmConfig {
         crate::llm::config::LlmConfig {
-            provider: crate::core::types::Provider::Generic(provider.to_string()),
+            provider: crate::protocol::Provider::Generic(provider.to_string()),
             api_key: String::new(),
             base_url: base_url.to_string(),
             model: model.to_string(),
             available_models: vec![model.to_string()],
             endpoints: Default::default(),
-            api: crate::core::types::ApiProtocol::Responses,
+            api: crate::protocol::ApiProtocol::Responses,
             account_id: None,
             thinking_effort: None,
             context_window: 128_000,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
-            permission: crate::core::types::PermissionMode::Trusted,
+            permission: crate::protocol::PermissionMode::Trusted,
             verify_command: None,
             extra_headers: Default::default(),
             global_headers: Default::default(),

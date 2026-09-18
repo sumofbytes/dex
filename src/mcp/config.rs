@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::core::types::ToolDefinition;
+use crate::protocol::ToolDefinition;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------

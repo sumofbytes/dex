@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use crate::agent::r#loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
 use crate::agent::subagent::{AgentTurnContext, WaitOutcome};
-use crate::core::types::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override_for;
+use crate::protocol::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
 use crate::runtime::console::{CancellationToken, Console, TraceWriter};
 use crate::runtime::unwind::CatchUnwind;
@@ -314,9 +314,9 @@ pub(crate) async fn run_turn_inner(
     // storing garbage (which would come back as an empty plan on reload).
     if let Some(plan_json) = &req.plan {
         let canonical = if plan_json.is_empty() {
-            crate::core::types::Plan::default().to_json()
+            crate::protocol::Plan::default().to_json()
         } else {
-            let plan: crate::core::types::Plan = serde_json::from_str(plan_json)
+            let plan: crate::protocol::Plan = serde_json::from_str(plan_json)
                 .map_err(|e| format!("invalid plan JSON from client: {e}"))?;
             plan.to_json()
         };
@@ -343,9 +343,9 @@ pub(crate) async fn run_turn_inner(
 
     // Permission ceiling: daemon policy (env) is max; client may only go stricter.
     let daemon_perm = crate::llm::config::permission_from_env()
-        .unwrap_or(crate::core::types::PermissionMode::AskWrites);
+        .unwrap_or(crate::protocol::PermissionMode::AskWrites);
     if let Some(req_perm_str) = &req.permission {
-        let req_perm = crate::core::types::PermissionMode::parse(req_perm_str)?;
+        let req_perm = crate::protocol::PermissionMode::parse(req_perm_str)?;
         if req_perm.permissiveness() > daemon_perm.permissiveness() {
             return Err(format!(
                 "permission escalation denied: daemon ceiling is {:?} (client requested {:?}); use a stricter mode or change daemon config",
@@ -388,7 +388,7 @@ pub(crate) async fn run_turn_inner(
     let perm_override = req
         .permission
         .as_deref()
-        .map(crate::core::types::PermissionMode::parse)
+        .map(crate::protocol::PermissionMode::parse)
         .transpose()?;
     let mut config = LlmConfig::from_env_async(
         req.base_url.clone().filter(|v| !v.is_empty()),

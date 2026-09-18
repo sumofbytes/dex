@@ -217,10 +217,10 @@ pub(crate) struct App {
     pub(crate) transcript: Vec<TranscriptBlock>,
     pub(crate) input: InputField,
     pub(crate) config: LlmConfig,
-    pub(crate) messages: Vec<crate::core::types::ChatMessage>,
+    pub(crate) messages: Vec<crate::protocol::ChatMessage>,
     pub(crate) tool_state: ToolState,
     pub(crate) session: Session,
-    pub(crate) skills: Vec<crate::core::types::Skill>,
+    pub(crate) skills: Vec<crate::protocol::Skill>,
     pub(crate) turn_start: usize,
     pub(crate) cwd: String,
     pub(crate) git_branch: Option<String>,
@@ -233,7 +233,7 @@ pub(crate) struct App {
     /// Busy Ctrl+C presses since the current cancel started; the third press
     /// force-quits (stuck daemon). Reset wherever `cancel_requested` resets.
     pub(crate) cancel_presses: u8,
-    pub(crate) approval_rx: Option<mpsc::Receiver<crate::core::types::ApprovalRequest>>,
+    pub(crate) approval_rx: Option<mpsc::Receiver<crate::protocol::ApprovalRequest>>,
     /// Waiting approval prompts, oldest first (V1b): child agents can park
     /// several at once and they outlive the parent turn, so the old
     /// single-slot overwrite-deny invariant is a queue now. The overlay
@@ -272,7 +272,7 @@ pub(crate) struct App {
     /// the collapsed indicator's dot animation; it closes (settles) as soon
     /// as any non-thinking line arrives or the turn ends.
     pub(crate) thinking_open: bool,
-    pub(crate) plan: crate::core::types::Plan,
+    pub(crate) plan: crate::protocol::Plan,
     /// Assistant deltas buffered between throttle windows. `markdown_lines`
     /// (term-md + tree-sitter) runs on the buffer at most once per
     /// `STREAM_FLUSH_INTERVAL` instead of once per token; `flush_assistant`
@@ -324,19 +324,19 @@ impl App {
             transcript: Vec::new(),
             input: crate::ui::input::InputField::new(),
             config: crate::llm::config::LlmConfig {
-                provider: crate::core::types::Provider::OpenCode,
+                provider: crate::protocol::Provider::OpenCode,
                 api_key: String::new(),
                 base_url: String::new(),
                 model: "test".into(),
                 available_models: vec!["test".into()],
                 endpoints: Default::default(),
-                api: crate::core::types::ApiProtocol::Responses,
+                api: crate::protocol::ApiProtocol::Responses,
                 account_id: None,
                 thinking_effort: None,
                 context_window: 128_000,
                 reserve_tokens: 16_384,
                 keep_recent_tokens: 20_000,
-                permission: crate::core::types::PermissionMode::Trusted,
+                permission: crate::protocol::PermissionMode::Trusted,
                 verify_command: None,
                 extra_headers: Default::default(),
                 global_headers: Default::default(),
@@ -378,7 +378,7 @@ impl App {
             assistant_open: false,
             show_thinking: false,
             thinking_open: false,
-            plan: crate::core::types::Plan::default(),
+            plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),
             assistant_gap: crate::core::markdown::GapState::new(),
             stream_last_flush: Instant::now(),
@@ -478,7 +478,7 @@ impl App {
 pub(crate) struct PendingApproval {
     pub(crate) name: String,
     pub(crate) input: String,
-    pub(crate) response: tokio::sync::mpsc::Sender<crate::core::types::ApprovalDecision>,
+    pub(crate) response: tokio::sync::mpsc::Sender<crate::protocol::ApprovalDecision>,
     pub(crate) selected: usize,
     /// Wire request id (V1b): the POST /approve target. Parent-turn
     /// approvals carried it implicitly (one per turn); child approvals can
@@ -500,7 +500,7 @@ impl PendingApproval {
     pub(crate) fn new(
         name: String,
         input: String,
-        response: tokio::sync::mpsc::Sender<crate::core::types::ApprovalDecision>,
+        response: tokio::sync::mpsc::Sender<crate::protocol::ApprovalDecision>,
         request_id: String,
         agent: Option<String>,
     ) -> Self {

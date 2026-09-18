@@ -1,7 +1,7 @@
 use super::super::manager::AgentManager;
 use super::super::model::AgentState;
-use crate::core::types::ApprovalRequest;
 use crate::llm::config::LlmConfig;
+use crate::protocol::ApprovalRequest;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;

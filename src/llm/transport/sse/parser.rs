@@ -1,11 +1,11 @@
-use crate::core::types::LlmToolCall;
-use crate::core::types::StopReason;
-use crate::core::types::StreamChunk;
-use crate::core::types::StreamDelta;
-use crate::core::types::Usage;
 use crate::llm::protocol::merge_chat_tool_call;
 use crate::llm::protocol::response_call_index;
 use crate::llm::protocol::response_tool_call;
+use crate::protocol::LlmToolCall;
+use crate::protocol::StopReason;
+use crate::protocol::StreamChunk;
+use crate::protocol::StreamDelta;
+use crate::protocol::Usage;
 use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -514,7 +514,7 @@ impl StreamParser for AnthropicParser {
                                 self.tool_calls.push(LlmToolCall {
                                     id: block.id,
                                     call_type: "function".to_string(),
-                                    function: crate::core::types::FunctionCall {
+                                    function: crate::protocol::FunctionCall {
                                         name: block.name,
                                         arguments: if block.json.is_empty() {
                                             "{}".to_string()

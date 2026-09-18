@@ -1,7 +1,7 @@
 use super::catalog_index::with_catalog_index;
 use super::catalog_index::CostRates;
 use super::catalog_index::IndexedModel;
-use crate::core::types::Provider;
+use crate::protocol::Provider;
 
 pub(crate) fn cost_rates(entry: &serde_json::Value) -> Option<CostRates> {
     let cost = entry.get("cost")?;
@@ -67,7 +67,7 @@ pub(crate) fn usage_cost(
     model: &str,
     provider: &Provider,
     base_url: &str,
-    usage: &crate::core::types::Usage,
+    usage: &crate::protocol::Usage,
 ) -> Option<f64> {
     let keys = provider.catalog_keys();
     let cost = resolve_model_cost(model, &keys, base_url)?;

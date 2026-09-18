@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::runtime::cancel::CancellationSource;
 
-use crate::core::types::{ApprovalRequest, SinkLine};
+use crate::protocol::{ApprovalRequest, SinkLine};
 
 /// Live "allow for session" lookup (V1b): the daemon hands children a
 /// closure over its approval map so decisions granted after a child

@@ -1,6 +1,6 @@
 use super::warn_once;
 use super::LlmConfig;
-use crate::core::types::Provider;
+use crate::protocol::Provider;
 use std::collections::BTreeMap;
 
 use std::env;

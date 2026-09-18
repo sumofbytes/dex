@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::types::{ChatMessage, Role};
+use crate::protocol::{ChatMessage, Role};
 
 use super::header::{
     file_id, FileId, PathCache, SessionClearEntry, SessionEffectEntry, SessionEventEntry,
@@ -277,7 +277,7 @@ impl Session {
     /// entry (key `skills`), so the JSONL documents which skills the system
     /// prompt advertised at session start. Failures are swallowed: a bad
     /// skills record must not fail session creation.
-    fn record_skills(&mut self, skills: &[crate::core::types::Skill]) {
+    fn record_skills(&mut self, skills: &[crate::protocol::Skill]) {
         if skills.is_empty() {
             return;
         }
@@ -1009,7 +1009,7 @@ impl Session {
 
 /// Serialize discovered skills for the session-start `skills` state entry:
 /// a JSON array of `{name, description, path}` objects.
-fn skills_state_value(skills: &[crate::core::types::Skill]) -> String {
+fn skills_state_value(skills: &[crate::protocol::Skill]) -> String {
     let entries: Vec<serde_json::Value> = skills
         .iter()
         .map(|s| {
@@ -1041,7 +1041,7 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
 /// that blocks first paint — pays one.
 pub(crate) fn load_messages_and_plan(
     path: &Path,
-) -> io::Result<(Vec<ChatMessage>, crate::core::types::Plan)> {
+) -> io::Result<(Vec<ChatMessage>, crate::protocol::Plan)> {
     if let Some(mut messages) = history_cache_get(path) {
         repair_dangling_tool_calls(&mut messages);
         return Ok((messages, load_plan(path)));
@@ -1050,7 +1050,7 @@ pub(crate) fn load_messages_and_plan(
     repair_dangling_tool_calls(&mut messages);
     Ok((
         messages,
-        plan.map(|s| crate::core::types::Plan::from_json(&s))
+        plan.map(|s| crate::protocol::Plan::from_json(&s))
             .unwrap_or_default(),
     ))
 }
@@ -1205,16 +1205,16 @@ impl Session {
     }
 }
 
-pub(crate) fn load_plan(path: &Path) -> crate::core::types::Plan {
+pub(crate) fn load_plan(path: &Path) -> crate::protocol::Plan {
     load_session_state(path)
         .ok()
         .and_then(|m| m.get("plan").cloned())
-        .map(|s| crate::core::types::Plan::from_json(&s))
+        .map(|s| crate::protocol::Plan::from_json(&s))
         .unwrap_or_default()
 }
 
 #[allow(dead_code)]
-pub(crate) fn save_plan(session: &mut Session, plan: &crate::core::types::Plan) -> io::Result<()> {
+pub(crate) fn save_plan(session: &mut Session, plan: &crate::protocol::Plan) -> io::Result<()> {
     session.set_state("plan", &plan.to_json())
 }
 
@@ -1370,7 +1370,7 @@ mod tests {
         // `!!`: saved to history and shown in the TUI, never sent to
         // the LLM. The transcript rebuild uses the full load; the
         // model-bound load filters.
-        use crate::core::types::BASH_EXCLUDED_NAME;
+        use crate::protocol::BASH_EXCLUDED_NAME;
         let path = unique_path("dex-session-shell-exclude");
         let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
         fs::write(&path, format!("{header}\n")).unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn history_cache_hit_repairs_dangling_tool_calls_idempotently() {
-        use crate::core::types::{FunctionCall, LlmToolCall};
+        use crate::protocol::{FunctionCall, LlmToolCall};
         let path = unique_path("dex-history-cache-repair");
         let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
         fs::write(&path, format!("{header}\n")).unwrap();
@@ -1758,7 +1758,7 @@ mod tests {
         let path = unique_path("dex-messages-plan");
         let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
         let user = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"hi"}"#;
-        let want = crate::core::types::Plan {
+        let want = crate::protocol::Plan {
             goal: Some("g".into()),
             steps: vec![("s".into(), false)],
             constraints: Vec::new(),
@@ -1902,7 +1902,7 @@ mod tests {
         let _lock = TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let skills = vec![crate::core::types::Skill {
+        let skills = vec![crate::protocol::Skill {
             name: "demo".into(),
             description: "does demo things".into(),
             path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
@@ -2037,10 +2037,10 @@ mod tests {
         s.append_message(&ChatMessage::user("goal")).unwrap();
         s.append_message(&ChatMessage::assistant_calls(
             None,
-            vec![crate::core::types::LlmToolCall {
+            vec![crate::protocol::LlmToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
-                function: crate::core::types::FunctionCall {
+                function: crate::protocol::FunctionCall {
                     name: "edit".into(),
                     arguments: r#"{"path":"a.rs"}"#.into(),
                 },
@@ -2056,7 +2056,7 @@ mod tests {
             "assistant call must get a synthesized result"
         );
         let last = messages.last().unwrap();
-        assert_eq!(last.role, crate::core::types::Role::Tool);
+        assert_eq!(last.role, crate::protocol::Role::Tool);
         assert_eq!(last.tool_call_id.as_deref(), Some("call-1"));
         assert!(
             last.content
@@ -2080,10 +2080,10 @@ mod tests {
         let mut s = Session::new("/tmp/dex-clean-cwd".into(), None).unwrap();
         s.append_message(&ChatMessage::assistant_calls(
             None,
-            vec![crate::core::types::LlmToolCall {
+            vec![crate::protocol::LlmToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
-                function: crate::core::types::FunctionCall {
+                function: crate::protocol::FunctionCall {
                     name: "read".into(),
                     arguments: "{}".into(),
                 },
@@ -2107,10 +2107,10 @@ mod tests {
             ChatMessage::user("goal"),
             ChatMessage::assistant_calls(
                 None,
-                vec![crate::core::types::LlmToolCall {
+                vec![crate::protocol::LlmToolCall {
                     id: "mid-1".into(),
                     call_type: "function".into(),
-                    function: crate::core::types::FunctionCall {
+                    function: crate::protocol::FunctionCall {
                         name: "read".into(),
                         arguments: "{}".into(),
                     },
@@ -2120,7 +2120,7 @@ mod tests {
         ];
         super::repair_dangling_tool_calls(&mut messages);
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[2].role, crate::core::types::Role::Tool);
+        assert_eq!(messages[2].role, crate::protocol::Role::Tool);
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("mid-1"));
         assert_eq!(messages[3].content.as_deref(), Some("follow-up"));
     }

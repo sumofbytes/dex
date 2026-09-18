@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::core::types::ApiProtocol;
+use crate::protocol::ApiProtocol;
 use crate::workspace::{cached_parse, xdg_path, FileCache};
 
 /// Models empirically switched to chat-completions after the responses API

@@ -7,15 +7,14 @@ use crate::client::http::ChatOptions;
 #[cfg(test)]
 use crate::client::http::DaemonClient;
 #[cfg(test)]
-use crate::core::types::ApiProtocol;
+use crate::protocol::ApiProtocol;
 #[cfg(test)]
-use crate::core::types::ApprovalDecision as CoreApprovalDecision;
+use crate::protocol::ApprovalDecision;
 #[cfg(test)]
-use crate::core::types::PermissionMode;
+use crate::protocol::PermissionMode;
 #[cfg(test)]
-use crate::core::types::Provider;
+use crate::protocol::Provider;
 #[cfg(test)]
-use crate::protocol::ApprovalDecision as ProtocolApprovalDecision;
 #[cfg(test)]
 use crate::runtime::console::DIM;
 #[cfg(test)]
@@ -65,9 +64,7 @@ pub(crate) use keys::{handle_key, handle_paste, recall_candidate, recall_queued}
 #[cfg(test)]
 pub(crate) use osc::is_osc_report;
 #[cfg(test)]
-pub(crate) use pollers::{
-    map_approval_decision, premature_close_error, spawn_git_poller, GIT_REFRESH_INTERVAL,
-};
+pub(crate) use pollers::{premature_close_error, spawn_git_poller, GIT_REFRESH_INTERVAL};
 #[cfg(test)]
 pub(crate) use resume::{connection_label, format_resume_hint, resume_command, shell_quote};
 #[cfg(test)]
@@ -190,8 +187,8 @@ mod tests {
         assert!(!is_osc_report("10;rgb:0505/1818"));
     }
 
-    fn skill(name: &str) -> crate::core::types::Skill {
-        crate::core::types::Skill {
+    fn skill(name: &str) -> crate::protocol::Skill {
+        crate::protocol::Skill {
             name: name.to_string(),
             description: String::new(),
             path: std::path::PathBuf::new(),
@@ -291,7 +288,7 @@ mod tests {
             crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
         std::env::set_var("XDG_DATA_HOME", &dir);
         let mut s = crate::session::Session::new("/tmp/dex-resume-cwd".into(), None).unwrap();
-        s.append_message(&crate::core::types::ChatMessage::user("hi".to_string()))
+        s.append_message(&crate::protocol::ChatMessage::user("hi".to_string()))
             .unwrap();
         let id = s.id().to_string();
         let path = s.path().unwrap().to_path_buf();
@@ -323,22 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn approval_decision_mapping_covers_all_variants() {
-        assert!(matches!(
-            map_approval_decision(CoreApprovalDecision::Once),
-            ProtocolApprovalDecision::AllowOnce
-        ));
-        assert!(matches!(
-            map_approval_decision(CoreApprovalDecision::Session),
-            ProtocolApprovalDecision::AllowSession
-        ));
-        assert!(matches!(
-            map_approval_decision(CoreApprovalDecision::Deny),
-            ProtocolApprovalDecision::Deny
-        ));
-    }
-
-    #[test]
     fn premature_close_reports_transport_failure() {
         assert_eq!(
             premature_close_error(false),
@@ -354,7 +335,7 @@ mod tests {
         // parked approval (the overlay's resolve path owns the sender).
         // `spawn_approval_poster` maps the `None` from a closed channel to
         // `Deny`; here we pin the channel semantics it relies on.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<CoreApprovalDecision>(1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ApprovalDecision>(1);
         drop(tx);
         assert!(
             rx.recv().await.is_none(),
@@ -446,7 +427,7 @@ mod tests {
             assistant_open: false,
             show_thinking: false,
             thinking_open: false,
-            plan: crate::core::types::Plan::default(),
+            plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),
             assistant_gap: crate::core::markdown::GapState::new(),
             stream_last_flush: Instant::now(),
