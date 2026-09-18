@@ -17,6 +17,15 @@
 //! The caller passes the exact archivable span (from `find_cut_point`, which
 //! already excludes the keep-recent window): there is no internal
 //! recency pin.
+//!
+//! Stack order with the other output shrinkers: the evidence reducer
+//! compresses a result inline at execution time, observation pack projects
+//! large results out of the provider's request view (recallable via
+//! `obs_recall`), and this prune runs last at compaction time over the
+//! intact session history pack never edits. A Jev drop is therefore
+//! destructive where packing is recallable — contained by only ever
+//! dropping re-runnable reads (re-run the tool to restore): errors,
+//! plans, and mutating-tool evidence truncate instead of dropping.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +75,37 @@ pub(crate) enum SummaryMode {
     Jev,
 }
 
+impl SummaryMode {
+    /// True when this mode prunes verbatim instead of summarizing.
+    pub(crate) fn prunes_jev(self) -> bool {
+        self == SummaryMode::Jev
+    }
+}
+
+/// One knob shape shared by [`COMPACTION_LLM_ENV`] and
+/// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`]: `jev`
+/// selects verbatim pruning, `1` selects the LLM/summary behavior, unset
+/// and explicit offs disable, anything else is a typo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionKnob {
+    Jev,
+    One,
+    Off,
+    Unrecognized,
+}
+
+/// Case-insensitive parse of the shared `1`/`jev` knob shape. Returns the
+/// selection without warning — callers warn with their own env var name on
+/// [`CompactionKnob::Unrecognized`].
+pub(crate) fn parse_compaction_knob(raw: &str) -> CompactionKnob {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        JEV_VALUE => CompactionKnob::Jev,
+        "1" => CompactionKnob::One,
+        "" | "0" | "false" | "off" | "no" => CompactionKnob::Off,
+        _ => CompactionKnob::Unrecognized,
+    }
+}
+
 /// Parse `DEX_COMPACTION_LLM`: `jev` (any case) → [`SummaryMode::Jev`],
 /// `1` → [`SummaryMode::Llm`], unset/explicit offs →
 /// [`SummaryMode::Deterministic`]. Only `1` selects the LLM so existing
@@ -74,11 +114,11 @@ pub(crate) enum SummaryMode {
 /// deterministic) and likewise falls back to deterministic.
 pub(crate) fn summary_mode() -> SummaryMode {
     let raw = std::env::var(COMPACTION_LLM_ENV).unwrap_or_default();
-    match raw.trim().to_ascii_lowercase().as_str() {
-        JEV_VALUE => SummaryMode::Jev,
-        "1" => SummaryMode::Llm,
-        "" | "0" | "false" | "off" | "no" => SummaryMode::Deterministic,
-        _ => {
+    match parse_compaction_knob(&raw) {
+        CompactionKnob::Jev => SummaryMode::Jev,
+        CompactionKnob::One => SummaryMode::Llm,
+        CompactionKnob::Off => SummaryMode::Deterministic,
+        CompactionKnob::Unrecognized => {
             let short: String = raw.trim().chars().take(32).collect();
             warn_once(
                 "env:DEX_COMPACTION_LLM",
@@ -141,16 +181,22 @@ pub(crate) fn is_worthwhile(stats: &JevStats) -> bool {
 }
 
 /// Tools whose output can be reproduced by re-running them — safe to drop
-/// verbatim when old and large. Mutating / delegating tools are only ever
-/// truncated, so file-op evidence and child answers survive. `bash` is
-/// mutating (no re-run restores a side effect), so it truncates even when
-/// huge — never drops.
+/// verbatim when old and large. Single-sourced from the tool registry
+/// (`ToolMetadata::read_only + idempotent`) instead of a second tool list:
+/// pure reads (`read`, `ls`, the fff tools, `git`) drop when old and huge,
+/// while mutating / delegating / external tools (`bash`, `write`, `edit`,
+/// `chain`, `mcp__*`, extensions) only ever truncate, so file-op evidence
+/// and child answers survive. Unknown tools have no registry row and stay
+/// conservative: truncate, never drop.
 fn is_rerunnable(tool: &str) -> bool {
-    matches!(tool, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls")
+    crate::tools::metadata(tool).is_some_and(|m| m.read_only && m.idempotent)
 }
 
-/// Anchors that must survive verbatim: plan snapshots orient the next plan,
-/// `obs_recall` pages are already the recall path.
+/// Anchors that must survive verbatim: plan snapshots orient the next plan
+/// (`update_plan`, defined in `online_compaction::tool_defs`), `obs_recall`
+/// pages are already the recall path (defined in `obs_pack`). Both are
+/// read-only in the registry but never reach the scorer — `decide` keeps
+/// them above.
 fn is_anchor(tool: &str) -> bool {
     matches!(tool, "update_plan" | "obs_recall")
 }
@@ -210,6 +256,9 @@ fn span_chars(messages: &[ChatMessage], start: usize, end: usize) -> usize {
 /// result). Messages outside the span, user/assistant text, and anchors are
 /// untouched. Returns per-reason counts plus char savings.
 pub(crate) fn prune_span(messages: &mut Vec<ChatMessage>, start: usize, end: usize) -> JevStats {
+    // Callers pass the archivable span from `find_cut_point`; an inverted
+    // range is a caller bug — loud in tests, clamped to empty in release.
+    debug_assert!(start <= end, "jev prune_span: start {start} > end {end}");
     let len = messages.len();
     let start = start.min(len);
     let end = end.min(len).max(start);

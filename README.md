@@ -43,7 +43,9 @@ build, test, and submit changes. Please follow the
   summarized deterministically (no LLM call) to keep requests bounded. Set
   `DEX_COMPACTION_LLM=1` for model summarization, or `=jev` to prune stale
   tool outputs verbatim instead (drops/truncates old results, keeps text;
-  falls back to the deterministic summary when pruning doesn't pay).
+  falls back to the deterministic summary when pruning doesn't pay). It runs
+  at compaction time over the intact history, after inline evidence reduction
+  at execution time and large-result projection per request.
 - **Online context compaction** — set `DEX_ONLINE_COMPACTION=1` to add an
   `update_plan` tool: the model keeps a working plan, and each completed step is
   a safe point where history may compact early if the cache re-write cost pays
