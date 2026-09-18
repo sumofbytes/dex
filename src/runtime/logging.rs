@@ -182,9 +182,9 @@ fn log_file() -> Option<PathBuf> {
 #[macro_export]
 macro_rules! log {
     ($level:ident, $($arg:tt)+) => {
-        if $crate::core::logging::enabled($crate::core::logging::Level::$level) {
-            $crate::core::logging::log(
-                $crate::core::logging::Level::$level,
+        if $crate::runtime::logging::enabled($crate::runtime::logging::Level::$level) {
+            $crate::runtime::logging::log(
+                $crate::runtime::logging::Level::$level,
                 module_path!(),
                 format_args!($($arg)+),
             )

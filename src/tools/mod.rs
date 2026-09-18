@@ -1,6 +1,7 @@
 #![allow(clippy::doc_lazy_continuation)]
 mod edit;
 mod meta;
+pub(crate) mod plan;
 mod read;
 pub(crate) mod sandbox;
 mod search;
@@ -40,13 +41,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::time::Duration;
 
-use crate::agent::online_compaction::{
-    format_plan_snapshot, parse_plan_progress, parse_plan_steps,
-};
-use crate::agent::state::{wait_cancelled, CancellationSource};
-use crate::core::console::Console;
+use self::plan::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use crate::core::format::{clamp_lines_checked, clip_chars};
 use crate::core::types::{ApprovalDecision, ApprovalRequest, PermissionMode};
+use crate::runtime::cancel::{wait_cancelled, CancellationSource};
+use crate::runtime::console::Console;
 
 pub(crate) static CONFIGURED_OUTPUT_LIMIT: AtomicUsize = AtomicUsize::new(1_048_576);
 
@@ -893,7 +892,7 @@ pub(crate) fn execute_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::state::GlobalCancellation;
+    use crate::runtime::cancel::GlobalCancellation;
     use serde_json::json;
 
     #[test]
@@ -2275,7 +2274,7 @@ mod tests {
     #[tokio::test]
     async fn bash_cancel_is_prompt_not_poll_quantized() {
         // TDD Phase 3: cancel via select!, not 25ms poll.
-        use crate::core::console::CancellationToken;
+        use crate::runtime::console::CancellationToken;
         let token = CancellationToken::new();
         let t2 = token.clone();
         tokio::spawn(async move {
@@ -2300,7 +2299,7 @@ mod tests {
         // Producer side of the cancel-during-IO contract: a fired token
         // turns the tool into ok:false, so the loop neither caches nor
         // replays it — and `execute_outcome` never derives success from text.
-        use crate::core::console::CancellationToken;
+        use crate::runtime::console::CancellationToken;
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut args = serde_json::Map::new();
@@ -2408,8 +2407,8 @@ mod tests {
     // approval prompt for mutating calls under ask modes, and blocks for
     // the verdict. Files land under `target/` (unique per test) with
     // best-effort cleanup, mirroring the existing tests in this module.
-    use crate::core::console::Console;
     use crate::core::types::{ApprovalDecision, PermissionMode};
+    use crate::runtime::console::Console;
 
     fn phase0_console() -> (
         Console,
@@ -2648,7 +2647,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_wait_unwinds_on_cancel() {
-        use crate::core::console::CancellationToken;
+        use crate::runtime::console::CancellationToken;
         let rel = "target/phase0-cancel.txt";
         let _ = fs::remove_file(rel);
         let (console, mut approval_rx) = phase0_console();

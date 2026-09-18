@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::core::console::CancellationToken;
-use crate::core::unwind::CatchUnwind;
+use crate::runtime::console::CancellationToken;
+use crate::runtime::unwind::CatchUnwind;
 use crate::session::Session;
 
 use super::definition::AgentDefinition;

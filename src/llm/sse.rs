@@ -10,12 +10,12 @@ use std::io::{self, Write};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::core::console::with_console;
 use crate::core::highlight::{print_code_block, print_markdown_text};
 use crate::core::types::{
     ChatMessage, LlmToolCall, Role, SinkLine, StopReason, StreamChunk, StreamDelta, Usage,
 };
 use crate::llm::protocol::{merge_chat_tool_call, response_call_index, response_tool_call};
+use crate::runtime::console::with_console;
 
 /// Incremental markdown printer: prose is flushed as soon as a full line
 /// arrives; code fences are buffered until closed so they can be highlighted
@@ -362,7 +362,7 @@ impl SseDriver {
         }
         if !self.thinking_open {
             self.thinking_open = true;
-            let _ = io::stderr().write_all(crate::core::console::DIM.as_bytes());
+            let _ = io::stderr().write_all(crate::runtime::console::DIM.as_bytes());
         }
         let _ = io::stderr().write_all(thought.as_bytes());
     }
@@ -1308,8 +1308,8 @@ mod tests {
         read_stream, stream_err, stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta,
         StreamPrinter, Usage,
     };
-    use crate::core::console::CancellationToken;
     use crate::core::types::{StopReason, StreamUsage};
+    use crate::runtime::console::CancellationToken;
     use std::time::Duration;
     use tokio::sync::mpsc;
 

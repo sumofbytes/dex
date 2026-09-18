@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Path, PathBuf};
 
-use crate::core::console::{AGENT_COLOR, RESET, TOOL_INPUT_COLOR};
+use crate::runtime::console::{AGENT_COLOR, RESET, TOOL_INPUT_COLOR};
 use crate::session::Session;
 
 /// Horizontal chart: 15 rows tall, one column per call (long sessions are

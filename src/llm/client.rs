@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
-use crate::core::console::with_console;
 use crate::core::types::{ChatMessage, ChatRequest, SinkLine, StreamOptions};
 use crate::llm::config::LlmConfig;
 use crate::llm::http::{
@@ -15,6 +14,7 @@ use crate::llm::protocol::{
     chat_completions_messages, responses_input, responses_tools, tools_schema,
 };
 use crate::llm::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
+use crate::runtime::console::with_console;
 
 /// Agent-loop model seam: `process_turn` is generic over this so tests run
 /// deterministic doubles; the single production impl is `LlmConfig` (via
