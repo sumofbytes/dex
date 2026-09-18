@@ -1,0 +1,81 @@
+{
+  "file": "src/ui/mod.rs",
+  "decl": "mod",
+  "drops": [
+    [
+      3,
+      19
+    ],
+    [
+      33,
+      33
+    ]
+  ],
+  "head": [
+    [
+      1,
+      2
+    ]
+  ],
+  "keep": [
+    [
+      20,
+      32
+    ]
+  ],
+  "siblings": [
+    "herdr",
+    "input",
+    "remote",
+    "render",
+    "slash",
+    "status",
+    "theme",
+    "wrapping",
+    "app",
+    "selection",
+    "transcript"
+  ],
+  "stay": [
+    {
+      "range": [
+        1676,
+        2929
+      ],
+      "test": true
+    }
+  ],
+  "children": [
+    {
+      "name": "app",
+      "ranges": [
+        [
+          34,
+          607
+        ]
+      ]
+    },
+    {
+      "name": "selection",
+      "ranges": [
+        [
+          608,
+          862
+        ]
+      ]
+    },
+    {
+      "name": "transcript",
+      "ranges": [
+        [
+          863,
+          921
+        ],
+        [
+          922,
+          1675
+        ]
+      ]
+    }
+  ]
+}
