@@ -334,6 +334,9 @@ def main():
             elif nm in level_names:
                 tgt = "super::" + nm
                 (gated_imports if nm not in used_nontest else imports).append(tgt)
+            elif nm in siblings:
+                tgt = spec.get("sib_prefix", "super") + "::" + nm
+                (gated_imports if nm not in used_nontest else imports).append(tgt)
         body = []
         for imp in sorted(set(imports)):
             body.append(f"use {imp};")
@@ -374,7 +377,9 @@ def main():
         for ln in blines:
             m = DEF_RE.match(ln)
             if m and m.group(3) in upgraded and home_of.get(m.group(3)) == name:
-                ln = "pub(crate) " + ln.lstrip()
+                ln = re.sub(r"^\s*pub\s*(\([^)]*\))?\s*", "pub(crate) ", ln, count=1)
+                if not ln.lstrip().startswith("pub(crate)"):
+                    ln = "pub(crate) " + ln.lstrip()
                 out.append(ln)
                 continue
             m2 = re.match(
@@ -410,6 +415,9 @@ def main():
             continue
         if nm in import_of:
             p, gated = import_of[nm]
+            segs = p.split("::")
+            if segs[0] in siblings:
+                p = "self::" + p
             if gated or nm not in used_nt:
                 p_gated.append(p)
             else:
@@ -572,12 +580,17 @@ if __name__ == "__main__":
     import subprocess
 
     path, parent_text, outputs = main()
-    stem = path.split("/")[-1].replace(".rs", "")
-    d = "/".join(path.split("/")[:-1]) + "/" + stem
+    parts = path.split("/")
+    stem = parts[-1].replace(".rs", "")
+    if stem == "mod":
+        d = "/".join(parts[:-1])
+    else:
+        d = "/".join(parts[:-1]) + "/" + stem
     os.makedirs(d, exist_ok=True)
     with open(f"{d}/mod.rs", "w") as f:
         f.write(parent_text)
-    subprocess.run(["rm", path], check=True)
+    if stem != "mod":
+        subprocess.run(["rm", path], check=True)
     for name, text in outputs.items():
         with open(f"{d}/{name}.rs", "w") as f:
             f.write(text)
