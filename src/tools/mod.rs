@@ -1,6 +1,8 @@
 #![allow(clippy::doc_lazy_continuation)]
 mod edit;
+pub(crate) mod error;
 mod meta;
+pub(crate) mod outcome;
 pub(crate) mod plan;
 mod read;
 pub(crate) mod sandbox;
@@ -10,6 +12,8 @@ mod write;
 
 // Workspace confinement lives in `sandbox.rs`; re-exported here so existing
 // `tools::...` paths keep working.
+pub(crate) use error::ToolError;
+pub(crate) use outcome::{ShellEvidence, ToolOutcome};
 pub(crate) use sandbox::{
     normalize_conflict_path, resolve_workspace_path, workspace_path, workspace_root,
 };
@@ -35,7 +39,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -55,40 +59,6 @@ pub(crate) fn set_output_limit(limit: usize) {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum ToolError {
-    Missing(&'static str),
-    NotString(&'static str),
-    InvalidArgument(String),
-    Io(io::Error),
-    EditNotUnique(usize),
-    OutsideWorkspace(String),
-    /// A write/edit supplied an `expected_hash` that no longer matches the
-    /// file on disk (someone else changed it since the model's last read).
-    /// The caller must re-read and retry — the write is not applied.
-    StaleFile {
-        path: String,
-        expected: String,
-        actual: String,
-    },
-    /// A shell command ran but signalled failure (non-zero exit, killed, or
-    /// timed out). `code` is `None` when the process never exited on its own.
-    /// Carries the combined output so partial results still reach the model.
-    Shell {
-        output: String,
-        code: Option<i32>,
-    },
-    /// An internal tool-engine failure (not a bad invocation, not a shell
-    /// exit): e.g. the fff index failed to initialize.
-    Internal(String),
-    /// The permission policy refused the call before it ran: a read-only
-    /// rejection, a user deny, an unanswered approval (approver gone), or
-    /// approval needed with no channel to ask on. Never inferred from tool
-    /// output — decided by the Phase 0 gate in `execute`.
-    Denied(String),
-    Unknown(String),
-}
-
 /// A tool result together with whether the call actually succeeded. Success
 /// is decided where the exit status is known — never inferred from the
 /// output text, which may legitimately contain markers like `[exit 1]`.
@@ -100,19 +70,6 @@ pub(crate) enum ToolError {
 /// tool output must not be able to point verification at a different
 /// archive, or re-label a run's outcome. `None` for tools that ran no shell
 /// command (or ran one without the reducer gate on, in the id's case).
-#[derive(Clone, Debug)]
-pub(crate) struct ShellEvidence {
-    pub(crate) archive_id: Option<String>,
-    pub(crate) exit_code: Option<i32>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ToolOutcome {
-    pub(crate) text: String,
-    pub(crate) ok: bool,
-    pub(crate) diff: Option<String>,
-    pub(crate) shell: Option<ShellEvidence>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ToolMetadata {
@@ -229,47 +186,6 @@ fn tool_update_plan(args: &Map<String, Value>) -> Result<String, ToolError> {
     let steps = parse_plan_steps(steps).map_err(ToolError::InvalidArgument)?;
     let progress = parse_plan_progress(args.get("progress")).map_err(ToolError::InvalidArgument)?;
     Ok(format_plan_snapshot(&steps, &progress))
-}
-
-impl From<crate::workspace::WorkspaceError> for ToolError {
-    fn from(e: crate::workspace::WorkspaceError) -> Self {
-        match e {
-            crate::workspace::WorkspaceError::Io(io) => Self::Io(io),
-            crate::workspace::WorkspaceError::OutsideWorkspace(p) => Self::OutsideWorkspace(p),
-        }
-    }
-}
-
-impl std::fmt::Display for ToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing(k) => write!(f, "missing argument '{}'", k),
-            Self::NotString(k) => write!(f, "argument '{}' must be a string", k),
-            Self::InvalidArgument(message) => write!(f, "{}", message),
-            Self::Io(e) => write!(f, "io error: {}", e),
-            Self::EditNotUnique(n) => write!(
-                f,
-                "oldText matches {n} locations; include more surrounding lines to make it unique, or pass replaceAll: true"
-            ),
-            Self::OutsideWorkspace(path) => write!(f, "path is outside the workspace: {}", path),
-            Self::StaleFile {
-                path,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "file changed since it was read (expected_hash mismatch: expected {expected}, file is {actual}) — re-read {} and retry; concurrent edit wins, your write was not applied",
-                path
-            ),
-            Self::Shell { output, code } => match code {
-                Some(code) => write!(f, "{output}\n[exit {code}]"),
-                None => write!(f, "{output}"),
-            },
-            Self::Internal(e) => write!(f, "{e}"),
-            Self::Denied(message) => write!(f, "permission denied: {message}"),
-            Self::Unknown(t) => write!(f, "unknown tool '{}'", t),
-        }
-    }
 }
 
 fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolError> {
