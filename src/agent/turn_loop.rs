@@ -21,7 +21,7 @@ use crate::core::format::{
 use crate::core::types::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
-use crate::llm::sse::Turn;
+use crate::llm::transport::sse::Turn;
 use crate::runtime::console::{
     with_console, Console, SpinnerGuard, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK,
     TOOL_OUTPUT_COLOR,
