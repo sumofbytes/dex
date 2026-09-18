@@ -6,7 +6,12 @@ use std::time::{Duration, SystemTime};
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::core::types::{ApiProtocol, PermissionMode, Provider};
+use crate::agent::router::{
+    classify_with_reasons, count_history_tool_calls, infer_tool_hints, model_for, TaskSignal, Tier,
+    TierMap,
+};
+use crate::agent::tokens::estimate_tokens;
+use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
 use crate::llm::auth::load_codex_credentials;
 
 /// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
@@ -197,7 +202,7 @@ pub(crate) fn config_file_value() -> Option<serde_yaml::Value> {
     load_config_file()
 }
 
-fn load_config_file() -> Option<serde_yaml::Value> {
+pub(crate) fn load_config_file() -> Option<serde_yaml::Value> {
     let path = config_file_path()?;
     cached_parse(&CONFIG_CACHE, &path, |text| {
         // Unknown keys are almost always typos; name them instead of
@@ -326,6 +331,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "system_prompt_file",
     "mcp_servers",
     "agent_wake",
+    "routing",
     "extensions",
     // Deprecated but still honored for old files:
     "active_provider",
@@ -379,6 +385,420 @@ pub(crate) fn agent_wake_origin() -> (bool, &'static str) {
 /// The wake gate read by the scheduler: `true` unless disabled.
 pub(crate) fn agent_wake_enabled() -> bool {
     agent_wake_origin().0
+}
+
+/// Complexity-router switch (`routing.enabled:`) and per-tier env vars.
+/// Env beats file, per the standard precedence; tiers name full
+/// `provider/model` selections, so catalog/learned-API/`api:` pins keep
+/// working through the existing selection path.
+pub(crate) const ROUTING_ENV: &str = "DEX_ROUTING";
+pub(crate) const ROUTING_FAST_ENV: &str = "DEX_ROUTING_FAST";
+pub(crate) const ROUTING_BALANCED_ENV: &str = "DEX_ROUTING_BALANCED";
+pub(crate) const ROUTING_POWERFUL_ENV: &str = "DEX_ROUTING_POWERFUL";
+/// Env var holding a tier's selection (`DEX_ROUTING_FAST`…).
+fn routing_tier_env(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Fast => ROUTING_FAST_ENV,
+        Tier::Balanced => ROUTING_BALANCED_ENV,
+        Tier::Powerful => ROUTING_POWERFUL_ENV,
+    }
+}
+
+/// Origin wording for a tier's file selection (`config routing.fast:`…).
+fn routing_file_origin(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Fast => "config routing.fast:",
+        Tier::Balanced => "config routing.balanced:",
+        Tier::Powerful => "config routing.powerful:",
+    }
+}
+
+/// Per-tier origins for [`RoutingResolution`]: where each raw selection
+/// came from. A miss falls back at use time (`model_for`: tier miss →
+/// `balanced` → top-level `model:`), so the miss origin only says that.
+pub(crate) struct TierOrigins {
+    pub(crate) fast: &'static str,
+    pub(crate) balanced: &'static str,
+    pub(crate) powerful: &'static str,
+}
+
+impl TierOrigins {
+    fn get(&self, tier: Tier) -> &'static str {
+        match tier {
+            Tier::Fast => self.fast,
+            Tier::Balanced => self.balanced,
+            Tier::Powerful => self.powerful,
+        }
+    }
+}
+
+/// The resolved `routing:` knob: the switch plus the raw per-tier
+/// selections (empty = unset). `from_env` and `doctor` share this
+/// resolution so the origin rows cannot drift from runtime routing.
+pub(crate) struct RoutingResolution {
+    pub(crate) enabled: bool,
+    pub(crate) enabled_origin: &'static str,
+    pub(crate) tiers: TierMap,
+    pub(crate) tier_origins: TierOrigins,
+}
+
+/// One file key's trimmed selection (`None` = missing, empty, or
+/// non-string). A present-but-empty or non-string value warns once and
+/// falls through like a miss, never a hard error.
+fn routing_file_key(file: &Option<serde_yaml::Value>, key: &str) -> Option<String> {
+    let value = file
+        .as_ref()
+        .and_then(|f| f.get("routing"))
+        .and_then(|r| r.as_mapping())
+        .and_then(|m| m.get(key))?;
+    match value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(s.to_string()),
+        None => {
+            warn_once(
+                &format!("config:routing:{key}"),
+                &format!("ignoring routing.{key}: — set a 'provider/model' selection string"),
+            );
+            None
+        }
+    }
+}
+
+/// One tier's raw selection: `DEX_ROUTING_<TIER>` > file `routing.<tier>:`.
+/// Empty/missing at every layer is not an error — `model_for` falls
+/// through to `balanced`, then to top-level `model:`.
+fn routing_tier_value(
+    file: &Option<serde_yaml::Value>,
+    tier: Tier,
+    miss_origin: &'static str,
+) -> (String, &'static str) {
+    let env_var = routing_tier_env(tier);
+    if let Ok(raw) = env::var(env_var) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return (trimmed, env_var);
+        }
+    }
+    if let Some(selection) = routing_file_key(file, tier.key()) {
+        return (selection, routing_file_origin(tier));
+    }
+    (String::new(), miss_origin)
+}
+
+/// Shared `routing:` resolution: `DEX_ROUTING` > file `routing.enabled:`
+/// > off, plus each tier's selection. Default off — routing is opt-in.
+pub(crate) fn routing_resolution(file: &Option<serde_yaml::Value>) -> RoutingResolution {
+    const BALANCED_MISS: &str = "unset (falls back to model:)";
+    const TIER_MISS: &str = "unset (falls back to routing.balanced:, then model:)";
+    let mut enabled = false;
+    let mut enabled_origin = "built-in default";
+    if let Ok(raw) = env::var(ROUTING_ENV) {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => {
+                enabled = false;
+                enabled_origin = ROUTING_ENV;
+            }
+            "1" | "true" | "on" | "yes" => {
+                enabled = true;
+                enabled_origin = ROUTING_ENV;
+            }
+            _ => warn_once(
+                "env:DEX_ROUTING",
+                "DEX_ROUTING must be 0/1 (or true/false, on/off, yes/no) — ignoring it",
+            ),
+        }
+    }
+    if enabled_origin == "built-in default" {
+        let flag = file
+            .as_ref()
+            .and_then(|f| f.get("routing"))
+            .and_then(|r| r.as_mapping())
+            .and_then(|m| m.get("enabled"));
+        match flag {
+            None => {}
+            Some(v) => match v.as_bool() {
+                Some(b) => {
+                    enabled = b;
+                    enabled_origin = "config routing.enabled:";
+                }
+                None => warn_once(
+                    "config:routing:enabled",
+                    "ignoring routing.enabled: — set true or false",
+                ),
+            },
+        }
+    }
+    let mut tiers = TierMap::default();
+    let mut origins = TierOrigins {
+        fast: TIER_MISS,
+        balanced: BALANCED_MISS,
+        powerful: TIER_MISS,
+    };
+    for tier in Tier::ALL {
+        let miss = if tier == Tier::Balanced {
+            BALANCED_MISS
+        } else {
+            TIER_MISS
+        };
+        let (value, origin) = routing_tier_value(file, tier, miss);
+        match tier {
+            Tier::Fast => {
+                tiers.fast = value;
+                origins.fast = origin;
+            }
+            Tier::Balanced => {
+                tiers.balanced = value;
+                origins.balanced = origin;
+            }
+            Tier::Powerful => {
+                tiers.powerful = value;
+                origins.powerful = origin;
+            }
+        }
+    }
+    RoutingResolution {
+        enabled,
+        enabled_origin,
+        tiers,
+        tier_origins: origins,
+    }
+}
+
+/// One routed turn: classify the prompt and resolve the tier's model
+/// through `model_for` (tier miss → `balanced` → top-level `model:`).
+/// `None` when routing is off or nothing selects a model (the normal
+/// `from_env` setup error then explains itself). `model_override` is
+/// `Some` only when the tier resolves away from the current selection,
+/// so an unrouted turn rebuilds nothing. Callers with an explicit
+/// `--model` / per-request model skip this — the explicit pick wins.
+pub(crate) struct RoutedTurn {
+    pub(crate) tier: Tier,
+    pub(crate) model_override: Option<String>,
+    /// Strongest classification signal, for the per-turn log line.
+    pub(crate) reason: &'static str,
+}
+
+pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<RoutedTurn> {
+    let file = load_config_file();
+    let routing = routing_resolution(&file);
+    if !routing.enabled {
+        return None;
+    }
+    let selection = resolve_selection(None, &file).ok()?;
+    let signal = routing_signal(prompt, history);
+    let decision = classify_with_reasons(&signal, prompt);
+    Some(finish_route(
+        &selection.value,
+        &routing.tiers,
+        decision.tier,
+        decision.top_reason(),
+    ))
+}
+
+/// Jev-aware routing: same contract as [`route_turn`], but the tier
+/// decision goes through [`classify_turn_async`] — Jev's tier-Choice when
+/// `DEX_ROUTING_CLASSIFIER=jev`, else the deterministic classifier.
+/// Async because the Jev call is network; the daemon (TUI + `serve`
+/// clients) uses this, while the sync one-shot path stays deterministic.
+pub(crate) async fn route_turn_async(prompt: &str, history: &[ChatMessage]) -> Option<RoutedTurn> {
+    let file = load_config_file();
+    let routing = routing_resolution(&file);
+    if !routing.enabled {
+        return None;
+    }
+    let selection = resolve_selection(None, &file).ok()?;
+    let signal = routing_signal(prompt, history);
+    let (tier, reason) = classify_turn_async(&signal, prompt).await;
+    Some(finish_route(&selection.value, &routing.tiers, tier, reason))
+}
+
+/// The shared routing signal: prompt size plus history token size and the
+/// real tool-call count, so a deep session weighs in without prompt words.
+/// The daemon reuses the turn's own history load, so routing sees exactly
+/// what the turn will send.
+fn routing_signal(prompt: &str, history: &[ChatMessage]) -> TaskSignal {
+    TaskSignal {
+        prompt_chars: prompt.chars().count(),
+        history_tokens: estimate_tokens(history),
+        history_tool_calls: count_history_tool_calls(history),
+        tool_hints: infer_tool_hints(prompt),
+    }
+}
+
+/// Shared tail: resolve the tier's model through `model_for` (tier miss →
+/// `balanced` → top-level `model:`), overriding only on change.
+fn finish_route(
+    selection_value: &str,
+    tiers: &TierMap,
+    tier: Tier,
+    reason: &'static str,
+) -> RoutedTurn {
+    let model = model_for(tier, tiers, selection_value);
+    RoutedTurn {
+        tier,
+        model_override: (model != selection_value).then(|| model.to_string()),
+        reason,
+    }
+}
+
+/// Routing classifier knob: `DEX_ROUTING_CLASSIFIER=jev` sends each routed
+/// turn's tier decision to Jev (one SystemOne Choice per turn, confidence-
+/// gated with deterministic fallback); unset or anything else keeps the
+/// deterministic stem/weight classifier. Unknown values warn once — the
+/// deterministic default must never change silently.
+pub(crate) fn routing_classifier_is_jev() -> bool {
+    match env::var("DEX_ROUTING_CLASSIFIER") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("jev") => true,
+        Ok(v) if v.trim().is_empty() => false,
+        Ok(other) => {
+            warn_once(
+                "env:DEX_ROUTING_CLASSIFIER",
+                &format!(
+                    "ignoring DEX_ROUTING_CLASSIFIER='{other}': only 'jev' is supported (deterministic stays default)"
+                ),
+            );
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Jev model id: `DEX_JEV_MODEL`, else the `jev-latest` alias. Pin a
+/// versioned id once confidence thresholds are tuned against a release
+/// (aliases move under you).
+pub(crate) fn jev_model_name() -> String {
+    env::var("DEX_JEV_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| crate::jev::DEFAULT_MODEL.to_string())
+}
+
+/// Minimum Jev Choice confidence that routes on Jev's answer
+/// (`DEX_JEV_MIN_CONFIDENCE`, default 0.6): below it — or on any Jev
+/// error — the deterministic classifier decides instead. Out-of-range or
+/// unparsable values fall back to the default.
+pub(crate) fn jev_min_confidence() -> f64 {
+    const DEFAULT: f64 = 0.6;
+    env::var("DEX_JEV_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|c| (0.0..=1.0).contains(c))
+        .unwrap_or(DEFAULT)
+}
+
+/// Classify one turn: Jev's tier-Choice when gated on and confident,
+/// otherwise the deterministic classifier. The fallback is silent on low
+/// confidence (routine) but loud once per process on errors (setup worth
+/// fixing) — either way the turn still routes.
+async fn classify_turn_async(signal: &TaskSignal, prompt: &str) -> (Tier, &'static str) {
+    let deterministic = || {
+        let decision = classify_with_reasons(signal, prompt);
+        (decision.tier, decision.top_reason())
+    };
+    if !routing_classifier_is_jev() {
+        return deterministic();
+    }
+    match jev_tier(signal, prompt).await {
+        Ok((tier, confidence)) if confidence >= jev_min_confidence() => (tier, "jev classifier"),
+        Ok(_) => deterministic(),
+        Err(e) => {
+            warn_once(
+                "jev-classifier",
+                &format!("jev classifier unavailable ({e}); deterministic fallback"),
+            );
+            deterministic()
+        }
+    }
+}
+
+/// One SystemOne call asking for the turn's tier. The state is the prompt
+/// plus a one-line turn-context trailer (prompt/history size, real session
+/// tool activity) so Jev weighs session depth the deterministic classifier
+/// sees. Returns the tier plus the Choice confidence for gating.
+async fn jev_tier(
+    signal: &TaskSignal,
+    prompt: &str,
+) -> Result<(Tier, f64), Box<dyn std::error::Error>> {
+    let cfg = crate::jev::resolve()?;
+    let state = serde_json::json!(format!(
+        "{prompt}\n\n[turn context: prompt_chars={} history_tokens={} history_tool_calls={}]",
+        signal.prompt_chars, signal.history_tokens, signal.history_tool_calls
+    ));
+    let eval = crate::jev::evaluate(&cfg, state, &[tier_choice_question()])
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let answer = eval
+        .answers
+        .get("tier")
+        .ok_or("jev: response missing 'tier' answer")?;
+    match answer {
+        crate::jev::Answer::Choice {
+            value, confidence, ..
+        } => value
+            .parse::<Tier>()
+            .map(|tier| (tier, *confidence))
+            .map_err(|e| format!("jev: unknown tier '{value}': {e}").into()),
+        other => Err(format!("jev: 'tier' answer is not a Choice ({other:?})").into()),
+    }
+}
+
+/// The routing tier-Choice: option descriptions mirror
+/// `agent::router`'s tier contract so both classifiers pick from the same
+/// three buckets. Single question today; complexity-Score / Noul probes
+/// can join this same call later without another round trip.
+fn tier_choice_question() -> crate::jev::Question {
+    crate::jev::Question {
+        id: "tier".to_string(),
+        kind: crate::jev::QuestionKind::Choice {
+            instructions: "Which model tier should handle this coding turn?".to_string(),
+            options: vec![
+                (
+                    Tier::Fast.key().to_string(),
+                    "Typos, single-file reads, trivial Q&A — the smallest capable model."
+                        .to_string(),
+                ),
+                (
+                    Tier::Balanced.key().to_string(),
+                    "Normal feature work and single-scope edits.".to_string(),
+                ),
+                (
+                    Tier::Powerful.key().to_string(),
+                    "Multi-file refactors, auth or data paths, ambiguous specs, migrations, security, irreversible changes."
+                        .to_string(),
+                ),
+            ],
+        },
+    }
+}
+
+/// What `doctor` shows per tier: the tier's own selection, else
+/// `routing.balanced:`, else the top-level selection — the same chain
+/// `model_for` applies at runtime, so the row explains the turn's model.
+fn routing_tier_display(
+    tier: Tier,
+    routing: &RoutingResolution,
+    selection: Option<&str>,
+    selection_source: &str,
+) -> (String, String) {
+    let value = routing.tiers.get(tier);
+    if !value.is_empty() {
+        return (
+            value.to_string(),
+            routing.tier_origins.get(tier).to_string(),
+        );
+    }
+    if tier != Tier::Balanced && !routing.tiers.balanced.is_empty() {
+        return (
+            routing.tiers.balanced.clone(),
+            routing.tier_origins.balanced.to_string(),
+        );
+    }
+    match selection {
+        Some(value) => (value.to_string(), selection_source.to_string()),
+        None => (
+            "(unset)".to_string(),
+            "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
+        ),
+    }
 }
 
 /// Read a system-prompt file for the env/file layers: a miss warns once and
@@ -515,7 +935,9 @@ pub(crate) struct ProviderEntry {
     pub(crate) headers: BTreeMap<String, String>,
 }
 
-fn load_provider_entries(file: &Option<serde_yaml::Value>) -> BTreeMap<String, ProviderEntry> {
+pub(crate) fn load_provider_entries(
+    file: &Option<serde_yaml::Value>,
+) -> BTreeMap<String, ProviderEntry> {
     let Some(map) = file
         .as_ref()
         .and_then(|f| f.get("providers"))
@@ -1061,6 +1483,12 @@ fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
     match provider {
         Provider::OpenCode => Some("OPENCODE_API_KEY"),
         Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
+        // The provider's own SDK env var (TypeSafe SDKs read it), honored
+        // cache-less like the other pins — the models.dev catalog has no
+        // typesafe entry, so this is the only env deposit for the Jev key.
+        Provider::Generic(name) if name.as_str() == crate::jev::PROVIDER_NAME => {
+            Some("TYPESAFE_API_KEY")
+        }
         _ => None,
     }
 }
@@ -2113,13 +2541,13 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
                 .get(url)
                 .send()
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?
                 .error_for_status()
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             let text = resp
                 .text()
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             if serde_json::from_str::<serde_json::Value>(&text).is_err() {
                 return Err("response is not valid JSON".to_string());
             }
@@ -2136,10 +2564,10 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
             let tmp = unique_tmp_path(&path);
             tokio::fs::write(&tmp, text)
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             tokio::fs::rename(&tmp, &path)
                 .await
-                .map_err(|e| crate::llm::client::error_chain_message(&e))?;
+                .map_err(|e| crate::llm::http::error_chain_message(&e))?;
             println!("cached models.dev {} to {}", url, path.display());
             Ok(())
         }
@@ -3203,6 +3631,8 @@ struct ProviderDoctor<'a> {
     provider_source: &'a str,
     selection_source: &'a str,
     has_selection: bool,
+    routing_selection: Option<&'a str>,
+    routing_selection_source: &'a str,
     pre_model: &'a str,
     cfg_result: &'a Result<LlmConfig, Box<dyn std::error::Error>>,
     flag_base_url: Option<&'a str>,
@@ -3485,6 +3915,71 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
         if wake { "on" } else { "off" },
         wake_source,
     );
+    // Complexity router (V1): one row per value — the switch plus each
+    // tier's resolved selection (tier miss → routing.balanced: →
+    // top-level model:), sharing `from_env`'s resolution.
+    let routing = routing_resolution(d.file);
+    row(
+        out,
+        "routing",
+        if routing.enabled { "on" } else { "off" },
+        routing.enabled_origin,
+    );
+    for tier in Tier::ALL {
+        let (value, origin) = routing_tier_display(
+            tier,
+            &routing,
+            d.routing_selection,
+            d.routing_selection_source,
+        );
+        row(out, &format!("routing {}", tier.key()), &value, &origin);
+    }
+    // Routing classifier: deterministic default, Jev behind
+    // `DEX_ROUTING_CLASSIFIER=jev` (one SystemOne tier-Choice per turn,
+    // confidence-gated with deterministic fallback). Model/threshold rows
+    // only show under Jev — they resolve nothing otherwise.
+    let classifier_env = env::var("DEX_ROUTING_CLASSIFIER")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let classifier_jev = routing_classifier_is_jev();
+    row(
+        out,
+        "routing classifier",
+        if classifier_jev {
+            "jev"
+        } else {
+            "deterministic"
+        },
+        classifier_env
+            .as_deref()
+            .map(|_| "DEX_ROUTING_CLASSIFIER")
+            .unwrap_or("built-in default"),
+    );
+    if classifier_jev {
+        row(
+            out,
+            "jev model",
+            &jev_model_name(),
+            if env::var("DEX_JEV_MODEL")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                "DEX_JEV_MODEL"
+            } else {
+                "built-in default (jev-latest)"
+            },
+        );
+        row(
+            out,
+            "jev min confidence",
+            &format!("{:.2}", jev_min_confidence()),
+            if env::var("DEX_JEV_MIN_CONFIDENCE").is_ok() {
+                "DEX_JEV_MIN_CONFIDENCE"
+            } else {
+                "built-in default (0.60)"
+            },
+        );
+    }
 
     // Headers: count per layer, sources joined.
     let mut header_count = 0;
@@ -3739,6 +4234,8 @@ pub(crate) fn doctor(
             flag_base_url: flag_base_url.as_deref(),
             permission_override,
             header_overrides,
+            routing_selection: selection.as_deref(),
+            routing_selection_source: &selection_source,
             custom_route: selection_provider.is_none() && provider_name == "custom",
         },
     );
@@ -4418,7 +4915,7 @@ pub(crate) mod tests {
         assert!(!cfg.extra_headers.contains_key("X-File"));
         // The wire merge orders the layers: CLI wins over both config-file
         // spellings, file keys survive where nothing above them speaks.
-        let merged: BTreeMap<String, String> = crate::llm::client::merged_headers(&cfg)
+        let merged: BTreeMap<String, String> = crate::llm::http::merged_headers(&cfg)
             .into_iter()
             .map(|(name, value)| {
                 (
@@ -6309,6 +6806,13 @@ pub(crate) mod tests {
             crate::agent::evidence_reducer::GATE_ENV,
             crate::agent::evidence_reducer::MODEL_ENV,
             "DEX_AGENT_WAKE",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
             "OPENCODE_API_KEY",
@@ -6325,6 +6829,13 @@ pub(crate) mod tests {
         std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
         std::env::remove_var("DEX_SYSTEM_PROMPT");
         std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
+        std::env::remove_var("DEX_ROUTING");
+        std::env::remove_var("DEX_ROUTING_FAST");
+        std::env::remove_var("DEX_ROUTING_BALANCED");
+        std::env::remove_var("DEX_ROUTING_POWERFUL");
+        std::env::remove_var("DEX_ROUTING_CLASSIFIER");
+        std::env::remove_var("DEX_JEV_MODEL");
+        std::env::remove_var("DEX_JEV_MIN_CONFIDENCE");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -6367,6 +6878,11 @@ pub(crate) mod tests {
                 "thinking          (unset)                                       model default\n",
                 "permission        trusted                                       built-in default\n",
                 "agent wake        on                                            built-in default\n",
+                "routing           off                                           built-in default\n",
+                "routing fast      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing balanced  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing powerful  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing classifierdeterministic                                 built-in default\n",
                 "headers           0                                             none\n",
                 "endpoints         go, zen                                       available to /model routing\n",
                 "system prompt     default                                       built-in default\n",
@@ -6381,6 +6897,504 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(out, expected, "doctor output drifted");
+    }
+
+    /// Complexity router: off with unset tiers by default; file `routing:`
+    /// parses the switch plus per-tier selections; env beats file per tier;
+    /// an unknown tier key and a non-string tier warn and fall through
+    /// instead of erroring (the typo policy `load_config_file` uses).
+    #[test]
+    fn routing_resolution_reads_switch_tiers_and_env() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+        ] {
+            std::env::remove_var(key);
+        }
+        // Default: off, every tier unset.
+        let r = super::routing_resolution(&None);
+        assert!(!r.enabled);
+        assert_eq!(r.enabled_origin, "built-in default");
+        assert!(r.tiers.fast.is_empty());
+        assert!(r.tiers.balanced.is_empty());
+        assert!(r.tiers.powerful.is_empty());
+        // File switch + tiers; env wins one tier; garbage warns through.
+        let dir = std::env::temp_dir().join(format!("dex-routing-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/mid\n  powerful: 7\n  bogus: myprov/nope\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("DEX_ROUTING_POWERFUL", "myprov/fast");
+        let file = super::load_config_file();
+        let r = super::routing_resolution(&file);
+        assert!(r.enabled);
+        assert_eq!(r.enabled_origin, "config routing.enabled:");
+        assert_eq!(r.tiers.fast, "myprov/cheap");
+        assert_eq!(r.tier_origins.fast, "config routing.fast:");
+        assert_eq!(r.tiers.balanced, "myprov/mid");
+        // Non-string file tier ignored; env fills the gap with env origin.
+        assert_eq!(r.tiers.powerful, "myprov/fast");
+        assert_eq!(r.tier_origins.powerful, "DEX_ROUTING_POWERFUL");
+        std::env::remove_var("DEX_ROUTING_POWERFUL");
+        // Unknown tier keys are ignored: only fast/balanced/powerful exist.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/mid\n",
+        )
+        .unwrap();
+        let file = super::load_config_file();
+        let r = super::routing_resolution(&file);
+        assert!(r.tiers.fast.is_empty());
+        assert!(r.tiers.balanced.is_empty());
+        assert!(r.tiers.powerful.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SystemOne mock answering every requested id with one canned Choice;
+    /// returns the base URL for `providers.typesafe.base_url`.
+    async fn spawn_jev_mock(choice: &str, confidence: f64) -> String {
+        use axum::extract::State as AxumState;
+        use axum::routing::post;
+        use axum::Router;
+
+        let choice = choice.to_string();
+
+        #[derive(Clone)]
+        struct Mock {
+            choice: String,
+            confidence: f64,
+        }
+
+        async fn handler(
+            AxumState(mock): AxumState<Mock>,
+            body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            let empty = serde_json::Map::new();
+            let asked = body
+                .get("questions")
+                .and_then(|q| q.as_object())
+                .unwrap_or(&empty);
+            let mut out = serde_json::Map::new();
+            for id in asked.keys() {
+                out.insert(
+                    id.clone(),
+                    serde_json::json!({
+                        "type": "choice",
+                        "choice": mock.choice,
+                        "probabilities": {mock.choice.clone(): 1.0},
+                        "confidence": mock.confidence,
+                    }),
+                );
+            }
+            axum::Json(serde_json::json!({
+                "model": "jev-1.13.0",
+                "answers": out,
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }))
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/systemone", post(handler))
+                    .with_state(Mock {
+                        choice: choice.to_string(),
+                        confidence,
+                    }),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Hermetic routing setup with a Jev endpoint: returns the temp dir
+    /// (removed by the caller) after pointing `DEX_CONFIG` at a config with
+    /// routing on plus `myprov` tiers and a `typesafe` base_url.
+    fn write_jev_routing_config(jev_base_url: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dex-jev-routing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    base_url: {jev_base_url}\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/m-7\n",
+            ),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        dir
+    }
+
+    #[test]
+    fn routing_classifier_gate_defaults_off_parses_jev() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_ROUTING_CLASSIFIER"]);
+        std::env::remove_var("DEX_ROUTING_CLASSIFIER");
+        assert!(!super::routing_classifier_is_jev());
+        for v in ["jev", "JEV", " jev "] {
+            std::env::set_var("DEX_ROUTING_CLASSIFIER", v);
+            assert!(super::routing_classifier_is_jev(), "{v}");
+        }
+        std::env::set_var("DEX_ROUTING_CLASSIFIER", "");
+        assert!(!super::routing_classifier_is_jev());
+        // Unknown values warn once and stay deterministic.
+        std::env::set_var("DEX_ROUTING_CLASSIFIER", "llm");
+        assert!(!super::routing_classifier_is_jev());
+    }
+
+    #[test]
+    fn jev_model_and_confidence_knobs_default_and_parse() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_JEV_MODEL", "DEX_JEV_MIN_CONFIDENCE"]);
+        std::env::remove_var("DEX_JEV_MODEL");
+        std::env::remove_var("DEX_JEV_MIN_CONFIDENCE");
+        assert_eq!(super::jev_model_name(), "jev-latest");
+        assert_eq!(super::jev_min_confidence(), 0.6);
+        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
+        assert_eq!(super::jev_model_name(), "jev-1.13.0");
+        std::env::set_var("DEX_JEV_MODEL", "  ");
+        assert_eq!(super::jev_model_name(), "jev-latest");
+        std::env::set_var("DEX_JEV_MIN_CONFIDENCE", "0.8");
+        assert_eq!(super::jev_min_confidence(), 0.8);
+        for v in ["high", "2", "-0.1", ""] {
+            std::env::set_var("DEX_JEV_MIN_CONFIDENCE", v);
+            assert_eq!(super::jev_min_confidence(), 0.6, "{v}");
+        }
+    }
+
+    /// `route_turn_async` with `DEX_ROUTING_CLASSIFIER=jev`: a confident
+    /// Jev Choice routes — even against the deterministic grain
+    /// ("migration" is Powerful-shaped; Jev says fast here).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env stays redirected for the whole turn
+    async fn route_turn_async_uses_jev_when_gated() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
+            "TYPESAFE_API_KEY",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
+        std::env::set_var("TYPESAFE_API_KEY", "test-key");
+        let base = spawn_jev_mock("fast", 0.95).await;
+        let dir = write_jev_routing_config(&base);
+        let routed = super::route_turn_async("run the database migration", &[])
+            .await
+            .expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
+        assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
+        assert_eq!(routed.reason, "jev classifier");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Below the confidence threshold — or when Jev is unreachable — the
+    /// deterministic classifier decides, so the turn still routes.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env stays redirected for the whole turn
+    async fn route_turn_async_falls_back_below_confidence_and_on_error() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
+            "TYPESAFE_API_KEY",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
+        std::env::set_var("TYPESAFE_API_KEY", "test-key");
+        // Timid Jev: the migration prompt falls back to Powerful.
+        let base = spawn_jev_mock("fast", 0.1).await;
+        let dir = write_jev_routing_config(&base);
+        let routed = super::route_turn_async("run the database migration", &[])
+            .await
+            .expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
+        assert_ne!(routed.reason, "jev classifier");
+        // Dead endpoint: same fallback, no panic.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let dir2 = write_jev_routing_config(&format!("http://127.0.0.1:{port}"));
+        let routed = super::route_turn_async("run the database migration", &[])
+            .await
+            .expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// `dex doctor` shows the classifier plus, under Jev, the model and
+    /// threshold with origins.
+    #[test]
+    fn doctor_shows_jev_classifier_rows() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+            "DEX_JEV_MODEL",
+            "DEX_JEV_MIN_CONFIDENCE",
+        ] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-jev-doctor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        let out = super::doctor(None, None, None, &[], None);
+        let classifier: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("routing classifier"))
+            .collect();
+        assert_eq!(classifier.len(), 1, "{out}");
+        assert!(classifier[0].contains("deterministic"), "{}", classifier[0]);
+        assert!(
+            classifier[0].contains("built-in default"),
+            "{}",
+            classifier[0]
+        );
+        assert!(!out.contains("jev model"), "{out}");
+        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
+        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
+        std::env::set_var("DEX_JEV_MIN_CONFIDENCE", "0.75");
+        let out = super::doctor(None, None, None, &[], None);
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("routing classifier") && l.contains("jev")),
+            "{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("jev model")
+                && l.contains("jev-1.13.0")
+                && l.contains("DEX_JEV_MODEL")),
+            "{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("jev min confidence")
+                && l.contains("0.75")
+                && l.contains("DEX_JEV_MIN_CONFIDENCE")),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `route_turn`: `None` when routing is off; otherwise the classified
+    /// tier resolves through `routing.balanced:` → `model:`, overriding only
+    /// when the tier names a different selection (no pointless rebuilds).
+    #[test]
+    fn route_turn_classifies_and_overrides_only_on_change() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+        ] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-routing-turn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/m-7\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        // Trivial prompt → fast tier → override to the cheap model.
+        let routed = super::route_turn("fix typo", &[]).expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
+        assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
+        assert!(!routed.reason.is_empty());
+        // Ordinary work with history behind it → balanced, which already is
+        // the selection → no override, the config never rebuilds.
+        let history = vec![crate::core::types::ChatMessage::user("x".repeat(20_000))];
+        let routed =
+            super::route_turn("add a retry to the fetch call", &history).expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Balanced);
+        assert_eq!(routed.model_override, None);
+        // Migration work escalates; unset powerful falls back to balanced.
+        let routed = super::route_turn("run the database migration", &[]).expect("routing on");
+        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
+        assert_eq!(routed.model_override, None);
+        // Routing off → None even for a powerful-shaped prompt.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n",
+        )
+        .unwrap();
+        assert!(super::route_turn("run the database migration", &[]).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dex doctor` shows the routing switch plus each tier's resolved
+    /// model and origin — an unset tier displays the `balanced` fallback it
+    /// would actually use at runtime.
+    #[test]
+    fn doctor_shows_routing_tiers_with_origins() {
+        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&[
+            "DEX_CONFIG",
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+            "OPENCODE_API_KEY",
+            "XDG_CACHE_HOME",
+        ]);
+        for key in [
+            "DEX_MODEL",
+            "DEX_ROUTING",
+            "DEX_ROUTING_FAST",
+            "DEX_ROUTING_BALANCED",
+            "DEX_ROUTING_POWERFUL",
+            "DEX_ROUTING_CLASSIFIER",
+        ] {
+            std::env::remove_var(key);
+        }
+        let dir = std::env::temp_dir().join(format!("dex-routing-doc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/mid\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        let out = super::doctor(None, None, None, &[], None);
+        // Four tier rows plus the classifier row (deterministic here).
+        let routing: Vec<&str> = out.lines().filter(|l| l.starts_with("routing")).collect();
+        assert_eq!(routing.len(), 5, "{out}");
+        assert!(routing[0].contains("on"), "{}", routing[0]);
+        assert!(
+            routing[0].contains("config routing.enabled:"),
+            "{}",
+            routing[0]
+        );
+        assert!(routing[1].contains("myprov/cheap"), "{}", routing[1]);
+        assert!(
+            routing[1].contains("config routing.fast:"),
+            "{}",
+            routing[1]
+        );
+        // Unset powerful shows the balanced fallback with balanced's origin —
+        // the same chain `model_for` applies at runtime.
+        assert!(routing[3].contains("myprov/mid"), "{}", routing[3]);
+        assert!(
+            routing[3].contains("config routing.balanced:"),
+            "{}",
+            routing[3]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

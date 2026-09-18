@@ -1,6 +1,6 @@
 //! Anthropic Messages wire protocol (`anthropic-messages`). This module is
 //! the request side: history → `POST /v1/messages` body. The response side
-//! is the SSE parser in `stream::AnthropicParser`, and auth is
+//! is the SSE parser in `sse::AnthropicParser`, and auth is
 //! `provider::AuthScheme::Anthropic` — the same one-module-per-protocol
 //! split the OpenAI pair (`protocol.rs` + `stream.rs` parsers) uses, so a
 //! wire detail is only ever touched in one place.
@@ -9,10 +9,7 @@ use serde_json::{json, Value};
 
 use crate::core::types::{ChatMessage, LlmToolCall, Role};
 use crate::llm::config::LlmConfig;
-use crate::llm::protocol::{sort_wire_tools_by_name, tools_schema_parts};
-
-/// `anthropic-version` header value pinned by `AuthScheme::Anthropic`.
-pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+use crate::llm::protocol::wire_tools;
 
 /// Required `max_tokens` cap. Deliberately a constant, not a knob: it only
 /// bounds output. The models.dev catalog's `limit.output` clamps it tighter
@@ -244,37 +241,17 @@ fn tool_result_block(message: &ChatMessage) -> Value {
 }
 
 /// Shared tool schemas → Anthropic shape (`input_schema` instead of the
-/// OpenAI `function.parameters` wrapper). Borrowed slices: no merged-schema
-/// copy on the wire path. Native order is fixed; the MCP + extension tail is
-/// sorted by name at serialization so refresh completion order can't reorder
-/// the schema (deterministic bytes; adding/removing a tool still shifts the
-/// tail) — the caches already sort, this holds the invariant at the wire.
+/// OpenAI `function.parameters` wrapper). Merge + tail-sort via
+/// [`wire_tools`](crate::llm::protocol::wire_tools); only the per-tool
+/// mapping differs per wire shape.
 pub(crate) fn anthropic_tools() -> Vec<Value> {
-    let (native, mcp, ext) = tools_schema_parts();
-    let mut out: Vec<Value> = native
-        .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "input_schema": tool.function.parameters,
-            })
+    wire_tools(|tool| {
+        json!({
+            "name": tool.function.name,
+            "description": tool.function.description,
+            "input_schema": tool.function.parameters,
         })
-        .collect();
-    let mut tail: Vec<Value> = mcp
-        .iter()
-        .chain(ext.iter())
-        .map(|tool| {
-            json!({
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "input_schema": tool.function.parameters,
-            })
-        })
-        .collect();
-    sort_wire_tools_by_name(&mut tail);
-    out.extend(tail);
-    out
+    })
 }
 
 #[cfg(test)]
