@@ -269,6 +269,24 @@ def main():
 
     siblings = set(spec.get("siblings", []))
 
+    # facade_refs: push-down splits (mod.rs -> existing children). Names
+    # available at the origin-module level (kept re-exports, mod decls,
+    # resident + moved defs): children import them as `super::Name`.
+    level_names = set()
+    if spec.get("facade_refs"):
+        for s, e in spec.get("keep", []):
+            for i in range(s, e + 1):
+                m = re.match(r"\s*pub(?:\([^)]*\))?\s+use\s+(.+);", lines[i])
+                if m:
+                    for _, nm in expand_use(m.group(1)):
+                        level_names.add(nm)
+                m = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", lines[i])
+                if m:
+                    level_names.add(m.group(1))
+        for nm, (ln, vis) in file_defs.items():
+            if vis in ("pub", "pub(crate)"):
+                level_names.add(nm)
+
     def absolutize_for_child(raw_path):
         segs = raw_path.split("::")
         if segs[0] == "super":
@@ -312,6 +330,9 @@ def main():
                     tgt = "super::" + home_of[nm] + "::" + nm
                 else:
                     tgt = origin_prefix + "::" + nm
+                (gated_imports if nm not in used_nontest else imports).append(tgt)
+            elif nm in level_names:
+                tgt = "super::" + nm
                 (gated_imports if nm not in used_nontest else imports).append(tgt)
         body = []
         for imp in sorted(set(imports)):
