@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::core::types::PermissionMode;
 
 #[derive(Clone)]
-pub(crate) struct Args {
+pub struct Args {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub session_path: Option<PathBuf>,
@@ -38,7 +38,7 @@ pub(crate) struct Args {
 
 /// The mode in which the binary was invoked.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
+pub enum Mode {
     /// Start a headless HTTP server (`dex serve [host:port|port]`).
     Serve { bind: String },
     /// Start the TUI connected to a remote daemon (`dex connect <url>`).
@@ -83,7 +83,7 @@ pub(crate) enum Mode {
     },
 }
 
-pub(crate) fn parse_args() -> Args {
+pub fn parse_args() -> Args {
     let mut base_url = None;
     let mut model = None;
     let mut session_path = None;
@@ -166,7 +166,7 @@ pub(crate) fn parse_args() -> Args {
 }
 
 /// Determine the invocation mode from parsed args.
-pub(crate) fn resolve_mode(args: &Args) -> Mode {
+pub fn resolve_mode(args: &Args) -> Mode {
     // Help/version win before anything else so `--help` never falls through
     // to a OneShot LLM turn (previously `dex --help` burned a network call).
     match args.rest.first().map(|s| s.as_str()) {

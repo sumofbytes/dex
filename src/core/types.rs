@@ -578,7 +578,7 @@ pub(crate) struct StreamFunctionCall {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PermissionMode {
+pub enum PermissionMode {
     /// Permit reads, but reject all mutations and shell commands.
     ReadOnly,
     /// Prompt before writes and edits; reads are always permitted.
