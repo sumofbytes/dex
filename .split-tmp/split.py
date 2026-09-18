@@ -130,7 +130,7 @@ def top_defs(lines, s, e):
             continue
         if BLOCK_OPEN_RE.match(ln):
             m0 = DEF_RE.match(ln)
-            if m0 and m0.group(2) in ("struct", "enum", "union"):
+            if m0 and m0.group(2) in ("struct", "enum", "union", "trait"):
                 defs[m0.group(3)] = (i, (m0.group(1) or "").strip())
             in_block = ln.count("{") - ln.count("}")
             continue
@@ -223,6 +223,9 @@ def main():
             line_home[i] = None
     for i in range(1, n + 1):
         for m in re.finditer(r"\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", code_text(lines[i])):
+            method_callers.setdefault(m.group(1), set()).add(line_home.get(i))
+    for i in range(1, n + 1):
+        for m in re.finditer(r"::([A-Za-z_][A-Za-z0-9_]*)\s*\(", code_text(lines[i])):
             method_callers.setdefault(m.group(1), set()).add(line_home.get(i))
     method_upgrades = set()
     for mn, callers in method_callers.items():
@@ -328,9 +331,26 @@ def main():
             chunk = rewrite_super(chunk, t)
             body.append(chunk)
         text = "\n".join(body).rstrip("\n") + "\n"
+        blines = text.split("\n")
+        inherent = {}
+        mode, depth = None, 0
+        for _bl in blines:
+            if depth == 0:
+                if re.match(r"^trait\b", _bl):
+                    mode = "trait"
+                elif re.match(r"^impl\b.*\bfor\b", _bl):
+                    mode = "traitimpl"
+                elif re.match(r"^impl\b", _bl):
+                    mode = "inherent"
+                else:
+                    mode = None
+                depth = _bl.count("{") - _bl.count("}")
+            else:
+                depth += _bl.count("{") - _bl.count("}")
+            inherent[id(_bl)] = (mode == "inherent")
         # apply visibility upgrades to defs owned by this child
         out = []
-        for ln in text.split("\n"):
+        for ln in blines:
             m = DEF_RE.match(ln)
             if m and m.group(3) in upgraded and home_of.get(m.group(3)) == name:
                 ln = "pub(crate) " + ln.lstrip()
@@ -341,6 +361,9 @@ def main():
                 ln,
             )
             if m2 and (name, m2.group(2)) in method_upgrades and "pub" not in ln.split("fn")[0]:
+                if not inherent.get(id(ln), False):
+                    out.append(ln)
+                    continue
                 ln = m2.group(1) + "pub(crate) " + ln.lstrip()
             out.append(ln)
         outputs[name] = "\n".join(out)
@@ -439,6 +462,59 @@ def main():
             ext = any(u != home for u in users)
         if ext:
             field_upgrade_structs.add(nm)
+
+    # construction + field access outside home also force field visibility
+    struct_home = {}
+    for ch in spec["children"]:
+        for s, e in ch["ranges"]:
+            for nm in top_defs(lines, s, e):
+                struct_home[nm] = ch["name"]
+    dot_uses = {}
+    construct_uses = {}
+    for i in range(1, n + 1):
+        home = line_home.get(i)
+        code = DOT_IDENT_RE.sub(".", code_text(lines[i]))
+        for m in re.finditer(r"\.([A-Za-z_][A-Za-z0-9_]*)", code_text(lines[i])):
+            dot_uses.setdefault(m.group(1), set()).add(home)
+        for m in re.finditer(r"\b([A-Z][A-Za-z0-9_]*)\s*\{", code):
+            construct_uses.setdefault(m.group(1), set()).add(home)
+    # field names per struct (braced bodies)
+    struct_fields = {}
+    i = 1
+    while i <= n:
+        m = re.match(
+            r"^(?:pub(?:\s*\([^)]*\))?\s+)?(struct|union)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)[^;{]*\{\s*$",
+            lines[i],
+        )
+        if m:
+            nm, fields, j = m.group(2), [], i + 1
+            while j <= n and not re.match(r"^\}", lines[j]):
+                fm = re.match(r"^\s+(?:#[^\n]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:", lines[j])
+                if fm:
+                    fields.append(fm.group(1))
+                j += 1
+            struct_fields[nm] = fields
+            i = j
+        i += 1
+    for nm, fields in struct_fields.items():
+        home = struct_home.get(nm)
+        for f in fields:
+            users = dot_uses.get(f, set())
+            if home is None:
+                ext = any(u is not None for u in users)
+            else:
+                ext = any(u != home for u in users)
+            if ext:
+                field_upgrade_structs.add(nm)
+                break
+        if nm not in field_upgrade_structs:
+            users = construct_uses.get(nm, set())
+            if home is None:
+                ext = any(u is not None for u in users)
+            else:
+                ext = any(u != home for u in users)
+            if ext:
+                field_upgrade_structs.add(nm)
 
     def upgrade_fields(text):
         out_lines, cur, upgrading = [], None, False
