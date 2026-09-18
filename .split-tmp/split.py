@@ -124,6 +124,9 @@ def top_defs(lines, s, e):
             in_block += ln.count("{") - ln.count("}")
             continue
         if BLOCK_OPEN_RE.match(ln):
+            m0 = DEF_RE.match(ln)
+            if m0 and m0.group(2) in ("struct", "enum", "union"):
+                defs[m0.group(3)] = (i, (m0.group(1) or "").strip())
             in_block = ln.count("{") - ln.count("}")
             continue
         m = DEF_RE.match(ln)
@@ -132,18 +135,17 @@ def top_defs(lines, s, e):
     return defs
 
 
-def region_idents(lines, ranges, extra_skip=()):
-    """Idents used in ranges minus names defined in those same ranges."""
-    used, defined = set(), set(extra_skip)
+DOT_IDENT_RE = re.compile(r"\.\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*")
+
+def region_idents(lines, ranges):
+    """Idents used in ranges minus col-0 names defined in those same ranges."""
+    used, defined = set(), set()
     for s, e in ranges:
         for ln in lines[s : e + 1]:
-            ln = code_text(ln)
-            m = re.match(
-                r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+|unsafe\s+)?(struct|enum|union|fn|const|static|type|trait|mod)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)",
-                ln,
-            )
+            ln = DOT_IDENT_RE.sub(".", code_text(ln))
+            m = DEF_RE.match(ln)
             if m:
-                defined.add(m.group(2))
+                defined.add(m.group(3))
             for im in IDENT_RE.finditer(ln):
                 used.add(im.group(1))
     return used - defined - KEYWORDS - SKIP_IDENTS
@@ -193,14 +195,6 @@ def main():
                 if nm in home_of:
                     fail(f"duplicate top-level def {nm}")
                 home_of[nm] = ch["name"]
-    method_names = set()
-    for i in range(1, n + 1):
-        m = re.match(
-            r"^\s+(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+|unsafe\s+)?fn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)",
-            lines[i],
-        )
-        if m:
-            method_names.add(m.group(1))
 
     # Method defs per home (for cross-module method calls).
     method_home = {}
@@ -246,7 +240,7 @@ def main():
     for i in range(1, n + 1):
         if covered[i] == 0:
             continue
-        for im in IDENT_RE.finditer(code_text(lines[i])):
+        for im in IDENT_RE.finditer(DOT_IDENT_RE.sub(".", code_text(lines[i]))):
             used_where.setdefault(im.group(1), set()).add(region_of.get(i))
     upgraded = set()
     for nm, (ln, vis) in file_defs.items():
@@ -294,7 +288,7 @@ def main():
         ]
         used_all, used_nontest = set(), set()
         for s, e, t in ranges_test:
-            ids = region_idents(lines, [(s, e)], method_names)
+            ids = region_idents(lines, [(s, e)])
             used_all |= ids
             if not t:
                 used_nontest |= ids
@@ -351,8 +345,8 @@ def main():
         parent.extend(lines[s : e + 1])
     stay_nontest = [st["range"] for st in spec.get("stay", []) if not st.get("test")]
     stay_test = [st["range"] for st in spec.get("stay", []) if st.get("test")]
-    used_nt = region_idents(lines, stay_nontest, method_names)
-    used_t = region_idents(lines, stay_test, method_names)
+    used_nt = region_idents(lines, stay_nontest)
+    used_t = region_idents(lines, stay_test)
     kept_names = set()
     for s, e in spec.get("keep", []):
         for i in range(s, e + 1):
