@@ -20,10 +20,10 @@ use super::state::WorkerMessage;
 use super::state::LAUNCH_START;
 use crate::cli::Args;
 use crate::client::http::DaemonClient;
-use crate::core::types::ApiProtocol;
-use crate::core::types::PermissionMode;
-use crate::core::types::Provider;
+use crate::protocol::ApiProtocol;
 use crate::protocol::DaemonInfo;
+use crate::protocol::PermissionMode;
+use crate::protocol::Provider;
 use crate::session::Session;
 use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableBracketedPaste;
@@ -102,7 +102,7 @@ pub(crate) fn push_skills_listing(app: &mut App) {
 
 /// The session-start skills line: names comma-separated on a single row, all
 /// muted like the DEX banner above it. `None` when no skills are loaded.
-pub(crate) fn skills_listing_line(skills: &[crate::core::types::Skill]) -> Option<Line<'static>> {
+pub(crate) fn skills_listing_line(skills: &[crate::protocol::Skill]) -> Option<Line<'static>> {
     let (first, rest) = skills.split_first()?;
     let mut names = first.name.clone();
     for skill in rest {
@@ -268,7 +268,7 @@ pub(crate) fn bootstrap(
         messages: Vec::new(),
         tool_state: crate::agent::state::ToolState::default(),
         session: Session::in_memory(info.cwd.clone()),
-        plan: crate::core::types::Plan::default(),
+        plan: crate::protocol::Plan::default(),
         skills: Vec::new(),
         turn_start: 0,
         cwd: info.cwd.clone(),
@@ -476,7 +476,7 @@ pub(crate) fn bootstrap(
     // the load call re-discovers on the daemon side.
     remote.app.skills = daemon_skills
         .into_iter()
-        .map(|info| crate::core::types::Skill {
+        .map(|info| crate::protocol::Skill {
             name: info.name,
             description: info.description,
             path: std::path::PathBuf::from(""),

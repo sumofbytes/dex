@@ -222,7 +222,7 @@ mod tests {
         // The counterpart of `take_session_pendings`: parent approvals stay
         // (their turn owns them); children leave so their parked prompts
         // deny when the session goes away.
-        use crate::core::types::ApprovalDecision;
+        use crate::protocol::ApprovalDecision;
         let state = DaemonState::new();
         let (tx_parent, mut rx_parent) = tokio::sync::mpsc::channel(1);
         let (tx_child, mut rx_child) = tokio::sync::mpsc::channel(1);

@@ -7,9 +7,9 @@
 
 use serde_json::{json, Value};
 
-use crate::core::types::{ChatMessage, LlmToolCall, Role};
 use crate::llm::config::LlmConfig;
 use crate::llm::protocol::wire_tools;
+use crate::protocol::{ChatMessage, LlmToolCall, Role};
 
 /// Required `max_tokens` cap. Deliberately a constant, not a knob: it only
 /// bounds output. The models.dev catalog's `limit.output` clamps it tighter
@@ -257,7 +257,7 @@ pub(crate) fn anthropic_tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::FunctionCall;
+    use crate::protocol::FunctionCall;
 
     #[test]
     fn messages_url_appends_version_segment_once() {

@@ -20,8 +20,8 @@ use super::state::RemoteApp;
 use super::state::WorkerMessage;
 use super::worker::try_reconnect;
 use super::worker::Reconnect;
-use crate::core::types::ApprovalDecision as CoreApprovalDecision;
-use crate::core::types::SinkLine;
+use crate::protocol::ApprovalDecision;
+use crate::protocol::SinkLine;
 use crate::protocol::StreamEvent;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyModifiers;
@@ -164,7 +164,7 @@ fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Deny the pending approval and cancel the turn; another Ctrl+C
             // once idle quits.
-            resolve_approval(app, CoreApprovalDecision::Deny);
+            resolve_approval(app, ApprovalDecision::Deny);
             request_cancel(remote);
         }
         KeyCode::Up | KeyCode::Left => {
@@ -178,22 +178,22 @@ fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
             }
         }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            resolve_approval(app, CoreApprovalDecision::Once);
+            resolve_approval(app, ApprovalDecision::AllowOnce);
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
-            resolve_approval(app, CoreApprovalDecision::Session);
+            resolve_approval(app, ApprovalDecision::AllowSession);
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            resolve_approval(app, CoreApprovalDecision::Deny);
+            resolve_approval(app, ApprovalDecision::Deny);
         }
         KeyCode::Enter => {
             let decision = app
                 .pending_approvals
                 .first()
                 .map(|approval| match approval.selected {
-                    0 => CoreApprovalDecision::Once,
-                    1 => CoreApprovalDecision::Session,
-                    _ => CoreApprovalDecision::Deny,
+                    0 => ApprovalDecision::AllowOnce,
+                    1 => ApprovalDecision::AllowSession,
+                    _ => ApprovalDecision::Deny,
                 });
             if let Some(decision) = decision {
                 resolve_approval(app, decision);

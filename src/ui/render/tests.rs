@@ -2,7 +2,7 @@
 
 use super::super::status::{cell_safe, footer_text, status_pieces, ui_status};
 use super::*;
-use crate::core::types::{ApiProtocol, PermissionMode, Provider};
+use crate::protocol::{ApiProtocol, PermissionMode, Provider};
 use ratatui::backend::TestBackend;
 use std::time::Instant;
 
@@ -272,7 +272,7 @@ fn test_app() -> super::super::App {
         assistant_open: false,
         show_thinking: false,
         thinking_open: false,
-        plan: crate::core::types::Plan::default(),
+        plan: crate::protocol::Plan::default(),
         assistant_pending: String::new(),
         assistant_gap: crate::core::markdown::GapState::new(),
         stream_last_flush: std::time::Instant::now(),
@@ -766,7 +766,7 @@ fn streamed_flush_merges_into_display_without_losing_blocks() {
 
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::Assistant("more text".into()),
+        crate::protocol::SinkLine::Assistant("more text".into()),
     );
     terminal
         .draw(|frame| view(frame, &mut app))
@@ -815,7 +815,7 @@ fn display_cache_extends_incrementally_on_tail_append() {
     app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::Assistant("more text".into()),
+        crate::protocol::SinkLine::Assistant("more text".into()),
     );
     terminal
         .draw(|frame| view(frame, &mut app))
@@ -1433,14 +1433,14 @@ fn assistant_text_is_gapped_after_tool_preview() {
     let mut app = test_app();
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::ToolInput {
+        crate::protocol::SinkLine::ToolInput {
             id: String::new(),
             input: "bash grep foo src".into(),
         },
     );
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::ToolOutput {
+        crate::protocol::SinkLine::ToolOutput {
             id: String::new(),
             name: "bash".into(),
             summary: "v 1 match".into(),
@@ -1453,7 +1453,7 @@ fn assistant_text_is_gapped_after_tool_preview() {
     app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::Assistant("Looked at src/main.rs.".into()),
+        crate::protocol::SinkLine::Assistant("Looked at src/main.rs.".into()),
     );
 
     // Transcript: [Assistant(hello), Tool, Assistant(Looked at)]
@@ -1585,7 +1585,7 @@ fn input_ghost_with_transcript_interaction() {
     let mut app = test_app();
     // Fill transcript with several blocks to make it scrollable
     for i in 0..5 {
-        super::super::append_sink_line(&mut app, crate::core::types::SinkLine::Assistant(format!("Assistant message {i} with some long text that will wrap across multiple lines to fill the transcript area and test scrolling behavior. {}", long_input)));
+        super::super::append_sink_line(&mut app, crate::protocol::SinkLine::Assistant(format!("Assistant message {i} with some long text that will wrap across multiple lines to fill the transcript area and test scrolling behavior. {}", long_input)));
     }
     app.input = InputField::from_text(long_input);
     terminal.draw(|f| view(f, &mut app)).expect("frame1");
@@ -1745,14 +1745,14 @@ fn ghost_key_facts_does_not_overflow_or_overlap_bottom() {
         ] {
             super::super::append_sink_line(
                 &mut app,
-                crate::core::types::SinkLine::ToolInput {
+                crate::protocol::SinkLine::ToolInput {
                     id: String::new(),
                     input: format!("read /tmp/dex/src/ui/{name}"),
                 },
             );
             super::super::append_sink_line(
                 &mut app,
-                crate::core::types::SinkLine::ToolOutput {
+                crate::protocol::SinkLine::ToolOutput {
                     id: String::new(),
                     name: "read".into(),
                     summary: "10 lines".into(),
@@ -1768,13 +1768,13 @@ fn ghost_key_facts_does_not_overflow_or_overlap_bottom() {
         }
         super::super::append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant(
+            crate::protocol::SinkLine::Assistant(
                 "Evidence map 80% complete - pulling final modules to re-score the board.".into(),
             ),
         );
         super::super::append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant(ghost.into()),
+            crate::protocol::SinkLine::Assistant(ghost.into()),
         );
         app.input = InputField::from_text("try a different approach");
         terminal.draw(|f| view(f, &mut app)).unwrap();
@@ -1857,12 +1857,12 @@ fn consecutive_assistant_chunks_do_not_add_gaps() {
     app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::Assistant("first".into()),
+        crate::protocol::SinkLine::Assistant("first".into()),
     );
     app.stream_last_flush = std::time::Instant::now() - std::time::Duration::from_millis(500);
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::Assistant("second".into()),
+        crate::protocol::SinkLine::Assistant("second".into()),
     );
     // [Assistant(hello)] + streamed Assistant => two blocks, tail holds both.
     assert_eq!(app.transcript.len(), 2);
@@ -1903,14 +1903,14 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     super::super::render_user_prompt(&mut app, "can you check pillar 1 form harness.md");
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::ToolInput {
+        crate::protocol::SinkLine::ToolInput {
             id: String::new(),
             input: "read HARNESS.md".into(),
         },
     );
     super::super::append_sink_line(
         &mut app,
-        crate::core::types::SinkLine::ToolOutput {
+        crate::protocol::SinkLine::ToolOutput {
             id: String::new(),
             name: "read".into(),
             summary: "v 313 lines".into(),
@@ -2304,10 +2304,7 @@ fn streamed_table_renders_as_one_block() {
         "All good.",
     ];
     for line in lines {
-        super::super::append_sink_line(
-            &mut app,
-            crate::core::types::SinkLine::Assistant(line.into()),
-        );
+        super::super::append_sink_line(&mut app, crate::protocol::SinkLine::Assistant(line.into()));
     }
     super::super::flush_assistant(&mut app);
     let text: String = app

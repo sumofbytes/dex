@@ -22,10 +22,10 @@ use crate::agent::r#loop::process_turn;
 use crate::agent::r#loop::AgentRuntime;
 use crate::agent::state::CancellationSource;
 use crate::agent::state::ToolState;
-use crate::core::types::ApprovalRequest;
-use crate::core::types::ChatMessage;
-use crate::core::types::SinkLine;
 use crate::llm::config::LlmConfig;
+use crate::protocol::ApprovalRequest;
+use crate::protocol::ChatMessage;
+use crate::protocol::SinkLine;
 use crate::runtime::console::CancellationToken;
 use crate::runtime::console::Console;
 use crate::session::load_llm_messages_from_session;
@@ -706,7 +706,7 @@ async fn child_run(
             // The persona (System role) is rebuilt per generation, never
             // journaled — same rule the fresh path follows.
             for message in &messages {
-                if message.role != crate::core::types::Role::System {
+                if message.role != crate::protocol::Role::System {
                     let _ = session.append_message(message);
                 }
             }

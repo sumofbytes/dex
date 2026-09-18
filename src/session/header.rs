@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 
 pub(crate) const SESSION_VERSION: u32 = 1;
 

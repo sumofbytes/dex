@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::subagent::{AgentId, AgentManager};
-use crate::core::types::{ApprovalDecision, ApprovalRequest};
+use crate::protocol::{ApprovalDecision, ApprovalRequest};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 
 use super::{journal_event, lock_map, DaemonState, PendingApproval};

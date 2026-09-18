@@ -18,10 +18,10 @@ use crate::agent::tokens::{
 use crate::core::format::{
     model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
 };
-use crate::core::types::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, StopReason, Usage};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::transport::sse::Turn;
+use crate::protocol::{ChatMessage, LlmToolCall, QueueMsg, Role, SinkLine, StopReason, Usage};
 use crate::runtime::console::{
     with_console, Console, SpinnerGuard, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK,
     TOOL_OUTPUT_COLOR,
@@ -920,7 +920,7 @@ where
     } else {
         let appendix = appends.join("\n\n");
         match rt.messages.first_mut() {
-            Some(first) if first.role == crate::core::types::Role::System => {
+            Some(first) if first.role == crate::protocol::Role::System => {
                 let original = first.content.clone();
                 first.content = Some(format!(
                     "{}\n\n--- Extensions ---\n{}",
@@ -975,7 +975,7 @@ where
     // Restore the System message the appendix rode on: per-turn scope.
     if let Some(original) = saved_system {
         if let Some(first) = messages.first_mut() {
-            if first.role == crate::core::types::Role::System {
+            if first.role == crate::protocol::Role::System {
                 first.content = original;
             }
         }
@@ -1383,8 +1383,8 @@ pub(crate) mod tests {
     pub(crate) static TEST_TURN_ENV_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
     use crate::agent::state::{CancellationSource, ToolState};
-    use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
     use crate::llm::client::ModelClient;
+    use crate::protocol::{ApiProtocol, ChatMessage, PermissionMode, Provider};
 
     #[derive(Clone)]
     struct MockModel;
@@ -1672,10 +1672,10 @@ pub(crate) mod tests {
             let message = if round == 0 {
                 ChatMessage::assistant_calls(
                     None,
-                    vec![crate::core::types::LlmToolCall {
+                    vec![crate::protocol::LlmToolCall {
                         id: "call-1".into(),
                         call_type: "function".into(),
-                        function: crate::core::types::FunctionCall {
+                        function: crate::protocol::FunctionCall {
                             name: "bash".into(),
                             arguments: r#"{"command":"echo line-one; echo line-two; echo line-three; echo line-four"}"#.into(),
                         },
@@ -1778,10 +1778,10 @@ pub(crate) mod tests {
             let call = |name: &str, args: String, id: &str| {
                 ChatMessage::assistant_calls(
                     None,
-                    vec![crate::core::types::LlmToolCall {
+                    vec![crate::protocol::LlmToolCall {
                         id: id.into(),
                         call_type: "function".into(),
-                        function: crate::core::types::FunctionCall {
+                        function: crate::protocol::FunctionCall {
                             name: name.into(),
                             arguments: args,
                         },
@@ -1906,18 +1906,18 @@ pub(crate) mod tests {
     async fn conflict_serialize_still_serializes_same_path_edits() {
         // TDD Phase 2: same-path edits must take the serialize path.
         let calls = vec![
-            crate::core::types::LlmToolCall {
+            crate::protocol::LlmToolCall {
                 id: "a".into(),
                 call_type: "function".into(),
-                function: crate::core::types::FunctionCall {
+                function: crate::protocol::FunctionCall {
                     name: "edit".into(),
                     arguments: r#"{"path":"same.rs"}"#.into(),
                 },
             },
-            crate::core::types::LlmToolCall {
+            crate::protocol::LlmToolCall {
                 id: "b".into(),
                 call_type: "function".into(),
-                function: crate::core::types::FunctionCall {
+                function: crate::protocol::FunctionCall {
                     name: "edit".into(),
                     arguments: r#"{"path":"same.rs"}"#.into(),
                 },
@@ -1925,18 +1925,18 @@ pub(crate) mod tests {
         ];
         assert!(tool_calls_conflict(&calls));
         let different = vec![
-            crate::core::types::LlmToolCall {
+            crate::protocol::LlmToolCall {
                 id: "a".into(),
                 call_type: "function".into(),
-                function: crate::core::types::FunctionCall {
+                function: crate::protocol::FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"a.rs"}"#.into(),
                 },
             },
-            crate::core::types::LlmToolCall {
+            crate::protocol::LlmToolCall {
                 id: "b".into(),
                 call_type: "function".into(),
-                function: crate::core::types::FunctionCall {
+                function: crate::protocol::FunctionCall {
                     name: "read".into(),
                     arguments: r#"{"path":"b.rs"}"#.into(),
                 },
@@ -1952,10 +1952,10 @@ pub(crate) mod tests {
         // calls — a slow first worker must never shift attribution onto the
         // second call's result.
         use crate::tools::Policy;
-        let call = |id: &str, path: &str| crate::core::types::LlmToolCall {
+        let call = |id: &str, path: &str| crate::protocol::LlmToolCall {
             id: id.into(),
             call_type: "function".into(),
-            function: crate::core::types::FunctionCall {
+            function: crate::protocol::FunctionCall {
                 name: "read".into(),
                 arguments: format!(r#"{{"path":"{path}"}}"#),
             },
@@ -1996,10 +1996,10 @@ pub(crate) mod tests {
         // A `write`/`edit` carrying `then_run` runs a shell command, so the
         // batch must serialize even across distinct paths — otherwise N edits
         // fan out N concurrent shells.
-        let call = |name: &str, args: &str| crate::core::types::LlmToolCall {
+        let call = |name: &str, args: &str| crate::protocol::LlmToolCall {
             id: name.into(),
             call_type: "function".into(),
-            function: crate::core::types::FunctionCall {
+            function: crate::protocol::FunctionCall {
                 name: name.into(),
                 arguments: args.into(),
             },
@@ -2073,10 +2073,10 @@ pub(crate) mod tests {
                 Ok(Turn {
                     message: ChatMessage::assistant_calls(
                         Some("thinking about it".to_string()),
-                        vec![crate::core::types::LlmToolCall {
+                        vec![crate::protocol::LlmToolCall {
                             id: format!("c{}", uuid::Uuid::new_v4().simple()),
                             call_type: "function".into(),
-                            function: crate::core::types::FunctionCall {
+                            function: crate::protocol::FunctionCall {
                                 name: "read".into(),
                                 arguments: r#"{"path":"README.md"}"#.into(),
                             },
@@ -2287,10 +2287,10 @@ pub(crate) mod tests {
                 let message = if round == 0 {
                     ChatMessage::assistant_calls(
                         None,
-                        vec![crate::core::types::LlmToolCall {
+                        vec![crate::protocol::LlmToolCall {
                             id: "call-1".into(),
                             call_type: "function".into(),
-                            function: crate::core::types::FunctionCall {
+                            function: crate::protocol::FunctionCall {
                                 name: "bash".into(),
                                 arguments: r#"{"command":"sleep 30"}"#.into(),
                             },
@@ -2377,10 +2377,10 @@ pub(crate) mod tests {
             let message = if round < self.commands.len() {
                 ChatMessage::assistant_calls(
                     None,
-                    vec![crate::core::types::LlmToolCall {
+                    vec![crate::protocol::LlmToolCall {
                         id: format!("call-{round}"),
                         call_type: "function".into(),
-                        function: crate::core::types::FunctionCall {
+                        function: crate::protocol::FunctionCall {
                             name: "bash".into(),
                             arguments: format!(r#"{{"command":"{}"}}"#, self.commands[round]),
                         },
@@ -2522,18 +2522,18 @@ pub(crate) mod tests {
                 ChatMessage::assistant_calls(
                     None,
                     vec![
-                        crate::core::types::LlmToolCall {
+                        crate::protocol::LlmToolCall {
                             id: "call-1".into(),
                             call_type: "function".into(),
-                            function: crate::core::types::FunctionCall {
+                            function: crate::protocol::FunctionCall {
                                 name: "read".into(),
                                 arguments: r#"{"path":"Cargo.toml"}"#.into(),
                             },
                         },
-                        crate::core::types::LlmToolCall {
+                        crate::protocol::LlmToolCall {
                             id: "call-2".into(),
                             call_type: "function".into(),
-                            function: crate::core::types::FunctionCall {
+                            function: crate::protocol::FunctionCall {
                                 name: "bash".into(),
                                 arguments: r#"{"command":"echo hi"}"#.into(),
                             },

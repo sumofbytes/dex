@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 #[cfg(test)]
-use crate::core::types::SinkLine;
+use crate::protocol::SinkLine;
 #[cfg(test)]
 use crate::session::Session;
 #[cfg(test)]
@@ -306,10 +306,7 @@ mod tests {
         // Throttle window open, so every delta bumps the version.
         app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         for chunk in ["Let me ", "think."] {
-            append_sink_line(
-                &mut app,
-                crate::core::types::SinkLine::Thinking(chunk.into()),
-            );
+            append_sink_line(&mut app, crate::protocol::SinkLine::Thinking(chunk.into()));
         }
         assert!(app.thinking_open, "streaming deltas keep the block open");
         // The thinking bumps reset the shared throttle clock; reopen the
@@ -317,7 +314,7 @@ mod tests {
         app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant("done".into()),
+            crate::protocol::SinkLine::Assistant("done".into()),
         );
         assert!(
             !app.thinking_open,
@@ -339,10 +336,7 @@ mod tests {
     fn thinking_only_deltas_stay_in_one_block() {
         let mut app = test_app();
         for chunk in ["a", "b", "c"] {
-            append_sink_line(
-                &mut app,
-                crate::core::types::SinkLine::Thinking(chunk.into()),
-            );
+            append_sink_line(&mut app, crate::protocol::SinkLine::Thinking(chunk.into()));
         }
         assert_eq!(app.transcript.len(), 1);
         assert!(
@@ -358,7 +352,7 @@ mod tests {
         app.stream_last_flush = Instant::now();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant("hello".into()),
+            crate::protocol::SinkLine::Assistant("hello".into()),
         );
         assert_eq!(app.assistant_pending, "hello\n");
         assert!(app.transcript.is_empty(), "nothing renders mid-window");
@@ -367,7 +361,7 @@ mod tests {
         app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant("world".into()),
+            crate::protocol::SinkLine::Assistant("world".into()),
         );
         assert!(app.assistant_pending.is_empty());
         assert!(app.assistant_open);
@@ -392,12 +386,12 @@ mod tests {
         app.stream_last_flush = Instant::now();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant("tail".into()),
+            crate::protocol::SinkLine::Assistant("tail".into()),
         );
         assert_eq!(app.assistant_pending, "tail\n");
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput {
+            crate::protocol::SinkLine::ToolInput {
                 id: String::new(),
                 input: "bash echo".into(),
             },
@@ -427,13 +421,13 @@ mod tests {
         app.stream_last_flush = due();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant("intro text".into()),
+            crate::protocol::SinkLine::Assistant("intro text".into()),
         );
         assert!(app.assistant_open);
         app.stream_last_flush = due();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::Assistant("## Heading".into()),
+            crate::protocol::SinkLine::Assistant("## Heading".into()),
         );
         let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
             panic!("expected assistant block");
@@ -460,10 +454,7 @@ mod tests {
         let due = || Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
         for line in ["para one", "", "", "", "para two"] {
             app.stream_last_flush = due();
-            append_sink_line(
-                &mut app,
-                crate::core::types::SinkLine::Assistant(line.into()),
-            );
+            append_sink_line(&mut app, crate::protocol::SinkLine::Assistant(line.into()));
         }
         flush_assistant(&mut app);
         let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
@@ -488,7 +479,7 @@ mod tests {
     fn thinking_closes_on_user_prompt() {
         // Steering-style interleave: a user prompt lands mid-turn.
         let mut app = test_app();
-        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("h".into()));
+        append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("h".into()));
         assert!(app.thinking_open);
         render_user_prompt(&mut app, "steer");
         assert!(!app.thinking_open);
@@ -497,7 +488,7 @@ mod tests {
     #[test]
     fn thinking_close_records_elapsed_duration() {
         let mut app = test_app();
-        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("h".into()));
+        append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("h".into()));
         assert!(matches!(
             &app.transcript[0],
             TranscriptBlock::Thinking { elapsed: None, .. }
@@ -524,7 +515,7 @@ mod tests {
         // A tool block lands after it: the indicator must move below it.
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput {
+            crate::protocol::SinkLine::ToolInput {
                 id: String::new(),
                 input: "bash cargo test".into(),
             },
@@ -565,7 +556,7 @@ mod tests {
         for i in 0..4000 {
             append_sink_line(
                 &mut app,
-                crate::core::types::SinkLine::Thinking(format!("{i:06}abcdefghij")),
+                crate::protocol::SinkLine::Thinking(format!("{i:06}abcdefghij")),
             );
         }
         let text = match app.transcript.last() {
@@ -664,8 +655,8 @@ mod tests {
         let mut app = test_app();
         app.busy = true;
         start_activity(&mut app);
-        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("a".into()));
-        append_sink_line(&mut app, crate::core::types::SinkLine::Thinking("b".into()));
+        append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("a".into()));
+        append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("b".into()));
         // One thinking block + trailing spinner, not a fragment per delta.
         assert_eq!(app.transcript.len(), 2);
         assert!(matches!(
@@ -679,7 +670,7 @@ mod tests {
         // Non-thinking line settles the duration even with the spinner last.
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput {
+            crate::protocol::SinkLine::ToolInput {
                 id: String::new(),
                 input: "bash x".into(),
             },
@@ -700,14 +691,14 @@ mod tests {
         start_activity(&mut app);
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput {
+            crate::protocol::SinkLine::ToolInput {
                 id: String::new(),
                 input: "bash cargo test".into(),
             },
         );
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolOutput {
+            crate::protocol::SinkLine::ToolOutput {
                 name: "bash".into(),
                 id: String::new(),
                 summary: "ok".into(),
@@ -739,11 +730,11 @@ mod tests {
         // completion order is deliberate — tail-pairing would attach B's
         // summary to A's block.
         let mut app = test_app();
-        let input = |id: &str, text: &str| crate::core::types::SinkLine::ToolInput {
+        let input = |id: &str, text: &str| crate::protocol::SinkLine::ToolInput {
             id: id.to_string(),
             input: text.to_string(),
         };
-        let output = |id: &str, summary: &str| crate::core::types::SinkLine::ToolOutput {
+        let output = |id: &str, summary: &str| crate::protocol::SinkLine::ToolOutput {
             id: id.to_string(),
             name: "read".into(),
             summary: summary.to_string(),
@@ -785,7 +776,7 @@ mod tests {
         // per call, so each tool message must complete that block — not
         // open a second bare one. Rebuilt inputs also use `short_arg`
         // (`read a.rs`), matching the live path for highlighting.
-        use crate::core::types::{ChatMessage, FunctionCall, LlmToolCall};
+        use crate::protocol::{ChatMessage, FunctionCall, LlmToolCall};
         let call = |id: &str, path: &str| LlmToolCall {
             id: id.to_string(),
             call_type: "function".to_string(),
@@ -833,7 +824,7 @@ mod tests {
         // a chunk boundary) must render exactly what one-shot does: tool
         // ids thread across chunks, assistant text spanning a seam still
         // coalesces (no mid flush).
-        use crate::core::types::{ChatMessage, FunctionCall, LlmToolCall};
+        use crate::protocol::{ChatMessage, FunctionCall, LlmToolCall};
         use std::collections::HashSet;
         let call = |id: &str| LlmToolCall {
             id: id.to_string(),
@@ -900,15 +891,9 @@ mod tests {
         app.busy = true;
         start_activity(&mut app);
         app.stream_last_flush = Instant::now() - std::time::Duration::from_secs(1);
-        append_sink_line(
-            &mut app,
-            crate::core::types::SinkLine::Assistant("one".into()),
-        );
+        append_sink_line(&mut app, crate::protocol::SinkLine::Assistant("one".into()));
         app.stream_last_flush = Instant::now() - std::time::Duration::from_secs(1);
-        append_sink_line(
-            &mut app,
-            crate::core::types::SinkLine::Assistant("two".into()),
-        );
+        append_sink_line(&mut app, crate::protocol::SinkLine::Assistant("two".into()));
         flush_assistant(&mut app);
         let assistants = app
             .transcript
@@ -970,14 +955,14 @@ mod tests {
         let mut app = test_app();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput {
+            crate::protocol::SinkLine::ToolInput {
                 id: String::new(),
                 input: "bash echo hi".into(),
             },
         );
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolOutput {
+            crate::protocol::SinkLine::ToolOutput {
                 name: "bash".into(),
                 id: String::new(),
                 summary: "v ok".into(),
@@ -1005,14 +990,14 @@ mod tests {
         let mut app = test_app();
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolInput {
+            crate::protocol::SinkLine::ToolInput {
                 id: String::new(),
                 input: "read src/main.rs:1-2".into(),
             },
         );
         append_sink_line(
             &mut app,
-            crate::core::types::SinkLine::ToolOutput {
+            crate::protocol::SinkLine::ToolOutput {
                 name: "read".into(),
                 id: String::new(),
                 summary: "v 2 lines".into(),
@@ -1121,8 +1106,7 @@ mod tests {
     #[test]
     fn reset_session_state_clears_per_session_state() {
         let mut app = test_app();
-        app.messages
-            .push(crate::core::types::ChatMessage::user("hi"));
+        app.messages.push(crate::protocol::ChatMessage::user("hi"));
         app.transcript.push(TranscriptBlock::Info {
             stamp: 0,
             line: Line::from("old"),

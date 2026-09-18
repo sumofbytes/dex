@@ -16,8 +16,8 @@ use super::super::Selection;
 use super::pollers::refresh_git_async;
 use super::pollers::spawn_approval_poster;
 use super::state::RemoteApp;
-use crate::core::types::ApprovalDecision as CoreApprovalDecision;
-use crate::core::types::SinkLine;
+use crate::protocol::ApprovalDecision;
+use crate::protocol::SinkLine;
 use crate::protocol::StreamEvent;
 use crate::session::Session;
 use crossterm::event;
@@ -236,7 +236,7 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             // Queue (V1b): child agents park labeled prompts that outlive
             // the parent turn, so several can be answerable at once. The
             // overlay resolves the front; each entry POSTs its own decision.
-            let (response, decision_rx) = mpsc::channel::<CoreApprovalDecision>(1);
+            let (response, decision_rx) = mpsc::channel::<ApprovalDecision>(1);
             remote.app.pending_approvals.push(PendingApproval::new(
                 name,
                 input,
@@ -322,7 +322,7 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             constraints,
             acceptance,
         } => {
-            remote.app.plan = crate::core::types::Plan {
+            remote.app.plan = crate::protocol::Plan {
                 goal,
                 steps,
                 constraints,
@@ -399,7 +399,7 @@ pub(crate) fn rebuild_remote_from_messages(
         .messages
         .first()
         .cloned()
-        .unwrap_or(crate::core::types::ChatMessage::system(String::new()));
+        .unwrap_or(crate::protocol::ChatMessage::system(String::new()));
     remote.app.messages.clear();
     remote.app.messages.push(system);
     remote.app.messages.extend(loaded);

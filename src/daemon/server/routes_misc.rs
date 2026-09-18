@@ -2,8 +2,8 @@ use super::super::lock_map;
 use super::super::lookup::lookup_entry_async;
 use super::super::required_token;
 use super::super::DaemonState;
-use crate::core::types::ChatMessage;
 use crate::llm::config::LlmConfig;
+use crate::protocol::ChatMessage;
 use crate::protocol::DaemonInfo;
 use crate::protocol::ExtensionRunRequest;
 use crate::protocol::GitInfo;
@@ -194,7 +194,7 @@ async fn resolve_daemon_info_async() -> DaemonInfo {
             // so the client still renders.
             let permission = std::env::var("DEX_PERMISSION")
                 .ok()
-                .filter(|v| crate::core::types::PermissionMode::parse(v).is_ok())
+                .filter(|v| crate::protocol::PermissionMode::parse(v).is_ok())
                 .unwrap_or_else(|| "ask-writes".to_string());
             DaemonInfo::default_for(cwd, git_branch, git_dirty, permission)
         }

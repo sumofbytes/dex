@@ -8,7 +8,7 @@ use super::load_config_file;
 use super::provider::load_provider_entries;
 use super::provider::ProviderEntry;
 use super::warn_once;
-use crate::core::types::Provider;
+use crate::protocol::Provider;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;

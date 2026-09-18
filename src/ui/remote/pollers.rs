@@ -1,8 +1,8 @@
 use super::state::RemoteApp;
 use super::state::WorkerMessage;
 use crate::client::http::DaemonClient;
-use crate::core::types::ApprovalDecision as CoreApprovalDecision;
-use crate::protocol::ApprovalDecision as ProtocolApprovalDecision;
+use crate::protocol::ApprovalDecision;
+
 use crate::protocol::StreamEvent;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -113,14 +113,6 @@ pub(crate) fn refresh_git_async(client: DaemonClient, tx: mpsc::Sender<WorkerMes
 
 /// Maps a UI overlay decision to the wire protocol. Pure so approval routing
 /// is unit-testable without a daemon or TUI.
-pub(crate) fn map_approval_decision(decision: CoreApprovalDecision) -> ProtocolApprovalDecision {
-    match decision {
-        CoreApprovalDecision::Once => ProtocolApprovalDecision::AllowOnce,
-        CoreApprovalDecision::Session => ProtocolApprovalDecision::AllowSession,
-        CoreApprovalDecision::Deny => ProtocolApprovalDecision::Deny,
-    }
-}
-
 /// One decision courier per queued approval (V1b): the overlay resolves the
 /// front entry through its own sender and this task POSTs the decision for
 /// that request_id. Child approvals can be queued while the parent turn's
@@ -130,18 +122,15 @@ pub(crate) fn spawn_approval_poster(
     client: DaemonClient,
     session_id: String,
     request_id: String,
-    decision_rx: mpsc::Receiver<CoreApprovalDecision>,
+    decision_rx: mpsc::Receiver<ApprovalDecision>,
 ) {
     crate::client::http::spawn_task(async move {
         let mut decision_rx = decision_rx;
         // A closed channel (the TUI went away) resolves to deny: the parked
         // approval must never strand the requesting agent thread.
-        let decision = decision_rx
-            .recv()
-            .await
-            .unwrap_or(CoreApprovalDecision::Deny);
+        let decision = decision_rx.recv().await.unwrap_or(ApprovalDecision::Deny);
         if let Err(e) = client
-            .approve_async(&session_id, &request_id, map_approval_decision(decision))
+            .approve_async(&session_id, &request_id, decision)
             .await
         {
             crate::llm::http::provider_log(

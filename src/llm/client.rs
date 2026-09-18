@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
-use crate::core::types::{ChatMessage, ChatRequest, SinkLine, StreamOptions};
 use crate::llm::config::LlmConfig;
 use crate::llm::http::{
     authenticated_request, backoff_delay, error_chain_message, error_head, is_cancelled_message,
@@ -14,6 +13,7 @@ use crate::llm::protocol::{
     chat_completions_messages, responses_input, responses_tools, tools_schema,
 };
 use crate::llm::transport::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
+use crate::protocol::{ChatCompletionsRequest, ChatMessage, SinkLine, StreamOptions};
 use crate::runtime::console::with_console;
 
 /// Agent-loop model seam: `process_turn` is generic over this so tests run
@@ -245,7 +245,7 @@ pub(crate) async fn call_chat_completions(
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    let req = ChatRequest {
+    let req = ChatCompletionsRequest {
         model: &config.model,
         messages: chat_completions_messages(messages),
         tools: if with_tools {
@@ -419,7 +419,7 @@ fn should_retry_stream_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::Usage;
+    use crate::protocol::Usage;
 
     #[derive(Clone)]
     struct MockModel;

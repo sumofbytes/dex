@@ -7,7 +7,7 @@ use super::input::no_paint;
 use super::input::rebuild_remote_from_messages;
 use super::input::replay_remote_events;
 use super::state::RemoteApp;
-use crate::core::types::PermissionMode;
+use crate::protocol::PermissionMode;
 use crate::session::Session;
 
 /// Slash commands for remote mode. Locally-answered commands are handled
@@ -209,7 +209,7 @@ fn remote_skill(remote: &mut RemoteApp, name: Option<&str>) {
                     if let Ok(fresh) = remote.client.list_skills() {
                         remote.app.skills = fresh
                             .into_iter()
-                            .map(|info| crate::core::types::Skill {
+                            .map(|info| crate::protocol::Skill {
                                 name: info.name,
                                 description: info.description,
                                 path: std::path::PathBuf::from(""),

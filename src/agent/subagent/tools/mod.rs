@@ -35,7 +35,7 @@ use super::resume::ResumeRequest;
 #[cfg(test)]
 use super::SpawnMeta;
 #[cfg(test)]
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 #[cfg(test)]
 use crate::runtime::console::CancellationToken;
 #[cfg(test)]
@@ -438,7 +438,7 @@ mod tests {
         .unwrap();
         assert!(reloaded
             .iter()
-            .all(|m| m.role != crate::core::types::Role::System));
+            .all(|m| m.role != crate::protocol::Role::System));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -547,7 +547,7 @@ mod tests {
         };
         let (in_memory, journal) = resume_conversation(&def, replayed, &request);
         assert_eq!(in_memory.len(), 4);
-        assert_eq!(in_memory[0].role, crate::core::types::Role::System);
+        assert_eq!(in_memory[0].role, crate::protocol::Role::System);
         assert!(!in_memory[0]
             .content
             .as_deref()
@@ -567,7 +567,7 @@ mod tests {
         );
         // The journal mirrors the fresh path: no system line, nudge last.
         assert_eq!(journal.len(), 3);
-        assert_ne!(journal[0].role, crate::core::types::Role::System);
+        assert_ne!(journal[0].role, crate::protocol::Role::System);
         assert_eq!(journal[2].name.as_deref(), Some("resume"));
     }
 
