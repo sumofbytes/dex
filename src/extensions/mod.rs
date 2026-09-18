@@ -6,6 +6,9 @@
 //! whole — its tools never enter the schema. See
 //! `docs/lua-extensions-plan.md` §§6/9/11 (P0).
 
+#[cfg(test)]
+use std::path::PathBuf;
+
 mod engine;
 pub(crate) mod hooks;
 mod manifest;
@@ -24,7 +27,6 @@ pub(crate) use manifest::Manifest;
 
 #[cfg(test)]
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -33,19 +35,27 @@ mod discovery;
 mod global;
 mod manager;
 mod state;
+pub(crate) use discovery::{discovered_extensions, list_command, summary_line};
+#[cfg(test)]
+pub(crate) use global::resolve_active_name;
+pub(crate) use global::{
+    call_shadow_global, has_event_handlers, is_shadowed, loaded_summaries, set_active_global,
+    tools_list,
+};
+pub(crate) use manager::{install, remove};
 
+#[cfg(test)]
+use appendix::full_tool_name;
 pub(crate) use appendix::{
-    full_tool_name, is_extension_tool, normalize_tool_name, prompt_appendix, push_prompt_appendix,
-    split_ext_name,
+    is_extension_tool, normalize_tool_name, prompt_appendix, push_prompt_appendix, split_ext_name,
 };
 #[cfg(test)]
 use appendix::{remove_prompt_appendix, PROMPT_APPENDIX};
-pub(crate) use discovery::{
-    config_extension_paths, is_disabled, is_enabled, scoped_extension_dirs, set_enabled,
-    set_extra_dirs, user_extensions_dir, Scope,
-};
+pub(crate) use discovery::{config_extension_paths, set_enabled, set_extra_dirs};
 #[cfg(test)]
 use discovery::{data_extensions_dir, parse_config_paths};
+#[cfg(test)]
+pub(crate) use discovery::{scoped_extension_dirs, user_extensions_dir, Scope};
 pub(crate) use global::{
     apply_after_hooks, apply_before_agent_start, apply_before_compact, apply_before_hooks,
     cached_schema_tokens, cached_tools, call_global, command_list, current_drive_model,
@@ -54,280 +64,11 @@ pub(crate) use global::{
 };
 #[cfg(test)]
 use global::{current_routing_headers, harvest_routing_headers, with_routing_headers};
-use global::{spin_guard, spin_read, GLOBAL};
 #[cfg(test)]
 use global::{LAST_MODEL, LAST_ROUTING_HEADERS};
 #[cfg(test)]
 use state::STATE;
 pub(crate) use state::{state_get, state_set};
-
-/// `dex.tools.list()`: the extension tool names (full `ext__` names).
-/// Spins under contention like every other sync cache read (see
-/// `global::spin_read`) instead of failing open to an empty list.
-pub(crate) fn tools_list() -> Vec<String> {
-    GLOBAL
-        .get()
-        .and_then(|m| {
-            spin_read(&m.cached).map(|t| t.iter().map(|d| d.function.name.clone()).collect())
-        })
-        .unwrap_or_default()
-}
-
-/// `dex.tools.set_active(list)`: persist the schema slice; an empty list
-/// means "no extension tools". Short (own-extension) names resolve to full
-/// `ext__<ext>__<tool>` names here so extension code never spells the
-/// prefix; full names pass through, and unknown names filter out at read
-/// time (see `set_active`).
-pub(crate) async fn set_active_global(ext: &str, tools: Vec<String>) {
-    let tools = tools.iter().map(|t| resolve_active_name(ext, t)).collect();
-    if let Some(m) = GLOBAL.get() {
-        m.set_active(tools).await;
-    }
-}
-
-/// Resolve one `set_active` entry to its full name: already-full `ext__`
-/// names pass through, legacy `lua__` names normalize to `ext__` (so the
-/// read-time filter against canonical cache names still matches), and
-/// anything else names the caller's own tool.
-pub(crate) fn resolve_active_name(ext: &str, name: &str) -> String {
-    if name.starts_with("ext__") {
-        name.to_string()
-    } else if name.starts_with("lua__") {
-        normalize_tool_name(name)
-    } else {
-        full_tool_name(ext, name)
-    }
-}
-
-/// Dispatch a shadowed built-in through its shadow (plan §6.4 step 4).
-pub(crate) async fn call_shadow_global(
-    target: &str,
-    args: &serde_json::Map<String, serde_json::Value>,
-    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
-    policy: &crate::tools::Policy,
-    filter: Option<&crate::tools::ToolFilter>,
-    shell_out: &mut Option<crate::tools::ShellEvidence>,
-) -> Result<String, String> {
-    let host = HostCtx {
-        cancel,
-        policy,
-        filter,
-    };
-    global_manager()
-        .call_shadow(target, args, &host, shell_out)
-        .await
-}
-
-/// `dex extensions install <dir>`: copy an extension directory into the
-/// user-scope dir. The manifest must parse — install validates before
-/// copying so a broken extension never lands.
-pub(crate) fn install(src: &str) -> Result<String, String> {
-    let src = PathBuf::from(src);
-    let text = std::fs::read_to_string(src.join("manifest.yaml"))
-        .map_err(|e| format!("{}: {e}", src.display()))?;
-    let manifest = manifest::parse_manifest(&text)?;
-    let target = user_extensions_dir().join(&manifest.id);
-    if target.exists() {
-        return Err(format!(
-            "{} already exists (remove it first)",
-            target.display()
-        ));
-    }
-    copy_dir(&src, &target)?;
-    Ok(manifest.id)
-}
-
-/// `dex extensions remove <id>`: delete the extension directory wherever it
-/// was discovered (user or project scope — removing is always a user act).
-pub(crate) fn remove(id: &str) -> Result<(), String> {
-    // `dir.join(id)` below must never traverse: reject anything outside the
-    // same [a-z0-9_-]+ (no `__`) shape the manifest validator enforces.
-    if !manifest::valid_segment(id) {
-        return Err(format!(
-            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
-        ));
-    }
-    for (dir, _) in scoped_extension_dirs() {
-        let ext_dir = dir.join(id);
-        if ext_dir.join("manifest.yaml").is_file() {
-            std::fs::remove_dir_all(&ext_dir)
-                .map_err(|e| format!("removing {}: {e}", ext_dir.display()))?;
-            return Ok(());
-        }
-    }
-    Err(format!("extension '{id}' not found"))
-}
-
-fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        // Symlinks are skipped: a cyclic one would recurse to stack
-        // overflow, and an escaping one would copy outside the extension.
-        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
-            eprintln!(
-                "dex: [extensions] install: skipping symlink {}",
-                entry.path().display()
-            );
-            continue;
-        }
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir(&path, &target)?;
-        } else {
-            std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-/// Disk discovery for `dex doctor`: (id, version, scope, consent state)
-/// per found manifest. Reads no manager state, so it is deterministic
-/// regardless of what parallel test runs loaded.
-pub(crate) fn discovered_extensions() -> Vec<(String, String, &'static str, String)> {
-    let mut found = Vec::new();
-    for (dir, scope) in scoped_extension_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let ext_dir = entry.path();
-            if !ext_dir.is_dir() {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(ext_dir.join("manifest.yaml")) else {
-                continue;
-            };
-            let Ok(m) = manifest::parse_manifest(&text) else {
-                continue;
-            };
-            let scope = match scope {
-                Scope::Project => "project",
-                Scope::User => "user",
-            };
-            let state = if is_disabled(&m.id) {
-                "disabled"
-            } else if scope == "project" && !is_enabled(&m.id) {
-                "not enabled (trust gate)"
-            } else {
-                "enabled"
-            };
-            found.push((m.id, m.version, scope, state.to_string()));
-        }
-    }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
-    found.dedup_by(|a, b| a.0 == b.0);
-    found
-}
-
-/// Per-extension status for `dex extensions list` / `/extensions`: (id,
-/// version, tools, events) for every loaded engine. Sync snapshot, never
-/// blocks (same contract as `cached_tools`).
-pub(crate) fn loaded_summaries() -> Vec<(String, String, Vec<String>, Vec<String>)> {
-    GLOBAL
-        .get()
-        .and_then(|m| {
-            spin_guard(&m.engines).map(|engines| {
-                engines
-                    .values()
-                    .map(|e| {
-                        (
-                            e.manifest.id.clone(),
-                            e.manifest.version.clone(),
-                            e.tools.clone(),
-                            e.events.clone(),
-                        )
-                    })
-                    .collect()
-            })
-        })
-        .unwrap_or_default()
-}
-
-/// One-line summary for `dex extensions list` / `/extensions` (shared so
-/// the two surfaces never drift).
-pub(crate) fn summary_line(id: &str, version: &str, tools: &[String], events: &[String]) -> String {
-    format!(
-        "{id} {version} — {} tool(s), events: {}",
-        tools.len(),
-        if events.is_empty() {
-            "-".to_string()
-        } else {
-            events.join(",")
-        }
-    )
-}
-
-/// `dex extensions list`: discovery walk + consent state + loaded summary.
-/// The caller refreshes the manager first (one-shot blocks on it).
-pub(crate) fn list_command() {
-    for (dir, scope) in scoped_extension_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let ext_dir = entry.path();
-            let text = match std::fs::read_to_string(ext_dir.join("manifest.yaml")) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let m = match manifest::parse_manifest(&text) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let scope = match scope {
-                Scope::Project => "project",
-                Scope::User => "user",
-            };
-            let state = if is_disabled(&m.id) {
-                "disabled"
-            } else if scope == "project" && !is_enabled(&m.id) {
-                "not enabled (trust gate)"
-            } else {
-                "enabled"
-            };
-            let loaded = loaded_summaries()
-                .into_iter()
-                .find(|(id, _, _, _)| *id == m.id)
-                .map(|(_, _, tools, events)| {
-                    format!(
-                        "loaded, {}",
-                        summary_line(&m.id, &m.version, &tools, &events)
-                    )
-                })
-                .unwrap_or_else(|| "not loaded".to_string());
-            println!(
-                "{:<14} {:<8} {:<6} {:<28} {}",
-                m.id, m.version, scope, state, loaded
-            );
-            println!("  {}", ext_dir.display());
-        }
-    }
-}
-
-/// Sync shadow check for `metadata()`: a shadowed built-in is Shell-gated.
-/// Never blocks — empty until the first refresh lands (same as the schema).
-pub(crate) fn is_shadowed(name: &str) -> bool {
-    GLOBAL
-        .get()
-        .and_then(|m| spin_read(&m.shadowed).map(|s| s.contains(name)))
-        .unwrap_or(false)
-}
-
-/// Does any loaded extension subscribe to `event`? Fast path so the common
-/// no-hooks turn skips arg cloning + JSON round-trips entirely.
-pub(crate) fn has_event_handlers(event: &str) -> bool {
-    GLOBAL
-        .get()
-        .and_then(|m| {
-            spin_guard(&m.engines).map(|e| {
-                e.values()
-                    .any(|ext| ext.events.contains(&event.to_string()))
-            })
-        })
-        .unwrap_or(false)
-}
 
 #[cfg(test)]
 pub(crate) mod tests {
