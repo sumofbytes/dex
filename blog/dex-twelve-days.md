@@ -226,7 +226,7 @@ Deterministic by default — no extra LLM call to summarize, because the
 summarizer is the same model that's already confused. Keep the recent N
 tokens verbatim, split the turn cleanly, pin the last user message, structure
 the summary, and only fall back to LLM compaction if you ask for it
-(`DEX_COMPACTION_LLM=1`). The invariant stayed sacred: compact when
+(`DEX_COMPACTION=llm`). The invariant stayed sacred: compact when
 `tokens > contextWindow − reserveTokens`, and never otherwise.
 
 **The budget and the nudge.** `474d30a`:

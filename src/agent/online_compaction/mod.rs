@@ -23,7 +23,7 @@ use crate::llm::config::warn_once;
 /// every request and only pays off on long-horizon work.
 pub(crate) const ONLINE_COMPACTION_ENV: &str = "DEX_ONLINE_COMPACTION";
 
-/// Case-insensitive mode (`1`, `jev`) for the online gate. Unset and
+/// Case-insensitive mode (`1`/`llm`, `jev`) for the online gate. Unset and
 /// explicit offs disable silently; a non-empty unrecognized value warns
 /// once (a typo like `=jve` must not silently disable the gate) and
 /// likewise disables.
@@ -37,7 +37,9 @@ fn online_compaction_mode() -> Option<String> {
             let short: String = raw.trim().chars().take(32).collect();
             warn_once(
                 "env:DEX_ONLINE_COMPACTION",
-                &format!("ignoring DEX_ONLINE_COMPACTION={short:?} — expected '1' or 'jev'"),
+                &format!(
+                    "ignoring DEX_ONLINE_COMPACTION={short:?} — expected '1', 'jev', or 'llm'"
+                ),
             );
             None
         }

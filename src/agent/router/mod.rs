@@ -3,7 +3,7 @@
 //! Each turn is routed to a model tier by task complexity. V1 is
 //! stem/weight scoring only — no LLM call, no new dependencies, stdlib
 //! only — so routing stays pure and unit-testable. An LLM classifier may
-//! follow later behind an opt-in env gate (the `DEX_COMPACTION_LLM=1`
+//! follow later behind an opt-in env gate (the `DEX_COMPACTION=llm`
 //! pattern); deterministic stays the default.
 //!
 //! This lives in core rather than as a Lua extension: the tier picks the
