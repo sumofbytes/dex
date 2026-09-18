@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::core::types::{ApiProtocol, Provider};
+use crate::protocol::{ApiProtocol, Provider};
 
 impl Provider {
     /// Base URL when `--base-url` and config-file

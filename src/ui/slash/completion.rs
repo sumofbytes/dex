@@ -5,8 +5,8 @@ use super::super::InputField;
 use super::parser::is_extension_command;
 use super::parser::split_extension_command;
 use super::parser::COMMANDS;
-use crate::core::types::ChatMessage;
-use crate::core::types::Provider;
+use crate::protocol::ChatMessage;
+use crate::protocol::Provider;
 use crate::session::Session;
 use std::fs;
 use std::path::Path;
@@ -332,7 +332,7 @@ pub(crate) fn reset_session_state(app: &mut App) {
     for approval in app.pending_approvals.drain(..) {
         let _ = approval
             .response
-            .try_send(crate::core::types::ApprovalDecision::Deny);
+            .try_send(crate::protocol::ApprovalDecision::Deny);
     }
     app.approval_rx = None;
     app.steering_rx = None;
@@ -344,7 +344,7 @@ pub(crate) fn reset_session_state(app: &mut App) {
     app.tool_state.total_cost = 0.0;
     app.tool_state.last_tok_s = None;
     app.tool_state.verify_dirty = false;
-    app.plan = crate::core::types::Plan::default();
+    app.plan = crate::protocol::Plan::default();
     app.transcript.clear();
     // Wrapped/display caches are keyed by block stamps: a cleared transcript
     // reuses stamp 0, so stale rows would hit. Drop both (and any selection
@@ -497,7 +497,7 @@ fn cmd_clear(app: &mut App) {
     let _ = app.session.clear_messages();
     let _ = app
         .session
-        .set_state("plan", &crate::core::types::Plan::default().to_json());
+        .set_state("plan", &crate::protocol::Plan::default().to_json());
     push_info(app, "history cleared.".to_string());
 }
 
@@ -1040,7 +1040,7 @@ pub(crate) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
         }
     }
     if let Some(plan_json) = state.get("plan") {
-        let plan = crate::core::types::Plan::from_json(plan_json);
+        let plan = crate::protocol::Plan::from_json(plan_json);
         if !plan.is_empty() {
             app.plan = plan;
             let done = app.plan.steps.iter().filter(|(_, d)| *d).count();

@@ -5,7 +5,7 @@ use super::App;
 #[cfg(test)]
 use super::InputField;
 #[cfg(test)]
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 #[cfg(test)]
 use crate::session::Session;
 
@@ -27,7 +27,7 @@ use completion::commands_help_line;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::Skill;
+    use crate::protocol::Skill;
 
     fn new_app() -> App {
         App::test_app()
@@ -316,7 +316,7 @@ mod tests {
         app.tool_state.total_usage = 99;
         app.tool_state.total_cost = 1.5;
         app.tool_state.verify_dirty = true;
-        app.plan = crate::core::types::Plan {
+        app.plan = crate::protocol::Plan {
             goal: Some("g".into()),
             steps: vec![("step".into(), false)],
             ..Default::default()
@@ -349,7 +349,7 @@ mod tests {
         assert!(app.pending_approvals.is_empty());
         assert_eq!(
             rx.try_recv().ok(),
-            Some(crate::core::types::ApprovalDecision::Deny),
+            Some(crate::protocol::ApprovalDecision::Deny),
             "pending approvals are denied, not dropped silently"
         );
     }
@@ -734,7 +734,7 @@ mod tests {
             session
                 .set_state(
                     "plan",
-                    &crate::core::types::Plan {
+                    &crate::protocol::Plan {
                         goal: Some("build it".into()),
                         steps: vec![("one".into(), true), ("two".into(), false)],
                         ..Default::default()

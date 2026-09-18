@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::core::types::ToolDefinition;
 use crate::llm::config::ExtensionModelSnapshot;
+use crate::protocol::ToolDefinition;
 
 use super::appendix::{full_tool_name, normalize_tool_name};
 use super::manager::ExtensionManager;
@@ -593,7 +593,7 @@ pub(crate) async fn apply_before_compact(
         };
     }
     let policy = crate::tools::Policy::turn(
-        crate::core::types::PermissionMode::ReadOnly,
+        crate::protocol::PermissionMode::ReadOnly,
         &crate::runtime::console::Console::none(),
     );
     let host = HostCtx {
@@ -638,7 +638,7 @@ pub(crate) async fn run_command_global(
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<String, String> {
     let policy = crate::tools::Policy::turn(
-        crate::core::types::PermissionMode::ReadOnly,
+        crate::protocol::PermissionMode::ReadOnly,
         &crate::runtime::console::Console::none(),
     );
     let host = HostCtx {

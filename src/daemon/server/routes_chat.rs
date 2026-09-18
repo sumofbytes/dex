@@ -4,11 +4,11 @@ use super::super::lookup::lookup_entry_async;
 use super::super::turn::run_agent_turn;
 use super::super::DaemonState;
 use super::routes_sessions::steal_wake_and_claim;
-use crate::core::types::ApprovalDecision;
-use crate::core::types::QueueMsg;
+use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalResponse;
 use crate::protocol::ChatRequest;
 use crate::protocol::FollowupRequest;
+use crate::protocol::QueueMsg;
 use crate::protocol::RecallRequest;
 use crate::protocol::SteerRequest;
 use crate::protocol::StreamEnvelope;
@@ -184,8 +184,8 @@ pub(crate) async fn approve(
 
     match pending {
         Some(pending) if pending.session_id == session_id => {
-            let decision = ApprovalDecision::from(req.decision);
-            if decision == ApprovalDecision::Session {
+            let decision = req.decision;
+            if decision == ApprovalDecision::AllowSession {
                 // Persist for the whole session so next turns skip the overlay
                 state.record_session_approval(&session_id, &pending.name, &pending.input);
             }
