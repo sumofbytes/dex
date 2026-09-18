@@ -10,8 +10,8 @@ use super::status;
 use super::theme;
 use crate::core::format::agent_lifecycle;
 use crate::core::format::short_arg;
-use crate::core::types::Role;
-use crate::core::types::SinkLine;
+use crate::protocol::Role;
+use crate::protocol::SinkLine;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -656,7 +656,7 @@ fn dim_intermediate_assistant_block(app: &mut App) {
 
 /// Send the user's approval decision for the front pending approval, then
 /// reveal the next queued one (V1b: child agents can park several).
-pub(crate) fn resolve_approval(app: &mut App, decision: crate::core::types::ApprovalDecision) {
+pub(crate) fn resolve_approval(app: &mut App, decision: crate::protocol::ApprovalDecision) {
     if !app.pending_approvals.is_empty() {
         let approval = app.pending_approvals.remove(0);
         let _ = approval.response.try_send(decision);
@@ -669,7 +669,7 @@ pub(crate) fn deny_all_approvals(app: &mut App) {
     for approval in app.pending_approvals.drain(..) {
         let _ = approval
             .response
-            .try_send(crate::core::types::ApprovalDecision::Deny);
+            .try_send(crate::protocol::ApprovalDecision::Deny);
     }
 }
 
@@ -748,7 +748,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
 /// one-shot.
 pub(crate) fn render_message_slice<'m>(
     app: &mut App,
-    msgs: &'m [crate::core::types::ChatMessage],
+    msgs: &'m [crate::protocol::ChatMessage],
     opened: &mut HashSet<&'m str>,
 ) {
     for msg in msgs {
@@ -765,7 +765,7 @@ pub(crate) fn render_message_slice<'m>(
                     if !content.trim().is_empty() {
                         append_sink_line(
                             app,
-                            crate::core::types::SinkLine::Assistant(content.clone()),
+                            crate::protocol::SinkLine::Assistant(content.clone()),
                         );
                     }
                 }
@@ -779,7 +779,7 @@ pub(crate) fn render_message_slice<'m>(
                         );
                         append_sink_line(
                             app,
-                            crate::core::types::SinkLine::ToolInput {
+                            crate::protocol::SinkLine::ToolInput {
                                 id: tc.id.clone(),
                                 input,
                             },
@@ -810,7 +810,7 @@ pub(crate) fn render_message_slice<'m>(
                 } else {
                     append_sink_line(
                         app,
-                        crate::core::types::SinkLine::ToolInput {
+                        crate::protocol::SinkLine::ToolInput {
                             id: tool_id.to_string(),
                             input: name.clone(),
                         },
@@ -818,7 +818,7 @@ pub(crate) fn render_message_slice<'m>(
                 }
                 append_sink_line(
                     app,
-                    crate::core::types::SinkLine::ToolOutput {
+                    crate::protocol::SinkLine::ToolOutput {
                         id: tool_id.to_string(),
                         name,
                         summary,

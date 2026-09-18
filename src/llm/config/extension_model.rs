@@ -18,8 +18,8 @@ use super::selection::provider_fallback_with_origin;
 use super::selection::provider_without_prefix;
 use super::selection::resolve_selection;
 use super::selection::split_selection;
-use crate::core::types::ApiProtocol;
-use crate::core::types::Provider;
+use crate::protocol::ApiProtocol;
+use crate::protocol::Provider;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 

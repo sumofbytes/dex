@@ -19,11 +19,9 @@ use super::PendingApproval;
 #[cfg(test)]
 use super::SessionEntry;
 #[cfg(test)]
-use crate::core::types::ApprovalDecision;
-#[cfg(test)]
-use crate::core::types::QueueMsg;
-#[cfg(test)]
 use crate::llm::config::LlmConfig;
+#[cfg(test)]
+use crate::protocol::ApprovalDecision;
 #[cfg(test)]
 use crate::protocol::ChatRequest;
 #[cfg(test)]
@@ -34,6 +32,8 @@ use crate::protocol::ExtensionRunRequest;
 use crate::protocol::FollowupRequest;
 #[cfg(test)]
 use crate::protocol::LoadSkillRequest;
+#[cfg(test)]
+use crate::protocol::QueueMsg;
 #[cfg(test)]
 use crate::protocol::RecallRequest;
 #[cfg(test)]
@@ -400,19 +400,19 @@ mod handler_tests {
     fn thinking_override_sets_clears_and_keeps_default() {
         // Pure override applied per turn: None keeps, "" clears, else sets.
         let mut config = LlmConfig {
-            provider: crate::core::types::Provider::OpenCode,
+            provider: crate::protocol::Provider::OpenCode,
             api_key: String::new(),
             base_url: String::new(),
             model: "m".into(),
             available_models: Vec::new(),
             endpoints: Default::default(),
-            api: crate::core::types::ApiProtocol::Responses,
+            api: crate::protocol::ApiProtocol::Responses,
             account_id: None,
             thinking_effort: Some("low".into()),
             context_window: 128_000,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
-            permission: crate::core::types::PermissionMode::Trusted,
+            permission: crate::protocol::PermissionMode::Trusted,
             verify_command: None,
             extra_headers: Default::default(),
             global_headers: Default::default(),
@@ -680,7 +680,7 @@ mod handler_tests {
         assert!(r.is_ok());
         assert_eq!(
             rx.try_recv().ok(),
-            Some(crate::core::types::ApprovalDecision::Deny)
+            Some(crate::protocol::ApprovalDecision::Deny)
         );
     }
 
@@ -719,7 +719,7 @@ mod handler_tests {
 
         assert_eq!(
             rx_a.try_recv().ok(),
-            Some(crate::core::types::ApprovalDecision::Deny)
+            Some(crate::protocol::ApprovalDecision::Deny)
         );
         assert!(rx_b.try_recv().is_err(), "other sessions must be untouched");
     }
@@ -1014,7 +1014,7 @@ mod handler_tests {
         )
         .await;
         assert!(r.is_ok());
-        assert_eq!(rx.try_recv().ok(), Some(ApprovalDecision::Session));
+        assert_eq!(rx.try_recv().ok(), Some(ApprovalDecision::AllowSession));
         assert!(
             state.is_session_approved("s-a", "bash", "{}"),
             "AllowSession must persist for the session"

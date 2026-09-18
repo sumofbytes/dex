@@ -109,7 +109,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
-use crate::core::types::{ApprovalDecision, ApprovalRequest, PermissionMode};
+use crate::protocol::{ApprovalDecision, ApprovalRequest, PermissionMode};
 use crate::runtime::cancel::{wait_cancelled, CancellationSource};
 use crate::runtime::console::Console;
 
@@ -209,8 +209,8 @@ pub(crate) async fn enforce_policy(
         verdict = response_rx.recv() => verdict,
     };
     match decision {
-        Some(ApprovalDecision::Once) => Ok(()),
-        Some(ApprovalDecision::Session) => {
+        Some(ApprovalDecision::AllowOnce) => Ok(()),
+        Some(ApprovalDecision::AllowSession) => {
             // Same-turn repeats skip the prompt via the turn policy's
             // console copy; the daemon's /approve handler persists to its
             // session map for later turns (the console is per-turn).

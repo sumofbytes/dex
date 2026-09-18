@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::core::types::Skill;
+use crate::protocol::Skill;
 
 use super::parse::{parse_frontmatter, parse_skill, skill_name_ok};
 
@@ -123,7 +123,7 @@ pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> 
             });
         }
     }
-    let mut found: Vec<(usize, crate::core::types::Skill)> = Vec::new();
+    let mut found: Vec<(usize, crate::protocol::Skill)> = Vec::new();
     while let Some(r) = set.join_next().await {
         if let Ok(Some(s)) = r {
             found.push(s);

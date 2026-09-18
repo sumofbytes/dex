@@ -7,7 +7,7 @@ use super::{
     unique_tmp_path, usage_cost, validate_thinking_effort, warn_provider_like_selection,
     write_ctx_index, ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
 };
-use crate::core::types::Usage;
+use crate::protocol::Usage;
 use std::{collections::BTreeSet, env};
 use unicode_width::UnicodeWidthStr;
 
@@ -2859,7 +2859,7 @@ fn route_turn_classifies_and_overrides_only_on_change() {
     assert_eq!(routed.reason_label(), "typo");
     // Ordinary work with history behind it → balanced, which already is
     // the selection → no override, the config never rebuilds.
-    let history = vec![crate::core::types::ChatMessage::user("x".repeat(20_000))];
+    let history = vec![crate::protocol::ChatMessage::user("x".repeat(20_000))];
     let routed = super::route_turn("add a retry to the fetch call", &history).expect("routing on");
     assert_eq!(routed.tier, crate::agent::router::Tier::Balanced);
     assert_eq!(routed.model_override, None);
@@ -3289,16 +3289,16 @@ fn builtin_provider_names_stay_in_sync_with_parse_known() {
     // entry must resolve without any file entry, or builtins silently drop
     // out of `net.providers` / `dex.model.providers()`.
     let known = std::collections::BTreeSet::new();
-    for name in crate::core::types::Provider::BUILTINS {
+    for name in crate::protocol::Provider::BUILTINS {
         assert!(
-            crate::core::types::Provider::parse_known(name, &known).is_some(),
+            crate::protocol::Provider::parse_known(name, &known).is_some(),
             "BUILTINS entry '{name}' must parse without any file entry"
         );
     }
     // Alias spellings land on one canonical provider.
     assert_eq!(
-        crate::core::types::Provider::parse_known("codex", &known).map(|p| p.name().to_string()),
-        crate::core::types::Provider::parse_known("openai-codex", &known)
+        crate::protocol::Provider::parse_known("codex", &known).map(|p| p.name().to_string()),
+        crate::protocol::Provider::parse_known("openai-codex", &known)
             .map(|p| p.name().to_string()),
     );
 }

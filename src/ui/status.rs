@@ -195,7 +195,7 @@ pub(super) fn status_tokens(app: &App) -> u64 {
 /// sampled bytes and misses — the old (len, tail-len) key collided on
 /// those. O(messages) pointer/len reads, never a full char walk, so a hit
 /// still avoids the estimator's walk.
-fn history_fingerprint(messages: &[crate::core::types::ChatMessage]) -> u64 {
+fn history_fingerprint(messages: &[crate::protocol::ChatMessage]) -> u64 {
     let mut h = 14695981039346656037u64;
     let mut mix = |b: u8| {
         h ^= u64::from(b);

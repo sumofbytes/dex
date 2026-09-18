@@ -4,7 +4,7 @@ use super::load_config_str;
 use super::provider::load_provider_name;
 use super::provider::setup_guide_error;
 use super::warn_once;
-use crate::core::types::Provider;
+use crate::protocol::Provider;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::str::FromStr;

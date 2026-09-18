@@ -4,9 +4,9 @@ use tokio::sync::mpsc;
 use crate::agent::state::CancellationSource;
 use crate::agent::tokens::{message_char_len, PER_MESSAGE_OVERHEAD};
 use crate::core::format::truncate_text;
-use crate::core::types::{ChatMessage, Role, Usage};
 use crate::llm::config::LlmConfig;
 use crate::llm::dispatch::complete as call_llm;
+use crate::protocol::{ChatMessage, Role, Usage};
 
 pub(crate) use super::tokens::estimate_tokens;
 
@@ -791,7 +791,7 @@ mod tests {
         compact_history, deterministic_summary, estimate_tokens, extract_file_ops_from_message,
         find_cutoff_by_tokens, ChatMessage, FileOps, KEEP_RECENT_MESSAGES,
     };
-    use crate::core::types::{FunctionCall, LlmToolCall, Role};
+    use crate::protocol::{FunctionCall, LlmToolCall, Role};
 
     /// Save/restore process env around tests that flip dex env vars.
     struct EnvRestore {

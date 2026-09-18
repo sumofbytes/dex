@@ -34,7 +34,7 @@
 
 use std::str::FromStr;
 
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 
 /// Model tier for one turn. Lowercase on the wire (`Display`/`FromStr`
 /// round-trip).
@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn history_tool_calls_count_real_calls() {
-        use crate::core::types::{FunctionCall, LlmToolCall, Role};
+        use crate::protocol::{FunctionCall, LlmToolCall, Role};
         let call = || LlmToolCall {
             id: "t1".into(),
             call_type: "function".into(),

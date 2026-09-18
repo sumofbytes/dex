@@ -5,12 +5,12 @@
 //! is written once and a new protocol plugs in as another [`StreamParser`].
 
 #[cfg(test)]
-use crate::core::types::SinkLine;
+use crate::protocol::SinkLine;
 #[cfg(test)]
 #[cfg(test)]
-use crate::core::types::StreamDelta;
+use crate::protocol::StreamDelta;
 #[cfg(test)]
-use crate::core::types::Usage;
+use crate::protocol::Usage;
 #[cfg(test)]
 #[cfg(test)]
 #[cfg(test)]
@@ -66,7 +66,7 @@ mod tests {
         read_stream, stream_err, stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta,
         StreamPrinter, Usage,
     };
-    use crate::core::types::{StopReason, StreamUsage};
+    use crate::protocol::{StopReason, StreamUsage};
     use crate::runtime::console::CancellationToken;
     use std::time::Duration;
     use tokio::sync::mpsc;

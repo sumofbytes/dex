@@ -36,10 +36,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
-use crate::core::types::ToolDefinition;
-use crate::core::types::{ChatMessage, Usage};
 use crate::llm::config::LlmConfig;
 use crate::llm::dispatch::complete as call_llm;
+use crate::protocol::ToolDefinition;
+use crate::protocol::{ChatMessage, Usage};
 use crate::tools::ShellEvidence;
 
 pub(crate) const GATE_ENV: &str = "DEX_EVIDENCE_REDUCER";

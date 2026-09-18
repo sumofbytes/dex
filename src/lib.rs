@@ -23,9 +23,9 @@ use crate::tools::execute_sync as execute;
 
 use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::{GlobalCancellation, ToolState};
-use crate::core::types::ChatMessage;
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override;
+use crate::protocol::ChatMessage;
 use crate::runtime::console::install_sigint_handler;
 use crate::skills::{discover_skills, skill_dirs};
 
@@ -93,7 +93,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
                     crate::runtime::console::is_interrupted(),
                 );
                 let msg = if excluded {
-                    ChatMessage::user_named(text, crate::core::types::BASH_EXCLUDED_NAME)
+                    ChatMessage::user_named(text, crate::protocol::BASH_EXCLUDED_NAME)
                 } else {
                     ChatMessage::user(text)
                 };

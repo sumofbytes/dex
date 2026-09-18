@@ -11,7 +11,7 @@ use crate::agent::router::TaskSignal;
 use crate::agent::router::Tier;
 use crate::agent::router::TierMap;
 use crate::agent::tokens::estimate_tokens;
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 
 use std::env;
 

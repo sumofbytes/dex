@@ -11,7 +11,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
-use crate::core::types::{FunctionDef, ToolDefinition};
+use crate::protocol::{FunctionDef, ToolDefinition};
 
 /// Opt-in switch: `DEX_ONLINE_COMPACTION=1` registers `update_plan` and
 /// enables boundary economics. Off by default — the tool costs prompt tokens

@@ -1,6 +1,6 @@
 //! The extension manager: load/reload, tool schema, dispatch.
 
-use crate::core::types::{FunctionDef, ToolDefinition};
+use crate::protocol::{FunctionDef, ToolDefinition};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;

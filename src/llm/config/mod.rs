@@ -1,6 +1,6 @@
-use crate::core::types::ApiProtocol;
-use crate::core::types::PermissionMode;
-use crate::core::types::Provider;
+use crate::protocol::ApiProtocol;
+use crate::protocol::PermissionMode;
+use crate::protocol::Provider;
 pub(crate) use crate::workspace::{cached_parse, xdg_path, FileCache};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

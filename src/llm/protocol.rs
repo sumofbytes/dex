@@ -3,7 +3,7 @@ use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
-use crate::core::types::{
+use crate::protocol::{
     ChatMessage, FunctionCall, FunctionDef, LlmToolCall, Role, StreamToolCall, ToolDefinition,
     WireMessage,
 };
@@ -462,7 +462,7 @@ mod tests {
         chat_completions_messages, merge_chat_tool_call, response_call_index, response_tool_call,
         responses_input, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
     };
-    use crate::core::types::StreamFunctionCall;
+    use crate::protocol::StreamFunctionCall;
     use serde_json::json;
 
     #[test]
@@ -655,7 +655,7 @@ mod tests {
         // The production sort helpers must yield identical bytes regardless
         // of cache fill order — not just agree across consecutive calls with
         // unchanged caches.
-        use crate::core::types::{FunctionDef, ToolDefinition};
+        use crate::protocol::{FunctionDef, ToolDefinition};
         fn def(name: &str) -> ToolDefinition {
             ToolDefinition {
                 tool_type: "function".to_string(),

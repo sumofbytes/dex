@@ -4,7 +4,7 @@ use super::super::lookup::session_path;
 use super::super::DaemonState;
 use super::super::SessionEntry;
 use super::routes_chat::try_claim_slot;
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 use crate::protocol::CreateSessionRequest;
 use crate::protocol::EventsResponse;
 use crate::protocol::ReattachResponse;

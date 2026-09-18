@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::core::format::clamp_lines;
-use crate::core::types::PermissionMode;
+use crate::protocol::PermissionMode;
 use crate::runtime::cancel::CancellationSource;
 use crate::runtime::console::Console;
 

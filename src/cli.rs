@@ -2,7 +2,7 @@ use serde_json::{Map, Value};
 use std::env;
 use std::path::PathBuf;
 
-use crate::core::types::PermissionMode;
+use crate::protocol::PermissionMode;
 
 #[derive(Clone)]
 pub struct Args {

@@ -1,6 +1,6 @@
 //! MCP tool/content mapping to agent tool definitions.
 
-use crate::core::types::ToolDefinition;
+use crate::protocol::ToolDefinition;
 use serde_json::Value;
 
 use super::config::{mcp_tool_name, resource_reader_name, MCP_DESC_LIMIT, MCP_OUTPUT_BYTES};
@@ -30,7 +30,7 @@ impl McpTool {
         }
         ToolDefinition {
             tool_type: "function".to_string(),
-            function: crate::core::types::FunctionDef {
+            function: crate::protocol::FunctionDef {
                 name: mcp_tool_name(server, &self.name),
                 description: desc,
                 parameters: params,
@@ -43,7 +43,7 @@ impl McpTool {
 pub(crate) fn resource_reader_definition(server: &str) -> ToolDefinition {
     ToolDefinition {
         tool_type: "function".to_string(),
-        function: crate::core::types::FunctionDef {
+        function: crate::protocol::FunctionDef {
             name: resource_reader_name(server),
             description: format!(
                 "[{server}] Read a resource served by this MCP server (file, doc, schema). Prefer this over shelling out when the server hosts the data."
