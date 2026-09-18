@@ -472,7 +472,7 @@ async fn compaction_gate(
                         write,
                         archive,
                         Some(config.cache_write_read_ratio()),
-                        memo_estimate(crate::agent::jev::summary_mode_is_jev()),
+                        memo_estimate(summarizer.prunes_jev()),
                     );
                     state
                         .online_compaction

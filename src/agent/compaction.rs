@@ -762,7 +762,7 @@ pub(crate) async fn compact_history(
         let stats = crate::agent::jev::prune_span(&mut candidate, boundary_start, first_kept);
         if crate::agent::jev::is_worthwhile(&stats) {
             crate::log!(
-                Debug,
+                Info,
                 "jev compaction: dropped {} truncated {} kept {} (freed {} chars, ratio {:.2})",
                 stats.dropped,
                 stats.truncated,
@@ -1400,7 +1400,7 @@ mod tests {
     async fn online_jev_alone_does_not_prune_the_threshold_path() {
         // The knobs are independent: `DEX_ONLINE_COMPACTION=jev` governs
         // boundary compactions (the loop passes `online_compaction_jev()`
-        // there); the threshold path passes `summary_mode_is_jev()`, so
+        // there); the threshold path passes `summary_mode().prunes_jev()`, so
         // with only the online knob set a tool-heavy span still
         // summarizes instead of pruning.
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
