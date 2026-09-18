@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::redact_secrets;
+use super::redact::redact_secrets;
 
 const CALLBACK_TIMEOUT_SECS: u64 = 180;
 const DISCOVERY_TIMEOUT_SECS: u64 = 15;

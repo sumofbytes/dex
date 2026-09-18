@@ -1,7 +1,12 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+
+use crate::core::types::Provider;
+
+use super::config::{catalog_env_vars, ProviderEntry};
 
 #[derive(Deserialize)]
 pub(crate) struct CodexAuthFile {
@@ -43,6 +48,68 @@ pub(crate) fn load_codex_credentials(
         return Err("Codex auth.json contains an empty access token".into());
     }
     Ok((tokens.access_token, tokens.account_id))
+}
+
+/// Builtin providers whose canonical key env var is pinned in dex rather
+/// than catalog-discovered, so key resolution works cache-less on a fresh
+/// install (no `dex update --models` needed first). Mirrored in `doctor`'s
+/// key-origin row.
+pub(crate) fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
+    match provider {
+        Provider::OpenCode => Some("OPENCODE_API_KEY"),
+        Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    }
+}
+
+/// Per-provider credentials — the uniform deposit order for every provider
+/// except codex (which reads its own credential file):
+/// 1. `providers.<name>.api_key` in config.yaml,
+/// 2. the provider's own conventional env vars from the catalog `env` map
+///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …).
+///
+/// Then a loud error naming the deposit places.
+pub(crate) fn resolve_credentials(
+    provider: &Provider,
+    entries: &BTreeMap<String, ProviderEntry>,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    if matches!(provider, Provider::OpenAiCodex) {
+        return load_codex_credentials();
+    }
+    let name = provider.name();
+    if let Some(key) = entries
+        .get(name)
+        .and_then(|e| e.api_key.clone())
+        .filter(|k| !k.is_empty())
+    {
+        return Ok((key, None));
+    }
+    // The provider's own documented env vars; pinned builtin vars (see
+    // `pinned_key_env`) work cache-less — the catalog is the source for
+    // every other provider.
+    let mut env_names: Vec<String> = catalog_env_vars(name);
+    if let Some(pinned) = pinned_key_env(provider) {
+        if !env_names.iter().any(|v| v == pinned) {
+            env_names.insert(0, pinned.to_string());
+        }
+    }
+    for var in &env_names {
+        if let Ok(key) = env::var(var) {
+            if !key.trim().is_empty() {
+                return Ok((key, None));
+            }
+        }
+    }
+    Err(format!(
+        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
+        if env_names.is_empty() {
+            " or export the provider's key env var (run `dex update --models` to learn its name)"
+                .to_string()
+        } else {
+            format!(" or export {}", env_names.join(", "))
+        }
+    )
+    .into())
 }
 
 #[cfg(test)]
