@@ -12,7 +12,6 @@ use crate::agent::router::{
 };
 use crate::agent::tokens::estimate_tokens;
 use crate::core::types::{ApiProtocol, ChatMessage, PermissionMode, Provider};
-use crate::llm::auth::load_codex_credentials;
 
 /// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
 /// unset or unparseable. Single-sources the
@@ -29,78 +28,10 @@ fn env_parse_opt<T: FromStr>(name: &str) -> Option<T> {
     env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
-/// Shared XDG-vs-HOME directory resolution: `$<env_var>/dex/<rel>` when the
-/// XDG variable is set, else `$HOME/<home_sub>/dex/<rel>`, else `None` (no
-/// `HOME`). Pure re-expression of the layout every config/cache path below
-/// uses; the env var is a parameter because the sites use three different
-/// ones (`DEX_CONFIG` overrides the whole config path, so its check stays
-/// at that call site).
-fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::PathBuf> {
-    if let Some(dir) = env::var_os(env_var) {
-        return Some(std::path::PathBuf::from(dir).join(rel));
-    }
-    env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(home_sub).join(rel))
-}
-
-/// File-identity cache entry shared by the config file, learned-apis map,
-/// and models.dev catalog: the parse is served while the content hash is
-/// unchanged.
-struct FileCache<T> {
-    path: std::path::PathBuf,
-    /// FNV-1a of the file bytes: identity is content, not (mtime, len),
-    /// so same-length rewrites within one mtime tick and mtime-preserving
-    /// copies still miss. Reads are per call (these files are KBs, the
-    /// catalog parse below stays cached); the hit saves the parse.
-    hash: u64,
-    value: T,
-}
-
-fn fnv_bytes(text: &str) -> u64 {
-    let mut h = 14695981039346656037u64;
-    for b in text.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(1099511628211);
-    }
-    h
-}
-
-/// Read `path` and serve `cache`'s stored parse while the content hash is
-/// unchanged; on a miss, hand the text to `parse`, storing the result.
-/// `parse` gets `None` when the read failed and returns `None` when nothing
-/// should be cached (read/parse failure) — the caller decides what that
-/// means (empty default vs hard failure). Identity is the content hash
-/// rather than (mtime, len): a same-length rewrite inside one mtime tick
-/// (FAT/NFS 1–2 s granularity, `cp -p`, checkout preserving mtime) still
-/// misses instead of serving stale config/endpoints indefinitely.
-/// Poisoned-mutex recovery matches the rest of the daemon: keep the value.
-fn cached_parse<T: Clone>(
-    cache: &OnceLock<Mutex<Option<FileCache<T>>>>,
-    path: &std::path::Path,
-    parse: impl FnOnce(Option<String>) -> Option<T>,
-) -> Option<T> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let hash = fnv_bytes(&text);
-    if let Some(hit) = cache
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|cached| cached.path == path && cached.hash == hash)
-    {
-        return Some(hit.value.clone());
-    }
-    let value = parse(Some(text))?;
-    cache
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .replace(FileCache {
-            path: path.to_path_buf(),
-            hash,
-            value: value.clone(),
-        });
-    Some(value)
-}
+// Filesystem helpers live in `core::fs` (one owner for XDG paths, atomic
+// tmp files, and content-identity caching); re-exported here so existing
+// `config::...` paths (and tests) keep working.
+pub(crate) use crate::core::fs::{cached_parse, fnv_bytes, unique_tmp_path, xdg_path, FileCache};
 
 /// One resolved knob: the value that `from_env` applies and the origin
 /// that `doctor` reports. Both sides consume the same resolution, so the
@@ -594,23 +525,6 @@ pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<Routed
     ))
 }
 
-/// Jev-aware routing: same contract as [`route_turn`], but the tier
-/// decision goes through [`classify_turn_async`] — Jev's tier-Choice when
-/// `DEX_ROUTING_CLASSIFIER=jev`, else the deterministic classifier.
-/// Async because the Jev call is network; the daemon (TUI + `serve`
-/// clients) uses this, while the sync one-shot path stays deterministic.
-pub(crate) async fn route_turn_async(prompt: &str, history: &[ChatMessage]) -> Option<RoutedTurn> {
-    let file = load_config_file();
-    let routing = routing_resolution(&file);
-    if !routing.enabled {
-        return None;
-    }
-    let selection = resolve_selection(None, &file).ok()?;
-    let signal = routing_signal(prompt, history);
-    let (tier, reason) = classify_turn_async(&signal, prompt).await;
-    Some(finish_route(&selection.value, &routing.tiers, tier, reason))
-}
-
 /// The shared routing signal: prompt size plus history token size and the
 /// real tool-call count, so a deep session weighs in without prompt words.
 /// The daemon reuses the turn's own history load, so routing sees exactly
@@ -640,165 +554,28 @@ fn finish_route(
     }
 }
 
-/// Routing classifier knob: `DEX_ROUTING_CLASSIFIER=jev` sends each routed
-/// turn's tier decision to Jev (one SystemOne Choice per turn, confidence-
-/// gated with deterministic fallback); unset or anything else keeps the
-/// deterministic stem/weight classifier. Unknown values warn once — the
-/// deterministic default must never change silently.
-pub(crate) fn routing_classifier_is_jev() -> bool {
-    match env::var("DEX_ROUTING_CLASSIFIER") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("jev") => true,
-        Ok(v) if v.trim().is_empty() => false,
-        Ok(other) => {
-            warn_once(
-                "env:DEX_ROUTING_CLASSIFIER",
-                &format!(
-                    "ignoring DEX_ROUTING_CLASSIFIER='{other}': only 'jev' is supported (deterministic stays default)"
-                ),
-            );
-            false
-        }
-        Err(_) => false,
-    }
-}
-
-/// Jev model id: `DEX_JEV_MODEL`, else the `jev-latest` alias. Pin a
-/// versioned id once confidence thresholds are tuned against a release
-/// (aliases move under you).
-pub(crate) fn jev_model_name() -> String {
-    env::var("DEX_JEV_MODEL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| crate::jev::DEFAULT_MODEL.to_string())
-}
-
-/// Minimum Jev Choice confidence that routes on Jev's answer
-/// (`DEX_JEV_MIN_CONFIDENCE`, default 0.6): below it — or on any Jev
-/// error — the deterministic classifier decides instead. Out-of-range or
-/// unparsable values fall back to the default.
-pub(crate) fn jev_min_confidence() -> f64 {
-    const DEFAULT: f64 = 0.6;
-    env::var("DEX_JEV_MIN_CONFIDENCE")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|c| (0.0..=1.0).contains(c))
-        .unwrap_or(DEFAULT)
-}
-
-/// Classify one turn: Jev's tier-Choice when gated on and confident,
-/// otherwise the deterministic classifier. The fallback is silent on low
-/// confidence (routine) but loud once per process on errors (setup worth
-/// fixing) — either way the turn still routes.
-async fn classify_turn_async(signal: &TaskSignal, prompt: &str) -> (Tier, &'static str) {
-    let deterministic = || {
-        let decision = classify_with_reasons(signal, prompt);
-        (decision.tier, decision.top_reason())
-    };
-    if !routing_classifier_is_jev() {
-        return deterministic();
-    }
-    match jev_tier(signal, prompt).await {
-        Ok((tier, confidence)) if confidence >= jev_min_confidence() => (tier, "jev classifier"),
-        Ok(_) => deterministic(),
-        Err(e) => {
-            warn_once(
-                "jev-classifier",
-                &format!("jev classifier unavailable ({e}); deterministic fallback"),
-            );
-            deterministic()
-        }
-    }
-}
-
-/// One SystemOne call asking for the turn's tier. The state is the prompt
-/// plus a one-line turn-context trailer (prompt/history size, real session
-/// tool activity) so Jev weighs session depth the deterministic classifier
-/// sees. Returns the tier plus the Choice confidence for gating.
-async fn jev_tier(
-    signal: &TaskSignal,
-    prompt: &str,
-) -> Result<(Tier, f64), Box<dyn std::error::Error>> {
-    let cfg = crate::jev::resolve()?;
-    let state = serde_json::json!(format!(
-        "{prompt}\n\n[turn context: prompt_chars={} history_tokens={} history_tool_calls={}]",
-        signal.prompt_chars, signal.history_tokens, signal.history_tool_calls
-    ));
-    let eval = crate::jev::evaluate(&cfg, state, &[tier_choice_question()])
-        .await
-        .map_err(|e| format!("{e}"))?;
-    let answer = eval
-        .answers
-        .get("tier")
-        .ok_or("jev: response missing 'tier' answer")?;
-    match answer {
-        crate::jev::Answer::Choice {
-            value, confidence, ..
-        } => value
-            .parse::<Tier>()
-            .map(|tier| (tier, *confidence))
-            .map_err(|e| format!("jev: unknown tier '{value}': {e}").into()),
-        other => Err(format!("jev: 'tier' answer is not a Choice ({other:?})").into()),
-    }
-}
-
-/// The routing tier-Choice: option descriptions mirror
-/// `agent::router`'s tier contract so both classifiers pick from the same
-/// three buckets. Single question today; complexity-Score / Noul probes
-/// can join this same call later without another round trip.
-fn tier_choice_question() -> crate::jev::Question {
-    crate::jev::Question {
-        id: "tier".to_string(),
-        kind: crate::jev::QuestionKind::Choice {
-            instructions: "Which model tier should handle this coding turn?".to_string(),
-            options: vec![
-                (
-                    Tier::Fast.key().to_string(),
-                    "Typos, single-file reads, trivial Q&A — the smallest capable model."
-                        .to_string(),
-                ),
-                (
-                    Tier::Balanced.key().to_string(),
-                    "Normal feature work and single-scope edits.".to_string(),
-                ),
-                (
-                    Tier::Powerful.key().to_string(),
-                    "Multi-file refactors, auth or data paths, ambiguous specs, migrations, security, irreversible changes."
-                        .to_string(),
-                ),
-            ],
-        },
-    }
-}
-
-/// What `doctor` shows per tier: the tier's own selection, else
-/// `routing.balanced:`, else the top-level selection — the same chain
-/// `model_for` applies at runtime, so the row explains the turn's model.
+/// What `doctor` shows per tier: the tier's effective selection through
+/// [`model_for`] (tier miss → `balanced` → top-level `model:`) plus where
+/// that selection came from, so the row explains the turn's model.
 fn routing_tier_display(
     tier: Tier,
     routing: &RoutingResolution,
     selection: Option<&str>,
     selection_source: &str,
 ) -> (String, String) {
-    let value = routing.tiers.get(tier);
-    if !value.is_empty() {
-        return (
-            value.to_string(),
-            routing.tier_origins.get(tier).to_string(),
-        );
-    }
-    if tier != Tier::Balanced && !routing.tiers.balanced.is_empty() {
-        return (
-            routing.tiers.balanced.clone(),
-            routing.tier_origins.balanced.to_string(),
-        );
-    }
-    match selection {
-        Some(value) => (value.to_string(), selection_source.to_string()),
-        None => (
-            "(unset)".to_string(),
-            "UNCONFIGURED — set 'model: <provider>/<model>'".to_string(),
-        ),
-    }
+    let fallback = selection.unwrap_or("(unset)");
+    let value = model_for(tier, &routing.tiers, fallback).to_string();
+    let origin = if !routing.tiers.get(tier).is_empty() {
+        routing.tier_origins.get(tier)
+    } else if tier != Tier::Balanced && !routing.tiers.balanced.is_empty() {
+        routing.tier_origins.balanced
+    } else {
+        match selection {
+            Some(_) => selection_source,
+            None => "UNCONFIGURED — set 'model: <provider>/<model>'",
+        }
+    };
+    (value, origin.to_string())
 }
 
 /// Read a system-prompt file for the env/file layers: a miss warns once and
@@ -1467,7 +1244,7 @@ fn warn_provider_like_selection(selection: &str, provider_name: &str, served: &[
 /// `env` map: e.g. ZHIPU_API_KEY, OPENROUTER_API_KEY, …), sorted so the
 /// resolution order never depends on JSON key order. Tried in order — a
 /// provider documenting several names accepts any of them.
-fn catalog_env_vars(key: &str) -> Vec<String> {
+pub(crate) fn catalog_env_vars(key: &str) -> Vec<String> {
     // api.json shape is a list of names; older catalog.json used an object
     // (name → description). Accept both — only the names matter here.
     // Sorted at index time so resolution never depends on JSON key order.
@@ -1476,22 +1253,10 @@ fn catalog_env_vars(key: &str) -> Vec<String> {
 }
 
 /// Builtin providers whose canonical key env var is pinned in dex rather
-/// than catalog-discovered, so key resolution works cache-less on a fresh
-/// install (no `dex update --models` needed first). Mirrored in `doctor`'s
-/// key-origin row.
-fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
-    match provider {
-        Provider::OpenCode => Some("OPENCODE_API_KEY"),
-        Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
-        // The provider's own SDK env var (TypeSafe SDKs read it), honored
-        // cache-less like the other pins — the models.dev catalog has no
-        // typesafe entry, so this is the only env deposit for the Jev key.
-        Provider::Generic(name) if name.as_str() == crate::jev::PROVIDER_NAME => {
-            Some("TYPESAFE_API_KEY")
-        }
-        _ => None,
-    }
-}
+/// than catalog-discovered — see `llm::auth::pinned_key_env` (single owner
+/// of key resolution); re-exported here so existing `config::...` paths
+/// keep working.
+pub(crate) use super::auth::{pinned_key_env, resolve_credentials};
 
 /// Landing base URL when nothing explicit (`--base-url`, top-level
 /// `base_url:`) is set: the provider's config entry override, then the
@@ -1583,56 +1348,6 @@ fn setup_guide_error() -> String {
          \u{20}\u{20}codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"
     )
-}
-
-/// Per-provider credentials — the uniform deposit order for every provider
-/// except codex (which reads its own credential file):
-/// 1. `providers.<name>.api_key` in config.yaml,
-/// 2. the provider's own conventional env vars from the catalog `env` map
-///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …).
-///
-/// Then a loud error naming the deposit places.
-pub(crate) fn resolve_credentials(
-    provider: &Provider,
-    entries: &BTreeMap<String, ProviderEntry>,
-) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    if matches!(provider, Provider::OpenAiCodex) {
-        return load_codex_credentials();
-    }
-    let name = provider.name();
-    if let Some(key) = entries
-        .get(name)
-        .and_then(|e| e.api_key.clone())
-        .filter(|k| !k.is_empty())
-    {
-        return Ok((key, None));
-    }
-    // The provider's own documented env vars; pinned builtin vars (see
-    // `pinned_key_env`) work cache-less — the catalog is the source for
-    // every other provider.
-    let mut env_names: Vec<String> = catalog_env_vars(name);
-    if let Some(pinned) = pinned_key_env(provider) {
-        if !env_names.iter().any(|v| v == pinned) {
-            env_names.insert(0, pinned.to_string());
-        }
-    }
-    for var in &env_names {
-        if let Ok(key) = env::var(var) {
-            if !key.trim().is_empty() {
-                return Ok((key, None));
-            }
-        }
-    }
-    Err(format!(
-        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
-        if env_names.is_empty() {
-            " or export the provider's key env var (run `dex update --models` to learn its name)"
-                .to_string()
-        } else {
-            format!(" or export {}", env_names.join(", "))
-        }
-    )
-    .into())
 }
 
 /// CLI overrides for the extension snapshot below (`--model`, `--base-url`,
@@ -1768,7 +1483,7 @@ fn extension_model_parts() -> Result<ExtensionModelParts, String> {
     }
     let (base_api, _) = base_protocol(&provider, resolved.api_pin, &file);
     let api = model_api_from_env(&raw_selection, &model)
-        .or_else(|| learned_api(&base_url, &model))
+        .or_else(|| crate::llm::learned::lookup(&base_url, &model))
         .unwrap_or(base_api);
     Ok((provider, entries, base_url, api, model))
 }
@@ -1908,93 +1623,23 @@ pub(crate) fn extension_model_auth_for(
     let provider = Provider::parse_known(provider_name, &known)
         .unwrap_or_else(|| Provider::Generic(provider_name.to_string()));
     let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| e.to_string())?;
-    let mut headers = load_config_headers(&file);
-    // Provider-scoped entries beat the global table per key (AGENTS.md
-    // precedence): overwrite, don't `or_insert`.
-    if let Some(entry) = entries.get(provider.name()) {
-        for (name, value) in &entry.headers {
-            headers.insert(name.clone(), value.clone());
-        }
-    }
-    for (name, value) in custom_headers_from_env() {
-        insert_extra_header(&mut headers, &name, &value);
-    }
+    // Same merge as the wire path — one function, so the Lua view and the
+    // request headers can never drift apart.
+    let global = load_config_headers(&file);
+    let scoped = entries
+        .get(provider.name())
+        .map(|entry| entry.headers.clone())
+        .unwrap_or_default();
+    let mut extra = custom_headers_from_env();
     for raw in &cli_headers {
-        insert_parsed_headers(&mut headers, raw);
+        insert_parsed_headers(&mut extra, raw);
     }
-    headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+    let headers = merge_header_layers(&global, &scoped, &extra);
     Ok(ExtensionModelAuth {
         api_key,
         base_url: base_url.to_string(),
         headers,
     })
-}
-
-/// Persisted wire protocols learned empirically at runtime
-/// (`XDG_CACHE_HOME/dex/learned-apis.json`): models that rejected
-/// `/responses` and succeeded over `/chat/completions`. Keyed
-/// `"<base_url>|<model>"`. Only consulted when nothing explicit pins the
-/// protocol. ponytail: no expiry — a model that speaks completions keeps
-/// working even after the provider adds responses support.
-fn learned_apis_path() -> Option<std::path::PathBuf> {
-    xdg_path("XDG_CACHE_HOME", ".cache", "dex/learned-apis.json")
-}
-
-/// Learned wire protocols, cached process-wide and invalidated by file
-/// identity. `from_env` consulted this file on every turn (one read + parse
-/// per turn); hits are now a mutex bump.
-type LearnedApiMap = serde_json::Map<String, serde_json::Value>;
-
-static LEARNED_CACHE: OnceLock<Mutex<Option<FileCache<LearnedApiMap>>>> = OnceLock::new();
-
-fn learned_api_map() -> serde_json::Map<String, serde_json::Value> {
-    let Some(path) = learned_apis_path() else {
-        return Default::default();
-    };
-    // A missing or unparseable file is an empty map (and gets cached as
-    // one): learning simply starts over.
-    cached_parse(&LEARNED_CACHE, &path, |text| {
-        Some(
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                &text.unwrap_or_default(),
-            )
-            .unwrap_or_default(),
-        )
-    })
-    .unwrap_or_default()
-}
-
-fn learned_api(base_url: &str, model: &str) -> Option<ApiProtocol> {
-    learned_api_map()
-        .get(format!("{base_url}|{model}").as_str())?
-        .as_str()
-        .and_then(ApiProtocol::parse)
-}
-
-/// Best-effort write; a lost race between concurrent learners just re-learns.
-pub(crate) fn remember_learned_api(base_url: &str, model: &str, api: ApiProtocol) {
-    let Some(path) = learned_apis_path() else {
-        return;
-    };
-    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    map.insert(
-        format!("{base_url}|{model}"),
-        serde_json::Value::from(api.name()),
-    );
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(path, text);
-        // The file changed under us; drop the cached map so the next
-        // lookup re-reads instead of serving the pre-write copy.
-        if let Some(cache) = LEARNED_CACHE.get() {
-            cache.lock().unwrap_or_else(|e| e.into_inner()).take();
-        }
-    }
 }
 
 /// Reasoning-effort options the selected model advertises (models.dev
@@ -2016,64 +1661,10 @@ pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
     .flatten()
 }
 
-/// Per-model reasoning effort chosen via `/thinking`
-/// (`XDG_CACHE_HOME/dex/thinking-effort.json`): `"<base_url>|<model>"` →
-/// effort. Wins over `DEX_THINKING_EFFORT` (a stored choice is more specific
-/// than a global). `None` clears the entry.
-/// ponytail: read-through, no process cache — the file holds a handful of
-/// entries; add file-identity caching like `learned-apis.json` if it grows.
-fn thinking_path() -> Option<std::path::PathBuf> {
-    xdg_path("XDG_CACHE_HOME", ".cache", "dex/thinking-effort.json")
-}
-
-fn thinking_map() -> serde_json::Map<String, serde_json::Value> {
-    thinking_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-fn write_thinking_map(map: &serde_json::Map<String, serde_json::Value>) {
-    let Some(path) = thinking_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(map) {
-        // Atomic (unique tmp + rename): the daemon re-reads this file per
-        // turn; a direct write can hand it torn JSON that then sticks as a
-        // cached parse failure until the next write.
-        let tmp = unique_tmp_path(&path);
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-}
-
-pub(crate) fn stored_thinking_effort(base_url: &str, model: &str) -> Option<String> {
-    thinking_map()
-        .get(format!("{base_url}|{model}").as_str())?
-        .as_str()
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-}
-
-/// Remember (`Some`) or clear (`None`) the `/thinking` choice for one
-/// endpoint+model. Best-effort.
-pub(crate) fn remember_thinking_effort(base_url: &str, model: &str, effort: Option<&str>) {
-    let mut map = thinking_map();
-    let key = format!("{base_url}|{model}");
-    match effort.filter(|e| !e.is_empty()) {
-        Some(effort) => {
-            map.insert(key, serde_json::Value::from(effort));
-        }
-        None => {
-            map.remove(&key);
-        }
-    }
-    write_thinking_map(&map);
-}
+/// Per-model reasoning effort — see `llm::thinking` (single owner of
+/// `thinking-effort.json`); re-exported here so existing `config::...`
+/// paths keep working.
+pub(crate) use super::thinking::{remember_thinking_effort, stored_thinking_effort};
 
 /// Validate a `/thinking` pick against the model's advertised options: the
 /// catalog's own casing on match, the raw pick for unknown models (a stale
@@ -2253,21 +1844,6 @@ fn build_ctx_map(catalog: &serde_json::Value) -> BTreeMap<String, u64> {
         }
     }
     map
-}
-
-/// Unique tmp path for an atomic write: PID plus a per-call counter, so
-/// concurrent writers (daemon fetch vs `dex update --models`, or two
-/// in-process rebuilds) never share a tmp file — a shared name lets one
-/// writer's rename publish another writer's half-written bytes, which is
-/// exactly the torn state the rename was meant to prevent. Readers ignore
-/// tmp files, so a crashed write just litters one stale file.
-fn unique_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    path.with_extension(format!(
-        "json.tmp.{}.{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
 }
 
 /// Best-effort index write; failures just mean the next launch re-parses.
@@ -2523,12 +2099,10 @@ fn load_dex_models_cache() -> Option<Vec<String>> {
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
 /// and autocomplete without network. Falls back to opencode /models if needed.
 pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::builder()
-        .user_agent(crate::client::http::USER_AGENT)
-        // 30s total: api.json is a ~4MB body; the old 10s cap failed on
-        // normal slow links while curl (no timeout) succeeded.
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    // Shared client (pool reuse): the 30s total rides per-request — api.json
+    // is a ~4MB body, and the old 10s cap failed on normal slow links while
+    // curl (no timeout) succeeded.
+    let client = crate::client::http::shared_async_client();
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
     let mut fetched = false;
     let mut last_err = String::from("no fetch attempted");
@@ -2539,6 +2113,7 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
         let outcome = async {
             let resp = client
                 .get(url)
+                .timeout(Duration::from_secs(30))
                 .send()
                 .await
                 .map_err(|e| crate::llm::http::error_chain_message(&e))?
@@ -2765,6 +2340,27 @@ pub(crate) fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str
     out.insert(name.to_string(), value.to_string());
 }
 
+/// One merge for the AGENTS.md header precedence (global file `headers:` <
+/// provider-scoped file `headers:` < env/CLI extras, per key): later layers
+/// overwrite earlier ones, `authorization` never survives (the api key owns
+/// it). Shared by the wire merge (`llm::http::merged_headers`) and the
+/// extension auth view (`extension_model_auth_for`) so the two can never
+/// drift apart by re-implementing the same order.
+pub(crate) fn merge_header_layers(
+    global: &BTreeMap<String, String>,
+    scoped: &BTreeMap<String, String>,
+    extra: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = global.clone();
+    for (name, value) in scoped {
+        insert_extra_header(&mut out, name, value);
+    }
+    for (name, value) in extra {
+        insert_extra_header(&mut out, name, value);
+    }
+    out
+}
+
 /// Console Go routing affinity: the zen/go endpoint rejects requests without
 /// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
 /// base URL, filled from the dex session id. Keys already present (any
@@ -2950,7 +2546,13 @@ pub(crate) struct LlmConfig {
     /// `merged_headers` can order the three layers exactly like
     /// `extension_model_auth_for` does.
     pub(crate) global_headers: BTreeMap<String, String>,
-    pub(crate) client: reqwest::Client,
+    /// Timeout knobs, not a client: the wire goes through
+    /// [`LlmConfig::http_client`], which shares the process-wide streaming
+    /// client on defaults and builds a bounded one only when
+    /// `DEX_HTTP_*_TIMEOUT_SECS` overrides say otherwise. Carrying a
+    /// `reqwest::Client` here duplicated the shared pool per config.
+    pub(crate) connect_timeout_secs: u64,
+    pub(crate) request_timeout_secs: u64,
 }
 
 /// Base wire protocol + baked pin from the provider entry's `api:` pin and
@@ -3057,21 +2659,27 @@ fn env_models() -> Vec<String> {
 /// `error decoding response body`. The default shares the process-wide
 /// streaming client (connect timeout only); an explicit
 /// DEX_HTTP_REQUEST_TIMEOUT_SECS still builds a bounded backstop client.
-fn http_client(connect_secs: u64, request_secs: u64) -> Result<reqwest::Client, reqwest::Error> {
-    if connect_secs == 10 && request_secs == 300 {
-        Ok(crate::client::http::shared_streaming_client())
-    } else {
-        reqwest::Client::builder()
-            .user_agent(crate::client::http::USER_AGENT)
-            .connect_timeout(Duration::from_secs(connect_secs))
-            .timeout(Duration::from_secs(request_secs))
-            // Same dead-socket detection as the shared streaming client.
-            .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
-            .build()
-    }
-}
-
 impl LlmConfig {
+    /// HTTP client for provider generations: the process-wide streaming
+    /// client (connect timeout only — a total timeout would kill long
+    /// generations) unless explicit `DEX_HTTP_*_TIMEOUT_SECS` overrides
+    /// demand a bounded backstop client. Timeouts ride the config so the
+    /// shared pool isn't duplicated per turn.
+    pub(crate) fn http_client(&self) -> reqwest::Client {
+        if self.connect_timeout_secs == 10 && self.request_timeout_secs == 300 {
+            crate::client::http::shared_streaming_client()
+        } else {
+            reqwest::Client::builder()
+                .user_agent(crate::client::http::USER_AGENT)
+                .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
+                .timeout(Duration::from_secs(self.request_timeout_secs))
+                // Same dead-socket detection as the shared streaming client.
+                .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
+                .build()
+                .unwrap_or_else(|_| crate::client::http::shared_streaming_client())
+        }
+    }
+
     pub(crate) fn from_env(
         base_url_override: Option<String>,
         model_override: Option<String>,
@@ -3084,8 +2692,8 @@ impl LlmConfig {
             None => permission_from_env()?,
         };
         let file = load_config_file();
-        // Custom headers, three layers so the wire merge can order them like
-        // `extension_model_auth_for` (AGENTS.md precedence): global file table
+        // Custom headers, three layers merged by `merge_header_layers`
+        // (AGENTS.md precedence): global file table
         // < provider-scoped < env < CLI. `extra_headers` carries env+CLI (and
         // later per-request overrides); the file's global table rides in
         // `global_headers`.
@@ -3199,9 +2807,8 @@ impl LlmConfig {
         // Reserve 16384, keep 20000 tokens recent (not 12 messages)
         let reserve_tokens = env_parse("DEX_RESERVE_TOKENS", 16_384);
         let keep_recent_tokens = env_parse("DEX_KEEP_RECENT_TOKENS", 20_000);
-        let connect_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
-        let request_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
-        let client = http_client(connect_secs, request_secs)?;
+        let connect_timeout_secs: u64 = env_parse("DEX_HTTP_CONNECT_TIMEOUT_SECS", 10);
+        let request_timeout_secs: u64 = env_parse("DEX_HTTP_REQUEST_TIMEOUT_SECS", 300);
         // Dex standalone: no network at startup — models come from config/DEX_MODELS
         // or `dex update --models` cache (XDG_DATA_HOME/dex/models.json). Removed
         // live /models fetch (was 5s+ blocking per endpoint).
@@ -3234,7 +2841,8 @@ impl LlmConfig {
             permission,
             extra_headers,
             global_headers,
-            client,
+            connect_timeout_secs,
+            request_timeout_secs,
             endpoints: resolved.endpoints,
             provider_entries,
             provider_headers: resolved.headers,
@@ -3299,7 +2907,7 @@ impl LlmConfig {
         if let Some(api) = model_api_from_env(selection, &self.model) {
             return Some(api);
         }
-        learned_api(&self.base_url, &self.model)
+        crate::llm::learned::lookup(&self.base_url, &self.model)
     }
 
     /// Apply a `/model` selection. `provider/model` switches provider (and its
@@ -3736,7 +3344,7 @@ fn protocol_source(
         )
     } else if let Some(api) = model_api {
         (api.name().to_string(), "DEX_MODEL_APIS")
-    } else if let Some(api) = learned_api(base_url, model) {
+    } else if let Some(api) = crate::llm::learned::lookup(base_url, model) {
         (api.name().to_string(), "learned (learned-apis.json)")
     } else if let Some(api) = provider.default_api() {
         (api.name().to_string(), "built-in provider default")
@@ -3933,52 +3541,6 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
             d.routing_selection_source,
         );
         row(out, &format!("routing {}", tier.key()), &value, &origin);
-    }
-    // Routing classifier: deterministic default, Jev behind
-    // `DEX_ROUTING_CLASSIFIER=jev` (one SystemOne tier-Choice per turn,
-    // confidence-gated with deterministic fallback). Model/threshold rows
-    // only show under Jev — they resolve nothing otherwise.
-    let classifier_env = env::var("DEX_ROUTING_CLASSIFIER")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let classifier_jev = routing_classifier_is_jev();
-    row(
-        out,
-        "routing classifier",
-        if classifier_jev {
-            "jev"
-        } else {
-            "deterministic"
-        },
-        classifier_env
-            .as_deref()
-            .map(|_| "DEX_ROUTING_CLASSIFIER")
-            .unwrap_or("built-in default"),
-    );
-    if classifier_jev {
-        row(
-            out,
-            "jev model",
-            &jev_model_name(),
-            if env::var("DEX_JEV_MODEL")
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-            {
-                "DEX_JEV_MODEL"
-            } else {
-                "built-in default (jev-latest)"
-            },
-        );
-        row(
-            out,
-            "jev min confidence",
-            &format!("{:.2}", jev_min_confidence()),
-            if env::var("DEX_JEV_MIN_CONFIDENCE").is_ok() {
-                "DEX_JEV_MIN_CONFIDENCE"
-            } else {
-                "built-in default (0.60)"
-            },
-        );
     }
 
     // Headers: count per layer, sources joined.
@@ -4248,10 +3810,9 @@ pub(crate) mod tests {
     use super::{
         apply_verify_optin, build_ctx_map, catalog_cache_missing, detect_verify_command, doctor,
         load_config_file, load_dex_models_cache, load_provider_entries, model_api_from_env,
-        persist_selection, reasoning_options_for, remember_learned_api, remember_thinking_effort,
-        stored_thinking_effort, unique_tmp_path, usage_cost, validate_thinking_effort,
-        warn_provider_like_selection, write_ctx_index, ApiProtocol, LlmConfig, PermissionMode,
-        Provider, ProviderEntry,
+        persist_selection, reasoning_options_for, remember_thinking_effort, stored_thinking_effort,
+        unique_tmp_path, usage_cost, validate_thinking_effort, warn_provider_like_selection,
+        write_ctx_index, ApiProtocol, LlmConfig, PermissionMode, Provider, ProviderEntry,
     };
     use crate::core::types::Usage;
     use std::{collections::BTreeSet, env};
@@ -4519,7 +4080,8 @@ pub(crate) mod tests {
             verify_command: None,
             extra_headers: Default::default(),
             global_headers: Default::default(),
-            client: reqwest::Client::new(),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 300,
             provider_entries: Default::default(),
             provider_headers: Default::default(),
         }
@@ -5494,7 +5056,7 @@ pub(crate) mod tests {
         let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
         let cache = dir.join("cache");
         std::env::set_var("XDG_CACHE_HOME", &cache);
-        remember_learned_api(
+        crate::llm::learned::remember(
             "https://file.example/v1",
             "file-model",
             ApiProtocol::ChatCompletions,
@@ -5943,7 +5505,7 @@ pub(crate) mod tests {
         assert_eq!(cfg.api, ApiProtocol::ChatCompletions);
         // Without the table, the learned fallback decides instead.
         std::env::remove_var("DEX_MODEL_APIS");
-        remember_learned_api(
+        crate::llm::learned::remember(
             "https://opencode.ai/zen/go/v1",
             "m-go",
             ApiProtocol::ChatCompletions,
@@ -6810,9 +6372,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
             "ANTHROPIC_CUSTOM_HEADERS",
             "OPENAI_HEADERS",
             "OPENCODE_API_KEY",
@@ -6833,9 +6392,6 @@ pub(crate) mod tests {
         std::env::remove_var("DEX_ROUTING_FAST");
         std::env::remove_var("DEX_ROUTING_BALANCED");
         std::env::remove_var("DEX_ROUTING_POWERFUL");
-        std::env::remove_var("DEX_ROUTING_CLASSIFIER");
-        std::env::remove_var("DEX_JEV_MODEL");
-        std::env::remove_var("DEX_JEV_MIN_CONFIDENCE");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_CONFIG", "/tmp/dex-doctor-snapshot/missing.yaml");
         std::env::set_var("XDG_CACHE_HOME", "/tmp/dex-doctor-snapshot/cache");
@@ -6882,7 +6438,6 @@ pub(crate) mod tests {
                 "routing fast      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
                 "routing balanced  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
                 "routing powerful  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing classifierdeterministic                                 built-in default\n",
                 "headers           0                                             none\n",
                 "endpoints         go, zen                                       available to /model routing\n",
                 "system prompt     default                                       built-in default\n",
@@ -6967,308 +6522,6 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SystemOne mock answering every requested id with one canned Choice;
-    /// returns the base URL for `providers.typesafe.base_url`.
-    async fn spawn_jev_mock(choice: &str, confidence: f64) -> String {
-        use axum::extract::State as AxumState;
-        use axum::routing::post;
-        use axum::Router;
-
-        let choice = choice.to_string();
-
-        #[derive(Clone)]
-        struct Mock {
-            choice: String,
-            confidence: f64,
-        }
-
-        async fn handler(
-            AxumState(mock): AxumState<Mock>,
-            body: axum::Json<serde_json::Value>,
-        ) -> axum::Json<serde_json::Value> {
-            let empty = serde_json::Map::new();
-            let asked = body
-                .get("questions")
-                .and_then(|q| q.as_object())
-                .unwrap_or(&empty);
-            let mut out = serde_json::Map::new();
-            for id in asked.keys() {
-                out.insert(
-                    id.clone(),
-                    serde_json::json!({
-                        "type": "choice",
-                        "choice": mock.choice,
-                        "probabilities": {mock.choice.clone(): 1.0},
-                        "confidence": mock.confidence,
-                    }),
-                );
-            }
-            axum::Json(serde_json::json!({
-                "model": "jev-1.13.0",
-                "answers": out,
-                "usage": {"input_tokens": 10, "output_tokens": 2},
-            }))
-        }
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/v1/systemone", post(handler))
-                    .with_state(Mock {
-                        choice: choice.to_string(),
-                        confidence,
-                    }),
-            )
-            .await
-            .unwrap();
-        });
-        format!("http://{addr}")
-    }
-
-    /// Hermetic routing setup with a Jev endpoint: returns the temp dir
-    /// (removed by the caller) after pointing `DEX_CONFIG` at a config with
-    /// routing on plus `myprov` tiers and a `typesafe` base_url.
-    fn write_jev_routing_config(jev_base_url: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dex-jev-routing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.yaml"),
-            format!(
-                "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n  typesafe:\n    base_url: {jev_base_url}\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/m-7\n",
-            ),
-        )
-        .unwrap();
-        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-        dir
-    }
-
-    #[test]
-    fn routing_classifier_gate_defaults_off_parses_jev() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_ROUTING_CLASSIFIER"]);
-        std::env::remove_var("DEX_ROUTING_CLASSIFIER");
-        assert!(!super::routing_classifier_is_jev());
-        for v in ["jev", "JEV", " jev "] {
-            std::env::set_var("DEX_ROUTING_CLASSIFIER", v);
-            assert!(super::routing_classifier_is_jev(), "{v}");
-        }
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "");
-        assert!(!super::routing_classifier_is_jev());
-        // Unknown values warn once and stay deterministic.
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "llm");
-        assert!(!super::routing_classifier_is_jev());
-    }
-
-    #[test]
-    fn jev_model_and_confidence_knobs_default_and_parse() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&["DEX_JEV_MODEL", "DEX_JEV_MIN_CONFIDENCE"]);
-        std::env::remove_var("DEX_JEV_MODEL");
-        std::env::remove_var("DEX_JEV_MIN_CONFIDENCE");
-        assert_eq!(super::jev_model_name(), "jev-latest");
-        assert_eq!(super::jev_min_confidence(), 0.6);
-        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
-        assert_eq!(super::jev_model_name(), "jev-1.13.0");
-        std::env::set_var("DEX_JEV_MODEL", "  ");
-        assert_eq!(super::jev_model_name(), "jev-latest");
-        std::env::set_var("DEX_JEV_MIN_CONFIDENCE", "0.8");
-        assert_eq!(super::jev_min_confidence(), 0.8);
-        for v in ["high", "2", "-0.1", ""] {
-            std::env::set_var("DEX_JEV_MIN_CONFIDENCE", v);
-            assert_eq!(super::jev_min_confidence(), 0.6, "{v}");
-        }
-    }
-
-    /// `route_turn_async` with `DEX_ROUTING_CLASSIFIER=jev`: a confident
-    /// Jev Choice routes — even against the deterministic grain
-    /// ("migration" is Powerful-shaped; Jev says fast here).
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env stays redirected for the whole turn
-    async fn route_turn_async_uses_jev_when_gated() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-            "TYPESAFE_API_KEY",
-            "XDG_CACHE_HOME",
-        ]);
-        for key in [
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-        ] {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
-        std::env::set_var("TYPESAFE_API_KEY", "test-key");
-        let base = spawn_jev_mock("fast", 0.95).await;
-        let dir = write_jev_routing_config(&base);
-        let routed = super::route_turn_async("run the database migration", &[])
-            .await
-            .expect("routing on");
-        assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
-        assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
-        assert_eq!(routed.reason, "jev classifier");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Below the confidence threshold — or when Jev is unreachable — the
-    /// deterministic classifier decides, so the turn still routes.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env stays redirected for the whole turn
-    async fn route_turn_async_falls_back_below_confidence_and_on_error() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-            "TYPESAFE_API_KEY",
-            "XDG_CACHE_HOME",
-        ]);
-        for key in [
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-        ] {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
-        std::env::set_var("TYPESAFE_API_KEY", "test-key");
-        // Timid Jev: the migration prompt falls back to Powerful.
-        let base = spawn_jev_mock("fast", 0.1).await;
-        let dir = write_jev_routing_config(&base);
-        let routed = super::route_turn_async("run the database migration", &[])
-            .await
-            .expect("routing on");
-        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
-        assert_ne!(routed.reason, "jev classifier");
-        // Dead endpoint: same fallback, no panic.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
-        let dir2 = write_jev_routing_config(&format!("http://127.0.0.1:{port}"));
-        let routed = super::route_turn_async("run the database migration", &[])
-            .await
-            .expect("routing on");
-        assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    /// `dex doctor` shows the classifier plus, under Jev, the model and
-    /// threshold with origins.
-    #[test]
-    fn doctor_shows_jev_classifier_rows() {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvRestore::take(&[
-            "DEX_CONFIG",
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-            "XDG_CACHE_HOME",
-        ]);
-        for key in [
-            "DEX_MODEL",
-            "DEX_ROUTING",
-            "DEX_ROUTING_FAST",
-            "DEX_ROUTING_BALANCED",
-            "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
-            "DEX_JEV_MODEL",
-            "DEX_JEV_MIN_CONFIDENCE",
-        ] {
-            std::env::remove_var(key);
-        }
-        let dir = std::env::temp_dir().join(format!("dex-jev-doctor-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n",
-        )
-        .unwrap();
-        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-        std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-        let out = super::doctor(None, None, None, &[], None);
-        let classifier: Vec<&str> = out
-            .lines()
-            .filter(|l| l.starts_with("routing classifier"))
-            .collect();
-        assert_eq!(classifier.len(), 1, "{out}");
-        assert!(classifier[0].contains("deterministic"), "{}", classifier[0]);
-        assert!(
-            classifier[0].contains("built-in default"),
-            "{}",
-            classifier[0]
-        );
-        assert!(!out.contains("jev model"), "{out}");
-        std::env::set_var("DEX_ROUTING_CLASSIFIER", "jev");
-        std::env::set_var("DEX_JEV_MODEL", "jev-1.13.0");
-        std::env::set_var("DEX_JEV_MIN_CONFIDENCE", "0.75");
-        let out = super::doctor(None, None, None, &[], None);
-        assert!(
-            out.lines()
-                .any(|l| l.starts_with("routing classifier") && l.contains("jev")),
-            "{out}"
-        );
-        assert!(
-            out.lines().any(|l| l.starts_with("jev model")
-                && l.contains("jev-1.13.0")
-                && l.contains("DEX_JEV_MODEL")),
-            "{out}"
-        );
-        assert!(
-            out.lines().any(|l| l.starts_with("jev min confidence")
-                && l.contains("0.75")
-                && l.contains("DEX_JEV_MIN_CONFIDENCE")),
-            "{out}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// `route_turn`: `None` when routing is off; otherwise the classified
     /// tier resolves through `routing.balanced:` → `model:`, overriding only
     /// when the tier names a different selection (no pointless rebuilds).
@@ -7346,7 +6599,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
             "OPENCODE_API_KEY",
             "XDG_CACHE_HOME",
         ]);
@@ -7356,7 +6608,6 @@ pub(crate) mod tests {
             "DEX_ROUTING_FAST",
             "DEX_ROUTING_BALANCED",
             "DEX_ROUTING_POWERFUL",
-            "DEX_ROUTING_CLASSIFIER",
         ] {
             std::env::remove_var(key);
         }
@@ -7371,9 +6622,9 @@ pub(crate) mod tests {
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
         let out = super::doctor(None, None, None, &[], None);
-        // Four tier rows plus the classifier row (deterministic here).
+        // One switch row plus three tier rows.
         let routing: Vec<&str> = out.lines().filter(|l| l.starts_with("routing")).collect();
-        assert_eq!(routing.len(), 5, "{out}");
+        assert_eq!(routing.len(), 4, "{out}");
         assert!(routing[0].contains("on"), "{}", routing[0]);
         assert!(
             routing[0].contains("config routing.enabled:"),

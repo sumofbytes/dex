@@ -58,24 +58,6 @@ pub struct ShellResponse {
     pub code: Option<i32>,
 }
 
-/// Split a `!`/`!!` shell escape into `(command, exclude_from_context)`.
-/// `!cmd` feeds the next turn; `!!cmd` stays out of the LLM context. Returns
-/// `None` when the line isn't a shell escape — including a bare `!`/`!!`,
-/// which falls through to the agent instead of erroring. Everything
-/// after the prefix is the command, newlines included.
-pub fn parse_shell_escape(line: &str) -> Option<(String, bool)> {
-    let (rest, excluded) = match line.strip_prefix("!!") {
-        Some(rest) => (rest, true),
-        None => (line.strip_prefix('!')?, false),
-    };
-    let command = rest.trim().to_string();
-    if command.is_empty() {
-        None
-    } else {
-        Some((command, excluded))
-    }
-}
-
 /// Request to enqueue a steering message into an active turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerRequest {
@@ -452,39 +434,6 @@ mod tests {
         let back: ShellResponse = serde_json::from_str(&json).unwrap();
         assert!(back.success);
         assert_eq!(back.code, Some(0));
-    }
-
-    #[test]
-    fn shell_escape_splits_command() {
-        assert_eq!(
-            parse_shell_escape("!ls -la"),
-            Some(("ls -la".to_string(), false))
-        );
-        assert_eq!(
-            parse_shell_escape("!  echo hi  "),
-            Some(("echo hi".to_string(), false))
-        );
-        assert_eq!(
-            parse_shell_escape("!!cargo test"),
-            Some(("cargo test".to_string(), true))
-        );
-        assert_eq!(
-            parse_shell_escape("!!  echo hi  "),
-            Some(("echo hi".to_string(), true))
-        );
-        // Multiline scripts run whole.
-        assert_eq!(
-            parse_shell_escape("!echo a\necho b"),
-            Some(("echo a\necho b".to_string(), false))
-        );
-        // Bare `!`/`!!` fall through to the agent (usage, not a run).
-        assert_eq!(parse_shell_escape("!"), None);
-        assert_eq!(parse_shell_escape("!   "), None);
-        assert_eq!(parse_shell_escape("!!"), None);
-        // Ordinary prompts and slash commands are not shell escapes.
-        assert_eq!(parse_shell_escape("hello"), None);
-        assert_eq!(parse_shell_escape("/model foo"), None);
-        assert_eq!(parse_shell_escape(""), None);
     }
 
     #[test]
