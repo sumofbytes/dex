@@ -1,10 +1,13 @@
 //! Tests, split out of the module body so it stays implementation.
 
+use super::then_run::then_run_command;
 use super::*;
 use crate::runtime::cancel::GlobalCancellation;
 use serde_json::json;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
+use std::time::Duration;
 
 #[test]
 fn shell_escape_splits_command() {
