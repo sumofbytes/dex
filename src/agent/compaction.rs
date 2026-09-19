@@ -3,10 +3,10 @@ use tokio::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
 use crate::agent::tokens::{message_char_len, PER_MESSAGE_OVERHEAD};
-use crate::core::format::truncate_text;
 use crate::llm::config::LlmConfig;
 use crate::llm::dispatch::complete as call_llm;
 use crate::protocol::{ChatMessage, Role, Usage};
+use crate::ui::format::truncate_text;
 
 pub(crate) use super::tokens::estimate_tokens;
 
