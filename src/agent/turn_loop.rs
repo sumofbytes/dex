@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
-use crate::agent::online_compaction::{cache_debt_for_ratio, online_compaction_enabled};
+use crate::agent::jev::summary_mode;
+use crate::agent::online_compaction::{
+    cache_debt_for_memo, memo_estimate, online_compaction_enabled,
+};
 use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::{
     estimate_ephemeral_tokens, estimate_tokens, schema_budget_tokens, TokenLedger,
@@ -110,7 +113,19 @@ async fn compaction_gate(
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
             )
         });
-        match compact_history(config, messages, cancel, false).await {
+        // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
+        // one parse selects both the prune and the fallback summarizer.
+        let summarizer = summary_mode();
+        match compact_history(
+            config,
+            messages,
+            cancel,
+            false,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        {
             Ok((true, compacted)) => {
                 compaction_attempts += 1;
                 // History was rewritten: re-measure once for the next attempt.
@@ -127,8 +142,12 @@ async fn compaction_gate(
                     // pressure samples reset, the re-write is carried
                     // as debt the next boundary repays, and the plan
                     // survives (the model was not asked to re-plan).
-                    let (debt, repayment) =
-                        cache_debt_for_ratio(write, archive, Some(config.cache_write_read_ratio()));
+                    let (debt, repayment) = cache_debt_for_memo(
+                        write,
+                        archive,
+                        Some(config.cache_write_read_ratio()),
+                        memo_estimate(summarizer.prunes_jev()),
+                    );
                     state
                         .online_compaction
                         .record_threshold_compaction(debt, repayment);
