@@ -13,9 +13,7 @@ mod engine;
 pub(crate) mod hooks;
 mod manifest;
 
-pub(crate) use engine::{
-    CallKind, ExtensionEngine, HostCtx, ShadowCtx, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
-};
+pub(crate) use engine::{CallKind, ExtensionEngine, HostCtx, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN};
 pub(crate) use manifest::MAX_TOOL_TIMEOUT_SECS;
 /// `dex.net.fetch` ceilings: per-request timeout cap (matches the tool
 /// budget) and response-body cap (a runaway body fails the call, not the

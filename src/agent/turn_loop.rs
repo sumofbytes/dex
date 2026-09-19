@@ -6,13 +6,8 @@ use tokio::sync::mpsc;
 
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
 use crate::agent::jev::summary_mode;
-use crate::agent::online_compaction::{
-    cache_debt_for_memo, memo_estimate, online_compaction_enabled,
-};
 use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
-use crate::agent::tokens::{
-    estimate_ephemeral_tokens, estimate_tokens, schema_budget_tokens, TokenLedger,
-};
+use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::transport::sse::Turn;
@@ -65,16 +60,13 @@ pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
 }
 
 /// Proactive compaction gate, run before every model call: compact while
-/// the stored context exceeds the token threshold or — without online
-/// compaction — the message-count cap, at most three attempts. Threshold
-/// compactions carry their cache re-write as debt the boundary economics
-/// repay (math moved verbatim from the original inline block).
+/// the stored context exceeds the token threshold or the message-count cap,
+/// at most three attempts.
 /// The budget is re-derived from the ledger after every cut: re-checking a
 /// stale pre-cut number forces up to three compactions even when the first
-/// already fit. Stored (not projected): the gate guards the window AND the
-/// journal — a projected-only reading defers while the stored history grows
-/// unbounded — matching the boundary economics and the pre-pack behavior.
-/// The per-request sampler keeps the projected number (bytes actually sent).
+/// already fit. The gate reads the stored history, not a projection: it
+/// guards the window AND the journal, so the stored history can't grow
+/// unbounded while the gate defers.
 #[allow(clippy::too_many_arguments)]
 async fn compaction_gate(
     config: &LlmConfig,
@@ -94,25 +86,10 @@ async fn compaction_gate(
     while compaction_attempts < 3 {
         let eff = ledger.stored_tokens() + budget_overhead;
         let need_by_tokens = eff > config.compaction_threshold();
-        // The message-count fallback is a global cap — exactly what the
-        // online compaction economics replace. With the experiment on,
-        // the count cap is dropped: short turns compact at plan
-        // boundaries when economical, and the token threshold stays as
-        // window protection.
-        let need_by_count =
-            !online_compaction_enabled() && messages.len() > 1 + KEEP_RECENT_MESSAGES;
+        let need_by_count = messages.len() > 1 + KEEP_RECENT_MESSAGES;
         if !need_by_tokens && !need_by_count {
             break;
         }
-        // Measure the re-write cost and the archivable slice before
-        // `compact_history` rewrites `messages` — both read off the ledger,
-        // O(keep-recent) instead of full transcript walks.
-        let online = online_compaction_enabled().then(|| {
-            (
-                eff,
-                ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
-            )
-        });
         // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
         // one parse selects both the prune and the fallback summarizer.
         let summarizer = summary_mode();
@@ -136,22 +113,6 @@ async fn compaction_gate(
                     record_usage(config, state, console, u, None).await;
                 }
                 rewrite_session(session.as_deref_mut(), messages, persisted_cursor)?;
-                if let Some((write, archive)) = online {
-                    // A threshold compaction bypasses the boundary
-                    // economics, but the state must still see it:
-                    // pressure samples reset, the re-write is carried
-                    // as debt the next boundary repays, and the plan
-                    // survives (the model was not asked to re-plan).
-                    let (debt, repayment) = cache_debt_for_memo(
-                        write,
-                        archive,
-                        Some(config.cache_write_read_ratio()),
-                        memo_estimate(summarizer.prunes_jev()),
-                    );
-                    state
-                        .online_compaction
-                        .record_threshold_compaction(debt, repayment);
-                }
                 continue;
             }
             Ok((false, _)) => break,
@@ -332,11 +293,6 @@ where
     // failure (single message too large), not something more slicing fixes.
     let mut overflow_retried = false;
     let mut budget_warned = false;
-    // Online compaction evaluates at most one plan boundary per turn (the
-    // reference sets `pendingBoundary` on the first completed step and never
-    // overwrites it); later completions in the same turn only feed the
-    // horizon sample.
-    let mut online_boundary_handled = false;
     // Phase 0 gate context: every tool call this turn runs under the
     // turn's permission mode + approval channel. One policy for the whole
     // turn so same-turn allow-for-session records are shared. The daemon
@@ -355,11 +311,8 @@ where
             return Err("cancelled by user".into());
         }
         if let Some(rx) = steering_rx.as_mut() {
-            // A steer redirects the work: the horizon learned from completed
-            // boundaries no longer describes the remaining effort.
             let injected = inject_steering(rx, steering_accepted_tx, messages).await;
             if injected {
-                state.online_compaction.record_correction();
                 // Steering appends user messages outside the tracked pushes.
                 ledger = TokenLedger::rebuild(messages);
                 persist_pending(&mut session, messages, &mut persisted_cursor)?;
@@ -374,8 +327,7 @@ where
         // and a budget probe never spawns the background refresh.
         let ephemerals = [crate::mcp::ephemeral_line()];
         // Stored-budget overhead for the gate: the gate re-derives
-        // ledger + overhead per attempt (see `compaction_gate`); the
-        // sampler below keeps the projected `eff` (bytes actually sent).
+        // ledger + overhead per attempt (see `compaction_gate`).
         let budget_overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
         compaction_gate(
             config,
@@ -390,58 +342,11 @@ where
         )
         .await?;
 
-        // Observation pack projection: the provider-bound view replaces
-        // stale large tool results with placeholders. Built fresh from the
-        // intact history on every request — and only AFTER the gate, so a
-        // compaction that rewrote `messages` this iteration is what the
-        // projection (and the sampler below) sees. Building it before the
-        // gate sent the pre-compaction history once the pack was on. The
-        // stored session never changes. Token accounting (online sampling)
-        // reads this view too — archived payloads must not pressure the
-        // window estimate after their grace period expires.
-        let obs_session = policy.agent.as_ref().map(|ctx| ctx.session_path.clone());
-        // Owned projection only when the pack is on: when off the
-        // provider-bound view IS `messages` (borrowed at the call site).
-        // Held after the gate's `&mut` so no borrow freezes `messages`.
-        let projected_owned: Option<Vec<ChatMessage>> =
-            if crate::agent::obs_pack::observation_pack_enabled() {
-                Some(
-                    crate::agent::obs_pack::project_messages(
-                        &state.obs_projection,
-                        obs_session.as_deref(),
-                        messages,
-                    )
-                    .into_owned(),
-                )
-            } else {
-                None
-            };
-        // Placeholder takeovers are otherwise invisible — the stored history
-        // never changes — so surface each first takeover to the user.
-        for note in state.obs_projection.take_notes() {
-            system_note(console, &note).await;
-        }
-        // Projected budget for the sampler below: with the pack off the
-        // ledger total is exact (the wire view is history); with it on, one
-        // walk over the projected view replaces the 3–4 full walks the loop
-        // used to pay.
-        let eff = match &projected_owned {
-            Some(projected) => estimate_tokens(projected),
-            None => ledger.stored_tokens(),
-        } + budget_overhead;
-
-        // Online compaction bookkeeping: sample the context size of
-        // every provider request — the growth rate and the
-        // per-boundary request counts feed the compaction economics.
-        // Sampled on the projected view: only bytes actually sent count.
-        crate::agent::online_compaction::sample_request(&mut state.online_compaction, eff);
-
         // Async LLM call with prompt cancel: `select!(cancelled, complete)`
-        // wakes within ~10ms. The wire view borrows history when the pack is
-        // off (no `to_vec` clone) and the owned projection otherwise.
+        // wakes within ~10ms.
         let cancel_ref: &(dyn CancellationSource + Send + Sync) = cancel;
         let call_started = std::time::Instant::now();
-        let wire: &[ChatMessage] = projected_owned.as_deref().unwrap_or(messages.as_slice());
+        let wire: &[ChatMessage] = messages;
         let turn: Turn = tokio::select! {
             _ = wait_cancelled(cancel_ref) => {
                 return Err("cancelled by user".into());
@@ -571,16 +476,11 @@ where
                 .unwrap_or_default();
             {
                 let mut ctx = ToolResultCtx {
-                    config,
                     console,
                     state: &mut *state,
-                    policy: &policy,
                     messages: &mut *messages,
                     session: &mut session,
                     persisted_cursor: &mut persisted_cursor,
-                    cancel: cancellation,
-                    ephemerals: &ephemerals,
-                    online_boundary_handled: &mut online_boundary_handled,
                     last_tools: &mut last_tools,
                     ledger: &mut ledger,
                 };
@@ -620,13 +520,9 @@ where
             // process exit right after the turn can't lose it — a detached
             // spawn would be dropped on shutdown before it ever ran. Clone
             // keeps the saved field list compiler-enforced (state.rs disables
-            // dead_code lints, so a hand-written literal could forget one);
-            // the projection is reset because a resume re-derives it from
-            // scratch.
+            // dead_code lints, so a hand-written literal could forget one).
             if state.dirty {
-                let mut to_save = state.clone();
-                to_save.obs_projection = crate::agent::obs_pack::ProjectionState::new();
-                to_save.save_async().await;
+                state.save_async().await;
                 state.dirty = false;
             }
         } else {
@@ -644,7 +540,6 @@ where
             if let Some(rx) = steering_rx.as_mut() {
                 let injected = inject_steering(rx, steering_accepted_tx, messages).await;
                 if injected {
-                    state.online_compaction.record_correction();
                     state.last_usage = last_usage;
                     // Steering appended outside the tracked pushes.
                     ledger = TokenLedger::rebuild(messages);

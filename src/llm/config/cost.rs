@@ -14,16 +14,15 @@ pub(crate) fn cost_rates(entry: &serde_json::Value) -> Option<CostRates> {
     Some(CostRates {
         input: rate(&["input"]).unwrap_or(0.0),
         cache_read: rate(&["cache_read", "cacheRead"]),
-        cache_write: rate(&["cache_write", "cacheWrite"]),
         output: rate(&["output"]),
     })
 }
 
-/// Shared 3-tier model-cost lookup for `usage_cost` and
-/// `cache_write_read_ratio`: the entry whose `api` matches the configured
-/// endpoint wins, then any catalog entry of the configured provider, then
-/// any provider at all. Served from the per-generation index — a map lookup
-/// plus a scan over one model's entries instead of a full catalog walk.
+/// Shared 3-tier model-cost lookup for `usage_cost`: the entry whose `api`
+/// matches the configured endpoint wins, then any catalog entry of the
+/// configured provider, then any provider at all. Served from the
+/// per-generation index — a map lookup plus a scan over one model's entries
+/// instead of a full catalog walk.
 pub(crate) fn resolve_model_cost(
     model: &str,
     provider_keys: &[String],
