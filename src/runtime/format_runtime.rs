@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(marker, "◇");
         assert_eq!(rest, "explorer:sess-1] finished completed · 3 tok");
         // Non-lifecycle system notes stay muted.
-        assert!(agent_lifecycle("obs pack: bash result 45 KiB archived").is_none());
+        assert!(agent_lifecycle("note: bash result truncated to 45 KiB").is_none());
         assert!(agent_lifecycle("").is_none());
     }
 

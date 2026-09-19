@@ -10,3 +10,4 @@ ak-tool-cache.json
 .worktrees/
 .split-tmp/
 blog/
+.commandcode/

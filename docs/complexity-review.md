@@ -78,10 +78,10 @@ preserved exactly (a denial must never prompt). Verify the two pre-dispatch `Err
 
 ### 1.3 `metadata()`: 13 struct-literal branches (`tools/mod.rs:214-296`)
 
-Eight read-only tools share an identical field set.
+Six read-only tools share an identical field set.
 
 **Simplification:** a `const READONLY: ToolMetadata` shared by
-`"read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "obs_recall" | "update_plan"`;
+`"read" | "grep" | "ffgrep" | "find" | "fffind" | "ls"`;
 only `git`, `chain`, `bash`, `write|edit`, `mcp__` deviate. Drops ~70 lines to ~25.
 
 **Risk: low** — `metadata_classifies_tools` test covers the essentials; dispatch has an
