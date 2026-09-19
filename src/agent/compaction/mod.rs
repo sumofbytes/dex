@@ -359,7 +359,7 @@ pub(crate) fn find_cutoff_by_tokens(
     }
 }
 
-/// LLM summarization path (`DEX_COMPACTION_LLM=1`): summarize the history
+/// LLM summarization path (`DEX_COMPACTION=llm`): summarize the history
 /// and — for split turns — the turn prefix with the configured model,
 /// folding the summarizer spend into `usage_total`. Empty or failed replies
 /// fall back to the deterministic summary; a cancelled summarizer fails the
@@ -444,6 +444,17 @@ pub(crate) async fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &(dyn CancellationSource + Send + Sync),
     emergency: bool,
+    // Whether a worthwhile verbatim prune beats the summary. Threaded
+    // separately from `summarizer` because the two knobs are independent:
+    // the threshold path derives both from `summary_mode()`
+    // (`DEX_COMPACTION`), the boundary path passes
+    // `online_compaction_jev()` (`DEX_ONLINE_COMPACTION=jev`) here while
+    // still taking the fallback summarizer from the threshold knob.
+    jev_prune: bool,
+    // Fallback summarizer when no hook summary applies and the prune is
+    // skipped or does not pay — always the threshold knob's choice, parsed
+    // once by the caller instead of re-read here.
+    summarizer: crate::agent::jev::SummaryMode,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -534,11 +545,33 @@ pub(crate) async fn compact_history(
         extract_file_ops_from_message(msg, &mut file_ops);
     }
 
+    // Jev verbatim prune: drop/truncate stale tool outputs in place, no
+    // summary message, no LLM spend. Tried on a clone so an insufficient
+    // prune discards cleanly and the summarizer below still sees the
+    // original span. An explicit hook summary always wins.
+    if hook.summary.is_none() && jev_prune {
+        let mut candidate = messages.clone();
+        let stats = crate::agent::jev::prune_span(&mut candidate, boundary_start, first_kept);
+        if crate::agent::jev::is_worthwhile(&stats) {
+            crate::log!(
+                Info,
+                "jev compaction: dropped {} truncated {} kept {} (freed {} chars, ratio {:.2})",
+                stats.dropped,
+                stats.truncated,
+                stats.kept,
+                stats.freed_chars,
+                crate::agent::jev::reduction_ratio(&stats)
+            );
+            *messages = candidate;
+            return Ok((true, None));
+        }
+    }
+
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
     let summarized = if let Some(summary) = &hook.summary {
         summary.clone()
-    } else if std::env::var("DEX_COMPACTION_LLM").as_deref() == Ok("1") {
+    } else if summarizer == crate::agent::jev::SummaryMode::Llm {
         llm_summary(
             _config,
             _cancel,
@@ -810,9 +843,13 @@ mod tests {
     /// checkpoint subsumes the previous one. The old splice (from index 1)
     /// stacked summaries, so the model kept re-reading a stale checkpoint.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
     async fn repeated_compaction_keeps_a_single_summary() {
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "goal: build the thing"));
@@ -825,6 +862,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -839,6 +878,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -856,9 +897,13 @@ mod tests {
     /// Transcripts already stacked by the old bug (two summaries) heal to
     /// one: the splice starts at the FIRST summary, not the last.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
     async fn stacked_summaries_heal_to_a_single_summary() {
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         let mut s1 = msg(Role::User, "old checkpoint");
@@ -877,6 +922,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -901,7 +948,14 @@ mod tests {
     /// `session.before_compact`: a hook can cancel the compaction (exact
     /// wording the turn loop matches) or replace the summary outright.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env vars must stay put across the compaction awaits
     async fn before_compact_hook_cancels_or_replaces() {
+        // Global env-guarded locks, taken in the shared order
+        // sessions -> turn -> manager (see the extensions tests) so no
+        // two tests can acquire them in opposite order and deadlock.
+        let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The fixture loads into the process-global extension manager, which
         // every concurrent compaction reads — serialize against the
         // process_turn tests (their emergency compactions would see this
@@ -914,8 +968,8 @@ mod tests {
         let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
             .lock()
             .await;
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "goal: build the thing"));
@@ -938,6 +992,8 @@ mod tests {
             &mut messages.clone(),
             &crate::agent::state::GlobalCancellation,
             true,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap_err();
@@ -949,6 +1005,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -969,9 +1027,13 @@ mod tests {
     /// after the provider has declared the input over-limit, the normal
     /// 20k keep-window and 8-message minimum would refuse to shrink at all.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
     async fn emergency_compaction_cuts_below_the_comfort_floor() {
-        let _guard = EnvRestore::take(&["DEX_COMPACTION_LLM"]);
-        std::env::remove_var("DEX_COMPACTION_LLM");
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
         let config = crate::llm::config::tests::test_cfg();
         // A history the normal path would refuse to cut: 12 messages, under
         // the fallback window (1 + 12 kept) it requires.
@@ -986,6 +1048,8 @@ mod tests {
             &mut messages.clone(),
             &crate::agent::state::GlobalCancellation,
             false,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -995,6 +1059,8 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             true,
+            false,
+            crate::agent::jev::summary_mode(),
         )
         .await
         .unwrap();
@@ -1007,5 +1073,180 @@ mod tests {
         // Transcript coherence: system first, then the summary.
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].name.as_deref(), Some("summary"));
+    }
+
+    fn jev_call(id: &str) -> LlmToolCall {
+        LlmToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "read".into(),
+                arguments: "{\"path\":\"src/main.rs\"}".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env must stay `=jev` across the compaction await
+    async fn jev_prunes_tool_heavy_history_without_a_summary() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::take(&[
+            "DEX_COMPACTION",
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+        ]);
+        std::env::set_var("DEX_COMPACTION", "jev");
+        std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..10 {
+            messages.push(ChatMessage::assistant_calls(
+                None,
+                vec![jev_call(&format!("c{i}"))],
+            ));
+            messages.push(ChatMessage::tool_result(
+                format!("c{i}"),
+                "x".repeat(12_000),
+            ));
+        }
+        for i in 0..KEEP_RECENT_MESSAGES {
+            messages.push(msg(Role::User, &format!("recent {i}")));
+        }
+        let before = messages.len();
+        // Mirrors the threshold caller in `loop.rs`: one parse selects
+        // both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
+        let (compacted, usage) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "jev must prune a tool-heavy span");
+        assert!(usage.is_none(), "pruning spends no summarizer tokens");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.name.as_deref() == Some("summary")),
+            "jev leaves no summary message"
+        );
+        // User text survives verbatim; stale pairs are gone.
+        assert!(messages
+            .iter()
+            .any(|m| m.content_str() == "goal: build the thing"));
+        assert!(messages.len() < before, "pruning must shrink history");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("c0")),
+            "oldest dropped pair must be gone with its call"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env must stay `=jev` across the compaction await
+    async fn jev_falls_back_to_deterministic_when_pruning_does_not_pay() {
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::take(&[
+            "DEX_COMPACTION",
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+        ]);
+        std::env::set_var("DEX_COMPACTION", "jev");
+        std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
+        let config = crate::llm::config::tests::test_cfg();
+        // Tool-light history the normal path still cuts: nothing to prune,
+        // so the deterministic summary must cover the span instead.
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..20 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        // Mirrors the threshold caller in `loop.rs`: one parse selects
+        // both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "fallback summary must run");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.name.as_deref() == Some("summary")),
+            "insufficient prune must fall back to a summary"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env must stay set across the compaction await
+    async fn online_jev_alone_does_not_prune_the_threshold_path() {
+        // The knobs are independent: `DEX_ONLINE_COMPACTION=jev` governs
+        // boundary compactions (the loop passes `online_compaction_jev()`
+        // there); the threshold path passes `summary_mode().prunes_jev()`, so
+        // with only the online knob set a tool-heavy span still
+        // summarizes instead of pruning.
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::take(&[
+            "DEX_COMPACTION",
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+        ]);
+        std::env::remove_var("DEX_COMPACTION");
+        std::env::set_var(
+            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
+            "jev",
+        );
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..10 {
+            messages.push(ChatMessage::assistant_calls(
+                None,
+                vec![jev_call(&format!("c{i}"))],
+            ));
+            messages.push(ChatMessage::tool_result(
+                format!("c{i}"),
+                "x".repeat(12_000),
+            ));
+        }
+        for i in 0..KEEP_RECENT_MESSAGES {
+            messages.push(msg(Role::User, &format!("recent {i}")));
+        }
+        // Mirrors the threshold caller in `loop.rs`: one parse selects
+        // both the prune and the fallback summarizer.
+        let summarizer = crate::agent::jev::summary_mode();
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "threshold compaction must still run");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.name.as_deref() == Some("summary")),
+            "threshold without DEX_COMPACTION=jev must summarize, not prune"
+        );
     }
 }

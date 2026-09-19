@@ -2621,6 +2621,7 @@ fn doctor_output_is_byte_stable() {
             online_row,
             concat!(
                 "obs pack          off                                           built-in default (off)\n",
+                "compaction        deterministic                                 built-in default\n",
                 "thinking          (unset)                                       model default\n",
                 "permission        trusted                                       built-in default\n",
                 "agent wake        on                                            built-in default\n",
