@@ -11,7 +11,7 @@ pub(crate) use crate::workspace::fnv_bytes;
 
 /// Per-catalog-generation lookup index (§24/§25): `from_env` runs per daemon
 /// chat turn and every model call re-probes the catalog (idle timeout via
-/// `reasoning_options_for`, `usage_cost`, `cache_write_read_ratio`), but each
+/// `reasoning_options_for`, `usage_cost`), but each
 /// probe used to walk all providers × models with a lowercase alloc per id.
 /// The index walks once per catalog generation (same file-identity
 /// invalidation as the catalog parse itself) and serves every probe from
