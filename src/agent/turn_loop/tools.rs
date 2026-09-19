@@ -437,8 +437,7 @@ where
 }
 
 /// Everything one tool result in a completed batch touches, bundled so
-/// Everything one tool result in a completed batch touches, bundled so
-/// `process_tool_result` stays a plain function instead of a 11-arg one.
+/// `process_tool_result` stays a plain function instead of a 7-arg one.
 /// `'b` is the per-batch scope the mutable state is reborrowed for.
 pub(super) struct ToolResultCtx<'a, 'b> {
     pub(super) console: &'a Console,

@@ -373,8 +373,7 @@ impl ExtensionManager {
 
     /// Dispatch a shadowed built-in: run the shadow on its worker. Nested
     /// `dex.tools.call` re-enters the full pipeline; `call_original`
-    /// re-dispatches the shadowed built-in with the caller's gates (and the
-    /// live shell-evidence slot, so wrapped `bash` still reports).
+    /// re-dispatches the shadowed built-in with the caller's gates.
     pub(crate) async fn call_shadow(
         &self,
         target: &str,
