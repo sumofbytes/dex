@@ -184,68 +184,6 @@ fn resolve_model_cost_ignores_trailing_slash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Cache-write/read ratio resolution feeding the online compaction
-/// economics: explicit write surcharge wins, unpriced writes derive
-/// from input/cache_read (writes bill at the plain input rate), and no
-/// cache pricing at all falls back to the measured cross-provider
-/// default. Hermetic catalog via `XDG_CACHE_HOME`.
-#[test]
-fn cache_write_read_ratio_resolves_write_unpriced_and_fallback() {
-    // Serializes process-env redirection against other tests.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("dex-ratio-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("dex")).unwrap();
-    std::fs::write(
-            dir.join("dex/models.dev.json"),
-            serde_json::json!({
-                // Anthropic-style: explicit write surcharge.
-                "anthropic-like": {
-                    "models": {
-                        "surcharge": { "cost": { "input": 3.0, "cache_write": 3.75, "cache_read": 0.3, "output": 15.0 } }
-                    }
-                },
-                // The norm: cache_read priced, writes unpriced (input rate).
-                "plain": {
-                    "models": {
-                        "flat": { "cost": { "input": 1.25, "cache_read": 0.125, "output": 10.0 } }
-                    }
-                },
-                // No cache pricing at all: reads bill at the input rate.
-                "opaque": {
-                    "models": {
-                        "nada": { "cost": { "input": 2.0, "output": 8.0 } }
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-    let prev_cache = env::var_os("XDG_CACHE_HOME");
-    env::set_var("XDG_CACHE_HOME", &dir);
-    let mut cfg = test_cfg();
-    // No model match at all → measured fallback.
-    assert!((cfg.cache_write_read_ratio() - 5.0).abs() < 1e-9);
-    cfg.model = "flat".into();
-    // Writes at the plain input rate: 1.25 / 0.125 = 10.
-    assert!((cfg.cache_write_read_ratio() - 10.0).abs() < 1e-9);
-    cfg.model = "surcharge".into();
-    // Explicit surcharge: 3.75 / 0.3 = 12.5.
-    assert!((cfg.cache_write_read_ratio() - 12.5).abs() < 1e-9);
-    cfg.model = "nada".into();
-    // No cache rates: both bill at input (like `usage_cost`), so a
-    // re-write after compaction costs exactly what a read costs → 1.0,
-    // and the economics see no surcharge to amortize.
-    assert!((cfg.cache_write_read_ratio() - 1.0).abs() < 1e-9);
-    match prev_cache {
-        Some(v) => env::set_var("XDG_CACHE_HOME", v),
-        None => env::remove_var("XDG_CACHE_HOME"),
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 pub(crate) fn test_cfg() -> LlmConfig {
     LlmConfig {
         provider: Provider::OpenCode,
@@ -2296,10 +2234,8 @@ fn doctor_reports_selection_and_origins() {
         "DEX_PROVIDER",
         "DEX_MODEL",
         "OPENCODE_API_KEY",
-        crate::agent::obs_pack::OBSERVATION_PACK_ENV,
     ]);
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
     // Point at a missing file so the host config can't color the output.
     std::env::set_var(
         "DEX_CONFIG",
@@ -2311,13 +2247,6 @@ fn doctor_reports_selection_and_origins() {
     assert!(out.contains("OPENCODE_API_KEY"), "{out}");
     assert!(out.contains("built-in default"), "{out}");
     assert!(out.contains("resolve"), "{out}");
-    // Observation pack row: default off, origin named.
-    let obs = out
-        .lines()
-        .find(|l| l.starts_with("obs pack "))
-        .expect("obs pack row");
-    assert!(obs.contains("off"), "{obs}");
-    assert!(obs.contains("built-in default"), "{obs}");
 }
 
 /// A bare provider pick (`DEX_MODEL=anthropic`) surfaces as the provider
@@ -2349,104 +2278,6 @@ fn doctor_shows_bare_provider_pick_as_provider() {
         .expect("model row");
     assert!(model.contains("(unset)"), "{model}");
     assert!(!model.contains("anthropic"), "{model}");
-}
-
-/// The obs pack row reflects the gate on and names the env var as its
-/// origin.
-#[test]
-fn doctor_reports_obs_pack_env() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_PROVIDER",
-        "DEX_MODEL",
-        "OPENCODE_API_KEY",
-        crate::agent::obs_pack::OBSERVATION_PACK_ENV,
-    ]);
-    std::env::set_var("OPENCODE_API_KEY", "test-key");
-    std::env::set_var(
-        "DEX_CONFIG",
-        std::env::temp_dir().join(format!("dex-obs-doctor-{}", std::process::id())),
-    );
-    std::env::set_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV, "1");
-    let out = doctor(None, None, None, &[], None);
-    let obs = out
-        .lines()
-        .find(|l| l.starts_with("obs pack "))
-        .expect("obs pack row");
-    assert!(obs.contains("on"), "{obs}");
-    assert!(
-        obs.contains(crate::agent::obs_pack::OBSERVATION_PACK_ENV),
-        "{obs}"
-    );
-}
-
-/// The evidence reducer row only appears behind its gate, reports the
-/// pack gate it depends on, and names the reducer model env var as the
-/// model origin when it is set.
-#[test]
-fn doctor_reports_evidence_reducer_env() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_PROVIDER",
-        "DEX_MODEL",
-        "OPENCODE_API_KEY",
-        crate::agent::evidence_reducer::GATE_ENV,
-        crate::agent::obs_pack::OBSERVATION_PACK_ENV,
-        crate::agent::evidence_reducer::MODEL_ENV,
-    ]);
-    std::env::set_var("OPENCODE_API_KEY", "test-key");
-    std::env::set_var(
-        "DEX_CONFIG",
-        std::env::temp_dir().join(format!("dex-evidence-doctor-{}", std::process::id())),
-    );
-    // Gate off: no row at all.
-    std::env::remove_var(crate::agent::evidence_reducer::GATE_ENV);
-    std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
-    std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
-    let out = doctor(None, None, None, &[], None);
-    assert!(
-        !out.lines().any(|l| l.starts_with("evidence reducer")),
-        "gate off must not produce a row: {out}"
-    );
-    // Gate on but the pack off: the row explains what is missing.
-    std::env::set_var(crate::agent::evidence_reducer::GATE_ENV, "1");
-    let out = doctor(None, None, None, &[], None);
-    let row = out
-        .lines()
-        .find(|l| l.starts_with("evidence reducer"))
-        .expect("evidence reducer row");
-    assert!(
-        row.contains(&format!(
-            "needs {}=1",
-            crate::agent::obs_pack::OBSERVATION_PACK_ENV
-        )),
-        "{row}"
-    );
-    assert!(row.contains("main model"), "{row}");
-    // Pack on: fully enabled, and an explicit reducer model is named
-    // with its env origin.
-    std::env::set_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV, "1");
-    std::env::set_var(
-        crate::agent::evidence_reducer::MODEL_ENV,
-        "openrouter/z-ai/glm-4.5-air",
-    );
-    let out = doctor(None, None, None, &[], None);
-    let row = out
-        .lines()
-        .find(|l| l.starts_with("evidence reducer"))
-        .expect("evidence reducer row");
-    assert!(row.contains("on ·"), "{row}");
-    assert!(row.contains("openrouter/z-ai/glm-4.5-air"), "{row}");
-    assert!(
-        row.contains(crate::agent::evidence_reducer::MODEL_ENV),
-        "{row}"
-    );
 }
 
 /// Rows whose value overflows the value column wrap instead of
@@ -2553,10 +2384,6 @@ fn doctor_output_is_byte_stable() {
         "DEX_SYSTEM_PROMPT_FILE",
         "DEX_PERMISSION",
         "DEX_HEADERS",
-        crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
-        crate::agent::obs_pack::OBSERVATION_PACK_ENV,
-        crate::agent::evidence_reducer::GATE_ENV,
-        crate::agent::evidence_reducer::MODEL_ENV,
         "DEX_AGENT_WAKE",
         "DEX_ROUTING",
         "DEX_ROUTING_FAST",
@@ -2569,13 +2396,6 @@ fn doctor_output_is_byte_stable() {
         "DEX_EXTENSIONS_PATHS",
     ]);
     std::env::remove_var("DEX_EXTENSIONS_PATHS");
-    // `EnvRestore::take` saves-and-restores; the toggles that flip doctor
-    // rows must be cleared outright, so a developer shell with the
-    // experiment gates set does not drift the byte-stable output.
-    std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
-    std::env::remove_var(crate::agent::obs_pack::OBSERVATION_PACK_ENV);
-    std::env::remove_var(crate::agent::evidence_reducer::GATE_ENV);
-    std::env::remove_var(crate::agent::evidence_reducer::MODEL_ENV);
     std::env::remove_var("DEX_SYSTEM_PROMPT");
     std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
     std::env::remove_var("DEX_ROUTING");
@@ -2590,20 +2410,8 @@ fn doctor_output_is_byte_stable() {
     // XDG config dir, which must not see the developer's real installs.
     std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
     let out = doctor(None, None, None, &[], None);
-    // The online row is built from the experiment module's own env
-    // const so config.rs never names the gate; the padding is derived
-    // from the value width (origin column = 18+46) instead of
-    // hand-counted spaces, so an env rename tracks cleanly.
-    let online_value = format!(
-        "off (set {}=1)",
-        crate::agent::online_compaction::ONLINE_COMPACTION_ENV
-    );
-    let online_row = format!(
-        "online compaction {online_value}{}built-in default (off)\n",
-        " ".repeat(46 - online_value.chars().count())
-    );
     let expected = format!(
-            "{}{}{}",
+            "{}{}",
             concat!(
                 concat!("dex ", env!("CARGO_PKG_VERSION"), "\n"),
                 "\n",
@@ -2618,9 +2426,7 @@ fn doctor_output_is_byte_stable() {
                 "protocol          openai-responses                              default (auto-fallback to completions)\n",
                 "context           UNKNOWN tokens                                no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW\n",
             ),
-            online_row,
             concat!(
-                "obs pack          off                                           built-in default (off)\n",
                 "compaction        deterministic                                 built-in default\n",
                 "thinking          (unset)                                       model default\n",
                 "permission        trusted                                       built-in default\n",

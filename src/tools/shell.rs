@@ -1,7 +1,6 @@
 //! Shell execution: timeouts, process groups, output capture.
 
 use std::env;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -10,10 +9,10 @@ use serde_json::{Map, Value};
 use tokio::io::AsyncReadExt as _;
 
 use crate::runtime::cancel::{wait_cancelled, CancellationSource};
-use crate::ui::format::clamp_lines_checked;
+use crate::ui::format::clamp_lines;
 
 use super::then_run::arg_str;
-use super::{ShellEvidence, ToolError, CONFIGURED_OUTPUT_LIMIT};
+use super::{ToolError, CONFIGURED_OUTPUT_LIMIT};
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -239,17 +238,9 @@ fn shell_command(command: &str) -> tokio::process::Command {
 pub(crate) async fn tool_bash(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
-    session: Option<&Path>,
-    shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
     let (output, code) = run_bash(&arg_str(args, "command")?, cancel).await?;
-    let (clamped, was_clamped) = clamp_lines_checked(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
-    let (clamped, archive_id) =
-        crate::agent::evidence_reducer::capture(session, "bash", &output, clamped, was_clamped);
-    *shell_out = Some(ShellEvidence {
-        archive_id,
-        exit_code: code,
-    });
+    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
     match code {
         Some(0) => Ok(clamped),
         code => Err(ToolError::Shell {
