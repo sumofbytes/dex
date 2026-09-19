@@ -228,7 +228,7 @@ pub(crate) async fn get_mcp() -> Json<serde_json::Value> {
     // `auth` carries the OAuth line for HTTP servers (`null` for stdio, which
     // needs no login, and for servers the daemon never configured).
     // Config loads once and maps over statuses (no N+1 reloads).
-    let configs = crate::mcp::load_server_configs();
+    let configs = crate::mcp::config::load_server_configs();
     let servers: Vec<serde_json::Value> = crate::mcp::global_manager()
         .statuses()
         .await

@@ -770,8 +770,8 @@ pub(crate) async fn probe_challenge(
 /// reconnect. Prints the authorize URL (and tries to open it) for headless
 /// terminals.
 pub(crate) async fn login(server: &str) -> Result<String, String> {
-    let server = super::super::sanitize_server_name(server);
-    let configs = super::super::load_server_configs();
+    let server = super::super::config::sanitize_server_name(server);
+    let configs = super::super::config::load_server_configs();
     let cfg = configs
         .get(&server)
         .cloned()
@@ -850,7 +850,7 @@ struct ResolvedClient {
 /// registration for the same token endpoint (no re-registration every
 /// login), else dynamic registration against `asm.registration_endpoint`.
 async fn resolve_client(
-    cfg: &super::super::McpServerConfig,
+    cfg: &super::super::config::McpServerConfig,
     server: &str,
     asm: &AuthServerMetadata,
     redirect_uri: &str,
@@ -926,7 +926,7 @@ async fn authorize_and_exchange(
 }
 
 pub(crate) fn logout(server: &str) -> Result<String, String> {
-    let server = super::super::sanitize_server_name(server);
+    let server = super::super::config::sanitize_server_name(server);
     if clear_token(&server) {
         Ok(format!("logged out of '{server}'"))
     } else {

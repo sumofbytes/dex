@@ -1,6 +1,16 @@
 //! MCP client tests.
 
+use super::client::McpClient;
+use super::config::{sanitize_server_name, split_mcp_name, McpServerConfig};
+use super::manager::McpManager;
+use super::mapping::{content_to_text, McpTool};
+use super::transport::McpTransport;
 use super::*;
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use serde_json::Value;
 
 struct FakeTransport {
     tools: Vec<McpTool>,
