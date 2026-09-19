@@ -1,38 +1,13 @@
-//! MCP status line and panel rendering for the compaction budget and the
-//! `/mcp` slash surface.
+//! `/mcp` panel rendering for the slash surface. The one-line status lives
+//! with its owner (`mcp::status_line`).
 
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-
-use super::{clip_chars, one_line_summary, truncate_cols};
+use super::clip_chars;
 
 /// Ephemeral MCP status line for the compaction budget (`agent::loop`
 /// counts it via the `ephemerals` preamble without storing it in the
 /// transcript). `None` when no servers are configured so the budget is
 /// unaffected. The schema already tells the model which tools exist; this
 /// names what it is *not* seeing — down servers and schema-cap drops.
-pub(crate) fn mcp_status_line(statuses: &[crate::mcp::ServerStatus]) -> Option<String> {
-    if statuses.is_empty() {
-        return None;
-    }
-    let mut parts: Vec<String> = statuses
-        .iter()
-        .map(|s| {
-            if s.state.as_str() == "up" {
-                format!("{} ({} tools)", s.name, s.tools)
-            } else {
-                format!("{} (down)", s.name)
-            }
-        })
-        .collect();
-    let dropped = crate::mcp::cached_truncated();
-    if dropped > 0 {
-        parts.push(format!("{dropped} tools omitted (schema cap)"));
-    }
-    Some(format!("MCP servers: {}", parts.join(", ")))
-}
-
 /// Multi-line `/mcp` panel: one header with totals,
 /// then per server a `✓ name — N tools` line (with each tool + its one-line
 /// description indented beneath) or a `✗ name — down: <reason>` line.

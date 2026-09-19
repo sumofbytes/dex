@@ -696,6 +696,30 @@ pub(crate) fn cached_truncated() -> usize {
 /// never stored. `None` when the manager was never initialized (no MCP
 /// tools in the schema then either) or a lock is contended — the budget
 /// probe must never block the loop or spawn the background refresh.
+/// One-line MCP status summary (`MCP servers: gh (3 tools), db (down) …`)
+/// plus the schema-cap drop count. Presentation lives with the owner; the
+/// budget probe in `agent` counts the line without storing it.
+pub(crate) fn status_line(statuses: &[ServerStatus]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = statuses
+        .iter()
+        .map(|s| {
+            if s.state.as_str() == "up" {
+                format!("{} ({} tools)", s.name, s.tools)
+            } else {
+                format!("{} (down)", s.name)
+            }
+        })
+        .collect();
+    let dropped = cached_truncated();
+    if dropped > 0 {
+        parts.push(format!("{dropped} tools omitted (schema cap)"));
+    }
+    Some(format!("MCP servers: {}", parts.join(", ")))
+}
+
 pub(crate) fn ephemeral_line() -> Option<String> {
     let mgr = GLOBAL.get()?;
     // Zero-config managers have no line to print (the cached-status path
@@ -703,7 +727,7 @@ pub(crate) fn ephemeral_line() -> Option<String> {
     if mgr.configs.is_empty() {
         return None;
     }
-    try_snapshot(mgr).and_then(|st| crate::ui::format::mcp_status_line(&st))
+    try_snapshot(mgr).and_then(|st| status_line(&st))
 }
 
 pub(crate) async fn call_global(

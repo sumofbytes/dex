@@ -4,11 +4,6 @@ use super::parser::COMMANDS;
 use crate::session::Session;
 use std::path::PathBuf;
 
-fn save_plan(app: &mut App) -> std::io::Result<()> {
-    let json = app.plan.to_json();
-    app.session.set_state("plan", &json)
-}
-
 /// Every session for this workspace, newest first, excluding the current one.
 /// No emptiness filtering: users pick by index/time, and resuming a session
 /// without messages just shows an empty transcript. Listing is header-only

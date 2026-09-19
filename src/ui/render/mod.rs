@@ -55,7 +55,9 @@ pub(super) use transcript::TranscriptView;
 
 // Test-only helpers from the children (rendered-view unit tests below).
 #[cfg(test)]
-pub(crate) use activity::{pending_queue_metrics, QUEUE_MAX_ITEM_ROWS};
+pub(crate) use activity::pending_queue_metrics;
+#[cfg(test)]
+pub(crate) use activity::QUEUE_MAX_ITEM_ROWS;
 #[cfg(test)]
 #[cfg(test)]
 pub(crate) use markdown::highlight_code_block;
@@ -132,7 +134,6 @@ pub(super) fn minimum_view_height(activity_h: u16, approval_h: u16) -> u16 {
 pub(super) struct UiLayout {
     pub(super) transcript: Rect,
     pub(super) activity: Rect,
-    pub(super) approval: Rect,
     pub(super) input: Rect,
     pub(super) footer: Rect,
 }
@@ -171,7 +172,6 @@ pub(super) fn compute_layout(
         return Some(UiLayout {
             transcript: area,
             activity: Rect::new(area.x, area.y, area.width, 0),
-            approval: Rect::new(area.x, area.y, area.width, 0),
             input: Rect::new(area.x, area.y, area.width, 0),
             footer: Rect::new(area.x, area.y, area.width, 0),
         });
@@ -187,7 +187,6 @@ pub(super) fn compute_layout(
         Constraint::Min(1),
         Constraint::Length(super::VERTICAL_GUTTER),
         Constraint::Length(activity_h),
-        Constraint::Length(approval_h),
         Constraint::Length(input_h),
         Constraint::Length(super::INPUT_STATUS_GUTTER),
         Constraint::Length(status_height()),
@@ -197,9 +196,8 @@ pub(super) fn compute_layout(
     Some(UiLayout {
         transcript: chunks[0],
         activity: chunks[2],
-        approval: chunks[3],
-        input: chunks[4],
-        footer: chunks[6],
+        input: chunks[3],
+        footer: chunks[5],
     })
 }
 

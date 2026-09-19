@@ -869,7 +869,7 @@ fn submitted_prompt_keeps_user_voice() {
 
 #[test]
 fn git_context_returns_empty_on_non_repo() {
-    let (branch, dirty) = crate::ui::format::git_context("/tmp/not-a-repo-12345");
+    let (branch, dirty) = crate::runtime::format_runtime::git_context("/tmp/not-a-repo-12345");
     assert!(branch.is_none());
     assert!(!dirty);
 }

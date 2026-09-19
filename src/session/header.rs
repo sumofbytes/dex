@@ -80,8 +80,10 @@ pub(crate) struct SessionEventEntry {
 
 /// Durable record of one side effect: intent (before execution) and outcome
 /// (after). Written around every tool execution so a restart can reconcile
-/// what happened vs. what completed (P8 journal).
+/// what happened vs. what completed (P8 journal). Nothing wires it into the
+/// turn loop yet — test-only until a producer lands.
 #[derive(Serialize)]
+#[cfg(test)]
 pub(crate) struct SessionEffectEntry {
     #[serde(rename = "type")]
     pub(crate) entry_type: String,

@@ -13,7 +13,9 @@ pub(crate) use super::runtime::{
     block_on, shared_async_client, shared_streaming_client, spawn_task, TCP_KEEPALIVE_SECS,
     USER_AGENT,
 };
-pub(crate) use super::sse::{ChatStream, SseFramer};
+pub(crate) use super::sse::ChatStream;
+#[cfg(test)]
+pub(crate) use super::sse::SseFramer;
 
 /// Per-request overrides forwarded to the daemon with a chat turn.
 #[derive(Debug, Clone, Default)]
@@ -145,6 +147,7 @@ impl DaemonClient {
         Ok(info)
     }
 
+    #[cfg(test)]
     pub fn get_config(&self) -> Result<DaemonInfo, Box<dyn std::error::Error>> {
         block_on(self.get_config_async())
     }
@@ -232,6 +235,7 @@ impl DaemonClient {
         Ok(info)
     }
 
+    #[cfg(test)]
     pub fn get_git(&self) -> Result<GitInfo, Box<dyn std::error::Error>> {
         block_on(self.get_git_async()).map_err(|e| -> Box<dyn std::error::Error> { e })
     }
@@ -316,6 +320,7 @@ impl DaemonClient {
     /// interaction) so it is safe to call from any context and trivial to
     /// unit-test. Returns `None` for keep-alives (`ping`), blanks, non-`data:`
     /// lines, and unparsable payloads (skipped, matching prior behavior).
+    #[cfg(test)]
     pub(crate) fn parse_sse_line(line: &str) -> Option<StreamEvent> {
         Some(SseFramer::parse_envelope(line)?.event)
     }
@@ -432,6 +437,7 @@ impl DaemonClient {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn approve(
         &self,
         session_id: &str,
@@ -605,7 +611,9 @@ impl DaemonClient {
         block_on(self.events_async(session_id, since))
     }
 
-    /// Fetch the redacted trace rows for a session (P9).
+    /// Fetch the redacted trace rows for a session (P9). Test-only: the
+    /// UI never renders the raw trace rows (the journal carries them).
+    #[cfg(test)]
     pub async fn trace_async(
         &self,
         session_id: &str,
@@ -622,6 +630,7 @@ impl DaemonClient {
         Ok(resp["trace"].as_array().cloned().unwrap_or_default())
     }
 
+    #[cfg(test)]
     pub fn trace(
         &self,
         session_id: &str,

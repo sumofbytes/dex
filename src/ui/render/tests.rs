@@ -1282,7 +1282,6 @@ fn approval_overlay_renders_action_and_choices() {
         "bash".to_string(),
         r#"{"command":"cargo test"}"#.to_string(),
         response_tx,
-        "req-1".to_string(),
         None,
     );
     approval.selected = 1;
@@ -1329,7 +1328,6 @@ fn approval_overlay_renders_action_and_choices() {
         "write".to_string(),
         r#"{"path":"src/main.rs","content":"hello\nworld\n"}"#.to_string(),
         tx2,
-        "req-2".to_string(),
         Some("explorer".to_string()),
     )];
     let backend2 = TestBackend::new(80, 24);
