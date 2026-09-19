@@ -13,13 +13,13 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use crate::core::types::ChatMessage;
+use crate::protocol::ChatMessage;
 use crate::protocol::StreamEvent;
 use crate::session::Session;
 
 use super::lookup::session_path;
 use super::{lock_map, DaemonState};
-use crate::core::console::CancellationToken;
+use crate::runtime::console::CancellationToken;
 
 /// `POST /api/sessions/{id}/shell` with `{"command": ...}` — run a shell
 /// command directly in the daemon workspace (`!`/`!!` prefix in the TUI).
@@ -108,11 +108,13 @@ pub(crate) async fn session_shell(
     // failure mode.
     let persist = if req.exclude_from_context {
         ChatMessage::user_named(
-            crate::core::format::bash_context_text(&command, &output, success, code, cancelled),
-            crate::core::types::BASH_EXCLUDED_NAME,
+            crate::runtime::format_runtime::bash_context_text(
+                &command, &output, success, code, cancelled,
+            ),
+            crate::protocol::BASH_EXCLUDED_NAME,
         )
     } else {
-        ChatMessage::user(crate::core::format::bash_context_text(
+        ChatMessage::user(crate::runtime::format_runtime::bash_context_text(
             &command, &output, success, code, cancelled,
         ))
     };
@@ -120,10 +122,10 @@ pub(crate) async fn session_shell(
     // true-remote reattach (events-journal replay) renders the same block
     // the co-located transcript rebuild draws from the message above.
     let input_json = serde_json::json!({"command": command}).to_string();
-    let short = crate::core::format::short_arg("bash", &input_json);
+    let short = crate::ui::format::short_arg("bash", &input_json);
     let summary =
-        crate::core::format::tool_result_summary("bash", &input_json, &output, success, None);
-    let preview = crate::core::format::tool_preview("bash", success, None, &output, true);
+        crate::ui::format::tool_result_summary("bash", &input_json, &output, success, None);
+    let preview = crate::ui::format::tool_preview("bash", success, None, &output, true);
     let (call_seq, result_seq) = state.next_seq_pair(&session_id);
     // Unique id shared by the pair so concurrent runs can't steal each
     // other's half even if the two pairs interleave in the journal. The

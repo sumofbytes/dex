@@ -195,7 +195,7 @@ pub(super) fn status_tokens(app: &App) -> u64 {
 /// sampled bytes and misses — the old (len, tail-len) key collided on
 /// those. O(messages) pointer/len reads, never a full char walk, so a hit
 /// still avoids the estimator's walk.
-fn history_fingerprint(messages: &[crate::core::types::ChatMessage]) -> u64 {
+fn history_fingerprint(messages: &[crate::protocol::ChatMessage]) -> u64 {
     let mut h = 14695981039346656037u64;
     let mut mix = |b: u8| {
         h ^= u64::from(b);
@@ -349,11 +349,14 @@ fn agents_pieces(app: &App) -> Vec<Piece> {
     ]
 }
 
+/// Test shim: the status row as plain text (string asserts in `render/tests`).
+#[cfg(test)]
 pub(super) fn ui_status(app: &App) -> String {
     status_pieces(app, true)
         .into_iter()
         .map(|(text, _)| text)
-        .collect()
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 fn compact_pieces(app: &App) -> Vec<Piece> {
@@ -487,6 +490,8 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
     to_line(truncate_pieces(left, width))
 }
 
+/// Test shim: the footer row as plain text (string asserts in `render/tests`).
+#[cfg(test)]
 pub(super) fn footer_text(app: &App, width: u16) -> String {
     footer_line(app, width)
         .spans

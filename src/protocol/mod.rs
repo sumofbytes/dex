@@ -133,12 +133,30 @@ pub struct ApprovalResponse {
     pub decision: ApprovalDecision,
 }
 
+// Single enum for the wire AND the agent loop (merged from the old
+// `protocol::ApprovalDecision` + `core::types::ApprovalDecision` bridge in
+// plan §4 Phase 3). Serde spellings are the wire contract ("allow_once" /
+// "allow_session" / "deny"); `as_str` is the audit spelling ("once" /
+// "session" / "deny") — single source so audit rows never drift from the
+// wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     AllowOnce,
     AllowSession,
     Deny,
+}
+
+impl ApprovalDecision {
+    /// Audit/wire spelling for an approval decision ("once"/"session"/
+    /// "deny"). Single source so audit rows never drift from the wire.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "once",
+            Self::AllowSession => "session",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 /// SSE event types streamed during a chat turn.
@@ -379,6 +397,21 @@ pub struct GitInfo {
     #[serde(default)]
     pub git_dirty: bool,
 }
+
+/// Domain vocabulary shared across agent/tools/session/ui and persisted in
+/// session JSONL (plan §4 Phase 3: wire-schema items went to `shared.rs`,
+/// these stay domain — sessions are the wire).
+#[path = "domain.rs"]
+pub(crate) mod domain;
+
+pub(crate) use domain::*;
+
+/// Wire schema for chat messages, tool definitions and stream chunk
+/// parsing (plan §4 Phase 3: formerly `core/types.rs`).
+#[path = "shared.rs"]
+pub(crate) mod shared;
+
+pub(crate) use shared::*;
 
 #[cfg(test)]
 mod tests {

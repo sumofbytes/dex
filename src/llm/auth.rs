@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::core::types::Provider;
+use crate::protocol::Provider;
 
 use super::config::{catalog_env_vars, ProviderEntry};
 

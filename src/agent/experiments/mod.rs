@@ -7,8 +7,8 @@
 //! experiment's env var or gate. Adding an experiment means adding one
 //! directory under `src/agent/` and one entry here.
 
-use crate::core::types::ToolDefinition;
 use crate::llm::config::LlmConfig;
+use crate::protocol::ToolDefinition;
 
 /// One row of `dex doctor` output, rendered by `row()` in
 /// `llm/config.rs::doctor`.

@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use tokio::io::AsyncReadExt as _;
 
-use crate::agent::state::wait_cancelled;
-use crate::core::format::clamp_lines;
+use crate::runtime::cancel::wait_cancelled;
+use crate::ui::format::clamp_lines;
 
-use super::{arg_str, resolve_workspace_path, workspace_path, workspace_root, ToolError};
+use super::then_run::arg_str;
+use super::{resolve_workspace_path, workspace_path, workspace_root, ToolError};
 
 /// Multi-file read caps: enough for the "search, then read the hits" pattern
 /// in one call, small enough that a fan-out cannot flood the context.
@@ -75,11 +76,14 @@ fn parse_path_list(paths: &[Value]) -> Result<Vec<PathBuf>, ToolError> {
     paths
         .iter()
         .map(|value| {
-            value.as_str().map(workspace_path).unwrap_or_else(|| {
-                Err(ToolError::InvalidArgument(
-                    "paths entries must be strings".to_string(),
-                ))
-            })
+            value
+                .as_str()
+                .map(|s| workspace_path(s).map_err(ToolError::from))
+                .unwrap_or_else(|| {
+                    Err(ToolError::InvalidArgument(
+                        "paths entries must be strings".to_string(),
+                    ))
+                })
         })
         .collect()
 }
@@ -367,7 +371,7 @@ async fn expand_glob_via_find(root: &Path, glob: &str) -> Result<Vec<PathBuf>, T
     // with a wall-clock cap so a wedged FS can't park a turn past cancel.
     let output = tokio::select! {
         out = child.wait_with_output() => out.map_err(ToolError::Io)?,
-        _ = wait_cancelled(&crate::agent::state::GlobalCancellation) => {
+        _ = wait_cancelled(&crate::runtime::cancel::GlobalCancellation) => {
             return Err(ToolError::Shell {
                 output: "Error: shell command cancelled".to_string(),
                 code: None,

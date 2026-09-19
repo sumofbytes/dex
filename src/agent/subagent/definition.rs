@@ -56,7 +56,6 @@ pub(crate) struct AgentDefinition {
     /// Routing key (`delegate(agent, …)` resolves it) + session-path slug.
     pub(crate) name: String,
     /// Shown to the parent model for routing.
-    pub(crate) description: String,
     /// Body: the child's system-prompt persona.
     pub(crate) prompt: String,
     /// Same single knob as the main agent (`provider/model` against the
@@ -141,9 +140,13 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
             "invalid agent name '{name}': use ascii letters, digits, '-' or '_'"
         ));
     }
-    let description = description.filter(|d| !d.is_empty()).ok_or_else(|| {
-        format!("agent '{name}' is missing a 'description': the parent model routes on it")
-    })?;
+    // The parent model routes on the description; validate it here but
+    // don't carry it — nothing downstream reads it after parse.
+    if description.filter(|d| !d.is_empty()).is_none() {
+        return Err(format!(
+            "agent '{name}' is missing a 'description': the parent model routes on it"
+        ));
+    }
     let prompt = prompt
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
@@ -193,7 +196,6 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
     let model = model.filter(|m| !m.is_empty());
     Ok(AgentDefinition {
         name,
-        description,
         prompt,
         model,
         tools,
@@ -244,7 +246,6 @@ mod tests {
     fn parses_all_frontmatter_fields() {
         let def = parse_definition(VALID).unwrap();
         assert_eq!(def.name, "scout");
-        assert_eq!(def.description, "Finds things.");
         assert_eq!(def.model.as_deref(), Some("opencode/gpt-5"));
         assert_eq!(def.prompt, "You find things.");
         assert_eq!(def.max_tool_iterations, Some(50));
@@ -333,7 +334,6 @@ mod tests {
         let names: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["explorer", "reviewer", "tester"]);
         for def in &defs {
-            assert!(!def.description.is_empty(), "{}", def.name);
             assert!(!def.prompt.is_empty(), "{}", def.name);
             assert_eq!(def.model, None, "{} inherits the model", def.name);
         }
