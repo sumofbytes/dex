@@ -1,8 +1,61 @@
 //! Server handler/permission/e2e/parallelism tests, split out of
 //! `server/mod.rs` so the facade stays route wiring only.
 
+#[cfg(test)]
+#[cfg(test)]
+use super::super::lookup::lookup_entry;
+#[cfg(test)]
+use super::super::lookup::persisted_current;
+#[cfg(test)]
+use super::super::required_token;
+#[cfg(test)]
+use super::super::shell::session_shell;
+#[cfg(test)]
+use super::super::turn::apply_thinking_override;
+#[cfg(test)]
+use super::super::turn::run_turn_inner;
+#[cfg(test)]
+use super::super::turn::TurnChannels;
+#[cfg(test)]
+use crate::daemon::server::{
+    approve, cancel, chat, create_session, extensions_reload, extensions_run, followup,
+    get_extensions, get_git, get_mcp, health, list_skills, load_skill, mcp_reconnect, reattach,
+    recall, router, session_events, session_name, session_trace, session_undo, session_waive,
+    steal_wake_and_claim, steer,
+};
+#[cfg(test)]
+use crate::daemon::server::{list_sessions, DaemonState};
+#[cfg(test)]
+use crate::daemon::state::{lock_map, PendingApproval, SessionEntry};
+#[cfg(test)]
+use crate::llm::config::LlmConfig;
+#[cfg(test)]
+use crate::protocol::{
+    ApprovalDecision, ChatRequest, CreateSessionRequest, ExtensionRunRequest, FollowupRequest,
+    LoadSkillRequest, QueueMsg, RecallRequest, SteerRequest, StreamEvent,
+};
+#[cfg(test)]
+use crate::runtime::console::CancellationToken;
+#[cfg(test)]
+use crate::session::Session;
+#[cfg(test)]
+use axum::extract::State;
+#[cfg(test)]
+use axum::http::StatusCode;
+#[cfg(test)]
+use axum::Json;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use tokio::sync::mpsc;
+
+#[cfg(test)]
 mod handler_tests {
-    use super::super::*;
+    use super::*;
     use axum::extract::{Path, Query};
     use serde_json::json;
 
@@ -1437,7 +1490,7 @@ not json
 
 #[cfg(test)]
 mod permission_gate_tests {
-    use super::super::*;
+    use super::*;
     use crate::daemon::state::lock_map;
     use crate::session::Session;
     use std::sync::Arc;
@@ -1570,7 +1623,7 @@ mod permission_gate_tests {
 
 #[cfg(test)]
 mod e2e_tests {
-    use super::super::*;
+    use super::*;
     use crate::client::http::{ChatOptions, DaemonClient};
     use axum::body::Body;
     use axum::extract::State as AxumState;
@@ -2458,7 +2511,7 @@ mod e2e_tests {
 
 #[cfg(test)]
 mod async_parallel_tests {
-    use super::super::*;
+    use super::*;
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
