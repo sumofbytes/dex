@@ -12,7 +12,8 @@ use tokio::io::AsyncReadExt as _;
 use crate::runtime::cancel::{wait_cancelled, CancellationSource};
 use crate::ui::format::clamp_lines_checked;
 
-use super::{arg_str, ShellEvidence, ToolError, CONFIGURED_OUTPUT_LIMIT};
+use super::then_run::arg_str;
+use super::{ShellEvidence, ToolError, CONFIGURED_OUTPUT_LIMIT};
 
 #[cfg(unix)]
 unsafe extern "C" {

@@ -13,7 +13,8 @@ use ::fff::{
     SharedFilePicker, SharedFrecency,
 };
 
-use super::{arg_str, ToolError};
+use super::then_run::arg_str;
+use super::ToolError;
 use serde_json::{Map, Value};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
