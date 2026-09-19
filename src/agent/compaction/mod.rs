@@ -444,12 +444,8 @@ pub(crate) async fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &(dyn CancellationSource + Send + Sync),
     emergency: bool,
-    // Whether a worthwhile verbatim prune beats the summary. Threaded
-    // separately from `summarizer` because the two knobs are independent:
-    // the threshold path derives both from `summary_mode()`
-    // (`DEX_COMPACTION`), the boundary path passes
-    // `online_compaction_jev()` (`DEX_ONLINE_COMPACTION=jev`) here while
-    // still taking the fallback summarizer from the threshold knob.
+    // Whether a worthwhile verbatim prune beats the summary. The threshold
+    // path derives both from `summary_mode()` (`DEX_COMPACTION`).
     jev_prune: bool,
     // Fallback summarizer when no hook summary applies and the prune is
     // skipped or does not pay — always the threshold knob's choice, parsed
@@ -1092,12 +1088,8 @@ mod tests {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvRestore::take(&[
-            "DEX_COMPACTION",
-            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
-        ]);
+        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
         std::env::set_var("DEX_COMPACTION", "jev");
-        std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "goal: build the thing"));
@@ -1155,12 +1147,8 @@ mod tests {
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvRestore::take(&[
-            "DEX_COMPACTION",
-            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
-        ]);
+        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
         std::env::set_var("DEX_COMPACTION", "jev");
-        std::env::remove_var(crate::agent::online_compaction::ONLINE_COMPACTION_ENV);
         let config = crate::llm::config::tests::test_cfg();
         // Tool-light history the normal path still cuts: nothing to prune,
         // so the deterministic summary must cover the span instead.
@@ -1194,24 +1182,14 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env must stay set across the compaction await
-    async fn online_jev_alone_does_not_prune_the_threshold_path() {
-        // The knobs are independent: `DEX_ONLINE_COMPACTION=jev` governs
-        // boundary compactions (the loop passes `online_compaction_jev()`
-        // there); the threshold path passes `summary_mode().prunes_jev()`, so
-        // with only the online knob set a tool-heavy span still
-        // summarizes instead of pruning.
+    async fn threshold_compaction_summarizes_by_default() {
+        // The threshold path follows `DEX_COMPACTION`: unset means the
+        // deterministic summary covers a tool-heavy span (no verbatim prune).
         let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvRestore::take(&[
-            "DEX_COMPACTION",
-            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
-        ]);
+        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
         std::env::remove_var("DEX_COMPACTION");
-        std::env::set_var(
-            crate::agent::online_compaction::ONLINE_COMPACTION_ENV,
-            "jev",
-        );
         let config = crate::llm::config::tests::test_cfg();
         let mut messages = vec![msg(Role::System, "sys")];
         messages.push(msg(Role::User, "goal: build the thing"));
