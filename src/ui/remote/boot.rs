@@ -124,7 +124,7 @@ pub(crate) fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     Line::from(vec![Span::styled(
         format!(
             "ready in {}",
-            crate::core::format::format_duration(elapsed_secs)
+            crate::ui::format::format_duration(elapsed_secs)
         ),
         Style::default().fg(super::super::theme::muted_fg()),
     )])
@@ -299,7 +299,7 @@ pub(crate) fn bootstrap(
         show_thinking: false,
         thinking_open: false,
         assistant_pending: String::new(),
-        assistant_gap: crate::core::markdown::GapState::new(),
+        assistant_gap: crate::ui::theme::markdown::GapState::new(),
         stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,

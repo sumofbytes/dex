@@ -173,7 +173,7 @@ fn remote_mcp(remote: &mut RemoteApp, arg: Option<&str>) {
                         .unwrap_or_default();
                     // No per-tool detail over the wire yet: headers + errors.
                     let truncated = body["truncated"].as_u64().unwrap_or(0) as usize;
-                    for line in crate::core::format::render_mcp_panel(&statuses, &[], truncated) {
+                    for line in crate::ui::format::render_mcp_panel(&statuses, &[], truncated) {
                         push_info(&mut remote.app, line);
                     }
                     // Auth rides the same body (`auth`, null for stdio) so a

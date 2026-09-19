@@ -274,7 +274,7 @@ fn test_app() -> super::super::App {
         thinking_open: false,
         plan: crate::protocol::Plan::default(),
         assistant_pending: String::new(),
-        assistant_gap: crate::core::markdown::GapState::new(),
+        assistant_gap: crate::ui::theme::markdown::GapState::new(),
         stream_last_flush: std::time::Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
@@ -2010,7 +2010,7 @@ fn submitted_prompt_is_one_row_above_tool_block() {
 fn blank_runs_render_one_air_row() {
     // Double/triple blank lines collapse to one air row (CommonMark renders
     // a single separator for a blank run).
-    let src = crate::core::markdown::normalize_gaps(
+    let src = crate::ui::theme::markdown::normalize_gaps(
         "",
         "para one\n\n\n\npara two\n\n\n- a\n- b\n\n\ntail",
     );
@@ -2030,7 +2030,7 @@ fn normalized_source_renders_gapped() {
     // The gap rule lives in `core::markdown` (unit-tested there); this
     // pins the render layer end to end: normalized dense source renders
     // the heading, list and table separated instead of wall-to-wall.
-    let src = crate::core::markdown::normalize_gaps(
+    let src = crate::ui::theme::markdown::normalize_gaps(
         "",
         "text\n## Changes\n- a\n| A | B |\n|---|---|\n| 1 | 2 |",
     );
@@ -2332,10 +2332,10 @@ fn streamed_table_renders_as_one_block() {
 fn table_rows_stay_tight_across_seams() {
     // A throttle seam between table rows must not insert air: that would
     // split one table into two blocks mid-column.
-    let out = crate::core::markdown::normalize_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
+    let out = crate::ui::theme::markdown::normalize_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
     assert_eq!(out, "| 1 | 2 |\n");
     // Same for the delimiter row following a header.
-    let out = crate::core::markdown::normalize_gaps("| a | b |\n", "|---|---|");
+    let out = crate::ui::theme::markdown::normalize_gaps("| a | b |\n", "|---|---|");
     assert_eq!(out, "|---|---|\n");
 }
 
