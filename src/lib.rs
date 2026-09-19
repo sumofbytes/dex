@@ -20,8 +20,8 @@ use crate::cli::{Args, Mode};
 use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::execute_sync as execute;
 
-use crate::agent::r#loop::{process_turn, AgentRuntime};
 use crate::agent::state::{GlobalCancellation, ToolState};
+use crate::agent::turn_loop::{process_turn, AgentRuntime};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override;
 use crate::protocol::ChatMessage;
