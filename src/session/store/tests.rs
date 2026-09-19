@@ -2,6 +2,8 @@
 //! `Session` load/append/undo implementation).
 
 use super::*;
+use crate::session::changes::{load_changes, make_change_record, record_change};
+use crate::session::events::events_cache;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};

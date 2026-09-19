@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 
 use crate::protocol::{ApprovalDecision, StreamEvent};
 use crate::runtime::console::{AGENT_COLOR, RESET};
-use crate::ui::format::agent_lifecycle;
+use crate::runtime::format_runtime::agent_lifecycle;
 
 use super::http::{ChatOptions, DaemonClient};
 
@@ -206,99 +206,6 @@ fn one_shot_chat(
     )?;
 
     println!();
-    Ok(())
-}
-
-/// Interactive REPL mode.
-pub(crate) fn run_repl(client: &DaemonClient) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let session = client.create_session(&cwd, None)?;
-
-    println!("Connected to daemon. Session: {}", session.session_id);
-    println!("Type your prompt and press Enter. Ctrl+C to quit.");
-    println!("Prefix with ! to run shell directly (!! keeps it out of model context).\n");
-
-    let stdin = io::stdin();
-
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        match stdin.read_line(&mut input) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("read error: {e}");
-                break;
-            }
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input == "/quit" || input == "/exit" {
-            break;
-        }
-        if input == "/sessions" {
-            match client.list_sessions() {
-                Ok(sessions) => {
-                    for s in &sessions {
-                        println!(
-                            "  {} {} ({})",
-                            s.session_id,
-                            s.name.as_deref().unwrap_or("(unnamed)"),
-                            s.cwd,
-                        );
-                    }
-                }
-                Err(e) => eprintln!("error listing sessions: {e}"),
-            }
-            continue;
-        }
-        if input == "/cancel" {
-            if let Err(e) = client.cancel(&session.session_id) {
-                eprintln!("error cancelling: {e}");
-            } else {
-                println!("cancel sent");
-            }
-            continue;
-        }
-        // `!`/`!!` shell escape: run directly, no agent turn. A
-        // bare `!`/`!!` falls through to the agent.
-        if let Some((command, excluded)) = crate::tools::parse_shell_escape(input) {
-            match client.shell(&session.session_id, &command, excluded) {
-                Ok(resp) => {
-                    if resp.success {
-                        print!("{}", resp.output);
-                        if !resp.output.ends_with('\n') {
-                            println!();
-                        }
-                    } else {
-                        eprintln!("{}", resp.output);
-                    }
-                }
-                Err(e) => eprintln!("error: {e}"),
-            }
-            println!();
-            continue;
-        }
-
-        if let Err(e) = client.chat(
-            &session.session_id,
-            input,
-            ChatOptions::default(),
-            &mut handle_event,
-        ) {
-            eprintln!("error: {e}");
-        }
-
-        println!();
-    }
-
     Ok(())
 }
 

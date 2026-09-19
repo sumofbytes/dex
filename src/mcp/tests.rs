@@ -457,3 +457,29 @@ async fn statuses_report_down_without_clients() {
     assert_eq!(st.len(), 1);
     assert_eq!(st[0].state, "down");
 }
+
+#[test]
+fn mcp_status_line_empty_when_no_servers() {
+    assert_eq!(super::status_line(&[]), None);
+}
+
+#[test]
+fn mcp_status_line_names_up_and_down_servers() {
+    let line = super::status_line(&[
+        ServerStatus {
+            name: "gh".to_string(),
+            state: "up".to_string(),
+            tools: 3,
+            error: None,
+        },
+        ServerStatus {
+            name: "db".to_string(),
+            state: "down".to_string(),
+            tools: 0,
+            error: Some("refused".to_string()),
+        },
+    ])
+    .expect("non-empty statuses produce a line");
+    assert!(line.contains("gh (3 tools)"), "{line}");
+    assert!(line.contains("db (down)"), "{line}");
+}

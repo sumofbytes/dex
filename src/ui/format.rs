@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -757,89 +756,18 @@ pub(crate) fn model_tool_result(text: &str) -> String {
     truncate_text(text, 50 * 1024, 2_000)
 }
 
-/// Child-agent lifecycle system lines (`[agent <name>:<id>] started|finished
-/// …`, formatted in `subagent/tools.rs` / `subagent/manager.rs`) get their own
-/// spawn/terminal marker so a delegation pops out of the muted system notes,
-/// like the per-tool glyphs do. One owner for the TUI and the headless REPL —
-/// the format lives in two emit sites, so the parser must not be duplicated.
-/// Returns the marker (`◈` spawn / `◇` terminal) and the text after the
-/// `[agent ` prefix.
-pub(crate) fn agent_lifecycle(s: &str) -> Option<(&'static str, &str)> {
-    let rest = s.strip_prefix("[agent ")?;
-    let marker = if rest.contains(" finished ") {
-        "◇"
-    } else {
-        "◈"
-    };
-    Some((marker, rest))
-}
-
-/// Git branch + dirty flag for a working directory, for status displays.
-pub(crate) fn git_context(cwd: &str) -> (Option<String>, bool) {
-    use std::process::Command;
-    let branch = Command::new("git")
-        .args(["-C", cwd, "branch", "--show-current"])
-        .stdin(std::process::Stdio::null())
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|branch| !branch.is_empty());
-    let dirty = branch.is_some()
-        && Command::new("git")
-            .args(["-C", cwd, "status", "--porcelain"])
-            .stdin(std::process::Stdio::null())
-            .env("GIT_PAGER", "cat")
-            .env("PAGER", "cat")
-            .output()
-            .ok()
-            .is_some_and(|output| !output.stdout.is_empty());
-    (branch, dirty)
-}
-
-pub(crate) async fn git_context_async(cwd: &str) -> (Option<String>, bool) {
-    use tokio::process::Command as AsyncCommand;
-    // `branch` and `status` are independent spawns (~5-30ms each): run them
-    // together instead of serially. The `branch.is_some()` guard stays on the
-    // *result* — outside a repo `status` prints to stderr, so stdout is empty
-    // anyway — at the cost of one wasted spawn in non-repos.
-    let mut branch_cmd = AsyncCommand::new("git");
-    branch_cmd
-        .args(["-C", cwd, "branch", "--show-current"])
-        .stdin(std::process::Stdio::null())
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat");
-    let mut status_cmd = AsyncCommand::new("git");
-    status_cmd
-        .args(["-C", cwd, "status", "--porcelain"])
-        .stdin(std::process::Stdio::null())
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat");
-    let (branch_out, status_out) = tokio::join!(branch_cmd.output(), status_cmd.output());
-    let branch = branch_out
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|branch| !branch.is_empty());
-    let dirty = branch.is_some()
-        && status_out
-            .ok()
-            .is_some_and(|output| !output.stdout.is_empty());
-    (branch, dirty)
-}
-
 #[cfg(test)]
 mod tests;
 
 mod mcp;
 
-pub(crate) use mcp::{mcp_status_line, render_mcp_panel};
+pub(crate) use mcp::render_mcp_panel;
 
 mod approval;
 
+#[cfg(test)]
+pub(crate) use approval::approval_risk;
 pub(crate) use approval::{
-    approval_details, approval_risk, approval_risk_with_then_run, approval_summary, approval_title,
-    approval_title_with_then_run, bash_context_text, input_has_then_run,
+    approval_details, approval_risk_with_then_run, approval_summary, approval_title,
+    approval_title_with_then_run, input_has_then_run,
 };

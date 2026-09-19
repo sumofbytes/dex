@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;

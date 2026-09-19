@@ -7,20 +7,11 @@ use tokio::sync::Barrier;
 fn test_def(name: &str) -> AgentDefinition {
     AgentDefinition {
         name: name.to_string(),
-        description: format!("{name} test agent"),
         prompt: String::new(),
         model: None,
         tools: ["read".to_string()].into_iter().collect(),
         max_tool_iterations: None,
         timeout: Duration::from_secs(60),
-    }
-}
-
-fn test_seed() -> ContextSeed {
-    ContextSeed {
-        task: "do the thing".to_string(),
-        file_hints: vec![PathBuf::from("src/main.rs")],
-        parent_summary: None,
     }
 }
 
@@ -90,20 +81,12 @@ async fn journal_hook_fires_on_every_terminal_path() {
         capture.lock().unwrap_or_else(|e| e.into_inner()).push(text);
     }));
     let completed = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { completed("findings") },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            completed("findings")
+        })
         .unwrap();
     let cancelled_id = mgr
-        .spawn(
-            &test_def("tester"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            token_body,
-        )
+        .spawn(&test_def("tester"), SpawnMeta::fresh(), token_body)
         .unwrap();
     assert!(matches!(
         mgr.wait(&completed, Duration::from_secs(5)).await,
@@ -136,20 +119,14 @@ async fn spawn_assigns_session_scoped_ids_and_reports_running() {
     // `spawn` never yields before returning, so on a single-threaded
     // runtime the wrapper cannot have run yet: fully deterministic.
     let first = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { completed("findings") },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            completed("findings")
+        })
         .unwrap();
     let second = mgr
-        .spawn(
-            &test_def("tester"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { completed("pass") },
-        )
+        .spawn(&test_def("tester"), SpawnMeta::fresh(), |_, _, _| async {
+            completed("pass")
+        })
         .unwrap();
     assert_eq!(first.to_string(), "sess-0");
     assert_eq!(second.to_string(), "sess-1");
@@ -165,12 +142,9 @@ async fn spawn_assigns_session_scoped_ids_and_reports_running() {
 async fn completing_child_files_result_and_notice() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { completed("findings") },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            completed("findings")
+        })
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => {
@@ -200,12 +174,9 @@ async fn completing_child_files_result_and_notice() {
 async fn failed_result_preserved_with_error() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("tester"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { failed("boom") },
-        )
+        .spawn(&test_def("tester"), SpawnMeta::fresh(), |_, _, _| async {
+            failed("boom")
+        })
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => {
@@ -223,15 +194,10 @@ async fn failed_result_preserved_with_error() {
 async fn wait_times_out_then_finishes() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                completed("late")
-            },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            completed("late")
+        })
         .unwrap();
     match mgr.wait(&id, Duration::from_millis(50)).await {
         WaitOutcome::Running(state) => assert_eq!(state, AgentState::Running),
@@ -260,12 +226,7 @@ async fn unknown_id_is_unknown_everywhere() {
 async fn cancel_fires_child_token_and_yields_cancelled() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            token_body,
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
         .unwrap();
     assert_eq!(mgr.cancel(&id), Some(AgentState::Running));
     // `cancel` never yields, so on a single-threaded runtime the
@@ -298,21 +259,11 @@ async fn over_cap_spawn_rejects_fail_fast() {
     let mut ids = Vec::new();
     for _ in 0..MAX_CHILDREN {
         ids.push(
-            mgr.spawn(
-                &test_def("explorer"),
-                test_seed(),
-                SpawnMeta::fresh(),
-                token_body,
-            )
-            .unwrap(),
+            mgr.spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
+                .unwrap(),
         );
     }
-    match mgr.spawn(
-        &test_def("explorer"),
-        test_seed(),
-        SpawnMeta::fresh(),
-        token_body,
-    ) {
+    match mgr.spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body) {
         Err(SpawnError::AtCapacity { limit, running }) => {
             assert_eq!(limit, MAX_CHILDREN);
             assert_eq!(running.len(), MAX_CHILDREN);
@@ -326,13 +277,8 @@ async fn over_cap_spawn_rejects_fail_fast() {
         mgr.wait(&ids[0], Duration::from_secs(5)).await,
         WaitOutcome::Finished(_)
     ));
-    mgr.spawn(
-        &test_def("explorer"),
-        test_seed(),
-        SpawnMeta::fresh(),
-        token_body,
-    )
-    .unwrap();
+    mgr.spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
+        .unwrap();
     mgr.shutdown().await;
 }
 
@@ -341,12 +287,9 @@ async fn notices_bound_and_overflow_folds() {
     let mgr = AgentManager::new("sess");
     for _ in 0..(MAX_NOTICES + 3) {
         let id = mgr
-            .spawn(
-                &test_def("explorer"),
-                test_seed(),
-                SpawnMeta::fresh(),
-                |_, _, _| async { completed("done") },
-            )
+            .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+                completed("done")
+            })
             .unwrap();
         assert!(matches!(
             mgr.wait(&id, Duration::from_secs(5)).await,
@@ -365,12 +308,9 @@ async fn notices_bound_and_overflow_folds() {
 async fn results_survive_notice_drain() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { completed("durable") },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            completed("durable")
+        })
         .unwrap();
     assert!(matches!(
         mgr.wait(&id, Duration::from_secs(5)).await,
@@ -387,20 +327,10 @@ async fn results_survive_notice_drain() {
 async fn shutdown_cancels_and_joins_children() {
     let mgr = AgentManager::new("sess");
     let first = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            token_body,
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
         .unwrap();
     let second = mgr
-        .spawn(
-            &test_def("tester"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            token_body,
-        )
+        .spawn(&test_def("tester"), SpawnMeta::fresh(), token_body)
         .unwrap();
     mgr.shutdown().await;
     assert_eq!(mgr.active_count(), 0);
@@ -425,7 +355,6 @@ async fn concurrent_completions_stay_consistent() {
         ids.push(
             mgr.spawn(
                 &test_def(&format!("agent-{n}")),
-                test_seed(),
                 SpawnMeta::fresh(),
                 |_, _, _| async move {
                     gate.wait().await;
@@ -452,12 +381,9 @@ async fn concurrent_completions_stay_consistent() {
 async fn panicking_body_fails_without_orphaning_the_entry() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { panic!("body exploded") },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            panic!("body exploded")
+        })
         .unwrap();
     // The wrapper catches the panic and funnels a synthesized `Failed`
     // through `finish` — no entry left Running, no slot leaked (§14).
@@ -473,13 +399,8 @@ async fn panicking_body_fails_without_orphaning_the_entry() {
     assert_eq!(mgr.active_count(), 0);
     assert_eq!(mgr.drain_notices().len(), 1);
     // Cleanup ran: a fresh spawn still works.
-    mgr.spawn(
-        &test_def("explorer"),
-        test_seed(),
-        SpawnMeta::fresh(),
-        token_body,
-    )
-    .unwrap();
+    mgr.spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -488,7 +409,7 @@ async fn child_timeout_ends_timed_out() {
     let mut def = test_def("explorer");
     def.timeout = Duration::from_millis(50);
     let id = mgr
-        .spawn(&def, test_seed(), SpawnMeta::fresh(), |_, _, _| async {
+        .spawn(&def, SpawnMeta::fresh(), |_, _, _| async {
             tokio::time::sleep(Duration::from_secs(60)).await;
             completed("never")
         })
@@ -509,12 +430,7 @@ async fn child_timeout_ends_timed_out() {
 async fn spawn_after_shutdown_rejects_closed() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            token_body,
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
         .unwrap();
     mgr.shutdown().await;
     match mgr.wait(&id, Duration::from_secs(5)).await {
@@ -526,7 +442,7 @@ async fn spawn_after_shutdown_rejects_closed() {
     // A stale clone (an in-flight tool call holds one) cannot respawn a
     // child nobody will ever join.
     assert!(matches!(
-        mgr.spawn(&test_def("x"), test_seed(), SpawnMeta::fresh(), token_body),
+        mgr.spawn(&test_def("x"), SpawnMeta::fresh(), token_body),
         Err(SpawnError::Closed)
     ));
 }
@@ -538,7 +454,6 @@ async fn progress_reports_current_tool_and_clears() {
     let id = mgr
         .spawn(
             &test_def("explorer"),
-            test_seed(),
             SpawnMeta::fresh(),
             move |_, progress, _| {
                 async move {
@@ -570,23 +485,15 @@ async fn one_child_failing_does_not_disturb_a_sibling() {
     // cascade.
     let mgr = AgentManager::new("sess");
     let doomed = mgr
-        .spawn(
-            &test_def("doomed"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { failed("boom") },
-        )
+        .spawn(&test_def("doomed"), SpawnMeta::fresh(), |_, _, _| async {
+            failed("boom")
+        })
         .unwrap();
     let sibling = mgr
-        .spawn(
-            &test_def("sibling"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                completed("fine")
-            },
-        )
+        .spawn(&test_def("sibling"), SpawnMeta::fresh(), |_, _, _| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            completed("fine")
+        })
         .unwrap();
     match mgr.wait(&doomed, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => {
@@ -687,7 +594,6 @@ async fn transient_wrapper_death_advertises_a_resume_handle() {
     let id = mgr
         .spawn(
             &test_def("explorer"),
-            test_seed(),
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(dir.join("sess.jsonl")),
@@ -727,7 +633,6 @@ async fn escalate_clamps_exhausted_meter_to_full_cap() {
     let spent_all = mgr
         .spawn(
             &def,
-            test_seed(),
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(dir.join("sess.jsonl")),
@@ -749,7 +654,6 @@ async fn escalate_clamps_exhausted_meter_to_full_cap() {
     let spent_one = mgr
         .spawn(
             &def,
-            test_seed(),
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(dir.join("sess.jsonl")),
@@ -785,22 +689,17 @@ async fn normal_completion_advertises_no_handle() {
     // `Normal` never advertises a handle, even with progress.
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async {
-                AgentResult {
-                    status: AgentState::Completed,
-                    summary: "done".to_string(),
-                    error: None,
-                    usage: None,
-                    reason: ExitReason::Normal,
-                    tool_calls: 7,
-                    resume: None,
-                }
-            },
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
+            AgentResult {
+                status: AgentState::Completed,
+                summary: "done".to_string(),
+                error: None,
+                usage: None,
+                reason: ExitReason::Normal,
+                tool_calls: 7,
+                resume: None,
+            }
+        })
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => assert!(result.resume.is_none()),
@@ -816,17 +715,11 @@ async fn resume_shaped_spawn_completes() {
     // response, not the registry).
     let mgr = AgentManager::new("sess");
     let first = mgr
-        .spawn(
-            &test_def("explorer"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            token_body,
-        )
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
         .unwrap();
     let second = mgr
         .spawn(
             &test_def("explorer"),
-            test_seed(),
             SpawnMeta {
                 generation: 1,
                 parent_session: None,
@@ -864,7 +757,6 @@ async fn wrapper_synthesized_ending_reconciles_the_spend_meter() {
     let id = mgr
         .spawn(
             &def,
-            test_seed(),
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(dir.join("sess.jsonl")),
@@ -913,7 +805,6 @@ async fn escalated_handle_carries_def_model_for_resume_inheritance() {
     let id = mgr
         .spawn(
             &with_model,
-            test_seed(),
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(dir.join("sess.jsonl")),
@@ -939,7 +830,6 @@ async fn snapshot_lists_live_and_retained() {
     let live = mgr
         .spawn(
             &test_def("explorer"),
-            test_seed(),
             SpawnMeta::fresh(),
             |token, _, _| async move {
                 token.cancelled().await;
@@ -956,12 +846,9 @@ async fn snapshot_lists_live_and_retained() {
         )
         .unwrap();
     let done = mgr
-        .spawn(
-            &test_def("tester"),
-            test_seed(),
-            SpawnMeta::fresh(),
-            |_, _, _| async { completed("ok") },
-        )
+        .spawn(&test_def("tester"), SpawnMeta::fresh(), |_, _, _| async {
+            completed("ok")
+        })
         .unwrap();
     match mgr.wait(&done, Duration::from_secs(5)).await {
         WaitOutcome::Finished(_) => {}

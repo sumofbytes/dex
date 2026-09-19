@@ -1,28 +1,26 @@
-use serde_json::value::RawValue;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::protocol::{ChatMessage, Role};
 
+use super::discovery;
 use super::header::{
-    file_id, FileId, PathCache, SessionClearEntry, SessionEffectEntry, SessionEventEntry,
-    SessionHeader, SessionInfoEntry, SessionMessageEntry, SessionStateEntry, SESSION_VERSION,
+    file_id, FileId, PathCache, SessionClearEntry, SessionEventEntry, SessionHeader,
+    SessionInfoEntry, SessionMessageEntry, SessionStateEntry, SESSION_VERSION,
 };
-use super::{discovery, events};
 
 #[cfg(test)]
-use super::{
-    events_cache, load_changes, make_change_record, record_change, undo_last_change, EnvGuard,
-    TEST_SESSIONS_ENV_LOCK,
-};
+use super::header::SessionEffectEntry;
+#[cfg(test)]
+use super::{undo_last_change, EnvGuard, TEST_SESSIONS_ENV_LOCK};
 
 #[derive(Debug)]
 pub(crate) struct Session {
@@ -521,10 +519,6 @@ impl Session {
         (children.len(), interrupted)
     }
 
-    pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Self> {
-        discovery::resume(cwd, selector)
-    }
-
     pub(crate) fn set_name(&mut self, name: String) -> io::Result<()> {
         self.header.name = Some(name.clone());
         let entry = SessionInfoEntry {
@@ -702,6 +696,7 @@ impl Session {
 
     /// Durable side-effect intent: recorded BEFORE the tool executes so a
     /// restart can see effects that started but never completed.
+    #[cfg(test)]
     pub(crate) fn effect_start(
         &mut self,
         tool_call_id: &str,
@@ -721,6 +716,7 @@ impl Session {
     }
 
     /// Durable side-effect outcome: recorded AFTER the tool executed.
+    #[cfg(test)]
     pub(crate) fn effect_result(&mut self, tool_call_id: &str, ok: bool) -> io::Result<()> {
         let entry = SessionEffectEntry {
             entry_type: "effect_result".into(),
@@ -767,13 +763,12 @@ impl Session {
         writeln!(file, "{line}")?;
         // Don't fsync every line — rely on the OS buffer + periodic flush.
         // Sync only when
-        // durability matters (turn boundaries / effect journal) or when
-        // DEX_DURABLE=1 is set for strict recovery testing.
+        // durability matters (turn boundaries) or when DEX_DURABLE=1 is
+        // set for strict recovery testing.
         // `clear` is rare (compaction rewrites atomically now; `/clear` is
         // user intent) — sync it so the fold point itself is durable.
         let durable = durable_journal()
             || line.contains("\"type\":\"turn_")
-            || line.contains("\"type\":\"effect_")
             || line.contains("\"type\":\"clear\"");
         if durable {
             file.sync_data()?;
@@ -1032,6 +1027,9 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
 }
 
 /// Async full-history load: streaming file, fast — short `spawn_blocking`.
+/// No async production consumer yet (the TUI replays via SSE); test-only
+/// until one lands.
+#[cfg(test)]
 pub(crate) async fn load_messages_from_session_async(
     path: PathBuf,
 ) -> io::Result<Vec<ChatMessage>> {
