@@ -12,7 +12,7 @@ use super::discovery::{discover_scoped, scoped_extension_dirs, user_extensions_d
 use super::hooks;
 use super::manifest::{self, Manifest};
 use super::{
-    AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx, ShadowCtx,
+    AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx,
     HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
 };
 
@@ -367,21 +367,18 @@ impl ExtensionManager {
                 timeout,
                 host.cancel,
                 *host,
-                None,
             )
             .await
     }
 
     /// Dispatch a shadowed built-in: run the shadow on its worker. Nested
     /// `dex.tools.call` re-enters the full pipeline; `call_original`
-    /// re-dispatches the shadowed built-in with the caller's gates (and the
-    /// live shell-evidence slot, so wrapped `bash` still reports).
+    /// re-dispatches the shadowed built-in with the caller's gates.
     pub(crate) async fn call_shadow(
         &self,
         target: &str,
         args: &serde_json::Map<String, serde_json::Value>,
         host: &HostCtx<'_>,
-        shell_out: &mut Option<crate::tools::ShellEvidence>,
     ) -> Result<String, String> {
         let (engine, timeout) = {
             let engines = self.engines.read().await;
@@ -434,7 +431,6 @@ impl ExtensionManager {
                 timeout,
                 host.cancel,
                 *host,
-                Some(ShadowCtx { shell_out }),
             )
             .await
     }
@@ -471,7 +467,6 @@ impl ExtensionManager {
                 std::time::Duration::from_secs(HOOK_TIMEOUT_SECS),
                 host.cancel,
                 *host,
-                None,
             )
             .await;
         let elapsed = started.elapsed();

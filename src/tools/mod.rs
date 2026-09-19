@@ -5,7 +5,6 @@ mod edit;
 pub(crate) mod error;
 mod meta;
 pub(crate) mod outcome;
-pub(crate) mod plan;
 pub(crate) mod policy;
 mod read;
 pub(crate) mod sandbox;
@@ -18,7 +17,7 @@ mod write;
 // `tools::...` paths keep working.
 pub(crate) use dispatch::{dispatch_original, execute, execute_outcome, execute_sync};
 pub(crate) use error::ToolError;
-pub(crate) use outcome::{ShellEvidence, ToolOutcome};
+pub(crate) use outcome::ToolOutcome;
 pub(crate) use policy::{metadata, PermissionRequirement, ToolFilter};
 pub(crate) use sandbox::{
     normalize_conflict_path, resolve_workspace_path, workspace_path, workspace_root,

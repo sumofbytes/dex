@@ -1,20 +1,16 @@
 //! Tool-execution half of the turn loop: tool-call batching, per-result
-//! bookkeeping (evidence reducer, cache, compaction, transcript), steering
-//! injection, and the console/sink note emitters.
+//! bookkeeping (cache, transcript), steering injection, and the
+//! console/sink note emitters.
 
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::apply_queue_msg;
-use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
+use crate::agent::compaction::compact_history;
 use crate::agent::jev::summary_mode;
-use crate::agent::online_compaction::{
-    decide_compaction, memo_estimate, online_compaction_jev, post_compaction_reminder,
-    CompactionEconomics, DEFAULT_COMPACTION_ECONOMICS,
-};
 use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
-use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
+use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
 use crate::protocol::{ChatMessage, LlmToolCall, QueueMsg, SinkLine, Usage};
 use crate::runtime::console::{
@@ -260,7 +256,6 @@ pub(super) async fn execute_tool_call(
                     text: format!("Error: invalid tool arguments: {}", error),
                     ok: false,
                     diff: None,
-                    shell: None,
                 },
             )
         }
@@ -273,7 +268,6 @@ pub(super) async fn execute_tool_call(
                 text: "Error: tool arguments must be a JSON object".into(),
                 ok: false,
                 diff: None,
-                shell: None,
             },
         );
     };
@@ -432,7 +426,6 @@ where
                             text: "Error: tool worker panicked".into(),
                             ok: false,
                             diff: None,
-                            shell: None,
                         },
                         Duration::ZERO,
                     ))
@@ -444,28 +437,21 @@ where
 }
 
 /// Everything one tool result in a completed batch touches, bundled so
-/// `process_tool_result` stays a plain function instead of an 11-arg one.
-/// `'a` is the turn-wide borrow (config, policy, cancel, ephemerals); `'b`
-/// is the per-batch scope the mutable state is reborrowed for.
+/// `process_tool_result` stays a plain function instead of a 7-arg one.
+/// `'b` is the per-batch scope the mutable state is reborrowed for.
 pub(super) struct ToolResultCtx<'a, 'b> {
-    pub(super) config: &'a LlmConfig,
     pub(super) console: &'a Console,
     pub(super) state: &'b mut ToolState,
-    pub(super) policy: &'a Policy,
     pub(super) messages: &'b mut Vec<ChatMessage>,
     pub(super) session: &'b mut Option<&'a mut Session>,
     pub(super) persisted_cursor: &'b mut usize,
-    pub(super) cancel: &'a (dyn CancellationSource + Send + Sync),
-    pub(super) ephemerals: &'b [Option<String>],
-    pub(super) online_boundary_handled: &'b mut bool,
     pub(super) last_tools: &'b mut Vec<String>,
     pub(super) ledger: &'b mut TokenLedger,
 }
 
 /// Process one tool result from a completed batch: repeated-call guard,
-/// cache, evidence reducer, plan-boundary bookkeeping, sink emit, transcript
-/// append, and (at most one per turn) the online compaction decision. Moved
-/// verbatim from the inline per-result loop body.
+/// cache, sink emit, and transcript append. Moved verbatim from the inline
+/// per-result loop body.
 pub(super) async fn process_tool_result(
     ctx: &mut ToolResultCtx<'_, '_>,
     call: &LlmToolCall,
@@ -475,16 +461,11 @@ pub(super) async fn process_tool_result(
     outcome: ToolOutcome,
     elapsed: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config: &LlmConfig = ctx.config;
     let console: &Console = ctx.console;
-    let policy: &Policy = ctx.policy;
-    let cancel: &(dyn CancellationSource + Send + Sync) = ctx.cancel;
-    let ephemerals: &[Option<String>] = ctx.ephemerals;
     let state: &mut ToolState = ctx.state;
     let messages: &mut Vec<ChatMessage> = ctx.messages;
     let session: &mut Option<&mut Session> = ctx.session;
     let persisted_cursor: &mut usize = ctx.persisted_cursor;
-    let online_boundary_handled: &mut bool = ctx.online_boundary_handled;
     let last_tools: &mut Vec<String> = ctx.last_tools;
     let ledger: &mut TokenLedger = ctx.ledger;
     let cache_key = format!(
@@ -519,7 +500,7 @@ pub(super) async fn process_tool_result(
     let cacheable = matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls");
     let mut cache_hit = false;
     let mut ok = succeeded;
-    let mut result = if repeated_count >= 3 {
+    let result = if repeated_count >= 3 {
         ok = false;
         "Error: repeated identical tool call; choose a different action or finish.".to_string()
     } else if cacheable && succeeded {
@@ -536,78 +517,6 @@ pub(super) async fn process_tool_result(
         }
         outcome.text
     };
-    // Evidence-preserving reducer: delegate the first read of a
-    // large build/test log to the configured reducer model and
-    // verify every quoted line byte for byte against the archived
-    // raw output. Any uncheckable receipt falls open: the raw
-    // (clamped) result is kept untouched and the observation pack
-    // handles it.
-    let processed = crate::agent::evidence_reducer::process(
-        config,
-        policy
-            .agent
-            .as_ref()
-            .map(|ctx| ctx.session_path.clone())
-            .as_deref(),
-        cancel,
-        crate::agent::evidence_reducer::ToolResultView {
-            call_id: call.id.as_str(),
-            tool_name: name,
-            input_json: input,
-            result_text: &result,
-            ok: succeeded,
-            shell: outcome.shell.as_ref(),
-        },
-    )
-    .await;
-    // The reducer call's spend is real even when its receipt is
-    // rejected: fold it into the session totals and the usage
-    // stream, priced at the model that actually ran.
-    let crate::agent::evidence_reducer::Processed {
-        reduction,
-        usage,
-        pricing,
-    } = processed;
-    if let Some(usage) = usage {
-        record_usage(
-            pricing.as_ref().unwrap_or(config),
-            state,
-            console,
-            usage,
-            None,
-        )
-        .await;
-        state.dirty = true;
-    }
-    if let Some(reduced) = reduction {
-        result = reduced.receipt;
-        system_note(
-            console,
-            &format!(
-                "evidence reducer: {} -> {} (verified)",
-                crate::agent::evidence_reducer::format_bytes(reduced.source_bytes),
-                crate::agent::evidence_reducer::format_bytes(reduced.receipt_bytes),
-            ),
-        )
-        .await;
-    }
-    // Online context compaction: a completed plan step is a boundary —
-    // a safe point where history can be compacted if the economics say
-    // the cache re-write pays for itself before the work ends. The
-    // boundary bookkeeping runs *before* the sink emit so plan-hygiene
-    // advice is part of the `result` the user sees; the compaction
-    // decision itself runs after the tool result is appended so the
-    // transcript keeps assistant → tool_result → reminder order (pi's
-    // reference aborts the turn instead; dex compacts inline, and the
-    // ordering must stay wire-valid). At most one boundary per turn is
-    // evaluated.
-    let boundary = crate::agent::online_compaction::capture_plan_update(
-        &mut state.online_compaction,
-        name,
-        ok,
-        input,
-        &mut result,
-    );
     note_sink(
         console,
         || {
@@ -642,132 +551,15 @@ pub(super) async fn process_tool_result(
         },
     )
     .await;
-    // The tool result lands before any boundary reminder so the
-    // transcript stays assistant → tool_result → reminder (see
-    // the boundary note above).
+    // The tool result lands before any system note so the transcript
+    // stays assistant → tool_result → note.
     let mut result_message = ChatMessage::tool_result(call.id.clone(), model_tool_result(&result));
     // Internal-only metadata (`chat_completions_messages` strips `name`
-    // from the wire): lets the observation pack label placeholders with the
-    // producing tool and exempt `obs_recall` read-backs from re-packing.
+    // from the wire): lets the transcript label which tool produced the
+    // result.
     result_message.name = Some(name.to_string());
     messages.push(result_message);
     ledger.push(messages.last().expect("just pushed"));
     persist_pending(session, messages, persisted_cursor)?;
-    if let Some(steps) = boundary {
-        state.online_compaction.record_boundary(steps);
-        if !*online_boundary_handled {
-            *online_boundary_handled = true;
-            // Ledger + preamble + schema: the same budget the pre-call gate
-            // enforces, without re-walking history (`messages` here is the
-            // stored history, matching the gate's pack-off reading; with the
-            // pack on the gate reads the smaller projected view, so this is
-            // the conservative side).
-            let context_tokens = ledger.stored_tokens()
-                + estimate_ephemeral_tokens(ephemerals)
-                + schema_budget_tokens();
-            // The reference pins windowReserveTokens at a fixed
-            // 16 KiB, independent of the host's compaction reserve;
-            // dex's default reserve_tokens is also 16_384, and
-            // following dex's configured edge keeps window
-            // protection consistent with the pre-call compaction
-            // threshold.
-            let economics = CompactionEconomics {
-                window_reserve_tokens: config.reserve_tokens,
-                ..DEFAULT_COMPACTION_ECONOMICS
-            };
-            let decision = decide_compaction(
-                context_tokens,
-                // Archivable slice: what a cut can actually
-                // remove (see `TokenLedger::archivable_tokens`) — the system
-                // message and the keep-recent window are never
-                // archived, and the ephemeral preamble + tool
-                // schema are re-sent on every request.
-                ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
-                // Jev prunes leave truncated heads (~200 tokens), not a 1k
-                // summary, behind — the same archive repays faster.
-                memo_estimate(online_compaction_jev()),
-                context_tokens,
-                &state.online_compaction,
-                Some(config.context_window),
-                Some(config.cache_write_read_ratio()),
-                &economics,
-            );
-            crate::log!(
-                Debug,
-                "online compaction boundary: {} (write {}, archive {})",
-                decision.reason,
-                decision.write_tokens,
-                decision.archive_tokens
-            );
-            if decision.compact {
-                // Boundary cuts follow the boundary knob for the prune
-                // (`DEX_ONLINE_COMPACTION`) and the threshold knob for the
-                // fallback summarizer.
-                match compact_history(
-                    config,
-                    messages,
-                    cancel,
-                    false,
-                    online_compaction_jev(),
-                    summary_mode(),
-                )
-                .await
-                {
-                    Ok((true, usage)) => {
-                        if let Some(u) = usage {
-                            record_usage(config, state, console, u, None).await;
-                        }
-                        rewrite_session(session.as_deref_mut(), messages, persisted_cursor)?;
-                        // History was rewritten: re-measure before the
-                        // reminder push so the ledger mirrors `messages`.
-                        *ledger = TokenLedger::rebuild(messages);
-                        // The compaction forces the retained prefix to
-                        // be re-written at cache-write price on the next
-                        // request; carry that as debt the following
-                        // boundaries must repay before another compaction
-                        // is economical.
-                        let (debt, repayment) = decision.cache_debt();
-                        // The reminder lists the remaining goals — build
-                        // it before record_compaction clears the plan.
-                        let reminder = post_compaction_reminder(
-                            &state.online_compaction.plan,
-                            &state.online_compaction.progress,
-                        );
-                        state.online_compaction.record_compaction(debt, repayment);
-                        messages.push(ChatMessage::user_named(reminder, "compact"));
-                        ledger.push(messages.last().expect("just pushed"));
-                        persist_pending(session, messages, persisted_cursor)?;
-                        // The boundary fired silently before; a
-                        // system line is the only user-visible
-                        // proof the economics paid out.
-                        let note = if online_compaction_jev() {
-                            format!(
-                                "online compaction (jev): pruned stale tool outputs at plan boundary (~{} tokens archived)",
-                                decision.archive_tokens
-                            )
-                        } else {
-                            format!(
-                                "online compaction: history compacted at plan boundary (~{} tokens archived)",
-                                decision.archive_tokens
-                            )
-                        };
-                        system_note(console, &note).await;
-                    }
-                    // Below the summarize floor (e.g. a boundary
-                    // right after the previous compaction) or a
-                    // summarizer failure: nothing was cut, so no
-                    // cache debt is carried — log why anyway.
-                    Ok((false, _)) => {
-                        crate::log!(Debug,
-                            "online compaction boundary declined: history below the summarize floor"
-                        );
-                    }
-                    Err(e) => {
-                        crate::log!(Debug, "online compaction boundary failed: {e}");
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }

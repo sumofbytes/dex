@@ -2,28 +2,13 @@
 //! carries, run after a successful mutation with the same clamping and
 //! shell timeout as `bash`.
 
-use std::path::{Path, PathBuf};
-
 use serde_json::{Map, Value};
 
 use crate::runtime::cancel::CancellationSource;
-use crate::ui::format::{clamp_lines_checked, clip_chars};
+use crate::ui::format::{clamp_lines, clip_chars};
 
 use super::error::ToolError;
-use super::outcome::ShellEvidence;
-use super::plan::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
 use super::shell::{run_bash, BASH_CLAMP_BYTES, BASH_CLAMP_LINES};
-use super::Policy;
-
-/// `update_plan`: validate the full plan replacement and echo the snapshot.
-/// Pure — the boundary bookkeeping and the compaction decision live in the
-/// agent loop ([`crate::agent::online_compaction`]).
-pub(super) fn tool_update_plan(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let steps = args.get("steps").ok_or(ToolError::Missing("steps"))?;
-    let steps = parse_plan_steps(steps).map_err(ToolError::InvalidArgument)?;
-    let progress = parse_plan_progress(args.get("progress")).map_err(ToolError::InvalidArgument)?;
-    Ok(format_plan_snapshot(&steps, &progress))
-}
 
 pub(super) fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolError> {
     match args.get(key) {
@@ -67,8 +52,6 @@ pub(super) async fn append_then_run(
     mut text: String,
     command: &str,
     cancel: &(dyn CancellationSource + Send + Sync),
-    session: Option<&Path>,
-    shell_out: &mut Option<ShellEvidence>,
 ) -> (String, Option<i32>) {
     let (output, code) = match run_bash(command, cancel).await {
         Ok(result) => result,
@@ -77,11 +60,6 @@ pub(super) async fn append_then_run(
                 "\n\n[then_run:failed] {}\n(error: {error})",
                 clip_command(command)
             ));
-            // No exit code and no archive: the command never produced output.
-            *shell_out = Some(ShellEvidence {
-                archive_id: None,
-                exit_code: None,
-            });
             return (text, None);
         }
     };
@@ -94,13 +72,7 @@ pub(super) async fn append_then_run(
         "\n\n[then_run:{marker}] {}\n",
         clip_command(command)
     ));
-    let (clamped, was_clamped) = clamp_lines_checked(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
-    let (clamped, archive_id) =
-        crate::agent::evidence_reducer::capture(session, "then_run", &output, clamped, was_clamped);
-    *shell_out = Some(ShellEvidence {
-        archive_id,
-        exit_code: code,
-    });
+    let clamped = clamp_lines(&output, BASH_CLAMP_LINES, BASH_CLAMP_BYTES);
     text.push_str(if clamped.trim().is_empty() {
         "(no output)"
     } else {
@@ -114,10 +86,4 @@ pub(super) async fn append_then_run(
 /// to identify it — not a second full copy of a very long command in context.
 fn clip_command(command: &str) -> String {
     clip_chars(&command.replace('\n', " "), 200)
-}
-
-/// The session path the evidence reducer archives into (`Some` only for
-/// daemon parent turns — the same source the projection and recall read).
-pub(super) fn evidence_session(policy: &Policy) -> Option<PathBuf> {
-    policy.agent.as_ref().map(|ctx| ctx.session_path.clone())
 }

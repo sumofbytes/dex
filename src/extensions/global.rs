@@ -675,7 +675,6 @@ pub(crate) async fn run_command_global(
             std::time::Duration::from_secs(HOOK_TIMEOUT_SECS),
             cancel,
             host,
-            None,
         )
         .await
 }
@@ -725,16 +724,13 @@ pub(crate) async fn call_shadow_global(
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     policy: &crate::tools::Policy,
     filter: Option<&crate::tools::ToolFilter>,
-    shell_out: &mut Option<crate::tools::ShellEvidence>,
 ) -> Result<String, String> {
     let host = HostCtx {
         cancel,
         policy,
         filter,
     };
-    global_manager()
-        .call_shadow(target, args, &host, shell_out)
-        .await
+    global_manager().call_shadow(target, args, &host).await
 }
 
 /// Per-extension status for `dex extensions list` / `/extensions`: (id,

@@ -90,29 +90,6 @@ impl TokenLedger {
     pub(crate) fn stored_tokens(&self) -> u64 {
         self.chars / 4 + (self.lens.len() as u64 * PER_MESSAGE_OVERHEAD)
     }
-
-    /// Tokens a compaction can actually archive: the transcript minus the
-    /// system message (never summarized) and the larger of the keep-recent
-    /// token window and the `keep_recent_messages` message floor. Same
-    /// formula as the old `archivable_tokens` walk, read off the cached
-    /// lengths — O(`keep_recent_messages`) instead of O(history).
-    pub(crate) fn archivable_tokens(
-        &self,
-        keep_recent_messages: usize,
-        keep_recent_tokens: u64,
-    ) -> u64 {
-        let n = self.lens.len();
-        if n <= 1 {
-            return 0;
-        }
-        let transcript_chars = self.chars.saturating_sub(self.lens[0] as u64);
-        let transcript = transcript_chars / 4 + ((n - 1) as u64 * PER_MESSAGE_OVERHEAD);
-        let from = n.saturating_sub(keep_recent_messages);
-        #[allow(clippy::cast_possible_truncation)]
-        let recent_chars = self.lens[from..].iter().sum::<usize>() as u64;
-        let recent = recent_chars / 4 + ((n - from) as u64 * PER_MESSAGE_OVERHEAD);
-        transcript.saturating_sub(recent.max(keep_recent_tokens))
-    }
 }
 
 /// Per-request tool-schema budget for the compaction threshold: the native
@@ -173,27 +150,5 @@ mod tests {
         }
         assert_eq!(incremental.stored_tokens(), ledger.stored_tokens());
         assert_eq!(incremental.stored_tokens(), estimate_tokens(&messages));
-    }
-
-    #[test]
-    fn ledger_archivable_matches_slice_formula() {
-        // The retired `archivable_tokens` walk: estimate(messages[1..]) minus
-        // the larger of the last-K estimate and the token floor.
-        let messages = sample_history();
-        let ledger = TokenLedger::rebuild(&messages);
-        let keep = 2usize;
-        let floor = 50u64;
-        let transcript = estimate_tokens(&messages[1..]);
-        let recent = estimate_tokens(&messages[messages.len().saturating_sub(keep)..]);
-        assert_eq!(
-            ledger.archivable_tokens(keep, floor),
-            transcript.saturating_sub(recent.max(floor))
-        );
-        // Degenerate histories archive nothing.
-        assert_eq!(TokenLedger::rebuild(&[]).archivable_tokens(keep, floor), 0);
-        assert_eq!(
-            TokenLedger::rebuild(&messages[..1]).archivable_tokens(keep, floor),
-            0
-        );
     }
 }
