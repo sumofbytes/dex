@@ -3,14 +3,14 @@ use super::parser::ChatCompletionsParser;
 use super::parser::ResponsesParser;
 use super::parser::StreamEvent;
 use super::parser::StreamParser;
-use crate::core::highlight::print_code_block;
-use crate::core::highlight::print_markdown_text;
 use crate::protocol::ChatMessage;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
 use crate::protocol::StopReason;
 use crate::protocol::Usage;
 use crate::runtime::console::with_console;
+use crate::ui::theme::highlight::print_code_block;
+use crate::ui::theme::highlight::print_markdown_text;
 use std::io;
 use std::io::Write;
 use std::time::Duration;
@@ -52,7 +52,7 @@ impl StreamPrinter {
     /// rule (`core::markdown`) — the same one the TUI throttle normalizes
     /// with — so both renderers agree on air. Only called outside fences.
     fn headless_gap(&self, line: &str) -> bool {
-        use crate::core::markdown as md;
+        use crate::ui::theme::markdown as md;
         if line.trim().is_empty() {
             return false;
         }
@@ -63,7 +63,7 @@ impl StreamPrinter {
     }
 
     fn headless_note(&mut self, line: &str) {
-        use crate::core::markdown as md;
+        use crate::ui::theme::markdown as md;
         if line.trim().is_empty() {
             self.headless_empty = true;
             self.headless_air = false;

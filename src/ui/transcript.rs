@@ -8,10 +8,10 @@ use super::app::TRANSCRIPT_INDENT;
 use super::render;
 use super::status;
 use super::theme;
-use crate::core::format::agent_lifecycle;
-use crate::core::format::short_arg;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
+use crate::ui::format::agent_lifecycle;
+use crate::ui::format::short_arg;
 use ratatui::style::Color;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -229,7 +229,7 @@ fn append_assistant(app: &mut App, s: String) {
         .rsplit('\n')
         .next()
         .unwrap_or("");
-    let holding_table = crate::core::markdown::is_table_line(last_line);
+    let holding_table = crate::ui::theme::markdown::is_table_line(last_line);
     if stream_flush_due(app) && !holding_table {
         flush_assistant(app);
     }
@@ -321,7 +321,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     ];
     if duration > 0.0 {
         spans.push(Span::styled(
-            format!(" · {}", crate::core::format::format_duration(duration)),
+            format!(" · {}", crate::ui::format::format_duration(duration)),
             Style::default().fg(theme::muted_fg()),
         ));
     }
@@ -377,7 +377,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
             .unwrap_or_default();
         let path = arg_path.split_whitespace().next().unwrap_or("");
         let path = path.split(':').next().unwrap_or(path);
-        render::render_read_preview(&preview, crate::core::highlight::lang_from_path(path))
+        render::render_read_preview(&preview, crate::ui::theme::highlight::lang_from_path(path))
     } else if success && matches!(name.as_str(), "grep" | "ffgrep") {
         // Content-mode hits are `path:line:code` rows: keep the gutter dim,
         // highlight the code by path extension (same engine and dim fallback
