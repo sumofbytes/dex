@@ -42,8 +42,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use self::plan::{format_plan_snapshot, parse_plan_progress, parse_plan_steps};
-use crate::core::format::{clamp_lines_checked, clip_chars};
 use crate::runtime::cancel::CancellationSource;
+use crate::ui::format::{clamp_lines_checked, clip_chars};
 
 pub(crate) static CONFIGURED_OUTPUT_LIMIT: AtomicUsize = AtomicUsize::new(1_048_576);
 

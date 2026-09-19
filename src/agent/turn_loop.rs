@@ -15,9 +15,6 @@ use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource,
 use crate::agent::tokens::{
     estimate_ephemeral_tokens, estimate_tokens, schema_budget_tokens, TokenLedger,
 };
-use crate::core::format::{
-    model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
-};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
 use crate::llm::transport::sse::Turn;
@@ -28,6 +25,9 @@ use crate::runtime::console::{
 };
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
+use crate::ui::format::{
+    model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
+};
 
 /// Emit a system note on every surface: a transcript line when a sink is
 /// attached (TUI / daemon), `eprintln` headless.

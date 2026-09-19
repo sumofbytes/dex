@@ -1180,7 +1180,7 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
             pos,
             ChatMessage::tool_result(
                 id,
-                crate::core::format::model_tool_result(
+                crate::ui::format::model_tool_result(
                     "Error: tool result missing — the agent exited before it was recorded; the call may have executed. Verify the effect on disk before retrying.",
                 ),
             ),
