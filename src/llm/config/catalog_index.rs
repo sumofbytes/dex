@@ -22,7 +22,6 @@ pub(crate) use crate::workspace::fnv_bytes;
 pub(crate) struct CostRates {
     pub(crate) input: f64,
     pub(crate) cache_read: Option<f64>,
-    pub(crate) cache_write: Option<f64>,
     pub(crate) output: Option<f64>,
 }
 

@@ -327,19 +327,9 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
         .unwrap_or(chain_ctx);
     row(out, "context", &format!("{ctx} tokens"), ctx_source);
 
-    // Experiment rows (online compaction, obs pack, evidence reducer): owned
-    // by each experiment module and rendered through the experiment registry
-    // — config.rs never names a gate or its env var. Order follows the
-    // registry.
-    for r in crate::agent::experiments::doctor_rows(crate::agent::experiments::DoctorCtx {
-        live,
-        model: &model,
-    }) {
-        row(out, r.label, &r.value, &r.source);
-    }
     // Threshold-compaction mode: value and origin owned by the Jev module
     // next to its parse, so the row cannot drift from runtime behavior.
-    // Printed unconditionally like the online row above.
+    // Printed unconditionally.
     let (compaction, compaction_source) = crate::agent::jev::compaction_doctor();
     row(out, "compaction", &compaction, &compaction_source);
 

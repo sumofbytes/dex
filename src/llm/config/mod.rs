@@ -35,7 +35,9 @@ pub(crate) use catalog_query::{
     catalog_env_vars, load_dex_models_cache, reasoning_options_for, refresh_models_cache,
     refresh_models_cache_async, validate_thinking_effort, warn_provider_like_selection,
 };
-pub(crate) use cost::{resolve_model_cost, usage_cost};
+#[cfg(test)]
+pub(crate) use cost::resolve_model_cost;
+pub(crate) use cost::usage_cost;
 #[cfg(test)]
 pub(crate) use ctx_index::{build_ctx_map, write_ctx_index};
 pub(crate) use ctx_index::{
@@ -852,34 +854,6 @@ impl LlmConfig {
     }
 
     /// Cache-write / cache-read price ratio for the configured model, from
-    /// the models.dev catalog when it prices the model. Feeds the online
-    /// compaction economics. Billing follows `usage_cost`: cache reads (and
-    /// writes) with no catalog rate bill at the plain input rate, so the
-    /// ratio is `write_rate / read_rate` — an explicit write surcharge
-    /// (Anthropic-style), `input / cache_read` when writes bill at the
-    /// plain input rate (the industry norm), and 1.0 when the provider
-    /// prices no caching at all (reads bill at input price, so re-writing
-    /// after a compaction costs the same as reading it). The measured
-    /// cross-provider fallback only covers models the catalog doesn't
-    /// price.
-    pub(crate) fn cache_write_read_ratio(&self) -> f64 {
-        const FALLBACK: f64 = crate::agent::online_compaction::DEFAULT_CACHE_WRITE_READ_RATIO;
-        let keys = self.provider.catalog_keys();
-        let Some(cost) = resolve_model_cost(&self.model, &keys, &self.base_url) else {
-            return FALLBACK;
-        };
-        let input_rate = (cost.input > 0.0).then_some(cost.input);
-        // Same unbilled-rate assumptions as `usage_cost`: a missing rate
-        // bills at the input price, so `write / read` covers every pricing
-        // shape the catalog actually carries.
-        let read_rate = cost.cache_read.or(input_rate);
-        let write_rate = cost.cache_write.or(input_rate);
-        match (write_rate, read_rate) {
-            (Some(write), Some(read)) if write > 0.0 && read > 0.0 => write / read,
-            _ => FALLBACK,
-        }
-    }
-
     pub(crate) fn keep_recent_tokens(&self) -> u64 {
         self.keep_recent_tokens
     }
