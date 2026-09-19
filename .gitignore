@@ -9,3 +9,4 @@ ak-tool-cache.json
 *.env
 .worktrees/
 .split-tmp/
+blog/
