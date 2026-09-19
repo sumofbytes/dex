@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::agent::experiments::{DoctorCtx, DoctorRow};
-use crate::core::types::{ChatMessage, FunctionDef, ToolDefinition};
+use crate::protocol::{ChatMessage, FunctionDef, ToolDefinition};
 
 /// Only tool results larger than this participate.
 pub(crate) const THRESHOLD_BYTES: usize = 10 * 1024;
@@ -82,7 +82,7 @@ pub(crate) fn project_messages<'a>(
     // archive IO inside `project` entirely.
     if !messages
         .iter()
-        .any(|m| m.role == crate::core::types::Role::Tool)
+        .any(|m| m.role == crate::protocol::Role::Tool)
     {
         return std::borrow::Cow::Borrowed(messages);
     }
@@ -475,12 +475,12 @@ impl Default for ProjectionState {
 /// the history — the number of provider requests the message has already
 /// been part of. Structural, so it survives resume/compaction with no extra
 /// persisted state.
-fn prior_assistant_counts(messages: &[crate::core::types::ChatMessage]) -> Vec<usize> {
+fn prior_assistant_counts(messages: &[crate::protocol::ChatMessage]) -> Vec<usize> {
     let mut counts = vec![0usize; messages.len()];
     let mut following = 0usize;
     for index in (0..messages.len()).rev() {
         counts[index] = following;
-        if messages[index].role == crate::core::types::Role::Assistant {
+        if messages[index].role == crate::protocol::Role::Assistant {
             following += 1;
         }
     }
@@ -494,9 +494,9 @@ fn prior_assistant_counts(messages: &[crate::core::types::ChatMessage]) -> Vec<u
 pub(crate) fn project(
     state: &ProjectionState,
     session_path: Option<&Path>,
-    messages: &[crate::core::types::ChatMessage],
-) -> Vec<crate::core::types::ChatMessage> {
-    use crate::core::types::{ChatMessage, Role};
+    messages: &[crate::protocol::ChatMessage],
+) -> Vec<crate::protocol::ChatMessage> {
+    use crate::protocol::{ChatMessage, Role};
 
     let prior = prior_assistant_counts(messages);
     let mut projected: Vec<ChatMessage> = Vec::with_capacity(messages.len());
@@ -660,7 +660,7 @@ pub(crate) fn read_observation(session_path: &Path, id: &str) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{ChatMessage, Role};
+    use crate::protocol::{ChatMessage, Role};
     use crate::session::TEST_SESSIONS_ENV_LOCK;
 
     fn big_text(lines: usize) -> String {
@@ -848,10 +848,10 @@ mod tests {
             vec![
                 ChatMessage::assistant_calls(
                     None,
-                    vec![crate::core::types::LlmToolCall {
+                    vec![crate::protocol::LlmToolCall {
                         id: call_id.into(),
                         call_type: "function".into(),
-                        function: crate::core::types::FunctionCall {
+                        function: crate::protocol::FunctionCall {
                             name: "bash".into(),
                             arguments: "{}".into(),
                         },

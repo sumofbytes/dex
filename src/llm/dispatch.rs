@@ -1,10 +1,10 @@
 //! Shared streaming boundary. The concrete SSE readers remain compatible with
 //! both provider protocols and are called through these typed entry points.
 
-use crate::core::types::{ApiProtocol, ChatMessage, SinkLine};
 use crate::llm::config::LlmConfig;
-use crate::llm::sse::is_mid_stream;
-use crate::llm::sse::Turn;
+use crate::llm::transport::sse::is_mid_stream;
+use crate::llm::transport::sse::Turn;
+use crate::protocol::{ApiProtocol, ChatMessage, SinkLine};
 
 /// Wire protocol for this call: an explicit pin (config-file `api:` or the
 /// provider entry's, baked into `config.api_pinned`) or a `DEX_MODEL_APIS`
@@ -44,10 +44,10 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     if crate::llm::http::is_rate_limited(err) {
         return false; // transient capacity — retry the same protocol instead
     }
-    if crate::llm::sse::is_stream_idle_error(err) {
+    if crate::llm::transport::sse::is_stream_idle_error(err) {
         return false; // transient stall — retried same-protocol, not a mismatch
     }
-    if crate::llm::sse::is_dropped_connection(err) {
+    if crate::llm::transport::sse::is_dropped_connection(err) {
         return false; // dead socket — retried same-protocol, not a mismatch
     }
     !crate::llm::http::is_cancelled_message(err)
@@ -57,7 +57,7 @@ pub(crate) async fn complete(
     config: &LlmConfig,
     messages: &[ChatMessage],
     with_tools: bool,
-    sink: Option<tokio::sync::mpsc::Sender<crate::core::types::SinkLine>>,
+    sink: Option<tokio::sync::mpsc::Sender<crate::protocol::SinkLine>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     match effective_api(config) {
@@ -131,9 +131,9 @@ pub(crate) async fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::Provider;
     use crate::llm::config::tests::test_cfg;
-    use crate::llm::sse::MidStreamError;
+    use crate::llm::transport::sse::MidStreamError;
+    use crate::protocol::Provider;
 
     /// Set/restore env around gate tests (local copy of config's EnvRestore).
     struct EnvGuard {

@@ -6,7 +6,7 @@
 //! ponytail: read-through, no process cache — the file holds a handful of
 //! entries; add file-identity caching like `learned-apis.json` if it grows.
 
-use crate::core::fs::{unique_tmp_path, xdg_path};
+use crate::workspace::{unique_tmp_path, xdg_path};
 
 fn thinking_path() -> Option<std::path::PathBuf> {
     xdg_path("XDG_CACHE_HOME", ".cache", "dex/thinking-effort.json")

@@ -3,8 +3,9 @@
 use serde_json::{Map, Value};
 use similar::TextDiff;
 
+use super::then_run::arg_str;
 use super::write::{atomic_write, check_expected_hash_bytes};
-use super::{arg_str, workspace_path, ToolError};
+use super::{workspace_path, ToolError};
 
 pub(crate) async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
     let path = workspace_path(&arg_str(args, "path")?)?;

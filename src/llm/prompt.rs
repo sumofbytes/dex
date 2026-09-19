@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use crate::core::types::Skill;
+use crate::protocol::Skill;
 
 /// Format discovered skills as a system-prompt section. Sorted by name so
 /// the system prefix is byte-identical no matter what order the caller
@@ -305,7 +305,7 @@ mod tests {
         let custom = system_prompt_with_override(&[], Some("You are a pirate."));
         assert!(custom.starts_with("You are a pirate."), "{custom}");
         assert!(!custom.contains("Batch independent reads"), "{custom}");
-        let skills = vec![crate::core::types::Skill {
+        let skills = vec![crate::protocol::Skill {
             name: "s".to_string(),
             description: "d".to_string(),
             path: std::path::PathBuf::from("/tmp/s/SKILL.md"),

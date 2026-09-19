@@ -29,8 +29,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::core::types::{ChatMessage, Role};
 use crate::llm::config::warn_once;
+use crate::protocol::{ChatMessage, Role};
 
 /// Value of [`COMPACTION_ENV`] /
 /// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`] selecting
@@ -405,7 +405,7 @@ pub(crate) fn prune_span(messages: &mut Vec<ChatMessage>, start: usize, end: usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{FunctionCall, LlmToolCall};
+    use crate::protocol::{FunctionCall, LlmToolCall};
 
     fn call(id: &str, name: &str) -> LlmToolCall {
         LlmToolCall {
