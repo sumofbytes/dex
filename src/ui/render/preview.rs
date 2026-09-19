@@ -165,7 +165,7 @@ pub(crate) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Li
                 .trim_end_matches("<==")
                 .trim();
             let path = inner.split_whitespace().next().unwrap_or(inner);
-            let lang = crate::core::highlight::lang_from_path(path).to_string();
+            let lang = crate::ui::theme::highlight::lang_from_path(path).to_string();
             cur = Section {
                 header: Some(line.as_str()),
                 lang,
@@ -330,11 +330,11 @@ pub(crate) fn render_search_preview(preview: &[String]) -> Vec<Line<'static>> {
             rows.push(Row::Code {
                 gutter: format!("  {path}:{num}{sep}"),
                 code,
-                lang: crate::core::highlight::lang_from_path(path).to_string(),
+                lang: crate::ui::theme::highlight::lang_from_path(path).to_string(),
             });
             continue;
         }
-        let lang = crate::core::highlight::lang_from_path(trimmed);
+        let lang = crate::ui::theme::highlight::lang_from_path(trimmed);
         if !trimmed.chars().any(char::is_whitespace) && !lang.is_empty() {
             // Bare path (files-mode list, fuzzy grouping): dim landmark
             // re-targeting the language for following grouped rows.

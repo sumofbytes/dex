@@ -429,7 +429,7 @@ mod tests {
             thinking_open: false,
             plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),
-            assistant_gap: crate::core::markdown::GapState::new(),
+            assistant_gap: crate::ui::theme::markdown::GapState::new(),
             stream_last_flush: Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,

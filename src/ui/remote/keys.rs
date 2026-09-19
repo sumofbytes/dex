@@ -448,7 +448,7 @@ pub(crate) fn finish_shell_command(
         SHELL_BLOCK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let input = serde_json::json!({"command": command}).to_string();
-    let short = crate::core::format::short_arg("bash", &input);
+    let short = crate::ui::format::short_arg("bash", &input);
     append_sink_line(
         &mut remote.app,
         SinkLine::ToolInput {
@@ -456,12 +456,11 @@ pub(crate) fn finish_shell_command(
             input: format!("bash {short}"),
         },
     );
-    let mut summary =
-        crate::core::format::tool_result_summary("bash", &input, output, success, None);
+    let mut summary = crate::ui::format::tool_result_summary("bash", &input, output, success, None);
     if excluded {
         summary.push_str(" · excluded from context");
     }
-    let preview = crate::core::format::tool_preview("bash", success, None, output, true);
+    let preview = crate::ui::format::tool_preview("bash", success, None, output, true);
     append_sink_line(
         &mut remote.app,
         SinkLine::ToolOutput {

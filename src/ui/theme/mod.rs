@@ -1,27 +1,20 @@
-//! Theme-aware surface colors for the TUI.
+//! Theme: terminal palette, surface colors, markdown line semantics and the
+//! tree-sitter code highlighter shared by the TUI renderers and the headless
+//! stream printer (`llm::transport::sse::turn`). Single home so the TUI and
+//! the console agree on colors and markdown spacing rules.
 //!
-//! Fixed palette slots bypass the terminal's theme (the 256-color gray ramp
-//! is never remapped), so neutral grays clash with tinted backgrounds. Surface
-//! colors here are instead derived from the terminal's real background and
-//! foreground colors, queried once at startup (OSC 11): raised surfaces
-//! (popups) blend the background a step toward the foreground, while the
-//! composer/transcript band (`surface_bg`) shades it a step darker, so both
-//! keep the theme's hue and always contrast with text on them.
+//! `palette.rs` holds the OSC-11 terminal query primitive; the surface
+//! color functions live here (moved verbatim from the old `ui/theme.rs`).
+
+pub(crate) mod highlight;
+pub(crate) mod markdown;
+pub(crate) mod palette;
 
 use std::sync::{Mutex, OnceLock};
 
 use ratatui::style::Color;
 
-use crate::core::palette::{blend, faint_rgb, fg_rgb, muted_rgb, term_palette};
-
-/// Which side of the light/dark split the terminal background sits on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Background {
-    Dark,
-    Light,
-    /// Unknown (query failed or not a TTY); assume dark, the common case.
-    Unknown,
-}
+use self::palette::{blend, faint_rgb, fg_rgb, muted_rgb, term_palette, Background};
 
 /// A raised surface: the terminal's actual background lifted a step toward
 /// its foreground, so the hue matches the active theme. `amount` controls how
