@@ -337,6 +337,11 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
     }) {
         row(out, r.label, &r.value, &r.source);
     }
+    // Threshold-compaction mode: value and origin owned by the Jev module
+    // next to its parse, so the row cannot drift from runtime behavior.
+    // Printed unconditionally like the online row above.
+    let (compaction, compaction_source) = crate::agent::jev::compaction_doctor();
+    row(out, "compaction", &compaction, &compaction_source);
 
     let (chain_effort, effort_source) = thinking_source(d.file, &base_url, &model);
     let effort = live

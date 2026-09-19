@@ -8,9 +8,10 @@ use tokio::sync::mpsc;
 
 use super::apply_queue_msg;
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
+use crate::agent::jev::summary_mode;
 use crate::agent::online_compaction::{
-    decide_compaction, post_compaction_reminder, CompactionEconomics, DEFAULT_COMPACTION_ECONOMICS,
-    NATIVE_SUMMARY_TOKEN_ESTIMATE,
+    decide_compaction, memo_estimate, online_compaction_jev, post_compaction_reminder,
+    CompactionEconomics, DEFAULT_COMPACTION_ECONOMICS,
 };
 use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
 use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
@@ -302,7 +303,19 @@ pub(super) async fn emergency_compact(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
     for _ in 0..3 {
-        match compact_history(config, messages, cancel, true).await {
+        // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
+        // one parse selects both the prune and the fallback summarizer.
+        let summarizer = summary_mode();
+        match compact_history(
+            config,
+            messages,
+            cancel,
+            true,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        {
             Ok((true, usage)) => {
                 compacted_any = true;
                 if let Some(u) = usage {
@@ -670,7 +683,9 @@ pub(super) async fn process_tool_result(
                 // archived, and the ephemeral preamble + tool
                 // schema are re-sent on every request.
                 ledger.archivable_tokens(KEEP_RECENT_MESSAGES, config.keep_recent_tokens()),
-                NATIVE_SUMMARY_TOKEN_ESTIMATE,
+                // Jev prunes leave truncated heads (~200 tokens), not a 1k
+                // summary, behind — the same archive repays faster.
+                memo_estimate(online_compaction_jev()),
                 context_tokens,
                 &state.online_compaction,
                 Some(config.context_window),
@@ -685,7 +700,19 @@ pub(super) async fn process_tool_result(
                 decision.archive_tokens
             );
             if decision.compact {
-                match compact_history(config, messages, cancel, false).await {
+                // Boundary cuts follow the boundary knob for the prune
+                // (`DEX_ONLINE_COMPACTION`) and the threshold knob for the
+                // fallback summarizer.
+                match compact_history(
+                    config,
+                    messages,
+                    cancel,
+                    false,
+                    online_compaction_jev(),
+                    summary_mode(),
+                )
+                .await
+                {
                     Ok((true, usage)) => {
                         if let Some(u) = usage {
                             record_usage(config, state, console, u, None).await;
@@ -713,14 +740,18 @@ pub(super) async fn process_tool_result(
                         // The boundary fired silently before; a
                         // system line is the only user-visible
                         // proof the economics paid out.
-                        system_note(
-                            console,
-                            &format!(
+                        let note = if online_compaction_jev() {
+                            format!(
+                                "online compaction (jev): pruned stale tool outputs at plan boundary (~{} tokens archived)",
+                                decision.archive_tokens
+                            )
+                        } else {
+                            format!(
                                 "online compaction: history compacted at plan boundary (~{} tokens archived)",
                                 decision.archive_tokens
-                            ),
-                        )
-                        .await;
+                            )
+                        };
+                        system_note(console, &note).await;
                     }
                     // Below the summarize floor (e.g. a boundary
                     // right after the previous compaction) or a
