@@ -1,13 +1,13 @@
 use std::io::{self, IsTerminal, Write};
 
-use crate::core::format::agent_lifecycle;
 use crate::protocol::{ApprovalDecision, StreamEvent};
 use crate::runtime::console::{AGENT_COLOR, RESET};
+use crate::ui::format::agent_lifecycle;
 
 use super::http::{ChatOptions, DaemonClient};
 
 fn prompt_for_approval(name: &str, input: &str) -> ApprovalDecision {
-    use crate::core::format::{approval_details, approval_summary, approval_title};
+    use crate::ui::format::{approval_details, approval_summary, approval_title};
     let title = approval_title(name, input);
     let summary = approval_summary(name, input);
     let details = approval_details(name, input);
@@ -77,7 +77,7 @@ fn handle_event_with(
         } => {
             let icon = if success { "✓" } else { "✗" };
             let timing = if duration > 0.0 {
-                format!(" ({})", crate::core::format::format_duration(duration))
+                format!(" ({})", crate::ui::format::format_duration(duration))
             } else {
                 String::new()
             };

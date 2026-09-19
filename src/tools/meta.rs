@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-use crate::core::format::clamp_lines;
 use crate::protocol::PermissionMode;
 use crate::runtime::cancel::CancellationSource;
 use crate::runtime::console::Console;
+use crate::ui::format::clamp_lines;
 
 use super::read::{READ_FANOUT_MAX_FILES, READ_MAX_BYTES, READ_MAX_LINES};
 use super::shell::{run_bash, BASH_CLAMP_BYTES, BASH_CLAMP_LINES};

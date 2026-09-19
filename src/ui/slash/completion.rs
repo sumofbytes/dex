@@ -574,8 +574,7 @@ fn cmd_mcp(app: &mut App, arg: Option<&str>) {
                 Some(statuses) => {
                     let tools = crate::mcp::cached_tools();
                     let truncated = crate::mcp::cached_truncated();
-                    for line in crate::core::format::render_mcp_panel(&statuses, &tools, truncated)
-                    {
+                    for line in crate::ui::format::render_mcp_panel(&statuses, &tools, truncated) {
                         push_info(app, line);
                     }
                     for line in crate::mcp::oauth::auth_lines() {

@@ -703,7 +703,7 @@ pub(crate) fn ephemeral_line() -> Option<String> {
     if mgr.configs.is_empty() {
         return None;
     }
-    try_snapshot(mgr).and_then(|st| crate::core::format::mcp_status_line(&st))
+    try_snapshot(mgr).and_then(|st| crate::ui::format::mcp_status_line(&st))
 }
 
 pub(crate) async fn call_global(

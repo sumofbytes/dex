@@ -1,4 +1,5 @@
-//! Shared message/role/approval/permission vocabulary (from core/types.rs;
+//! Shared message/role/approval/permission vocabulary (from the old
+//! core/types.rs;
 //! dissolving in Phase 3 — see protocol/shared.rs for the split map).
 
 use serde::{Deserialize, Serialize};
