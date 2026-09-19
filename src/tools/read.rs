@@ -8,7 +8,8 @@ use tokio::io::AsyncReadExt as _;
 use crate::runtime::cancel::wait_cancelled;
 use crate::ui::format::clamp_lines;
 
-use super::{arg_str, resolve_workspace_path, workspace_path, workspace_root, ToolError};
+use super::then_run::arg_str;
+use super::{resolve_workspace_path, workspace_path, workspace_root, ToolError};
 
 /// Multi-file read caps: enough for the "search, then read the hits" pattern
 /// in one call, small enough that a fan-out cannot flood the context.

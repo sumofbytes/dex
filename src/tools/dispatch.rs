@@ -11,8 +11,8 @@ use super::policy::{enforce_policy, metadata, metadata_native, PermissionRequire
 use super::read::tool_read;
 use super::search::{tool_fffind, tool_ffgrep};
 use super::shell::tool_bash;
+use super::then_run::{append_then_run, evidence_session, then_run_command, tool_update_plan};
 use super::write::tool_write;
-use super::{append_then_run, evidence_session, then_run_command, tool_update_plan};
 
 /// Execute a tool using paths confined to the current workspace.
 pub(crate) async fn execute(
