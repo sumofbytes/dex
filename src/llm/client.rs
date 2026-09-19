@@ -4,8 +4,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::state::CancellationSource;
-use crate::core::console::with_console;
-use crate::core::types::{ChatMessage, ChatRequest, SinkLine, StreamOptions};
 use crate::llm::config::LlmConfig;
 use crate::llm::http::{
     authenticated_request, backoff_delay, error_chain_message, error_head, is_cancelled_message,
@@ -14,7 +12,9 @@ use crate::llm::http::{
 use crate::llm::protocol::{
     chat_completions_messages, responses_input, responses_tools, tools_schema,
 };
-use crate::llm::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
+use crate::llm::transport::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
+use crate::protocol::{ChatCompletionsRequest, ChatMessage, SinkLine, StreamOptions};
+use crate::runtime::console::with_console;
 
 /// Agent-loop model seam: `process_turn` is generic over this so tests run
 /// deterministic doubles; the single production impl is `LlmConfig` (via
@@ -245,7 +245,7 @@ pub(crate) async fn call_chat_completions(
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    let req = ChatRequest {
+    let req = ChatCompletionsRequest {
         model: &config.model,
         messages: chat_completions_messages(messages),
         tools: if with_tools {
@@ -351,13 +351,16 @@ const MAX_IDLE_STREAM_RETRIES: u32 = 2;
 /// (see `stream_idle_timeout_for`). One helper so the three protocol entry
 /// points share the catalog lookup instead of repeating it.
 fn idle_timeout(config: &LlmConfig) -> Option<Duration> {
-    crate::llm::sse::stream_idle_timeout_for(&config.model, config.thinking_effort.is_some())
+    crate::llm::transport::sse::stream_idle_timeout_for(
+        &config.model,
+        config.thinking_effort.is_some(),
+    )
 }
 
 fn should_retry_idle(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
     attempt < MAX_IDLE_STREAM_RETRIES
-        && !crate::llm::sse::is_mid_stream(err)
-        && crate::llm::sse::is_stream_idle_error(&error_chain_message(err))
+        && !crate::llm::transport::sse::is_mid_stream(err)
+        && crate::llm::transport::sse::is_stream_idle_error(&error_chain_message(err))
         && !is_cancelled_message(&error_chain_message(err))
 }
 
@@ -371,8 +374,8 @@ fn should_retry_idle(err: &(dyn std::error::Error + 'static), attempt: u32) -> b
 /// cancellations.
 fn should_retry_dropped(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
     attempt < MAX_IDLE_STREAM_RETRIES
-        && !crate::llm::sse::is_mid_stream(err)
-        && crate::llm::sse::is_transport_error(err)
+        && !crate::llm::transport::sse::is_mid_stream(err)
+        && crate::llm::transport::sse::is_transport_error(err)
         && !is_cancelled_message(&error_chain_message(err))
 }
 
@@ -409,14 +412,14 @@ fn should_retry_stream_error(
     max_retries: u32,
 ) -> bool {
     attempt < max_retries
-        && !crate::llm::sse::is_mid_stream(err)
+        && !crate::llm::transport::sse::is_mid_stream(err)
         && is_rate_limited(&error_chain_message(err))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::Usage;
+    use crate::protocol::Usage;
 
     #[derive(Clone)]
     struct MockModel;
@@ -452,7 +455,7 @@ mod tests {
         // Mid-stream rate limits never retry — partial text is already on
         // the transcript and a re-issued call would duplicate it.
         let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
-            crate::llm::sse::MidStreamError("rate_limit_error: Overloaded".into()),
+            crate::llm::transport::sse::MidStreamError("rate_limit_error: Overloaded".into()),
         );
         assert!(!should_retry_stream_error(&*mid, 0, 3));
         // Non-rate-limit failures never retry through this gate.
@@ -480,18 +483,20 @@ mod tests {
         assert!(!should_retry_idle(&*idle_cancelled, 0));
         // Mid-stream stall: output already flowed, so no retry.
         let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
-            crate::llm::sse::MidStreamError("stream idle for over 300s; stalled".into()),
+            crate::llm::transport::sse::MidStreamError("stream idle for over 300s; stalled".into()),
         );
         assert!(!should_retry_idle(&*mid, 0));
-        assert!(crate::llm::sse::is_stream_idle_error(
+        assert!(crate::llm::transport::sse::is_stream_idle_error(
             "stream idle for over 300s; x"
         ));
-        assert!(!crate::llm::sse::is_stream_idle_error("API error: boom"));
+        assert!(!crate::llm::transport::sse::is_stream_idle_error(
+            "API error: boom"
+        ));
     }
 
     #[test]
     fn dropped_connection_retries_pre_output_only() {
-        use crate::llm::sse::StreamTransportError;
+        use crate::llm::transport::sse::StreamTransportError;
         // A marked transport failure before any output is a pure re-issue
         // within budget — detection is provenance, not wording.
         let err: Box<dyn std::error::Error + Send + Sync> =
@@ -502,7 +507,7 @@ mod tests {
         // Mid-stream drops never retry here — partial output may already be
         // on the transcript and a re-issued call would duplicate it.
         let mid: Box<dyn std::error::Error + Send + Sync> = Box::new(
-            crate::llm::sse::MidStreamError("connection reset by peer".into()),
+            crate::llm::transport::sse::MidStreamError("connection reset by peer".into()),
         );
         assert!(!should_retry_dropped(&*mid, 0));
         // Anything else never retries through this gate — including the bare

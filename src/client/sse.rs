@@ -65,6 +65,7 @@ impl SseFramer {
     /// non-`data:` lines, and unparsable payloads. Lenient consumers should
     /// prefer [`SseFramer::ingest`], which keeps the cursor moving past
     /// unknown event types.
+    #[cfg(test)]
     pub(crate) fn parse_envelope(line: &str) -> Option<StreamEnvelope> {
         let data = Self::data_payload(line)?;
         serde_json::from_str::<StreamEnvelope>(data).ok()

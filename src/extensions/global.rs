@@ -4,12 +4,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::core::types::ToolDefinition;
 use crate::llm::config::ExtensionModelSnapshot;
+use crate::protocol::ToolDefinition;
 
+use super::appendix::{full_tool_name, normalize_tool_name};
 use super::manager::ExtensionManager;
-use super::{has_event_handlers, MAX_NET_RESPONSE_BYTES, MAX_NET_TIMEOUT_MS};
 use super::{AfterOutcome, BeforeOutcome, CallKind, CompactAction, HostCtx, HOOK_TIMEOUT_SECS};
+use super::{MAX_NET_RESPONSE_BYTES, MAX_NET_TIMEOUT_MS};
 
 // ---------------------------------------------------------------------------
 // Global (process-wide) manager: sync reads for schema + dispatch paths
@@ -592,8 +593,8 @@ pub(crate) async fn apply_before_compact(
         };
     }
     let policy = crate::tools::Policy::turn(
-        crate::core::types::PermissionMode::ReadOnly,
-        &crate::core::console::Console::none(),
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
     );
     let host = HostCtx {
         cancel,
@@ -637,8 +638,8 @@ pub(crate) async fn run_command_global(
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<String, String> {
     let policy = crate::tools::Policy::turn(
-        crate::core::types::PermissionMode::ReadOnly,
-        &crate::core::console::Console::none(),
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
     );
     let host = HostCtx {
         cancel,
@@ -677,4 +678,108 @@ pub(crate) async fn run_command_global(
             None,
         )
         .await
+}
+
+/// `dex.tools.list()`: the extension tool names (full `ext__` names).
+/// Spins under contention like every other sync cache read (see
+/// `global::spin_read`) instead of failing open to an empty list.
+pub(crate) fn tools_list() -> Vec<String> {
+    GLOBAL
+        .get()
+        .and_then(|m| {
+            spin_read(&m.cached).map(|t| t.iter().map(|d| d.function.name.clone()).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// `dex.tools.set_active(list)`: persist the schema slice; an empty list
+/// means "no extension tools". Short (own-extension) names resolve to full
+/// `ext__<ext>__<tool>` names here so extension code never spells the
+/// prefix; full names pass through, and unknown names filter out at read
+/// time (see `set_active`).
+pub(crate) async fn set_active_global(ext: &str, tools: Vec<String>) {
+    let tools = tools.iter().map(|t| resolve_active_name(ext, t)).collect();
+    if let Some(m) = GLOBAL.get() {
+        m.set_active(tools).await;
+    }
+}
+
+/// Resolve one `set_active` entry to its full name: already-full `ext__`
+/// names pass through, legacy `lua__` names normalize to `ext__` (so the
+/// read-time filter against canonical cache names still matches), and
+/// anything else names the caller's own tool.
+pub(crate) fn resolve_active_name(ext: &str, name: &str) -> String {
+    if name.starts_with("ext__") {
+        name.to_string()
+    } else if name.starts_with("lua__") {
+        normalize_tool_name(name)
+    } else {
+        full_tool_name(ext, name)
+    }
+}
+
+/// Dispatch a shadowed built-in through its shadow (plan §6.4 step 4).
+pub(crate) async fn call_shadow_global(
+    target: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+    shell_out: &mut Option<crate::tools::ShellEvidence>,
+) -> Result<String, String> {
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager()
+        .call_shadow(target, args, &host, shell_out)
+        .await
+}
+
+/// Per-extension status for `dex extensions list` / `/extensions`: (id,
+/// version, tools, events) for every loaded engine. Sync snapshot, never
+/// blocks (same contract as `cached_tools`).
+pub(crate) fn loaded_summaries() -> Vec<(String, String, Vec<String>, Vec<String>)> {
+    GLOBAL
+        .get()
+        .and_then(|m| {
+            spin_guard(&m.engines).map(|engines| {
+                engines
+                    .values()
+                    .map(|e| {
+                        (
+                            e.manifest.id.clone(),
+                            e.manifest.version.clone(),
+                            e.tools.clone(),
+                            e.events.clone(),
+                        )
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Sync shadow check for `metadata()`: a shadowed built-in is Shell-gated.
+/// Never blocks — empty until the first refresh lands (same as the schema).
+pub(crate) fn is_shadowed(name: &str) -> bool {
+    GLOBAL
+        .get()
+        .and_then(|m| spin_read(&m.shadowed).map(|s| s.contains(name)))
+        .unwrap_or(false)
+}
+
+/// Does any loaded extension subscribe to `event`? Fast path so the common
+/// no-hooks turn skips arg cloning + JSON round-trips entirely.
+pub(crate) fn has_event_handlers(event: &str) -> bool {
+    GLOBAL
+        .get()
+        .and_then(|m| {
+            spin_guard(&m.engines).map(|e| {
+                e.values()
+                    .any(|ext| ext.events.contains(&event.to_string()))
+            })
+        })
+        .unwrap_or(false)
 }

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use super::global::loaded_summaries;
 use super::manifest::{self, Manifest};
 
 /// Walk the discovery dirs and collect consent-passing (dir, manifest)
@@ -186,4 +187,104 @@ pub(crate) fn set_enabled(id: &str, enabled: bool) -> std::io::Result<()> {
         std::fs::remove_file(&enabled_path).ok();
     }
     Ok(())
+}
+
+/// Disk discovery for `dex doctor`: (id, version, scope, consent state)
+/// per found manifest. Reads no manager state, so it is deterministic
+/// regardless of what parallel test runs loaded.
+pub(crate) fn discovered_extensions() -> Vec<(String, String, &'static str, String)> {
+    let mut found = Vec::new();
+    for (dir, scope) in scoped_extension_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let ext_dir = entry.path();
+            if !ext_dir.is_dir() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(ext_dir.join("manifest.yaml")) else {
+                continue;
+            };
+            let Ok(m) = manifest::parse_manifest(&text) else {
+                continue;
+            };
+            let scope = match scope {
+                Scope::Project => "project",
+                Scope::User => "user",
+            };
+            let state = if is_disabled(&m.id) {
+                "disabled"
+            } else if scope == "project" && !is_enabled(&m.id) {
+                "not enabled (trust gate)"
+            } else {
+                "enabled"
+            };
+            found.push((m.id, m.version, scope, state.to_string()));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.dedup_by(|a, b| a.0 == b.0);
+    found
+}
+
+/// One-line summary for `dex extensions list` / `/extensions` (shared so
+/// the two surfaces never drift).
+pub(crate) fn summary_line(id: &str, version: &str, tools: &[String], events: &[String]) -> String {
+    format!(
+        "{id} {version} — {} tool(s), events: {}",
+        tools.len(),
+        if events.is_empty() {
+            "-".to_string()
+        } else {
+            events.join(",")
+        }
+    )
+}
+
+/// `dex extensions list`: discovery walk + consent state + loaded summary.
+/// The caller refreshes the manager first (one-shot blocks on it).
+pub(crate) fn list_command() {
+    for (dir, scope) in scoped_extension_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let ext_dir = entry.path();
+            let text = match std::fs::read_to_string(ext_dir.join("manifest.yaml")) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let m = match manifest::parse_manifest(&text) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let scope = match scope {
+                Scope::Project => "project",
+                Scope::User => "user",
+            };
+            let state = if is_disabled(&m.id) {
+                "disabled"
+            } else if scope == "project" && !is_enabled(&m.id) {
+                "not enabled (trust gate)"
+            } else {
+                "enabled"
+            };
+            let loaded = loaded_summaries()
+                .into_iter()
+                .find(|(id, _, _, _)| *id == m.id)
+                .map(|(_, _, tools, events)| {
+                    format!(
+                        "loaded, {}",
+                        summary_line(&m.id, &m.version, &tools, &events)
+                    )
+                })
+                .unwrap_or_else(|| "not loaded".to_string());
+            println!(
+                "{:<14} {:<8} {:<6} {:<28} {}",
+                m.id, m.version, scope, state, loaded
+            );
+            println!("  {}", ext_dir.display());
+        }
+    }
 }
