@@ -1,6 +1,7 @@
 //! Turn-loop tests, split out of `turn_loop.rs` (the agent state machine).
 //! Exposes `TEST_TURN_ENV_LOCK` for cross-module serialization.
 
+use super::tools::tool_calls_conflict;
 use super::*;
 
 /// Serializes tests that run `process_turn`: every turn reads
@@ -11,7 +12,7 @@ use super::*;
 pub(crate) static TEST_TURN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use crate::agent::state::{CancellationSource, ToolState};
 use crate::llm::client::ModelClient;
-use crate::protocol::{ApiProtocol, ChatMessage, PermissionMode, Provider};
+use crate::protocol::{ApiProtocol, ChatMessage, PermissionMode, Provider, Usage};
 
 #[derive(Clone)]
 struct MockModel;
