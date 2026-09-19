@@ -15,6 +15,7 @@ use super::turn::run_turn_inner;
 use super::turn::TurnChannels;
 use super::DaemonState;
 #[cfg(test)]
+#[cfg(test)]
 use super::PendingApproval;
 #[cfg(test)]
 use super::SessionEntry;
@@ -53,6 +54,7 @@ use axum::routing::post;
 #[cfg(test)]
 use axum::Json;
 use axum::Router;
+#[cfg(test)]
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
