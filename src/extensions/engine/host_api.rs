@@ -10,11 +10,11 @@ use std::rc::Rc;
 use mlua::{Error as LuaError, Function, Lua, MultiValue, Table, Value};
 use serde_json::Value as Json;
 
-use super::super::engine::{
+use super::super::Manifest;
+use super::{
     host_upcall, json_to_lua, lua_to_json, lua_type_name, lua_value_to_string, valid_segment,
     worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS,
 };
-use super::super::Manifest;
 use crate::tools::resolve_workspace_path;
 
 /// `dex.tools.*` — registration, host-mediated calls, shadow rails.
