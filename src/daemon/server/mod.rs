@@ -1,75 +1,16 @@
-#[cfg(test)]
-use super::lock_map;
-#[cfg(test)]
-use super::lookup::lookup_entry;
-#[cfg(test)]
-use super::lookup::persisted_current;
-#[cfg(test)]
-use super::required_token;
+//! Daemon HTTP server: route wiring only. Handlers live in
+//! `routes_{chat,misc,sessions}.rs`; tests in `tests.rs`.
+
 use super::shell::session_shell;
-#[cfg(test)]
-use super::turn::apply_thinking_override;
-#[cfg(test)]
-use super::turn::run_turn_inner;
-#[cfg(test)]
-use super::turn::TurnChannels;
 use super::DaemonState;
-#[cfg(test)]
-#[cfg(test)]
-use super::PendingApproval;
-#[cfg(test)]
-use super::SessionEntry;
-#[cfg(test)]
-use crate::llm::config::LlmConfig;
-#[cfg(test)]
-use crate::protocol::ApprovalDecision;
-#[cfg(test)]
-use crate::protocol::ChatRequest;
-#[cfg(test)]
-use crate::protocol::CreateSessionRequest;
-#[cfg(test)]
-use crate::protocol::ExtensionRunRequest;
-#[cfg(test)]
-use crate::protocol::FollowupRequest;
-#[cfg(test)]
-use crate::protocol::LoadSkillRequest;
-#[cfg(test)]
-use crate::protocol::QueueMsg;
-#[cfg(test)]
-use crate::protocol::RecallRequest;
-#[cfg(test)]
-use crate::protocol::SteerRequest;
-#[cfg(test)]
-use crate::protocol::StreamEvent;
-#[cfg(test)]
-use crate::runtime::console::CancellationToken;
-#[cfg(test)]
-use crate::session::Session;
-#[cfg(test)]
-use axum::extract::State;
-#[cfg(test)]
-use axum::http::StatusCode;
-use axum::routing::get;
-use axum::routing::post;
-#[cfg(test)]
-use axum::Json;
+use axum::routing::{get, post};
 use axum::Router;
-#[cfg(test)]
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Mutex;
-#[cfg(test)]
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
-#[cfg(test)]
-use tokio::sync::mpsc;
 
 mod routes_chat;
 mod routes_misc;
 mod routes_sessions;
+
 pub(crate) use routes_chat::{approve, cancel, chat, create_queue_pair, followup, recall, steer};
 pub(crate) use routes_misc::{
     extensions_reload, extensions_run, get_config, get_extensions, get_git, get_mcp, health,
