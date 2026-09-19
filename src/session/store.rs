@@ -765,10 +765,14 @@ impl Session {
         // Sync only when
         // durability matters (turn boundaries) or when DEX_DURABLE=1 is
         // set for strict recovery testing.
-        // `clear` is rare (compaction rewrites atomically now; `/clear` is
-        // user intent) — sync it so the fold point itself is durable.
+        // `effect_start`/`effect_result` are the restart-recovery intent
+        // records (written BEFORE the tool executes) — sync them so a crash
+        // can't leave an executed tool unrecorded. `clear` is rare
+        // (compaction rewrites atomically now; `/clear` is user intent) —
+        // sync it so the fold point itself is durable.
         let durable = durable_journal()
             || line.contains("\"type\":\"turn_")
+            || line.contains("\"type\":\"effect_")
             || line.contains("\"type\":\"clear\"");
         if durable {
             file.sync_data()?;

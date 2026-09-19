@@ -8,3 +8,4 @@ ak-tool-cache.json
 .env.local-ci
 *.env
 .worktrees/
+.split-tmp/
