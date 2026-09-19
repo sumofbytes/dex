@@ -247,7 +247,7 @@ Files: `src/agent/loop.rs`, `src/agent/compaction.rs:300-352,543-701`.
   serialize path itself awaits). Preserve the 6-entry `last_tools` repeat
   guard, cacheable set, and `state.clear()` on write/edit exactly.
 - Compaction: `summarize_old_messages` / prefix summary call sites become
-  `.await`; deterministic fallback unchanged. `DEX_COMPACTION_LLM=1` path
+  `.await`; deterministic fallback unchanged. `DEX_COMPACTION=llm` path
   keeps the dead-drop sink pattern (dropped receiver → sends fail silently).
   `compact_history` itself can stay sync except the two `call_llm` awaits —
   make it async for that reason only.

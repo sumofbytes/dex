@@ -1542,25 +1542,33 @@ async fn net_fetch_confines_to_model_endpoint() {
 /// endpoints (each with its own key); lookalike hosts and anything
 /// unconfigured stay confined even with the capability declared.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // redirected env must stay put across the manager awaits
 async fn net_fetch_allows_configured_provider_endpoints() {
+    // This test redirects DEX_CONFIG/XDG_CACHE_HOME, which the
+    // sessions-locked config tests also mutate — serialize against
+    // them (consistent order: sessions -> turn -> manager, like the
+    // other extension tests, so the global locks can't deadlock).
+    let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
     let _env = EnvRestore::take(&["DEX_CONFIG", "XDG_CACHE_HOME", "DEX_MODEL", "DEX_PROVIDER"]);
     let root = std::env::temp_dir().join(format!("dex-ext-netprov-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
-            root.join("config.yaml"),
-            "providers:\n  otherprov:\n    base_url: https://otherprov.example/v1\n    api_key: k-other\n",
-        )
-        .unwrap();
+        root.join("config.yaml"),
+        "providers:\n  otherprov:\n    base_url: https://otherprov.example/v1\n    api_key: k-other\n",
+    )
+    .unwrap();
     std::env::set_var("DEX_CONFIG", root.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
     for key in ["DEX_MODEL", "DEX_PROVIDER"] {
         std::env::remove_var(key);
     }
-    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
     let mgr = global_manager();
     mgr.reset_for_tests().await;
     *LAST_MODEL.lock().expect("served model lock") =
@@ -1824,14 +1832,15 @@ async fn web_example_loads_and_gates_tools() {
 /// through that provider's endpoint + key over `net.providers`.
 /// Visibility re-syncs inside the command itself (no `model_select`
 /// round-trip — that event only fires on provider/model change).
-#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // redirected env must stay put across the manager awaits
 async fn web_example_falls_back_to_override_model() {
-    // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
-    // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
-    // concurrent daemon turn can't slip a snapshot in between
-    // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    // Same race as above: this test redirects DEX_CONFIG/XDG_* while
+    // sessions-locked config tests assume exclusive env access. Take the
+    // sessions lock first (consistent order: sessions -> turn -> manager).
+    let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1914,12 +1923,12 @@ async fn web_example_falls_back_to_override_model() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     std::fs::write(
-            root.join("config.yaml"),
-            format!(
-                "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n"
-            ),
-        )
-        .unwrap();
+        root.join("config.yaml"),
+        format!(
+            "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n"
+        ),
+    )
+    .unwrap();
     std::env::set_var("DEX_CONFIG", root.join("config.yaml"));
     let body = serde_json::json!({
         "content": [{
@@ -1939,15 +1948,15 @@ async fn web_example_falls_back_to_override_model() {
         let _ = stream.read(&mut buf).await;
         let _ = seen_tx.send(buf);
         let _ = stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        payload.len(),
-                        payload
-                    )
-                    .as_bytes(),
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
                 )
-                .await;
+                .as_bytes(),
+            )
+            .await;
     });
     let mgr = global_manager();
     mgr.reset_for_tests().await;
@@ -2006,12 +2015,12 @@ async fn web_example_falls_back_to_override_model() {
     //    (The override must be a configured provider — set-time
     //    validation rejects keyless ones, so declare gemini here.)
     std::fs::write(
-              root.join("config.yaml"),
-              format!(
-                  "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n  gemini:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-gemini\n"
-              ),
-          )
-          .unwrap();
+          root.join("config.yaml"),
+          format!(
+              "providers:\n  anthropic:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-fallback\n    api: anthropic-messages\n  gemini:\n    base_url: http://127.0.0.1:{port}\n    api_key: k-gemini\n"
+          ),
+      )
+      .unwrap();
     let out = crate::extensions::run_command_global("web", "search-model", "gemini/gm-1", &cancel)
         .await
         .unwrap();
