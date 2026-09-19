@@ -8,7 +8,6 @@
 //! children by hand with `delegate(resume_from)`. The blanket
 //! `dead_code` allow stays only for genuinely optional surface;
 //! everything else is dead-code free.
-#![allow(dead_code)]
 
 mod definition;
 mod exit;

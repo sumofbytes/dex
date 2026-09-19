@@ -2,11 +2,11 @@
 //! (builtin tables); what differs by provider *configuration* (endpoint,
 //! key, protocol pin, headers) is derived once into
 //! `config::ResolvedProvider` from the `providers:` map + models.dev
-//! catalog. Identity (`parse`/`name`) stays on the enum in `core::types`.
+//! catalog. Identity (`parse`/`name`) stays on the enum in `protocol::shared`.
 
 use std::collections::BTreeMap;
 
-use crate::core::types::{ApiProtocol, Provider};
+use crate::protocol::{ApiProtocol, Provider};
 
 impl Provider {
     /// Base URL when `--base-url` and config-file

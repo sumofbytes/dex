@@ -50,17 +50,6 @@ fn read_first_line(path: &Path) -> Option<String> {
     }
 }
 
-async fn read_first_line_async(path: PathBuf) -> Option<String> {
-    use tokio::io::AsyncBufReadExt as _;
-    let file = tokio::fs::File::open(&path).await.ok()?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let mut first = String::new();
-    match reader.read_line(&mut first).await {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(first),
-    }
-}
-
 pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     let dir = Session::session_dir().join(Session::cwd_slug(cwd));
     let mut sessions = scan_jsonl_dir(&dir);
@@ -143,23 +132,6 @@ pub(crate) fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
             id.starts_with(&q) || q.starts_with(&id)
         })
     })
-}
-
-pub(crate) fn resume(cwd: &str, selector: &str) -> io::Result<Session> {
-    let sessions = Session::list(cwd)?;
-    let path = if let Ok(index) = selector.parse::<usize>() {
-        sessions.get(index).map(|(path, _)| path.clone())
-    } else {
-        let candidate = PathBuf::from(selector);
-        sessions
-            .iter()
-            .find(|(path, _)| {
-                path == &candidate || path.file_name().and_then(|n| n.to_str()) == Some(selector)
-            })
-            .map(|(path, _)| path.clone())
-    }
-    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session not found"))?;
-    Session::from_path(&path)
 }
 
 pub(crate) async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {

@@ -1,6 +1,6 @@
 //! The extension manager: load/reload, tool schema, dispatch.
 
-use crate::core::types::{FunctionDef, ToolDefinition};
+use crate::protocol::{FunctionDef, ToolDefinition};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,9 +8,9 @@ use std::sync::Arc;
 use super::appendix::{
     full_tool_name, max_extension_tools, remove_prompt_appendix, split_ext_name, warn_hidden_tools,
 };
-use super::discovery::discover_scoped;
+use super::discovery::{discover_scoped, scoped_extension_dirs, user_extensions_dir};
 use super::hooks;
-use super::manifest::Manifest;
+use super::manifest::{self, Manifest};
 use super::{
     AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx, ShadowCtx,
     HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
@@ -745,4 +745,68 @@ impl ExtensionManager {
             }
         }
     }
+}
+
+/// `dex extensions install <dir>`: copy an extension directory into the
+/// user-scope dir. The manifest must parse — install validates before
+/// copying so a broken extension never lands.
+pub(crate) fn install(src: &str) -> Result<String, String> {
+    let src = PathBuf::from(src);
+    let text = std::fs::read_to_string(src.join("manifest.yaml"))
+        .map_err(|e| format!("{}: {e}", src.display()))?;
+    let manifest = manifest::parse_manifest(&text)?;
+    let target = user_extensions_dir().join(&manifest.id);
+    if target.exists() {
+        return Err(format!(
+            "{} already exists (remove it first)",
+            target.display()
+        ));
+    }
+    copy_dir(&src, &target)?;
+    Ok(manifest.id)
+}
+
+/// `dex extensions remove <id>`: delete the extension directory wherever it
+/// was discovered (user or project scope — removing is always a user act).
+pub(crate) fn remove(id: &str) -> Result<(), String> {
+    // `dir.join(id)` below must never traverse: reject anything outside the
+    // same [a-z0-9_-]+ (no `__`) shape the manifest validator enforces.
+    if !manifest::valid_segment(id) {
+        return Err(format!(
+            "invalid extension id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
+        ));
+    }
+    for (dir, _) in scoped_extension_dirs() {
+        let ext_dir = dir.join(id);
+        if ext_dir.join("manifest.yaml").is_file() {
+            std::fs::remove_dir_all(&ext_dir)
+                .map_err(|e| format!("removing {}: {e}", ext_dir.display()))?;
+            return Ok(());
+        }
+    }
+    Err(format!("extension '{id}' not found"))
+}
+
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        // Symlinks are skipped: a cyclic one would recurse to stack
+        // overflow, and an escaping one would copy outside the extension.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            eprintln!(
+                "dex: [extensions] install: skipping symlink {}",
+                entry.path().display()
+            );
+            continue;
+        }
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }

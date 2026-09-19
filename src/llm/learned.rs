@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::core::fs::{cached_parse, xdg_path, FileCache};
-use crate::core::types::ApiProtocol;
+use crate::protocol::ApiProtocol;
+use crate::workspace::{cached_parse, xdg_path, FileCache};
 
 /// Models empirically switched to chat-completions after the responses API
 /// rejected them (e.g. glm-5.3-flash on zen/go 500s on `/responses`, 200s on

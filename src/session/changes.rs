@@ -29,8 +29,10 @@ pub(crate) struct ChangeRecord {
 
 /// Cap for content stored in a change record; larger files record hashes
 /// only (undo unavailable for them).
+#[cfg(test)]
 const CHANGE_CONTENT_CAP: usize = 64 * 1024;
 /// Keep at most this many change records per session (FIFO).
+#[cfg(test)]
 const CHANGE_RECORD_CAP: usize = 50;
 
 /// Load the change ledger (FIFO, newest last).
@@ -49,6 +51,10 @@ pub(crate) fn save_changes(session: &mut Session, changes: &[ChangeRecord]) -> i
 }
 
 /// Record one change (FIFO-capped). Returns the updated ledger.
+/// Production code never appends to the ledger yet (undo entries are
+/// seeded by tests against the `/undo` route); test-only until a
+/// write/edit tool wires it up.
+#[cfg(test)]
 pub(crate) fn record_change(
     session: &mut Session,
     record: ChangeRecord,
@@ -103,6 +109,7 @@ pub(crate) fn undo_last_change(session: &mut Session) -> io::Result<String> {
 }
 
 /// Build a change record from a completed write/edit.
+#[cfg(test)]
 pub(crate) fn make_change_record(
     tool: &str,
     path: &str,
