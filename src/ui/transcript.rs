@@ -10,7 +10,7 @@ use super::status;
 use super::theme;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
-use crate::ui::format::agent_lifecycle;
+use crate::runtime::format_runtime::agent_lifecycle;
 use crate::ui::format::short_arg;
 use ratatui::style::Color;
 use ratatui::style::Style;
@@ -95,10 +95,6 @@ fn content_tail_idx(app: &App) -> Option<usize> {
     app.transcript
         .iter()
         .rposition(|b| !matches!(b, TranscriptBlock::Activity { settled: None, .. }))
-}
-
-fn content_tail(app: &App) -> Option<&TranscriptBlock> {
-    content_tail_idx(app).and_then(|i| app.transcript.get(i))
 }
 
 fn content_tail_mut(app: &mut App) -> Option<&mut TranscriptBlock> {

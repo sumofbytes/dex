@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 pub(crate) mod changes;
 pub(crate) mod discovery;
 pub(crate) mod events;
@@ -7,14 +6,12 @@ pub(crate) mod store;
 
 // The undo ledger lives in `changes.rs`, the events journal in `events.rs`;
 // re-exported here so existing `session::...` paths keep working.
-pub(crate) use changes::{
-    load_changes, make_change_record, record_change, save_changes, undo_last_change, ChangeRecord,
-};
-pub(crate) use events::{events_cache, EVENTS_PAGE_LIMIT};
+pub(crate) use changes::undo_last_change;
+pub(crate) use events::EVENTS_PAGE_LIMIT;
 pub(crate) use header::{file_id, FileId, PathCache, SessionHeader};
 pub(crate) use store::{
     load_llm_messages_from_session, load_messages_and_plan, load_messages_from_session,
-    load_messages_from_session_async, load_plan, load_session_state, save_plan, Session,
+    load_session_state, Session,
 };
 
 /// Serializes tests that redirect XDG_DATA_HOME (it decides where ALL

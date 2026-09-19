@@ -1,50 +1,10 @@
 //! Approval-surface rendering: titles, risk coloring, one-line summaries,
-//! and the per-tool detail lines shown in the permission dialog. Also the
-//! model-facing `bash_context_text` for `!`/`!!` shell runs.
+//! and the per-tool detail lines shown in the permission dialog.
 
-use ratatui::style::Color;
 use serde_json::Value;
 
-use super::{clip_chars, plural, short_arg};
+use super::{clip_chars, short_arg};
 
-/// Model-facing text for a `!`/`!!` shell run:
-/// the persisted message the next turn reads. The output is already clamped
-/// for the context window by the bash tool. Single owner for the daemon
-/// (`POST /shell`) and local one-shot paths so the two can't diverge.
-pub(crate) fn bash_context_text(
-    command: &str,
-    output: &str,
-    success: bool,
-    code: Option<i32>,
-    cancelled: bool,
-) -> String {
-    let mut text = format!("Ran `{command}`\n");
-    if output.trim().is_empty() {
-        text.push_str("(no output)");
-    } else {
-        text.push_str("```\n");
-        text.push_str(output);
-        if !output.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str("```");
-    }
-    if cancelled {
-        text.push_str("\n\n(command cancelled)");
-    } else if !success {
-        match code {
-            Some(code) => text.push_str(&format!("\n\nCommand exited with code {code}")),
-            None => text.push_str("\n\nCommand failed"),
-        }
-    }
-    text
-}
-
-/// Human-readable approval helpers — keep tool JSON out of the user's face.
-/// `approval_title` / `approval_summary` / `approval_details` turn raw
-/// `{"path":…}` / `{"command":…}` payloads into the short, scannable
-/// lines the overlay and CLI prompt show. No filesystem IO, pure formatting.
-/// ponytail: one place for all tool-to-human mapping; add a tool → add a branch.
 pub(crate) fn approval_title(name: &str, input: &str) -> &'static str {
     approval_title_with_then_run(name, input_has_then_run(input))
 }
@@ -72,6 +32,7 @@ pub(crate) fn approval_title_with_then_run(name: &str, has_then_run: bool) -> &'
     }
 }
 
+#[cfg(test)]
 pub(crate) fn approval_risk(name: &str, input: &str) -> (&'static str, ratatui::style::Color) {
     approval_risk_with_then_run(name, input_has_then_run(input))
 }

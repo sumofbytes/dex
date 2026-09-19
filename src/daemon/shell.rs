@@ -108,11 +108,13 @@ pub(crate) async fn session_shell(
     // failure mode.
     let persist = if req.exclude_from_context {
         ChatMessage::user_named(
-            crate::ui::format::bash_context_text(&command, &output, success, code, cancelled),
+            crate::runtime::format_runtime::bash_context_text(
+                &command, &output, success, code, cancelled,
+            ),
             crate::protocol::BASH_EXCLUDED_NAME,
         )
     } else {
-        ChatMessage::user(crate::ui::format::bash_context_text(
+        ChatMessage::user(crate::runtime::format_runtime::bash_context_text(
             &command, &output, success, code, cancelled,
         ))
     };

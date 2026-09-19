@@ -303,7 +303,6 @@ fn reset_session_state_clears_conversation_scope_only() {
         "bash".into(),
         "{}".into(),
         tx,
-        "r".into(),
         None,
     ));
 

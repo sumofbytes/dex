@@ -477,13 +477,8 @@ impl App {
 
 pub(crate) struct PendingApproval {
     pub(crate) name: String,
-    pub(crate) input: String,
     pub(crate) response: tokio::sync::mpsc::Sender<crate::protocol::ApprovalDecision>,
     pub(crate) selected: usize,
-    /// Wire request id (V1b): the POST /approve target. Parent-turn
-    /// approvals carried it implicitly (one per turn); child approvals can
-    /// queue, so each entry names its own.
-    pub(crate) request_id: String,
     /// The child agent's definition name (V1b, §12): the prompt renders
     /// labeled ("explorer wants to run bash: …").
     pub(crate) agent: Option<String>,
@@ -501,7 +496,6 @@ impl PendingApproval {
         name: String,
         input: String,
         response: tokio::sync::mpsc::Sender<crate::protocol::ApprovalDecision>,
-        request_id: String,
         agent: Option<String>,
     ) -> Self {
         let has_then_run = crate::ui::format::input_has_then_run(&input);
@@ -512,10 +506,8 @@ impl PendingApproval {
             crate::ui::format::approval_risk_with_then_run(&name, has_then_run);
         Self {
             name,
-            input,
             response,
             selected: 0,
-            request_id,
             agent,
             title,
             summary,

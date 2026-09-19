@@ -13,7 +13,7 @@ use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override_for;
 use crate::protocol::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
-use crate::runtime::console::{CancellationToken, Console, TraceWriter};
+use crate::runtime::console::{CancellationToken, Console};
 use crate::runtime::unwind::CatchUnwind;
 use crate::session::{self, Session};
 use crate::skills::{discover_skills_async, skill_dirs};
@@ -544,17 +544,11 @@ pub(crate) async fn run_turn_inner(
         .map_err(|e| format!("failed to persist prompt: {e}"))?;
     messages.push(user_message);
 
-    // Per-turn redacted trace journal (P9): `<session>.trace.jsonl`, 0600.
-    let trace = session
-        .path()
-        .map(|p| p.with_extension("trace.jsonl"))
-        .and_then(|p| TraceWriter::open(p).ok());
-
     // The agent loop reports through std channels; bridge them onto the
     // tokio sender with dedicated threads.
     let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>(256);
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(16);
-    let console = Console::daemon(sink_tx, approval_tx).with_trace(trace);
+    let console = Console::daemon(sink_tx, approval_tx);
     // Surface the routed tier in the transcript: daemon users get no other
     // signal that the model changed under them (the tier is also journaled
     // on `turn_start`).

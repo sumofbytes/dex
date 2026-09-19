@@ -65,8 +65,8 @@ pub(crate) use exec::execute_delegation;
 #[cfg(test)]
 pub(crate) use exec::{
     child_system_prompt, delegate, delegate_list, delegate_output, effective_child_model,
-    parse_generation, resolve_child_config, resolve_resume_handle, resume_conversation,
-    resume_messages, resume_nudge, seed_task_text,
+    parse_generation, resolve_child_config, resolve_resume_handle, resume_messages, resume_nudge,
+    seed_task_text,
 };
 #[cfg(test)]
 pub(crate) use schema::DELEGATION_TOOLS;

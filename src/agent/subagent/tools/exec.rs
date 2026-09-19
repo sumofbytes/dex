@@ -194,7 +194,6 @@ pub(crate) async fn delegate(
             .manager
             .spawn(
                 &def,
-                seed.clone(),
                 SpawnMeta {
                     generation,
                     parent_session: Some(ctx.session_path.clone()),
@@ -228,7 +227,6 @@ pub(crate) async fn delegate(
         .manager
         .spawn(
             &def,
-            seed.clone(),
             SpawnMeta {
                 generation: 0,
                 parent_session: Some(ctx.session_path.clone()),
@@ -316,6 +314,9 @@ async fn delegate_stop(
 /// sees and what the journal records; the journal mirrors the fresh path
 /// (no system line), so re-resuming a resumed generation re-derives the
 /// prompt again instead of duplicating it.
+/// Test-only: the live resume path inlines this assembly in `child_body`
+/// (turn_event ordering differs). Kept as the reference the test asserts.
+#[cfg(test)]
 pub(crate) fn resume_conversation(
     def: &AgentDefinition,
     replayed: Vec<ChatMessage>,

@@ -67,7 +67,7 @@ mod handler_tests {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (branch, dirty) = crate::ui::format::git_context(&cwd);
+        let (branch, dirty) = crate::runtime::format_runtime::git_context(&cwd);
         assert_eq!(info.git_branch, branch);
         assert_eq!(info.git_dirty, dirty);
     }
@@ -1294,9 +1294,9 @@ not json
         let (state, id) = state_with_session(&path);
         {
             let mut session = Session::from_path(&path).unwrap();
-            crate::session::record_change(
+            crate::session::changes::record_change(
                 &mut session,
-                crate::session::make_change_record(
+                crate::session::changes::make_change_record(
                     "write",
                     &target.to_string_lossy(),
                     Some("before"),
@@ -1331,9 +1331,9 @@ not json
         let after2 = crate::tools::hash_file(&target.to_string_lossy());
         {
             let mut session = Session::from_path(&path).unwrap();
-            crate::session::record_change(
+            crate::session::changes::record_change(
                 &mut session,
-                crate::session::make_change_record(
+                crate::session::changes::make_change_record(
                     "edit",
                     &target.to_string_lossy(),
                     Some("before"),

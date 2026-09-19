@@ -237,13 +237,10 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             // the parent turn, so several can be answerable at once. The
             // overlay resolves the front; each entry POSTs its own decision.
             let (response, decision_rx) = mpsc::channel::<ApprovalDecision>(1);
-            remote.app.pending_approvals.push(PendingApproval::new(
-                name,
-                input,
-                response,
-                request_id.clone(),
-                agent,
-            ));
+            remote
+                .app
+                .pending_approvals
+                .push(PendingApproval::new(name, input, response, agent));
             spawn_approval_poster(
                 remote.client.clone(),
                 remote.session_id.clone(),
