@@ -49,6 +49,7 @@ impl AgentState {
     /// only `Running` keeps a registry entry and a task alive — spawns
     /// reject at capacity instead of queueing, so there is no dormant
     /// state to represent.
+    #[cfg(test)]
     pub(crate) fn is_terminal(self) -> bool {
         !matches!(self, Self::Running)
     }
@@ -60,9 +61,7 @@ impl AgentState {
 /// timeouts — the instance itself holds no runtime machinery.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentInstance {
-    pub(crate) id: AgentId,
     pub(crate) definition: AgentDefinition,
-    pub(crate) context: ContextSeed,
     pub(crate) state: AgentState,
     /// Tool the child is currently running, as reported through its
     /// [`ProgressReporter`](super::manager::ProgressReporter) — the

@@ -231,11 +231,6 @@ async fn parent_cancel_ends_delegate_output_without_touching_children() {
                 .into_iter()
                 .next()
                 .unwrap(),
-            ContextSeed {
-                task: "do the thing".to_string(),
-                file_hints: Vec::new(),
-                parent_summary: None,
-            },
             SpawnMeta::fresh(),
             // Ends only through its own token: parent cancel must not
             // reach it.
@@ -467,7 +462,7 @@ fn resume_conversation_prepends_system_prompt_and_journals_without_it() {
         instruction: Some("skip the build".to_string()),
         file_hints: Vec::new(),
     };
-    let (in_memory, journal) = resume_conversation(&def, replayed, &request);
+    let (in_memory, journal) = super::exec::resume_conversation(&def, replayed, &request);
     assert_eq!(in_memory.len(), 4);
     assert_eq!(in_memory[0].role, crate::protocol::Role::System);
     assert!(!in_memory[0]
@@ -522,11 +517,6 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
                 .into_iter()
                 .next()
                 .unwrap(),
-            ContextSeed {
-                task: "do the thing".to_string(),
-                file_hints: Vec::new(),
-                parent_summary: None,
-            },
             SpawnMeta::fresh(),
             move |_, _, _| {
                 let transcript = held.clone();
@@ -568,11 +558,6 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
                 .into_iter()
                 .next()
                 .unwrap(),
-            ContextSeed {
-                task: "hang".to_string(),
-                file_hints: Vec::new(),
-                parent_summary: None,
-            },
             SpawnMeta::fresh(),
             |token, _, _| async move {
                 token.cancelled().await;
@@ -666,11 +651,6 @@ async fn delegate_list_reports_live_retained_and_disk() {
                 .into_iter()
                 .next()
                 .unwrap(),
-            ContextSeed {
-                task: "hang".to_string(),
-                file_hints: Vec::new(),
-                parent_summary: None,
-            },
             SpawnMeta::fresh(),
             |token, _, _| async move {
                 token.cancelled().await;
@@ -692,11 +672,6 @@ async fn delegate_list_reports_live_retained_and_disk() {
                 .into_iter()
                 .next()
                 .unwrap(),
-            ContextSeed {
-                task: "finish".to_string(),
-                file_hints: Vec::new(),
-                parent_summary: None,
-            },
             SpawnMeta::fresh(),
             |_, _, _| async {
                 AgentResult {

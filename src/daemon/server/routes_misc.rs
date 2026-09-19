@@ -118,7 +118,7 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
     {
         return (hit.branch.clone(), hit.dirty);
     }
-    let (branch, dirty) = crate::ui::format::git_context_async(cwd).await;
+    let (branch, dirty) = crate::runtime::format_runtime::git_context_async(cwd).await;
     let mut cache = lock_map(CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new())));
     if cache.len() > 32 {
         cache.clear();

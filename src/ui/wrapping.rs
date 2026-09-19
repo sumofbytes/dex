@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use unicode_width::UnicodeWidthChar;
 
 /// Greedily wrap an input line and locate the cursor in the resulting rows.

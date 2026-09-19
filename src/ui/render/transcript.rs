@@ -481,7 +481,6 @@ pub(crate) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
         text: String,
         style: Style,
         width: usize,
-        whitespace: bool,
     }
 
     // Drop the whole leading indent span (TRANSCRIPT_INDENT cells), not just
@@ -549,12 +548,7 @@ pub(crate) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
             last_space = Some(row.len());
         }
         row_width += width;
-        row.push(Unit {
-            text,
-            style,
-            width,
-            whitespace,
-        });
+        row.push(Unit { text, style, width });
     }
     if !row.is_empty() || rows.is_empty() {
         rows.push(row);

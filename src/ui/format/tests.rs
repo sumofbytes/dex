@@ -14,23 +14,6 @@ fn display_cols(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-#[test]
-fn agent_lifecycle_markers() {
-    // The two emit formats (spawn in `subagent/tools.rs`, terminal in
-    // `subagent/manager.rs`) must both parse — a wording change here
-    // downgrades the lines to muted system notes.
-    let (marker, rest) = agent_lifecycle("[agent explorer:sess-1] started").unwrap();
-    assert_eq!(marker, "◈");
-    assert_eq!(rest, "explorer:sess-1] started");
-    let (marker, rest) =
-        agent_lifecycle("[agent explorer:sess-1] finished completed · 3 tok").unwrap();
-    assert_eq!(marker, "◇");
-    assert_eq!(rest, "explorer:sess-1] finished completed · 3 tok");
-    // Non-lifecycle system notes stay muted.
-    assert!(agent_lifecycle("obs pack: bash result 45 KiB archived").is_none());
-    assert!(agent_lifecycle("").is_none());
-}
-
 /// The budget's canonical cut of `l`-filler: budget-1 columns of content
 /// plus the 1-column `…` marker — what any 400+-column line must clip to.
 fn clipped_at_budget() -> String {
@@ -568,45 +551,6 @@ fn strip_ansi_consumes_osc_payloads() {
     );
     // Window title with a BEL terminator.
     assert_eq!(one_line_summary("\x1b]0;title\x07done"), "done");
-}
-
-#[tokio::test]
-async fn git_context_async_matches_sync() {
-    // TDD Phase 6: tokio::process git spawns under cache, same branch/dirty.
-    let cwd = std::env::current_dir()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let sync_res = super::git_context(&cwd);
-    let async_res = super::git_context_async(&cwd).await;
-    assert_eq!(sync_res, async_res);
-}
-
-#[test]
-fn mcp_status_line_empty_when_no_servers() {
-    assert_eq!(mcp_status_line(&[]), None);
-}
-
-#[test]
-fn mcp_status_line_names_up_and_down_servers() {
-    use crate::mcp::ServerStatus;
-    let line = mcp_status_line(&[
-        ServerStatus {
-            name: "gh".to_string(),
-            state: "up".to_string(),
-            tools: 3,
-            error: None,
-        },
-        ServerStatus {
-            name: "db".to_string(),
-            state: "down".to_string(),
-            tools: 0,
-            error: Some("refused".to_string()),
-        },
-    ])
-    .expect("non-empty statuses produce a line");
-    assert!(line.contains("gh (3 tools)"), "{line}");
-    assert!(line.contains("db (down)"), "{line}");
 }
 
 #[test]

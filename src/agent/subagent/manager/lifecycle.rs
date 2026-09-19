@@ -6,7 +6,6 @@ use super::super::model::AgentId;
 use super::super::model::AgentInstance;
 use super::super::model::AgentResult;
 use super::super::model::AgentState;
-use super::super::model::ContextSeed;
 use super::registry::escalate_handle;
 use super::registry::AgentNotice;
 use super::registry::BodyFuture;
@@ -196,7 +195,6 @@ impl AgentManager {
     pub(crate) fn spawn<F, Fut>(
         &self,
         def: &AgentDefinition,
-        seed: ContextSeed,
         meta: SpawnMeta,
         run: F,
     ) -> Result<AgentId, SpawnError>
@@ -208,7 +206,7 @@ impl AgentManager {
             let future: BodyFuture = Box::pin(run(token, progress, id));
             future
         });
-        self.launch(def, seed, meta, run)
+        self.launch(def, meta, run)
     }
 
     /// Cap check, id allocation, transcript derivation, registry insert,
@@ -219,7 +217,6 @@ impl AgentManager {
     fn launch(
         &self,
         def: &AgentDefinition,
-        seed: ContextSeed,
         meta: SpawnMeta,
         run: BoxRun,
     ) -> Result<AgentId, SpawnError> {
@@ -245,7 +242,7 @@ impl AgentManager {
             if inner.running.len() >= MAX_CHILDREN {
                 return Err(Self::at_capacity(&inner));
             }
-            Self::register(&mut inner, def, seed, &meta, &id)
+            Self::register(&mut inner, def, &meta, &id)
         };
         self.spawn_wrapper(id.clone(), def.name.clone(), timeout, token, run);
         // §15 V1b: the typed spawn event fires after registration, so the
@@ -277,7 +274,6 @@ impl AgentManager {
     fn register(
         inner: &mut Inner,
         def: &AgentDefinition,
-        seed: ContextSeed,
         meta: &SpawnMeta,
         id: &AgentId,
     ) -> (CancellationToken, Duration) {
@@ -294,9 +290,7 @@ impl AgentManager {
             id.clone(),
             RunningChild {
                 instance: AgentInstance {
-                    id: id.clone(),
                     definition: def.clone(),
-                    context: seed,
                     state: AgentState::Running,
                     progress: None,
                 },
@@ -539,6 +533,9 @@ impl AgentManager {
         out
     }
 
+    /// Test-only: the parent observes cancellation through the child's
+    /// exit result, not by polling state.
+    #[cfg(test)]
     pub(crate) fn status(&self, id: &AgentId) -> Option<AgentState> {
         let inner = self.lock();
         if let Some(child) = inner.running.get(id) {
@@ -588,6 +585,7 @@ impl AgentManager {
 
     /// Live children. The daemon shutdown path (§17) joins until this
     /// reaches zero.
+    #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {
         self.lock().running.len()
     }

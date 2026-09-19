@@ -87,6 +87,7 @@ pub(crate) fn queue_metrics_of(groups: &[QueueGroup]) -> QueueMetrics {
 
 /// Items and content rows the strip renders, straight from `queue_groups`
 /// so sizing can't drift from the drawing.
+#[cfg(test)]
 pub(crate) fn pending_queue_metrics(app: &App) -> QueueMetrics {
     queue_metrics_of(&queue_groups(app))
 }

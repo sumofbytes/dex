@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::io::{self, IsTerminal, Write};
@@ -193,58 +192,6 @@ pub(crate) struct Console {
     /// Stamped onto its `ApprovalRequest`s so the daemon parks and labels
     /// them as the child's; `None` for the parent turn's own tools.
     pub(crate) agent: Option<(String, String)>,
-    /// Redacted per-turn observability journal (P9). Optional; the daemon
-    /// opens one per turn (`<session>.trace.jsonl`, `0600`), local paths skip it.
-    trace: Option<TraceWriter>,
-}
-
-/// Redacted event span appended to a per-turn `trace.jsonl` (P9).
-/// Field meanings are fixed; no prompts, tool args, or secrets are ever
-/// written — only hashes and counters, so a trace is safe to ship to cost
-/// tooling.
-#[derive(Clone)]
-pub(crate) struct TraceWriter {
-    file: Arc<Mutex<std::fs::File>>,
-}
-
-impl TraceWriter {
-    /// Open (append) a trace file with `0600` permissions on unix.
-    pub(crate) fn open(path: std::path::PathBuf) -> std::io::Result<Self> {
-        let file = trace_file(path)?;
-        Ok(Self {
-            file: Arc::new(Mutex::new(file)),
-        })
-    }
-
-    pub(crate) fn record(&self, span: serde_json::Value) {
-        use std::io::Write;
-        if let Ok(mut file) = self.file.lock() {
-            let mut line = span.to_string();
-            line.push('\n');
-            let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
-        }
-    }
-}
-
-/// Unix: create/append with `0600` so traces stay private to the user.
-#[cfg(unix)]
-fn trace_file(path: std::path::PathBuf) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)
-}
-
-/// No permission bits to set; plain create/append.
-#[cfg(not(unix))]
-fn trace_file(path: std::path::PathBuf) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
 }
 
 impl Clone for Console {
@@ -258,7 +205,6 @@ impl Clone for Console {
             remote_approval: self.remote_approval,
             live_approvals: self.live_approvals.clone(),
             agent: self.agent.clone(),
-            trace: self.trace.clone(),
         }
     }
 }
@@ -276,7 +222,6 @@ impl Console {
             remote_approval: false,
             live_approvals: None,
             agent: None,
-            trace: None,
         }
     }
 
@@ -290,7 +235,6 @@ impl Console {
             remote_approval: false,
             live_approvals: None,
             agent: None,
-            trace: None,
         }
     }
 
@@ -306,7 +250,6 @@ impl Console {
             remote_approval: true,
             live_approvals: None,
             agent: None,
-            trace: None,
         }
     }
 
@@ -323,26 +266,6 @@ impl Console {
     pub(crate) fn with_agent(mut self, agent_id: String, name: String) -> Self {
         self.agent = Some((agent_id, name));
         self
-    }
-
-    /// Attach a trace journal (P9). Returns a clone (the same file).
-    pub(crate) fn with_trace(mut self, trace: Option<TraceWriter>) -> Self {
-        self.trace = trace;
-        self
-    }
-
-    /// Record one span, if a trace journal is attached. Field names are the
-    /// contract; see `TraceWriter`.
-    pub(crate) fn trace_span(&self, mut span: serde_json::Value) {
-        if let Some(trace) = &self.trace {
-            if let Some(obj) = span.as_object_mut() {
-                obj.insert(
-                    "ts".into(),
-                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
-                );
-            }
-            trace.record(span);
-        }
     }
 
     /// Seed the per-console session-approval set from the daemon's

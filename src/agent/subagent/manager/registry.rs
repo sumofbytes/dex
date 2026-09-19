@@ -232,6 +232,7 @@ pub(crate) struct SpawnMeta {
     pub(crate) remaining_budget: Option<usize>,
 }
 
+#[cfg(test)]
 impl SpawnMeta {
     pub(crate) fn fresh() -> Self {
         Self {

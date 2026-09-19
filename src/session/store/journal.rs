@@ -2,10 +2,9 @@
 //! records `turn_start`/`turn_complete`/`turn_failed` markers and streamed
 //! daemon events, plus the cheap single-pass summary scan used by listing.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
