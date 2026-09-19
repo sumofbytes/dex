@@ -76,7 +76,7 @@ pub(crate) fn tools_schema_parts() -> (
     (tools, mcp, ext)
 }
 
-/// Native + experiment schema: everything `tools_schema()` owns itself.
+/// Native schema: everything `tools_schema()` owns itself.
 /// Built fresh per call (small: ~11 defs); the MCP + extension slices ride
 /// alongside as borrowed `Arc`s.
 fn native_tools() -> Vec<ToolDefinition> {
@@ -266,10 +266,6 @@ fn native_tools() -> Vec<ToolDefinition> {
             },
         });
     }
-    // Experiment tools (the online compaction plan tool, the observation
-    // pack recall tool): owned by each experiment module and registered
-    // through the experiment registry — protocol.rs never names a gate.
-    tools.extend(crate::agent::experiments::tool_definitions());
     if extra {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
@@ -314,7 +310,7 @@ fn native_tools() -> Vec<ToolDefinition> {
 /// `DEX_EXTRA_TOOLS` flag, cached process-wide: `tools_schema()` runs per
 /// model call and the env lookup is pure overhead after boot. Tests bypass
 /// the cache — they flip the var mid-process and expect the schema to
-/// follow (see the experiments schema test).
+/// follow.
 fn extra_tools_enabled() -> bool {
     #[cfg(test)]
     {

@@ -18,23 +18,19 @@
 //! already excludes the keep-recent window): there is no internal
 //! recency pin.
 //!
-//! Stack order with the other output shrinkers: the evidence reducer
-//! compresses a result inline at execution time, observation pack projects
-//! large results out of the provider's request view (recallable via
-//! `obs_recall`), and this prune runs last at compaction time over the
-//! intact session history pack never edits. A Jev drop is therefore
-//! destructive where packing is recallable — contained by only ever
-//! dropping re-runnable reads (re-run the tool to restore): errors,
-//! plans, and mutating-tool evidence truncate instead of dropping.
+//! Stack order with the other output shrinkers: this prune runs last at
+//! compaction time over the intact session history. A Jev drop is
+//! destructive, contained by only ever dropping re-runnable reads (re-run
+//! the tool to restore): errors and mutating-tool evidence truncate instead
+//! of dropping.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::llm::config::warn_once;
 use crate::protocol::{ChatMessage, Role};
 
-/// Value of [`COMPACTION_ENV`] /
-/// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`] selecting
-/// verbatim pruning instead of summarization.
+/// Value of [`COMPACTION_ENV`] selecting verbatim pruning instead of
+/// summarization.
 pub(crate) const JEV_VALUE: &str = "jev";
 
 /// `DEX_COMPACTION` selects the threshold-compaction summarizer
@@ -55,18 +51,6 @@ pub(crate) const JEV_TRUNCATE_HEAD_CHARS: usize = 300;
 /// Minimum reduction for a prune to beat a summary (upstream
 /// `reductionRatio < 0.25` falls back to summary).
 pub(crate) const JEV_MIN_REDUCTION_RATIO: f64 = 0.25;
-
-/// Memo estimate for the boundary economics when Jev prunes instead of
-/// summarizing: a few truncated heads, not a 1k summary. A deliberate
-/// pre-decision floor, not a measurement: each truncated head leaves behind
-/// ~90 tokens (300 chars + trailer), so a prune with many truncations leaves
-/// more than 200 behind and the saving (`archive - memo`) is overstated.
-/// Bounded in practice: the worthwhile gate needs ≥25% reduction, so a
-/// many-truncation prune always frees thousands of tokens and the few-hundred
-/// memo error barely moves the breakeven — and the carried-debt gate prices
-/// the next compaction against the same floor, so the error cannot compound
-/// into a compaction spiral.
-pub(crate) const JEV_MEMO_TOKEN_ESTIMATE: u64 = 200;
 
 /// Medium results are truncated; huge ones from re-runnable tools are dropped.
 const TRUNCATE_ABOVE_CHARS: usize = 2_000;
@@ -89,8 +73,7 @@ impl SummaryMode {
     }
 }
 
-/// One knob shape shared by [`COMPACTION_ENV`] and
-/// [`crate::agent::online_compaction::ONLINE_COMPACTION_ENV`]: `jev`
+/// One knob shape shared by [`COMPACTION_ENV`]: `jev`
 /// selects verbatim pruning, `llm` (or `1`) selects the LLM/summary
 /// behavior, unset and explicit offs disable, anything else is a typo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,15 +192,6 @@ fn is_rerunnable(tool: &str) -> bool {
     crate::tools::metadata(tool).is_some_and(|m| m.read_only && m.idempotent)
 }
 
-/// Anchors that must survive verbatim: plan snapshots orient the next plan
-/// (`update_plan`, defined in `online_compaction::tool_defs`), `obs_recall`
-/// pages are already the recall path (defined in `obs_pack`). Both are
-/// read-only in the registry but never reach the scorer — `decide` keeps
-/// them above.
-fn is_anchor(tool: &str) -> bool {
-    matches!(tool, "update_plan" | "obs_recall")
-}
-
 fn looks_like_error(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("error")
@@ -230,9 +204,6 @@ fn looks_like_error(text: &str) -> bool {
 /// Heuristic stand-in for Jev's two `noul` questions (call still matters?
 /// result still needed verbatim?): returns `(keep_call, keep_result)`.
 fn decide(tool: &str, result: &str) -> (bool, bool) {
-    if is_anchor(tool) {
-        return (true, true);
-    }
     // Chars, not bytes: the thresholds are named `_CHARS` and the truncate
     // head is 300 chars, so a multibyte result must clear the same bar.
     let len = result.chars().count();
@@ -467,21 +438,18 @@ mod tests {
     }
 
     #[test]
-    fn anchors_and_errors_are_never_dropped() {
+    fn error_evidence_is_never_dropped() {
+        // `bash` is mutating and its error output is the evidence: even a
+        // huge result only truncates, never drops.
         let mut msgs = vec![ChatMessage::system("sys")];
-        msgs.push(ChatMessage::assistant_calls(
-            None,
-            vec![call("p1", "update_plan"), call("e1", "bash")],
-        ));
-        msgs.push(ChatMessage::tool_result("p1", "plan ".repeat(3_000)));
+        msgs.push(ChatMessage::assistant_calls(None, vec![call("e1", "bash")]));
         msgs.push(ChatMessage::tool_result(
             "e1",
             format!("ERROR boom {}", "e".repeat(11_000)),
         ));
         msgs.push(ChatMessage::user("tail"));
-        let stats = prune_span(&mut msgs, 1, 4);
+        let stats = prune_span(&mut msgs, 1, 3);
         assert_eq!(stats.dropped, 0, "{stats:?}");
-        assert!(msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("p1")));
         assert!(msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("e1")));
     }
 

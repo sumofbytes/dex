@@ -6,37 +6,23 @@ use super::audit::audit;
 use super::edit::{change_diff_async, tool_edit};
 use super::error::ToolError;
 use super::meta::{tool_chain, tool_git, tool_ls, Policy};
-use super::outcome::{ShellEvidence, ToolOutcome};
+use super::outcome::ToolOutcome;
 use super::policy::{enforce_policy, metadata, metadata_native, PermissionRequirement, ToolFilter};
 use super::read::tool_read;
 use super::search::{tool_fffind, tool_ffgrep};
 use super::shell::tool_bash;
-use super::then_run::{append_then_run, evidence_session, then_run_command, tool_update_plan};
+use super::then_run::{append_then_run, then_run_command};
 use super::write::tool_write;
 
-/// Execute a tool using paths confined to the current workspace.
+/// Execute a tool using paths confined to the current workspace: the H1
+/// `tool.before` seam, the gates, and the `then_run` follow-up — the full
+/// pipeline every model-issued call goes through.
 pub(crate) async fn execute(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
     filter: Option<&ToolFilter>,
-) -> Result<String, ToolError> {
-    let mut shell = None;
-    execute_with_shell(name, args, cancel, policy, filter, &mut shell).await
-}
-
-/// Like `execute`, but surfaces the out-of-band shell facts (archive id,
-/// exit code) the evidence reducer needs without parsing them out of the
-/// result text. Only the agent loop's outcome path needs this; every other
-/// caller uses `execute`.
-pub(crate) async fn execute_with_shell(
-    name: &str,
-    args: &Map<String, Value>,
-    cancel: &(dyn CancellationSource + Send + Sync),
-    policy: &Policy,
-    filter: Option<&ToolFilter>,
-    shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
     // H1 (`tool.before`, plan §8): mutate/deny seam before every gate.
     // Delegation tools skip it — the child allowlist sees the call the
@@ -74,10 +60,7 @@ pub(crate) async fn execute_with_shell(
         Ok(command) => command,
         Err(error) => return Err(error),
     };
-    let result = dispatch_tool(
-        name, args, then_run, cancel, policy, filter, shell_out, true,
-    )
-    .await;
+    let result = dispatch_tool(name, args, then_run, cancel, policy, filter, true).await;
     // A tool.before hook already saw the args even when a later gate denies
     // the call: record that observation, so the audit trail shows a third
     // party witnessed a call it never got to influence.
@@ -99,14 +82,7 @@ pub(crate) async fn execute_with_shell(
     // `write`/`edit`, which always take the workspace path above.)
     let result = match (result, then_run) {
         (Ok(text), Some(command)) => {
-            let (text, code) = append_then_run(
-                text,
-                command,
-                cancel,
-                evidence_session(policy).as_deref(),
-                shell_out,
-            )
-            .await;
+            let (text, code) = append_then_run(text, command, cancel).await;
             // Audit the shell run separately from the mutation: `DEX_AUDIT=1`
             // must show that a command ran and how it exited, not just a
             // successful `write`/`edit`.
@@ -144,12 +120,11 @@ pub(crate) async fn dispatch_original(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
     filter: Option<&ToolFilter>,
-    shell_out: &mut Option<ShellEvidence>,
 ) -> Result<String, ToolError> {
-    dispatch_tool(name, args, None, cancel, policy, filter, shell_out, false).await
+    dispatch_tool(name, args, None, cancel, policy, filter, false).await
 }
 
-/// The tool-selection core behind `execute_with_shell`: routes and gates a
+/// The tool-selection core behind `execute`: routes and gates a
 /// call, then runs it — with no `audit` calls (the single audit row lives in
 /// the caller). The gate order is load-bearing (§11): delegation route first,
 /// then the permission requirement, then the child allowlist (a sharper,
@@ -163,7 +138,6 @@ async fn dispatch_tool(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
     filter: Option<&ToolFilter>,
-    shell_out: &mut Option<ShellEvidence>,
     resolve_shadow: bool,
 ) -> Result<String, ToolError> {
     // Delegation tools route first (Phase 5): they are not workspace tools
@@ -232,11 +206,9 @@ async fn dispatch_tool(
         // Same gates as the ext__ row in metadata(): a shadow intercepts a
         // built-in, so it can lie about what the built-in does.
         enforce_policy(name, args, PermissionRequirement::Shell, cancel, policy).await?;
-        return crate::extensions::call_shadow_global(
-            name, args, cancel, policy, filter, shell_out,
-        )
-        .await
-        .map_err(ToolError::Internal);
+        return crate::extensions::call_shadow_global(name, args, cancel, policy, filter)
+            .await
+            .map_err(ToolError::Internal);
     }
     enforce_policy(name, args, requirement, cancel, policy).await?;
     if name.starts_with("mcp__") {
@@ -266,35 +238,15 @@ async fn dispatch_tool(
     }
     match name {
         "read" => tool_read(args).await,
-        "bash" => tool_bash(args, cancel, evidence_session(policy).as_deref(), shell_out).await,
+        "bash" => tool_bash(args, cancel).await,
         "write" => tool_write(args).await,
         "edit" => tool_edit(args).await,
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
         "ls" => tool_ls(args).await,
         "git" => tool_git(args, cancel).await,
         "chain" => tool_chain(args, cancel, policy, filter).await,
-        "update_plan" => tool_update_plan(args),
-        "obs_recall" => tool_obs_recall(args, cancel, policy),
         _ => unreachable!("metadata and dispatch must stay in sync"),
     }
-}
-
-pub(crate) fn tool_obs_recall(
-    args: &Map<String, Value>,
-    cancel: &(dyn CancellationSource + Send + Sync),
-    policy: &Policy,
-) -> Result<String, ToolError> {
-    // Only a daemon parent turn carries a session path (same source the
-    // projection reads): OneShot / direct runs / children have none and
-    // fail with a clear error rather than silently succeeding with an
-    // empty archive.
-    let Some(session_path) = policy.agent.as_ref().map(|ctx| ctx.session_path.clone()) else {
-        return Err(ToolError::InvalidArgument(
-            "obs_recall requires a daemon session (no session archive attached)".to_string(),
-        ));
-    };
-    let _ = cancel;
-    crate::agent::obs_pack::tool_obs_recall(&session_path, args)
 }
 
 /// Execute a tool, reporting success explicitly. Callers must not re-derive
@@ -318,12 +270,10 @@ pub(crate) async fn execute_outcome(
     } else {
         None
     };
-    let mut shell = None;
-    let (mut text, mut ok) =
-        match execute_with_shell(name, args, cancel, policy, filter, &mut shell).await {
-            Ok(out) => (out, true),
-            Err(e) => (format!("Error: {}", e), false),
-        };
+    let (mut text, mut ok) = match execute(name, args, cancel, policy, filter).await {
+        Ok(out) => (out, true),
+        Err(e) => (format!("Error: {}", e), false),
+    };
     // H2 middleware: `tool.after` may rewrite the result. Fail-open — a hook
     // error keeps the host result (the manager already logs it).
     let after =
@@ -334,7 +284,6 @@ pub(crate) async fn execute_outcome(
         text,
         ok,
         diff: pending_diff,
-        shell,
     }
 }
 

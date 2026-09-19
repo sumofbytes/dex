@@ -14,12 +14,8 @@ pub(crate) enum PermissionRequirement {
     Shell,
 }
 
-/// One row shared by the eight tools that neither mutate nor shell out:
-/// `read`, `ls`, the in-process fff tools (`grep`/`ffgrep`/`find`/`fffind`),
-/// `obs_recall` (reads the session's observation archive; never touches the
-/// workspace) and `update_plan` (pure bookkeeping: validates and echoes the
-/// plan snapshot; the agent loop owns the boundary state and compaction
-/// decision).
+/// One row shared by the six tools that neither mutate nor shell out:
+/// `read`, `ls`, and the in-process fff tools (`grep`/`ffgrep`/`find`/`fffind`).
 const READONLY: ToolMetadata = ToolMetadata {
     read_only: true,
     mutating: false,
@@ -49,9 +45,7 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
 /// call in `ask-shell` mode.
 pub(crate) fn metadata_native(name: &str) -> Option<ToolMetadata> {
     Some(match name {
-        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "obs_recall" | "update_plan" => {
-            READONLY
-        }
+        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => READONLY,
         "git" => ToolMetadata {
             read_only: true,
             mutating: false,
