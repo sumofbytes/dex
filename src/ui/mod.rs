@@ -49,6 +49,7 @@ pub(crate) use transcript::{
 pub(crate) use transcript::{move_activity_to_tail, BANNER};
 
 pub(crate) mod app;
+pub(crate) mod format;
 pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
@@ -942,7 +943,7 @@ mod tests {
 
     #[test]
     fn git_context_returns_empty_on_non_repo() {
-        let (branch, dirty) = crate::core::format::git_context("/tmp/not-a-repo-12345");
+        let (branch, dirty) = crate::ui::format::git_context("/tmp/not-a-repo-12345");
         assert!(branch.is_none());
         assert!(!dirty);
     }

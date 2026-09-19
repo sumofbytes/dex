@@ -127,7 +127,7 @@ mod handler_tests {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (branch, dirty) = crate::core::format::git_context(&cwd);
+        let (branch, dirty) = crate::ui::format::git_context(&cwd);
         assert_eq!(info.git_branch, branch);
         assert_eq!(info.git_dirty, dirty);
     }

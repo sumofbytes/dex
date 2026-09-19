@@ -138,7 +138,7 @@ pub struct ApprovalResponse {
 // plan §4 Phase 3). Serde spellings are the wire contract ("allow_once" /
 // "allow_session" / "deny"); `as_str` is the audit spelling ("once" /
 // "session" / "deny") — single source so audit rows never drift from the
-// wire (formerly `core::types::ApprovalDecision::as_str`).
+// wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
@@ -407,7 +407,7 @@ pub(crate) mod domain;
 pub(crate) use domain::*;
 
 /// Wire schema for chat messages, tool definitions and stream chunk
-/// parsing (from `core/types.rs`, plan §4 Phase 3).
+/// parsing (plan §4 Phase 3: formerly `core/types.rs`).
 #[path = "shared.rs"]
 pub(crate) mod shared;
 

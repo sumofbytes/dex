@@ -1,7 +1,6 @@
 mod agent;
 pub mod cli;
 mod client;
-mod core;
 mod daemon;
 mod extensions;
 mod llm;
@@ -85,7 +84,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             if let Some(mut session) = open_session(args, &cwd) {
                 // Same text the daemon persists for shell runs;
                 // `!!` is tagged out of the model-bound history.
-                let text = crate::core::format::bash_context_text(
+                let text = crate::ui::format::bash_context_text(
                     &command,
                     &output,
                     success,
