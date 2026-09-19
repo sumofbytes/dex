@@ -281,7 +281,7 @@ pub(crate) struct App {
     /// Markdown gap state for the open assistant block. Survives throttled
     /// `flush_assistant` clears of `assistant_pending` so a heading/list at a
     /// window edge keeps its top air; reset on every fresh assistant block.
-    pub(crate) assistant_gap: crate::core::markdown::GapState,
+    pub(crate) assistant_gap: crate::ui::theme::markdown::GapState,
     /// Last wall-clock markdown/thinking flush; gates `append_sink_line`
     /// throttling so the re-parse rate is frame-rate independent.
     pub(crate) stream_last_flush: Instant,
@@ -380,7 +380,7 @@ impl App {
             thinking_open: false,
             plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),
-            assistant_gap: crate::core::markdown::GapState::new(),
+            assistant_gap: crate::ui::theme::markdown::GapState::new(),
             stream_last_flush: Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
@@ -504,12 +504,12 @@ impl PendingApproval {
         request_id: String,
         agent: Option<String>,
     ) -> Self {
-        let has_then_run = crate::core::format::input_has_then_run(&input);
-        let title = crate::core::format::approval_title_with_then_run(&name, has_then_run);
-        let summary = crate::core::format::approval_summary(&name, &input);
-        let details = crate::core::format::approval_details(&name, &input);
+        let has_then_run = crate::ui::format::input_has_then_run(&input);
+        let title = crate::ui::format::approval_title_with_then_run(&name, has_then_run);
+        let summary = crate::ui::format::approval_summary(&name, &input);
+        let details = crate::ui::format::approval_details(&name, &input);
         let (risk_label, risk_color) =
-            crate::core::format::approval_risk_with_then_run(&name, has_then_run);
+            crate::ui::format::approval_risk_with_then_run(&name, has_then_run);
         Self {
             name,
             input,

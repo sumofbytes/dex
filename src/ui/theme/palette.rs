@@ -68,3 +68,12 @@ pub(crate) fn faint_rgb() -> Option<(u8, u8, u8)> {
         blend(p.foreground, p.background, amount)
     })
 }
+
+/// Which side of the light/dark split the terminal background sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Background {
+    Dark,
+    Light,
+    /// Unknown (query failed or not a TTY); assume dark, the common case.
+    Unknown,
+}
