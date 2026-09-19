@@ -68,7 +68,7 @@ pub(crate) fn token_path(server: &str) -> PathBuf {
     // traversal. Idempotent over already-sanitized names.
     oauth_dir().join(format!(
         "{}.json",
-        super::super::sanitize_server_name(server)
+        super::super::config::sanitize_server_name(server)
     ))
 }
 
@@ -159,11 +159,11 @@ pub(crate) fn status_line(server: &str) -> String {
 /// to: stdio servers carry no OAuth, so `/mcp` and `dex mcp status` skip
 /// them instead of crying "not logged in".
 pub(crate) fn auth_line_with(
-    configs: &std::collections::BTreeMap<String, super::super::McpServerConfig>,
+    configs: &std::collections::BTreeMap<String, super::super::config::McpServerConfig>,
     server: &str,
 ) -> Option<String> {
     let http = configs
-        .get(&super::super::sanitize_server_name(server))
+        .get(&super::super::config::sanitize_server_name(server))
         .is_some_and(|cfg| cfg.is_http());
     http.then(|| status_line(server))
 }
@@ -171,7 +171,7 @@ pub(crate) fn auth_line_with(
 /// Auth statuses for every HTTP server (sorted by name). Loads the config
 /// once, then maps over statuses (no N+1 reloads).
 pub(crate) fn auth_lines() -> Vec<String> {
-    let configs = super::super::load_server_configs();
+    let configs = super::super::config::load_server_configs();
     configs
         .keys()
         .filter_map(|name| auth_line_with(&configs, name))
