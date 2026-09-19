@@ -12,8 +12,6 @@ mod skills;
 mod telemetry;
 mod tools;
 mod ui;
-mod update;
-mod usage;
 mod workspace;
 
 use crate::cli::{Args, Mode};
@@ -635,7 +633,7 @@ pub fn run() {
             // Bare `dex update` self-updates the binary; `--models` keeps the
             // old catalog refresh; `--all` does both.
             if all || !models {
-                match crate::update::self_update() {
+                match crate::telemetry::self_update::self_update() {
                     Ok(message) => println!("{message}"),
                     Err(e) => {
                         eprintln!("self-update failed: {e}");
@@ -651,7 +649,7 @@ pub fn run() {
             }
         }
         Mode::Usage { session } => {
-            if let Err(e) = crate::usage::run(&session) {
+            if let Err(e) = crate::telemetry::session_plot::run(&session) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
