@@ -1090,7 +1090,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1149,7 +1151,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1176,7 +1180,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1252,7 +1258,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1410,7 +1418,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1505,7 +1515,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1604,7 +1616,9 @@ end
     /// unconfigured stay confined even with the capability declared.
     #[tokio::test]
     async fn net_fetch_allows_configured_provider_endpoints() {
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _env = EnvRestore::take(&["DEX_CONFIG", "XDG_CACHE_HOME", "DEX_MODEL", "DEX_PROVIDER"]);
         let root = std::env::temp_dir().join(format!("dex-ext-netprov-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1689,7 +1703,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1754,7 +1770,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
         mgr.reset_for_tests().await;
@@ -1808,7 +1826,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let example =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions");
@@ -1886,7 +1906,9 @@ end
         // concurrent daemon turn can't slip a snapshot in between
         // `reset_for_tests()` and the first fire (previous != nil).
         let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
-        let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let example =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions");

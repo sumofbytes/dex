@@ -1114,7 +1114,9 @@ mod tests {
         // every concurrent compaction reads — serialize against the
         // process_turn tests (their emergency compactions would see this
         // hook otherwise).
-        let _turn_lock = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
+        let _turn_lock = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+            .lock()
+            .await;
         // Same lock the extensions tests use: two concurrent global-manager
         // fixtures would unload each other via `reset_for_tests`.
         let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK

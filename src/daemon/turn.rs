@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::agent::r#loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::agent::state::ToolState;
 use crate::agent::subagent::{AgentTurnContext, WaitOutcome};
+use crate::agent::turn_loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override_for;
 use crate::protocol::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
