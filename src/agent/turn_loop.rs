@@ -64,9 +64,9 @@ pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
 /// at most three attempts.
 /// The budget is re-derived from the ledger after every cut: re-checking a
 /// stale pre-cut number forces up to three compactions even when the first
-/// already fit. Stored (not projected): the gate guards the window AND the
-/// journal — a reading of anything smaller defers while the stored history
-/// grows unbounded.
+/// already fit. The gate reads the stored history, not a projection: it
+/// guards the window AND the journal, so the stored history can't grow
+/// unbounded while the gate defers.
 #[allow(clippy::too_many_arguments)]
 async fn compaction_gate(
     config: &LlmConfig,

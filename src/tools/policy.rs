@@ -14,7 +14,7 @@ pub(crate) enum PermissionRequirement {
     Shell,
 }
 
-/// One row shared by the seven tools that neither mutate nor shell out:
+/// One row shared by the six tools that neither mutate nor shell out:
 /// `read`, `ls`, and the in-process fff tools (`grep`/`ffgrep`/`find`/`fffind`).
 const READONLY: ToolMetadata = ToolMetadata {
     read_only: true,
