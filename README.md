@@ -43,32 +43,7 @@ build, test, and submit changes. Please follow the
   summarized deterministically (no LLM call) to keep requests bounded. Set
   `DEX_COMPACTION=llm` for model summarization (`1` also accepted), or `=jev` to prune stale
   tool outputs verbatim instead (drops/truncates old results, keeps text;
-  falls back to the deterministic summary when pruning doesn't pay). It runs
-  at compaction time over the intact history, after inline evidence reduction
-  at execution time and large-result projection per request.
-- **Online context compaction** — set `DEX_ONLINE_COMPACTION=1` to add an
-  `update_plan` tool: the model keeps a working plan, and each completed step is
-  a safe point where history may compact early if the cache re-write cost pays
-  for itself within the projected remaining work (horizon learned from
-  requests-per-boundary; port of SoL-Pi's online-context-compact).
-  `=jev` keeps the same boundaries but prunes stale tool outputs verbatim
-  instead of summarizing (cheaper memo, same economics).
-  Cache-write/read pricing resolves from the models.dev catalog for the running
-  model — explicit write surcharge, else `input / cache_read` (writes bill at
-  the plain input rate), else `1.0` when the provider prices no caching (reads
-  then bill at the input rate, so a re-write costs what a read costs) — with a
-  measured cross-provider fallback of 5.0 for unpriced models. Each fired
-  boundary compaction leaves an `online compaction:` system line in the
-  transcript.
-- **Evidence-preserving reducer** — set `DEX_EVIDENCE_REDUCER=1` to delegate the
-  first read of a large build/test log (`cargo`/`pytest`/`go test`/ `make`/…) to
-  a cheap model: the raw clamped output is archived beside the session, and the
-  accepted reduction keeps only lines that are verified byte for byte against
-  that archive (`status` is copied from the exit code, never judged by the
-  model; an error log that names a failure must yield at least one failure
-  quote). Any uncheckable receipt falls open to the raw result — delegation
-  never requires trusting a fluent summary. Port of SoL-Pi's
-  evidence-preserving-reducer; pairs with `obs_recall` for exact readback.
+  falls back to the deterministic summary when pruning doesn't pay).
 
 - **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
   the system prompt automatically.
@@ -620,18 +595,13 @@ schema):
 | `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result.                                                                                                                                                                                                            |
 | `delegate_stop`*   | Cancel a running child and return its terminal result.                                                                                                                                                                                                                   |
 | `delegate_list`*   | List this session's children — live, finished, and interrupted on-disk runs — with resumability. Read-only.                                                                                                                                                              |
-| `update_plan`†     | Replace the complete working plan (`steps`, optional `progress`). A completed step is a compaction boundary. Behind `DEX_ONLINE_COMPACTION=1`.                                                                                                                           |
-| `obs_recall`‡      | Read one page of an archived large tool result (`id`, optional byte `offset`); continue with the returned `next_offset`. Behind `DEX_OBSERVATION_PACK=1`.                                                                                                                |
 
 The model-facing schema registers `grep` and `find`; both are also dispatched
 under their fff-engine names, `ffgrep`/`fffind` (`dex run ffgrep …` and older
 transcripts keep working).
 
-`*` behind `DEX_EXTRA_TOOLS=1` — default is 7 tools. `†` behind
-`DEX_ONLINE_COMPACTION=1` (or `=jev`). `‡` behind `DEX_OBSERVATION_PACK=1` — large tool
-results (> 10 KB) are sent in full for their first 2 provider requests, then
-replaced with a placeholder; the original bytes are archived beside the session
-JSONL and paged back with this tool. Tool results are truncated before being
+`*` behind `DEX_EXTRA_TOOLS=1` — default is 7 tools.
+Tool results are truncated before being
 sent back to the model, and a result cache (`dex-tool-cache.json`) is kept only
 when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same
 `path`, any `bash`, or any call carrying `then_run` (which runs a shell command)
@@ -791,10 +761,6 @@ discovered extension with its consent state.
 | `DEX_LOG`                                                     | Runtime log level: `off`, `error`, `warn` (default), `info`, `debug`, `trace` — works on release builds. Logs go to stderr, or to `$XDG_DATA_HOME/dex/dex.log` while the TUI runs. `debug` covers provider requests/responses and tool runs; `trace` adds raw provider SSE lines.                                                                                                                               |
 | `DEX_VERIFY`                                                  | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default.                                                                                                                                                                                                                                                                                                     |
 | `DEX_COMPACTION`                                              | `llm` for LLM summarization (`1` accepted), `jev` for verbatim tool-output pruning (default deterministic; `jev` falls back to deterministic when pruning doesn't pay).                                                                                                                                                                                                                                                         |
-| `DEX_ONLINE_COMPACTION`                                       | `1` for summary compaction at completed plan steps, `jev` for verbatim pruning at the same boundaries: adds the `update_plan` tool and compacts when the cache re-write pays for itself. While on, the fixed message-count cap is suspended (the token threshold still bounds growth).                                                                                                                                  |
-| `DEX_OBSERVATION_PACK`                                        | `1` to enable the observation pack: tool results > 10 KB stop being re-sent after a 2-request grace period and are replaced with placeholders; `obs_recall` pages the archived original back. Compaction, resume, and fork still see intact history. The first time a result is placeholdered, an `obs pack:` system line notes it in the transcript. `obs_recall`'s own output is exempt from re-packing — recalled pages stay in context so the model never has to recall its recall.                                                           |
-| `DEX_EVIDENCE_REDUCER`                                        | `1` to enable the evidence-preserving reducer: large diagnostic tool results (`cargo`/`pytest`/`go test`/`make`/…) are reduced to a receipt whose quotes are verified byte for byte against the archived raw output; an uncheckable receipt falls back to the raw result. Requires a daemon session and the observation pack (`DEX_OBSERVATION_PACK=1`), so a receipt always keeps a recallable source archive. |
-| `DEX_REDUCER_MODEL`                                           | Model selection (`provider/model`, same syntax as `DEX_MODEL`) for the evidence reducer's cheap delegate call. Unset: the main model is used (still verified, just not cheap).                                                                                                                                                                                                                                  |
 | `DEX_DURABLE`                                                 | `1` to `fsync` every session line (default only `turn_*`/`effect_*`).                                                                                                                                                                                                                                                                |
 | `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
 | `DEX_EXTRA_TOOLS`                                             | `1` to expose `git`+`chain` to the model (default 7 tools).                                                                                                                                                                                                                                                                                                                                                     |

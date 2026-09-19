@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::Manifest;
 use super::MAX_TOOL_TIMEOUT_SECS;
 use crate::agent::state::{wait_cancelled, CancellationSource};
-use crate::tools::{Policy, ShellEvidence, ToolFilter};
+use crate::tools::{Policy, ToolFilter};
 
 /// Budget for one extension's handlers of a single hook event: hooks are an
 /// observing layer, so a wedged hook stalls dispatch at most this long
@@ -73,13 +73,6 @@ pub(crate) struct HostCtx<'a> {
     pub(crate) cancel: &'a (dyn CancellationSource + Send + Sync),
     pub(crate) policy: &'a Policy,
     pub(crate) filter: Option<&'a ToolFilter>,
-}
-
-/// Live routing for `dex.tools.call_original`: only a shadow drive carries
-/// one, which is what makes `call_original` outside a shadow impossible by
-/// construction (the worker also rejects it — defense in depth).
-pub(crate) struct ShadowCtx<'a> {
-    pub(crate) shell_out: &'a mut Option<ShellEvidence>,
 }
 
 tokio::task_local! {
@@ -255,8 +248,7 @@ impl ExtensionEngine {
     /// Run a registered tool, shadow, or event handler to completion,
     /// answering host upcalls from the task side. `ToolCall` re-enters the
     /// full pipeline under `host`; `CallOriginal` re-dispatches the shadowed
-    /// built-in with the caller's gates — legal only when `shadow` carries
-    /// the live shell-evidence slot. The returned string is the tool result
+    /// built-in with the caller's gates. The returned string is the tool result
     /// (or the directive envelope JSON, for events).
     pub(crate) async fn drive(
         &self,
@@ -265,7 +257,6 @@ impl ExtensionEngine {
         timeout: Duration,
         cancel: &(dyn CancellationSource + Send + Sync),
         host: HostCtx<'_>,
-        mut shadow: Option<ShadowCtx<'_>>,
     ) -> Result<String, String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMsg>();
         let call_id = uuid::Uuid::new_v4().to_string();
@@ -325,7 +316,7 @@ impl ExtensionEngine {
                             let depth = hostcall_depth();
                             set_hostcall_depth(depth + 1);
                             let outcome = tokio::select! {
-                                result = answer_hostcall(op, &host, &mut shadow) => result,
+                                result = answer_hostcall(op, &host) => result,
                                 _ = tokio::time::sleep_until(deadline) => {
                                     Err(format!("extension '{}' call timed out", self.manifest.id_for_error()))
                                 }
@@ -375,13 +366,9 @@ impl ExtensionEngine {
 /// Answer one host upcall from Lua. `ToolCall` is a full host-mediated
 /// invocation — H1 hooks, allowlist, gates, dispatch — exactly like a
 /// model-issued call. Boxed: this is the cycle's cut point
-/// (`execute_with_shell` → dispatch → `call_global` → `drive` → here →
-/// `execute` → `execute_with_shell`), and unboxed it would recurse in type.
-async fn answer_hostcall(
-    op: HostOp,
-    host: &HostCtx<'_>,
-    shadow: &mut Option<ShadowCtx<'_>>,
-) -> Result<String, String> {
+/// (`execute` → dispatch → `call_global` → `drive` → here →
+/// `execute`), and unboxed it would recurse in type.
+async fn answer_hostcall(op: HostOp, host: &HostCtx<'_>) -> Result<String, String> {
     match op {
         HostOp::ToolCall { name, args } => {
             let Some(args) = args.as_object() else {
@@ -417,9 +404,6 @@ async fn answer_hostcall(
                 .await
         }
         HostOp::CallOriginal { target, args } => {
-            let Some(slot) = shadow.as_mut() else {
-                return Err("call_original outside a shadow has no original".to_string());
-            };
             let Some(args) = args.as_object() else {
                 return Err("call_original args must be an object".to_string());
             };
@@ -430,7 +414,6 @@ async fn answer_hostcall(
                 host.cancel,
                 host.policy,
                 host.filter,
-                slot.shell_out,
             ))
             .await
             .map_err(|e| e.to_string())
