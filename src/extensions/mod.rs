@@ -1082,8 +1082,14 @@ end
     /// always fires), records the served snapshot, and stays fail-open when
     /// a handler errors. Holds both global locks: the snapshot static is
     /// process-wide and every `process_turn` records into it.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn model_select_fires_once_per_change_and_fails_open() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1135,8 +1141,14 @@ end
 
     /// Without subscribers the event is a snapshot record only: no fire,
     /// no failure, current model still served.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn model_select_is_zero_cost_without_subscribers() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1156,8 +1168,14 @@ end
 
     /// The turn records dex's own routing-affinity headers for `dex.net.fetch`:
     /// only the `x-opencode-*` pair (canonical lowercase), never user headers.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn model_select_records_routing_headers() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1226,8 +1244,14 @@ end
     /// The task-local drive context shadows the process-wide fallback while
     /// in scope, and the fallback returns afterwards (nested scopes restore
     /// the outer turn — the subagent child pattern).
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn drive_model_scope_shadows_global_fallback() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1378,8 +1402,14 @@ end
     /// and the capability gates read attempts without it. The snapshot is
     /// set directly (no env): file+env resolution is covered by the
     /// `llm::config` unit tests.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn dex_model_tables_read_snapshot_and_gate_capability() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1467,8 +1497,14 @@ end
 
     /// `dex.net.fetch` refuses anything outside the model endpoint before
     /// touching the network — plus bad methods and host-controlled headers.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn net_fetch_confines_to_model_endpoint() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1645,8 +1681,14 @@ end
 
     /// `dex.net.fetch` success path against a loopback stub: status +
     /// headers + body come back as a value.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn net_fetch_returns_values_against_loopback() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1704,8 +1746,14 @@ end
     /// `dex.net.fetch` never follows redirects: a 302 to a closed port
     /// surfaces as a 3xx value instead of a followed (failed) fetch.
     /// Confinement is checked against the requested URL only.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn net_fetch_does_not_follow_redirects() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let mgr = global_manager();
@@ -1752,8 +1800,14 @@ end
     /// snapshot is set directly (no env): file resolution is covered by the
     /// `llm::config` unit tests. Visibility syncs through the `model_select`
     /// event (load-time host calls don't exist), exactly like production.
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn web_example_loads_and_gates_tools() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let example =
@@ -1824,8 +1878,14 @@ end
     /// through that provider's endpoint + key over `net.providers`.
     /// Visibility re-syncs inside the command itself (no `model_select`
     /// round-trip — that event only fires on provider/model change).
+    #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     #[tokio::test]
     async fn web_example_falls_back_to_override_model() {
+        // Daemon e2e tests run real turns (which record `LAST_MODEL`) under
+        // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
+        // concurrent daemon turn can't slip a snapshot in between
+        // `reset_for_tests()` and the first fire (previous != nil).
+        let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
         let _turn = crate::agent::r#loop::tests::TEST_TURN_ENV_LOCK.lock().await;
         let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
         let example =
