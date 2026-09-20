@@ -1,9 +1,8 @@
+use super::super::style::{composer_band, INPUT_PROMPT, INPUT_PROMPT_WIDTH};
 use super::super::theme;
 use super::super::wrapping::wrap_line;
 use super::super::App;
 use super::super::InputField;
-use super::super::INPUT_PROMPT;
-use super::super::INPUT_PROMPT_WIDTH;
 use super::input_block;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -24,7 +23,7 @@ impl ComposerView {
         lines: Vec<Line<'static>>,
         cursor: (u16, u16, u16),
     ) {
-        let band = super::composer_band(area);
+        let band = composer_band(area);
         f.render_widget(Clear, band);
         // Bare text on the terminal background between the two hairline rules
         // (see `input_block`); the busy state dims the text.

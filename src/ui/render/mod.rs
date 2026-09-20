@@ -2,6 +2,9 @@
 use super::status::footer_line;
 #[cfg(test)]
 use super::status::truncate_display;
+use super::style::content_width as input_content_width;
+#[cfg(test)]
+use super::style::TRANSCRIPT_INDENT;
 use super::theme;
 use super::App;
 #[cfg(test)]
@@ -10,8 +13,6 @@ use super::InputField;
 use super::Selection;
 #[cfg(test)]
 use super::TAB_WIDTH;
-#[cfg(test)]
-use super::TRANSCRIPT_INDENT;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -22,7 +23,6 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::text::Span;
-use ratatui::widgets::block::Padding;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
@@ -68,29 +68,6 @@ pub(crate) use thinking::{
 #[cfg(test)]
 pub(crate) use transcript::{apply_selection, wrap_block, SEL_BG};
 
-pub(super) fn surface_padding() -> Padding {
-    Padding {
-        left: super::HORIZONTAL_GUTTER,
-        right: super::HORIZONTAL_GUTTER,
-        top: super::VERTICAL_GUTTER,
-        bottom: super::VERTICAL_GUTTER,
-    }
-}
-
-/// The composer band inset one `HORIZONTAL_GUTTER` column from each window
-/// edge, so its top/bottom rules never touch the screen border. The inset
-/// *is* the text column: `input_block` adds no horizontal padding, so the
-/// band's inner left edge sits on the shared transcript indent and its inner
-/// width equals `input_content_width` of the full area.
-pub(super) fn composer_band(area: Rect) -> Rect {
-    Rect {
-        x: area.x + super::HORIZONTAL_GUTTER,
-        y: area.y,
-        width: area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2),
-        height: area.height,
-    }
-}
-
 pub(super) fn input_block() -> Block<'static> {
     // Borderless sides, hairline rules top and bottom: the composer is a
     // band on the terminal's own background (no surface fill — the
@@ -120,10 +97,6 @@ pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
     line_count
         .saturating_add(item_count.saturating_sub(1))
         .saturating_add(super::VERTICAL_GUTTER * 2)
-}
-
-pub(super) fn input_content_width(width: u16) -> u16 {
-    width.saturating_sub(super::HORIZONTAL_GUTTER * 2)
 }
 
 /// Footer chunk: one gutter above the status row, none below — the status

@@ -1,6 +1,6 @@
 use super::super::status::truncate_display;
+use super::super::style::surface_padding;
 use super::super::App;
-use super::surface_padding;
 use super::QueueMetrics;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -100,7 +100,7 @@ impl ActivityView {
         if groups.is_empty() {
             return;
         }
-        let content_width = super::input_content_width(area.width);
+        let content_width = super::super::style::content_width(area.width);
         let style = Style::default().fg(Color::Yellow);
         // Blank separator between groups only — a group's continuation
         // rows sit directly under their badge.

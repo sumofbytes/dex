@@ -3,6 +3,7 @@
 use super::super::status::{cell_safe, footer_text, status_pieces, ui_status};
 use super::*;
 use crate::protocol::{ApiProtocol, PermissionMode, Provider};
+use crate::ui::style::{composer_band, content_width as input_content_width};
 use ratatui::backend::TestBackend;
 use std::time::Instant;
 
@@ -291,7 +292,7 @@ fn test_app() -> super::super::App {
 fn shared_surface_dimensions_are_consistent() {
     // Content width tracks the shared knob so the wrap width equals the
     // rendered inner width at any gutter value.
-    let gutter = super::super::HORIZONTAL_GUTTER;
+    let gutter = crate::ui::style::HORIZONTAL_GUTTER;
     assert_eq!(input_content_width(80), 80 - gutter * 2);
     assert_eq!(input_content_width(1), 0);
     assert_eq!(input_content_width(3), (3u16).saturating_sub(gutter * 2));
@@ -437,7 +438,7 @@ fn full_queue_height_stays_bounded() {
     let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, queue, false)
         .expect("maxed queue must fit a 24-row terminal");
     assert!(layout.activity.height > 0);
-    assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
+    assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
     assert_eq!(layout.footer.height, status_height());
 }
 
@@ -464,7 +465,7 @@ fn degenerate_layout_keeps_composer_and_footer() {
     let layout =
         compute_layout(Rect::new(0, 0, 80, 20), 1, queue, false).expect("layout should exist");
     assert_eq!(layout.activity.height, 0);
-    assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
+    assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
     assert_eq!(layout.footer.height, status_height());
     assert!(layout.transcript.height > 0);
 
@@ -487,7 +488,7 @@ fn transcript_wrapper_keeps_first_content_grapheme() {
         .collect();
     assert_eq!(
         rendered,
-        format!("{}▸ tool", super::super::transcript_indent())
+        format!("{}▸ tool", crate::ui::transcript_indent())
     );
 }
 
@@ -499,7 +500,7 @@ fn layout_reserves_bottom_pane_before_transcript() {
     assert_eq!(layout.transcript.y, 0);
     assert!(layout.transcript.height > 0);
     assert_eq!(
-        layout.input.y + layout.input.height + super::super::INPUT_STATUS_GUTTER,
+        layout.input.y + layout.input.height + crate::ui::style::INPUT_STATUS_GUTTER,
         layout.footer.y
     );
     assert_eq!(layout.footer.height, status_height());
@@ -1133,7 +1134,7 @@ fn control_characters_are_expanded_not_rendered_raw() {
     assert!(!symbols.contains('\t'), "tab must be expanded: {symbols}");
     // Indented preview: indent + "  35\tlet" -> indent + 2 spaces + 2 chars
     // before the tab, which then fills to the next tabstop column.
-    let tab_pad = TAB_WIDTH - ((super::super::TRANSCRIPT_INDENT + 4) % TAB_WIDTH);
+    let tab_pad = TAB_WIDTH - ((crate::ui::style::TRANSCRIPT_INDENT + 4) % TAB_WIDTH);
     assert!(
         symbols.contains(&format!("35{}let cwd", " ".repeat(tab_pad))),
         "{symbols}"
@@ -1397,7 +1398,10 @@ fn composer_has_top_and_bottom_rules() {
     // by hairline `─` rules top and bottom: height = content rows + the
     // two border rows (no vertical padding — the empty composer is one
     // text row between the rules).
-    assert_eq!(input_outer_height(1), 1 + super::super::INPUT_BORDER_ROWS);
+    assert_eq!(
+        input_outer_height(1),
+        1 + crate::ui::style::INPUT_BORDER_ROWS
+    );
     let area = Rect::new(0, 0, 20, 5);
     let backend = TestBackend::new(20, 5);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -1452,8 +1456,8 @@ fn composer_text_column_matches_transcript_indent() {
     let area = Rect::new(0, 0, 40, 3);
     let band = composer_band(area);
     let composer_col = input_block().inner(band).x as usize;
-    assert_eq!(composer_col, super::super::TRANSCRIPT_INDENT);
-    let indent = super::super::transcript_indent();
+    assert_eq!(composer_col, crate::ui::style::TRANSCRIPT_INDENT);
+    let indent = crate::ui::transcript_indent();
     assert_eq!(indent.len(), composer_col);
     assert!(indent.chars().all(|c| c == ' '));
     // The caret wraps against the block's own inside width, so it never
@@ -1731,7 +1735,7 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
             }
             assert_eq!(
                 row.spans.first().map(|sp| sp.content.as_ref()),
-                Some(super::super::transcript_indent().as_str()),
+                Some(crate::ui::transcript_indent().as_str()),
                 "user row must carry the grid-margin indent span at w {w}: {s:?}"
             );
         }
@@ -1988,7 +1992,7 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     assert!(
         prompt_row.starts_with(&format!(
             "{}❯ can you check pillar",
-            super::super::transcript_indent()
+            crate::ui::transcript_indent()
         )),
         "prompt row must sit on the transcript margin: {prompt_row:?}"
     );
