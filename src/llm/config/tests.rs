@@ -608,15 +608,19 @@ fn custom_headers_layer_file_env_cli() {
     assert!(!cfg.extra_headers.contains_key("X-File"));
     // The wire merge orders the layers: CLI wins over both config-file
     // spellings, file keys survive where nothing above them speaks.
-    let merged: BTreeMap<String, String> = crate::llm::http::merged_headers(&cfg)
-        .into_iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or("").to_string(),
-            )
-        })
-        .collect();
+    let merged: BTreeMap<String, String> = crate::llm::http::merged_headers(
+        &cfg.global_headers,
+        &cfg.provider_headers,
+        &cfg.extra_headers,
+    )
+    .into_iter()
+    .map(|(name, value)| {
+        (
+            name.as_str().to_string(),
+            value.to_str().unwrap_or("").to_string(),
+        )
+    })
+    .collect();
     assert_eq!(merged.get("x-shared").map(String::as_str), Some("cli"));
     assert_eq!(merged.get("x-file").map(String::as_str), Some("file"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2392,6 +2396,8 @@ fn doctor_output_is_byte_stable() {
         "ANTHROPIC_CUSTOM_HEADERS",
         "OPENAI_HEADERS",
         "OPENCODE_API_KEY",
+        "TYPESAFE_API_KEY",
+        "TYPESAFE_JEV_URL",
         "XDG_CONFIG_HOME",
         "DEX_EXTENSIONS_PATHS",
     ]);
@@ -2428,6 +2434,7 @@ fn doctor_output_is_byte_stable() {
             ),
             concat!(
                 "compaction        deterministic                                 built-in default\n",
+                "jev scorer        heuristic scorer                              no TYPESAFE_API_KEY\n",
                 "thinking          (unset)                                       model default\n",
                 "permission        trusted                                       built-in default\n",
                 "agent wake        on                                            built-in default\n",

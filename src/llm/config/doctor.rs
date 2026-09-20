@@ -332,6 +332,33 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
     let (compaction, compaction_source) = crate::agent::jev::compaction_doctor();
     row(out, "compaction", &compaction, &compaction_source);
 
+    // Live Jev scorer: key comes only from the environment; the config
+    // `jev:` table is the opt-in. Print the key masked, like `api key`.
+    let jev_row = match (
+        env::var(crate::agent::jev::JEV_KEY_ENV)
+            .ok()
+            .filter(|k| !k.trim().is_empty()),
+        crate::agent::jev::live_credentials(),
+    ) {
+        (_, Some((url, _))) => {
+            let value = if compaction.contains("jev") {
+                "live jev scorer".to_string()
+            } else {
+                "live jev scorer (inactive — compaction not =jev)".to_string()
+            };
+            (value, url)
+        }
+        (Some(_), None) => (
+            "heuristic scorer".to_string(),
+            "TYPESAFE_API_KEY set — add a config 'jev:' table to opt in".to_string(),
+        ),
+        (None, None) => (
+            "heuristic scorer".to_string(),
+            "no TYPESAFE_API_KEY".to_string(),
+        ),
+    };
+    row(out, "jev scorer", &jev_row.0, &jev_row.1);
+
     let (chain_effort, effort_source) = thinking_source(d.file, &base_url, &model);
     let effort = live
         .and_then(|c| c.thinking_effort.clone())
