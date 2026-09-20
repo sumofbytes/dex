@@ -20,6 +20,7 @@ use super::state::WorkerMessage;
 use super::state::LAUNCH_START;
 use crate::cli::Args;
 use crate::client::http::DaemonClient;
+use crate::protocol::AgentMode;
 use crate::protocol::ApiProtocol;
 use crate::protocol::DaemonInfo;
 use crate::protocol::PermissionMode;
@@ -70,7 +71,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         context_window: info.context_window,
         reserve_tokens: 16_384,
         keep_recent_tokens: 20_000,
-        permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::AskWrites),
+        permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask),
         verify_command: None,
         extra_headers: Default::default(),
         global_headers: Default::default(),
@@ -256,7 +257,21 @@ pub(crate) fn bootstrap(
     // needs skills, only the session-start listing does.
 
     // Per-request overrides so client flags keep working in remote mode.
-    let options = crate::chat_options_from_args(args);
+    let mut options = crate::chat_options_from_args(args);
+    // Seed the mode from an explicit client `--permission` (a stricter
+    // per-run choice), else from the daemon's reported ceiling. Clamp to
+    // the ceiling, which a client may only go stricter than.
+    let ceiling = PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask);
+    let wanted = args.permission.unwrap_or(ceiling);
+    let mode = if wanted.permissiveness() > ceiling.permissiveness() {
+        AgentMode::from_permission(ceiling)
+    } else {
+        AgentMode::from_permission(wanted)
+    };
+    options.mode = Some(mode.as_str().to_string());
+    // `permission` still rides along (derived) so an older daemon that
+    // ignores `mode` restricts identically.
+    options.permission = Some(mode.permission().as_str().to_string());
 
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(256);
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -323,6 +338,8 @@ pub(crate) fn bootstrap(
         client: client.clone(),
         session_id: session_id.clone(),
         options,
+        mode,
+        ceiling,
         worker_tx: worker_tx.clone(),
         worker_rx,
         cancel_flag,

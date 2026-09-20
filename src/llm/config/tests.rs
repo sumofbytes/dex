@@ -207,7 +207,7 @@ pub(crate) fn test_cfg() -> LlmConfig {
         context_window: 128_000,
         reserve_tokens: 16_384,
         keep_recent_tokens: 20_000,
-        permission: PermissionMode::AskWrites,
+        permission: PermissionMode::Ask,
         verify_command: None,
         extra_headers: Default::default(),
         global_headers: Default::default(),
@@ -724,7 +724,7 @@ fn permission_parse_and_ordering() {
     );
     assert_eq!(
         PermissionMode::parse("ask_writes").unwrap(),
-        PermissionMode::AskWrites
+        PermissionMode::Ask
     );
     assert_eq!(
         PermissionMode::parse("trusted").unwrap(),

@@ -37,9 +37,9 @@ pub(crate) const COMMANDS: &[SlashCommandSpec] = &[
         description: "List or resume a session",
     },
     SlashCommandSpec {
-        command: "/permissions",
-        usage: "/permissions",
-        description: "Show permission mode and workspace",
+        command: "/mode",
+        usage: "/mode [plan|manual|auto]",
+        description: "Show or set the agent mode",
     },
     SlashCommandSpec {
         command: "/mcp",

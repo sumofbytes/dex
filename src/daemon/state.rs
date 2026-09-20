@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::agent::subagent::{AgentEvent, AgentManager};
-use crate::protocol::{ApprovalDecision, QueueMsg};
+use crate::protocol::{ApprovalDecision, PermissionMode, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 use crate::runtime::console::CancellationToken;
 
@@ -52,6 +52,12 @@ pub(crate) struct IdempotentTurn {
 /// section is short and never holds the lock across an `.await`.
 pub(crate) struct DaemonState {
     pub sessions: Mutex<HashMap<String, SessionEntry>>,
+    /// The daemon's permission ceiling, resolved **once** at construction
+    /// from `--permission` / `DEX_PERMISSION` (one default, `trusted`).
+    /// Turn clamps and `/api/config` both read it, so a later env change
+    /// cannot split the two. Only a long-lived `dex serve` clamp can bite;
+    /// the embedded daemon inherits the same env, so its clamp is a no-op.
+    pub(crate) ceiling: PermissionMode,
     /// Pending approval requests keyed by request ID (as sent to the client
     /// in the `ApprovalRequired` stream event). The sender resolves the
     /// blocking `approve_tool` call inside the agent loop.
@@ -159,6 +165,9 @@ impl DaemonState {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            // Single resolution: `permission_from_env` already defaults to
+            // `trusted`; the two former `ask-writes` fallbacks are gone.
+            ceiling: crate::llm::config::permission_from_env().unwrap_or(PermissionMode::Trusted),
             pending_approvals: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashSet::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
