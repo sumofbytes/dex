@@ -31,19 +31,20 @@ pub(crate) use self::input::InputField;
 pub(crate) use crate::agent::state::ToolState;
 #[cfg(test)]
 pub(crate) use crate::llm::config::LlmConfig;
-pub(crate) use app::{
-    TerminalCleanup, APPROVAL_HEIGHT, HORIZONTAL_GUTTER, INPUT_BORDER_ROWS, INPUT_MIN_ROWS,
-    INPUT_PAD_Y, INPUT_PROMPT, INPUT_PROMPT_WIDTH, INPUT_STATUS_GUTTER, STATUS_CONTENT_ROWS,
-    TAB_WIDTH, VERTICAL_GUTTER,
-};
+pub(crate) use app::TerminalCleanup;
 #[cfg(test)]
 pub(crate) use app::{STREAM_FLUSH_INTERVAL, THINKING_TEXT_CAP, THINKING_TEXT_SLACK};
 pub(crate) use remote::{mark_launch_start, run_ratatui_repl_with_remote};
 pub(crate) use render::view;
+pub(crate) use style::{
+    APPROVAL_HEIGHT, INPUT_BORDER_ROWS, INPUT_MIN_ROWS, INPUT_PAD_Y, INPUT_STATUS_GUTTER,
+    STATUS_CONTENT_ROWS, TAB_WIDTH, TRANSCRIPT_INDENT, VERTICAL_GUTTER,
+};
 pub(crate) use transcript::{
     bump_thinking_stamps, deny_all_approvals, push_info, push_info_line, resolve_approval,
     scroll_transcript,
 };
+pub(crate) mod style;
 #[cfg(test)]
 pub(crate) use transcript::{move_activity_to_tail, BANNER};
 
@@ -53,7 +54,7 @@ pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
     format_tokens, AgentChip, App, EnableMouseScroll, PendingApproval, TranscriptBlock,
-    WrappedBlock, NOTICE_LIFETIME, TRANSCRIPT_INDENT,
+    WrappedBlock, NOTICE_LIFETIME,
 };
 #[cfg(test)]
 pub(crate) use selection::{b64, line_width};

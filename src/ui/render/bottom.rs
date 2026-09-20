@@ -1,12 +1,12 @@
 use super::super::slash;
 use super::super::status::footer_line;
 use super::super::status::truncate_display;
+use super::super::style::{composer_band, content_width, status_padding};
 use super::super::theme;
 use super::super::App;
 use super::activity::ActivityView;
 use super::activity::QueueGroup;
 use super::composer::ComposerView;
-use super::composer_band;
 use super::preview::render_approval_detail;
 use super::UiLayout;
 use ratatui::layout::Constraint;
@@ -31,18 +31,13 @@ struct FooterView;
 
 impl FooterView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
-        let width = super::input_content_width(area.width);
+        let width = content_width(area.width);
         let line = footer_line(app, width);
         // Status row sits on the last screen row: top gutter only. The
         // terminal adds its own dead space below the grid, and the old
         // bottom gutter row read as a hole under the footer.
         f.render_widget(
-            Paragraph::new(line).block(Block::default().padding(Padding {
-                left: super::super::HORIZONTAL_GUTTER,
-                right: super::super::HORIZONTAL_GUTTER,
-                top: super::super::VERTICAL_GUTTER,
-                bottom: 0,
-            })),
+            Paragraph::new(line).block(Block::default().padding(status_padding())),
             area,
         );
     }
@@ -95,7 +90,9 @@ impl SlashSuggestionsView {
         // just the item (`> gpt-5`), not the repeated command (`/model
         // <item>`) — the header already names the picker.
         let band = composer_band(area);
-        let width = band.width.saturating_sub(super::super::HORIZONTAL_GUTTER);
+        let width = band
+            .width
+            .saturating_sub(super::super::style::HORIZONTAL_GUTTER);
         let avail = width.saturating_sub(2) as usize;
         let cmd_col = window
             .iter()

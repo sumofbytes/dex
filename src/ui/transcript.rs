@@ -1,13 +1,13 @@
 use super::app::format_tokens;
 use super::app::App;
 use super::app::TranscriptBlock;
-use super::app::INPUT_PROMPT;
 use super::app::STREAM_FLUSH_INTERVAL;
 use super::app::THINKING_TEXT_CAP;
 use super::app::THINKING_TEXT_SLACK;
-use super::app::TRANSCRIPT_INDENT;
 use super::render;
 use super::status;
+use super::style::INPUT_PROMPT;
+use super::style::TRANSCRIPT_INDENT;
 use super::theme;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
