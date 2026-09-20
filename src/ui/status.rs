@@ -81,6 +81,20 @@ fn quiet(text: impl Into<String>) -> Piece {
     (text.into(), quiet_style())
 }
 
+/// The agent-mode chip: a safety indicator (what the model is allowed to do),
+/// so it survives every narrowing tier. Derived from the permission the
+/// session will send, so it can never disagree with the gate.
+fn mode_piece(app: &App) -> Piece {
+    use crate::protocol::AgentMode;
+    let mode = AgentMode::from_permission(app.config.permission);
+    let color = match mode {
+        AgentMode::Plan => Color::Cyan,
+        AgentMode::Manual => Color::Yellow,
+        AgentMode::Auto => Color::Green,
+    };
+    (mode.label().to_string(), Style::default().fg(color))
+}
+
 /// Style for the context-usage run, graduating with pressure: quiet while
 /// there is headroom, the app's warning yellow at ≥75% of the compaction
 /// trigger (`context_window - reserve_tokens`), red once past it.
@@ -257,6 +271,8 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     push_sep(&mut pieces);
     pieces.push(quiet(model_label(app)));
     pieces.push(sep());
+    pieces.push(mode_piece(app));
+    pieces.push(sep());
     // Live context usage against the window. The % duplicates the pair, but
     // it is the glanceable readout behind the pressure color, so it stays.
     let ctx_text = if app.config.context_window > 0 {
@@ -370,13 +386,17 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
     }
     push_sep(&mut pieces);
     pieces.push(quiet(app.config.model.clone()));
+    pieces.push(sep());
+    pieces.push(mode_piece(app));
     pieces.extend(agents_pieces(app));
     push_cost(&mut pieces, app);
     pieces
 }
 
 fn bare_pieces(app: &App) -> Vec<Piece> {
-    let mut pieces = vec![quiet(app.config.model.clone())];
+    let mut pieces = vec![mode_piece(app)];
+    push_sep(&mut pieces);
+    pieces.push(quiet(app.config.model.clone()));
     push_cost(&mut pieces, app);
     pieces
 }

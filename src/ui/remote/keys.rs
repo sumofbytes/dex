@@ -20,6 +20,7 @@ use super::state::RemoteApp;
 use super::state::WorkerMessage;
 use super::worker::try_reconnect;
 use super::worker::Reconnect;
+use crate::protocol::AgentMode;
 use crate::protocol::ApprovalDecision;
 use crate::protocol::SinkLine;
 use crate::protocol::StreamEvent;
@@ -123,6 +124,18 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
             let name = super::super::theme::cycle_voice();
             app.notice = Some((format!("voice: {name}"), Instant::now()));
         }
+        // Shift+Tab cycle: plan → manual → auto → plan, clamped to the
+        // daemon ceiling. `BackTab` is crossterm's mapping for `ESC[Z` and
+        // Kitty's `CSI 9;2u`; Shift+Tab is also accepted for terminals that
+        // forward the raw pair. Placed after the approval early-return (inert
+        // while an approval is parked) and before the popup arm so it works
+        // with the slash popup open; the composer never sees BackTab.
+        KeyCode::BackTab | KeyCode::Tab
+            if key.modifiers.contains(KeyModifiers::SHIFT)
+                || matches!(key.code, KeyCode::BackTab) =>
+        {
+            cycle_mode(remote);
+        }
         // Alt+Up while working: pull the newest queued message back into the
         // composer to edit it. Hoisted above the slash-popup arm so the
         // popup's highlight navigation can't swallow the "Alt+Up again for
@@ -150,6 +163,39 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         KeyCode::Down => handle_down_key(app, key),
         _ => handle_composer_key(app, key),
     }
+}
+
+/// Shift+Tab: advance the mode one stop, clamped to the daemon ceiling. A
+/// clamped cycle is a no-op that reports why instead of silently wrapping
+/// past the boundary.
+fn cycle_mode(remote: &mut RemoteApp) {
+    let wanted = remote.mode.next();
+    let clamp = AgentMode::from_permission(remote.ceiling);
+    if wanted.permission().permissiveness() > clamp.permission().permissiveness() {
+        remote.app.notice = Some((
+            format!(
+                "mode: {} (ceiling {} — raise with --permission/DEX_PERMISSION)",
+                wanted.label(),
+                remote.ceiling.as_str()
+            ),
+            Instant::now(),
+        ));
+        return;
+    }
+    apply_mode(remote, wanted);
+    remote.app.notice = Some((format!("mode: {}", wanted.label()), Instant::now()));
+}
+
+/// Set the mode and keep every derived surface in sync: the session value,
+/// the display config (approval overlay), and the per-request `options`
+/// (both `mode` and the derived `permission`, so older daemons restrict
+/// identically). Takes effect on the next submit; an in-flight turn keeps
+/// the mode it started with.
+fn apply_mode(remote: &mut RemoteApp, mode: AgentMode) {
+    remote.mode = mode;
+    remote.app.config.permission = mode.permission();
+    remote.options.mode = Some(mode.as_str().to_string());
+    remote.options.permission = Some(mode.permission().as_str().to_string());
 }
 
 /// Approval overlay: the worker is blocked until a decision arrives, so this

@@ -57,18 +57,60 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ChatMessage, PermissionMode, Role};
+    use crate::protocol::{AgentMode, ChatMessage, PermissionMode, Role};
 
     #[test]
     fn permission_mode_wire_spelling_round_trips() {
         for mode in [
             PermissionMode::ReadOnly,
-            PermissionMode::AskWrites,
-            PermissionMode::AskShell,
+            PermissionMode::Ask,
             PermissionMode::Trusted,
         ] {
             assert_eq!(PermissionMode::parse(mode.as_str()), Ok(mode));
         }
+    }
+
+    #[test]
+    fn permission_mode_deprecated_spellings_still_parse() {
+        // `ask-writes` is the old name for `ask` (silent) and `ask-shell`
+        // collapses to `ask` too (strictly stricter); `as_str` never emits
+        // either, so the wire vocabulary is monotone.
+        assert_eq!(PermissionMode::parse("ask-writes"), Ok(PermissionMode::Ask));
+        assert_eq!(PermissionMode::parse("ask-shell"), Ok(PermissionMode::Ask));
+        assert_eq!(PermissionMode::Ask.as_str(), "ask");
+        assert!(PermissionMode::ReadOnly.permissiveness() < PermissionMode::Ask.permissiveness());
+        assert!(PermissionMode::Ask.permissiveness() < PermissionMode::Trusted.permissiveness());
+    }
+
+    #[test]
+    fn agent_mode_round_trips_and_derives_permission() {
+        for mode in [AgentMode::Plan, AgentMode::Manual, AgentMode::Auto] {
+            assert_eq!(AgentMode::parse(mode.as_str()), Ok(mode));
+            assert_eq!(mode.label(), mode.as_str());
+        }
+        // Whitespace and case are tolerated like `PermissionMode::parse`.
+        assert_eq!(AgentMode::parse("  PLAN "), Ok(AgentMode::Plan));
+        assert_eq!(AgentMode::parse("default"), Ok(AgentMode::Manual));
+        assert!(AgentMode::parse("nonsense").is_err());
+
+        // The single mapping every consumer reads.
+        assert_eq!(AgentMode::Plan.permission(), PermissionMode::ReadOnly);
+        assert_eq!(AgentMode::Manual.permission(), PermissionMode::Ask);
+        assert_eq!(AgentMode::Auto.permission(), PermissionMode::Trusted);
+        // And its inverse, used to seed the cycle from the ceiling.
+        for mode in [AgentMode::Plan, AgentMode::Manual, AgentMode::Auto] {
+            assert_eq!(AgentMode::from_permission(mode.permission()), mode);
+        }
+    }
+
+    #[test]
+    fn agent_mode_cycle_is_plan_manual_auto() {
+        assert_eq!(AgentMode::Plan.next(), AgentMode::Manual);
+        assert_eq!(AgentMode::Manual.next(), AgentMode::Auto);
+        assert_eq!(AgentMode::Auto.next(), AgentMode::Plan);
+        // Only plan carries the prompt directive.
+        assert!(AgentMode::Plan.is_plan());
+        assert!(!AgentMode::Manual.is_plan() && !AgentMode::Auto.is_plan());
     }
 
     #[test]
