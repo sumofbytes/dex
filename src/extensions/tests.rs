@@ -893,7 +893,7 @@ end
         .await;
     let console = crate::runtime::console::Console::none();
     console.record_session_approval("bash", r#"{"command":"echo rewritten"}"#);
-    let policy = crate::tools::Policy::turn(crate::protocol::PermissionMode::AskShell, &console);
+    let policy = crate::tools::Policy::turn(crate::protocol::PermissionMode::Ask, &console);
     let mut args = serde_json::Map::new();
     args.insert(
         "command".to_string(),

@@ -445,14 +445,14 @@ pub(crate) struct StreamFunctionCall {
     pub(crate) arguments: Option<String>,
 }
 
+/// The monotone tool gate: `read-only < ask < trusted`. A permission is a
+/// boundary, never a style — see [`AgentMode`] for the user-facing selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Permit reads, but reject all mutations and shell commands.
     ReadOnly,
-    /// Prompt before writes and edits; reads are always permitted.
-    AskWrites,
-    /// Prompt before shell commands; reads and file mutations are permitted.
-    AskShell,
+    /// Prompt before writes, edits, and shell commands; reads are free.
+    Ask,
     /// Permit every tool without prompting (useful for automation).
     Trusted,
 }
@@ -461,11 +461,30 @@ impl PermissionMode {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().replace('_', "-").as_str() {
             "read-only" | "readonly" => Ok(Self::ReadOnly),
-            "ask-writes" | "ask-write" => Ok(Self::AskWrites),
-            "ask-shell" | "ask-commands" => Ok(Self::AskShell),
+            "ask" | "ask-writes" | "ask-write" => {
+                // Deprecated: `ask-writes` split edits from shell ("edits
+                // free, shell prompts"). It maps to `ask` (which also
+                // prompts on shell) and warns like every deprecated knob.
+                crate::llm::config::warn_once(
+                    "permission-ask-writes",
+                    "permission mode 'ask-writes' is deprecated — use 'ask'; it now also prompts on shell commands",
+                );
+                Ok(Self::Ask)
+            }
+            // Deprecated: `ask-shell` split edits from shell ("edits free,
+            // shell prompts") and ranked *above* ask-writes in
+            // `permissiveness`, making the ladder non-monotone. It now maps
+            // to `ask` — strictly stricter, the safe direction.
+            "ask-shell" | "ask-commands" => {
+                crate::llm::config::warn_once(
+                    "permission-ask-shell",
+                    "permission mode 'ask-shell' is deprecated — use 'ask'; it now also prompts on writes and edits",
+                );
+                Ok(Self::Ask)
+            }
             "trusted" | "non-interactive" => Ok(Self::Trusted),
             other => Err(format!(
-                "invalid permission mode '{}'; use read-only, ask-writes, ask-shell, or trusted",
+                "invalid permission mode '{}'; use read-only, ask, or trusted",
                 other
             )),
         }
@@ -473,20 +492,88 @@ impl PermissionMode {
     pub(crate) fn permissiveness(self) -> u8 {
         match self {
             Self::ReadOnly => 0,
-            Self::AskWrites => 1,
-            Self::AskShell => 2,
-            Self::Trusted => 3,
+            Self::Ask => 1,
+            Self::Trusted => 2,
         }
     }
     /// Canonical wire spelling (CLI `--permission`, daemon request field):
     /// round-trips through [`Self::parse`]. Single source so call sites
-    /// never drift from the accepted spellings.
+    /// never drift from the accepted spellings. Never emits the deprecated
+    /// `ask-shell`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
-            Self::AskWrites => "ask-writes",
-            Self::AskShell => "ask-shell",
+            Self::Ask => "ask",
             Self::Trusted => "trusted",
         }
+    }
+}
+
+/// The user-facing autonomy selector: three named stops over
+/// [`PermissionMode`], cycled with Shift+Tab and set with `/mode`.
+///
+/// `Plan` is not just `ReadOnly`: it also appends a directive that makes the
+/// model explore and present a plan instead of stopping at "denied". That
+/// tone is the one piece a bare permission cannot express, which is why this
+/// enum exists alongside — not instead of — `PermissionMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
+    Plan,
+    Manual,
+    Auto,
+}
+
+impl AgentMode {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "plan" | "planning" => Ok(Self::Plan),
+            "manual" | "default" => Ok(Self::Manual),
+            "auto" | "automatic" => Ok(Self::Auto),
+            other => Err(format!(
+                "invalid mode '{}'; use plan, manual, or auto",
+                other
+            )),
+        }
+    }
+    /// Canonical wire spelling (`ChatRequest.mode`), round-trips `parse`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+    /// The single mode → permission mapping; every consumer reads this.
+    pub(crate) fn permission(self) -> PermissionMode {
+        match self {
+            Self::Plan => PermissionMode::ReadOnly,
+            Self::Manual => PermissionMode::Ask,
+            Self::Auto => PermissionMode::Trusted,
+        }
+    }
+    /// Seed the cycle from the resolved `--permission` / `DEX_PERMISSION`.
+    pub(crate) fn from_permission(mode: PermissionMode) -> Self {
+        match mode {
+            PermissionMode::ReadOnly => Self::Plan,
+            PermissionMode::Ask => Self::Manual,
+            PermissionMode::Trusted => Self::Auto,
+        }
+    }
+    /// The cycle: `plan → manual → auto → plan`.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Plan => Self::Manual,
+            Self::Manual => Self::Auto,
+            Self::Auto => Self::Plan,
+        }
+    }
+    /// Status-chip label (same as the wire spelling; a method so the status
+    /// bar never formats `{:?}`).
+    pub(crate) fn label(self) -> &'static str {
+        self.as_str()
+    }
+    /// Does this mode append the plan directive to the system prompt?
+    pub(crate) fn is_plan(self) -> bool {
+        matches!(self, Self::Plan)
     }
 }

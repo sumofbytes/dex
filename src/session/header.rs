@@ -76,6 +76,11 @@ pub(crate) struct SessionEventEntry {
     /// stay byte-identical to before.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tier: Option<String>,
+    /// Agent mode (`plan`/`manual`/`auto`) that governed the turn
+    /// (`turn_start` only). Absent for legacy journals and subagent
+    /// turns, so a reattach can restore the client's last selector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<String>,
 }
 
 /// Durable record of one side effect: intent (before execution) and outcome

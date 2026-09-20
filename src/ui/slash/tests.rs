@@ -99,7 +99,9 @@ fn suggestions_only_for_bare_slash_prefixes() {
 
     type_input(&mut app, "/mod");
     let got = slash_suggestions(&app);
-    assert_eq!(got[0].0, "/model");
+    // `/mode` sorts before `/model` in COMMANDS, so `/mod` offers both.
+    assert_eq!(got[0].0, "/mode");
+    assert!(got.iter().any(|(cmd, _)| cmd == "/model"), "{got:?}");
     // Skills are suggested as /skill:<name> entries.
     app.skills.push(Skill {
         name: "demo".into(),
@@ -344,17 +346,45 @@ fn handle_slash_basic_commands() {
 
     let mut app = new_app();
     assert!(!handle_slash(&mut app, "/permissions"));
-    assert!(has_info(&app, "permission mode: Trusted"));
-    assert!(has_info(&app, "workspace: /tmp"));
+    assert!(has_info(&app, "permissions is now /mode"));
+    assert!(has_info(&app, "mode: auto"));
+    assert!(has_info(&app, "permission: trusted (derived from mode)"));
 
     let mut app = new_app();
     assert!(!handle_slash(&mut app, "/no-such-command"));
     assert!(has_info(&app, "unknown command: /no-such-command"));
-
     let mut app = new_app();
     assert!(!handle_slash(&mut app, "/help"));
     assert!(has_info(&app, "commands: /quit"));
     assert!(has_info(&app, "prefix: !<command>"));
+}
+
+#[test]
+fn handle_slash_mode_shows_and_sets() {
+    // Bare: report the mode and its derived permission (the default
+    // `trusted` maps to `auto`).
+    let mut app = new_app();
+    assert!(!handle_slash(&mut app, "/mode"));
+    assert!(has_info(&app, "mode: auto"));
+    assert!(has_info(&app, "permission: trusted (derived from mode)"));
+
+    // An argument switches the mode, which drives `config.permission`.
+    let mut app = new_app();
+    assert!(!handle_slash(&mut app, "/mode plan"));
+    assert!(has_info(&app, "mode: plan (permission: read-only)"));
+    assert_eq!(
+        app.config.permission,
+        crate::protocol::PermissionMode::ReadOnly
+    );
+
+    // An unknown mode reports the parser error and changes nothing.
+    let mut app = new_app();
+    assert!(!handle_slash(&mut app, "/mode nope"));
+    assert!(has_info(&app, "invalid mode 'nope'"));
+    assert_eq!(
+        app.config.permission,
+        crate::protocol::PermissionMode::Trusted
+    );
 }
 
 #[test]

@@ -76,8 +76,7 @@ pub(crate) fn row(out: &mut String, key: &str, value: &str, source: &str) {
 fn permission_name(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::ReadOnly => "read-only",
-        PermissionMode::AskWrites => "ask-writes",
-        PermissionMode::AskShell => "ask-shell",
+        PermissionMode::Ask => "ask",
         PermissionMode::Trusted => "trusted",
     }
 }
