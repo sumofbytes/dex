@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt as _;
 use crate::runtime::cancel::{wait_cancelled, CancellationSource};
 use crate::ui::format::clamp_lines;
 
-use super::then_run::arg_str;
+use super::args::arg_str;
 use super::{ToolError, CONFIGURED_OUTPUT_LIMIT};
 
 #[cfg(unix)]

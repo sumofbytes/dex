@@ -3,7 +3,7 @@
 use serde_json::{Map, Value};
 use similar::TextDiff;
 
-use super::then_run::arg_str;
+use super::args::arg_str;
 use super::write::{atomic_write, check_expected_hash_bytes};
 use super::{workspace_path, ToolError};
 

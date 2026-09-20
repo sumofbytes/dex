@@ -1,15 +1,17 @@
 use super::load_config_file;
 use super::selection::resolve_selection;
 use super::warn_once;
-use crate::agent::router::classify_with_reasons;
-use crate::agent::router::count_history_tool_calls;
-use crate::agent::router::infer_tool_hints;
-use crate::agent::router::model_for;
-use crate::agent::router::model_for_source;
-use crate::agent::router::ModelForSource;
-use crate::agent::router::TaskSignal;
-use crate::agent::router::Tier;
-use crate::agent::router::TierMap;
+pub(crate) mod classify;
+
+use self::classify::classify_with_reasons;
+use self::classify::count_history_tool_calls;
+use self::classify::infer_tool_hints;
+use self::classify::model_for;
+use self::classify::model_for_source;
+use self::classify::ModelForSource;
+use self::classify::TaskSignal;
+use self::classify::Tier;
+use self::classify::TierMap;
 use crate::agent::tokens::estimate_tokens;
 use crate::protocol::ChatMessage;
 

@@ -19,6 +19,7 @@ use super::provider::load_provider_entries;
 use super::provider::model_api_from_env;
 use super::provider::resolve_provider;
 use super::provider::ProviderEntry;
+use super::routing::classify::Tier;
 use super::routing::routing_resolution;
 use super::routing::routing_tier_display;
 use super::selection::classify_selection;
@@ -28,7 +29,6 @@ use super::selection::resolve_selection;
 use super::selection::split_selection;
 use super::selection::SelectionRoute;
 use super::LlmConfig;
-use crate::agent::router::Tier;
 use crate::protocol::ApiProtocol;
 use crate::protocol::PermissionMode;
 use crate::protocol::Provider;
@@ -329,16 +329,16 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
     // Threshold-compaction mode: value and origin owned by the Jev module
     // next to its parse, so the row cannot drift from runtime behavior.
     // Printed unconditionally.
-    let (compaction, compaction_source) = crate::agent::jev::compaction_doctor();
+    let (compaction, compaction_source) = crate::agent::compaction::verbatim::compaction_doctor();
     row(out, "compaction", &compaction, &compaction_source);
 
     // Live Jev scorer: key comes only from the environment; the config
     // `jev:` table is the opt-in. Print the key masked, like `api key`.
     let jev_row = match (
-        env::var(crate::agent::jev::JEV_KEY_ENV)
+        env::var(crate::agent::compaction::verbatim::JEV_KEY_ENV)
             .ok()
             .filter(|k| !k.trim().is_empty()),
-        crate::agent::jev::live_credentials(),
+        crate::agent::compaction::verbatim::live_credentials(),
     ) {
         (_, Some((url, _))) => {
             let value = if compaction.contains("jev") {

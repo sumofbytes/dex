@@ -2667,7 +2667,10 @@ fn route_turn_classifies_and_overrides_only_on_change() {
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
     // Trivial prompt → fast tier → override to the cheap model.
     let routed = super::route_turn("fix typo", &[]).expect("routing on");
-    assert_eq!(routed.tier, crate::agent::router::Tier::Fast);
+    assert_eq!(
+        routed.tier,
+        crate::llm::config::routing::classify::Tier::Fast
+    );
     assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
     assert_eq!(routed.reasons, vec!["typo"]);
     assert_eq!(routed.reason_label(), "typo");
@@ -2675,12 +2678,18 @@ fn route_turn_classifies_and_overrides_only_on_change() {
     // the selection → no override, the config never rebuilds.
     let history = vec![crate::protocol::ChatMessage::user("x".repeat(20_000))];
     let routed = super::route_turn("add a retry to the fetch call", &history).expect("routing on");
-    assert_eq!(routed.tier, crate::agent::router::Tier::Balanced);
+    assert_eq!(
+        routed.tier,
+        crate::llm::config::routing::classify::Tier::Balanced
+    );
     assert_eq!(routed.model_override, None);
     assert_eq!(routed.reason_label(), "ordinary work");
     // Migration work escalates; unset powerful falls back to balanced.
     let routed = super::route_turn("run the database migration", &[]).expect("routing on");
-    assert_eq!(routed.tier, crate::agent::router::Tier::Powerful);
+    assert_eq!(
+        routed.tier,
+        crate::llm::config::routing::classify::Tier::Powerful
+    );
     assert_eq!(routed.model_override, None);
     // Routing off → None even for a powerful-shaped prompt.
     std::fs::write(
