@@ -96,6 +96,12 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub permission: Option<String>,
+    /// Agent mode (`plan`/`manual`/`auto`); preferred over `permission` when
+    /// present — the daemon derives the permission from it and, for `plan`,
+    /// appends the plan directive. Absent (older clients) leaves behaviour
+    /// unchanged.
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Extra HTTP headers for the provider request (client `--header`
     /// flags). Merged over the daemon's own configured headers.
     #[serde(default)]

@@ -685,11 +685,33 @@ impl Session {
         event: &str,
         tier: Option<&str>,
     ) -> io::Result<()> {
+        self.turn_event_full(event, tier, None)
+    }
+
+    /// `turn_start` that also records the governing agent mode so a
+    /// reattach restores the client's last selector (`None` = no mode,
+    /// legacy/subagent rows serialize unchanged).
+    pub(crate) fn turn_event_with_mode(
+        &mut self,
+        event: &str,
+        tier: Option<&str>,
+        mode: Option<&str>,
+    ) -> io::Result<()> {
+        self.turn_event_full(event, tier, mode)
+    }
+
+    fn turn_event_full(
+        &mut self,
+        event: &str,
+        tier: Option<&str>,
+        mode: Option<&str>,
+    ) -> io::Result<()> {
         let entry = SessionEventEntry {
             entry_type: event.to_string(),
             id: self.next_id(),
             timestamp: Self::now_iso(),
             tier: tier.map(str::to_string),
+            mode: mode.map(str::to_string),
         };
         self.append_line(&entry)
     }

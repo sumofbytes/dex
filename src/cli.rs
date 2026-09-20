@@ -16,6 +16,10 @@ pub struct Args {
     /// Extra extension search dirs (`--extensions-dir`, repeatable).
     pub extension_dirs: Vec<PathBuf>,
     pub permission: Option<PermissionMode>,
+    /// Explicit agent mode (`--mode plan|manual|auto`). Strictly the TUI's
+    /// Shift+Tab selector, exposed so one-shot/connect runs can request plan
+    /// mode headlessly; the daemon clamps it to the permission ceiling.
+    pub mode: Option<crate::protocol::AgentMode>,
     /// Extra HTTP headers for provider requests (`--header "X-Foo: bar"`,
     /// repeatable). Same `Name: Value` / `Name=Value` / JSON-object syntax as
     /// `DEX_HEADERS`.
@@ -93,6 +97,7 @@ pub fn parse_args() -> Args {
     let mut skill_dirs = Vec::new();
     let mut extension_dirs = Vec::new();
     let mut permission = None;
+    let mut mode = None;
     let mut headers = Vec::new();
     let mut system_prompt = None;
     let mut system_prompt_file = None;
@@ -139,6 +144,12 @@ pub fn parse_args() -> Args {
                         .unwrap_or_else(|error| fail(&error)),
                 );
             }
+            "--mode" => {
+                mode = Some(
+                    crate::protocol::AgentMode::parse(&required(&mut input, "--mode"))
+                        .unwrap_or_else(|error| fail(&error)),
+                );
+            }
             "--skill" => skill_dirs.push(PathBuf::from(required(&mut input, "--skill"))),
             "--extensions-dir" => {
                 extension_dirs.push(PathBuf::from(required(&mut input, "--extensions-dir")));
@@ -157,6 +168,7 @@ pub fn parse_args() -> Args {
         skill_dirs,
         extension_dirs,
         permission,
+        mode,
         headers,
         system_prompt,
         system_prompt_file,
@@ -366,6 +378,7 @@ mod tests {
             skill_dirs: Vec::new(),
             extension_dirs: Vec::new(),
             permission: None,
+            mode: None,
             headers: Vec::new(),
             system_prompt: None,
             system_prompt_file: None,
@@ -415,6 +428,16 @@ mod tests {
             set(&mut args);
             assert!(check_reattach_mode(&args, &resolve_mode(&args)).is_err());
         }
+    }
+
+    #[test]
+    fn mode_flag_parses_and_defaults_absent() {
+        // `--mode` and `--mode=X` both parse into `AgentMode`; an invalid
+        // value is a hard error (process exit), so only valid ones test here.
+        let mut args = args_with_rest(&[]);
+        assert_eq!(args.mode, None);
+        args.mode = Some(crate::protocol::AgentMode::parse("plan").unwrap());
+        assert_eq!(args.mode, Some(crate::protocol::AgentMode::Plan));
     }
 
     #[test]

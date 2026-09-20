@@ -115,6 +115,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 base_url,
                 model,
                 permission: None,
+                mode: None,
                 headers: None,
                 plan: None,
                 system_prompt: None,

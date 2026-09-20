@@ -1,6 +1,8 @@
 use super::super::App;
 use crate::client::http::ChatOptions;
 use crate::client::http::DaemonClient;
+use crate::protocol::AgentMode;
+use crate::protocol::PermissionMode;
 use crate::protocol::StreamEvent;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -52,6 +54,15 @@ pub(crate) struct RemoteApp {
     pub(crate) client: DaemonClient,
     pub(crate) session_id: String,
     pub(crate) options: ChatOptions,
+    /// The agent mode selector (Shift+Tab / `/mode`). `permission()` derives
+    /// the permission the turn sends; `app.config.permission` is kept in sync
+    /// so the approval overlay and consumers never drift.
+    pub(crate) mode: AgentMode,
+    /// The daemon's permission ceiling (its `info.permission`), kept in
+    /// permission space (§3): a boundary, not a style. The cycle clamps to
+    /// `AgentMode::from_permission(ceiling)`; auto is unreachable against an
+    /// `ask` daemon.
+    pub(crate) ceiling: PermissionMode,
     pub(crate) worker_tx: mpsc::Sender<WorkerMessage>,
     pub(crate) worker_rx: mpsc::Receiver<WorkerMessage>,
     /// A `!`/`!!` shell run is in flight on the worker (one bash at a
