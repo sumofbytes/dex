@@ -341,11 +341,22 @@ pub(crate) async fn run_turn_inner(
         }
     }
 
-    // Permission ceiling: daemon policy (env) is max; client may only go stricter.
-    let daemon_perm = crate::llm::config::permission_from_env()
-        .unwrap_or(crate::protocol::PermissionMode::AskWrites);
-    if let Some(req_perm_str) = &req.permission {
-        let req_perm = crate::protocol::PermissionMode::parse(req_perm_str)?;
+    // Permission ceiling: the daemon resolves it once at construction
+    // (§3.1); the client may only go stricter. `mode` (when present) is the
+    // authority for the derived permission; `permission` rides along for
+    // older daemons and is the fallback for older clients that omit `mode`.
+    let daemon_perm = state.ceiling;
+    let agent_mode = req
+        .mode
+        .as_deref()
+        .map(crate::protocol::AgentMode::parse)
+        .transpose()?;
+    let derived_perm = agent_mode.map(crate::protocol::AgentMode::permission);
+    if let Some(req_perm) = derived_perm.or_else(|| {
+        req.permission
+            .as_deref()
+            .and_then(|s| crate::protocol::PermissionMode::parse(s).ok())
+    }) {
         if req_perm.permissiveness() > daemon_perm.permissiveness() {
             return Err(format!(
                 "permission escalation denied: daemon ceiling is {:?} (client requested {:?}); use a stricter mode or change daemon config",
@@ -385,11 +396,14 @@ pub(crate) async fn run_turn_inner(
     // optional per-request overrides sent by the client (now validated).
     // Async: cache hits are a mutex bump inline; misses parse the 4MB catalog
     // in `spawn_blocking` (Phase 6 `from_env_async`).
-    let perm_override = req
-        .permission
-        .as_deref()
-        .map(crate::protocol::PermissionMode::parse)
-        .transpose()?;
+    let perm_override = match derived_perm {
+        Some(mode) => Some(mode),
+        None => req
+            .permission
+            .as_deref()
+            .map(crate::protocol::PermissionMode::parse)
+            .transpose()?,
+    };
     let mut config = LlmConfig::from_env_async(
         req.base_url.clone().filter(|v| !v.is_empty()),
         model_override,
@@ -525,6 +539,7 @@ pub(crate) async fn run_turn_inner(
         &skills,
         req.system_prompt.as_deref(),
         Some(std::path::Path::new(&entry.cwd)),
+        agent_mode.is_some_and(crate::protocol::AgentMode::is_plan),
     )));
     // History was loaded up front for the routing signal; reuse it here
     // so the turn sends exactly what routing saw.

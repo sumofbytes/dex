@@ -24,6 +24,10 @@ pub(crate) struct ChatOptions {
     pub(crate) base_url: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) permission: Option<String>,
+    /// Agent mode (`plan`/`manual`/`auto`), the client's session selector.
+    /// The daemon prefers it over `permission` and appends the plan
+    /// directive in plan mode.
+    pub(crate) mode: Option<String>,
     pub(crate) headers: Option<std::collections::BTreeMap<String, String>>,
     pub(crate) plan: Option<String>,
     /// Custom base system prompt text (resolved client-side from
@@ -352,6 +356,7 @@ impl DaemonClient {
                 base_url: options.base_url,
                 model: options.model,
                 permission: options.permission,
+                mode: options.mode,
                 headers: options.headers,
                 plan: options.plan,
                 system_prompt: options.system_prompt,

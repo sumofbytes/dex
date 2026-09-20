@@ -15,6 +15,7 @@ pub(crate) fn chat_options_from_args(args: &Args) -> crate::client::http::ChatOp
         base_url: args.base_url.clone(),
         model: args.model.clone(),
         permission: args.permission.map(|mode| mode.as_str().to_string()),
+        mode: None,
         headers: if args.headers.is_empty() {
             None
         } else {

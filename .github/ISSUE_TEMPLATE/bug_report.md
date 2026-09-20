@@ -26,7 +26,7 @@ Relevant transcript / terminal output.
 - OS and terminal:
 - Provider + model (from `~/.config/dex/config.yaml` — redact API keys):
 - How you run dex: TUI / one-shot / daemon + connect
-- Permission mode, if relevant (`read-only` / `ask-writes` / `ask-shell` / `trusted`)
+- Permission mode, if relevant (`read-only` / `ask` / `trusted`; or the TUI agent mode `plan` / `manual` / `auto`)
 
 **Additional context**
 

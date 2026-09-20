@@ -1122,12 +1122,20 @@ fn enter_expansion_leaves_other_input_untouched() {
 
 #[test]
 fn command_prefix_completes_to_bare_picker_form() {
-    // `/mod` + completion → `/model `: the Enter handler sees a bare
-    // picker form in `EXPAND_ON_ENTER` and holds the submit so the popup
-    // stays open for the actual choice.
+    // `/mod` now resolves to `/mode` first (COMMANDS order), so completion
+    // yields `/mode ` and Enter submits it — it is not a picker.
     let mut app = test_app();
     app.input = crate::ui::input::InputField::from_text("/mod");
     assert!(crate::ui::slash::complete_slash(&mut app));
+    assert_eq!(app.input.text(), "/mode ");
+    assert!(!crate::ui::slash::EXPAND_ON_ENTER.contains(&"/mode"));
+
+    // `/model` stays a bare picker form: the Enter handler sees it in
+    // `EXPAND_ON_ENTER` and holds the submit so the popup stays open for
+    // the actual choice.
+    let mut app = test_app();
+    app.input = crate::ui::input::InputField::from_text("/model");
+    assert!(crate::ui::slash::expand_bare_command(&mut app));
     assert_eq!(app.input.text(), "/model ");
     assert!(crate::ui::slash::EXPAND_ON_ENTER.contains(&"/model"));
 }

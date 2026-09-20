@@ -24,7 +24,8 @@ assessment of impact. Expect an initial response within a week.
 
 `dex` is an agent that runs model-directed shell commands and file edits on
 your machine, under the permission mode you configure (`read-only`,
-`ask-writes`, `ask-shell`, `trusted`). By design, approving a `bash` command
+`ask`, `trusted`; the TUI adds the `plan`/`manual`/`auto` agent modes on top,
+deriving those permissions). By design, approving a `bash` command
 or running `trusted` hands the model that capability — that is the product
 working as intended, not a vulnerability.
 

@@ -162,7 +162,7 @@ impl DaemonInfo {
     }
 }
 
-async fn resolve_daemon_info_async() -> DaemonInfo {
+async fn resolve_daemon_info_async(ceiling: crate::protocol::PermissionMode) -> DaemonInfo {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -174,12 +174,8 @@ async fn resolve_daemon_info_async() -> DaemonInfo {
     );
     match config {
         Ok(config) => {
-            let mut info = DaemonInfo::default_for(
-                cwd,
-                git_branch,
-                git_dirty,
-                config.permission.as_str().to_string(),
-            );
+            let mut info =
+                DaemonInfo::default_for(cwd, git_branch, git_dirty, ceiling.as_str().to_string());
             info.thinking_warning = config.thinking_mismatch_warning();
             info.provider = config.provider.name().to_string();
             info.api = config.api.name().to_string();
@@ -191,19 +187,16 @@ async fn resolve_daemon_info_async() -> DaemonInfo {
         }
         Err(_) => {
             // Config is incomplete (e.g. no API key yet); report what we can
-            // so the client still renders.
-            let permission = std::env::var("DEX_PERMISSION")
-                .ok()
-                .filter(|v| crate::protocol::PermissionMode::parse(v).is_ok())
-                .unwrap_or_else(|| "ask-writes".to_string());
-            DaemonInfo::default_for(cwd, git_branch, git_dirty, permission)
+            // so the client still renders. The ceiling is the daemon's own
+            // resolved value, not a fresh env read (§3.1).
+            DaemonInfo::default_for(cwd, git_branch, git_dirty, ceiling.as_str().to_string())
         }
     }
 }
 
-pub(crate) async fn get_config() -> Json<DaemonInfo> {
+pub(crate) async fn get_config(State(state): State<Arc<DaemonState>>) -> Json<DaemonInfo> {
     // Async client is Clone (no blocking TLS init); cache hits are a mutex bump.
-    Json(resolve_daemon_info_async().await)
+    Json(resolve_daemon_info_async(state.ceiling).await)
 }
 
 /// Lightweight footer poll: just the daemon workspace's branch/dirty, behind

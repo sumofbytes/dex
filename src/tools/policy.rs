@@ -42,7 +42,7 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
 /// (`dex.tools.call_original`): the shadow call already cleared its own
 /// Shell gate, and the native requirement is what the built-in itself needs
 /// — re-reading the shadow's row here would prompt twice for one wrapped
-/// call in `ask-shell` mode.
+/// call in `ask` mode.
 pub(crate) fn metadata_native(name: &str) -> Option<ToolMetadata> {
     Some(match name {
         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => READONLY,
@@ -129,10 +129,10 @@ impl Policy {
 }
 
 /// Phase 0 approval gate: dispatch consults the turn's policy before any
-/// tool runs. Reads always pass; `trusted` passes everything; `ask-shell`
-/// passes file mutations (only shell prompts); everything else mutating
-/// parks an `ApprovalRequest` on the console's approval channel and blocks
-/// for the verdict, with session approvals short-circuiting first.
+/// tool runs. Reads always pass; `trusted` passes everything; otherwise
+/// mutating tools park an `ApprovalRequest` on the console's approval
+/// channel and block for the verdict, with session approvals
+/// short-circuiting first. `read-only` rejects up front.
 /// Denial, cancellation, and no-channel surface as `ToolError::Denied` —
 /// the loop records it as a failed tool result, and the post-fan-out
 /// cancellation check still unwinds a turn cancelled mid-prompt.
@@ -143,19 +143,16 @@ pub(crate) async fn enforce_policy(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
 ) -> Result<(), ToolError> {
-    let needs_approval = match (requirement, policy.mode) {
-        (PermissionRequirement::Read, _) => false,
-        (_, PermissionMode::Trusted) => false,
-        // ask-shell permits reads and file mutations; only shell prompts.
-        (PermissionRequirement::Write, PermissionMode::AskShell) => false,
-        _ => true,
-    };
+    let needs_approval = !matches!(
+        (requirement, policy.mode),
+        (PermissionRequirement::Read, _) | (_, PermissionMode::Trusted)
+    );
     if !needs_approval {
         return Ok(());
     }
     if policy.mode == PermissionMode::ReadOnly {
         return Err(ToolError::Denied(format!(
-            "{name} is not allowed in read-only mode"
+            "{name} is blocked in plan mode — read/search only; present the change in your plan for the user to approve"
         )));
     }
     let Some(console) = policy.console.as_ref() else {

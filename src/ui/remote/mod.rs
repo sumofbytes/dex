@@ -7,6 +7,8 @@ use crate::client::http::ChatOptions;
 #[cfg(test)]
 use crate::client::http::DaemonClient;
 #[cfg(test)]
+use crate::protocol::AgentMode;
+#[cfg(test)]
 use crate::protocol::ApiProtocol;
 #[cfg(test)]
 use crate::protocol::ApprovalDecision;

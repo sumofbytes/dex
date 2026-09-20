@@ -8,6 +8,7 @@ use super::super::App;
 use super::parser::is_extension_command;
 use super::parser::split_extension_command;
 use super::parser::COMMANDS;
+use crate::protocol::AgentMode;
 use crate::protocol::ChatMessage;
 use crate::protocol::Provider;
 use crate::session::Session;
@@ -67,6 +68,7 @@ pub(crate) enum SlashCommand<'a> {
     New,
     Session,
     Permissions,
+    Mode(Option<&'a str>),
     Resume(Option<&'a str>),
     Name(Option<&'a str>),
     Skill(Option<&'a str>),
@@ -102,6 +104,9 @@ pub(crate) fn parse(line: &str) -> SlashCommand<'_> {
         "clear" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Clear,
         "new" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::New,
         "session" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Session,
+        "mode" => SlashCommand::Mode(arg),
+        // Deprecated alias: kept so an old muscle-memory line still works and
+        // points at `/mode`; no longer advertised in `COMMANDS`.
         "permissions" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Permissions,
         "resume" => SlashCommand::Resume(arg),
         "name" => SlashCommand::Name(arg),
@@ -125,6 +130,7 @@ pub(crate) fn handle_slash(app: &mut App, line: &str) -> bool {
         SlashCommand::New => cmd_new(app),
         SlashCommand::Session => cmd_session(app),
         SlashCommand::Permissions => cmd_permissions(app),
+        SlashCommand::Mode(arg) => cmd_mode(app, arg),
         SlashCommand::Extension(line) => cmd_extension(app, line),
         SlashCommand::Mcp(arg) => cmd_mcp(app, arg),
         SlashCommand::Extensions(arg) => cmd_extensions(app, arg),
@@ -229,8 +235,41 @@ fn cmd_session(app: &mut App) {
 }
 
 fn cmd_permissions(app: &mut App) {
-    push_info(app, format!("permission mode: {:?}", app.config.permission));
-    push_info(app, format!("workspace: {}", app.cwd));
+    push_info(app, "permissions is now /mode".to_string());
+    cmd_mode(app, None);
+}
+
+/// `/mode [plan|manual|auto]`: report the current mode and its derived
+/// permission, or switch. The workspace fact the old `/permissions` printed
+/// is gone — `status_pieces` already shows the compact cwd.
+fn cmd_mode(app: &mut App, arg: Option<&str>) {
+    match arg {
+        None | Some("") => {
+            let mode = AgentMode::from_permission(app.config.permission);
+            push_info(app, format!("mode: {}", mode.label()));
+            push_info(
+                app,
+                format!(
+                    "permission: {} (derived from mode)",
+                    app.config.permission.as_str()
+                ),
+            );
+        }
+        Some(raw) => match AgentMode::parse(raw) {
+            Ok(mode) => {
+                app.config.permission = mode.permission();
+                push_info(
+                    app,
+                    format!(
+                        "mode: {} (permission: {})",
+                        mode.label(),
+                        mode.permission().as_str()
+                    ),
+                );
+            }
+            Err(e) => push_info(app, e),
+        },
+    }
 }
 
 fn cmd_extension(app: &mut App, line: &str) {

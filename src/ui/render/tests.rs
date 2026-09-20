@@ -1009,6 +1009,27 @@ fn status_bar_colors_are_semantic_per_item() {
 }
 
 #[test]
+fn status_mode_chip_is_colored_per_mode() {
+    let mut app = test_app();
+    let fg_of = |app: &App| {
+        status_pieces(app, true)
+            .into_iter()
+            .find(|(text, _)| matches!(text.as_str(), "plan" | "manual" | "auto"))
+            .map(|(_, style)| style.fg)
+            .unwrap_or_else(|| panic!("no mode chip in {:?}", status_pieces(app, true)))
+    };
+    // `trusted` (the test default) derives `auto` → green.
+    assert_eq!(fg_of(&app), Some(Color::Green));
+    app.config.permission = PermissionMode::Ask;
+    assert_eq!(fg_of(&app), Some(Color::Yellow));
+    app.config.permission = PermissionMode::ReadOnly;
+    assert_eq!(fg_of(&app), Some(Color::Cyan));
+    // It is a safety indicator: it survives every narrowing tier.
+    let bare = footer_text(&app, 40);
+    assert!(bare.starts_with("plan "), "{bare}");
+}
+
+#[test]
 fn footer_text_is_width_bounded() {
     assert_eq!(truncate_display("abcdef", 4), "abc…");
     assert_eq!(
@@ -1025,20 +1046,21 @@ fn footer_pins_connection_badge_right() {
     let mut app = test_app();
     app.connection = Some("[R] daemon.internal".into());
     // Wide enough for the full line + badge: cwd leads, badge flush right.
-    let text = footer_text(&app, 80);
+    let text = footer_text(&app, 82);
     assert!(text.starts_with("/tmp/dex-ui-test"), "{text}");
     assert!(text.ends_with("[R] daemon.internal"), "{text}");
-    assert_eq!(UnicodeWidthStr::width(text.as_str()), 80);
-    // Narrower: the static cwd is shed first — the line still opens with
-    // live facts, never a dangling separator.
-    let text = footer_text(&app, 60);
+    assert_eq!(UnicodeWidthStr::width(text.as_str()), 82);
+    // Narrower: the static cwd is shed before the mode chip — the line
+    // still opens with live facts, never a dangling separator.
+    let text = footer_text(&app, 80);
     assert!(text.starts_with("opencode/test-model"), "{text}");
     assert!(text.ends_with("[R] daemon.internal"), "{text}");
-    assert_eq!(UnicodeWidthStr::width(text.as_str()), 60);
-    // Narrow: badge survives, left degrades to the bare model name.
-    let text = footer_text(&app, 30);
+    assert_eq!(UnicodeWidthStr::width(text.as_str()), 80);
+    // Narrow: badge survives over the bare mode + model pair.
+    let text = footer_text(&app, 40);
     assert!(text.ends_with("[R] daemon.internal"), "{text}");
-    assert!(text.starts_with("test-model"), "{text}");
+    assert!(text.starts_with("auto · test-model"), "{text}");
+    assert_eq!(UnicodeWidthStr::width(text.as_str()), 40);
 }
 
 #[test]
