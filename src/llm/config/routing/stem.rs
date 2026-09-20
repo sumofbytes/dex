@@ -2,10 +2,6 @@
 //! stem-normalize, and score weighted hit tables. Pure string logic —
 //! no routing tables, no decisions.
 
-// Word-stem matching primitives for tier classification: tokenize,
-// stem-normalize, and score weighted hit tables. Pure string logic —
-// no routing tables, no decisions.
-
 /// Stem-normalize one lowercased alphanumeric token through three small
 /// steps (plural → verb ending → doubled consonant) so one table stem
 /// covers its inflections — `migrates`/`migrating` → `migrat`,
