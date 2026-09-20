@@ -6,7 +6,17 @@
 //! here; colors live in `theme`.
 
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::widgets::block::Padding;
+
+/// The one style constructor: `style::fg(theme::muted_fg())` instead of
+/// `Style::default().fg(..)`. Everything a renderer styles as plain colored
+/// text goes through here, so `Style::default()` appears exactly once in the
+/// UI — here — and a future default modifier (or bg sweep) is a one-line
+/// change instead of a sed across the renderers.
+pub(crate) fn fg(color: ratatui::style::Color) -> Style {
+    Style::default().fg(color)
+}
 
 /// Horizontal air, in cells, shared by every full-width surface (footer,
 /// activity strip, queue strip, slash popup) and the transcript's leading

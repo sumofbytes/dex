@@ -37,7 +37,7 @@ pub(crate) use app::{STREAM_FLUSH_INTERVAL, THINKING_TEXT_CAP, THINKING_TEXT_SLA
 pub(crate) use remote::{mark_launch_start, run_ratatui_repl_with_remote};
 pub(crate) use render::view;
 pub(crate) use style::{
-    APPROVAL_HEIGHT, INPUT_BORDER_ROWS, INPUT_MIN_ROWS, INPUT_PAD_Y, INPUT_STATUS_GUTTER,
+    fg, APPROVAL_HEIGHT, INPUT_BORDER_ROWS, INPUT_MIN_ROWS, INPUT_PAD_Y, INPUT_STATUS_GUTTER,
     STATUS_CONTENT_ROWS, TAB_WIDTH, TRANSCRIPT_INDENT, VERTICAL_GUTTER,
 };
 pub(crate) use transcript::{

@@ -1410,7 +1410,7 @@ fn composer_has_top_and_bottom_rules() {
             // Sentinel background: the no-band assertion below only means
             // something if the cells would otherwise keep a different bg.
             f.render_widget(
-                Block::default().style(Style::default().bg(Color::Magenta)),
+                Block::default().style(ratatui::style::Style::default().bg(Color::Magenta)),
                 area,
             );
             f.render_widget(Paragraph::new("hi").block(input_block()), area);
