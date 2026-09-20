@@ -1,12 +1,12 @@
 use super::super::status::truncate_display;
 use super::super::style::fg;
-use super::super::style::surface_padding;
 use super::super::theme;
 use super::super::App;
 use super::QueueMetrics;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use ratatui::widgets::block::Padding;
 use ratatui::widgets::Block;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
@@ -124,7 +124,15 @@ impl ActivityView {
             }));
         }
         f.render_widget(
-            Paragraph::new(rows).block(Block::default().padding(surface_padding())),
+            // No vertical padding: the strip is sized exactly (`activity_height`)
+            // and sits flush between the transcript and the composer's top
+            // rule; only the shared side gutters inset the text.
+            Paragraph::new(rows).block(Block::default().padding(Padding {
+                left: super::super::style::HORIZONTAL_GUTTER,
+                right: super::super::style::HORIZONTAL_GUTTER,
+                top: 0,
+                bottom: 0,
+            })),
             area,
         );
     }

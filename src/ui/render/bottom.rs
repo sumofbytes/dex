@@ -86,7 +86,10 @@ impl SlashSuggestionsView {
             .min(max_start);
         let window = &suggestions[start..start + visible];
         // Sheet width matches the composer band minus its left gutter: the
-        // labels share the composer's text column (glyph + gap to the left).
+        // labels share the composer's text column (glyph + gap to the
+        // left). The sheet is inset one extra column (so its text lands on
+        // the composer's text column, past the band's rule start), leaving
+        // one column of air on each side like the composer's rules.
         // Inside a picker (`/model `, `/provider `, `/resume …`) rows show
         // just the item (`> gpt-5`), not the repeated command (`/model
         // <item>`) — the header already names the picker.
@@ -103,7 +106,7 @@ impl SlashSuggestionsView {
             .min(48)
             .min(avail.max(1));
         let popup = Rect {
-            x: band.x,
+            x: band.x + super::super::style::HORIZONTAL_GUTTER,
             y: area.y - height,
             width,
             height,

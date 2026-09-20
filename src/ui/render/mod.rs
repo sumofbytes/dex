@@ -92,27 +92,21 @@ pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
     if item_count == 0 {
         return 0;
     }
-    // One content row per line (a multiline queued item spans several rows),
-    // one blank separator between items, gutters above and below.
-    line_count
-        .saturating_add(item_count.saturating_sub(1))
-        .saturating_add(super::VERTICAL_GUTTER * 2)
+    // One content row per line (a multiline queued item spans several rows)
+    // plus one blank separator between items; no gutters — the strip sits
+    // flush between the transcript and the composer's top rule.
+    line_count.saturating_add(item_count.saturating_sub(1))
 }
 
-/// Footer chunk: one gutter above the status row, none below — the status
-/// line sits on the last screen row. The terminal adds its own dead space
-/// under the grid, and the dropped row read as a hole under the footer.
+/// Footer chunk: no gutter above the status row — it hugs the composer's
+/// bottom hairline (the old gutter row read as a dead gap between them) and
+/// the status line sits on the last screen row.
 pub(super) fn status_height() -> u16 {
-    super::STATUS_CONTENT_ROWS + super::VERTICAL_GUTTER
+    super::STATUS_CONTENT_ROWS
 }
 
 pub(super) fn minimum_view_height(activity_h: u16, approval_h: u16) -> u16 {
-    activity_h
-        + approval_h
-        + super::VERTICAL_GUTTER
-        + status_height()
-        + super::INPUT_MIN_ROWS
-        + super::INPUT_STATUS_GUTTER
+    activity_h + approval_h + status_height() + super::INPUT_MIN_ROWS + super::INPUT_STATUS_GUTTER
 }
 
 pub(super) struct UiLayout {
@@ -169,7 +163,6 @@ pub(super) fn compute_layout(
         );
     let chunks = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(super::VERTICAL_GUTTER),
         Constraint::Length(activity_h),
         Constraint::Length(input_h),
         Constraint::Length(super::INPUT_STATUS_GUTTER),
@@ -179,9 +172,9 @@ pub(super) fn compute_layout(
 
     Some(UiLayout {
         transcript: chunks[0],
-        activity: chunks[2],
-        input: chunks[3],
-        footer: chunks[5],
+        activity: chunks[1],
+        input: chunks[2],
+        footer: chunks[4],
     })
 }
 
