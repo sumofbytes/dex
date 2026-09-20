@@ -195,6 +195,10 @@ pub(crate) fn system_prompt_with_override_for(
 /// gate (read-only) blocks the mutations; this directive is what makes the
 /// model *plan* instead of merely failing. Prose, not a tool or a struct —
 /// CC, Codex and pi all ship plan as prose.
+pub(crate) fn plan_mode_directive() -> &'static str {
+    PLAN_MODE_DIRECTIVE
+}
+
 const PLAN_MODE_DIRECTIVE: &str = concat!(
     "\n\n--- Plan mode ---\n",
     "You are in plan mode: research and present a plan; make no changes.\n",

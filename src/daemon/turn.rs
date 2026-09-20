@@ -552,7 +552,15 @@ pub(crate) async fn run_turn_inner(
     // Durable journal (P8): a turn only exists once turn_start is recorded,
     // and an io::Error here fails the turn instead of being swallowed.
     session
-        .turn_event_with_tier("turn_start", routed_tier.as_deref())
+        .turn_event_with_mode(
+            "turn_start",
+            routed_tier.as_deref(),
+            // Journal the governing mode so a reattach restores the
+            // client's last selector instead of reseeding from the
+            // ceiling (plan mode must survive a reconnect on a trusted
+            // daemon). Best-effort like the tier.
+            agent_mode.map(|m| m.as_str()),
+        )
         .map_err(|e| format!("failed to record turn_start: {e}"))?;
     session
         .append_message(&user_message)

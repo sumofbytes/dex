@@ -165,9 +165,10 @@ impl DaemonState {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            // Single resolution: `permission_from_env` already defaults to
-            // `trusted`; the two former `ask-writes` fallbacks are gone.
-            ceiling: crate::llm::config::permission_from_env().unwrap_or(PermissionMode::Trusted),
+            // `unwrap_or(Ask)`: a malformed `DEX_PERMISSION` must fail the
+            // gate closed, never open (the turn still dies at config
+            // resolution, but the ceiling itself stays conservative).
+            ceiling: crate::llm::config::permission_from_env().unwrap_or(PermissionMode::Ask),
             pending_approvals: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashSet::new()),
             cancel_tokens: Mutex::new(HashMap::new()),

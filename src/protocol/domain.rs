@@ -72,9 +72,10 @@ mod tests {
 
     #[test]
     fn permission_mode_deprecated_spellings_still_parse() {
-        // `ask-writes` is the old name for `ask` (silent) and `ask-shell`
-        // collapses to `ask` too (strictly stricter); `as_str` never emits
-        // either, so the wire vocabulary is monotone.
+        // `ask-writes` is the old name for `ask` (now with a `warn_once`,
+        // like every deprecated knob) and `ask-shell` collapses to `ask`
+        // too (strictly stricter); `as_str` never emits either, so the
+        // wire vocabulary is monotone.
         assert_eq!(PermissionMode::parse("ask-writes"), Ok(PermissionMode::Ask));
         assert_eq!(PermissionMode::parse("ask-shell"), Ok(PermissionMode::Ask));
         assert_eq!(PermissionMode::Ask.as_str(), "ask");

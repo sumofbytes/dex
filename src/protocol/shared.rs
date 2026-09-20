@@ -461,7 +461,16 @@ impl PermissionMode {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().replace('_', "-").as_str() {
             "read-only" | "readonly" => Ok(Self::ReadOnly),
-            "ask" | "ask-writes" | "ask-write" => Ok(Self::Ask),
+            "ask" | "ask-writes" | "ask-write" => {
+                // Deprecated: `ask-writes` split edits from shell ("edits
+                // free, shell prompts"). It maps to `ask` (which also
+                // prompts on shell) and warns like every deprecated knob.
+                crate::llm::config::warn_once(
+                    "permission-ask-writes",
+                    "permission mode 'ask-writes' is deprecated — use 'ask'; it now also prompts on shell commands",
+                );
+                Ok(Self::Ask)
+            }
             // Deprecated: `ask-shell` split edits from shell ("edits free,
             // shell prompts") and ranked *above* ask-writes in
             // `permissiveness`, making the ladder non-monotone. It now maps

@@ -261,8 +261,24 @@ pub(crate) fn bootstrap(
     // Seed the mode from an explicit client `--permission` (a stricter
     // per-run choice), else from the daemon's reported ceiling. Clamp to
     // the ceiling, which a client may only go stricter than.
+    //
+    // Exception: a trusted (default) ceiling still seeds `manual`, not
+    // `auto` — the documented default is a human in the loop, so a stock
+    // launch must not start hands-off. The ceiling stays `trusted`: the
+    // user can Shift+Tab up to `auto` at any time. An explicit
+    // `--permission trusted` / `DEX_PERMISSION=trusted` is the deliberate
+    // hands-off choice and seeds `auto` as before.
+    let explicit = args.permission.or_else(|| {
+        std::env::var("DEX_PERMISSION")
+            .ok()
+            .and_then(|v| PermissionMode::parse(&v).ok())
+    });
     let ceiling = PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask);
-    let wanted = args.permission.unwrap_or(ceiling);
+    let wanted = match explicit {
+        Some(p) => p,
+        None if ceiling == PermissionMode::Trusted => PermissionMode::Ask,
+        None => ceiling,
+    };
     let mode = if wanted.permissiveness() > ceiling.permissiveness() {
         AgentMode::from_permission(ceiling)
     } else {
@@ -440,6 +456,21 @@ pub(crate) fn bootstrap(
             let _ = terminal.draw(|f| view(f, &mut remote.app));
         };
         let local = find_local_session_file(&remote.session_id);
+        // Restore the journaled mode from the last `turn_start`: a user in
+        // `plan` who reconnects must not land back in the ceiling's mode.
+        // Falls back to the seeded selector for legacy journals / true
+        // remote (no local file).
+        if let Some(p) = local.as_deref() {
+            if let Some(mode) = Session::last_turn_mode(p).and_then(|m| AgentMode::parse(&m).ok()) {
+                // Clamp to the (possibly new) ceiling: the daemon may have
+                // restarted stricter since the mode was journaled.
+                if mode.permission().permissiveness() <= remote.ceiling.permissiveness() {
+                    remote.mode = mode;
+                    remote.options.mode = Some(mode.as_str().to_string());
+                    remote.options.permission = Some(mode.permission().as_str().to_string());
+                }
+            }
+        }
         let mut rebuilt = false;
         if let Some(p) = local.as_deref() {
             if let Ok(s) = Session::from_path(p) {

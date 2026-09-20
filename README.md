@@ -428,6 +428,7 @@ daemon's working directory.
 | `--no-session`                   | Disable session persistence for this run.                                                                         |
 | `-n`, `--new`                    | Start a new session (the default).                                                                                |
 | `--permission <mode>`            | Tool permission ceiling: `read-only`, `ask`, or `trusted` (default `trusted`). Deprecated `ask-writes`/`ask-shell` still parse and map to `ask`. |
+| `--mode <plan\|manual\|auto>`    | Agent mode for this run (`plan` = read-only + planning directive); clamped to the permission ceiling.               |
 | `--name <name>`                  | Name the session (default `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`).                                           |
 | `--reattach <id>`                | Attach to an existing daemon session and replay its event journal (bare `dex` or `dex connect <url>`, no prompt). |
 | `--skill <dir>`                  | Add an extra skill directory to discover skills from.                                                             |
@@ -461,10 +462,10 @@ touching config or network.
 | ---------------------------- | --------------------------------------------------------- |
 | `/quit`                      | Exit the REPL.                                            |
 | `/permissions`               | Deprecated alias for `/mode`.                             |
-  | `/mode [plan\|manual\|auto]` | Show or set the agent mode (also Shift+Tab).              |
-  | `/mcp`                       | Show MCP servers, tools, and connection errors.           |
-  | `/extensions [reload]`       | Show loaded Lua extensions (`reload` rescans).            |
-  | `/clear`                     | Clear the conversation history (keeps the system prompt). |
+| `/mode [plan\|manual\|auto]` | Show or set the agent mode (also Shift+Tab).              |
+| `/mcp`                       | Show MCP servers, tools, and connection errors.           |
+| `/extensions [reload]`       | Show loaded Lua extensions (`reload` rescans).            |
+| `/clear`                     | Clear the conversation history (keeps the system prompt). |
 | `/new`                       | Start a new session and clear history.                    |
 | `/session`                   | Show the current session id, path, and turn count.        |
 | `/resume [index\|path]`      | List sessions, or resume one by index/path.               |
@@ -510,6 +511,13 @@ The TUI has one autonomy selector, cycled with **Shift+Tab** or set with
 | `manual` (default) | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the approval overlay | none |
 | `auto` | Hands-off execution | `trusted` — no prompts | none |
 
+The default is `manual`: a stock launch seeds the mode from the permission
+default, except that a `trusted` (default) ceiling seeds `manual` rather than
+`auto` — hands-off is opt-in via Shift+Tab, `--mode auto`, or an explicit
+`--permission trusted`/`DEX_PERMISSION=trusted`. The mode is journaled with
+each turn, so `--reattach` and `/resume` restore the last selector instead of
+reseeding from the ceiling.
+
 The mode is a client-side selector that *derives* the per-turn permission; it
 is not a second wire concept. The daemon's `--permission`/`DEX_PERMISSION` is a
 **ceiling**: a client may only go stricter (`plan` ≤ `manual` ≤ `auto`), so the
@@ -552,6 +560,7 @@ unaffected.
   `set -g set-clipboard on`.
 
 ### Steering and follow-ups
+
 While `dex` is working, the input remains available. Submitted steering and
 follow-up messages stay visible in the queue directly above the input box until
 the worker accepts them. Steering is delivered before the next model call;
