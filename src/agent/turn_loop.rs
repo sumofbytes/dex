@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::agent::compaction::verbatim::summary_mode;
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
-use crate::agent::jev::summary_mode;
 use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
 use crate::llm::client::ModelClient;
@@ -48,6 +48,22 @@ pub(crate) struct AgentRuntime<'a, C, X> {
 /// `Content` appends, `Recall` removes the newest matching item. Recalls are
 /// applied in arrival order, so a recall can only cancel an item that has not
 /// been injected yet — one already sent is part of the transcript.
+///
+/// # Drain points (the steering contract)
+///
+/// Queued messages are drained only at two points in `process_turn_inner`,
+/// both *before a model call* — never mid-batch, never between a tool call
+/// and its result:
+///
+/// 1. top of every loop iteration (before compaction + the LLM call), and
+/// 2. after an assistant message with no tool calls lands, so a steering
+///    message racing the turn's final text still gets injected (loop
+///    continues once; the next iteration returns the new final text).
+///
+/// Everything sent after the last drain of a turn waits for the next turn —
+/// the queue never blocks the caller and never grows the current prompt
+/// after the request body is built. One drain applies ALL queued messages in
+/// arrival order (`inject_steering` loops `try_recv` until empty).
 pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
     match msg {
         QueueMsg::Content(text) => pending.push(text),

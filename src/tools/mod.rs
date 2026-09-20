@@ -1,4 +1,5 @@
 #![allow(clippy::doc_lazy_continuation)]
+mod args;
 mod audit;
 mod dispatch;
 mod edit;
@@ -10,7 +11,7 @@ mod read;
 pub(crate) mod sandbox;
 mod search;
 mod shell;
-mod then_run;
+pub(crate) mod then_run;
 mod write;
 
 // Workspace confinement lives in `sandbox.rs`; re-exported here so existing
