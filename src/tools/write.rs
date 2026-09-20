@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use super::then_run::arg_str;
+use super::args::arg_str;
 use super::{workspace_path, ToolError};
 
 pub(crate) async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
