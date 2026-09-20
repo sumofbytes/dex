@@ -1683,7 +1683,7 @@ async fn read_only_rejects_write_without_prompt() {
     .await
     .expect("read-only rejection must not block");
     assert!(!outcome.ok);
-    assert!(outcome.text.contains("plan mode"), "{}", outcome.text);
+    assert!(outcome.text.contains("read-only mode"), "{}", outcome.text);
     assert!(
         approval_rx.try_recv().is_err(),
         "read-only must reject, never prompt"

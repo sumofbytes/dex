@@ -128,7 +128,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             LlmConfig::from_env(
                 args.base_url.clone(),
                 args.model.clone(),
-                args.permission,
+                // The mode is the user-facing selector; its derived
+                // permission drives the same in-process tool gate the
+                // daemon enforces for remote turns (plan → read-only, …).
+                args.mode.map(|m| m.permission()).or(args.permission),
                 &args.headers,
             )
             .map_err(|e| e.to_string())
@@ -190,7 +193,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         config = LlmConfig::from_env(
             args.base_url.clone(),
             Some(model),
-            args.permission,
+            args.mode.map(|m| m.permission()).or(args.permission),
             &args.headers,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -212,12 +215,18 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             let _ = session.set_name(name.clone());
         }
     }
-    let mut messages = vec![ChatMessage::system(system_prompt_with_override(
+    let mut system = system_prompt_with_override(
         &skills,
         cli_system_prompt(args)
             .as_ref()
             .map(|(text, _)| text.as_str()),
-    ))];
+    );
+    // One-shot plan mode: same directive the daemon appends for remote
+    // `mode: plan` turns, so headless runs behave identically.
+    if args.mode.is_some_and(crate::protocol::AgentMode::is_plan) {
+        system.push_str(crate::llm::prompt::plan_mode_directive());
+    }
+    let mut messages = vec![ChatMessage::system(system)];
     // History already loaded on the session thread above (`!!` runs
     // excluded there); the turn below appends the new user message.
     messages.extend(history);
@@ -361,6 +370,7 @@ fn print_help() {
         \n\
         Options:\n  \
         --model <name>            --base-url <url>  --permission <mode>\n  \
+        --mode <plan|manual|auto>  agent mode (plan = read-only + planning)\n  \
         --system-prompt <text>  --system-prompt-file <path>  custom base prompt\n  \
         -H/--header <\"Name: Value\">  (repeatable) extra provider headers\n  \
         -s/--session <path>  --no-session  -n/--new  --name <name>  --skill <dir>\n  \
