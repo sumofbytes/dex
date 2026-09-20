@@ -28,7 +28,7 @@ pub(crate) fn thinking_display_lines(
     if expanded {
         return text
             .lines()
-            .flat_map(|l| wrap_line_display(&thinking_line(l), width))
+            .flat_map(|l| wrap_line_display(&thinking_line(l), width, 0))
             .collect();
     }
     vec![thinking_indicator_line(thinking_open, elapsed, tick, width)]
@@ -52,7 +52,7 @@ pub(crate) fn wrap_thinking_full(text: &str, width: u16) -> (Vec<Line<'static>>,
     let mut head_rows = 0usize;
     for l in text.lines() {
         head_rows = rows.len();
-        rows.extend(wrap_line_display(&thinking_line(l), width));
+        rows.extend(wrap_line_display(&thinking_line(l), width, 0));
     }
     let (open_len, open_rows) = if text.ends_with('\n') || text.is_empty() {
         (0, 0)

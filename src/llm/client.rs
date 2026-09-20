@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use crate::agent::state::CancellationSource;
 use crate::llm::config::LlmConfig;
 use crate::llm::http::{
-    authenticated_request, backoff_delay, error_chain_message, error_head, is_cancelled_message,
-    is_rate_limited, merged_headers, provider_log, retry_after, retryable_status,
+    backoff_delay, error_chain_message, is_cancelled_message, is_rate_limited, merged_headers,
+    post_with_retry, HttpCall,
 };
 use crate::llm::protocol::{
     chat_completions_messages, responses_input, responses_tools, tools_schema,
@@ -18,8 +18,8 @@ use crate::runtime::console::with_console;
 
 /// Agent-loop model seam: `process_turn` is generic over this so tests run
 /// deterministic doubles; the single production impl is `LlmConfig` (via
-/// `dispatch::complete`). New provider behavior lands in the `call_*`
-/// functions below, not behind this trait.
+/// `dispatch::complete`). New provider behavior lands in the [`WireProtocol`]
+/// impls below, not behind this trait.
 pub(crate) trait ModelClient: Clone + Send + Sync {
     async fn complete(
         &self,
@@ -44,133 +44,172 @@ impl ModelClient for LlmConfig {
     }
 }
 
-/// Send a provider request with shared retry/backoff, 401 credential refresh
-/// (OpenAI Codex), and provider logging. The protocol-specific request body
-/// and post-success reader are supplied by the caller.
-async fn post_with_retry(
-    config: &LlmConfig,
-    url: &str,
-    body: &impl serde::Serialize,
-    sink: Option<&mpsc::Sender<SinkLine>>,
-) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
-    const MAX_HTTP_RETRIES: u32 = 3;
-    let headers = merged_headers(config);
-    // One client per call, not per attempt: clones are an atomic bump, and a
-    // fresh build per retry would re-init TLS + pool each time.
-    let http = config.http_client();
-    // 401-refresh scratch: `None` borrows `config` (no clone on the common
-    // path — the old code cloned the whole config per call even though only
-    // the 401 path mutates). Materialized only when a refreshable provider
-    // actually returns 401.
-    let mut refreshed: Option<LlmConfig> = None;
-    for attempt in 0..=MAX_HTTP_RETRIES {
-        let active: &LlmConfig = refreshed.as_ref().unwrap_or(config);
-        let request = http.post(url);
-        crate::log!(
-            Debug,
-            "POST {url} (model {}, attempt {attempt})",
-            config.model
-        );
-        let started = std::time::Instant::now();
-        let resp = match authenticated_request(request, active, &headers)
-            .json(body)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                crate::log!(
-                    Debug,
-                    "HTTP {} {url} in {:?}",
-                    resp.status(),
-                    started.elapsed()
-                );
-                resp
-            }
-            Err(e) if attempt < MAX_HTTP_RETRIES => {
-                let delay = backoff_delay(attempt, None);
-                with_console(sink.is_some(), || {
-                    eprintln!(
-                        "[llm] request failed: {}; retrying in {:?}",
-                        error_chain_message(&e),
-                        delay
-                    )
-                });
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            Err(e) => {
-                provider_log("request_failed", &error_chain_message(&e));
-                crate::log!(Warn, "request failed: {}", error_chain_message(&e));
-                return Err(Box::new(e));
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(retry_after);
-            let body_text = resp.text().await.map_err(Box::new)?;
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                && active.provider.credentials_refreshable()
-                && attempt < MAX_HTTP_RETRIES
-            {
-                if let Ok((token, account)) = crate::llm::auth::resolve_credentials(
-                    &active.provider,
-                    &active.provider_entries,
-                ) {
-                    let mut next = refreshed.take().unwrap_or_else(|| config.clone());
-                    next.api_key = token;
-                    next.account_id = account;
-                    refreshed = Some(next);
-                    continue;
-                }
-            }
-            let retryable = retryable_status(status) || is_rate_limited(&body_text);
-            if retryable && attempt < MAX_HTTP_RETRIES {
-                let delay = backoff_delay(attempt, retry_after);
-                with_console(sink.is_some(), || {
-                    eprintln!(
-                        "[llm] API error {}: retrying in {:?}{}",
-                        status,
-                        delay,
-                        match retry_after {
-                            Some(d) => format!(" (server asked for {d:?})"),
-                            None => String::new(),
-                        }
-                    )
-                });
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            provider_log("api_error", &format!("{}: {}", status, body_text));
-            // Cap the logged body: some providers return whole HTML pages.
-            crate::log!(Warn, "api error {status}: {}", error_head(&body_text, 400));
-            // Opaque 5xx / missing route from `/responses` usually means the
-            // model only speaks chat-completions (proven for e.g.
-            // glm-5.3-flash on zen/go) — point at the per-model override
-            // instead of a bare body. Auth and rate-limit failures say
-            // nothing about the protocol, and a pinned `api:` means the user
-            // already decided.
-            if url.ends_with("/responses")
-                && !config.api_pinned
-                && (status == reqwest::StatusCode::NOT_FOUND || status.is_server_error())
-            {
-                return Err(format!(
-                    "API error: {} (hint: {} may speak openai-completions; set DEX_MODEL_APIS={}=openai-completions)",
-                    body_text, config.model, config.model
-                )
-                .into());
-            }
-            return Err(format!("API error: {}", body_text).into());
-        }
-
-        return Ok(resp);
+/// Resolve one streaming provider call from config. `hint_model` is
+/// `Some` only for `/responses` calls whose protocol wasn't pinned.
+pub(crate) fn http_call(config: &LlmConfig, url: String, hint_model: Option<String>) -> HttpCall {
+    HttpCall {
+        url,
+        model: config.model.clone(),
+        http: config.http_client(),
+        scheme: config.provider.auth_scheme(),
+        api_key: config.api_key.clone(),
+        account_id: config.account_id.clone(),
+        headers: merged_headers(
+            &config.global_headers,
+            &config.provider_headers,
+            &config.extra_headers,
+        ),
+        refresh: config
+            .provider
+            .credentials_refreshable()
+            .then(|| (config.provider.clone(), config.provider_entries.clone())),
+        hint_model,
+        thinking_effort: config.thinking_effort.clone(),
+        idle_timeout: crate::llm::transport::sse::stream_idle_timeout_for(
+            &config.model,
+            config.thinking_effort.is_some(),
+        ),
     }
+}
 
-    unreachable!()
+/// One wire protocol: how a turn's request is shaped for a provider and how
+/// its streamed response is read back into a [`Turn`]. One impl per
+/// protocol (`openai-completions`, `openai-responses`, `anthropic-messages`);
+/// a new wire is a new impl plus one dispatch arm in `dispatch::complete`
+/// (protocol selection and the empirical responses→completions fallback stay
+/// there, above this trait, which also resolves each wire's URL + [`HttpCall`]
+/// via `http_call`). The stream-phase retry core is shared: impls only differ
+/// in body, reader, and the pre-output rate-limit budget.
+pub(crate) trait WireProtocol {
+    async fn stream(
+        &self,
+        call: &HttpCall,
+        messages: &[ChatMessage],
+        with_tools: bool,
+        sink: Option<mpsc::Sender<SinkLine>>,
+        cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// `openai-completions`.
+pub(crate) struct ChatCompletions;
+
+impl WireProtocol for ChatCompletions {
+    async fn stream(
+        &self,
+        call: &HttpCall,
+        messages: &[ChatMessage],
+        with_tools: bool,
+        sink: Option<mpsc::Sender<SinkLine>>,
+        cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        let req = ChatCompletionsRequest {
+            model: &call.model,
+            messages: chat_completions_messages(messages),
+            tools: if with_tools {
+                tools_schema()
+            } else {
+                Vec::new()
+            },
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+            reasoning_effort: &call.thinking_effort,
+        };
+        run_streaming_call(
+            call,
+            &req,
+            sink,
+            cancel,
+            // Rate limits arrive as HTTP statuses, retried in `post_with_retry`.
+            0,
+            |resp, sink, cancel, idle| Box::pin(read_stream(resp, sink, cancel, idle)),
+        )
+        .await
+    }
+}
+
+/// `openai-responses`.
+pub(crate) struct Responses;
+
+impl WireProtocol for Responses {
+    async fn stream(
+        &self,
+        call: &HttpCall,
+        messages: &[ChatMessage],
+        with_tools: bool,
+        sink: Option<mpsc::Sender<SinkLine>>,
+        cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        let (instructions, input) = responses_input(messages);
+        let mut body = json!({
+            "model": call.model,
+            "input": input,
+            "stream": true,
+            "store": false,
+            // State is never stored server-side, so ask for the encrypted
+            // reasoning blobs — without them reasoning can't be replayed and
+            // the model re-reasons from scratch on every tool call.
+            "include": ["reasoning.encrypted_content"],
+        });
+        if let Some(instructions) = instructions {
+            body["instructions"] = json!(instructions);
+        }
+        if with_tools {
+            body["tools"] = json!(responses_tools());
+        }
+        if let Some(effort) = &call.thinking_effort {
+            body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        }
+        run_streaming_call(
+            call,
+            &body,
+            sink,
+            cancel,
+            // Rate limits arrive as HTTP statuses, retried in `post_with_retry`.
+            0,
+            |resp, sink, cancel, idle| Box::pin(read_responses_stream(resp, sink, cancel, idle)),
+        )
+        .await
+    }
+}
+
+/// `anthropic-messages`.
+pub(crate) struct AnthropicMessages;
+
+impl WireProtocol for AnthropicMessages {
+    async fn stream(
+        &self,
+        call: &HttpCall,
+        messages: &[ChatMessage],
+        with_tools: bool,
+        sink: Option<mpsc::Sender<SinkLine>>,
+        cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        let body = crate::llm::anthropic::messages_body(
+            &call.model,
+            call.thinking_effort.as_deref(),
+            messages,
+            with_tools,
+        );
+        // Anthropic can report rate limits as a terminal `error` event on a
+        // 200 body (no HTTP status to trigger `post_with_retry`), so a
+        // pre-output rate-limit failure re-issues the whole request here. In
+        // practice the loop only runs after the inner one already returned a
+        // 200, and a 200 body carries no `Retry-After` — hence
+        // `backoff_delay(_, None)` in the shared core.
+        const MAX_STREAM_RETRIES: u32 = 3;
+        run_streaming_call(
+            call,
+            &body,
+            sink,
+            cancel,
+            MAX_STREAM_RETRIES,
+            |resp, sink, cancel, idle| Box::pin(read_anthropic_stream(resp, sink, cancel, idle)),
+        )
+        .await
+    }
 }
 
 /// One streaming POST + stream-phase retry core shared by all three wire
@@ -187,8 +226,7 @@ async fn post_with_retry(
 /// recovery draws from its own `stall_attempt` budget, not the rate-limit
 /// index, so mixed failures starve neither budget.
 async fn run_streaming_call(
-    config: &LlmConfig,
-    url: &str,
+    call: &HttpCall,
     body: &impl serde::Serialize,
     sink: Option<mpsc::Sender<SinkLine>>,
     cancel: &(dyn CancellationSource + Send + Sync),
@@ -206,12 +244,11 @@ async fn run_streaming_call(
         >,
     >,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    let idle_timeout = idle_timeout(config);
     let mut rate_attempt = 0u32;
     let mut stall_attempt = 0u32;
     loop {
-        let resp = post_with_retry(config, url, body, sink.as_ref()).await?;
-        match read(resp, sink.clone(), cancel, idle_timeout).await {
+        let resp = post_with_retry(call, body, sink.as_ref()).await?;
+        match read(resp, sink.clone(), cancel, call.idle_timeout).await {
             Ok(turn) => return Ok(turn),
             Err(e) if should_retry_stream_error(&*e, rate_attempt, stream_rate_limit_retries) => {
                 let delay = backoff_delay(rate_attempt, None);
@@ -238,105 +275,6 @@ async fn run_streaming_call(
     }
 }
 
-pub(crate) async fn call_chat_completions(
-    config: &LlmConfig,
-    messages: &[ChatMessage],
-    with_tools: bool,
-    sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &(dyn CancellationSource + Send + Sync),
-) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    let req = ChatCompletionsRequest {
-        model: &config.model,
-        messages: chat_completions_messages(messages),
-        tools: if with_tools {
-            tools_schema()
-        } else {
-            Vec::new()
-        },
-        stream: true,
-        stream_options: StreamOptions {
-            include_usage: true,
-        },
-        reasoning_effort: &config.thinking_effort,
-    };
-    run_streaming_call(
-        config,
-        &format!("{}/chat/completions", config.base_url),
-        &req,
-        sink,
-        cancel,
-        0, // rate limits arrive as HTTP statuses, retried in `post_with_retry`
-        |resp, sink, cancel, idle| Box::pin(read_stream(resp, sink, cancel, idle)),
-    )
-    .await
-}
-
-pub(crate) async fn call_responses(
-    config: &LlmConfig,
-    messages: &[ChatMessage],
-    with_tools: bool,
-    sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &(dyn CancellationSource + Send + Sync),
-) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    let (instructions, input) = responses_input(messages);
-    let mut body = json!({
-        "model": config.model,
-        "input": input,
-        "stream": true,
-        "store": false,
-        // State is never stored server-side, so ask for the encrypted
-        // reasoning blobs — without them reasoning can't be replayed and
-        // the model re-reasons from scratch on every tool call.
-        "include": ["reasoning.encrypted_content"],
-    });
-    if let Some(instructions) = instructions {
-        body["instructions"] = json!(instructions);
-    }
-    if with_tools {
-        body["tools"] = json!(responses_tools());
-    }
-    if let Some(effort) = &config.thinking_effort {
-        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
-    }
-    run_streaming_call(
-        config,
-        &format!("{}/responses", config.base_url),
-        &body,
-        sink,
-        cancel,
-        0, // rate limits arrive as HTTP statuses, retried in `post_with_retry`
-        |resp, sink, cancel, idle| Box::pin(read_responses_stream(resp, sink, cancel, idle)),
-    )
-    .await
-}
-
-pub(crate) async fn call_anthropic_messages(
-    config: &LlmConfig,
-    messages: &[ChatMessage],
-    with_tools: bool,
-    sink: Option<mpsc::Sender<SinkLine>>,
-    cancel: &(dyn CancellationSource + Send + Sync),
-) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-    let body = crate::llm::anthropic::messages_body(config, messages, with_tools);
-    // Anthropic can report rate limits as a terminal `error` event on a 200
-    // body (no HTTP status to trigger `post_with_retry`), so a pre-output
-    // rate-limit failure re-issues the whole request here. In practice the
-    // loop only runs after the inner one already returned a 200, and a 200
-    // body carries no `Retry-After` — hence `backoff_delay(_, None)` in the
-    // shared core.
-    const MAX_STREAM_RETRIES: u32 = 3;
-    run_streaming_call(
-        config,
-        &crate::llm::anthropic::messages_url(&config.base_url),
-        &body,
-        sink,
-        cancel,
-        MAX_STREAM_RETRIES,
-        |resp, sink, cancel, idle| Box::pin(read_anthropic_stream(resp, sink, cancel, idle)),
-    )
-    .await
-}
-
 /// Bounded same-protocol retries for a stalled or dropped stream before any
 /// output flowed (`stream idle for over …` / transport marker). A stall is
 /// transient transport, not a verdict on the request — re-issuing resumes
@@ -346,17 +284,9 @@ pub(crate) async fn call_anthropic_messages(
 /// the turn for a manual `continue`. Never retries cancellations.
 const MAX_IDLE_STREAM_RETRIES: u32 = 2;
 
-/// Idle budget for this turn, computed once per call: the explicit env
-/// override wins, otherwise reasoning-capable models get the patient budget
-/// (see `stream_idle_timeout_for`). One helper so the three protocol entry
-/// points share the catalog lookup instead of repeating it.
-fn idle_timeout(config: &LlmConfig) -> Option<Duration> {
-    crate::llm::transport::sse::stream_idle_timeout_for(
-        &config.model,
-        config.thinking_effort.is_some(),
-    )
-}
-
+/// Idle budget for this turn lives on the resolved [`HttpCall`] — the explicit
+/// env override wins, otherwise reasoning-capable models get the patient
+/// budget (see `stream_idle_timeout_for`).
 fn should_retry_idle(err: &(dyn std::error::Error + 'static), attempt: u32) -> bool {
     attempt < MAX_IDLE_STREAM_RETRIES
         && !crate::llm::transport::sse::is_mid_stream(err)
@@ -419,7 +349,8 @@ fn should_retry_stream_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Usage;
+    use crate::llm::http::authenticated_request;
+    use crate::protocol::{Provider, Usage};
 
     #[derive(Clone)]
     struct MockModel;
@@ -535,12 +466,18 @@ mod tests {
         config
             .extra_headers
             .insert("not a header".to_string(), "bad".to_string());
-        let headers = merged_headers(&config);
+        let headers = merged_headers(
+            &config.global_headers,
+            &config.provider_headers,
+            &config.extra_headers,
+        );
         let req = authenticated_request(
             config
                 .http_client()
                 .get("http://localhost/v1/chat/completions"),
-            &config,
+            config.provider.auth_scheme(),
+            &config.api_key,
+            config.account_id.as_deref(),
             &headers,
         )
         .build()
@@ -579,12 +516,18 @@ mod tests {
         config
             .extra_headers
             .insert("X-Prov".to_string(), "env".to_string());
-        let headers = merged_headers(&config);
+        let headers = merged_headers(
+            &config.global_headers,
+            &config.provider_headers,
+            &config.extra_headers,
+        );
         let req = authenticated_request(
             config
                 .http_client()
                 .get("http://localhost/v1/chat/completions"),
-            &config,
+            config.provider.auth_scheme(),
+            &config.api_key,
+            config.account_id.as_deref(),
             &headers,
         )
         .build()
@@ -599,6 +542,29 @@ mod tests {
             req.headers().get("x-prov").map(|v| v.to_str().unwrap()),
             Some("env")
         );
+    }
+
+    #[test]
+    fn http_call_resolves_refresh_and_hint() {
+        let config = crate::llm::config::tests::test_cfg();
+        let call = http_call(&config, "https://x/v1/chat/completions".into(), None);
+        assert_eq!(call.url, "https://x/v1/chat/completions");
+        assert_eq!(call.model, config.model);
+        assert!(call.refresh.is_none(), "non-codex cannot refresh");
+        assert_eq!(call.hint_model, None);
+        assert!(call.account_id.is_none());
+        // Codex is the refreshable provider; a pinned /responses call builds
+        // no protocol hint.
+        let mut codex = config.clone();
+        codex.provider = Provider::OpenAiCodex;
+        codex.api_pinned = true;
+        let call = http_call(
+            &codex,
+            "https://x/responses".into(),
+            (!codex.api_pinned).then(|| codex.model.clone()),
+        );
+        assert!(call.refresh.is_some());
+        assert_eq!(call.hint_model, None);
     }
 
     #[tokio::test]
