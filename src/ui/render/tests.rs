@@ -304,15 +304,15 @@ fn shared_surface_dimensions_are_consistent() {
     );
     // Guard keeps the queue-only strip collapsed at zero items.
     assert_eq!(activity_height(0, 0), 0);
-    assert_eq!(activity_height(1, 1), 3);
-    assert_eq!(activity_height(3, 3), 7);
-    assert_eq!(status_height(), 2);
+    assert_eq!(activity_height(1, 1), 1);
+    assert_eq!(activity_height(3, 3), 5);
+    assert_eq!(status_height(), 1);
 }
 
 #[test]
 fn minimum_view_height_accounts_for_all_gutters() {
-    assert_eq!(minimum_view_height(activity_height(1, 1), 0), 9);
-    assert_eq!(minimum_view_height(activity_height(3, 3), 0), 13);
+    assert_eq!(minimum_view_height(activity_height(1, 1), 0), 5);
+    assert_eq!(minimum_view_height(activity_height(3, 3), 0), 9);
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn multiline_pending_steer_renders_each_source_line() {
     let queue = queue_metrics_of(&queue_groups(&app));
     assert_eq!(queue.items, 2);
     assert_eq!(queue.rows, 4);
-    assert_eq!(activity_height(queue.items, queue.rows), 4 + 1 + 2);
+    assert_eq!(activity_height(queue.items, queue.rows), 4 + 1);
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -461,18 +461,19 @@ fn degenerate_layout_keeps_composer_and_footer() {
         }
     }
     let queue = queue_metrics_of(&queue_groups(&app));
-    // activity_h = 18 here, so a 20-row terminal can't fit the strip.
+    // activity_h = 15 here, so a 12-row terminal can't fit the strip.
     let layout =
-        compute_layout(Rect::new(0, 0, 80, 20), 1, queue, false).expect("layout should exist");
+        compute_layout(Rect::new(0, 0, 80, 12), 1, queue, false).expect("layout should exist");
     assert_eq!(layout.activity.height, 0);
     assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
     assert_eq!(layout.footer.height, status_height());
     assert!(layout.transcript.height > 0);
 
-    // A handful of rows can't fit even the composer: transcript-only.
+    // Three rows can't fit even the composer (min is transcript 1 + input 3
+    // + footer 1): transcript-only.
     let layout =
-        compute_layout(Rect::new(0, 0, 80, 4), 1, queue, false).expect("layout should exist");
-    assert_eq!(layout.transcript.height, 4);
+        compute_layout(Rect::new(0, 0, 80, 3), 1, queue, false).expect("layout should exist");
+    assert_eq!(layout.transcript.height, 3);
     assert_eq!(layout.input.height, 0);
     assert_eq!(layout.footer.height, 0);
 }
@@ -480,7 +481,7 @@ fn degenerate_layout_keeps_composer_and_footer() {
 #[test]
 fn transcript_wrapper_keeps_first_content_grapheme() {
     let line = super::super::indent_transcript_line(Line::from("▸ tool"));
-    let wrapped = wrap_line_display(&line, 80);
+    let wrapped = wrap_line_display(&line, 80, 0);
     let rendered: String = wrapped[0]
         .spans
         .iter()
@@ -1519,7 +1520,7 @@ fn assistant_text_is_gapped_after_tool_preview() {
             display.push(Line::default());
         }
         for line in block.lines() {
-            display.extend(wrap_line_display(line, 100));
+            display.extend(wrap_line_display(line, 100, 0));
         }
     }
     let assistant_display_idx = display
@@ -2537,4 +2538,54 @@ fn composer_first_row_has_prompt_glyph() {
             .starts_with(&format!("{margin}❯ hello composer"))),
         "glyph + input on the transcript margin: {rows:?}"
     );
+}
+
+#[test]
+fn submitted_prompt_wraps_like_the_composer() {
+    // The echo contract is a wrap contract too: the composer's first
+    // visual row wraps `INPUT_PROMPT_WIDTH` narrower for the glyph, and
+    // the echoed submitted prompt must reflow at exactly the same
+    // boundaries — otherwise a prompt that fits one composer row wraps
+    // differently the moment Enter is hit.
+    let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+    for w in [40u16, 60, 80] {
+        // Live composer rows at this width.
+        let composer = render_input(&InputField::from_text(text), input_content_width(w), false).0;
+        // Echoed prompt rows at the same width.
+        let mut app = test_app();
+        super::super::render_user_prompt(&mut app, text);
+        let block = &app.transcript[1];
+        let echo = wrap_block(block, w, false, false);
+        // Strip the echo's `INPUT_PAD_Y` air rows, its leading transcript
+        // indent (the composer lives inside the band and has no indent
+        // span), and trailing pad fill, so both sides compare as bare
+        // text lines.
+        let echo_text: Vec<String> = echo[1..echo.len() - 1]
+            .iter()
+            .map(|r| {
+                let mut s: String = r
+                    .spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>();
+                if let Some(rest) = s.strip_prefix(crate::ui::transcript_indent().as_str()) {
+                    s = rest.to_string();
+                }
+                s.trim_end().to_string()
+            })
+            .collect();
+        let composer_text: Vec<String> = composer
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            echo_text, composer_text,
+            "echoed prompt must wrap identically to the composer at w {w}"
+        );
+    }
 }

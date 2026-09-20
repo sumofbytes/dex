@@ -1,6 +1,7 @@
 //! Shared streaming boundary. The concrete SSE readers remain compatible with
 //! both provider protocols and are called through these typed entry points.
 
+use crate::llm::client::WireProtocol;
 use crate::llm::config::LlmConfig;
 use crate::llm::transport::sse::is_mid_stream;
 use crate::llm::transport::sse::Turn;
@@ -62,25 +63,40 @@ pub(crate) async fn complete(
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     match effective_api(config) {
         ApiProtocol::ChatCompletions => {
-            crate::llm::client::call_chat_completions(config, messages, with_tools, sink, cancel)
+            let call = crate::llm::client::http_call(
+                config,
+                format!("{}/chat/completions", config.base_url),
+                None,
+            );
+            crate::llm::client::ChatCompletions
+                .stream(&call, messages, with_tools, sink, cancel)
                 .await
         }
         // Native Messages endpoint: no empirical fallback — the endpoint
         // speaks one wire, and a pin (or the provider default) already
         // decided it.
         ApiProtocol::Anthropic => {
-            crate::llm::client::call_anthropic_messages(config, messages, with_tools, sink, cancel)
+            let call = crate::llm::client::http_call(
+                config,
+                crate::llm::anthropic::messages_url(&config.base_url),
+                None,
+            );
+            crate::llm::client::AnthropicMessages
+                .stream(&call, messages, with_tools, sink, cancel)
                 .await
         }
         ApiProtocol::Responses => {
-            match crate::llm::client::call_responses(
+            // A NOT_FOUND/5xx here usually means the model only speaks
+            // chat-completions — but only when nothing pinned the protocol.
+            let hint_model = (!config.api_pinned).then(|| config.model.clone());
+            let call = crate::llm::client::http_call(
                 config,
-                messages,
-                with_tools,
-                sink.clone(),
-                cancel,
-            )
-            .await
+                format!("{}/responses", config.base_url),
+                hint_model,
+            );
+            match crate::llm::client::Responses
+                .stream(&call, messages, with_tools, sink.clone(), cancel)
+                .await
             {
                 Ok(ok) => Ok(ok),
                 Err(e) if !is_mid_stream(&*e) && try_responses_fallback(config, &e.to_string()) => {
@@ -91,14 +107,9 @@ pub(crate) async fn complete(
                     // the whole turn over chat-completions; once anything has
                     // streamed, MidStreamError blocks the retry so a partial
                     // transcript is never duplicated.
-                    match crate::llm::client::call_chat_completions(
-                        config,
-                        messages,
-                        with_tools,
-                        sink.clone(),
-                        cancel,
-                    )
-                    .await
+                    match crate::llm::client::ChatCompletions
+                        .stream(&call, messages, with_tools, sink.clone(), cancel)
+                        .await
                     {
                         Ok(ok) => {
                             // One write owns both layers: this process and

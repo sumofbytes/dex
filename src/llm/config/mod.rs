@@ -221,6 +221,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "agent_wake",
     "routing",
     "extensions",
+    "jev",
     // Deprecated but still honored for old files:
     "active_provider",
     "provider",

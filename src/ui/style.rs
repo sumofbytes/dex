@@ -27,10 +27,9 @@ pub(crate) fn fg(color: ratatui::style::Color) -> Style {
 /// the transcript indent. Tuning it moves the composer cursor and the
 /// transcript indent together, which is what keeps them aligned.
 pub(crate) const HORIZONTAL_GUTTER: u16 = 1;
-/// Vertical air, in rows, between stacked surfaces (transcript ↔ activity,
-/// activity ↔ footer). One row above and below; the status row drops its
-/// bottom gutter so it sits on the last screen row.
-pub(crate) const VERTICAL_GUTTER: u16 = 1;
+// `VERTICAL_GUTTER` was removed: no stacked surface carries vertical air
+// between rows any more — transcript, activity strip, composer band and
+// status line all sit flush.
 
 /// Left air of the transcript's shared grid, in cells. Derived from the
 /// gutter so tuning the gutter moves both at once.
@@ -39,7 +38,9 @@ pub(crate) const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
 /// The composer's top/bottom hairline rules: one row each.
 pub(crate) const INPUT_BORDER_ROWS: u16 = 2;
 /// Blank air rows above and below the composer text, echoed around the
-/// submitted prompt in the transcript so both keep the same shape.
+/// submitted prompt in the transcript so both keep the same shape. The
+/// live composer gets this from `composer.rs`'s air rows, not from
+/// `input_block` (which adds no vertical padding).
 pub(crate) const INPUT_PAD_Y: u16 = 1;
 /// Prompt glyph shown on the composer's first row and echoed on the first
 /// row of the submitted prompt, so your turns read as yours in the
@@ -49,7 +50,9 @@ pub(crate) const INPUT_PROMPT: &str = "❯ ";
 pub(crate) const INPUT_PROMPT_WIDTH: usize = 2;
 /// Rows of status text under the composer (name + mode line).
 pub(crate) const STATUS_CONTENT_ROWS: u16 = 1;
-/// Minimum text rows the composer shows when empty.
+/// Minimum *outer* height of the composer band: one text row plus the
+/// two hairline rules (`INPUT_BORDER_ROWS`). The composer grows beyond
+/// this as the input wraps, up to the 8-row cap in `compute_layout`.
 pub(crate) const INPUT_MIN_ROWS: u16 = 3;
 /// Blank rows between the composer band and the status row.
 pub(crate) const INPUT_STATUS_GUTTER: u16 = 0;
@@ -58,27 +61,15 @@ pub(crate) const APPROVAL_HEIGHT: u16 = 11;
 /// Tab stop for display expansion.
 pub(crate) const TAB_WIDTH: usize = 8;
 
-/// `Padding` of every full-width surface: `HORIZONTAL_GUTTER` left/right,
-/// `VERTICAL_GUTTER` top/bottom. Footer passes `bottom: 0` via
-/// `status_padding`.
-pub(crate) fn surface_padding() -> Padding {
-    Padding {
-        left: HORIZONTAL_GUTTER,
-        right: HORIZONTAL_GUTTER,
-        top: VERTICAL_GUTTER,
-        bottom: VERTICAL_GUTTER,
-    }
-}
-
-/// Footer `Padding`: gutters on top and sides, none on the bottom — the
-/// status line sits on the last screen row. The terminal adds its own dead
-/// space under the grid, and the dropped row read as a hole under the
-/// footer.
+/// Footer `Padding`: side gutters only. The status line hugs the composer's
+/// bottom rule and the last screen row — both vertical gutters were dropped:
+/// the top one read as a dead gap under the input band, the bottom one as a
+/// hole under the footer.
 pub(crate) fn status_padding() -> Padding {
     Padding {
         left: HORIZONTAL_GUTTER,
         right: HORIZONTAL_GUTTER,
-        top: VERTICAL_GUTTER,
+        top: 0,
         bottom: 0,
     }
 }
@@ -101,4 +92,18 @@ pub(crate) fn composer_band(area: Rect) -> Rect {
 /// inset from each side.
 pub(crate) fn content_width(width: u16) -> u16 {
     width.saturating_sub(HORIZONTAL_GUTTER * 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn prompt_glyph_width_matches_its_constant() {
+        // `INPUT_PROMPT_WIDTH` offsets the composer's row-0 wrap width and
+        // the echoed prompt's first-row overhang; if the glyph changes
+        // width and this drifts, typed and sent prompts reflow differently.
+        assert_eq!(INPUT_PROMPT.width(), INPUT_PROMPT_WIDTH);
+    }
 }

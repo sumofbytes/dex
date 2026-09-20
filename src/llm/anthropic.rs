@@ -7,7 +7,6 @@
 
 use serde_json::{json, Value};
 
-use crate::llm::config::LlmConfig;
 use crate::llm::protocol::wire_tools;
 use crate::protocol::{ChatMessage, LlmToolCall, Role};
 
@@ -53,7 +52,8 @@ fn thinking_budget(effort: &str) -> u64 {
 /// reusable prefixes (system, tool schemas, conversation-so-far) so each
 /// turn reuses the previous turn's cached prefix instead of re-reading it.
 pub(crate) fn messages_body(
-    config: &LlmConfig,
+    model: &str,
+    thinking_effort: Option<&str>,
     messages: &[ChatMessage],
     with_tools: bool,
 ) -> Value {
@@ -61,9 +61,9 @@ pub(crate) fn messages_body(
     if let Some(last) = msgs.last_mut() {
         mark_cacheable(last);
     }
-    let (max_tokens, budget) = max_tokens_and_budget(config);
+    let (max_tokens, budget) = max_tokens_and_budget(model, thinking_effort);
     let mut body = json!({
-        "model": config.model,
+        "model": model,
         "max_tokens": max_tokens,
         "messages": msgs,
         "stream": true,
@@ -88,9 +88,9 @@ pub(crate) fn messages_body(
 /// stands unless the catalog knows a tighter `limit.output` for the model;
 /// the thinking budget adds headroom, and on capped models shrinks toward
 /// the API floor (1024) so it stays strictly below `max_tokens`.
-fn max_tokens_and_budget(config: &LlmConfig) -> (u64, Option<u64>) {
-    let cap = crate::llm::config::catalog_output_limit_for(&config.model);
-    let budget = config.thinking_effort.as_deref().map(thinking_budget);
+fn max_tokens_and_budget(model: &str, thinking_effort: Option<&str>) -> (u64, Option<u64>) {
+    let cap = crate::llm::config::catalog_output_limit_for(model);
+    let budget = thinking_effort.map(thinking_budget);
     let budget = match (budget, cap) {
         (Some(b), Some(cap)) if b + THINKING_HEADROOM > cap => {
             Some(b.min(cap.saturating_sub(THINKING_HEADROOM)).max(1024))
@@ -395,11 +395,10 @@ mod tests {
     #[test]
     fn messages_body_keeps_system_and_tools_stable_across_appends() {
         let _catalog = HermeticCatalog::empty("prefix-stable");
-        let config = crate::llm::config::tests::test_cfg();
         let mut base = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let body1 = messages_body(&config, &base, true);
+        let body1 = messages_body("m-r", None, &base, true);
         base.push(ChatMessage::user("follow-up"));
-        let body2 = messages_body(&config, &base, true);
+        let body2 = messages_body("m-r", None, &base, true);
         assert_eq!(body1["system"], body2["system"]);
         assert_eq!(body1["tools"], body2["tools"]);
     }
@@ -472,10 +471,8 @@ mod tests {
         // Empty catalog: `limit.output` lookups miss, so the constants below
         // hold regardless of the machine's real models.dev cache.
         let _catalog = HermeticCatalog::empty("body-shape");
-        let mut config = crate::llm::config::tests::test_cfg();
-        config.model = "claude-sonnet-4-5".into();
-        config.thinking_effort = None;
-        let body = messages_body(&config, &[ChatMessage::user("hi")], false);
+        let model = "claude-sonnet-4-5";
+        let body = messages_body(model, None, &[ChatMessage::user("hi")], false);
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["max_tokens"], 16_384);
         assert_eq!(body["stream"], true);
@@ -491,8 +488,7 @@ mod tests {
 
         // Thinking enabled: budget maps from the effort knob and sits
         // strictly below max_tokens.
-        config.thinking_effort = Some("low".into());
-        let body = messages_body(&config, &[ChatMessage::user("hi")], true);
+        let body = messages_body(model, Some("low"), &[ChatMessage::user("hi")], true);
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
         assert_eq!(body["max_tokens"], 16_384);
         let tools = body["tools"].as_array().unwrap();
@@ -502,20 +498,19 @@ mod tests {
         // Tool-schema breakpoint marks the last definition.
         assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
 
-        config.thinking_effort = Some("xhigh".into());
-        let body = messages_body(&config, &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], false);
         assert_eq!(body["thinking"]["budget_tokens"], 32_768);
         assert_eq!(body["max_tokens"], 36_864);
 
         // Unknown / non-OpenAI-vocabulary picks land on the middle bucket.
-        config.thinking_effort = Some("mystery".into());
-        let body = messages_body(&config, &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, Some("mystery"), &[ChatMessage::user("hi")], false);
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
 
         // System content lands in the top-level `system` block array with
         // its own cache breakpoint.
         let body = messages_body(
-            &config,
+            model,
+            Some("mystery"),
             &[ChatMessage::system("be brief"), ChatMessage::user("hi")],
             false,
         );
@@ -529,17 +524,14 @@ mod tests {
             "output-clamp",
             r#"{"anthropic":{"models":{"claude-haiku-mini":{"limit":{"context":200000,"output":8192}}}}}"#,
         );
-        let mut config = crate::llm::config::tests::test_cfg();
-        config.model = "claude-haiku-mini".into();
+        let model = "claude-haiku-mini";
 
         // No thinking: the cap replaces the constant outright.
-        config.thinking_effort = None;
-        let body = messages_body(&config, &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, None, &[ChatMessage::user("hi")], false);
         assert_eq!(body["max_tokens"], 8_192);
 
         // Thinking: the budget shrinks so it stays strictly below the cap.
-        config.thinking_effort = Some("xhigh".into());
-        let body = messages_body(&config, &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], false);
         assert_eq!(body["max_tokens"], 8_192);
         assert_eq!(body["thinking"]["budget_tokens"], 4_096);
     }
@@ -561,8 +553,7 @@ mod tests {
         msg.reasoning_items = Some(vec![
             json!({"type": "thinking", "thinking": "hmm", "signature": "sig1"}),
         ]);
-        let config = crate::llm::config::tests::test_cfg();
-        let body = messages_body(&config, &[msg], false);
+        let body = messages_body("m-r", None, &[msg], false);
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         // The marker lands on the tool_use block; the thinking block —
         // which can't carry cache_control — stays untouched.

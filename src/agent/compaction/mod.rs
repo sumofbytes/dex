@@ -544,10 +544,32 @@ pub(crate) async fn compact_history(
     // Jev verbatim prune: drop/truncate stale tool outputs in place, no
     // summary message, no LLM spend. Tried on a clone so an insufficient
     // prune discards cleanly and the summarizer below still sees the
-    // original span. An explicit hook summary always wins.
+    // original span. An explicit hook summary always wins. With
+    // `TYPESAFE_API_KEY` + a config `jev:` table, the real Typesafe Jev
+    // scorer replaces the heuristic; any live failure falls back to the
+    // heuristic inside `prune_span`.
     if hook.summary.is_none() && jev_prune {
+        let creds = crate::agent::jev::live_credentials();
+        let scorer = if creds.is_some() {
+            crate::agent::jev::Scorer::Jev
+        } else {
+            crate::agent::jev::Scorer::Heuristic
+        };
+        let live = creds
+            .as_ref()
+            .map(|(endpoint, key)| crate::agent::jev::LiveScorer {
+                endpoint,
+                api_key: key,
+            });
         let mut candidate = messages.clone();
-        let stats = crate::agent::jev::prune_span(&mut candidate, boundary_start, first_kept);
+        let stats = crate::agent::jev::prune_span(
+            &mut candidate,
+            boundary_start,
+            first_kept,
+            scorer,
+            live.as_ref(),
+        )
+        .await;
         if crate::agent::jev::is_worthwhile(&stats) {
             crate::log!(
                 Info,
@@ -1226,5 +1248,136 @@ mod tests {
                 .any(|m| m.name.as_deref() == Some("summary")),
             "threshold without DEX_COMPACTION=jev must summarize, not prune"
         );
+    }
+
+    /// Live end-to-end: `DEX_COMPACTION=jev` + `TYPESAFE_API_KEY` + a
+    /// config `jev:` table sends the span's pairs to the (mock) systemone
+    /// endpoint and prunes by the noul verdicts — no summary, no LLM
+    /// summarizer usage.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env must stay set across the compaction await
+    async fn live_jev_compaction_uses_the_typesafe_api() {
+        use std::sync::{Arc, Mutex};
+
+        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
+
+        // Mock systemone: `read` pairs (even offsets) → drop everything;
+        // `bash` pairs (odd) → keep call, drop result. The endpoint's
+        // verdicts drive the prune, not the heuristic's tool registry.
+        let log: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let app_log = log.clone();
+        let handler = move |axum::extract::State(log): axum::extract::State<
+            Arc<Mutex<Vec<serde_json::Value>>>,
+        >,
+                            body: String| async move {
+            let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+            log.lock().unwrap().push(request.clone());
+            let mut answers = serde_json::Map::new();
+            for id in request["questions"].as_object().unwrap().keys() {
+                // Even pairs (read): noul 0 → drop both halves. Odd pairs
+                // (bash): keep the call (1.0), drop the result (0.0).
+                let even_pair = ["p0_", "p2_", "p4_"].iter().any(|p| id.starts_with(p));
+                let noul = if even_pair || id.ends_with("_result_needed_verbatim") {
+                    0.0
+                } else {
+                    1.0
+                };
+                answers.insert(
+                    id.clone(),
+                    serde_json::json!({"type": "noul", "noul": noul}),
+                );
+            }
+            axum::Json(serde_json::json!({"model": "jev-test", "answers": answers}))
+        };
+        let app = axum::Router::new()
+            .route("/v1/systemone", axum::routing::post(handler))
+            .with_state(app_log);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = format!("http://{addr}/v1/systemone");
+
+        // Config file with the `jev:` table + key env: the opt-in gate.
+        let dir = std::env::temp_dir().join("dex-jev-e2e-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.yaml");
+        std::fs::write(&cfg_path, format!("jev:\n  url: {endpoint}\n")).unwrap();
+        crate::llm::config::invalidate_config_cache();
+        let _cfg_env = EnvRestore::take(&["DEX_CONFIG"]);
+        std::env::set_var("DEX_CONFIG", &cfg_path);
+        let _key_env = EnvRestore::take(&["TYPESAFE_API_KEY"]);
+        std::env::set_var("TYPESAFE_API_KEY", "sk-test");
+
+        std::env::set_var("DEX_COMPACTION", "jev");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        for i in 0..6 {
+            let tool = if i % 2 == 0 { "read" } else { "bash" };
+            messages.push(ChatMessage::assistant_calls(
+                None,
+                vec![LlmToolCall {
+                    id: format!("c{i}"),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: tool.into(),
+                        arguments: format!("{{\"path\":\"f{i}.rs\"}}"),
+                    },
+                }],
+            ));
+            messages.push(ChatMessage::tool_result(
+                format!("c{i}"),
+                "x".repeat(12_000),
+            ));
+        }
+        for i in 0..KEEP_RECENT_MESSAGES {
+            messages.push(msg(Role::User, &format!("recent {i}")));
+        }
+        let summarizer = crate::agent::jev::summary_mode();
+        let (compacted, usage) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+            summarizer.prunes_jev(),
+            summarizer,
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "live jev must prune a tool-heavy span");
+        assert!(usage.is_none(), "pruning spends no summarizer tokens");
+        assert!(!messages
+            .iter()
+            .any(|m| m.name.as_deref() == Some("summary")));
+
+        // The endpoint saw the span's pairs: 6 result questions per request.
+        let log = log.lock().unwrap();
+        assert!(!log.is_empty(), "the mock endpoint must have been called");
+        let questions = log[0]["questions"].as_object().unwrap();
+        assert!(questions
+            .keys()
+            .any(|k| k.ends_with("_result_needed_verbatim")));
+        assert_eq!(log[0]["model"], crate::agent::jev::JEV_MODEL);
+        drop(log);
+
+        // Endpoint verdicts applied: even (read) pairs dropped entirely,
+        // odd (bash) results truncated, recent users untouched.
+        assert!(!messages.iter().any(|m| m
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|id| id == "c0" || id == "c2")));
+        assert!(messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("c1")
+                && m.content_str().contains("jev: truncated")));
+        assert!(messages
+            .iter()
+            .any(|m| m.content_str() == "goal: build the thing"));
+
+        crate::llm::config::invalidate_config_cache();
     }
 }
