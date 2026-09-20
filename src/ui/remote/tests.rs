@@ -156,7 +156,7 @@ fn skills_listing_wraps_within_terminal_width() {
         .collect();
     let line = skills_listing_line(&skills).expect("non-empty skills produce a line");
     let width = 40u16;
-    let rows = crate::ui::render::wrap_line_display(&line, width);
+    let rows = crate::ui::render::wrap_line_display(&line, width, 0);
     assert!(rows.len() > 1, "long listing must wrap into multiple rows");
     for row in &rows {
         assert!(
@@ -196,7 +196,7 @@ fn skills_listing_hard_breaks_overlong_single_name() {
     // One unbroken word (no whitespace) wider than the terminal must be
     // hard-split rather than overflow.
     let line = skills_listing_line(&[skill(&"x".repeat(120))]).expect("one skill");
-    let rows = crate::ui::render::wrap_line_display(&line, 40);
+    let rows = crate::ui::render::wrap_line_display(&line, 40, 0);
     assert!(rows.len() > 1, "overlong single name must hard-break");
     for row in &rows {
         assert!(row_width(row) <= 40, "row overflow: {}", row_width(row));

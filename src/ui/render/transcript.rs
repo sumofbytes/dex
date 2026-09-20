@@ -1,3 +1,4 @@
+use super::super::style::INPUT_PROMPT_WIDTH;
 use super::super::transcript_indent;
 use super::super::App;
 use super::super::Selection;
@@ -55,18 +56,21 @@ fn surface_pad_row(width: usize, bg: Color) -> Line<'static> {
 
 /// Wrap + pad a surface's stored lines: every row padded out to the full
 /// width in `bg`, with `pad` blank air rows above and below the content.
+/// `first_row_overhang` narrows the first row (the echoed prompt glyph);
+/// see `wrap_line_display`.
 /// Single source for the user-prompt and tool-step arms of `wrap_block`,
-/// which differ only in pad count.
+/// which differ only in pad count and overhang.
 fn surface_rows(
     lines: impl IntoIterator<Item = Line<'static>>,
     width: u16,
     pad: usize,
+    first_row_overhang: usize,
 ) -> Vec<Line<'static>> {
     let bg = Color::Reset;
     let w = width.max(1) as usize;
     let mut rows: Vec<Line<'static>> = lines
         .into_iter()
-        .flat_map(|l| wrap_line_display(&l, width))
+        .flat_map(|l| wrap_line_display(&l, width, first_row_overhang))
         .map(|r| paint_surface_row(r, w, bg))
         .collect();
     for _ in 0..pad {
@@ -86,13 +90,21 @@ pub(crate) fn wrap_block(
         super::super::TranscriptBlock::User { lines, .. } => {
             // No band: the prompt keeps the terminal's own background and is
             // framed by the composer's hairline rules, not a shaded strip.
-            // `INPUT_PAD_Y` air matches the live composer's shape.
-            surface_rows(lines.clone(), width, super::super::INPUT_PAD_Y as usize)
+            // `INPUT_PAD_Y` air matches the live composer's shape, and the
+            // first row wraps `INPUT_PROMPT_WIDTH` narrower for the echoed
+            // glyph — the same wrap the live composer applies, so typed and
+            // submitted prompts reflow identically.
+            surface_rows(
+                lines.clone(),
+                width,
+                super::super::INPUT_PAD_Y as usize,
+                INPUT_PROMPT_WIDTH,
+            )
         }
         super::super::TranscriptBlock::Tool { .. } => {
             // Each tool step carries its own air row top/bottom so the
             // content clears the edge; gaps between steps stay terminal bg.
-            surface_rows(block.lines().into_iter().cloned(), width, 1)
+            surface_rows(block.lines().into_iter().cloned(), width, 1, 0)
         }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
@@ -111,7 +123,7 @@ pub(crate) fn wrap_block(
         _ => block
             .lines()
             .into_iter()
-            .flat_map(|l| wrap_line_display(l, width))
+            .flat_map(|l| wrap_line_display(l, width, 0))
             .collect(),
     }
 }
@@ -464,7 +476,18 @@ fn pad_row(line: &mut Line<'static>, width: u16, hl: Style) {
     }
 }
 
-pub(crate) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
+/// Wrap a stored transcript line to `width` display cells, keeping the
+/// leading transcript indent (re-applied per row), expanding tabs, and
+/// dropping C0 controls. `first_row_overhang` carves that many leading
+/// cells (the echoed `❯ ` glyph) out of the wrapped body and re-applies
+/// them to the first row only — exactly like the indent — so the body's
+/// row-0 wrap width is reduced by the glyph once, matching the live
+/// composer's narrower row-0 wrap; callers without a glyph pass 0.
+pub(crate) fn wrap_line_display(
+    line: &Line<'static>,
+    width: u16,
+    first_row_overhang: usize,
+) -> Vec<Line<'static>> {
     let w = width.max(1) as usize;
     let output_indent = line.spans.first().is_some_and(|span| {
         span.content.as_ref() == transcript_indent() && span.style.bg.is_none()
@@ -505,9 +528,34 @@ pub(crate) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
         }
     }
 
+    // Carve off the echoed glyph — the first `first_row_overhang` body
+    // cells after the indent. Like the indent, it is re-applied per row
+    // (row 0 only), so it must not also count inside the wrapped body;
+    // otherwise row 0 wraps a glyph narrower than the composer's.
+    let mut glyph: Vec<(String, Style)> = Vec::new();
+    let mut glyph_width = 0usize;
+    for _ in 0..first_row_overhang {
+        let Some((symbol, _, _)) = raw.first() else {
+            break;
+        };
+        let width = symbol
+            .chars()
+            .map(|c| c.width().unwrap_or(0))
+            .sum::<usize>()
+            .max(1);
+        let (text, style, _) = raw.remove(0);
+        glyph_width += width;
+        glyph.push((text, style));
+        if glyph_width >= first_row_overhang {
+            break;
+        }
+    }
+
     let mut rows: Vec<Vec<Unit>> = Vec::new();
     let mut row = Vec::new();
-    let mut row_width = indent_width;
+    // Row 0 starts already carrying the transcript indent plus the echoed
+    // glyph, so its wrap width is reduced by both.
+    let mut row_width = (indent_width + glyph_width).min(w);
     let mut last_space: Option<usize> = None;
     for (symbol, style, is_tab) in raw {
         // Tab width is relative to the current column (row_width).
@@ -535,6 +583,8 @@ pub(crate) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
                 rows.push(row);
                 row = Vec::new();
             }
+            // Only the first wrapped row is narrowed; continuations get the
+            // full width (minus the indent), like the composer.
             row_width = indent_width + row.iter().map(|u: &Unit| u.width).sum::<usize>();
             last_space = None;
             if is_tab {
@@ -555,10 +605,18 @@ pub(crate) fn wrap_line_display(line: &Line<'static>, width: u16) -> Vec<Line<'s
 
     let out: Vec<Line<'static>> = rows
         .into_iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(i, row)| {
             let mut spans = Vec::new();
             if output_indent {
                 spans.push(Span::raw(" ".repeat(indent_width)));
+            }
+            if i == 0 {
+                spans.extend(
+                    glyph
+                        .iter()
+                        .map(|(text, style)| Span::styled(text.clone(), *style)),
+                );
             }
             spans.extend(row.into_iter().map(|u| Span::styled(u.text, u.style)));
             Line::from(spans)
