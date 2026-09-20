@@ -6,6 +6,7 @@ use super::super::App;
 use super::activity::ActivityView;
 use super::activity::QueueGroup;
 use super::composer::ComposerView;
+use super::composer_band;
 use super::preview::render_approval_detail;
 use super::UiLayout;
 use ratatui::layout::Constraint;
@@ -30,9 +31,7 @@ struct FooterView;
 
 impl FooterView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
-        let width = area
-            .width
-            .saturating_sub(super::super::HORIZONTAL_GUTTER * 2);
+        let width = super::input_content_width(area.width);
         let line = footer_line(app, width);
         // Status row sits on the last screen row: top gutter only. The
         // terminal adds its own dead space below the grid, and the old
@@ -73,12 +72,14 @@ impl SlashSuggestionsView {
         // 2-wide marker gutter when copying a command, as with any picker
         // affordance). One blank gutter row sits between the header text
         // and the first command so the list breathes instead of butting the
-        // header.
-        let height = (visible as u16 + 3).min(area.y);
-        if height < 4 {
+        // header. Sheet chrome: rule + header + blank gutter = 3 rows above
+        // the list.
+        const SHEET_CHROME_ROWS: u16 = 3;
+        let height = (visible as u16 + SHEET_CHROME_ROWS).min(area.y);
+        if height < SHEET_CHROME_ROWS + 1 {
             return;
         }
-        visible = visible.min(height.saturating_sub(3) as usize);
+        visible = visible.min((height - SHEET_CHROME_ROWS) as usize);
         if visible == 0 {
             return;
         }
@@ -88,12 +89,13 @@ impl SlashSuggestionsView {
             .saturating_sub(visible.saturating_sub(1))
             .min(max_start);
         let window = &suggestions[start..start + visible];
-        // Sheet width matches the composer minus its left gutter: the labels
-        // share the composer's text column (glyph + gap to the left). Inside
-        // a picker (`/model `, `/provider `, `/resume …`) rows show just
-        // the item (`> gpt-5`), not the repeated command (`/model <item>`)
-        // — the header already names the picker.
-        let width = area.width.saturating_sub(super::super::HORIZONTAL_GUTTER);
+        // Sheet width matches the composer band minus its left gutter: the
+        // labels share the composer's text column (glyph + gap to the left).
+        // Inside a picker (`/model `, `/provider `, `/resume …`) rows show
+        // just the item (`> gpt-5`), not the repeated command (`/model
+        // <item>`) — the header already names the picker.
+        let band = composer_band(area);
+        let width = band.width.saturating_sub(super::super::HORIZONTAL_GUTTER);
         let avail = width.saturating_sub(2) as usize;
         let cmd_col = window
             .iter()
@@ -103,7 +105,7 @@ impl SlashSuggestionsView {
             .min(48)
             .min(avail.max(1));
         let popup = Rect {
-            x: area.x + super::super::HORIZONTAL_GUTTER,
+            x: band.x,
             y: area.y - height,
             width,
             height,
@@ -172,38 +174,34 @@ impl SlashSuggestionsView {
         // Single `─` rule across the top is the sheet's only border: it
         // separates the popup from the transcript without side/corner
         // glyphs, and a stray leading `────` line is the only copy artifact.
-        // The row at `popup.y + 2` stays cleared (blank gutter) so the first
-        // command at `+ 3` doesn't butt the header text at `+ 1`.
+        // The row at `+ 2` stays cleared (blank gutter) so the first command
+        // at `+ 3` doesn't butt the header text at `+ 1`.
+        let sheet_row = |dy: u16| Rect {
+            x: popup.x,
+            y: popup.y + dy,
+            width: popup.width,
+            height: 1,
+        };
         f.render_widget(Clear, popup);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(inner_w),
                 Style::default().fg(theme::hairline_fg()),
             ))),
-            Rect {
-                x: popup.x,
-                y: popup.y,
-                width: popup.width,
-                height: 1,
-            },
+            sheet_row(0),
         );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 header_text,
                 Style::default().fg(theme::muted_fg()),
             ))),
-            Rect {
-                x: popup.x,
-                y: popup.y + 1,
-                width: popup.width,
-                height: 1,
-            },
+            sheet_row(1),
         );
         f.render_widget(
             List::new(items),
             Rect {
                 x: popup.x,
-                y: popup.y + 3,
+                y: popup.y + SHEET_CHROME_ROWS,
                 width: popup.width,
                 height: visible as u16,
             },

@@ -24,6 +24,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::block::Padding;
 use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 #[cfg(test)]
 use ratatui::widgets::Paragraph;
@@ -55,10 +56,7 @@ pub(super) use transcript::TranscriptView;
 
 // Test-only helpers from the children (rendered-view unit tests below).
 #[cfg(test)]
-pub(crate) use activity::pending_queue_metrics;
-#[cfg(test)]
 pub(crate) use activity::QUEUE_MAX_ITEM_ROWS;
-#[cfg(test)]
 #[cfg(test)]
 pub(crate) use markdown::highlight_code_block;
 #[cfg(test)]
@@ -79,25 +77,38 @@ pub(super) fn surface_padding() -> Padding {
     }
 }
 
+/// The composer band inset one `HORIZONTAL_GUTTER` column from each window
+/// edge, so its top/bottom rules never touch the screen border. The inset
+/// *is* the text column: `input_block` adds no horizontal padding, so the
+/// band's inner left edge sits on the shared transcript indent and its inner
+/// width equals `input_content_width` of the full area.
+pub(super) fn composer_band(area: Rect) -> Rect {
+    Rect {
+        x: area.x + super::HORIZONTAL_GUTTER,
+        y: area.y,
+        width: area.width.saturating_sub(super::HORIZONTAL_GUTTER * 2),
+        height: area.height,
+    }
+}
+
 pub(super) fn input_block() -> Block<'static> {
-    // Borderless composer: one `surface_bg()` band separating the transcript
-    // above from the status line below (no rules, no side borders). The
-    // padding is the shared `HORIZONTAL_GUTTER`, so the caret and the
-    // transcript's leading indent land on the same cell (no prompt glyph —
-    // the text column is the left edge); the right pad just keeps the cursor
-    // off the last cell.
+    // Borderless sides, hairline rules top and bottom: the composer is a
+    // band on the terminal's own background (no surface fill — the
+    // transcript's user band has none either), framed by two `─` rules in
+    // the shared `hairline_fg()` so it reads as an edge, not a box. The
+    // band is already inset one column from the window edges
+    // (`composer_band`), which supplies both the rules' air and the text
+    // column, so the block adds no horizontal padding and the caret and
+    // the transcript's leading indent land on the same cell. No vertical
+    // padding: the empty composer is one text row between the two rules
+    // and grows only as the input wraps.
     Block::default()
-        .style(Style::default().bg(theme::surface_bg()))
-        .padding(Padding {
-            left: super::HORIZONTAL_GUTTER,
-            right: super::HORIZONTAL_GUTTER,
-            top: super::INPUT_PAD_Y,
-            bottom: super::INPUT_PAD_Y,
-        })
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(theme::hairline_fg()))
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {
-    content_rows + super::INPUT_BORDER_ROWS + super::INPUT_PAD_Y * 2
+    content_rows + super::INPUT_BORDER_ROWS
 }
 
 pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
@@ -241,7 +252,7 @@ fn composer_text_carries_user_voice() {
     let input = InputField::from_text("hello");
     let (active, _) = render_input(&input, 40, false);
     let text: String = active[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, "hello");
+    assert_eq!(text, "❯ hello");
     assert!(active[0]
         .spans
         .iter()
