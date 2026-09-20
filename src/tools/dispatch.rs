@@ -168,9 +168,8 @@ async fn dispatch_tool(
         Some(meta) => {
             // A `write`/`edit` carrying `then_run` also runs a shell
             // command, so it must clear the *shell* gate rather than the weaker
-            // write gate — `ask-shell` passes file mutations unprompted, which
-            // would otherwise make an `edit` with `then_run` a way to run a
-            // command unapproved.
+            // write gate — `bash` is not the write gate, and an `edit` with
+            // `then_run` must not become a way to run a command unapproved.
             if then_run.is_some() {
                 PermissionRequirement::Shell
             } else {

@@ -94,6 +94,28 @@ impl Session {
         state
     }
 
+    /// Agent mode recorded on the most recent `turn_start` (see
+    /// `turn_event_with_mode`): the client's last selector, restored on
+    /// reattach. `None` for legacy journals and subagent turns.
+    pub(crate) fn last_turn_mode(path: &Path) -> Option<String> {
+        let mut mode: Option<String> = None;
+        let scan = super::for_each_line(path, |line| {
+            if !line.contains("\"type\":\"turn_start\"") {
+                return;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+                return;
+            };
+            if let Some(m) = value.get("mode").and_then(Value::as_str) {
+                mode = Some(m.to_string());
+            }
+        });
+        if scan.is_err() {
+            return None;
+        }
+        mode
+    }
+
     /// Single-pass listing summary (perf doc §31): `(message_count,
     /// turn_state)` with `load_messages_from_session` / `last_turn_state`
     /// semantics — one open, one scan. Lines that can carry neither (effect,

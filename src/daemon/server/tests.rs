@@ -217,6 +217,7 @@ mod handler_tests {
             base_url: None,
             model: None,
             permission: None,
+            mode: None,
             headers: None,
             plan: None,
             system_prompt: None,
@@ -1523,6 +1524,21 @@ mod permission_gate_tests {
         let id = session.id().to_string();
         drop(session);
 
+        // Deterministic provider config for the pass-through case: fake key
+        // plus a per-request unroutable base URL (connection refused, no
+        // network) — endpoint overrides are per-request/file, never env.
+        // Set before the state exists: the ceiling is resolved once at
+        // `DaemonState::new()` (§3.1), so a later env change must not move it.
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["DEX_PERMISSION", "DEX_PROVIDER", "OPENCODE_API_KEY"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
+        let _env2 = crate::session::EnvGuard(saved);
+        std::env::set_var("DEX_PERMISSION", "read-only");
+        std::env::set_var("DEX_PROVIDER", "opencode");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+
         let state = Arc::new(DaemonState::new());
         state.sessions.lock().unwrap().insert(
             id.clone(),
@@ -1541,27 +1557,27 @@ mod permission_gate_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let cancel = CancellationToken::new();
 
-        // Deterministic provider config for the pass-through case: fake key
-        // plus a per-request unroutable base URL (connection refused, no
-        // network) — endpoint overrides are per-request/file, never env.
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            ["DEX_PERMISSION", "DEX_PROVIDER", "OPENCODE_API_KEY"]
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
-        let _env2 = crate::session::EnvGuard(saved);
-        std::env::set_var("DEX_PERMISSION", "read-only");
-        std::env::set_var("DEX_PROVIDER", "opencode");
-        std::env::set_var("OPENCODE_API_KEY", "test-key");
-
         let mk_req = |permission: Option<&str>, plan: Option<&str>| ChatRequest {
             prompt: "go".into(),
             skill_dirs: vec![],
             base_url: Some("http://127.0.0.1:9".to_string()),
             model: None,
             permission: permission.map(String::from),
+            mode: None,
             headers: None,
             plan: plan.map(String::from),
+            system_prompt: None,
+            thinking_effort: None,
+        };
+        let mk_mode_req = |mode: &str| ChatRequest {
+            prompt: "go".into(),
+            skill_dirs: vec![],
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            model: None,
+            permission: None,
+            mode: Some(mode.to_string()),
+            headers: None,
+            plan: None,
             system_prompt: None,
             thinking_effort: None,
         };
@@ -1614,6 +1630,51 @@ mod permission_gate_tests {
         .await
         .unwrap_err();
         assert!(err.contains("invalid plan JSON"), "got: {err}");
+
+        // 4. `mode` is the authority when present: a client in `auto`
+        // (derives trusted) against the read-only daemon is rejected even
+        // though it sent no `permission`.
+        let err = run_turn_inner(
+            &state,
+            &id,
+            &mk_mode_req("auto"),
+            &cancel,
+            &tx,
+            TurnChannels::detached(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("escalation denied"), "got: {err}");
+
+        // 5. `plan` derives read-only, which is within the ceiling: the gate
+        // passes and the turn fails later, at the LLM call.
+        let err = run_turn_inner(
+            &state,
+            &id,
+            &mk_mode_req("plan"),
+            &cancel,
+            &tx,
+            TurnChannels::detached(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.contains("escalation denied"),
+            "plan mode must not trip the ceiling gate: {err}"
+        );
+
+        // 6. A malformed mode is rejected up front.
+        let err = run_turn_inner(
+            &state,
+            &id,
+            &mk_mode_req("nonsense"),
+            &cancel,
+            &tx,
+            TurnChannels::detached(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("invalid mode"), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_file(&path);
@@ -2342,7 +2403,9 @@ mod e2e_tests {
         assert_eq!(resp.status(), 200);
         let info: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(info["provider"], "opencode");
-        assert_eq!(info["permission"], "ask-writes");
+        // `ask-writes` is the deprecated spelling of `ask`; `as_str` never
+        // emits it, so `/api/config` reports the canonical value.
+        assert_eq!(info["permission"], "ask");
         assert_eq!(
             info["cwd"],
             std::env::current_dir()

@@ -373,6 +373,8 @@ fn test_remote() -> RemoteApp {
         client: DaemonClient::new("http://127.0.0.1:9").expect("test client builds"),
         session_id: "test".to_string(),
         options: ChatOptions::default(),
+        mode: AgentMode::Manual,
+        ceiling: PermissionMode::Trusted,
         worker_tx,
         worker_rx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -866,4 +868,115 @@ fn every_documented_command_is_handled_remotely() {
             "{name} fell through to the local unknown-command arm: {text}"
         );
     }
+}
+
+// --- Agent mode cycling (Shift+Tab) -----------------------------------------
+
+fn back_tab() -> crossterm::event::KeyEvent {
+    key(KeyCode::BackTab, KeyModifiers::SHIFT)
+}
+
+fn shift_tab() -> crossterm::event::KeyEvent {
+    key(KeyCode::Tab, KeyModifiers::SHIFT)
+}
+
+#[test]
+fn back_tab_cycles_plan_manual_auto() {
+    let mut remote = test_remote();
+    remote.mode = AgentMode::Plan;
+    remote.app.config.permission = AgentMode::Plan.permission();
+
+    handle_key(&mut remote, back_tab());
+    assert_eq!(remote.mode, AgentMode::Manual);
+    assert_eq!(remote.app.config.permission, PermissionMode::Ask);
+    assert_eq!(remote.options.mode.as_deref(), Some("manual"));
+    assert_eq!(remote.options.permission.as_deref(), Some("ask"));
+
+    handle_key(&mut remote, back_tab());
+    assert_eq!(remote.mode, AgentMode::Auto);
+    assert_eq!(remote.app.config.permission, PermissionMode::Trusted);
+
+    // auto → plan wraps.
+    handle_key(&mut remote, back_tab());
+    assert_eq!(remote.mode, AgentMode::Plan);
+    assert_eq!(remote.app.config.permission, PermissionMode::ReadOnly);
+    assert_eq!(remote.options.permission.as_deref(), Some("read-only"));
+
+    // A notice names the mode for two seconds.
+    let (text, _) = remote.app.notice.clone().expect("a notice is pushed");
+    assert_eq!(text, "mode: plan");
+}
+
+#[test]
+fn shift_tab_cycles_too_for_terminals_forwarding_the_pair() {
+    let mut remote = test_remote();
+    remote.mode = AgentMode::Plan;
+    handle_key(&mut remote, shift_tab());
+    assert_eq!(remote.mode, AgentMode::Manual);
+}
+
+#[test]
+fn back_tab_clamps_at_the_daemon_ceiling() {
+    // The daemon allows `ask` (manual); auto must be unreachable and the
+    // cycle must report why instead of silently wrapping past the boundary.
+    let mut remote = test_remote();
+    remote.mode = AgentMode::Manual;
+    remote.ceiling = PermissionMode::Ask;
+    remote.app.config.permission = PermissionMode::Ask;
+
+    handle_key(&mut remote, back_tab());
+    assert_eq!(remote.mode, AgentMode::Manual, "auto is clamped away");
+    assert_eq!(remote.app.config.permission, PermissionMode::Ask);
+    let (text, _) = remote
+        .app
+        .notice
+        .clone()
+        .expect("a notice explains the clamp");
+    assert!(text.contains("ceiling"), "{text}");
+    assert!(text.contains("ask"), "{text}");
+}
+
+#[test]
+fn back_tab_is_inert_while_an_approval_is_parked() {
+    let mut remote = test_remote();
+    remote.mode = AgentMode::Manual;
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    remote
+        .app
+        .pending_approvals
+        .push(crate::ui::PendingApproval::new(
+            "bash".into(),
+            "{}".into(),
+            tx,
+            None,
+        ));
+    handle_key(&mut remote, back_tab());
+    assert_eq!(remote.mode, AgentMode::Manual, "approval owns the keys");
+}
+
+#[test]
+fn back_tab_works_with_the_slash_popup_open() {
+    // It is global chrome like Alt+V: with the popup open it still cycles
+    // and does not dismiss the draft.
+    let mut remote = test_remote();
+    remote.mode = AgentMode::Plan;
+    remote.app.config.permission = PermissionMode::ReadOnly;
+    remote.app.input.insert_paste("/mod");
+    handle_key(&mut remote, back_tab());
+    assert_eq!(remote.mode, AgentMode::Manual);
+    assert_eq!(remote.app.input.text(), "/mod", "the draft survives");
+}
+
+#[test]
+fn plain_tab_still_completes_in_the_slash_popup() {
+    // Only Shift+Tab is the mode cycle; a bare Tab must keep completing the
+    // highlighted slash suggestion.
+    let mut remote = test_remote();
+    remote.mode = AgentMode::Plan;
+    remote.app.config.permission = PermissionMode::ReadOnly;
+    remote.app.input.insert_paste("/cle");
+    assert!(crate::ui::slash::popup_open(&remote.app));
+    handle_key(&mut remote, key(KeyCode::Tab, KeyModifiers::empty()));
+    assert_eq!(remote.mode, AgentMode::Plan, "Tab must not cycle the mode");
+    assert_eq!(remote.app.input.text(), "/clear ");
 }
