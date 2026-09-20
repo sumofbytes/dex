@@ -165,9 +165,9 @@ fn leading_border_range(line: &Line<'static>) -> (usize, usize) {
 fn copy_text(line: &Line<'static>) -> String {
     let (start, end) = leading_border_range(line);
     if start == end {
-        // Surface-band rows are padded to the full width with `surface_bg()`
-        // spaces so the submitted prompt reads as the composer's echo;
-        // strip that display fill so copies stay clean.
+        // Composer rows are padded to the full width so the submitted
+        // prompt reads as the composer's echo; strip that display fill so
+        // copies stay clean.
         return line
             .spans
             .iter()

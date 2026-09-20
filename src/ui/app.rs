@@ -16,17 +16,24 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 pub(crate) const VERTICAL_GUTTER: u16 = 1;
-/// Left/right air shared by every full-width surface (composer, footer,
-/// queue strip, slash popup) and the transcript's leading indent, so rendered
-/// transcript text and the composer's text column always start on the same
-/// cell. The composer's surface band is painted across the whole row (flush to
-/// the window edge), so this is the box's *inside* padding — there is no
-/// separate outer margin to shrink. Tuning it moves the composer cursor and
-/// the transcript indent together, which is what keeps them aligned.
-pub(crate) const HORIZONTAL_GUTTER: u16 = 2;
+/// Left air shared by every full-width surface (footer, queue strip, slash
+/// popup) and the transcript's leading indent, so rendered transcript text
+/// and the composer's text column always start on the same cell. The
+/// composer's band is inset `HORIZONTAL_GUTTER` from each window edge (see
+/// `composer_band`) and adds no inside horizontal padding, so its rules get
+/// one column of air while its text column lands on the transcript indent.
+/// Tuning it moves the composer cursor and the transcript indent together,
+/// which is what keeps them aligned.
+pub(crate) const HORIZONTAL_GUTTER: u16 = 1;
 pub(crate) const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
-pub(crate) const INPUT_BORDER_ROWS: u16 = 0;
+pub(crate) const INPUT_BORDER_ROWS: u16 = 2;
 pub(crate) const INPUT_PAD_Y: u16 = 1;
+/// Prompt glyph shown on the composer's first row and echoed on the first
+/// row of the submitted prompt, so your turns read as yours in the
+/// transcript. Width counts the trailing space; wrap width and the row-0
+/// cursor x are offset by it.
+pub(crate) const INPUT_PROMPT: &str = "❯ ";
+pub(crate) const INPUT_PROMPT_WIDTH: usize = 2;
 pub(crate) const STATUS_CONTENT_ROWS: u16 = 1;
 pub(crate) const INPUT_MIN_ROWS: u16 = 3;
 pub(crate) const INPUT_STATUS_GUTTER: u16 = 0;

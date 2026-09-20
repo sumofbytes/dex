@@ -85,13 +85,6 @@ pub(crate) fn queue_metrics_of(groups: &[QueueGroup]) -> QueueMetrics {
     }
 }
 
-/// Items and content rows the strip renders, straight from `queue_groups`
-/// so sizing can't drift from the drawing.
-#[cfg(test)]
-pub(crate) fn pending_queue_metrics(app: &App) -> QueueMetrics {
-    queue_metrics_of(&queue_groups(app))
-}
-
 impl ActivityView {
     /// The queue groups come from `view` (built once per frame, §29) —
     /// rebuilding them here doubled the per-frame queue cost.
@@ -107,9 +100,7 @@ impl ActivityView {
         if groups.is_empty() {
             return;
         }
-        let content_width = area
-            .width
-            .saturating_sub(super::super::HORIZONTAL_GUTTER * 2);
+        let content_width = super::input_content_width(area.width);
         let style = Style::default().fg(Color::Yellow);
         // Blank separator between groups only — a group's continuation
         // rows sit directly under their badge.
