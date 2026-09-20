@@ -1,10 +1,10 @@
 use super::super::status::truncate_display;
+use super::super::style::fg;
 use super::super::style::surface_padding;
+use super::super::theme;
 use super::super::App;
 use super::QueueMetrics;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
@@ -101,7 +101,7 @@ impl ActivityView {
             return;
         }
         let content_width = super::super::style::content_width(area.width);
-        let style = Style::default().fg(Color::Yellow);
+        let style = fg(theme::warn_fg());
         // Blank separator between groups only — a group's continuation
         // rows sit directly under their badge.
         let mut rows: Vec<Line<'static>> = Vec::new();

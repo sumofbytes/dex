@@ -3,6 +3,7 @@ use super::status::footer_line;
 #[cfg(test)]
 use super::status::truncate_display;
 use super::style::content_width as input_content_width;
+use super::style::fg;
 #[cfg(test)]
 use super::style::TRANSCRIPT_INDENT;
 use super::theme;
@@ -18,7 +19,6 @@ use ratatui::layout::Layout;
 use ratatui::layout::Rect;
 #[cfg(test)]
 use ratatui::style::Color;
-use ratatui::style::Style;
 #[cfg(test)]
 use ratatui::text::Line;
 #[cfg(test)]
@@ -81,7 +81,7 @@ pub(super) fn input_block() -> Block<'static> {
     // and grows only as the input wraps.
     Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(theme::hairline_fg()))
+        .border_style(fg(theme::hairline_fg()))
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {

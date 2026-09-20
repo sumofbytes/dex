@@ -1,7 +1,7 @@
+use super::super::style::fg;
 use super::super::theme;
 use crate::ui::theme::highlight;
 use crate::ui::theme::markdown as md;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui_markdown::markdown::MarkdownBlock;
@@ -158,7 +158,7 @@ struct CopySafeCodeHooks;
 
 impl RenderHooks for CopySafeCodeHooks {
     fn render_code_block(&self, lang: &str, content: &str) -> Option<Vec<Line<'static>>> {
-        let dim = Style::default().fg(theme::muted_fg());
+        let dim = fg(theme::muted_fg());
         let mut lines = Vec::new();
         if !lang.is_empty() {
             lines.push(Line::from(Span::styled(format!("  {lang}"), dim)));

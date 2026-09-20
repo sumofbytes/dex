@@ -1,3 +1,4 @@
+use crate::ui::fg;
 use std::io::{self, IsTerminal};
 
 use super::super::push_banner;
@@ -34,7 +35,6 @@ use crossterm::execute;
 use crossterm::terminal::enable_raw_mode;
 use crossterm::terminal::EnterAlternateScreen;
 use ratatui::backend::CrosstermBackend;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::Terminal;
@@ -95,7 +95,7 @@ pub(crate) fn push_skills_listing(app: &mut App) {
             Line::from(Span::styled(
                 "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
                     .to_string(),
-                Style::default().fg(super::super::theme::muted_fg()),
+                fg(super::super::theme::muted_fg()),
             )),
         ),
     }
@@ -110,7 +110,7 @@ pub(crate) fn skills_listing_line(skills: &[crate::protocol::Skill]) -> Option<L
         names.push_str(", ");
         names.push_str(&skill.name);
     }
-    let muted = Style::default().fg(super::super::theme::muted_fg());
+    let muted = fg(super::super::theme::muted_fg());
     Some(Line::from(vec![
         Span::styled(format!("skills loaded ({}): ", skills.len()), muted),
         Span::styled(names, muted),
@@ -127,7 +127,7 @@ pub(crate) fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
             "ready in {}",
             crate::ui::format::format_duration(elapsed_secs)
         ),
-        Style::default().fg(super::super::theme::muted_fg()),
+        fg(super::super::theme::muted_fg()),
     )])
 }
 

@@ -42,16 +42,16 @@ pub(crate) fn approval_risk_with_then_run(
     name: &str,
     has_then_run: bool,
 ) -> (&'static str, ratatui::style::Color) {
-    use ratatui::style::Color;
+    use crate::ui::theme::{failure_fg, success_fg, warn_fg};
     // A `then_run` turns a file mutation into a shell command; the approver
     // must see the same "high" risk as a bare `bash`.
     if matches!(name, "write" | "edit") && has_then_run {
-        return ("high", Color::LightRed);
+        return ("high", failure_fg());
     }
     match name {
-        "bash" => ("high", Color::LightRed),
-        "write" | "edit" => ("medium", Color::Yellow),
-        _ => ("low", Color::LightGreen),
+        "bash" => ("high", failure_fg()),
+        "write" | "edit" => ("medium", warn_fg()),
+        _ => ("low", success_fg()),
     }
 }
 
