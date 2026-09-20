@@ -1,6 +1,8 @@
 use super::super::slash;
 use super::super::status::footer_line;
 use super::super::status::truncate_display;
+use super::super::style::fg;
+use super::super::style::{composer_band, content_width, status_padding};
 use super::super::theme;
 use super::super::App;
 use super::activity::ActivityView;
@@ -30,20 +32,13 @@ struct FooterView;
 
 impl FooterView {
     fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
-        let width = area
-            .width
-            .saturating_sub(super::super::HORIZONTAL_GUTTER * 2);
+        let width = content_width(area.width);
         let line = footer_line(app, width);
         // Status row sits on the last screen row: top gutter only. The
         // terminal adds its own dead space below the grid, and the old
         // bottom gutter row read as a hole under the footer.
         f.render_widget(
-            Paragraph::new(line).block(Block::default().padding(Padding {
-                left: super::super::HORIZONTAL_GUTTER,
-                right: super::super::HORIZONTAL_GUTTER,
-                top: super::super::VERTICAL_GUTTER,
-                bottom: 0,
-            })),
+            Paragraph::new(line).block(Block::default().padding(status_padding())),
             area,
         );
     }
@@ -73,12 +68,14 @@ impl SlashSuggestionsView {
         // 2-wide marker gutter when copying a command, as with any picker
         // affordance). One blank gutter row sits between the header text
         // and the first command so the list breathes instead of butting the
-        // header.
-        let height = (visible as u16 + 3).min(area.y);
-        if height < 4 {
+        // header. Sheet chrome: rule + header + blank gutter = 3 rows above
+        // the list.
+        const SHEET_CHROME_ROWS: u16 = 3;
+        let height = (visible as u16 + SHEET_CHROME_ROWS).min(area.y);
+        if height < SHEET_CHROME_ROWS + 1 {
             return;
         }
-        visible = visible.min(height.saturating_sub(3) as usize);
+        visible = visible.min((height - SHEET_CHROME_ROWS) as usize);
         if visible == 0 {
             return;
         }
@@ -88,12 +85,15 @@ impl SlashSuggestionsView {
             .saturating_sub(visible.saturating_sub(1))
             .min(max_start);
         let window = &suggestions[start..start + visible];
-        // Sheet width matches the composer minus its left gutter: the labels
-        // share the composer's text column (glyph + gap to the left). Inside
-        // a picker (`/model `, `/provider `, `/resume …`) rows show just
-        // the item (`> gpt-5`), not the repeated command (`/model <item>`)
-        // — the header already names the picker.
-        let width = area.width.saturating_sub(super::super::HORIZONTAL_GUTTER);
+        // Sheet width matches the composer band minus its left gutter: the
+        // labels share the composer's text column (glyph + gap to the left).
+        // Inside a picker (`/model `, `/provider `, `/resume …`) rows show
+        // just the item (`> gpt-5`), not the repeated command (`/model
+        // <item>`) — the header already names the picker.
+        let band = composer_band(area);
+        let width = band
+            .width
+            .saturating_sub(super::super::style::HORIZONTAL_GUTTER);
         let avail = width.saturating_sub(2) as usize;
         let cmd_col = window
             .iter()
@@ -103,7 +103,7 @@ impl SlashSuggestionsView {
             .min(48)
             .min(avail.max(1));
         let popup = Rect {
-            x: area.x + super::super::HORIZONTAL_GUTTER,
+            x: band.x,
             y: area.y - height,
             width,
             height,
@@ -120,21 +120,21 @@ impl SlashSuggestionsView {
             .map(|(offset, (command, description))| {
                 let selected = start + offset == app.slash_selected;
                 let marker_style = if selected {
-                    Style::default().fg(Color::Cyan)
+                    fg(theme::accent_fg())
                 } else {
-                    Style::default().fg(theme::muted_fg())
+                    fg(theme::muted_fg())
                 };
                 let command_style = if selected {
                     // `>` plus the brighter fg mark the selection; unselected
                     // rows stay plain cyan. No bold — chrome stays quiet.
-                    Style::default().fg(theme::surface_fg())
+                    fg(theme::surface_fg())
                 } else {
-                    Style::default().fg(Color::Cyan)
+                    fg(theme::accent_fg())
                 };
                 let description_style = if selected {
-                    Style::default().fg(theme::surface_fg())
+                    fg(theme::surface_fg())
                 } else {
-                    Style::default().fg(theme::secondary_fg())
+                    fg(theme::secondary_fg())
                 };
                 let label = slash::suggestion_label(&input, command);
                 let cell = truncate_display(label, cmd_col as u16);
@@ -172,38 +172,31 @@ impl SlashSuggestionsView {
         // Single `─` rule across the top is the sheet's only border: it
         // separates the popup from the transcript without side/corner
         // glyphs, and a stray leading `────` line is the only copy artifact.
-        // The row at `popup.y + 2` stays cleared (blank gutter) so the first
-        // command at `+ 3` doesn't butt the header text at `+ 1`.
+        // The row at `+ 2` stays cleared (blank gutter) so the first command
+        // at `+ 3` doesn't butt the header text at `+ 1`.
+        let sheet_row = |dy: u16| Rect {
+            x: popup.x,
+            y: popup.y + dy,
+            width: popup.width,
+            height: 1,
+        };
         f.render_widget(Clear, popup);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(inner_w),
-                Style::default().fg(theme::hairline_fg()),
+                fg(theme::hairline_fg()),
             ))),
-            Rect {
-                x: popup.x,
-                y: popup.y,
-                width: popup.width,
-                height: 1,
-            },
+            sheet_row(0),
         );
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                header_text,
-                Style::default().fg(theme::muted_fg()),
-            ))),
-            Rect {
-                x: popup.x,
-                y: popup.y + 1,
-                width: popup.width,
-                height: 1,
-            },
+            Paragraph::new(Line::from(Span::styled(header_text, fg(theme::muted_fg())))),
+            sheet_row(1),
         );
         f.render_widget(
             List::new(items),
             Rect {
                 x: popup.x,
-                y: popup.y + 3,
+                y: popup.y + SHEET_CHROME_ROWS,
                 width: popup.width,
                 height: visible as u16,
             },
@@ -277,9 +270,9 @@ impl ApprovalOverlay {
         f.render_widget(Clear, popup);
         let block = Block::default()
             .title(format!(" {} — {} ", title, approval.name))
-            .title_style(Style::default().fg(Color::Yellow))
+            .title_style(fg(theme::warn_fg()))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(fg(theme::warn_fg()))
             .padding(Padding::new(1, 1, 1, 1))
             .style(Style::default().bg(theme::popup_bg()));
         let inner = block.inner(popup);
@@ -297,31 +290,19 @@ impl ApprovalOverlay {
         .split(inner);
 
         let header_line = Line::from(vec![
-            Span::styled(title.to_string(), Style::default().fg(Color::Cyan)),
-            Span::styled("  ·  ", Style::default().fg(theme::muted_fg())),
-            Span::styled(
-                format!("{} risk", risk_label),
-                Style::default().fg(risk_color),
-            ),
-            Span::styled(
-                format!("  ·  {}", approval.name),
-                Style::default().fg(theme::muted_fg()),
-            ),
+            Span::styled(title.to_string(), fg(theme::accent_fg())),
+            Span::styled("  ·  ", fg(theme::muted_fg())),
+            Span::styled(format!("{} risk", risk_label), fg(risk_color)),
+            Span::styled(format!("  ·  {}", approval.name), fg(theme::muted_fg())),
         ]);
-        let sub = Line::from(Span::styled(
-            summary.clone(),
-            Style::default().fg(theme::surface_fg()),
-        ));
+        let sub = Line::from(Span::styled(summary.clone(), fg(theme::surface_fg())));
         f.render_widget(
             Paragraph::new(vec![header_line, sub]).wrap(Wrap { trim: false }),
             chunks[0],
         );
         let wants = format!("The {agent_prefix}agent wants to run:");
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                wants,
-                Style::default().fg(theme::muted_fg()),
-            ))),
+            Paragraph::new(Line::from(Span::styled(wants, fg(theme::muted_fg())))),
             chunks[1],
         );
         // Queued behind this one (V1b): child agents can park several.
@@ -329,7 +310,7 @@ impl ApprovalOverlay {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("+{extra} more approval(s) waiting"),
-                    Style::default().fg(Color::Yellow),
+                    fg(theme::warn_fg()),
                 ))),
                 chunks[5],
             );
