@@ -2,6 +2,10 @@
 use super::status::footer_line;
 #[cfg(test)]
 use super::status::truncate_display;
+use super::style::content_width as input_content_width;
+use super::style::fg;
+#[cfg(test)]
+use super::style::TRANSCRIPT_INDENT;
 use super::theme;
 use super::App;
 #[cfg(test)]
@@ -10,20 +14,17 @@ use super::InputField;
 use super::Selection;
 #[cfg(test)]
 use super::TAB_WIDTH;
-#[cfg(test)]
-use super::TRANSCRIPT_INDENT;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
 #[cfg(test)]
 use ratatui::style::Color;
-use ratatui::style::Style;
 #[cfg(test)]
 use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::text::Span;
-use ratatui::widgets::block::Padding;
 use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
 #[cfg(test)]
 use ratatui::widgets::Paragraph;
@@ -55,10 +56,7 @@ pub(super) use transcript::TranscriptView;
 
 // Test-only helpers from the children (rendered-view unit tests below).
 #[cfg(test)]
-pub(crate) use activity::pending_queue_metrics;
-#[cfg(test)]
 pub(crate) use activity::QUEUE_MAX_ITEM_ROWS;
-#[cfg(test)]
 #[cfg(test)]
 pub(crate) use markdown::highlight_code_block;
 #[cfg(test)]
@@ -70,34 +68,24 @@ pub(crate) use thinking::{
 #[cfg(test)]
 pub(crate) use transcript::{apply_selection, wrap_block, SEL_BG};
 
-pub(super) fn surface_padding() -> Padding {
-    Padding {
-        left: super::HORIZONTAL_GUTTER,
-        right: super::HORIZONTAL_GUTTER,
-        top: super::VERTICAL_GUTTER,
-        bottom: super::VERTICAL_GUTTER,
-    }
-}
-
 pub(super) fn input_block() -> Block<'static> {
-    // Borderless composer: one `surface_bg()` band separating the transcript
-    // above from the status line below (no rules, no side borders). The
-    // padding is the shared `HORIZONTAL_GUTTER`, so the caret and the
-    // transcript's leading indent land on the same cell (no prompt glyph —
-    // the text column is the left edge); the right pad just keeps the cursor
-    // off the last cell.
+    // Borderless sides, hairline rules top and bottom: the composer is a
+    // band on the terminal's own background (no surface fill — the
+    // transcript's user band has none either), framed by two `─` rules in
+    // the shared `hairline_fg()` so it reads as an edge, not a box. The
+    // band is already inset one column from the window edges
+    // (`composer_band`), which supplies both the rules' air and the text
+    // column, so the block adds no horizontal padding and the caret and
+    // the transcript's leading indent land on the same cell. No vertical
+    // padding: the empty composer is one text row between the two rules
+    // and grows only as the input wraps.
     Block::default()
-        .style(Style::default().bg(theme::surface_bg()))
-        .padding(Padding {
-            left: super::HORIZONTAL_GUTTER,
-            right: super::HORIZONTAL_GUTTER,
-            top: super::INPUT_PAD_Y,
-            bottom: super::INPUT_PAD_Y,
-        })
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(fg(theme::hairline_fg()))
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {
-    content_rows + super::INPUT_BORDER_ROWS + super::INPUT_PAD_Y * 2
+    content_rows + super::INPUT_BORDER_ROWS
 }
 
 pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
@@ -109,10 +97,6 @@ pub(super) fn activity_height(item_count: u16, line_count: u16) -> u16 {
     line_count
         .saturating_add(item_count.saturating_sub(1))
         .saturating_add(super::VERTICAL_GUTTER * 2)
-}
-
-pub(super) fn input_content_width(width: u16) -> u16 {
-    width.saturating_sub(super::HORIZONTAL_GUTTER * 2)
 }
 
 /// Footer chunk: one gutter above the status row, none below — the status
@@ -241,7 +225,7 @@ fn composer_text_carries_user_voice() {
     let input = InputField::from_text("hello");
     let (active, _) = render_input(&input, 40, false);
     let text: String = active[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, "hello");
+    assert_eq!(text, "❯ hello");
     assert!(active[0]
         .spans
         .iter()

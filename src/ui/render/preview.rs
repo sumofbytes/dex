@@ -1,6 +1,6 @@
+use super::super::style::fg;
 use super::super::theme;
 use super::markdown::highlight_code_block;
-use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -35,11 +35,9 @@ pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("{} ", tool_glyph(name)),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            fg(theme::warn_fg()).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(name.to_string(), Style::default().fg(Color::Yellow)),
+        Span::styled(name.to_string(), fg(theme::warn_fg())),
     ];
     // Single-line commands only: highlight_code_block splits per row and
     // only the first row is appended — multi-line would drop lines 2+.
@@ -47,20 +45,14 @@ pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
         if let Some(mut rows) = highlight_code_block("bash", arg) {
             if let Some(first) = rows.first_mut() {
                 if !first.is_empty() {
-                    spans.push(Span::styled(
-                        " ".to_string(),
-                        Style::default().fg(theme::tool_input_fg()),
-                    ));
+                    spans.push(Span::styled(" ".to_string(), fg(theme::tool_input_fg())));
                     spans.append(first);
                     return super::super::indent_transcript_line(Line::from(spans));
                 }
             }
         }
     }
-    spans.push(Span::styled(
-        format!(" {arg}"),
-        Style::default().fg(theme::tool_input_fg()),
-    ));
+    spans.push(Span::styled(format!(" {arg}"), fg(theme::tool_input_fg())));
     super::super::indent_transcript_line(Line::from(spans))
 }
 
@@ -72,10 +64,7 @@ pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> 
         let (prefix, code) = if let Some(rest) = detail.strip_prefix("$ ") {
             ("$ ", rest)
         } else if detail.starts_with("$") && detail.trim() == "$" {
-            return Line::from(Span::styled(
-                detail.to_string(),
-                Style::default().fg(Color::Cyan),
-            ));
+            return Line::from(Span::styled(detail.to_string(), fg(theme::accent_fg())));
         } else if let Some(rest) = detail.strip_prefix("  ") {
             ("  ", rest)
         } else {
@@ -86,10 +75,8 @@ pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> 
             if let Some(mut rows) = highlight_code_block("bash", code) {
                 if let Some(first) = rows.first_mut() {
                     if !first.is_empty() {
-                        let mut spans = vec![Span::styled(
-                            prefix.to_string(),
-                            Style::default().fg(Color::Cyan),
-                        )];
+                        let mut spans =
+                            vec![Span::styled(prefix.to_string(), fg(theme::accent_fg()))];
                         spans.append(first);
                         return Line::from(spans);
                     }
@@ -98,13 +85,13 @@ pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> 
         }
     }
     let style = if detail.starts_with('$') || detail.starts_with("path:") {
-        Style::default().fg(Color::Cyan)
+        fg(theme::accent_fg())
     } else if detail.starts_with("  −") {
-        Style::default().fg(Color::LightRed)
+        fg(theme::failure_fg())
     } else if detail.starts_with("  +") {
-        Style::default().fg(Color::LightGreen)
+        fg(theme::success_fg())
     } else {
-        Style::default().fg(theme::tool_input_fg())
+        fg(theme::tool_input_fg())
     };
     Line::from(Span::styled(detail.to_string(), style))
 }
@@ -133,7 +120,7 @@ fn split_read_gutter(line: &str) -> Option<(String, &str)> {
 /// keep the gutter dim and highlight the code via ONE tree-sitter pass per
 /// section, falling back to dim per row when unhighlightable.
 pub(crate) fn render_read_preview(preview: &[String], base_lang: &str) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(theme::tool_preview_fg());
+    let dim = fg(theme::tool_preview_fg());
     // Section = header + its rows; headers re-target the language.
     struct Section<'a> {
         header: Option<&'a str>,
@@ -309,7 +296,7 @@ fn push_search_run(out: &mut Vec<Line<'static>>, run: &[(String, &str)], lang: &
 /// headers (files mode, fff's fuzzy-fallback grouping with `  N: code`
 /// rows) and prose stay dim.
 pub(crate) fn render_search_preview(preview: &[String]) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(theme::tool_preview_fg());
+    let dim = fg(theme::tool_preview_fg());
     enum Row<'a> {
         Meta(&'a str),
         Code {

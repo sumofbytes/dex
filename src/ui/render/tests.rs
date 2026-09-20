@@ -3,6 +3,7 @@
 use super::super::status::{cell_safe, footer_text, status_pieces, ui_status};
 use super::*;
 use crate::protocol::{ApiProtocol, PermissionMode, Provider};
+use crate::ui::style::{composer_band, content_width as input_content_width};
 use ratatui::backend::TestBackend;
 use std::time::Instant;
 
@@ -291,13 +292,15 @@ fn test_app() -> super::super::App {
 fn shared_surface_dimensions_are_consistent() {
     // Content width tracks the shared knob so the wrap width equals the
     // rendered inner width at any gutter value.
-    let gutter = super::super::HORIZONTAL_GUTTER;
+    let gutter = crate::ui::style::HORIZONTAL_GUTTER;
     assert_eq!(input_content_width(80), 80 - gutter * 2);
     assert_eq!(input_content_width(1), 0);
     assert_eq!(input_content_width(3), (3u16).saturating_sub(gutter * 2));
     assert_eq!(
         input_content_width(80),
-        input_block().inner(Rect::new(0, 0, 80, 24)).width
+        input_block()
+            .inner(composer_band(Rect::new(0, 0, 80, 24)))
+            .width
     );
     // Guard keeps the queue-only strip collapsed at zero items.
     assert_eq!(activity_height(0, 0), 0);
@@ -324,7 +327,7 @@ fn multiline_pending_steer_renders_each_source_line() {
         .push("first steer line\nsecond steer line".into());
     app.pending_followups.push("follow one\ntwo".into());
 
-    let queue = pending_queue_metrics(&app);
+    let queue = queue_metrics_of(&queue_groups(&app));
     assert_eq!(queue.items, 2);
     assert_eq!(queue.rows, 4);
     assert_eq!(activity_height(queue.items, queue.rows), 4 + 1 + 2);
@@ -378,7 +381,7 @@ fn long_multiline_queue_is_capped_per_item() {
         .join("\n");
     app.pending_steering.push(paste);
 
-    let queue = pending_queue_metrics(&app);
+    let queue = queue_metrics_of(&queue_groups(&app));
     assert_eq!(queue.items, 1);
     assert_eq!(queue.rows, QUEUE_MAX_ITEM_ROWS as u16);
 
@@ -428,14 +431,14 @@ fn full_queue_height_stays_bounded() {
             app.pending_followups.push(text);
         }
     }
-    let queue = pending_queue_metrics(&app);
+    let queue = queue_metrics_of(&queue_groups(&app));
     assert_eq!(queue.items, 4); // 3 items + tail
     assert_eq!(queue.rows, 3 * QUEUE_MAX_ITEM_ROWS as u16 + 1);
 
     let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, queue, false)
         .expect("maxed queue must fit a 24-row terminal");
     assert!(layout.activity.height > 0);
-    assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
+    assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
     assert_eq!(layout.footer.height, status_height());
 }
 
@@ -457,12 +460,12 @@ fn degenerate_layout_keeps_composer_and_footer() {
             app.pending_followups.push(text);
         }
     }
-    let queue = pending_queue_metrics(&app);
+    let queue = queue_metrics_of(&queue_groups(&app));
     // activity_h = 18 here, so a 20-row terminal can't fit the strip.
     let layout =
         compute_layout(Rect::new(0, 0, 80, 20), 1, queue, false).expect("layout should exist");
     assert_eq!(layout.activity.height, 0);
-    assert!(layout.input.height >= super::super::INPUT_MIN_ROWS);
+    assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
     assert_eq!(layout.footer.height, status_height());
     assert!(layout.transcript.height > 0);
 
@@ -485,7 +488,7 @@ fn transcript_wrapper_keeps_first_content_grapheme() {
         .collect();
     assert_eq!(
         rendered,
-        format!("{}▸ tool", super::super::transcript_indent())
+        format!("{}▸ tool", crate::ui::transcript_indent())
     );
 }
 
@@ -497,7 +500,7 @@ fn layout_reserves_bottom_pane_before_transcript() {
     assert_eq!(layout.transcript.y, 0);
     assert!(layout.transcript.height > 0);
     assert_eq!(
-        layout.input.y + layout.input.height + super::super::INPUT_STATUS_GUTTER,
+        layout.input.y + layout.input.height + crate::ui::style::INPUT_STATUS_GUTTER,
         layout.footer.y
     );
     assert_eq!(layout.footer.height, status_height());
@@ -1131,7 +1134,7 @@ fn control_characters_are_expanded_not_rendered_raw() {
     assert!(!symbols.contains('\t'), "tab must be expanded: {symbols}");
     // Indented preview: indent + "  35\tlet" -> indent + 2 spaces + 2 chars
     // before the tab, which then fills to the next tabstop column.
-    let tab_pad = TAB_WIDTH - ((super::super::TRANSCRIPT_INDENT + 4) % TAB_WIDTH);
+    let tab_pad = TAB_WIDTH - ((crate::ui::style::TRANSCRIPT_INDENT + 4) % TAB_WIDTH);
     assert!(
         symbols.contains(&format!("35{}let cwd", " ".repeat(tab_pad))),
         "{symbols}"
@@ -1371,7 +1374,7 @@ fn input_box_height_matches_wrapped_rows() {
     let area = Rect::new(0, 0, 80, 24);
     assert_eq!(
         input_content_width(area.width),
-        input_block().inner(area).width,
+        input_block().inner(composer_band(area)).width,
         "measurement width must equal the rendered inner width"
     );
     let mut app = test_app();
@@ -1379,26 +1382,35 @@ fn input_box_height_matches_wrapped_rows() {
     let measured = render_input(&app.input, input_content_width(area.width), false)
         .0
         .len();
-    let rendered = render_input(&app.input, input_block().inner(area).width, false)
-        .0
-        .len();
+    let rendered = render_input(
+        &app.input,
+        input_block().inner(composer_band(area)).width,
+        false,
+    )
+    .0
+    .len();
     assert_eq!(measured, rendered, "wrapped row counts must agree");
 }
 
 #[test]
-fn composer_has_no_border_rules() {
-    // The composer is a borderless band: one `surface_bg()` row set with
-    // no `─` rules, height = content rows + the shared vertical padding.
-    assert_eq!(input_outer_height(1), 1 + super::super::INPUT_PAD_Y * 2);
-    let area = Rect::new(0, 0, 20, 3);
-    let backend = TestBackend::new(20, 3);
+fn composer_has_top_and_bottom_rules() {
+    // The composer is a full-width band on the terminal background framed
+    // by hairline `─` rules top and bottom: height = content rows + the
+    // two border rows (no vertical padding — the empty composer is one
+    // text row between the rules).
+    assert_eq!(
+        input_outer_height(1),
+        1 + crate::ui::style::INPUT_BORDER_ROWS
+    );
+    let area = Rect::new(0, 0, 20, 5);
+    let backend = TestBackend::new(20, 5);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
     terminal
         .draw(|f| {
-            // Sentinel background: the band assertion below only means
+            // Sentinel background: the no-band assertion below only means
             // something if the cells would otherwise keep a different bg.
             f.render_widget(
-                Block::default().style(Style::default().bg(Color::Magenta)),
+                Block::default().style(ratatui::style::Style::default().bg(Color::Magenta)),
                 area,
             );
             f.render_widget(Paragraph::new("hi").block(input_block()), area);
@@ -1410,36 +1422,48 @@ fn composer_has_no_border_rules() {
             .map(|x| buffer[(x, y)].symbol().to_string())
             .collect::<String>()
     };
-    for y in 0..3 {
+    assert!(
+        row(0).chars().all(|c| c == '─'),
+        "top rule must span the width, got {:?}",
+        row(0)
+    );
+    assert_eq!(row(4), "─".repeat(20), "bottom rule must span the width");
+    for y in 1..4 {
         assert!(
             !row(y).contains('─'),
-            "composer must not draw a rule, got {y}: {:?}",
+            "no rules inside the band, got {y}: {:?}",
             row(y)
         );
         assert_eq!(
             buffer[(0, y)].bg,
-            theme::surface_bg(),
-            "composer background should be the shared surface band"
+            Color::Magenta,
+            "composer interior must not paint a background (transparent)"
         );
     }
-    assert!(row(1).contains("hi"), "content should render on the band");
+    assert!(
+        row(1).contains("hi"),
+        "content should render directly under the top rule"
+    );
 }
 
 #[test]
 fn composer_text_column_matches_transcript_indent() {
-    // Typing and history share one left edge: the composer's inside
-    // padding and the transcript's leading indent must resolve to the
-    // same column, or the caret jumps sideways when a prompt is sent.
+    // Typing and history share one left edge: the composer band is inset
+    // one gutter column from the window edge and the block adds no inside
+    // padding, so the composer's text column and the transcript's leading
+    // indent must resolve to the same column, or the caret jumps sideways
+    // when a prompt is sent.
     let area = Rect::new(0, 0, 40, 3);
-    let composer_col = input_block().inner(area).x as usize;
-    assert_eq!(composer_col, super::super::TRANSCRIPT_INDENT);
-    let indent = super::super::transcript_indent();
+    let band = composer_band(area);
+    let composer_col = input_block().inner(band).x as usize;
+    assert_eq!(composer_col, crate::ui::style::TRANSCRIPT_INDENT);
+    let indent = crate::ui::transcript_indent();
     assert_eq!(indent.len(), composer_col);
     assert!(indent.chars().all(|c| c == ' '));
     // The caret wraps against the block's own inside width, so it never
-    // escapes the padded band.
+    // escapes the padded text column.
     assert_eq!(
-        input_block().inner(area).width,
+        input_block().inner(band).width,
         input_content_width(area.width)
     );
 }
@@ -1532,7 +1556,7 @@ fn composer_shows_cursor_while_busy() {
         .len() as u16;
     let layout =
         compute_layout(area, input_rows, QueueMetrics { items: 1, rows: 1 }, false).unwrap();
-    let inner = input_block().inner(layout.input);
+    let inner = input_block().inner(composer_band(layout.input));
     let (_, cursor) = render_input(&app.input, inner.width, false);
     terminal
         .backend_mut()
@@ -1651,24 +1675,24 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, long);
         // The submitted prompt is the composer's echo: `wrap_block`
-        // paints the `surface_bg()` band and pads every row out to the
-        // full width, with `INPUT_PAD_Y` blank band rows above and below
-        // the content (same outer height as the live composer).
+        // pads every row out to the full width, with `INPUT_PAD_Y` blank
+        // rows above and below the content (same outer height as the live
+        // composer), all on the terminal background.
         let block = &app.transcript[1]; // 0 is hello, 1 is user
         let rows = wrap_block(block, w, false, false);
-        let bg = theme::surface_bg();
+        let bg = Color::Reset;
         assert!(
             rows.len() >= 3,
-            "user band must hold content plus composer air at w {w}"
+            "user block must hold content plus composer air at w {w}"
         );
         for row in &rows {
             let s: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert_eq!(
                 UnicodeWidthStr::width(s.as_str()),
                 w as usize,
-                "user band row must fill the full width like the composer at w {w}: {s:?}"
+                "user row must fill the full width like the composer at w {w}: {s:?}"
             );
-            // Line-level bg is the band carrier (`Line` renders each
+            // Line-level bg is the row carrier (`Line` renders each
             // span as `line.style.patch(span.style)`); spans either
             // inherit it (`None`) or carry it explicitly (trailing
             // fill). Either way the rendered row must be all-`bg`.
@@ -1676,11 +1700,11 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
                 row.spans
                     .iter()
                     .all(|sp| sp.style.bg.is_none() || sp.style.bg == Some(bg)),
-                "user band row must carry the composer background at w {w}: {s:?}"
+                "user row must carry the terminal background at w {w}: {s:?}"
             );
-            assert_eq!(row.style.bg, Some(bg), "user band line bg at w {w}");
+            assert_eq!(row.style.bg, Some(bg), "user row line bg at w {w}");
         }
-        // Composer air: blank band rows top and bottom, content between.
+        // Composer air: blank rows top and bottom, content between.
         let text = |row: &Line<'static>| {
             row.spans
                 .iter()
@@ -1689,17 +1713,17 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         };
         assert!(
             text(&rows[0]).trim().is_empty(),
-            "band top must be composer air at w {w}"
+            "air row must be blank above the content at w {w}"
         );
         assert!(
             text(rows.last().unwrap()).trim().is_empty(),
-            "band bottom must be composer air at w {w}"
+            "air row must be blank below the content at w {w}"
         );
         assert!(
             rows[1..rows.len() - 1]
                 .iter()
                 .any(|r| text(r).contains("Current:")),
-            "band content must survive between the air rows at w {w}"
+            "content must survive between the air rows at w {w}"
         );
         // Content rows sit on the shared transcript margin (exactly one
         // gutter of leading space, like the composer); pad rows are
@@ -1711,7 +1735,7 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
             }
             assert_eq!(
                 row.spans.first().map(|sp| sp.content.as_ref()),
-                Some(super::super::transcript_indent().as_str()),
+                Some(crate::ui::transcript_indent().as_str()),
                 "user row must carry the grid-margin indent span at w {w}: {s:?}"
             );
         }
@@ -1720,19 +1744,19 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| view(f, &mut app)).unwrap();
         assert_eq!(terminal.backend().buffer().area.width, w);
-        // Rendered contract: every cell of the band paints `bg`,
+        // Rendered contract: every cell of the padded block paints `bg`,
         // whatever the struct-level split between line and span style.
-        let band_backend = TestBackend::new(w, rows.len() as u16);
-        let mut band_terminal = ratatui::Terminal::new(band_backend).unwrap();
-        band_terminal
+        let block_backend = TestBackend::new(w, rows.len() as u16);
+        let mut block_terminal = ratatui::Terminal::new(block_backend).unwrap();
+        block_terminal
             .draw(|f| {
                 f.render_widget(Paragraph::new(rows.clone()), f.area());
             })
             .unwrap();
-        for cell in band_terminal.backend().buffer().content.iter() {
+        for cell in block_terminal.backend().buffer().content.iter() {
             assert_eq!(
                 cell.bg, bg,
-                "band cell must paint the composer background at w {w}: {cell:?}"
+                "cell must paint the terminal background at w {w}: {cell:?}"
             );
         }
     }
@@ -1804,7 +1828,7 @@ fn ghost_key_facts_does_not_overflow_or_overlap_bottom() {
         let input_rows = render_input(&app.input, input_content_width(area.width), false)
             .0
             .len() as u16;
-        let queue = pending_queue_metrics(&app);
+        let queue = queue_metrics_of(&queue_groups(&app));
         let layout = compute_layout(area, input_rows, queue, false).unwrap();
         // Check every cell in input and footer does not contain ghost fragments
         // Ghost contains distinctive substrings that should never leak into chrome
@@ -1905,7 +1929,7 @@ fn consecutive_assistant_chunks_do_not_add_gaps() {
     );
 }
 /// Regression: the submitted prompt renders as the composer's echo — a
-/// full-width `surface_bg()` band with `INPUT_PAD_Y` air above and below
+/// full-width block with `INPUT_PAD_Y` air above and below
 /// the content (same outer height as the live composer), headed by the
 /// composer glyph. The transcript Paragraph must NOT enable `Wrap`:
 /// the display cache is already pre-wrapped, and ratatui 0.29's WordWrapper
@@ -1952,41 +1976,42 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     };
     let text_row = row_of("can you check pillar").expect("prompt text rendered");
     let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
-    // Composer echo: content row, one band-air row, the inter-block gap
-    // row, the tool band's own top-air row, then the tool content.
+    // Composer echo: content row, one air row, the inter-block gap
+    // row, the tool block's own top-air row, then the tool content.
     assert_eq!(
         tool_row,
         text_row + 4,
         "a phantom row from Paragraph::wrap shifts the tool block down"
     );
     // On the shared transcript margin — the prompt row starts one gutter
-    // in, then bare text, on the composer background band.
+    // in, then the echoed `❯ ` glyph and the text, on the terminal
+    // background.
     let prompt_row: String = (0..area.width)
         .map(|x| buffer.cell((x, text_row)).unwrap().symbol())
         .collect();
     assert!(
         prompt_row.starts_with(&format!(
-            "{}can you check pillar",
-            super::super::transcript_indent()
+            "{}❯ can you check pillar",
+            crate::ui::transcript_indent()
         )),
         "prompt row must sit on the transcript margin: {prompt_row:?}"
     );
-    let bg = theme::surface_bg();
+    let bg = Color::Reset;
     for x in 0..area.width {
         assert_eq!(
             buffer.cell((x, text_row)).unwrap().bg,
             bg,
-            "prompt row must wear the composer band background"
+            "prompt row must sit on the terminal background"
         );
         assert_eq!(
             buffer.cell((x, text_row + 1)).unwrap().bg,
             bg,
-            "band air below the content must wear the composer background"
+            "air below the content must be the terminal background"
         );
         assert_eq!(
             buffer.cell((x, text_row - 1)).unwrap().bg,
             bg,
-            "band air above the content must wear the composer background"
+            "air above the content must be the terminal background"
         );
     }
     let air_below: String = (0..area.width)
@@ -1997,26 +2022,26 @@ fn submitted_prompt_is_one_row_above_tool_block() {
         .collect();
     assert!(
         air_below.trim().is_empty(),
-        "band air below the content must be blank: {air_below:?}"
+        "air below the content must be blank: {air_below:?}"
     );
     assert!(
         gap.trim().is_empty(),
-        "inter-block gap after the band must be blank: {gap:?}"
+        "inter-block gap after the prompt must be blank: {gap:?}"
     );
-    // The tool band carries its own top-air row: blank, but wearing the
-    // band background so the content clears the band edge.
+    // The tool block carries its own top-air row: blank, but on the
+    // terminal background so the content clears the edge.
     let tool_air: String = (0..area.width)
         .map(|x| buffer.cell((x, tool_row - 1)).unwrap().symbol())
         .collect();
     assert!(
         tool_air.trim().is_empty(),
-        "tool band air above the content must be blank: {tool_air:?}"
+        "tool air above the content must be blank: {tool_air:?}"
     );
     for x in 0..area.width {
         assert_eq!(
             buffer.cell((x, tool_row - 1)).unwrap().bg,
             bg,
-            "tool band air must wear the band background"
+            "tool air row must be the terminal background"
         );
         assert_eq!(
             buffer.cell((x, text_row + 2)).unwrap().bg,
@@ -2489,10 +2514,9 @@ fn markdown_fences_use_tree_sitter_and_fallback() {
 }
 
 #[test]
-fn composer_first_row_has_no_prompt_glyph() {
-    // No prompt glyph: the composer's first row is bare text on the
-    // shared transcript margin (one gutter in), same row as the first
-    // line of input.
+fn composer_first_row_has_prompt_glyph() {
+    // The composer's first row carries the `❯ ` glyph on the shared
+    // transcript margin, with the text following it on the same row.
     let (w, h) = (60u16, 16u16);
     let mut app = test_app();
     app.input = InputField::from_text("hello composer");
@@ -2504,12 +2528,13 @@ fn composer_first_row_has_no_prompt_glyph() {
         .collect();
     assert!(
         rows.iter().all(|r| !r.contains("▶")),
-        "no prompt glyph anywhere: {rows:?}"
+        "only the shared glyph, no stray prompt marks: {rows:?}"
     );
     let margin = " ".repeat(TRANSCRIPT_INDENT);
     assert!(
-        rows.iter()
-            .any(|r| r.trim_end().starts_with(&format!("{margin}hello composer"))),
-        "input text on the transcript margin: {rows:?}"
+        rows.iter().any(|r| r
+            .trim_end()
+            .starts_with(&format!("{margin}❯ hello composer"))),
+        "glyph + input on the transcript margin: {rows:?}"
     );
 }

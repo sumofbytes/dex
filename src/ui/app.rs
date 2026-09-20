@@ -15,24 +15,6 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-pub(crate) const VERTICAL_GUTTER: u16 = 1;
-/// Left/right air shared by every full-width surface (composer, footer,
-/// queue strip, slash popup) and the transcript's leading indent, so rendered
-/// transcript text and the composer's text column always start on the same
-/// cell. The composer's surface band is painted across the whole row (flush to
-/// the window edge), so this is the box's *inside* padding — there is no
-/// separate outer margin to shrink. Tuning it moves the composer cursor and
-/// the transcript indent together, which is what keeps them aligned.
-pub(crate) const HORIZONTAL_GUTTER: u16 = 2;
-pub(crate) const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
-pub(crate) const INPUT_BORDER_ROWS: u16 = 0;
-pub(crate) const INPUT_PAD_Y: u16 = 1;
-pub(crate) const STATUS_CONTENT_ROWS: u16 = 1;
-pub(crate) const INPUT_MIN_ROWS: u16 = 3;
-pub(crate) const INPUT_STATUS_GUTTER: u16 = 0;
-pub(crate) const APPROVAL_HEIGHT: u16 = 11;
-pub(crate) const TAB_WIDTH: usize = 8;
-
 /// Raised-surface colors are resolved in `ui/theme.rs` from the terminal's
 /// own palette / detected background, so they follow the terminal theme.
 /// Max markdown re-parse rate while streaming (`markdown_lines` +

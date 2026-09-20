@@ -1,4 +1,5 @@
-use ratatui::style::{Color, Style};
+use super::style::fg;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -70,7 +71,7 @@ pub(super) fn truncate_display(text: &str, width: u16) -> String {
 pub(super) type Piece = (String, Style);
 
 fn quiet_style() -> Style {
-    Style::default().fg(theme::muted_fg())
+    fg(theme::muted_fg())
 }
 
 fn sep() -> Piece {
@@ -88,11 +89,11 @@ fn mode_piece(app: &App) -> Piece {
     use crate::protocol::AgentMode;
     let mode = AgentMode::from_permission(app.config.permission);
     let color = match mode {
-        AgentMode::Plan => Color::Cyan,
-        AgentMode::Manual => Color::Yellow,
-        AgentMode::Auto => Color::Green,
+        AgentMode::Plan => theme::accent_fg(),
+        AgentMode::Manual => theme::warn_fg(),
+        AgentMode::Auto => theme::ok_fg(),
     };
-    (mode.label().to_string(), Style::default().fg(color))
+    (mode.label().to_string(), fg(color))
 }
 
 /// Style for the context-usage run, graduating with pressure: quiet while
@@ -104,9 +105,9 @@ fn context_style(app: &App, tokens: u64) -> Style {
     }
     let threshold = app.config.compaction_threshold();
     if tokens >= threshold {
-        Style::default().fg(Color::LightRed)
+        fg(theme::failure_fg())
     } else if tokens.saturating_mul(4) >= threshold.saturating_mul(3) {
-        Style::default().fg(Color::Yellow)
+        fg(theme::warn_fg())
     } else {
         quiet_style()
     }
@@ -124,7 +125,7 @@ fn cost_piece(app: &App) -> Option<Piece> {
     if app.tool_state.total_cost > 0.0005 {
         Some((
             format!("${:.3}", app.tool_state.total_cost),
-            Style::default().fg(theme::surface_fg()),
+            fg(theme::surface_fg()),
         ))
     } else {
         None
@@ -163,9 +164,9 @@ fn push_sep(pieces: &mut Vec<Piece>) {
 fn branch_pieces(app: &App) -> Vec<Piece> {
     let mut pieces = Vec::new();
     if let Some(branch) = app.git_branch.as_ref() {
-        pieces.push((branch.clone(), Style::default().fg(Color::LightGreen)));
+        pieces.push((branch.clone(), fg(theme::success_fg())));
         if app.git_dirty {
-            pieces.push(("*".to_string(), Style::default().fg(Color::Yellow)));
+            pieces.push(("*".to_string(), fg(theme::warn_fg())));
         }
     }
     pieces
@@ -244,7 +245,7 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     // expires: unmissable feedback beats the quiet facts for two seconds.
     if let Some((text, at)) = &app.notice {
         if at.elapsed() < super::NOTICE_LIFETIME {
-            return vec![(text.clone(), Style::default().fg(Color::Green))];
+            return vec![(text.clone(), fg(theme::ok_fg()))];
         }
     }
     let tokens = status_tokens(app);
@@ -258,7 +259,7 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     };
     let mut pieces = Vec::new();
     if with_cwd {
-        pieces.push((compact_path(&app.cwd), Style::default().fg(Color::Cyan)));
+        pieces.push((compact_path(&app.cwd), fg(theme::accent_fg())));
     }
     // The branch separator is part of the branch block: emitting it
     // unconditionally doubled up with the one after an empty branch
@@ -359,10 +360,7 @@ fn agents_pieces(app: &App) -> Vec<Piece> {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    vec![
-        sep(),
-        (format!("agents: {text}"), Style::default().fg(Color::Green)),
-    ]
+    vec![sep(), (format!("agents: {text}"), fg(theme::ok_fg()))]
 }
 
 /// Test shim: the status row as plain text (string asserts in `render/tests`).
@@ -378,7 +376,7 @@ pub(super) fn ui_status(app: &App) -> String {
 fn compact_pieces(app: &App) -> Vec<Piece> {
     // Narrow tier: cwd + branch + model + spend. Branch and cost share
     // helpers with the full line so the tiers cannot drift.
-    let mut pieces = vec![(compact_path(&app.cwd), Style::default().fg(Color::Cyan))];
+    let mut pieces = vec![(compact_path(&app.cwd), fg(theme::accent_fg()))];
     let branch = branch_pieces(app);
     if !branch.is_empty() {
         push_sep(&mut pieces);
@@ -409,7 +407,7 @@ fn conn_piece(app: &App) -> Piece {
         .clone()
         .unwrap_or_else(|| "[L] local".to_string());
     let style = if conn.starts_with("[R]") {
-        Style::default().fg(Color::Cyan)
+        fg(theme::accent_fg())
     } else {
         quiet_style()
     };
@@ -422,13 +420,7 @@ fn hint_pieces(app: &App) -> Vec<Piece> {
     if app.autoscroll {
         Vec::new()
     } else {
-        vec![
-            (
-                "▲ more above".to_string(),
-                Style::default().fg(Color::Yellow),
-            ),
-            sep(),
-        ]
+        vec![("▲ more above".to_string(), fg(theme::warn_fg())), sep()]
     }
 }
 

@@ -1,4 +1,3 @@
-use super::super::theme;
 use super::super::transcript_indent;
 use super::super::App;
 use super::super::Selection;
@@ -30,13 +29,13 @@ pub(crate) struct TranscriptView;
 /// turn-activity block wraps to zero rows while a thinking block streams:
 /// Working shows only when busy-but-not-thinking, so the transcript never
 /// stacks two live spinners.
-/// Submitted prompts read as the composer's echo: the same `surface_bg()`
-/// band and the same top/bottom air (`INPUT_PAD_Y`) as the live composer,
-/// so a sent prompt keeps the height and background it had while typed.
-/// Stored lines stay unpadded (width-dependent fill happens here at wrap
-/// time, keeping `wrap_line_display`'s indent logic intact); each wrapped
-/// row is painted and padded out to the full width, with blank band rows
-/// above and below the content.
+/// Submitted prompts read as the composer's echo: the same `❯ ` glyph and
+/// the same top/bottom air (`INPUT_PAD_Y`) as the live composer, on the
+/// terminal's own background, so a sent prompt keeps the height and shape
+/// it had while typed. Stored lines stay unpadded (width-dependent fill
+/// happens here at wrap time, keeping `wrap_line_display`'s indent logic
+/// intact); each wrapped row is padded out to the full width, with blank
+/// rows above and below the content.
 fn paint_surface_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'static> {
     // `Line` renders each span as `line.style.patch(span.style)`, so one
     // line-level bg covers every span that doesn't set its own — no need to
@@ -51,10 +50,30 @@ fn paint_surface_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'s
 }
 
 fn surface_pad_row(width: usize, bg: Color) -> Line<'static> {
-    let style = Style::default().bg(bg);
-    let mut pad = Line::from(Span::styled(" ".repeat(width), style));
-    pad.style = style;
-    pad
+    paint_surface_row(Line::default(), width, bg)
+}
+
+/// Wrap + pad a surface's stored lines: every row padded out to the full
+/// width in `bg`, with `pad` blank air rows above and below the content.
+/// Single source for the user-prompt and tool-step arms of `wrap_block`,
+/// which differ only in pad count.
+fn surface_rows(
+    lines: impl IntoIterator<Item = Line<'static>>,
+    width: u16,
+    pad: usize,
+) -> Vec<Line<'static>> {
+    let bg = Color::Reset;
+    let w = width.max(1) as usize;
+    let mut rows: Vec<Line<'static>> = lines
+        .into_iter()
+        .flat_map(|l| wrap_line_display(&l, width))
+        .map(|r| paint_surface_row(r, w, bg))
+        .collect();
+    for _ in 0..pad {
+        rows.insert(0, surface_pad_row(w, bg));
+        rows.push(surface_pad_row(w, bg));
+    }
+    rows
 }
 
 pub(crate) fn wrap_block(
@@ -65,35 +84,15 @@ pub(crate) fn wrap_block(
 ) -> Vec<Line<'static>> {
     match block {
         super::super::TranscriptBlock::User { lines, .. } => {
-            let bg = theme::surface_bg();
-            let w = width.max(1) as usize;
-            let mut rows: Vec<Line<'static>> = lines
-                .iter()
-                .flat_map(|l| wrap_line_display(l, width))
-                .map(|r| paint_surface_row(r, w, bg))
-                .collect();
-            let pad_n = super::super::INPUT_PAD_Y as usize;
-            for _ in 0..pad_n {
-                rows.insert(0, surface_pad_row(w, bg));
-                rows.push(surface_pad_row(w, bg));
-            }
-            rows
+            // No band: the prompt keeps the terminal's own background and is
+            // framed by the composer's hairline rules, not a shaded strip.
+            // `INPUT_PAD_Y` air matches the live composer's shape.
+            surface_rows(lines.clone(), width, super::super::INPUT_PAD_Y as usize)
         }
         super::super::TranscriptBlock::Tool { .. } => {
-            // Reversed from the old gap-band look: each tool step carries
-            // the contrast band itself, gaps stay terminal bg. One air row
-            // top/bottom inside the band so text clears the band edge.
-            let bg = theme::surface_bg();
-            let w = width.max(1) as usize;
-            let mut rows: Vec<Line<'static>> = block
-                .lines()
-                .into_iter()
-                .flat_map(|l| wrap_line_display(l, width))
-                .map(|r| paint_surface_row(r, w, bg))
-                .collect();
-            rows.insert(0, surface_pad_row(w, bg));
-            rows.push(surface_pad_row(w, bg));
-            rows
+            // Each tool step carries its own air row top/bottom so the
+            // content clears the edge; gaps between steps stay terminal bg.
+            surface_rows(block.lines().into_iter().cloned(), width, 1)
         }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
@@ -219,8 +218,8 @@ fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
 /// block's start offset (gap separators + wrapped-row counts — length
 /// arithmetic, no clones), then re-extend from there. Unchanged leading blocks
 /// keep byte-identical rows, so the offsets line up; this runs only on content
-/// or width changes, never for scroll. Tool steps carry the `surface_bg()` band
-/// themselves, so every gap between blocks stays blank terminal bg.
+/// or width changes, never for scroll. Tool steps carry their own air
+/// rows, so every gap between blocks stays blank terminal bg.
 fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
     let Some(dirty) = first_dirty else {
         return;
