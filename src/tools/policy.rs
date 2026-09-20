@@ -152,7 +152,10 @@ pub(crate) async fn enforce_policy(
     }
     if policy.mode == PermissionMode::ReadOnly {
         return Err(ToolError::Denied(format!(
-            "{name} is blocked in plan mode — read/search only; present the change in your plan for the user to approve"
+            // Mode-agnostic: `read-only` is reachable via plan mode, but also
+            // via `--permission read-only` / `DEX_PERMISSION` where there is
+            // no plan to present.
+            "{name} is blocked in read-only mode — read/search tools only; propose the change for the user to apply"
         )));
     }
     let Some(console) = policy.console.as_ref() else {
