@@ -1,5 +1,11 @@
 //! Complexity router (V1): deterministic tier classification + model lookup.
 //!
+//! Lives under `llm/config` rather than `agent`: its only consumers are the
+//! `routing:` config knob (this directory's `mod.rs`) and `doctor`, and the
+//! tier picks the model the turn's `LlmConfig` is rebuilt with *before* the
+//! first LLM call — `agent` reaching up into `llm` for it inverts the layer
+//! direction. (`llm` still knows no tools; this module is pure text scoring.)
+//!
 //! Each turn is routed to a model tier by task complexity. V1 is
 //! stem/weight scoring only — no LLM call, no new dependencies, stdlib
 //! only — so routing stays pure and unit-testable. An LLM classifier may
@@ -36,9 +42,10 @@ use std::str::FromStr;
 
 use crate::protocol::ChatMessage;
 
+#[path = "stem.rs"]
 mod stem;
 
-pub(crate) use stem::{score_hits, stem_hit, tokenize, word_hit};
+use stem::{score_hits, stem_hit, tokenize, word_hit};
 
 /// Model tier for one turn. Lowercase on the wire (`Display`/`FromStr`
 /// round-trip).
