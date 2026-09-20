@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::apply_queue_msg;
 use crate::agent::compaction::compact_history;
-use crate::agent::jev::summary_mode;
+use crate::agent::compaction::verbatim::summary_mode;
 use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
@@ -62,7 +62,8 @@ pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
         // the whole batch through the mutation lock rather than fan out
         // several concurrent shells — a case the scheduler never had to
         // consider while these calls were pure file writes.
-        if call.function.name == "bash" || carries_then_run(&value) {
+        let name = call.function.name.as_str();
+        if name == "bash" || crate::tools::then_run::carries_then_run(name, &value) {
             return true;
         }
         // Calls without a `path` can't be checked — they never force
@@ -76,17 +77,6 @@ pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
         // second silently clobbers the first.
         !paths.insert(crate::tools::normalize_conflict_path(path))
     })
-}
-
-/// Whether this call carries an executable `then_run` verification command.
-/// Mirrors the resolver in `tools::then_run_command`: only a non-empty string
-/// runs a shell, so a null / blank / wrong-typed field stays a plain write
-/// that can fan out in parallel.
-fn carries_then_run(value: &Value) -> bool {
-    value
-        .get("then_run")
-        .and_then(Value::as_str)
-        .is_some_and(|command| !command.trim().is_empty())
 }
 
 pub(crate) fn persist_pending(

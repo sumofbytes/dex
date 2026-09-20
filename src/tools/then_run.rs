@@ -10,12 +10,15 @@ use crate::ui::format::{clamp_lines, clip_chars};
 use super::error::ToolError;
 use super::shell::{run_bash, BASH_CLAMP_BYTES, BASH_CLAMP_LINES};
 
-pub(super) fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolError> {
-    match args.get(key) {
-        Some(Value::String(s)) => Ok(s.clone()),
-        Some(_) => Err(ToolError::NotString(key)),
-        None => Err(ToolError::Missing(key)),
-    }
+/// Whether a parsed tool-call argument object carries an executable
+/// `then_run` verification command. Single-sources the resolver in
+/// `tools::then_run_command` (only a non-empty string runs a shell, only
+/// `write`/`edit` accept the field) so the batch-conflict check here can
+/// never drift from what dispatch actually runs.
+pub(crate) fn carries_then_run(name: &str, value: &Value) -> bool {
+    then_run_command(name, value.as_object().unwrap_or(&Map::new()))
+        .unwrap_or(None)
+        .is_some()
 }
 
 /// The `then_run` field (SoL-Pi-compatible): the verification command a
@@ -25,7 +28,7 @@ pub(super) fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<St
 /// a silent no-op: a model guessing another harness's
 /// `then_run: {command: …, timeout: …}` shape would otherwise read the
 /// mutation's success as its own verification.
-pub(super) fn then_run_command<'a>(
+pub(crate) fn then_run_command<'a>(
     name: &str,
     args: &'a Map<String, Value>,
 ) -> Result<Option<&'a str>, ToolError> {

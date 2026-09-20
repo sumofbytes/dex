@@ -1,6 +1,7 @@
 use tokio::sync::mpsc;
 
 mod deterministic;
+pub(crate) mod verbatim;
 
 use deterministic::{attach_file_section, extract_file_ops_from_message};
 pub(crate) use deterministic::{deterministic_summary, FileOps};
@@ -450,7 +451,7 @@ pub(crate) async fn compact_history(
     // Fallback summarizer when no hook summary applies and the prune is
     // skipped or does not pay — always the threshold knob's choice, parsed
     // once by the caller instead of re-read here.
-    summarizer: crate::agent::jev::SummaryMode,
+    summarizer: crate::agent::compaction::verbatim::SummaryMode,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -549,20 +550,21 @@ pub(crate) async fn compact_history(
     // scorer replaces the heuristic; any live failure falls back to the
     // heuristic inside `prune_span`.
     if hook.summary.is_none() && jev_prune {
-        let creds = crate::agent::jev::live_credentials();
+        let creds = crate::agent::compaction::verbatim::live_credentials();
         let scorer = if creds.is_some() {
-            crate::agent::jev::Scorer::Jev
+            crate::agent::compaction::verbatim::Scorer::Jev
         } else {
-            crate::agent::jev::Scorer::Heuristic
+            crate::agent::compaction::verbatim::Scorer::Heuristic
         };
-        let live = creds
-            .as_ref()
-            .map(|(endpoint, key)| crate::agent::jev::LiveScorer {
-                endpoint,
-                api_key: key,
-            });
+        let live =
+            creds.as_ref().map(
+                |(endpoint, key)| crate::agent::compaction::verbatim::LiveScorer {
+                    endpoint,
+                    api_key: key,
+                },
+            );
         let mut candidate = messages.clone();
-        let stats = crate::agent::jev::prune_span(
+        let stats = crate::agent::compaction::verbatim::prune_span(
             &mut candidate,
             boundary_start,
             first_kept,
@@ -570,7 +572,7 @@ pub(crate) async fn compact_history(
             live.as_ref(),
         )
         .await;
-        if crate::agent::jev::is_worthwhile(&stats) {
+        if crate::agent::compaction::verbatim::is_worthwhile(&stats) {
             crate::log!(
                 Info,
                 "jev compaction: dropped {} truncated {} kept {} (freed {} chars, ratio {:.2})",
@@ -578,7 +580,7 @@ pub(crate) async fn compact_history(
                 stats.truncated,
                 stats.kept,
                 stats.freed_chars,
-                crate::agent::jev::reduction_ratio(&stats)
+                crate::agent::compaction::verbatim::reduction_ratio(&stats)
             );
             *messages = candidate;
             return Ok((true, None));
@@ -589,7 +591,7 @@ pub(crate) async fn compact_history(
     let mut usage_total: Option<Usage> = None;
     let summarized = if let Some(summary) = &hook.summary {
         summary.clone()
-    } else if summarizer == crate::agent::jev::SummaryMode::Llm {
+    } else if summarizer == crate::agent::compaction::verbatim::SummaryMode::Llm {
         llm_summary(
             _config,
             _cancel,
@@ -881,7 +883,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap();
@@ -897,7 +899,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap();
@@ -941,7 +943,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap();
@@ -1011,7 +1013,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             true,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap_err();
@@ -1024,7 +1026,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap();
@@ -1067,7 +1069,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             false,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap();
@@ -1078,7 +1080,7 @@ mod tests {
             &crate::agent::state::GlobalCancellation,
             true,
             false,
-            crate::agent::jev::summary_mode(),
+            crate::agent::compaction::verbatim::summary_mode(),
         )
         .await
         .unwrap();
@@ -1131,7 +1133,7 @@ mod tests {
         let before = messages.len();
         // Mirrors the threshold caller in `loop.rs`: one parse selects
         // both the prune and the fallback summarizer.
-        let summarizer = crate::agent::jev::summary_mode();
+        let summarizer = crate::agent::compaction::verbatim::summary_mode();
         let (compacted, usage) = compact_history(
             &config,
             &mut messages,
@@ -1182,7 +1184,7 @@ mod tests {
         }
         // Mirrors the threshold caller in `loop.rs`: one parse selects
         // both the prune and the fallback summarizer.
-        let summarizer = crate::agent::jev::summary_mode();
+        let summarizer = crate::agent::compaction::verbatim::summary_mode();
         let (compacted, _) = compact_history(
             &config,
             &mut messages,
@@ -1230,7 +1232,7 @@ mod tests {
         }
         // Mirrors the threshold caller in `loop.rs`: one parse selects
         // both the prune and the fallback summarizer.
-        let summarizer = crate::agent::jev::summary_mode();
+        let summarizer = crate::agent::compaction::verbatim::summary_mode();
         let (compacted, _) = compact_history(
             &config,
             &mut messages,
@@ -1337,7 +1339,7 @@ mod tests {
         for i in 0..KEEP_RECENT_MESSAGES {
             messages.push(msg(Role::User, &format!("recent {i}")));
         }
-        let summarizer = crate::agent::jev::summary_mode();
+        let summarizer = crate::agent::compaction::verbatim::summary_mode();
         let (compacted, usage) = compact_history(
             &config,
             &mut messages,
@@ -1361,7 +1363,10 @@ mod tests {
         assert!(questions
             .keys()
             .any(|k| k.ends_with("_result_needed_verbatim")));
-        assert_eq!(log[0]["model"], crate::agent::jev::JEV_MODEL);
+        assert_eq!(
+            log[0]["model"],
+            crate::agent::compaction::verbatim::JEV_MODEL
+        );
         drop(log);
 
         // Endpoint verdicts applied: even (read) pairs dropped entirely,
