@@ -1,3 +1,4 @@
+use super::super::style::fg;
 use super::super::style::{composer_band, INPUT_PROMPT, INPUT_PROMPT_WIDTH};
 use super::super::theme;
 use super::super::wrapping::wrap_line;
@@ -5,7 +6,6 @@ use super::super::App;
 use super::super::InputField;
 use super::input_block;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Clear;
@@ -28,9 +28,9 @@ impl ComposerView {
         // Bare text on the terminal background between the two hairline rules
         // (see `input_block`); the busy state dims the text.
         let input_style = if app.busy || !app.pending_approvals.is_empty() {
-            Style::default().fg(theme::muted_fg())
+            fg(theme::muted_fg())
         } else {
-            Style::default().fg(theme::surface_fg())
+            fg(theme::surface_fg())
         };
         let block = input_block();
         let inner = block.inner(band);
@@ -75,7 +75,7 @@ pub(crate) fn render_input(
     };
     // The glyph wears the same voice color as the words — one voice per
     // prompt row.
-    let prompt_span = Span::styled(INPUT_PROMPT.to_string(), Style::default().fg(text_fg));
+    let prompt_span = Span::styled(INPUT_PROMPT.to_string(), fg(text_fg));
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cur_row: u16 = 0;
     let mut cur_x: u16 = 0;
@@ -95,7 +95,7 @@ pub(crate) fn render_input(
             if first && si == 0 {
                 spans.push(prompt_span.clone());
             }
-            spans.push(Span::styled(seg.clone(), Style::default().fg(text_fg)));
+            spans.push(Span::styled(seg.clone(), fg(text_fg)));
             lines.push(Line::from(spans));
         }
         if li == input.row {
@@ -112,7 +112,7 @@ pub(crate) fn render_input(
     if lines.is_empty() {
         lines.push(Line::from(vec![
             prompt_span,
-            Span::styled(String::new(), Style::default().fg(text_fg)),
+            Span::styled(String::new(), fg(text_fg)),
         ]));
         if input.row == 0 {
             cur_x = INPUT_PROMPT_WIDTH as u16;

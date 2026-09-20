@@ -1,6 +1,7 @@
 use super::super::slash;
 use super::super::status::footer_line;
 use super::super::status::truncate_display;
+use super::super::style::fg;
 use super::super::style::{composer_band, content_width, status_padding};
 use super::super::theme;
 use super::super::App;
@@ -119,21 +120,21 @@ impl SlashSuggestionsView {
             .map(|(offset, (command, description))| {
                 let selected = start + offset == app.slash_selected;
                 let marker_style = if selected {
-                    Style::default().fg(Color::Cyan)
+                    fg(theme::accent_fg())
                 } else {
-                    Style::default().fg(theme::muted_fg())
+                    fg(theme::muted_fg())
                 };
                 let command_style = if selected {
                     // `>` plus the brighter fg mark the selection; unselected
                     // rows stay plain cyan. No bold — chrome stays quiet.
-                    Style::default().fg(theme::surface_fg())
+                    fg(theme::surface_fg())
                 } else {
-                    Style::default().fg(Color::Cyan)
+                    fg(theme::accent_fg())
                 };
                 let description_style = if selected {
-                    Style::default().fg(theme::surface_fg())
+                    fg(theme::surface_fg())
                 } else {
-                    Style::default().fg(theme::secondary_fg())
+                    fg(theme::secondary_fg())
                 };
                 let label = slash::suggestion_label(&input, command);
                 let cell = truncate_display(label, cmd_col as u16);
@@ -183,15 +184,12 @@ impl SlashSuggestionsView {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(inner_w),
-                Style::default().fg(theme::hairline_fg()),
+                fg(theme::hairline_fg()),
             ))),
             sheet_row(0),
         );
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                header_text,
-                Style::default().fg(theme::muted_fg()),
-            ))),
+            Paragraph::new(Line::from(Span::styled(header_text, fg(theme::muted_fg())))),
             sheet_row(1),
         );
         f.render_widget(
@@ -272,9 +270,9 @@ impl ApprovalOverlay {
         f.render_widget(Clear, popup);
         let block = Block::default()
             .title(format!(" {} — {} ", title, approval.name))
-            .title_style(Style::default().fg(Color::Yellow))
+            .title_style(fg(theme::warn_fg()))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(fg(theme::warn_fg()))
             .padding(Padding::new(1, 1, 1, 1))
             .style(Style::default().bg(theme::popup_bg()));
         let inner = block.inner(popup);
@@ -292,31 +290,19 @@ impl ApprovalOverlay {
         .split(inner);
 
         let header_line = Line::from(vec![
-            Span::styled(title.to_string(), Style::default().fg(Color::Cyan)),
-            Span::styled("  ·  ", Style::default().fg(theme::muted_fg())),
-            Span::styled(
-                format!("{} risk", risk_label),
-                Style::default().fg(risk_color),
-            ),
-            Span::styled(
-                format!("  ·  {}", approval.name),
-                Style::default().fg(theme::muted_fg()),
-            ),
+            Span::styled(title.to_string(), fg(theme::accent_fg())),
+            Span::styled("  ·  ", fg(theme::muted_fg())),
+            Span::styled(format!("{} risk", risk_label), fg(risk_color)),
+            Span::styled(format!("  ·  {}", approval.name), fg(theme::muted_fg())),
         ]);
-        let sub = Line::from(Span::styled(
-            summary.clone(),
-            Style::default().fg(theme::surface_fg()),
-        ));
+        let sub = Line::from(Span::styled(summary.clone(), fg(theme::surface_fg())));
         f.render_widget(
             Paragraph::new(vec![header_line, sub]).wrap(Wrap { trim: false }),
             chunks[0],
         );
         let wants = format!("The {agent_prefix}agent wants to run:");
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                wants,
-                Style::default().fg(theme::muted_fg()),
-            ))),
+            Paragraph::new(Line::from(Span::styled(wants, fg(theme::muted_fg())))),
             chunks[1],
         );
         // Queued behind this one (V1b): child agents can park several.
@@ -324,7 +310,7 @@ impl ApprovalOverlay {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("+{extra} more approval(s) waiting"),
-                    Style::default().fg(Color::Yellow),
+                    fg(theme::warn_fg()),
                 ))),
                 chunks[5],
             );
