@@ -1,6 +1,7 @@
 use super::app::format_tokens;
 use super::app::App;
 use super::app::TranscriptBlock;
+use super::app::INPUT_PROMPT;
 use super::app::STREAM_FLUSH_INTERVAL;
 use super::app::THINKING_TEXT_CAP;
 use super::app::THINKING_TEXT_SLACK;
@@ -677,25 +678,27 @@ pub(crate) fn scroll_transcript(app: &mut App, delta: i32) {
 }
 
 /// Render the user's submitted prompt with the shared transcript grid.
-/// The words keep the user's signature voice color from the composer, so
-/// your turns read as yours against the assistant's default foreground.
+/// The words keep the user's signature voice color from the composer, and
+/// the composer's `❯ ` glyph is echoed on the first row, so your turns
+/// keep the shape they had while typed.
 /// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
 pub(crate) fn render_user_prompt(app: &mut App, line: &str) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
-    // Plain words on the shared transcript margin: no prompt glyph, just
-    // the user's signature voice color from the composer, so your turns
-    // read as yours against the assistant's default foreground.
-    // No background is stored here: `wrap_block` paints the composer
-    // `surface_bg()` band plus `INPUT_PAD_Y` air at wrap time.
+    // No background is stored here: `wrap_block` pads every row to the
+    // full width plus `INPUT_PAD_Y` air at wrap time.
     let user_style = Style::default().fg(theme::user_fg());
     let mut block_lines = Vec::new();
-    for sub in line.split('\n') {
-        block_lines.push(indent_transcript_line(Line::from(Span::styled(
-            sub.to_string(),
-            user_style,
-        ))));
+    for (i, sub) in line.split('\n').enumerate() {
+        let mut l = Line::from(Span::styled(sub.to_string(), user_style));
+        if i == 0 {
+            // The glyph is echoed on the first row so submitted and typed
+            // share one shape.
+            l.spans
+                .insert(0, Span::styled(INPUT_PROMPT.to_string(), user_style));
+        }
+        block_lines.push(indent_transcript_line(l));
     }
     app.transcript.push(TranscriptBlock::User {
         stamp: 0,
