@@ -1,8 +1,7 @@
 use super::super::status::truncate_display;
+use super::super::style::fg;
 use super::super::theme;
 use super::transcript::wrap_line_display;
-use ratatui::style::Color;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::time::Duration;
@@ -14,7 +13,7 @@ use std::time::Duration;
 /// One expanded-thinking source line: dim + transcript-indented, exactly as
 /// the expanded arm of `thinking_display_lines` builds it.
 fn thinking_line(s: &str) -> Line<'static> {
-    let style = Style::default().fg(theme::muted_fg());
+    let style = fg(theme::muted_fg());
     super::super::indent_transcript_line(Line::from(Span::styled(s.to_string(), style)))
 }
 
@@ -153,7 +152,7 @@ pub(crate) fn thinking_indicator_line(
             &thinking_indicator_text(thinking_open, elapsed, tick),
             width,
         ),
-        Style::default().fg(theme::muted_fg()),
+        fg(theme::muted_fg()),
     )))
 }
 
@@ -167,10 +166,7 @@ pub(crate) fn activity_display_lines(
 ) -> Vec<Line<'static>> {
     match settled {
         Some(summary) => vec![super::super::indent_transcript_line(Line::from(
-            Span::styled(
-                truncate_display(summary, width),
-                Style::default().fg(Color::LightGreen),
-            ),
+            Span::styled(truncate_display(summary, width), fg(theme::success_fg())),
         ))],
         None => vec![activity_indicator_line(tick, width)],
     }
@@ -179,6 +175,6 @@ pub(crate) fn activity_display_lines(
 pub(crate) fn activity_indicator_line(tick: u16, width: u16) -> Line<'static> {
     super::super::indent_transcript_line(Line::from(Span::styled(
         truncate_display(&format!("● Working {}", dots_for_tick(tick)), width),
-        Style::default().fg(theme::muted_fg()),
+        fg(theme::muted_fg()),
     )))
 }

@@ -4,16 +4,16 @@ use super::app::TranscriptBlock;
 use super::app::STREAM_FLUSH_INTERVAL;
 use super::app::THINKING_TEXT_CAP;
 use super::app::THINKING_TEXT_SLACK;
-use super::app::TRANSCRIPT_INDENT;
 use super::render;
 use super::status;
+use super::style::fg;
+use super::style::INPUT_PROMPT;
+use super::style::TRANSCRIPT_INDENT;
 use super::theme;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
 use crate::runtime::format_runtime::agent_lifecycle;
 use crate::ui::format::short_arg;
-use ratatui::style::Color;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::collections::HashSet;
@@ -47,10 +47,7 @@ pub(crate) fn push_info_line(app: &mut App, line: Line<'static>) {
 }
 
 pub(crate) fn push_info(app: &mut App, text: String) {
-    push_info_line(
-        app,
-        Line::from(Span::styled(text, Style::default().fg(Color::Cyan))),
-    );
+    push_info_line(app, Line::from(Span::styled(text, fg(theme::accent_fg()))));
 }
 
 /// Session-start banner: the "DEX" wordmark with its version in
@@ -66,7 +63,7 @@ pub(crate) fn push_banner(app: &mut App) {
     app.assistant_open = false;
     // Subtle by design: the theme-aware muted foreground instead of a bright
     // accent, so the banner reads as quiet chrome on light/dark terminals.
-    let style = Style::default().fg(theme::muted_fg());
+    let style = fg(theme::muted_fg());
     let lines = vec![indent_transcript_line(Line::from(Span::styled(
         BANNER.to_string(),
         style,
@@ -306,19 +303,19 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     // outcome (glyph + summary) and trails timing in dim.
     let failed = !success;
     let color = if failed {
-        Color::LightRed
+        theme::failure_fg()
     } else {
-        Color::LightGreen
+        theme::success_fg()
     };
     let mut spans = vec![
-        Span::styled("└ ", Style::default().fg(color)),
-        Span::styled(if failed { "✗ " } else { "✓ " }, Style::default().fg(color)),
-        Span::styled(summary, Style::default().fg(color)),
+        Span::styled("└ ", fg(color)),
+        Span::styled(if failed { "✗ " } else { "✓ " }, fg(color)),
+        Span::styled(summary, fg(color)),
     ];
     if duration > 0.0 {
         spans.push(Span::styled(
             format!(" · {}", crate::ui::format::format_duration(duration)),
-            Style::default().fg(theme::muted_fg()),
+            fg(theme::muted_fg()),
         ));
     }
     let output = indent_transcript_line(Line::from(spans));
@@ -348,13 +345,13 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
             .iter()
             .map(|line| {
                 let style = if line.starts_with('+') && !line.starts_with("+++") {
-                    Style::default().fg(Color::LightGreen)
+                    fg(theme::success_fg())
                 } else if line.starts_with('-') && !line.starts_with("---") {
-                    Style::default().fg(Color::LightRed)
+                    fg(theme::failure_fg())
                 } else if line.starts_with("@@") {
-                    Style::default().fg(Color::Cyan)
+                    fg(theme::accent_fg())
                 } else {
-                    Style::default().fg(theme::tool_preview_fg())
+                    fg(theme::tool_preview_fg())
                 };
                 indent_transcript_line(Line::from(Span::styled(format!("  {line}"), style)))
             })
@@ -385,7 +382,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
             .map(|line| {
                 indent_transcript_line(Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(theme::tool_preview_fg()),
+                    fg(theme::tool_preview_fg()),
                 )))
             })
             .collect()
@@ -418,10 +415,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     // arg for highlighting.
     app.transcript.push(TranscriptBlock::Tool {
         stamp: 0,
-        input: indent_transcript_line(Line::from(Span::styled(
-            "▸ tool",
-            Style::default().fg(Color::Yellow),
-        ))),
+        input: indent_transcript_line(Line::from(Span::styled("▸ tool", fg(theme::warn_fg())))),
         output: Some(output),
         preview: preview_lines,
         tool_arg: String::new(),
@@ -437,12 +431,12 @@ fn append_system(app: &mut App, s: String) {
     app.assistant_open = false;
     let line = match agent_lifecycle(&s) {
         Some((glyph, _)) => indent_transcript_line(Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(Color::Green)),
-            Span::styled(s, Style::default().fg(Color::Green)),
+            Span::styled(format!("{glyph} "), fg(theme::ok_fg())),
+            Span::styled(s, fg(theme::ok_fg())),
         ])),
         None => indent_transcript_line(Line::from(vec![
-            Span::styled("· ", Style::default().fg(theme::muted_fg())),
-            Span::styled(s, Style::default().fg(theme::muted_fg())),
+            Span::styled("· ", fg(theme::muted_fg())),
+            Span::styled(s, fg(theme::muted_fg())),
         ])),
     };
     app.transcript
@@ -454,8 +448,8 @@ fn append_error(app: &mut App, s: String) {
     app.transcript.push(TranscriptBlock::Error {
         stamp: 0,
         line: indent_transcript_line(Line::from(vec![
-            Span::styled("! ", Style::default().fg(Color::Red)),
-            Span::styled(format!("error: {s}"), Style::default().fg(Color::Red)),
+            Span::styled("! ", fg(theme::error_fg())),
+            Span::styled(format!("error: {s}"), fg(theme::error_fg())),
         ])),
     });
 }
@@ -677,25 +671,27 @@ pub(crate) fn scroll_transcript(app: &mut App, delta: i32) {
 }
 
 /// Render the user's submitted prompt with the shared transcript grid.
-/// The words keep the user's signature voice color from the composer, so
-/// your turns read as yours against the assistant's default foreground.
+/// The words keep the user's signature voice color from the composer, and
+/// the composer's `❯ ` glyph is echoed on the first row, so your turns
+/// keep the shape they had while typed.
 /// No empty gap `Line`s are stored; gutter is inserted by `TranscriptView`.
 pub(crate) fn render_user_prompt(app: &mut App, line: &str) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
-    // Plain words on the shared transcript margin: no prompt glyph, just
-    // the user's signature voice color from the composer, so your turns
-    // read as yours against the assistant's default foreground.
-    // No background is stored here: `wrap_block` paints the composer
-    // `surface_bg()` band plus `INPUT_PAD_Y` air at wrap time.
-    let user_style = Style::default().fg(theme::user_fg());
+    // No background is stored here: `wrap_block` pads every row to the
+    // full width plus `INPUT_PAD_Y` air at wrap time.
+    let user_style = fg(theme::user_fg());
     let mut block_lines = Vec::new();
-    for sub in line.split('\n') {
-        block_lines.push(indent_transcript_line(Line::from(Span::styled(
-            sub.to_string(),
-            user_style,
-        ))));
+    for (i, sub) in line.split('\n').enumerate() {
+        let mut l = Line::from(Span::styled(sub.to_string(), user_style));
+        if i == 0 {
+            // The glyph is echoed on the first row so submitted and typed
+            // share one shape.
+            l.spans
+                .insert(0, Span::styled(INPUT_PROMPT.to_string(), user_style));
+        }
+        block_lines.push(indent_transcript_line(l));
     }
     app.transcript.push(TranscriptBlock::User {
         stamp: 0,

@@ -31,41 +31,7 @@ fn raised(amount: f32) -> Color {
     }
 }
 
-/// Minimum per-channel drop the darkened band must show against the raw
-/// background before it reads as visible; less is indistinguishable.
-const MIN_BAND_STEP: u8 = 8;
-
-/// BG for the composer band: the terminal's actual background shaded a
-/// step darker, so the input reads as a subtle inset strip rather than a
-/// raised card. Scaling toward black keeps the theme's hue (tinted themes
-/// stay tinted). Backgrounds that can't drop visibly — near-black,
-/// mid-gray, or already-deep dark themes — fall back to a slight raise
-/// toward the foreground so the band still reads as distinct.
-pub(crate) fn surface_bg() -> Color {
-    match term_palette() {
-        Some(p) => {
-            let amount = if p.dark { 0.15 } else { 0.05 };
-            let (r, g, b) = blend(p.background, (0, 0, 0), amount);
-            // Blending toward black only shrinks channels, so original
-            // minus blend is the per-channel drop; take the largest.
-            let (orig_r, orig_g, orig_b) = p.background;
-            let step = orig_r
-                .saturating_sub(r)
-                .max(orig_g.saturating_sub(g))
-                .max(orig_b.saturating_sub(b));
-            if step >= MIN_BAND_STEP {
-                Color::Rgb(r, g, b)
-            } else {
-                raised(0.075)
-            }
-        }
-        // No theme information at all: leave the background untouched so the
-        // surface always blends with whatever the terminal paints.
-        None => Color::Reset,
-    }
-}
-
-/// Slightly stronger surface for popups so they read as floating above the UI.
+/// BG for popup surfaces so they read as floating above the UI.
 pub(crate) fn popup_bg() -> Color {
     match background() {
         Background::Dark => raised(0.18),
@@ -256,6 +222,56 @@ pub(crate) fn tool_input_fg() -> Color {
     tool_muted_fg()
 }
 
+/// Semantic ANSI accents — Cyan / Yellow / Green / Red. Terminal themes remap
+/// these slots to their own palette, so the TUI picks up the active theme's
+/// hue instead of a fixed RGB. Two scales share each slot:
+///
+/// - structural chrome (identity, navigation, pending items) uses the **base**
+///   color: Cyan/Yellow,
+/// - content outcomes (tool results, ok/fail tails) use the **bright** scale:
+///   LightGreen/LightRed, which reads as data rather than as UI.
+///
+/// Strong `Green`/`Red` are reserved for affirmative state (mode: auto,
+/// clean-notice, agents) and the error block. This block is the only place
+/// raw `Color::Cyan`/`Yellow`/`Green`/`Red` constants should appear; named
+/// roles below are what renderers call.
+///
+/// Identity / navigation chrome: cwd + branch, mode: plan, info notes, the
+/// slash-sheet marker, diff `@@` hunks.
+pub(crate) fn accent_fg() -> Color {
+    Color::Cyan
+}
+
+/// Attention: pending items (queued steers, warnings, the `▲ more above`
+/// hint), the mode: manual chip, tool-glyph headings.
+pub(crate) fn warn_fg() -> Color {
+    Color::Yellow
+}
+
+/// Affirmative state: mode: auto, the transient saved notice, live agents.
+pub(crate) fn ok_fg() -> Color {
+    Color::Green
+}
+
+/// Errors: the transcript's `! error: …` block. Tool failures use
+/// `failure_fg` (bright scale) so a failed call reads as content outcome,
+/// not a UI alarm.
+pub(crate) fn error_fg() -> Color {
+    Color::Red
+}
+
+/// Content outcome — success (tool `✓` tails, settled turn summary, clean
+/// branch).
+pub(crate) fn success_fg() -> Color {
+    Color::LightGreen
+}
+
+/// Content outcome — failure (tool `✗` tails, failed diffs, context past
+/// the compaction trigger).
+pub(crate) fn failure_fg() -> Color {
+    Color::LightRed
+}
+
 fn background() -> Background {
     match term_palette() {
         Some(p) if p.dark => Background::Dark,
@@ -279,7 +295,7 @@ mod tests {
         // Whatever the detected background, surfaces must resolve without
         // panicking and stay on-theme: Reset when the theme is unknown, or
         // RGB derived from the queried palette.
-        for color in [surface_bg(), popup_bg()] {
+        for color in [popup_bg()] {
             match color {
                 Color::Reset => {}
                 Color::Rgb(..) if background() != Background::Unknown => {}
@@ -295,7 +311,6 @@ mod tests {
         // color that could match the surface it sits on.
         if background() == Background::Unknown {
             assert_eq!(surface_fg(), Color::Reset);
-            assert_eq!(surface_bg(), Color::Reset);
         }
     }
 
