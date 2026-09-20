@@ -427,15 +427,18 @@ daemon's working directory.
 | `-s`, `--session <path>`         | Open/continue a specific session file.                                                                            |
 | `--no-session`                   | Disable session persistence for this run.                                                                         |
 | `-n`, `--new`                    | Start a new session (the default).                                                                                |
-| `--permission <mode>`            | Tool permissions: `read-only`, `ask-writes`, `ask-shell`, or `trusted` (default `trusted`).                       |
+| `--permission <mode>`            | Tool permission ceiling: `read-only`, `ask`, or `trusted` (default `trusted`). Deprecated `ask-writes`/`ask-shell` still parse and map to `ask`. |
+| `--mode <plan\|manual\|auto>`    | Agent mode for this run (`plan` = read-only + planning directive); clamped to the permission ceiling.               |
 | `--name <name>`                  | Name the session (default `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`).                                           |
 | `--reattach <id>`                | Attach to an existing daemon session and replay its event journal (bare `dex` or `dex connect <url>`, no prompt). |
 | `--skill <dir>`                  | Add an extra skill directory to discover skills from.                                                             |
 | `--tool`                         | Run raw JSON tool mode (read JSON lines from stdin).                                                              |
 
 Tool safety defaults to `trusted` (no approval popups). Set
-`DEX_PERMISSION=ask-writes` or pass `--permission` to approve writes and shell
-commands. Paths are confined to the current workspace; `bash` can execute
+`DEX_PERMISSION=ask` or pass `--permission` to approve writes and shell
+commands. The ceiling also seeds the TUI's agent mode (`plan`/`manual`/`auto`,
+see [Agent modes](#agent-modes)): a client can only go stricter than the
+daemon's ceiling. Paths are confined to the current workspace; `bash` can execute
 arbitrary commands in that workspace and should only be enabled in trusted
 environments. Shell commands default to 120 seconds and 1 MiB per output stream.
 HTTP requests default to 10 seconds to connect and 300 seconds overall. Sessions
@@ -458,10 +461,11 @@ touching config or network.
 | Command                      | Description                                               |
 | ---------------------------- | --------------------------------------------------------- |
 | `/quit`                      | Exit the REPL.                                            |
-| `/permissions`               | Show permission mode and workspace.                       |
-  | `/mcp`                       | Show MCP servers, tools, and connection errors.           |
-  | `/extensions [reload]`       | Show loaded Lua extensions (`reload` rescans).            |
-  | `/clear`                     | Clear the conversation history (keeps the system prompt). |
+| `/permissions`               | Deprecated alias for `/mode`.                             |
+| `/mode [plan\|manual\|auto]` | Show or set the agent mode (also Shift+Tab).              |
+| `/mcp`                       | Show MCP servers, tools, and connection errors.           |
+| `/extensions [reload]`       | Show loaded Lua extensions (`reload` rescans).            |
+| `/clear`                     | Clear the conversation history (keeps the system prompt). |
 | `/new`                       | Start a new session and clear history.                    |
 | `/session`                   | Show the current session id, path, and turn count.        |
 | `/resume [index\|path]`      | List sessions, or resume one by index/path.               |
@@ -496,6 +500,32 @@ session — a second is refused until the first finishes, and `Esc`/`Ctrl+C`
 cancels it. `dex "!<command>"` and `dex connect <url> "!<command>"` do the same
 without the TUI.
 
+### Agent modes
+
+The TUI has one autonomy selector, cycled with **Shift+Tab** or set with
+`/mode [plan|manual|auto]`:
+
+| Mode | Intent | Tool gate | Model directive |
+| ------- | ---------------------------------------- | --------------------------------- | -------------------------------------- |
+| `plan` | Research and produce a plan; make **no** changes | `read-only` — every mutation/shell call denied | explore first, then present a plan; do not edit |
+| `manual` (default) | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the approval overlay | none |
+| `auto` | Hands-off execution | `trusted` — no prompts | none |
+
+The default is `manual`: a stock launch seeds the mode from the permission
+default, except that a `trusted` (default) ceiling seeds `manual` rather than
+`auto` — hands-off is opt-in via Shift+Tab, `--mode auto`, or an explicit
+`--permission trusted`/`DEX_PERMISSION=trusted`. The mode is journaled with
+each turn, so `--reattach` and `/resume` restore the last selector instead of
+reseeding from the ceiling.
+
+The mode is a client-side selector that *derives* the per-turn permission; it
+is not a second wire concept. The daemon's `--permission`/`DEX_PERMISSION` is a
+**ceiling**: a client may only go stricter (`plan` ≤ `manual` ≤ `auto`), so the
+cycle clamps and reports `ceiling …` rather than letting an `auto` client bypass
+an `ask` daemon. Switching takes effect on the next submit. A `plan` turn also
+appends a plan directive to the system prompt; already-sent turns are
+unaffected.
+
 ### Keyboard controls
 
 - **Enter** — submit the current input.
@@ -514,6 +544,9 @@ without the TUI.
   third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt
   clears it first, and **Ctrl+D** on an empty line quits.
 - **Ctrl+T** — expand/collapse the full thinking block.
+- **Shift+Tab** — cycle the agent mode: `plan` → `manual` → `auto` → `plan`
+  (clamped to the daemon's `--permission`/`DEX_PERMISSION` ceiling, which it
+  cannot exceed). See [Agent modes](#agent-modes).
 - **Alt+V** — cycle your voice color (plain by default; magenta → sky → peach →
   violet → rose → amber → coral → plain); the composer and new prompts use it,
   already-sent rows keep theirs.
@@ -757,7 +790,7 @@ discovered extension with its consent state.
 | `DEX_THINKING_EFFORT`                                         | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback).                                                                                                                                                                                                                                                                                                           |
 | `DEX_SYSTEM_PROMPT`                                           | Replace the built-in base system prompt (same knob as file `system_prompt:`; project/extensions/skills still append).                                                                                                                                                                                                                                                                                           |
 | `DEX_SYSTEM_PROMPT_FILE`                                      | Read the replacement base system prompt from a file (same knob as file `system_prompt_file:`).                                                                                                                                                                                                                                                                                                                  |
-| `DEX_PERMISSION`                                              | Tool permission mode (`read-only`, `ask-writes`, `ask-shell`, or `trusted`; default `trusted`).                                                                                                                                                                                                                                                                                                                 |
+| `DEX_PERMISSION`                                              | Tool permission ceiling (`read-only`, `ask`, or `trusted`; default `trusted`). Deprecated `ask-writes`/`ask-shell` map to `ask`.                                                                                                                         |
 | `DEX_LOG`                                                     | Runtime log level: `off`, `error`, `warn` (default), `info`, `debug`, `trace` — works on release builds. Logs go to stderr, or to `$XDG_DATA_HOME/dex/dex.log` while the TUI runs. `debug` covers provider requests/responses and tool runs; `trace` adds raw provider SSE lines.                                                                                                                               |
 | `DEX_VERIFY`                                                  | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default.                                                                                                                                                                                                                                                                                                     |
 | `DEX_COMPACTION`                                              | `llm` for LLM summarization (`1` accepted), `jev` for verbatim tool-output pruning (default deterministic; `jev` falls back to deterministic when pruning doesn't pay).                                                                                                                                                                                                                                                         |

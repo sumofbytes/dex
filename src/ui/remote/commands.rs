@@ -7,7 +7,7 @@ use super::input::no_paint;
 use super::input::rebuild_remote_from_messages;
 use super::input::replay_remote_events;
 use super::state::RemoteApp;
-use crate::protocol::PermissionMode;
+use crate::protocol::AgentMode;
 use crate::session::Session;
 
 /// Slash commands for remote mode. Locally-answered commands are handled
@@ -68,12 +68,26 @@ pub(crate) fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
                 remote.options.thinking_effort = None;
             }
             if remote.app.config.permission != had_permission {
-                remote.options.permission = Some(match remote.app.config.permission {
-                    PermissionMode::ReadOnly => "read-only".to_string(),
-                    PermissionMode::AskWrites => "ask-writes".to_string(),
-                    PermissionMode::AskShell => "ask-shell".to_string(),
-                    PermissionMode::Trusted => "trusted".to_string(),
-                });
+                // `/mode` (or its `/permissions` alias) set the permission via
+                // `cmd_mode`; fold it back into the single selector and clamp
+                // to the daemon ceiling so the next turn is not rejected.
+                let mut mode = AgentMode::from_permission(remote.app.config.permission);
+                let clamp = AgentMode::from_permission(remote.ceiling);
+                if mode.permission().permissiveness() > clamp.permission().permissiveness() {
+                    push_info(
+                        &mut remote.app,
+                        format!(
+                            "mode {} exceeds daemon ceiling {} — clamped",
+                            mode.label(),
+                            remote.ceiling.as_str()
+                        ),
+                    );
+                    mode = clamp;
+                    remote.app.config.permission = mode.permission();
+                }
+                remote.mode = mode;
+                remote.options.permission = Some(mode.permission().as_str().to_string());
+                remote.options.mode = Some(mode.as_str().to_string());
             }
             if remote.app.plan != had_plan {
                 if remote.app.plan.is_empty() {
@@ -602,6 +616,22 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
             // doesn't leak into the resumed one.
             reset_session_state(&mut remote.app);
             remote.options.plan = None;
+            // Restore the journaled agent mode from the last `turn_start`
+            // (same as reattach): a session parked in `plan` resumes in
+            // `plan`, not in the ceiling's mode. Best-effort for legacy
+            // journals — the seeded selector stands.
+            if let Some(p) = local_path.as_deref() {
+                if let Some(mode) = crate::session::Session::last_turn_mode(p)
+                    .and_then(|m| AgentMode::parse(&m).ok())
+                {
+                    // Clamp to the (possibly new) ceiling, same as reattach.
+                    if mode.permission().permissiveness() <= remote.ceiling.permissiveness() {
+                        remote.mode = mode;
+                        remote.options.mode = Some(mode.as_str().to_string());
+                        remote.options.permission = Some(mode.permission().as_str().to_string());
+                    }
+                }
+            }
             if let Some(p) = local_path.as_deref() {
                 if let Ok(s) = Session::from_path(p) {
                     remote.app.session = s;
