@@ -20,11 +20,11 @@ pub(crate) fn lock_map<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// A pending tool execution awaiting the client's approval decision.
-pub(crate) struct PendingApproval {
-    pub(crate) session_id: String,
-    pub(crate) response: tokio::sync::mpsc::Sender<ApprovalDecision>,
-    pub(crate) name: String,
-    pub(crate) input: String,
+pub struct PendingApproval {
+    pub session_id: String,
+    pub response: tokio::sync::mpsc::Sender<ApprovalDecision>,
+    pub name: String,
+    pub input: String,
     /// Set when the requester is a background child agent (plan §12 V1b):
     /// the child outlives the parent turn, so turn-end teardown and parent
     /// cancel must not deny its approval — it stays parked and answerable.
@@ -50,7 +50,7 @@ pub(crate) struct IdempotentTurn {
 
 /// Shared state for the daemon. Plain mutexes are fine here: every critical
 /// section is short and never holds the lock across an `.await`.
-pub(crate) struct DaemonState {
+pub struct DaemonState {
     pub sessions: Mutex<HashMap<String, SessionEntry>>,
     /// The daemon's permission ceiling, resolved **once** at construction
     /// from `--permission` / `DEX_PERMISSION` (one default, `trusted`).
@@ -68,12 +68,12 @@ pub(crate) struct DaemonState {
     /// Per-session cancellation tokens for in-flight turns. POST /cancel
     /// signals the token so this turn unwinds without touching other
     /// sessions; the entry is removed when the turn finishes.
-    pub cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
+    pub(crate) cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
     /// Per-session cancellation tokens for in-flight `!` shell runs (Esc
     /// cancels a running bash). POST /cancel signals these too; the
     /// entry is removed when the run finishes. At most one run per session
     /// (a second `POST /shell` while one is registered is 409).
-    pub shell_tokens: Mutex<HashMap<String, CancellationToken>>,
+    pub(crate) shell_tokens: Mutex<HashMap<String, CancellationToken>>,
     /// Per-session steering queue: `POST /steer` pushes a `Content` into the
     /// turn's `steering_rx` (consumed inside `process_turn` between
     /// iterations); `POST /recall` pushes a `Recall` that cancels a not-yet-
@@ -87,7 +87,7 @@ pub(crate) struct DaemonState {
     /// seeded from disk on startup so replays stay consistent across restarts.
     pub event_seqs: Mutex<HashMap<String, u64>>,
     /// `Idempotency-Key` → completed turn, for 60s dedup (P10).
-    pub idempotency: Mutex<HashMap<String, IdempotentTurn>>,
+    pub(crate) idempotency: Mutex<HashMap<String, IdempotentTurn>>,
     /// Persisted “allow for session” approvals, keyed by `name:hash` (same
     /// scope as `Console::approval_key`). Lives on the daemon so a decision
     /// survives across turns; previously `Console` was per-turn and lost it.
@@ -98,7 +98,7 @@ pub(crate) struct DaemonState {
     /// `remove_session_agents` drops a session's manager once session
     /// delete/reset endpoints exist. Managers are closed on shutdown, so
     /// stale clones cannot respawn children into a dropped registry.
-    pub agents: Mutex<HashMap<String, AgentManager>>,
+    pub(crate) agents: Mutex<HashMap<String, AgentManager>>,
     /// Set once the background startup rebuild has merged the disk registry.
     /// Surfaced via `/health` so operators can tell a partial registry apart
     /// from an empty one.
@@ -111,7 +111,7 @@ pub(crate) struct DaemonState {
     /// Per-session idle wake turn tokens (V1b, plan §10b). A user chat POST
     /// steals the wake: "chat wins, wake skips" — a user-visible 409 must
     /// never lose a race with a background notice.
-    pub wakes: Mutex<HashMap<String, CancellationToken>>,
+    pub(crate) wakes: Mutex<HashMap<String, CancellationToken>>,
     /// Last time a client read this session's event journal (V1b presence,
     /// §10b): every `GET /events` refreshes it. A wake fires only when a
     /// client is plausibly listening.
@@ -134,7 +134,7 @@ pub(crate) const NEGATIVE_TTL: Duration = Duration::from_secs(60);
 pub(crate) const IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
-pub(crate) struct SessionEntry {
+pub struct SessionEntry {
     pub path: PathBuf,
     pub name: Option<String>,
     pub cwd: String,
@@ -162,6 +162,7 @@ pub(crate) struct SessionEntry {
 }
 
 impl DaemonState {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),

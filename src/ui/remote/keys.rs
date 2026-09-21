@@ -121,7 +121,7 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         // popup open; already-submitted rows keep the voice they were
         // sent in, the composer and new prompts use the new one.
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::ALT) => {
-            let name = super::super::theme::cycle_voice();
+            let name = crate::render::theme::cycle_voice();
             app.notice = Some((format!("voice: {name}"), Instant::now()));
         }
         // Shift+Tab cycle: plan → manual → auto → plan, clamped to the
@@ -447,7 +447,7 @@ fn run_shell_command(remote: &mut RemoteApp, line: String, command: String, excl
     let client = remote.client.clone();
     let sid = remote.session_id.clone();
     let tx = remote.worker_tx.clone();
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         let start = Instant::now();
         match client.shell_async(&sid, &command, excluded).await {
             Ok(resp) => {
@@ -494,7 +494,7 @@ pub(crate) fn finish_shell_command(
         SHELL_BLOCK_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let input = serde_json::json!({"command": command}).to_string();
-    let short = crate::ui::format::short_arg("bash", &input);
+    let short = crate::render::format::short_arg("bash", &input);
     append_sink_line(
         &mut remote.app,
         SinkLine::ToolInput {
@@ -502,11 +502,12 @@ pub(crate) fn finish_shell_command(
             input: format!("bash {short}"),
         },
     );
-    let mut summary = crate::ui::format::tool_result_summary("bash", &input, output, success, None);
+    let mut summary =
+        crate::render::format::tool_result_summary("bash", &input, output, success, None);
     if excluded {
         summary.push_str(" · excluded from context");
     }
-    let preview = crate::ui::format::tool_preview("bash", success, None, output, true);
+    let preview = crate::render::format::tool_preview("bash", success, None, output, true);
     append_sink_line(
         &mut remote.app,
         SinkLine::ToolOutput {
@@ -696,7 +697,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     let prompt = line;
     let event_tx = remote.worker_tx.clone();
 
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         let mut saw_terminal = false;
         // Journal cursor: highest seq delivered to the UI; a reconnect
         // replays only what came after it.

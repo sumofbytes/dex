@@ -7,37 +7,30 @@ use crate::protocol::{
     SteerRequest, StreamEnvelope, StreamEvent,
 };
 
-// Runtime + shared clients live in `runtime.rs`, SSE framing in `sse.rs`;
-// re-exported here so existing `client::http::...` paths keep working.
-pub(crate) use super::runtime::{
-    block_on, shared_async_client, shared_streaming_client, spawn_task, TCP_KEEPALIVE_SECS,
-    USER_AGENT,
-};
-pub(crate) use super::sse::ChatStream;
-#[cfg(test)]
-pub(crate) use super::sse::SseFramer;
+use super::runtime::{block_on, shared_async_client, shared_streaming_client};
+pub use super::sse::ChatStream;
 
 /// Per-request overrides forwarded to the daemon with a chat turn.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ChatOptions {
-    pub(crate) skill_dirs: Vec<String>,
-    pub(crate) base_url: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) permission: Option<String>,
+pub struct ChatOptions {
+    pub skill_dirs: Vec<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub permission: Option<String>,
     /// Agent mode (`plan`/`manual`/`auto`), the client's session selector.
     /// The daemon prefers it over `permission` and appends the plan
     /// directive in plan mode.
-    pub(crate) mode: Option<String>,
-    pub(crate) headers: Option<std::collections::BTreeMap<String, String>>,
-    pub(crate) plan: Option<String>,
+    pub mode: Option<String>,
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    pub plan: Option<String>,
     /// Custom base system prompt text (resolved client-side from
     /// `--system-prompt` / `--system-prompt-file`).
-    pub(crate) system_prompt: Option<String>,
+    pub system_prompt: Option<String>,
     /// Remote `/thinking` choice: `None` uses the daemon default, `Some("")`
     /// is an explicit clear, otherwise the level. Mirrors `ChatRequest`.
-    pub(crate) thinking_effort: Option<String>,
+    pub thinking_effort: Option<String>,
     /// P10: replay-safe submission key; the daemon dedups identical keys within 60s.
-    pub(crate) idempotency_key: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 /// HTTP client for communicating with the dex daemon.
@@ -46,7 +39,7 @@ pub(crate) struct ChatOptions {
 /// are atomic bumps). Sync methods remain for one-shot CLI + repl; they
 /// `block_on` the async implementations so behavior is identical.
 #[derive(Clone)]
-pub(crate) struct DaemonClient {
+pub struct DaemonClient {
     base_url: String,
     http: reqwest::Client,
     /// Bearer token for the daemon API, when it requires one: `DEX_DAEMON_TOKEN`
@@ -326,7 +319,7 @@ impl DaemonClient {
     /// lines, and unparsable payloads (skipped, matching prior behavior).
     #[cfg(test)]
     pub(crate) fn parse_sse_line(line: &str) -> Option<StreamEvent> {
-        Some(SseFramer::parse_envelope(line)?.event)
+        Some(crate::client::sse::SseFramer::parse_envelope(line)?.event)
     }
 
     /// Async-native SSE transport: POSTs the chat request and yields parsed

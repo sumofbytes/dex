@@ -172,11 +172,11 @@ fn remote_mcp(remote: &mut RemoteApp, arg: Option<&str>) {
             // bootstrapped and would render an empty list.
             match remote.client.mcp_status() {
                 Ok(body) => {
-                    let statuses: Vec<crate::mcp::ServerStatus> = body["servers"]
+                    let statuses: Vec<crate::protocol::ServerStatus> = body["servers"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
-                                .map(|v| crate::mcp::ServerStatus {
+                                .map(|v| crate::protocol::ServerStatus {
                                     name: v["name"].as_str().unwrap_or("?").to_string(),
                                     state: v["state"].as_str().unwrap_or("down").to_string(),
                                     tools: v["tools"].as_u64().unwrap_or(0) as usize,
@@ -187,7 +187,7 @@ fn remote_mcp(remote: &mut RemoteApp, arg: Option<&str>) {
                         .unwrap_or_default();
                     // No per-tool detail over the wire yet: headers + errors.
                     let truncated = body["truncated"].as_u64().unwrap_or(0) as usize;
-                    for line in crate::ui::format::render_mcp_panel(&statuses, &[], truncated) {
+                    for line in crate::render::format::render_mcp_panel(&statuses, &[], truncated) {
                         push_info(&mut remote.app, line);
                     }
                     // Auth rides the same body (`auth`, null for stdio) so a

@@ -120,12 +120,7 @@ pub(crate) fn write_approval_audit(
     actor: &str,
     agent: Option<&str>,
 ) {
-    let Some(base) = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-        })
-    else {
+    let Some(base) = crate::runtime::logging::data_home() else {
         return;
     };
     let path = base.join("dex/audit.jsonl");

@@ -1,3 +1,4 @@
+use crate::runtime::logging::data_home;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -140,11 +141,8 @@ fn history_cache_touch(path: &Path, appended: u64) {
 
 impl Session {
     pub(crate) fn session_dir() -> PathBuf {
-        if let Some(dir) = env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(dir).join("dex/sessions");
-        }
-        env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".local/share/dex/sessions"))
+        data_home()
+            .map(|base| base.join("dex/sessions"))
             .unwrap_or_else(|| PathBuf::from(".dex/sessions"))
     }
 
@@ -446,6 +444,9 @@ impl Session {
         Self::new(cwd, None)
     }
 
+    // Session pickers (`/resume` sheet, remote UI) are the only runtime
+    // callers; tests exercise them directly.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
         discovery::list(cwd)
     }
@@ -453,6 +454,9 @@ impl Session {
     /// mtime of one workspace's sessions dir, for the slash-popup cache key
     /// (perf doc §29): one stat instead of a readdir + header parses per
     /// frame while `/resume ...` sits in the composer.
+    // Session pickers (`/resume` sheet, remote UI) are the only runtime
+    // callers; tests exercise them directly.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
         discovery::list_dir_mtime(cwd)
     }
@@ -557,6 +561,8 @@ impl Session {
         Ok(())
     }
 
+    // `/clear` (TUI) is the only runtime caller; tests exercise it directly.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn clear_messages(&mut self) -> io::Result<()> {
         let entry = SessionClearEntry {
             entry_type: "clear".into(),
@@ -849,6 +855,8 @@ impl Session {
     /// (`turn_start` markers). A rare explicit user command, so a
     /// streaming scan is fine — and it matches the label better than the
     /// old journal-line counter did.
+    // `/resume` sheet (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn count_turns(&self) -> usize {
         let Some(path) = self.path.as_deref() else {
             return 0;
@@ -861,6 +869,8 @@ impl Session {
         });
         turns
     }
+    // `/resume` sheet (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn display_name(&self) -> String {
         self.name().unwrap_or(self.id()).to_string()
     }
@@ -903,6 +913,8 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
 /// right after loading messages. On a snapshot hit this degrades to today's
 /// two passes (the snapshot stores messages only); the cold path — the one
 /// that blocks first paint — pays one.
+// Remote UI reattach (TUI) is the only runtime caller.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn load_messages_and_plan(
     path: &Path,
 ) -> io::Result<(Vec<ChatMessage>, crate::protocol::Plan)> {
@@ -1044,7 +1056,7 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
             pos,
             ChatMessage::tool_result(
                 id,
-                crate::ui::format::model_tool_result(
+                crate::render::format::model_tool_result(
                     "Error: tool result missing — the agent exited before it was recorded; the call may have executed. Verify the effect on disk before retrying.",
                 ),
             ),
@@ -1072,6 +1084,8 @@ impl Session {
     }
 }
 
+// `load_messages_and_plan` (TUI-only reattach) is the only caller.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn load_plan(path: &Path) -> crate::protocol::Plan {
     load_session_state(path)
         .ok()

@@ -254,7 +254,7 @@ impl HttpTransport {
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = rpc_request(id, method, params);
-        let mut req = crate::client::http::shared_async_client()
+        let mut req = crate::runtime::http::shared_async_client()
             .post(&self.url)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
