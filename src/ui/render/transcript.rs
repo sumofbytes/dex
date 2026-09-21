@@ -33,7 +33,9 @@ pub(crate) struct TranscriptView;
 /// stacks two live spinners.
 /// Submitted prompts read as the composer's echo: the same `❯ ` glyph as
 /// the live composer, on the terminal's own background, so a sent prompt
-/// keeps the shape it had while typed. Stored lines stay unpadded
+/// keeps the wrap/column shape it had while typed (spacing differs: the
+/// live composer has air below short text, the echo has none). Stored
+/// lines stay unpadded
 /// (width-dependent fill happens here at wrap time, keeping
 /// `wrap_line_display`'s indent logic intact); each wrapped row is padded
 /// out to the full width. Vertical spacing comes solely from the universal
