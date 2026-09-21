@@ -55,19 +55,22 @@ pub(crate) fn push_info(app: &mut App, text: String) {
 /// without wrapping.
 pub(crate) const BANNER: &str = concat!("DEX (v", env!("CARGO_PKG_VERSION"), ")");
 
-/// Push the session-start banner (wordmark plus version). One `Banner` block
-/// (not an Info block) so `TranscriptView` treats it as session chrome.
-pub(crate) fn push_banner(app: &mut App) {
+/// Push the session-start banner: the wordmark row plus any extra
+/// session-start chrome (skills listing, ready time) inside the same
+/// `Banner` block, so the header renders as one contiguous run with no
+/// inter-block gap rows between its lines.
+pub(crate) fn push_banner(app: &mut App, extra: Vec<Line<'static>>) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
     // Subtle by design: the theme-aware muted foreground instead of a bright
     // accent, so the banner reads as quiet chrome on light/dark terminals.
     let style = fg(theme::muted_fg());
-    let lines = vec![indent_transcript_line(Line::from(Span::styled(
+    let mut lines = vec![indent_transcript_line(Line::from(Span::styled(
         BANNER.to_string(),
         style,
     )))];
+    lines.extend(extra.into_iter().map(indent_transcript_line));
     app.transcript
         .push(TranscriptBlock::Banner { stamp: 0, lines });
 }
