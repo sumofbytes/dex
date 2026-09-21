@@ -261,13 +261,6 @@ pub(crate) fn bootstrap(
     // Seed the mode from an explicit client `--permission` (a stricter
     // per-run choice), else from the daemon's reported ceiling. Clamp to
     // the ceiling, which a client may only go stricter than.
-    //
-    // Exception: a trusted (default) ceiling still seeds `manual`, not
-    // `auto` — the documented default is a human in the loop, so a stock
-    // launch must not start hands-off. The ceiling stays `trusted`: the
-    // user can Shift+Tab up to `auto` at any time. An explicit
-    // `--permission trusted` / `DEX_PERMISSION=trusted` is the deliberate
-    // hands-off choice and seeds `auto` as before.
     let explicit = args.permission.or_else(|| {
         std::env::var("DEX_PERMISSION")
             .ok()
@@ -276,7 +269,6 @@ pub(crate) fn bootstrap(
     let ceiling = PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask);
     let wanted = match explicit {
         Some(p) => p,
-        None if ceiling == PermissionMode::Trusted => PermissionMode::Ask,
         None => ceiling,
     };
     let mode = if wanted.permissiveness() > ceiling.permissiveness() {
