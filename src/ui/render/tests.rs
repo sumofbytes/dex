@@ -1679,16 +1679,12 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, long);
         // The submitted prompt is the composer's echo: `wrap_block`
-        // pads every row out to the full width, with `INPUT_PAD_Y` blank
-        // rows above and below the content (same outer height as the live
-        // composer), all on the terminal background.
+        // pads every row out to the full width on the terminal background,
+        // with no baked air rows (spacing is the inter-block gap).
         let block = &app.transcript[1]; // 0 is hello, 1 is user
         let rows = wrap_block(block, w, false, false);
         let bg = Color::Reset;
-        assert!(
-            rows.len() >= 3,
-            "user block must hold content plus composer air at w {w}"
-        );
+        assert!(!rows.is_empty(), "user block must hold content at w {w}");
         for row in &rows {
             let s: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert_eq!(
@@ -1708,7 +1704,7 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
             );
             assert_eq!(row.style.bg, Some(bg), "user row line bg at w {w}");
         }
-        // Composer air: blank rows top and bottom, content between.
+        // No baked air: every row is wrapped content.
         let text = |row: &Line<'static>| {
             row.spans
                 .iter()
@@ -1716,23 +1712,13 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
                 .collect::<String>()
         };
         assert!(
-            text(&rows[0]).trim().is_empty(),
-            "air row must be blank above the content at w {w}"
-        );
-        assert!(
-            text(rows.last().unwrap()).trim().is_empty(),
-            "air row must be blank below the content at w {w}"
-        );
-        assert!(
-            rows[1..rows.len() - 1]
-                .iter()
-                .any(|r| text(r).contains("Current:")),
-            "content must survive between the air rows at w {w}"
+            rows.iter().any(|r| text(r).contains("Current:")),
+            "content must survive in the block at w {w}"
         );
         // Content rows sit on the shared transcript margin (exactly one
-        // gutter of leading space, like the composer); pad rows are
-        // blank fill.
-        for row in &rows[1..rows.len() - 1] {
+        // gutter of leading space, like the composer); pad fill trails
+        // to full width.
+        for row in &rows {
             let s = text(row);
             if s.trim().is_empty() {
                 continue;
@@ -1933,9 +1919,9 @@ fn consecutive_assistant_chunks_do_not_add_gaps() {
     );
 }
 /// Regression: the submitted prompt renders as the composer's echo — a
-/// full-width block with `INPUT_PAD_Y` air above and below
-/// the content (same outer height as the live composer), headed by the
-/// composer glyph. The transcript Paragraph must NOT enable `Wrap`:
+/// full-width block with no baked air rows (spacing is the inter-block
+/// gap), headed by the composer glyph. The transcript Paragraph must NOT
+/// enable `Wrap`:
 /// the display cache is already pre-wrapped, and ratatui 0.29's WordWrapper
 /// emits a phantom empty row before any all-whitespace line exactly
 /// `area.width` wide, which would shift the tool block down.
@@ -1980,12 +1966,12 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     };
     let text_row = row_of("can you check pillar").expect("prompt text rendered");
     let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
-    // Composer echo: content row, one air row, the inter-block gap
-    // rows (BLOCK_GAP_ROWS) — the tool block adds no air of its own —
-    // then the tool content.
+    // Composer echo: content row, then the inter-block gap rows
+    // (BLOCK_GAP_ROWS) — the prompt and tool blocks add no air of their
+    // own — then the tool content.
     assert_eq!(
         tool_row,
-        text_row + 2 + BLOCK_GAP_ROWS as u16,
+        text_row + 1 + BLOCK_GAP_ROWS as u16,
         "a phantom row from Paragraph::wrap shifts the tool block down"
     );
     // On the shared transcript margin — the prompt row starts one gutter
@@ -2009,26 +1995,14 @@ fn submitted_prompt_is_one_row_above_tool_block() {
             "prompt row must sit on the terminal background"
         );
         assert_eq!(
-            buffer.cell((x, text_row + 1)).unwrap().bg,
-            bg,
-            "air below the content must be the terminal background"
-        );
-        assert_eq!(
             buffer.cell((x, text_row - 1)).unwrap().bg,
             bg,
-            "air above the content must be the terminal background"
+            "gap above the content must be the terminal background"
         );
     }
-    let air_below: String = (0..area.width)
+    let gap: String = (0..area.width)
         .map(|x| buffer.cell((x, text_row + 1)).unwrap().symbol())
         .collect();
-    let gap: String = (0..area.width)
-        .map(|x| buffer.cell((x, text_row + 2)).unwrap().symbol())
-        .collect();
-    assert!(
-        air_below.trim().is_empty(),
-        "air below the content must be blank: {air_below:?}"
-    );
     assert!(
         gap.trim().is_empty(),
         "inter-block gap after the prompt must be blank: {gap:?}"
@@ -2049,7 +2023,7 @@ fn submitted_prompt_is_one_row_above_tool_block() {
             "inter-block gap row must be the terminal background"
         );
         assert_eq!(
-            buffer.cell((x, text_row + 2)).unwrap().bg,
+            buffer.cell((x, text_row + 1)).unwrap().bg,
             ratatui::style::Color::Reset,
             "inter-block gap must stay terminal background"
         );
@@ -2560,11 +2534,10 @@ fn submitted_prompt_wraps_like_the_composer() {
         super::super::render_user_prompt(&mut app, text);
         let block = &app.transcript[1];
         let echo = wrap_block(block, w, false, false);
-        // Strip the echo's `INPUT_PAD_Y` air rows, its leading transcript
-        // indent (the composer lives inside the band and has no indent
-        // span), and trailing pad fill, so both sides compare as bare
-        // text lines.
-        let echo_text: Vec<String> = echo[1..echo.len() - 1]
+        // Strip the echo's leading transcript indent (the composer lives
+        // inside the band and has no indent span) and trailing pad fill,
+        // so both sides compare as bare text lines.
+        let echo_text: Vec<String> = echo
             .iter()
             .map(|r| {
                 let mut s: String = r
