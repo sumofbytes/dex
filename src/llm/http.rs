@@ -5,10 +5,8 @@
 //! header) lands in one place: [`Provider::auth_scheme`].
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::json;
@@ -215,10 +213,7 @@ pub(crate) fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Dura
 const RETRY_AFTER_CAP_SECS: u64 = 120;
 
 pub(crate) fn provider_log(event: &str, detail: &str) {
-    let Some(base) = env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-    else {
+    let Some(base) = crate::runtime::logging::data_home() else {
         return;
     };
     let path = base.join("dex/provider.jsonl");

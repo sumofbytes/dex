@@ -33,8 +33,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
 
-use crate::llm::config::warn_once;
 use crate::protocol::{ChatMessage, Role};
+use crate::runtime::notice::warn_once;
 
 /// Value of [`COMPACTION_ENV`] selecting verbatim pruning instead of
 /// summarization.
@@ -288,7 +288,7 @@ pub(crate) async fn noul_answers(
         "model": JEV_MODEL,
         "questions": questions,
     });
-    let client = crate::client::http::shared_async_client();
+    let client = crate::runtime::http::shared_async_client();
     let resp = client
         .post(endpoint)
         .bearer_auth(api_key)

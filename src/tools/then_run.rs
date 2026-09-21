@@ -4,8 +4,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::render::format::{clamp_lines, clip_chars};
 use crate::runtime::cancel::CancellationSource;
-use crate::ui::format::{clamp_lines, clip_chars};
 
 use super::error::ToolError;
 use super::shell::{run_bash, BASH_CLAMP_BYTES, BASH_CLAMP_LINES};

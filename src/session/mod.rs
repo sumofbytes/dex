@@ -9,6 +9,9 @@ pub(crate) mod store;
 pub(crate) use changes::undo_last_change;
 pub(crate) use events::EVENTS_PAGE_LIMIT;
 pub(crate) use header::{file_id, FileId, PathCache, SessionHeader};
+// `load_messages_and_plan`/`load_messages_from_session` only serve the TUI
+// (remote reattach, `/resume` body view) at runtime.
+#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub(crate) use store::{
     load_llm_messages_from_session, load_messages_and_plan, load_messages_from_session,
     load_session_state, Session,

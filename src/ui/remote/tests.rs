@@ -130,7 +130,7 @@ fn skills_listing_is_one_comma_separated_line() {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(text, "skills loaded (3): a, b, c · /skill:<name> loads one");
     // Every span is muted like the DEX banner: session-start chrome.
-    let muted = super::super::theme::muted_fg();
+    let muted = crate::render::theme::muted_fg();
     for span in &line.spans {
         assert_eq!(span.style.fg, Some(muted), "span is muted: {span:?}");
     }
@@ -356,7 +356,7 @@ fn test_remote() -> RemoteApp {
         thinking_open: false,
         plan: crate::protocol::Plan::default(),
         assistant_pending: String::new(),
-        assistant_gap: crate::ui::theme::markdown::GapState::new(),
+        assistant_gap: crate::render::theme::markdown::GapState::new(),
         stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
@@ -422,7 +422,7 @@ fn ctrl_c_clears_whitespace_only_draft() {
 fn alt_v_cycles_the_voice_without_touching_the_draft() {
     // The voice slot is process-global, so serialize against the theme
     // tests that assert on it.
-    let _guard = crate::ui::theme::VOICE_SERIAL
+    let _guard = crate::render::theme::VOICE_SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut remote = test_remote();

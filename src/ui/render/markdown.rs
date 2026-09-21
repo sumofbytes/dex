@@ -1,7 +1,7 @@
 use super::super::style::fg;
-use super::super::theme;
-use crate::ui::theme::highlight;
-use crate::ui::theme::markdown as md;
+use crate::render::theme;
+use crate::render::theme::highlight;
+use crate::render::theme::markdown as md;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui_markdown::markdown::MarkdownBlock;
@@ -16,7 +16,7 @@ pub(crate) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     while i < lines.len() {
         let t = lines[i].trim_start();
         if t.starts_with("```") {
-            let lang = crate::ui::theme::highlight::normalize_code_lang(t.trim_start_matches('`'));
+            let lang = crate::render::theme::lang::normalize_code_lang(t.trim_start_matches('`'));
             let mut body = String::new();
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with("```") {

@@ -13,14 +13,14 @@ use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
 use crate::protocol::{ChatMessage, LlmToolCall, QueueMsg, SinkLine, Usage};
+use crate::render::format::{
+    model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
+};
 use crate::runtime::console::{
     with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK, TOOL_OUTPUT_COLOR,
 };
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
-use crate::ui::format::{
-    model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
-};
 
 /// Emit a system note on every surface: a transcript line when a sink is
 /// attached (TUI / daemon), `eprintln` headless.

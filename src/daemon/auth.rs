@@ -18,10 +18,7 @@ use super::lock_map;
 /// Where the daemon publishes its auto-generated bearer token for clients
 /// (`$XDG_DATA_HOME/dex/daemon.token`, 0600).
 pub(crate) fn daemon_token_file() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("dex/daemon.token"))
+    crate::runtime::logging::data_home().map(|base| base.join("dex/daemon.token"))
 }
 
 static REQUIRED_TOKEN: Mutex<Option<Option<String>>> = Mutex::new(None);

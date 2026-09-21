@@ -278,7 +278,7 @@ fn cmd_extension(app: &mut App, line: &str) {
     let (ext_id, name, arg) = split_extension_command(line);
     let label = format!("{name}@{ext_id}");
     let cancel = crate::agent::state::GlobalCancellation;
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         match crate::extensions::run_command_global(&ext_id, &name, &arg, &cancel).await {
             Ok(out) => eprintln!("dex: [extensions] /{name}: {out}"),
             Err(e) => eprintln!("dex: [extensions] /{name} failed: {e}"),
@@ -309,7 +309,9 @@ fn cmd_mcp(app: &mut App, arg: Option<&str>) {
                 Some(statuses) => {
                     let tools = crate::mcp::cached_tools();
                     let truncated = crate::mcp::cached_truncated();
-                    for line in crate::ui::format::render_mcp_panel(&statuses, &tools, truncated) {
+                    for line in
+                        crate::render::format::render_mcp_panel(&statuses, &tools, truncated)
+                    {
                         push_info(app, line);
                     }
                     for line in crate::mcp::oauth::auth_lines() {
@@ -329,7 +331,7 @@ fn cmd_extensions(app: &mut App, arg: Option<&str>) {
     // client's local copy).
     if let Some(url) = app.daemon_url.clone() {
         let reload = arg == "reload";
-        crate::client::http::spawn_task(async move {
+        crate::runtime::http::spawn_task(async move {
             let client = match crate::client::http::DaemonClient::new(&url) {
                 Ok(client) => client,
                 Err(e) => {
@@ -383,7 +385,7 @@ fn cmd_extensions(app: &mut App, arg: Option<&str>) {
     } else if arg == "reload" {
         // Fire-and-forget rescan in this process (local/loopback turn: it owns
         // the manager that dispatches).
-        crate::client::http::spawn_task(async move {
+        crate::runtime::http::spawn_task(async move {
             crate::extensions::global_manager().reload().await;
             eprintln!("dex: [extensions] reload complete");
         });
