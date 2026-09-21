@@ -50,6 +50,9 @@ fn read_first_line(path: &Path) -> Option<String> {
     }
 }
 
+// Session pickers (`/resume` sheet, remote UI) are the only runtime
+// callers; tests exercise them directly.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     let dir = Session::session_dir().join(Session::cwd_slug(cwd));
     let mut sessions = scan_jsonl_dir(&dir);
@@ -57,6 +60,9 @@ pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     Ok(sessions)
 }
 
+// Session pickers (`/resume` sheet, remote UI) are the only runtime
+// callers; tests exercise them directly.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
     std::fs::metadata(Session::session_dir().join(Session::cwd_slug(cwd)))
         .ok()?

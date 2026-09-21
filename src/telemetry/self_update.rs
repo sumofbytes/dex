@@ -21,7 +21,7 @@ pub(crate) const DEFAULT_REPO: &str = "sumofbytes/dex";
 
 /// Sync entry point for `dex update`: blocks on the shared runtime.
 pub(crate) fn self_update() -> Result<String, String> {
-    crate::client::http::block_on(self_update_async())
+    crate::runtime::http::block_on(self_update_async())
 }
 
 pub(crate) async fn self_update_async() -> Result<String, String> {
@@ -39,7 +39,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
 
     // Shared client (pool reuse; follows the /releases/latest redirect).
     // The generous total for multi-MB tarballs rides per-request below.
-    let client = crate::client::http::shared_async_client();
+    let client = crate::runtime::http::shared_async_client();
 
     // DEX_VERSION (same env as install.sh) pins a version: it installs that
     // release even when it is older, i.e. it can downgrade/force-reinstall.

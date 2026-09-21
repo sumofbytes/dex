@@ -15,7 +15,8 @@ use tokio::sync::RwLock;
 use crate::agent::state::CancellationSource;
 use crate::protocol::ToolDefinition;
 
-use super::manager::{McpManager, ServerStatus};
+use super::manager::McpManager;
+use crate::protocol::ServerStatus;
 
 static GLOBAL: OnceLock<Arc<McpManager>> = OnceLock::new();
 
@@ -33,11 +34,11 @@ pub(crate) fn global_manager() -> Arc<McpManager> {
             let mgr = McpManager::from_env();
             // Best-effort background connect; schema merges whatever is cached.
             let clone = Arc::clone(&mgr);
-            crate::client::http::spawn_task(async move { clone.refresh().await });
+            crate::runtime::http::spawn_task(async move { clone.refresh().await });
             // Liveness sweeper: ping each client every 60s so a server that
             // died mid-session goes `down` before the next turn uses it.
             let sweep = Arc::clone(&mgr);
-            crate::client::http::spawn_task(async move {
+            crate::runtime::http::spawn_task(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     sweep.sweep_once().await;
@@ -144,6 +145,8 @@ pub(crate) async fn call_global(
 /// the background refresh). `None` when uninitialized or contended — the
 /// caller renders that as "unavailable" rather than an empty server list,
 /// which would wrongly imply no MCP is configured.
+// `/mcp` panel (TUI) is the only runtime caller.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn cached_statuses() -> Option<Vec<ServerStatus>> {
     let mgr = GLOBAL.get()?;
     try_snapshot(mgr)

@@ -77,7 +77,7 @@ pub(crate) fn split_ext_name(name: &str) -> Option<(&str, &str)> {
         Some(rest) => rest,
         None => {
             let rest = name.strip_prefix("lua__")?;
-            crate::llm::config::warn_once(
+            crate::runtime::notice::warn_once(
                 "ext.lua-prefix",
                 "tool prefix `lua__` is deprecated, use `ext__` instead",
             );

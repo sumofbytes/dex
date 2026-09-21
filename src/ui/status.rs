@@ -3,7 +3,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{format_tokens, theme, App};
+use super::App;
+use crate::agent::tokens::format_tokens;
+use crate::render::theme;
 
 pub(super) fn compact_path(path: &str) -> String {
     if let Ok(home) = std::env::var("HOME") {

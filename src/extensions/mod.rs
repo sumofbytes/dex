@@ -33,6 +33,8 @@ mod discovery;
 mod global;
 mod manager;
 mod state;
+// `summary_line` is the `/extensions` sheet (TUI) consumer only.
+#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub(crate) use discovery::{discovered_extensions, list_command, summary_line};
 #[cfg(test)]
 pub(crate) use global::resolve_active_name;

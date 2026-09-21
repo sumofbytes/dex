@@ -1,4 +1,3 @@
-use super::app::format_tokens;
 use super::app::App;
 use super::app::TranscriptBlock;
 use super::app::STREAM_FLUSH_INTERVAL;
@@ -9,11 +8,12 @@ use super::status;
 use super::style::fg;
 use super::style::INPUT_PROMPT;
 use super::style::TRANSCRIPT_INDENT;
-use super::theme;
+use crate::agent::tokens::format_tokens;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
+use crate::render::format::short_arg;
+use crate::render::theme;
 use crate::runtime::format_runtime::agent_lifecycle;
-use crate::ui::format::short_arg;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::collections::HashSet;
@@ -222,7 +222,7 @@ fn append_assistant(app: &mut App, s: String) {
         .rsplit('\n')
         .next()
         .unwrap_or("");
-    let holding_table = crate::ui::theme::markdown::is_table_line(last_line);
+    let holding_table = crate::render::theme::markdown::is_table_line(last_line);
     if stream_flush_due(app) && !holding_table {
         flush_assistant(app);
     }
@@ -314,7 +314,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     ];
     if duration > 0.0 {
         spans.push(Span::styled(
-            format!(" · {}", crate::ui::format::format_duration(duration)),
+            format!(" · {}", crate::render::format::format_duration(duration)),
             fg(theme::muted_fg()),
         ));
     }
@@ -370,7 +370,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
             .unwrap_or_default();
         let path = arg_path.split_whitespace().next().unwrap_or("");
         let path = path.split(':').next().unwrap_or(path);
-        render::render_read_preview(&preview, crate::ui::theme::highlight::lang_from_path(path))
+        render::render_read_preview(&preview, crate::render::theme::lang::lang_from_path(path))
     } else if success && matches!(name.as_str(), "grep" | "ffgrep") {
         // Content-mode hits are `path:line:code` rows: keep the gutter dim,
         // highlight the code by path extension (same engine and dim fallback
@@ -458,7 +458,7 @@ fn append_error(app: &mut App, s: String) {
 /// the local engine uses, so remote and local turns look identical.
 /// Each `SinkLine` maps to one `TranscriptBlock` (or an extension of the
 /// tail `Assistant` block while streaming). No empty gap `Line`s are stored;
-/// `TranscriptView` inserts a single blank `Line` between any two blocks.
+/// `TranscriptView` inserts `BLOCK_GAP_ROWS` blank `Line`s between any two blocks.
 pub(crate) fn append_sink_line(app: &mut App, sl: SinkLine) {
     // Anything other than a thinking delta closes the open thinking block.
     // Non-assistant lines first drain the pending assistant buffer so it

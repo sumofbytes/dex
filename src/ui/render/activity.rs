@@ -1,8 +1,8 @@
 use super::super::status::truncate_display;
 use super::super::style::fg;
-use super::super::theme;
 use super::super::App;
 use super::QueueMetrics;
+use crate::render::theme;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::text::Span;

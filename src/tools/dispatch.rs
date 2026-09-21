@@ -295,5 +295,5 @@ pub(crate) fn execute_sync(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
 ) -> Result<String, ToolError> {
-    crate::client::http::block_on(execute(name, args, cancel, &Policy::trusted(), None))
+    crate::runtime::http::block_on(execute(name, args, cancel, &Policy::trusted(), None))
 }

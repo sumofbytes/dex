@@ -1,10 +1,10 @@
 use super::super::style::fg;
 use super::super::style::{composer_band, INPUT_PROMPT, INPUT_PROMPT_WIDTH};
-use super::super::theme;
 use super::super::wrapping::wrap_line;
 use super::super::App;
 use super::super::InputField;
 use super::input_block;
+use crate::render::theme;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::text::Span;
