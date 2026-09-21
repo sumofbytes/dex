@@ -267,15 +267,7 @@ pub(crate) fn bootstrap(
             .and_then(|v| PermissionMode::parse(&v).ok())
     });
     let ceiling = PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask);
-    let wanted = match explicit {
-        Some(p) => p,
-        None => ceiling,
-    };
-    let mode = if wanted.permissiveness() > ceiling.permissiveness() {
-        AgentMode::from_permission(ceiling)
-    } else {
-        AgentMode::from_permission(wanted)
-    };
+    let mode = seed_mode(explicit, ceiling);
     options.mode = Some(mode.as_str().to_string());
     // `permission` still rides along (derived) so an older daemon that
     // ignores `mode` restricts identically.
@@ -545,4 +537,57 @@ pub(crate) fn bootstrap(
         terminal,
         cleanup,
     })
+}
+
+/// Seed the TUI's agent mode for a launch: the explicit client
+/// `--permission`/`DEX_PERMISSION` wins, else the mode derives from the
+/// daemon's ceiling (`trusted` → `auto`, `ask` → `manual`, `read-only` →
+/// `plan`). The result is clamped to the ceiling, which a client may only go
+/// stricter than.
+pub(crate) fn seed_mode(explicit: Option<PermissionMode>, ceiling: PermissionMode) -> AgentMode {
+    let wanted = explicit.unwrap_or(ceiling);
+    if wanted.permissiveness() > ceiling.permissiveness() {
+        AgentMode::from_permission(ceiling)
+    } else {
+        AgentMode::from_permission(wanted)
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_ceiling_seeds_auto() {
+        assert_eq!(seed_mode(None, PermissionMode::Trusted), AgentMode::Auto);
+    }
+
+    #[test]
+    fn ask_ceiling_seeds_manual_and_read_only_seeds_plan() {
+        assert_eq!(seed_mode(None, PermissionMode::Ask), AgentMode::Manual);
+        assert_eq!(seed_mode(None, PermissionMode::ReadOnly), AgentMode::Plan);
+    }
+
+    #[test]
+    fn explicit_permission_seeds_its_mode() {
+        // A stock (trusted) daemon explicitly asked for `ask` stays manual.
+        assert_eq!(
+            seed_mode(Some(PermissionMode::Ask), PermissionMode::Trusted),
+            AgentMode::Manual
+        );
+    }
+
+    #[test]
+    fn explicit_permission_is_clamped_to_the_ceiling() {
+        // An `ask` ceiling clamps an explicit `trusted` client choice down
+        // to `manual` — the ceiling always wins.
+        assert_eq!(
+            seed_mode(Some(PermissionMode::Trusted), PermissionMode::Ask),
+            AgentMode::Manual
+        );
+        assert_eq!(
+            seed_mode(Some(PermissionMode::Trusted), PermissionMode::ReadOnly),
+            AgentMode::Plan
+        );
+    }
 }
