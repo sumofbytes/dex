@@ -31,8 +31,13 @@ type EditOp = (String, String);
 /// against the original file, so disjoint replacements land in one call
 /// instead of one round-trip each. The two shapes do not mix.
 pub(crate) fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
-    if let Some(edits) = args.get("edits") {
-        if args.contains_key("oldText") || args.contains_key("newText") {
+    // Treat explicit `null` as absent: some clients (and some providers'
+    // tool-call argument serializers) emit `null` for omitted optional
+    // fields — `edits: null` as well as `oldText: null`/`newText: null` —
+    // which used to trip the both-shapes guard or the array check.
+    let present = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
+    if let Some(edits) = args.get("edits").filter(|value| !value.is_null()) {
+        if present("oldText") || present("newText") {
             return Err(ToolError::InvalidArgument(
                 "pass either oldText/newText or edits[], not both".to_string(),
             ));
