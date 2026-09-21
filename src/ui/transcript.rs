@@ -680,7 +680,7 @@ pub(crate) fn render_user_prompt(app: &mut App, line: &str) {
     close_thinking(app);
     app.assistant_open = false;
     // No background is stored here: `wrap_block` pads every row to the
-    // full width plus `INPUT_PAD_Y` air at wrap time.
+    // full width at wrap time; spacing is the inter-block gap.
     let user_style = fg(theme::user_fg());
     let mut block_lines = Vec::new();
     for (i, sub) in line.split('\n').enumerate() {
