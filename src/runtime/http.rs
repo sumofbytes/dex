@@ -25,6 +25,12 @@ pub(crate) const USER_AGENT: &str = concat!("dex/", env!("CARGO_PKG_VERSION"));
 /// shared streaming client and the explicit-timeout client stay in sync.
 pub(crate) const TCP_KEEPALIVE_SECS: u64 = 60;
 
+/// Per-read bound on streaming connections (see `shared_streaming_client`).
+/// Sits above the app-level idle watchdog (300s for reasoning models) so it
+/// only ever fires on the waits that watchdog cannot see — chiefly the
+/// response-header wait of a re-issued attempt after a stream retry.
+pub(crate) const STREAM_READ_TIMEOUT_SECS: u64 = 330;
+
 /// Shared tokio runtime for sync callers (one-shot CLI, repl, `dex run`).
 /// Four workers: TUI boot overlaps config/session/skills fetches plus the
 /// git/event pollers here, and two workers head-of-line blocked on that fan-out.
@@ -93,6 +99,17 @@ pub(crate) fn shared_streaming_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
+                // Per-read bound (resets on every frame — NOT a total timeout,
+                // which would kill long streams). Closes the one unbounded wait
+                // in the streaming path: reqwest races this timeout against the
+                // send/header phase of every POST, so a wedged connection —
+                // typically a NAT/middlebox that ACKs TCP keepalive probes but
+                // drops the stream — errors out instead of parking a re-issued
+                // attempt (post-retry) forever with no terminal event. Healthy
+                // streams are unaffected: every chunk resets the timer, and
+                // provider silence is already bounded first by the app-level
+                // idle watchdog (90s / 300s, DEX_STREAM_IDLE_TIMEOUT_SECS).
+                .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
                 // Socket-level keepalives: periodic probes let a silently
                 // dropped connection (dead middlebox, hung peer) surface at
                 // the TCP layer instead of parking indefinitely. Detection
