@@ -292,6 +292,8 @@ static VOICE: OnceLock<Mutex<usize>> = OnceLock::new();
 
 /// Serializes tests that read or rotate the process-global voice slot (the
 /// theme tests below and the `Alt+V` keybinding test in `ui/remote.rs`).
+#[cfg(all(test, not(feature = "tui")))]
+pub(crate) use std::sync::Mutex;
 #[cfg(test)]
 pub(crate) static VOICE_SERIAL: Mutex<()> = Mutex::new(());
 
