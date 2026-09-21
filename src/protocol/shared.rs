@@ -323,6 +323,8 @@ impl Provider {
 
     /// Display-only parse (daemon echo of an already-resolved provider):
     /// unknown names still become `Generic` so the name survives round-trips.
+    // Remote UI connect (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn from_display(value: &str) -> Self {
         Self::parse_known(value, &std::collections::BTreeSet::new())
             .unwrap_or_else(|| Self::Generic(value.trim().to_ascii_lowercase()))
@@ -465,7 +467,7 @@ impl PermissionMode {
                 // Deprecated: `ask-writes` split edits from shell ("edits
                 // free, shell prompts"). It maps to `ask` (which also
                 // prompts on shell) and warns like every deprecated knob.
-                crate::llm::config::warn_once(
+                crate::runtime::notice::warn_once(
                     "permission-ask-writes",
                     "permission mode 'ask-writes' is deprecated — use 'ask'; it now also prompts on shell commands",
                 );
@@ -476,7 +478,7 @@ impl PermissionMode {
             // `permissiveness`, making the ladder non-monotone. It now maps
             // to `ask` — strictly stricter, the safe direction.
             "ask-shell" | "ask-commands" => {
-                crate::llm::config::warn_once(
+                crate::runtime::notice::warn_once(
                     "permission-ask-shell",
                     "permission mode 'ask-shell' is deprecated — use 'ask'; it now also prompts on writes and edits",
                 );
@@ -560,6 +562,8 @@ impl AgentMode {
         }
     }
     /// The cycle: `plan → manual → auto → plan`.
+    // Shift+Tab mode cycling (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn next(self) -> Self {
         match self {
             Self::Plan => Self::Manual,
@@ -569,6 +573,8 @@ impl AgentMode {
     }
     /// Status-chip label (same as the wire spelling; a method so the status
     /// bar never formats `{:?}`).
+    // Status chip (TUI) is the only runtime caller; tests exercise it directly.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn label(self) -> &'static str {
         self.as_str()
     }

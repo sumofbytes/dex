@@ -8,8 +8,8 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tokio::io::AsyncReadExt as _;
 
+use crate::render::format::clamp_lines;
 use crate::runtime::cancel::{wait_cancelled, CancellationSource};
-use crate::ui::format::clamp_lines;
 
 use super::args::arg_str;
 use super::{ToolError, CONFIGURED_OUTPUT_LIMIT};

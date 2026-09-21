@@ -114,6 +114,7 @@ pub(crate) fn log(level: Level, target: &str, args: fmt::Arguments<'_>) {
     };
 }
 
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 fn set_sink(sink: Sink) {
     // Same poison tolerance as `log`: a logger must not panic the process.
     let mut guard = match SINK.get_or_init(|| Mutex::new(Sink::Stderr)).lock() {
@@ -127,6 +128,7 @@ fn set_sink(sink: Sink) {
 /// null sink when it can't be opened. Returns a notice for the caller to
 /// print while the terminal is still the normal screen — only when logs are
 /// actually being raised above the default (`DEX_LOG` ≥ info).
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 fn install_file_sink(path: PathBuf) -> Option<String> {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
@@ -151,6 +153,8 @@ fn install_file_sink(path: PathBuf) -> Option<String> {
 /// lines would garble it (real errors still reach the TUI as protocol
 /// events). Returns a notice for the caller to print while the terminal is
 /// still the normal screen.
+// TUI-only: headless builds never hand the terminal to an alt screen.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn redirect_to_file() -> Option<String> {
     // `DEX_LOG=off` gates every line anyway — don't create the log file.
     if !enabled(Level::Error) {
@@ -171,11 +175,9 @@ pub(crate) fn redirect_to_file() -> Option<String> {
 /// Same base resolution as sessions (`Session::session_dir`): XDG wins, then
 /// the HOME default. No HOME at all → no file, and `redirect_to_file` drops
 /// lines instead of garbling the TUI with stderr.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 fn log_file() -> Option<PathBuf> {
-    let base = env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("dex/dex.log"))
+    data_home().map(|base| base.join("dex/dex.log"))
 }
 
 /// `crate::log!(Debug, "fmt {x}")` — filtered at runtime by `DEX_LOG`.
@@ -190,6 +192,15 @@ macro_rules! log {
             )
         }
     };
+}
+
+/// `$XDG_DATA_HOME/dex` (or `$HOME/.local/share/dex`). The one data-base
+/// resolution every module shares — sessions, logs, daemon state files,
+/// MCP token stores all live under it. `None` when neither env var is set.
+pub(crate) fn data_home() -> Option<PathBuf> {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
 }
 
 #[cfg(test)]

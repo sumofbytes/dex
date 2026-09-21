@@ -1,7 +1,7 @@
 use super::super::status::truncate_display;
 use super::super::style::fg;
-use super::super::theme;
 use super::transcript::wrap_line_display;
+use crate::render::theme;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use std::time::Duration;

@@ -11,6 +11,18 @@ keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
 categories = ["command-line-utilities", "development-tools"]
 
 [features]
+# `tui` owns every terminal-UI dependency (ratatui, crossterm,
+# ratatui-markdown/tree-sitter highlighters, terminal-colorsaurus). The
+# daemon + client library build without it: `cargo build
+# --no-default-features` produces a headless binary/library that never
+# links the TUI stack, so an embedder can ship their own UI against
+# `dex::client` + `dex::daemon` with a much smaller dependency tree.
+default = ["tui"]
+tui = [
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:ratatui-markdown",
+]
 network-tests = []
 
 [dependencies]
@@ -32,9 +44,9 @@ serde_yaml = "0.9"
       "socks",
   ] }
 chrono = "0.4"
-ratatui = "0.29"
-crossterm = "0.28"
-ratatui-markdown = { version = "0.3.6", default-features = false, features = [
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+ratatui-markdown = { version = "0.3.6", optional = true, default-features = false, features = [
     "markdown",
     "highlight-lang-bash",
     "highlight-lang-c",
@@ -69,13 +81,13 @@ ratatui-markdown = { version = "0.3.6", default-features = false, features = [
 ] }
 unicode-width = "0.2"
 similar = "3"
+terminal-colorsaurus = "1.0.3"
 
 # Client-server architecture
 axum = "0.8"
   tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util", "signal"] }
 futures-core = "0.3"
 uuid = { version = "1", features = ["v4"] }
-terminal-colorsaurus = "1.0.3"
 fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
 # MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
 base64 = "0.23"

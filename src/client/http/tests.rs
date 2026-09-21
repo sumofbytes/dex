@@ -1,6 +1,8 @@
 // binary), following the `llm::config::tests` precedent.
 use super::*;
 
+use crate::client::sse::SseFramer;
+
 #[test]
 fn mcp_auth_lines_skips_null_stdio() {
     let body = serde_json::json!({"servers": [
@@ -510,10 +512,14 @@ fn client_end_to_end_hits_every_endpoint() {
 
     // SSE chat against the fake provider (async-native transport, driven
     // through the shared runtime).
-    let mut stream =
-        block_on(client.chat_stream(&session_id, "hi", ChatOptions::default())).unwrap();
+    let mut stream = crate::runtime::http::block_on(client.chat_stream(
+        &session_id,
+        "hi",
+        ChatOptions::default(),
+    ))
+    .unwrap();
     let mut last = None;
-    while let Some(result) = block_on(stream.next_event()) {
+    while let Some(result) = crate::runtime::http::block_on(stream.next_event()) {
         last = Some(result.expect("stream event"));
     }
     assert!(
@@ -522,8 +528,13 @@ fn client_end_to_end_hits_every_endpoint() {
     );
     assert!(stream.last_seq() > 0, "the cursor advances with the stream");
     // The callback transport reports the same outcome.
-    block_on(client.chat_async(&session_id, "again", ChatOptions::default(), &mut |_| None))
-        .unwrap();
+    crate::runtime::http::block_on(client.chat_async(
+        &session_id,
+        "again",
+        ChatOptions::default(),
+        &mut |_| None,
+    ))
+    .unwrap();
 
     // Journaled events now replay past the cursor.
     let events = client.events(&session_id, 0).unwrap();

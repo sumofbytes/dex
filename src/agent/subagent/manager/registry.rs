@@ -52,7 +52,7 @@ impl AgentNotice {
         if let Some(usage) = self.usage {
             text.push_str(&format!(
                 " · {} tok",
-                crate::ui::format_tokens(usage.prompt_tokens + usage.output_tokens)
+                crate::protocol::tokens::format_tokens(usage.prompt_tokens + usage.output_tokens)
             ));
             if usage.cost_usd > 0.0 {
                 text.push_str(&format!(" · ${:.4}", usage.cost_usd));

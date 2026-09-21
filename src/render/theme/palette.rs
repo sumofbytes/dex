@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use terminal_colorsaurus::{color_palette, QueryOptions, ThemeMode};
 
 /// The terminal's real colors (`None` when the query fails / not a TTY).
+#[derive(Clone, Copy)]
 pub(crate) struct TermPalette {
     pub(crate) dark: bool,
     pub(crate) foreground: (u8, u8, u8),

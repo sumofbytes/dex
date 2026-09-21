@@ -89,14 +89,14 @@ impl SseFramer {
 /// One in-flight SSE response with its framing buffer. `next_event()` returns
 /// `None` on clean EOF and `Some(Err)` on transport failure, so callers can
 /// distinguish "turn completed" from "connection died".
-pub(crate) struct ChatStream {
+pub struct ChatStream {
     response: reqwest::Response,
     framer: SseFramer,
     eof: bool,
 }
 
 impl ChatStream {
-    pub(crate) fn new(response: reqwest::Response) -> Self {
+    pub fn new(response: reqwest::Response) -> Self {
         Self {
             response,
             framer: SseFramer::default(),
@@ -106,11 +106,11 @@ impl ChatStream {
 
     /// Next journal seq to serve (inclusive resume cursor) — 0 until the
     /// first envelope, then highest delivered + 1.
-    pub(crate) fn last_seq(&self) -> u64 {
+    pub fn last_seq(&self) -> u64 {
         self.framer.next_seq
     }
 
-    pub(crate) async fn next_event(&mut self) -> Option<Result<StreamEvent, String>> {
+    pub async fn next_event(&mut self) -> Option<Result<StreamEvent, String>> {
         loop {
             if let Some(event) = self.framer.pending.pop_front() {
                 return Some(Ok(event));

@@ -1,6 +1,7 @@
 use crate::protocol::ApiProtocol;
 use crate::protocol::PermissionMode;
 use crate::protocol::Provider;
+pub(crate) use crate::runtime::notice::warn_once;
 pub(crate) use crate::workspace::{cached_parse, xdg_path, FileCache};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -28,9 +29,14 @@ pub(crate) use super::auth::{pinned_key_env, resolve_credentials};
 /// Per-model reasoning effort — see `llm::thinking` (single owner of
 /// `thinking-effort.json`); re-exported so existing `config::...` paths
 /// keep working.
+// `/thinking` (TUI) is the only runtime caller of these two; tests use the
+// `llm::thinking` path directly.
+#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub(crate) use super::thinking::{remember_thinking_effort, stored_thinking_effort};
 #[cfg(test)]
 pub(crate) use crate::workspace::unique_tmp_path;
+// `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
+#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub(crate) use catalog_query::{
     catalog_env_vars, load_dex_models_cache, reasoning_options_for, refresh_models_cache,
     refresh_models_cache_async, validate_thinking_effort, warn_provider_like_selection,
@@ -230,23 +236,6 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "headers",
     "http_headers",
 ];
-
-/// One-time notice, keyed so a notice fires once per process even though
-/// the daemon rebuilds config every turn. `id` dedupes; `message` is the
-/// full text after the `dex: ` prefix. stderr only — stdout belongs to the
-/// client stream, and one line cannot corrupt a TUI the way a per-turn
-/// stream could.
-pub(crate) fn warn_once(id: &str, message: &str) {
-    static WARNED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    let seen = WARNED.get_or_init(Default::default);
-    if seen
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id.to_string())
-    {
-        eprintln!("dex: {message}");
-    }
-}
 
 /// The `agent_wake` knob (§10b V1b): when a completion notice is queued
 /// while the session is idle and a client is plausibly listening, the
@@ -470,16 +459,18 @@ impl LlmConfig {
     /// shared pool isn't duplicated per turn.
     pub(crate) fn http_client(&self) -> reqwest::Client {
         if self.connect_timeout_secs == 10 && self.request_timeout_secs == 300 {
-            crate::client::http::shared_streaming_client()
+            crate::runtime::http::shared_streaming_client()
         } else {
             reqwest::Client::builder()
-                .user_agent(crate::client::http::USER_AGENT)
+                .user_agent(crate::runtime::http::USER_AGENT)
                 .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
                 .timeout(Duration::from_secs(self.request_timeout_secs))
                 // Same dead-socket detection as the shared streaming client.
-                .tcp_keepalive(Duration::from_secs(crate::client::http::TCP_KEEPALIVE_SECS))
+                .tcp_keepalive(Duration::from_secs(
+                    crate::runtime::http::TCP_KEEPALIVE_SECS,
+                ))
                 .build()
-                .unwrap_or_else(|_| crate::client::http::shared_streaming_client())
+                .unwrap_or_else(|_| crate::runtime::http::shared_streaming_client())
         }
     }
 
@@ -935,6 +926,8 @@ impl LlmConfig {
         Ok(())
     }
 
+    // `/provider` (TUI) is the only runtime caller; tests exercise it directly.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn switch_provider(
         &mut self,
         provider: &Provider,

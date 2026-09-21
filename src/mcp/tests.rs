@@ -6,6 +6,7 @@ use super::manager::McpManager;
 use super::mapping::{content_to_text, McpTool};
 use super::transport::McpTransport;
 use super::*;
+use crate::protocol::ServerStatus;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
