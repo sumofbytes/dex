@@ -461,16 +461,19 @@ impl LlmConfig {
         if self.connect_timeout_secs == 10 && self.request_timeout_secs == 300 {
             crate::runtime::http::shared_streaming_client()
         } else {
-            reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder()
                 .user_agent(crate::runtime::http::USER_AGENT)
                 .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
-                .timeout(Duration::from_secs(self.request_timeout_secs))
-                // Same per-read backstop as the shared streaming client: the
-                // total timeout covers most waits, but a re-issued attempt's
-                // header wait must never outlive the turn's own idle budget.
-                .read_timeout(Duration::from_secs(
-                    crate::runtime::http::STREAM_READ_TIMEOUT_SECS,
-                ))
+                .timeout(Duration::from_secs(self.request_timeout_secs));
+            // Same per-read backstop as the shared streaming client (see
+            // `stream_read_timeout` in runtime::http): the total timeout
+            // covers most waits, but a re-issued attempt's header wait must
+            // never outlive the turn's own idle budget. `=0` (idle watchdog
+            // disabled) arms no read timeout either.
+            if let Some(read_timeout) = crate::runtime::http::stream_read_timeout() {
+                builder = builder.read_timeout(read_timeout);
+            }
+            builder
                 // Same dead-socket detection as the shared streaming client.
                 .tcp_keepalive(Duration::from_secs(
                     crate::runtime::http::TCP_KEEPALIVE_SECS,
