@@ -842,7 +842,7 @@ fn session_banner_renders_without_inter_row_gaps() {
     // row: it must be contiguous in the display cache (a blank gap is
     // only inserted between blocks, so an Info block would split it).
     let mut app = test_app();
-    super::super::push_banner(&mut app);
+    super::super::push_banner(&mut app, Vec::new());
     let text = |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
     let expected: Vec<String> = app
         .transcript

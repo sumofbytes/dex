@@ -3,7 +3,6 @@ use std::io::{self, IsTerminal};
 
 use super::super::push_banner;
 use super::super::push_info;
-use super::super::push_info_line;
 use super::super::view;
 use super::super::App;
 use super::super::EnableMouseScroll;
@@ -84,21 +83,17 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
     }
 }
 
-/// Show which skills the daemon has loaded. Used at session start and after
-/// `/new`, so the user can see what `/skill:<name>` can load. Muted like the
-/// DEX banner: session-start chrome, not a call to action.
-pub(crate) fn push_skills_listing(app: &mut App) {
-    match skills_listing_line(&app.skills) {
-        Some(line) => push_info_line(app, line),
-        None => push_info_line(
-            app,
-            Line::from(Span::styled(
-                "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
-                    .to_string(),
-                fg(crate::render::theme::muted_fg()),
-            )),
-        ),
-    }
+/// The skills line for the session-start header, or the "no skills" note.
+/// Muted like the DEX banner: session-start chrome, not a call to action.
+pub(crate) fn skills_header_line(skills: &[crate::protocol::Skill]) -> Line<'static> {
+    let muted = fg(crate::render::theme::muted_fg());
+    skills_listing_line(skills).unwrap_or_else(|| {
+        Line::from(Span::styled(
+            "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
+                .to_string(),
+            muted,
+        ))
+    })
 }
 
 /// The session-start skills line: names comma-separated on a single row, all
@@ -515,14 +510,14 @@ pub(crate) fn bootstrap(
         })
         .collect();
 
-    // Session-start view: the DEX banner, then the skills the daemon discovered,
-    // then how fast the TUI was ready to use.
-    push_banner(&mut remote.app);
-    push_skills_listing(&mut remote.app);
-    push_info_line(
-        &mut remote.app,
+    // Session-start header: one Banner block holding the DEX wordmark, the
+    // skills the daemon discovered, and the ready time — contiguous rows, no
+    // inter-block gap air between them.
+    let header = vec![
+        skills_header_line(&remote.app.skills),
         launch_time_line(launch_start.elapsed().as_secs_f64()),
-    );
+    ];
+    push_banner(&mut remote.app, header);
     // A mismatched `thinking_effort:` (config.yaml names a level the model
     // doesn't advertise) used to `eprintln!` from the daemon thread here —
     // mid OSC theme query / alternate screen — corrupting the display and
