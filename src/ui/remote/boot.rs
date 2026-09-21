@@ -85,16 +85,15 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
 
 /// The skills line for the session-start header, or the "no skills" note.
 /// Muted like the DEX banner: session-start chrome, not a call to action.
-pub(crate) fn skills_header_lines(skills: &[crate::protocol::Skill]) -> Vec<Line<'static>> {
+pub(crate) fn skills_header_line(skills: &[crate::protocol::Skill]) -> Line<'static> {
     let muted = fg(crate::render::theme::muted_fg());
-    let line = skills_listing_line(skills).unwrap_or_else(|| {
+    skills_listing_line(skills).unwrap_or_else(|| {
         Line::from(Span::styled(
             "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
                 .to_string(),
             muted,
         ))
-    });
-    vec![line]
+    })
 }
 
 /// The session-start skills line: names comma-separated on a single row, all
@@ -514,8 +513,10 @@ pub(crate) fn bootstrap(
     // Session-start header: one Banner block holding the DEX wordmark, the
     // skills the daemon discovered, and the ready time — contiguous rows, no
     // inter-block gap air between them.
-    let mut header = skills_header_lines(&remote.app.skills);
-    header.push(launch_time_line(launch_start.elapsed().as_secs_f64()));
+    let header = vec![
+        skills_header_line(&remote.app.skills),
+        launch_time_line(launch_start.elapsed().as_secs_f64()),
+    ];
     push_banner(&mut remote.app, header);
     // A mismatched `thinking_effort:` (config.yaml names a level the model
     // doesn't advertise) used to `eprintln!` from the daemon thread here —
