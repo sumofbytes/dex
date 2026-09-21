@@ -742,6 +742,26 @@ async fn edit_batch_note_counts_fan_out_sites() {
 }
 
 #[tokio::test]
+async fn edit_batch_null_optional_args_are_treated_as_absent() {
+    // Some clients serialize omitted optional fields as explicit `null`
+    // (`{"path": ..., "oldText": null, "edits": [...]}`). That used to trip
+    // the both-shapes guard; null is "absent", exactly like `then_run: null`.
+    let mut args = Map::new();
+    args.insert(
+        "edits".into(),
+        Value::Array(vec![serde_json::json!({"oldText": "a", "newText": "A"})]),
+    );
+    args.insert("oldText".into(), Value::Null);
+    args.insert("newText".into(), Value::Null);
+    args.insert("replaceAll".into(), Value::Null);
+    let ops = parse_edit_ops(&args).unwrap();
+    assert_eq!(ops, vec![("a".to_string(), "A".to_string())]);
+    // A real oldText alongside edits[] still fails loudly.
+    args.insert("oldText".into(), Value::String("a".into()));
+    assert!(parse_edit_ops(&args).is_err());
+}
+
+#[tokio::test]
 async fn edit_batch_rejects_non_object_entries_by_name() {
     // `edits: ["foo"]` used to report "missing oldText"; name the actual
     // shape problem so the model can self-correct.
