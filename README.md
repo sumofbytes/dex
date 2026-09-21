@@ -512,6 +512,7 @@ The TUI has one autonomy selector, cycled with **Shift+Tab** or set with
 | Mode | Intent | Tool gate | Model directive |
 | ------- | ---------------------------------------- | --------------------------------- | -------------------------------------- |
 | `plan` | Research and produce a plan; make **no** changes | `read-only` — every mutation/shell call denied | explore first, then present a plan; do not edit |
+| `manual` | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the approval overlay | none |
 | `auto` (default) | Hands-off execution | `trusted` — no prompts | none |
 
 The default is `auto`: a stock launch seeds the mode from the permission
