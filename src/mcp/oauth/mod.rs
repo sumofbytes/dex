@@ -102,7 +102,7 @@ mod flow_tests {
     }
 
     fn shared() -> reqwest::Client {
-        crate::client::http::shared_async_client()
+        crate::runtime::http::shared_async_client()
     }
 
     fn mk_tok(refresh: Option<&str>) -> OAuthToken {

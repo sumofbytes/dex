@@ -2376,7 +2376,7 @@ mod e2e_tests {
         );
 
         let base = spawn_app(router(Arc::new(DaemonState::new()))).await;
-        let http = crate::client::http::shared_async_client();
+        let http = crate::runtime::http::shared_async_client();
         let url = |path: &str| format!("{base}{path}");
 
         // Liveness stays open without credentials.

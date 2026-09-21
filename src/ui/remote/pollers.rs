@@ -49,7 +49,7 @@ pub(crate) fn spawn_events_poller(
     busy: Arc<AtomicBool>,
     cursor: Arc<AtomicU64>,
 ) {
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         // No tip seed here: the boot flow seeds the cursor (§4 — the replay
         // drain advances it per page, the local-JSONL path from the local
         // journal tip), so this task only advances it past rows it serves.
@@ -86,7 +86,7 @@ pub(crate) fn spawn_events_poller(
 }
 
 pub(crate) fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Sender<WorkerMessage>) {
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         loop {
             tokio::time::sleep(GIT_REFRESH_INTERVAL).await;
             match client.get_git_async().await {
@@ -104,7 +104,7 @@ pub(crate) fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Send
 /// worker channel (daemon 5s cache keeps it cheap). Used at turn end so
 /// tool mutations show up immediately.
 pub(crate) fn refresh_git_async(client: DaemonClient, tx: mpsc::Sender<WorkerMessage>) {
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         if let Ok(info) = client.get_git_async().await {
             let _ = tx.send(WorkerMessage::Git(info)).await;
         }
@@ -124,7 +124,7 @@ pub(crate) fn spawn_approval_poster(
     request_id: String,
     decision_rx: mpsc::Receiver<ApprovalDecision>,
 ) {
-    crate::client::http::spawn_task(async move {
+    crate::runtime::http::spawn_task(async move {
         let mut decision_rx = decision_rx;
         // A closed channel (the TUI went away) resolves to deny: the parked
         // approval must never strand the requesting agent thread.

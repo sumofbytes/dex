@@ -23,7 +23,7 @@ pub(crate) use routes_sessions::{
     session_undo, session_waive,
 };
 
-pub(crate) fn router(state: Arc<DaemonState>) -> Router {
+pub fn router(state: Arc<DaemonState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/config", get(get_config))

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use tokio::io::AsyncReadExt as _;
 
+use crate::render::format::clamp_lines;
 use crate::runtime::cancel::wait_cancelled;
-use crate::ui::format::clamp_lines;
 
 use super::args::arg_str;
 use super::{resolve_workspace_path, workspace_path, workspace_root, ToolError};

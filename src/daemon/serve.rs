@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::state::DaemonState;
 
 /// Start the daemon HTTP server on an already-bound listener.
-pub(crate) async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
     // MCP bootstrap: connects servers in the background and merges their
     // tools into the schema cache (plus the 60s liveness sweeper). Without
     // this the manager stays uninitialized and `mcp__*` tools never exist.

@@ -1,3 +1,4 @@
+use super::super::style::BLOCK_GAP_ROWS;
 use super::super::style::INPUT_PROMPT_WIDTH;
 use super::super::transcript_indent;
 use super::super::App;
@@ -55,7 +56,8 @@ fn surface_pad_row(width: usize, bg: Color) -> Line<'static> {
 }
 
 /// Wrap + pad a surface's stored lines: every row padded out to the full
-/// width in `bg`, with `pad` blank air rows above and below the content.
+/// width in `bg`, with `pad` blank air rows above and below the content
+/// (only the user prompt pads today — the composer-echo air).
 /// `first_row_overhang` narrows the first row (the echoed prompt glyph);
 /// see `wrap_line_display`.
 /// Single source for the user-prompt and tool-step arms of `wrap_block`,
@@ -102,9 +104,10 @@ pub(crate) fn wrap_block(
             )
         }
         super::super::TranscriptBlock::Tool { .. } => {
-            // Each tool step carries its own air row top/bottom so the
-            // content clears the edge; gaps between steps stay terminal bg.
-            surface_rows(block.lines().into_iter().cloned(), width, 1, 0)
+            // Spacing between tool steps comes solely from the universal
+            // inter-block gap (`rebuild_display_cache`); no baked air of
+            // its own, so every block pair is separated by the same row.
+            surface_rows(block.lines().into_iter().cloned(), width, 0, 0)
         }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
@@ -230,23 +233,25 @@ fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
 /// block's start offset (gap separators + wrapped-row counts — length
 /// arithmetic, no clones), then re-extend from there. Unchanged leading blocks
 /// keep byte-identical rows, so the offsets line up; this runs only on content
-/// or width changes, never for scroll. Tool steps carry their own air
-/// rows, so every gap between blocks stays blank terminal bg.
-fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
+/// or width changes, never for scroll. Every gap between blocks stays
+/// blank terminal bg.
+pub(crate) fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
     let Some(dirty) = first_dirty else {
         return;
     };
     let mut start = 0usize;
     for (idx, wb) in app.wrapped_cache.iter().enumerate().take(dirty) {
         if idx > 0 && !wb.rows.is_empty() {
-            start += 1;
+            start += BLOCK_GAP_ROWS;
         }
         start += wb.rows.len();
     }
     app.display_cache.truncate(start);
     for (idx, wb) in app.wrapped_cache.iter().enumerate().skip(dirty) {
         if idx > 0 && !wb.rows.is_empty() {
-            app.display_cache.push(Line::default());
+            for _ in 0..BLOCK_GAP_ROWS {
+                app.display_cache.push(Line::default());
+            }
         }
         app.display_cache.extend(wb.rows.iter().cloned());
     }
@@ -316,9 +321,9 @@ impl TranscriptView {
                             if rows > 0 {
                                 // Rows after the thinking block: only the
                                 // open activity (0 rows while thinking
-                                // streams) plus its 1-row separator when
+                                // streams) plus its separator when
                                 // non-empty.
-                                let sep = usize::from(tail_rows > 0);
+                                let sep = usize::from(tail_rows > 0) * BLOCK_GAP_ROWS;
                                 thinking_row = Some(app.display_cache.len() - tail_rows - sep - 1);
                             }
                         }

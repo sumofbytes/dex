@@ -143,13 +143,9 @@ pub(crate) enum Scope {
 /// `$XDG_DATA_HOME/dex/extensions` (marker-file home; no new persistence
 /// design — plan §9).
 pub(crate) fn data_extensions_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(dir).join("dex/extensions");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/dex/extensions");
-    }
-    PathBuf::from(".dex/extensions")
+    crate::runtime::logging::data_home()
+        .map(|base| base.join("dex/extensions"))
+        .unwrap_or_else(|| PathBuf::from(".dex/extensions"))
 }
 
 fn marker_path(kind: &str, id: &str) -> PathBuf {

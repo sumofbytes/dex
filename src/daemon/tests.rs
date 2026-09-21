@@ -482,7 +482,7 @@ async fn bearer_token_generated_for_non_loopback_bind_and_enforced() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let http = crate::client::http::shared_async_client();
+    let http = crate::runtime::http::shared_async_client();
     // /health stays open (liveness before any credential).
     let health = http
         .get(format!("http://{bound}/health"))

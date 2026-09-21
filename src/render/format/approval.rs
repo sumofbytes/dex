@@ -32,17 +32,18 @@ pub(crate) fn approval_title_with_then_run(name: &str, has_then_run: bool) -> &'
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tui"))]
 pub(crate) fn approval_risk(name: &str, input: &str) -> (&'static str, ratatui::style::Color) {
     approval_risk_with_then_run(name, input_has_then_run(input))
 }
 
 /// [`approval_risk`] with a precomputed flag (see [`approval_title_with_then_run`]).
+#[cfg(feature = "tui")]
 pub(crate) fn approval_risk_with_then_run(
     name: &str,
     has_then_run: bool,
 ) -> (&'static str, ratatui::style::Color) {
-    use crate::ui::theme::{failure_fg, success_fg, warn_fg};
+    use crate::render::theme::{failure_fg, success_fg, warn_fg};
     // A `then_run` turns a file mutation into a shell command; the approver
     // must see the same "high" risk as a bare `bash`.
     if matches!(name, "write" | "edit") && has_then_run {
