@@ -212,7 +212,7 @@ fn banner_is_one_block_of_wordmark_rows() {
     // TranscriptView inserts a blank gap line between blocks, which
     // would split the banner apart.
     let mut app = test_app();
-    push_banner(&mut app);
+    push_banner(&mut app, Vec::new());
     assert_eq!(app.transcript.len(), 1);
     let lines = app.transcript[0].lines();
     assert_eq!(lines.len(), 1);
