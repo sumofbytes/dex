@@ -465,6 +465,12 @@ impl LlmConfig {
                 .user_agent(crate::runtime::http::USER_AGENT)
                 .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
                 .timeout(Duration::from_secs(self.request_timeout_secs))
+                // Same per-read backstop as the shared streaming client: the
+                // total timeout covers most waits, but a re-issued attempt's
+                // header wait must never outlive the turn's own idle budget.
+                .read_timeout(Duration::from_secs(
+                    crate::runtime::http::STREAM_READ_TIMEOUT_SECS,
+                ))
                 // Same dead-socket detection as the shared streaming client.
                 .tcp_keepalive(Duration::from_secs(
                     crate::runtime::http::TCP_KEEPALIVE_SECS,
