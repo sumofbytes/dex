@@ -1,16 +1,18 @@
 mod agent;
 pub mod cli;
-mod client;
-mod daemon;
+pub mod client;
+pub mod daemon;
 mod extensions;
 mod llm;
 mod mcp;
 pub mod protocol;
+mod render;
 mod runtime;
 mod session;
 mod skills;
 mod telemetry;
 mod tools;
+#[cfg(feature = "tui")]
 mod ui;
 mod workspace;
 
@@ -120,8 +122,9 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let (config_result, skills, (mut session, history)) = std::thread::scope(|s| {
-        let ext = s
-            .spawn(|| crate::client::http::block_on(crate::extensions::global_manager().refresh()));
+        let ext = s.spawn(|| {
+            crate::runtime::http::block_on(crate::extensions::global_manager().refresh())
+        });
         // `from_env`'s boxed error is not `Send`; stringify it at the
         // thread boundary (same pattern as `from_env_async`).
         let cfg = s.spawn(|| {
@@ -243,7 +246,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     }
     let mut state = ToolState::load();
     let console = crate::runtime::console::Console::none();
-    let result = crate::client::http::block_on(process_turn(AgentRuntime {
+    let result = crate::runtime::http::block_on(process_turn(AgentRuntime {
         config: &config,
         messages: &mut messages,
         state: &mut state,
@@ -456,7 +459,7 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
         let normalized = crate::extensions::normalize_tool_name(name);
         match crate::extensions::split_ext_name(&normalized) {
             Some((ext, _)) => {
-                if let Err(e) = crate::client::http::block_on(
+                if let Err(e) = crate::runtime::http::block_on(
                     crate::extensions::global_manager().ensure_loaded(ext),
                 ) {
                     eprintln!("error: {e}");
@@ -464,7 +467,7 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
                 }
             }
             None => {
-                crate::client::http::block_on(crate::extensions::global_manager().refresh());
+                crate::runtime::http::block_on(crate::extensions::global_manager().refresh());
             }
         }
     }
@@ -481,7 +484,7 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
 fn run_extensions(action: &str, name: Option<&str>) {
     match action {
         "list" => {
-            crate::client::http::block_on(crate::extensions::global_manager().refresh());
+            crate::runtime::http::block_on(crate::extensions::global_manager().refresh());
             crate::extensions::list_command();
         }
         "enable" | "disable" => {
@@ -545,7 +548,7 @@ fn run_mcp(action: &str, server: Option<&str>) {
             }
         }
         "login" => run_or_exit(
-            server.map(|server| crate::client::http::block_on(crate::mcp::oauth::login(server))),
+            server.map(|server| crate::runtime::http::block_on(crate::mcp::oauth::login(server))),
             "usage: dex mcp login <server>",
             "mcp login failed: ",
         ),
@@ -564,6 +567,7 @@ fn run_mcp(action: &str, server: Option<&str>) {
 
 pub fn run() {
     crate::runtime::logging::init();
+    #[cfg(feature = "tui")]
     crate::ui::mark_launch_start();
     install_sigint_handler();
     let args = cli::parse_args();
@@ -619,7 +623,10 @@ pub fn run() {
                 // `false`: a loopback URL here may still be an SSH port-forward
                 // or a container's daemon, so never assume the session is
                 // reachable by a bare local `dex --reattach`.
+                #[cfg(feature = "tui")]
                 None => ui::run_ratatui_repl_with_remote(&args, &url, false).map_err(Into::into),
+                #[cfg(not(feature = "tui"))]
+                None => Err("interactive TUI not built (compile with `--features tui`)".into()),
             };
             if let Err(e) = result {
                 eprintln!("client error: {}", e);
@@ -676,9 +683,15 @@ pub fn run() {
             let url = format!("http://{addr}");
             // `true`: this process owns the daemon it just started, so its cwd
             // is the workspace a later `dex --reattach <id>` would resolve.
+            #[cfg(feature = "tui")]
             if let Err(e) = ui::run_ratatui_repl_with_remote(&args, &url, true) {
                 eprintln!("ui error: {}", e);
                 std::process::exit(1);
+            }
+            #[cfg(not(feature = "tui"))]
+            {
+                let _ = url;
+                eprintln!("interactive TUI not built (compile with `--features tui`)");
             }
         }
         Mode::OneShot { prompt } => {

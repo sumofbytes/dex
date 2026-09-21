@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::protocol::{ChatMessage, Role};
-use crate::ui::format::truncate_text;
+use crate::render::format::truncate_text;
 
 // File tracking — read/written/edited sets extracted from tool calls
 #[derive(Default)]

@@ -51,6 +51,7 @@ fn approval_prompt_shows_the_then_run_command() {
 
 /// A `then_run` mutation is a shell command in disguise: the approval
 /// overlay must not label it a plain write or under-rate its risk.
+#[cfg(all(test, feature = "tui"))]
 #[test]
 fn approval_surface_escalates_a_then_run_mutation() {
     let input = r#"{"path":"src/a.rs","content":"x","then_run":"cargo test"}"#;
@@ -555,7 +556,7 @@ fn strip_ansi_consumes_osc_payloads() {
 
 #[test]
 fn render_mcp_panel_lists_tools_and_down_servers() {
-    use crate::mcp::ServerStatus;
+    use crate::protocol::ServerStatus;
     use crate::protocol::{FunctionDef, ToolDefinition};
     let tool = |name: &str, description: &str| ToolDefinition {
         tool_type: "function".to_string(),
@@ -604,7 +605,7 @@ fn render_mcp_panel_lists_tools_and_down_servers() {
 fn render_mcp_panel_empty_and_truncated() {
     let lines = render_mcp_panel(&[], &[], 0);
     assert_eq!(lines, vec!["no MCP servers configured."]);
-    use crate::mcp::ServerStatus;
+    use crate::protocol::ServerStatus;
     let lines = render_mcp_panel(
         &[ServerStatus {
             name: "gh".to_string(),

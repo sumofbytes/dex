@@ -1,7 +1,11 @@
 //! Tests for syntax highlighting.
 #![cfg(test)]
 
-use super::*;
+use super::super::highlight::{
+    fallback_code_block, fallback_highlight_ansi, highlight_ansi, render_inline,
+    render_markdown_line,
+};
+use super::super::lang::{canonical_lang, lang_from_path, normalize_code_lang};
 
 #[test]
 fn lang_map_covers_compiled_grammars() {

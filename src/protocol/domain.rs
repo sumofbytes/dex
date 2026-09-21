@@ -3,6 +3,17 @@ use std::path::PathBuf;
 
 use crate::protocol::ApprovalDecision;
 
+/// Lifecycle snapshot of one MCP server for status lines and the UI panels.
+/// Plain data so `render` can depend on it without reaching upward into
+/// `mcp`.
+#[derive(Clone, Debug)]
+pub(crate) struct ServerStatus {
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) tools: usize,
+    pub(crate) error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Skill {
     pub(crate) name: String,
@@ -40,6 +51,8 @@ pub struct Plan {
 }
 
 impl Plan {
+    // `/resume` plan preview (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.goal.is_none()
             && self.steps.is_empty()
@@ -49,6 +62,8 @@ impl Plan {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+    // `/resume` plan preview (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn from_json(s: &str) -> Self {
         serde_json::from_str(s).unwrap_or_default()
     }

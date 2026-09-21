@@ -97,6 +97,8 @@ impl Session {
     /// Agent mode recorded on the most recent `turn_start` (see
     /// `turn_event_with_mode`): the client's last selector, restored on
     /// reattach. `None` for legacy journals and subagent turns.
+    // Remote UI reattach (TUI) is the only runtime caller.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) fn last_turn_mode(path: &Path) -> Option<String> {
         let mut mode: Option<String> = None;
         let scan = super::for_each_line(path, |line| {

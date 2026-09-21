@@ -183,7 +183,7 @@ mod tests {
         let req = Provider::OpenAiCodex
             .auth_scheme()
             .apply(
-                crate::client::http::shared_async_client().get("http://localhost/v1"),
+                crate::runtime::http::shared_async_client().get("http://localhost/v1"),
                 "tok",
                 Some("acct"),
             )
@@ -208,7 +208,7 @@ mod tests {
         let req = Provider::Anthropic
             .auth_scheme()
             .apply(
-                crate::client::http::shared_async_client().get("http://localhost/v1"),
+                crate::runtime::http::shared_async_client().get("http://localhost/v1"),
                 "tok",
                 None,
             )

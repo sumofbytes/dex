@@ -216,7 +216,7 @@ fn banner_is_one_block_of_wordmark_rows() {
     assert_eq!(app.transcript.len(), 1);
     let lines = app.transcript[0].lines();
     assert_eq!(lines.len(), 1);
-    let muted = theme::muted_fg();
+    let muted = crate::render::theme::muted_fg();
     let line = &lines[0];
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(
@@ -857,7 +857,7 @@ fn submitted_prompt_keeps_user_voice() {
         assert!(
             line.spans
                 .iter()
-                .any(|s| s.style.fg == Some(theme::user_fg())),
+                .any(|s| s.style.fg == Some(crate::render::theme::user_fg())),
             "every submitted row carries the voice color: {line:?}"
         );
         assert!(
@@ -904,7 +904,10 @@ fn tool_preview_lines_are_indented_and_dimmed() {
     assert_eq!(preview.len(), 2);
     for line in preview {
         assert!(line.spans.len() == 2); // indent gutter + content
-        assert_eq!(line.spans[1].style.fg, Some(theme::tool_preview_fg()));
+        assert_eq!(
+            line.spans[1].style.fg,
+            Some(crate::render::theme::tool_preview_fg())
+        );
     }
     assert!(preview[0].spans[1].content.as_ref() == "  src/main.rs");
     assert!(preview[1].spans[1].content.as_ref() == "  … +3 more lines");
@@ -953,18 +956,21 @@ fn read_preview_highlights_code_and_keeps_gutter_dim() {
         )
         .collect();
     assert!(gutter.contains('1'), "{gutter}");
-    assert_eq!(preview[0].spans[1].style.fg, Some(theme::tool_preview_fg()));
+    assert_eq!(
+        preview[0].spans[1].style.fg,
+        Some(crate::render::theme::tool_preview_fg())
+    );
     assert!(
         preview[0].spans[2..]
             .iter()
-            .any(|s| s.style.fg != Some(theme::tool_preview_fg())),
+            .any(|s| s.style.fg != Some(crate::render::theme::tool_preview_fg())),
         "code should highlight, got {:?}",
         preview[0]
     );
     // Tail row stays dim (spans[0] is the unstyled indent gutter).
     assert!(preview[1].spans[1..]
         .iter()
-        .all(|s| s.style.fg == Some(theme::tool_preview_fg())));
+        .all(|s| s.style.fg == Some(crate::render::theme::tool_preview_fg())));
 }
 
 /// Write a minimal persisted session JSONL (same entry shapes

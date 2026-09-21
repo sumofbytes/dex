@@ -95,7 +95,7 @@ pub(crate) fn push_skills_listing(app: &mut App) {
             Line::from(Span::styled(
                 "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
                     .to_string(),
-                fg(super::super::theme::muted_fg()),
+                fg(crate::render::theme::muted_fg()),
             )),
         ),
     }
@@ -110,7 +110,7 @@ pub(crate) fn skills_listing_line(skills: &[crate::protocol::Skill]) -> Option<L
         names.push_str(", ");
         names.push_str(&skill.name);
     }
-    let muted = fg(super::super::theme::muted_fg());
+    let muted = fg(crate::render::theme::muted_fg());
     Some(Line::from(vec![
         Span::styled(format!("skills loaded ({}): ", skills.len()), muted),
         Span::styled(names, muted),
@@ -125,9 +125,9 @@ pub(crate) fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     Line::from(vec![Span::styled(
         format!(
             "ready in {}",
-            crate::ui::format::format_duration(elapsed_secs)
+            crate::render::format::format_duration(elapsed_secs)
         ),
-        fg(super::super::theme::muted_fg()),
+        fg(crate::render::theme::muted_fg()),
     )])
 }
 
@@ -183,20 +183,20 @@ pub(crate) fn bootstrap(
     // Detach-on-error preserved: the spawned tasks are awaited only on the
     // success path; an early return drops their handles (detaches).
     let skills_client = client.clone();
-    let skills_handle = crate::client::http::spawn_task(async move {
+    let skills_handle = crate::runtime::http::spawn_task(async move {
         skills_client.list_skills_async().await.unwrap_or_default()
     });
     // §2: warm the one-time OSC 11 palette query alongside the session RTT
     // instead of serially before first paint. The `block_on` before the
     // skills listing (the first consumer of colors) is instant when the
     // probe finished in flight.
-    let palette_handle = crate::client::http::spawn_task(async move {
-        super::super::theme::detect_background();
+    let palette_handle = crate::runtime::http::spawn_task(async move {
+        crate::render::theme::detect_background();
     });
     // The daemon owns the model/provider/permission and the workspace; mirror
     // its state so the UI shows what turns will actually use.
     let config_client = client.clone();
-    let info_handle = crate::client::http::spawn_task(async move {
+    let info_handle = crate::runtime::http::spawn_task(async move {
         // `Box<dyn Error>` is not `Send`; stringify across the spawn boundary.
         config_client
             .get_config_async()
@@ -216,7 +216,7 @@ pub(crate) fn bootstrap(
         let resp = client
             .reattach(reattach)
             .map_err(|e| std::io::Error::other(format!("failed to reattach session: {e}")))?;
-        let info = crate::client::http::block_on(info_handle)
+        let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         (resp.session_id, true, info, None)
@@ -224,7 +224,7 @@ pub(crate) fn bootstrap(
         let resp = client
             .create_session(&local_cwd, Some(name))
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
-        let info = crate::client::http::block_on(info_handle)
+        let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         (resp.session_id, false, info, Some(name.to_string()))
@@ -236,14 +236,14 @@ pub(crate) fn bootstrap(
         let resp = client
             .create_session(&local_cwd, Some(&session_name))
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
-        let info = crate::client::http::block_on(info_handle)
+        let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         (resp.session_id, false, info, Some(session_name))
     } else {
         // Remote default: needs the daemon workspace first; the skills scan
         // above still overlaps this fetch.
-        let info = crate::client::http::block_on(info_handle)
+        let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
         let session_name = Session::default_session_name(&info.cwd);
@@ -330,7 +330,7 @@ pub(crate) fn bootstrap(
         show_thinking: false,
         thinking_open: false,
         assistant_pending: String::new(),
-        assistant_gap: crate::ui::theme::markdown::GapState::new(),
+        assistant_gap: crate::render::theme::markdown::GapState::new(),
         stream_last_flush: Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
@@ -399,7 +399,7 @@ pub(crate) fn bootstrap(
     // warms a memoized query; a panic in it must not take down startup.
     // (Moved up with the terminal init: the palette must resolve before raw
     // mode, and first paint precedes replay now.)
-    let _ = crate::client::http::block_on(palette_handle);
+    let _ = crate::runtime::http::block_on(palette_handle);
     enable_raw_mode()?;
     // No startup drain here: a blind deadline cuts OSC reply bursts in half
     // and leaks the tail (sans lead-in) into the composer. Late replies —
@@ -519,7 +519,7 @@ pub(crate) fn bootstrap(
     // §3: collect the skills future here — after replay, before the
     // session-start listing (its only consumer) — so a slow daemon dir scan
     // never delays replay or first paint.
-    let daemon_skills = crate::client::http::block_on(skills_handle).unwrap_or_default();
+    let daemon_skills = crate::runtime::http::block_on(skills_handle).unwrap_or_default();
     // Skills live on the daemon (its workspace); a stale list is harmless —
     // the load call re-discovers on the daemon side.
     remote.app.skills = daemon_skills

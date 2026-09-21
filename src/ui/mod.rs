@@ -23,7 +23,6 @@ pub(crate) mod remote;
 pub(crate) mod render;
 pub(crate) mod slash;
 pub(crate) mod status;
-pub(crate) mod theme;
 pub(crate) mod wrapping;
 
 pub(crate) use self::input::InputField;
@@ -49,12 +48,11 @@ pub(crate) mod style;
 pub(crate) use transcript::{move_activity_to_tail, BANNER};
 
 pub(crate) mod app;
-pub(crate) mod format;
 pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
-    format_tokens, AgentChip, App, EnableMouseScroll, PendingApproval, TranscriptBlock,
-    WrappedBlock, NOTICE_LIFETIME,
+    AgentChip, App, EnableMouseScroll, PendingApproval, TranscriptBlock, WrappedBlock,
+    NOTICE_LIFETIME,
 };
 #[cfg(test)]
 pub(crate) use selection::{b64, line_width};
