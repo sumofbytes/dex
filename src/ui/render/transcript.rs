@@ -31,13 +31,13 @@ pub(crate) struct TranscriptView;
 /// turn-activity block wraps to zero rows while a thinking block streams:
 /// Working shows only when busy-but-not-thinking, so the transcript never
 /// stacks two live spinners.
-/// Submitted prompts read as the composer's echo: the same `❯ ` glyph and
-/// the same top/bottom air (`INPUT_PAD_Y`) as the live composer, on the
-/// terminal's own background, so a sent prompt keeps the height and shape
-/// it had while typed. Stored lines stay unpadded (width-dependent fill
-/// happens here at wrap time, keeping `wrap_line_display`'s indent logic
-/// intact); each wrapped row is padded out to the full width, with blank
-/// rows above and below the content.
+/// Submitted prompts read as the composer's echo: the same `❯ ` glyph as
+/// the live composer, on the terminal's own background, so a sent prompt
+/// keeps the shape it had while typed. Stored lines stay unpadded
+/// (width-dependent fill happens here at wrap time, keeping
+/// `wrap_line_display`'s indent logic intact); each wrapped row is padded
+/// out to the full width. Vertical spacing comes solely from the universal
+/// inter-block gap — no baked air rows.
 fn paint_surface_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'static> {
     // `Line` renders each span as `line.style.patch(span.style)`, so one
     // line-level bg covers every span that doesn't set its own — no need to
@@ -51,35 +51,25 @@ fn paint_surface_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'s
     row
 }
 
-fn surface_pad_row(width: usize, bg: Color) -> Line<'static> {
-    paint_surface_row(Line::default(), width, bg)
-}
-
 /// Wrap + pad a surface's stored lines: every row padded out to the full
-/// width in `bg`, with `pad` blank air rows above and below the content
-/// (only the user prompt pads today — the composer-echo air).
+/// width in `bg`, with no baked vertical air — inter-block spacing comes
+/// solely from `BLOCK_GAP_ROWS`.
 /// `first_row_overhang` narrows the first row (the echoed prompt glyph);
 /// see `wrap_line_display`.
 /// Single source for the user-prompt and tool-step arms of `wrap_block`,
-/// which differ only in pad count and overhang.
+/// which differ only in overhang.
 fn surface_rows(
     lines: impl IntoIterator<Item = Line<'static>>,
     width: u16,
-    pad: usize,
     first_row_overhang: usize,
 ) -> Vec<Line<'static>> {
     let bg = Color::Reset;
     let w = width.max(1) as usize;
-    let mut rows: Vec<Line<'static>> = lines
+    lines
         .into_iter()
         .flat_map(|l| wrap_line_display(&l, width, first_row_overhang))
         .map(|r| paint_surface_row(r, w, bg))
-        .collect();
-    for _ in 0..pad {
-        rows.insert(0, surface_pad_row(w, bg));
-        rows.push(surface_pad_row(w, bg));
-    }
-    rows
+        .collect()
 }
 
 pub(crate) fn wrap_block(
@@ -91,23 +81,17 @@ pub(crate) fn wrap_block(
     match block {
         super::super::TranscriptBlock::User { lines, .. } => {
             // No band: the prompt keeps the terminal's own background and is
-            // framed by the composer's hairline rules, not a shaded strip.
-            // `INPUT_PAD_Y` air matches the live composer's shape, and the
-            // first row wraps `INPUT_PROMPT_WIDTH` narrower for the echoed
-            // glyph — the same wrap the live composer applies, so typed and
-            // submitted prompts reflow identically.
-            surface_rows(
-                lines.clone(),
-                width,
-                super::super::INPUT_PAD_Y as usize,
-                INPUT_PROMPT_WIDTH,
-            )
+            // separated from neighbours solely by the universal inter-block
+            // gap. The first row wraps `INPUT_PROMPT_WIDTH` narrower for the
+            // echoed glyph — the same wrap the live composer applies, so
+            // typed and submitted prompts reflow identically.
+            surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH)
         }
         super::super::TranscriptBlock::Tool { .. } => {
             // Spacing between tool steps comes solely from the universal
             // inter-block gap (`rebuild_display_cache`); no baked air of
             // its own, so every block pair is separated by the same row.
-            surface_rows(block.lines().into_iter().cloned(), width, 0, 0)
+            surface_rows(block.lines().into_iter().cloned(), width, 0)
         }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
