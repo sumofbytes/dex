@@ -9,7 +9,9 @@ use super::error::ToolError;
 pub(super) fn arg_str(args: &Map<String, Value>, key: &'static str) -> Result<String, ToolError> {
     match args.get(key) {
         Some(Value::String(s)) => Ok(s.clone()),
+        // Explicit `null` means absent: some clients serialize omitted
+        // optional fields that way (see then_run's same rule).
+        Some(Value::Null) | None => Err(ToolError::Missing(key)),
         Some(_) => Err(ToolError::NotString(key)),
-        None => Err(ToolError::Missing(key)),
     }
 }
