@@ -546,7 +546,7 @@ pub(crate) async fn refresh_access_token(saved: &OAuthToken) -> Result<OAuthToke
     if !saved.refreshable() {
         return Err("mcp oauth: stored token is not refreshable (log in again)".to_string());
     }
-    let http = crate::client::http::shared_async_client();
+    let http = crate::runtime::http::shared_async_client();
     let refresh = saved.refresh_token.clone().unwrap_or_default();
     let mut pairs = vec![
         ("grant_type", "refresh_token"),
@@ -779,7 +779,7 @@ pub(crate) async fn login(server: &str) -> Result<String, String> {
     let base = cfg.url.clone().ok_or_else(|| {
         format!("mcp server '{server}' is stdio: OAuth login is only for HTTP servers")
     })?;
-    let http = crate::client::http::shared_async_client();
+    let http = crate::runtime::http::shared_async_client();
 
     let probe = probe_challenge(&http, &base, &cfg.headers).await;
     if !probe.challenged {

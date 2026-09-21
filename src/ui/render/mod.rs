@@ -6,7 +6,6 @@ use super::style::content_width as input_content_width;
 use super::style::fg;
 #[cfg(test)]
 use super::style::TRANSCRIPT_INDENT;
-use super::theme;
 use super::App;
 #[cfg(test)]
 use super::InputField;
@@ -14,6 +13,7 @@ use super::InputField;
 use super::Selection;
 #[cfg(test)]
 use super::TAB_WIDTH;
+use crate::render::theme;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
@@ -66,7 +66,7 @@ pub(crate) use thinking::{
     extend_thinking_rows, thinking_display_lines, thinking_indicator_text, wrap_thinking_full,
 };
 #[cfg(test)]
-pub(crate) use transcript::{apply_selection, wrap_block, SEL_BG};
+pub(crate) use transcript::{apply_selection, rebuild_display_cache, wrap_block, SEL_BG};
 
 pub(super) fn input_block() -> Block<'static> {
     // Borderless sides, hairline rules top and bottom: the composer is a

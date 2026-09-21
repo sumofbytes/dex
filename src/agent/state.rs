@@ -80,7 +80,10 @@ pub(crate) struct ToolState {
     /// client-side from the Usage event's completion count and the
     /// daemon-measured call duration (`gen_ms`). Display-only; `None` until
     /// the first timed call and reset by `/new`.
+    // Written by the TUI (`ui::status`, `/clear`); unread in headless builds.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) last_tok_s: Option<f64>,
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub(crate) verify_dirty: bool,
 }
 

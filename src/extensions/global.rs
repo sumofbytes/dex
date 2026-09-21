@@ -26,7 +26,7 @@ pub(crate) fn global_manager() -> std::sync::Arc<ExtensionManager> {
             // cached (same contract as MCP). One-shot CLI awaits refresh
             // explicitly instead (see main.rs).
             let clone = std::sync::Arc::clone(&mgr);
-            crate::client::http::spawn_task(async move { clone.refresh().await });
+            crate::runtime::http::spawn_task(async move { clone.refresh().await });
             mgr
         })
         .clone()
@@ -420,7 +420,7 @@ fn net_client() -> reqwest::Client {
     NET_CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
-                .user_agent(crate::client::http::USER_AGENT)
+                .user_agent(crate::runtime::http::USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()

@@ -404,6 +404,12 @@ pub struct GitInfo {
     pub git_dirty: bool,
 }
 
+/// Token estimation shared by the turn loop, compaction, routing budget and
+/// the MCP/extension schema slices. Pure functions over the wire types —
+/// one layer down from `agent`, which owns the upward-reaching budget.
+#[path = "tokens.rs"]
+pub(crate) mod tokens;
+
 /// Domain vocabulary shared across agent/tools/session/ui and persisted in
 /// session JSONL (plan §4 Phase 3: wire-schema items went to `shared.rs`,
 /// these stay domain — sessions are the wire).

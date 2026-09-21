@@ -2,7 +2,6 @@ use serde_json::{Map, Value};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
 
 pub(crate) fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
     // Audit writes are sync open+write per
@@ -11,10 +10,7 @@ pub(crate) fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
     if std::env::var("DEX_AUDIT").as_deref() != Ok("1") {
         return;
     }
-    let Some(base) = env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-    else {
+    let Some(base) = crate::runtime::logging::data_home() else {
         return;
     };
     let path = base.join("dex/audit.jsonl");
