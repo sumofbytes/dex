@@ -1,7 +1,8 @@
 use super::super::push_info;
+use super::super::push_info_line;
 use super::super::slash::handle_slash;
 use super::super::slash::reset_session_state;
-use super::boot::push_skills_listing;
+use super::boot::skills_header_lines;
 use super::input::find_local_session_file;
 use super::input::no_paint;
 use super::input::rebuild_remote_from_messages;
@@ -133,7 +134,9 @@ fn remote_reset(remote: &mut RemoteApp, new_session: bool) {
             fresh.set_name(name).ok();
             remote.app.session = fresh;
             push_info(&mut remote.app, label.to_string());
-            push_skills_listing(&mut remote.app);
+            for line in skills_header_lines(&remote.app.skills) {
+                push_info_line(&mut remote.app, line);
+            }
         }
         Err(e) => push_info(&mut remote.app, format!("could not start new session: {e}")),
     }
