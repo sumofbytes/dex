@@ -437,9 +437,10 @@ daemon's working directory.
 | `--skill <dir>`                  | Add an extra skill directory to discover skills from.                                                             |
 | `--tool`                         | Run raw JSON tool mode (read JSON lines from stdin).                                                              |
 
-Tool safety defaults to `trusted` (no approval popups). Set
+Tool safety defaults to `trusted` (no approval popups; the TUI seeds the
+`auto` agent mode from it). Set
 `DEX_PERMISSION=ask` or pass `--permission` to approve writes and shell
-commands. The ceiling also seeds the TUI's agent mode (`plan`/`manual`/`auto`,
+commands and seed `manual` instead. The ceiling also seeds the TUI's agent mode (`plan`/`manual`/`auto`,
 see [Agent modes](#agent-modes)): a client can only go stricter than the
 daemon's ceiling. Paths are confined to the current workspace; `bash` can execute
 arbitrary commands in that workspace and should only be enabled in trusted
@@ -511,13 +512,13 @@ The TUI has one autonomy selector, cycled with **Shift+Tab** or set with
 | Mode | Intent | Tool gate | Model directive |
 | ------- | ---------------------------------------- | --------------------------------- | -------------------------------------- |
 | `plan` | Research and produce a plan; make **no** changes | `read-only` — every mutation/shell call denied | explore first, then present a plan; do not edit |
-| `manual` (default) | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the approval overlay | none |
-| `auto` | Hands-off execution | `trusted` — no prompts | none |
+| `auto` (default) | Hands-off execution | `trusted` — no prompts | none |
 
-The default is `manual`: a stock launch seeds the mode from the permission
-default, except that a `trusted` (default) ceiling seeds `manual` rather than
-`auto` — hands-off is opt-in via Shift+Tab, `--mode auto`, or an explicit
-`--permission trusted`/`DEX_PERMISSION=trusted`. The mode is journaled with
+The default is `auto`: a stock launch seeds the mode from the permission
+default (`trusted` → `auto`; a stricter `--permission`/`DEX_PERMISSION` ceiling
+seeds the matching mode). Prefer a human in the loop? Set
+`DEX_PERMISSION=ask` or pass `--permission ask` — that seeds `manual` and caps
+the Shift+Tab cycle. The mode is journaled with
 each turn, so `--reattach` and `/resume` restore the last selector instead of
 reseeding from the ceiling.
 
