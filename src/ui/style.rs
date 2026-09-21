@@ -42,11 +42,6 @@ pub(crate) const BLOCK_GAP_ROWS: usize = 2;
 
 /// The composer's top/bottom hairline rules: one row each.
 pub(crate) const INPUT_BORDER_ROWS: u16 = 2;
-/// Blank air rows above and below the composer text, echoed around the
-/// submitted prompt in the transcript so both keep the same shape. The
-/// live composer gets this from `composer.rs`'s air rows, not from
-/// `input_block` (which adds no vertical padding).
-pub(crate) const INPUT_PAD_Y: u16 = 1;
 /// Prompt glyph shown on the composer's first row and echoed on the first
 /// row of the submitted prompt, so your turns read as yours in the
 /// transcript. Width counts the trailing space; wrap width and the row-0
