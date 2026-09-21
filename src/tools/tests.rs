@@ -759,6 +759,15 @@ async fn edit_batch_null_optional_args_are_treated_as_absent() {
     // A real oldText alongside edits[] still fails loudly.
     args.insert("oldText".into(), Value::String("a".into()));
     assert!(parse_edit_ops(&args).is_err());
+    // Mirror case: `edits: null` with a real single shape parses as the
+    // single edit (the same serializer that nulls oldText nulls edits).
+    let mut args = Map::new();
+    args.insert("path".into(), Value::String("f".into()));
+    args.insert("edits".into(), Value::Null);
+    args.insert("oldText".into(), Value::String("a".into()));
+    args.insert("newText".into(), Value::String("A".into()));
+    let ops = parse_edit_ops(&args).unwrap();
+    assert_eq!(ops, vec![("a".to_string(), "A".to_string())]);
 }
 
 #[tokio::test]
