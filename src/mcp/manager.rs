@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::agent::state::CancellationSource;
-use crate::protocol::ToolDefinition;
+use crate::protocol::{ServerStatus, ToolDefinition};
 
 use super::client::McpClient;
 use super::config::{
@@ -22,13 +22,6 @@ use super::config::{
 use super::mapping::{content_to_text, resource_reader_definition};
 use super::redact::redact_secrets;
 use super::transport::{HttpTransport, McpTransport, StdioTransport};
-
-pub(crate) struct ServerStatus {
-    pub(crate) name: String,
-    pub(crate) state: String,
-    pub(crate) tools: usize,
-    pub(crate) error: Option<String>,
-}
 
 /// One server's fetched schema slice: raw defs plus the synthetic reader.
 /// The caller merges (collision renames need the shared map, so merging

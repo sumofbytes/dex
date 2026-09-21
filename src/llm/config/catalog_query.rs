@@ -150,6 +150,8 @@ pub(crate) fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
 /// Validate a `/thinking` pick against the model's advertised options: the
 /// catalog's own casing on match, the raw pick for unknown models (a stale
 /// catalog shouldn't block), or the valid options when rejected.
+// `/thinking` (TUI) is the only runtime caller; tests exercise it directly.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn validate_thinking_effort(model: &str, pick: &str) -> Result<String, Vec<String>> {
     match reasoning_options_for(model) {
         Some(options) => options
@@ -216,7 +218,7 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
     // Shared client (pool reuse): the 30s total rides per-request — api.json
     // is a ~4MB body, and the old 10s cap failed on normal slow links while
     // curl (no timeout) succeeded.
-    let client = crate::client::http::shared_async_client();
+    let client = crate::runtime::http::shared_async_client();
     // Primary: models.dev catalog (provider-agnostic, no auth, has limit.context)
     let mut fetched = false;
     let mut last_err = String::from("no fetch attempted");
@@ -283,5 +285,5 @@ pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::erro
 /// Sync wrapper for CLI paths that stay sync (`dex update --models`):
 /// blocks on the shared runtime handle.
 pub(crate) fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
-    crate::client::http::block_on(refresh_models_cache_async())
+    crate::runtime::http::block_on(refresh_models_cache_async())
 }

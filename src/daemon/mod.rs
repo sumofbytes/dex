@@ -1,7 +1,12 @@
+//! Reusable daemon library: run the agent daemon inside any process. The
+//! HTTP+SSE edge ([`server::router`]) and the bootstrap ([`serve::run_daemon`])
+//! are public so an embedder can serve the same API the built-in TUI talks to
+//! and put their own UI on top.
+
 pub(crate) mod approvals;
 pub(crate) mod auth;
 pub(crate) mod lookup;
-pub(crate) mod server;
+pub mod server;
 pub(crate) mod shell;
 pub(crate) mod turn;
 pub(crate) mod wake;
@@ -12,11 +17,10 @@ pub(crate) mod wake;
 pub(crate) use auth::reset_daemon_token_for_tests;
 pub(crate) use auth::{daemon_token_file, prepare_daemon_token, required_token};
 
-pub(crate) mod serve;
+pub mod serve;
 pub(crate) mod state;
 #[cfg(test)]
 mod tests;
-pub(crate) use serve::run_daemon;
-pub(crate) use state::{
-    journal_event, lock_map, DaemonState, PendingApproval, SessionEntry, NEGATIVE_TTL,
-};
+pub use serve::run_daemon;
+pub(crate) use state::{journal_event, lock_map, SessionEntry, NEGATIVE_TTL};
+pub use state::{DaemonState, PendingApproval};

@@ -122,10 +122,10 @@ pub(crate) async fn session_shell(
     // true-remote reattach (events-journal replay) renders the same block
     // the co-located transcript rebuild draws from the message above.
     let input_json = serde_json::json!({"command": command}).to_string();
-    let short = crate::ui::format::short_arg("bash", &input_json);
+    let short = crate::render::format::short_arg("bash", &input_json);
     let summary =
-        crate::ui::format::tool_result_summary("bash", &input_json, &output, success, None);
-    let preview = crate::ui::format::tool_preview("bash", success, None, &output, true);
+        crate::render::format::tool_result_summary("bash", &input_json, &output, success, None);
+    let preview = crate::render::format::tool_preview("bash", success, None, &output, true);
     let (call_seq, result_seq) = state.next_seq_pair(&session_id);
     // Unique id shared by the pair so concurrent runs can't steal each
     // other's half even if the two pairs interleave in the journal. The

@@ -17,7 +17,7 @@ use super::clip_chars;
 /// remote clients whose own process counter is always zero). Pure function
 /// over snapshots so both TUIs share the render.
 pub(crate) fn render_mcp_panel(
-    statuses: &[crate::mcp::ServerStatus],
+    statuses: &[crate::protocol::ServerStatus],
     tools: &[crate::protocol::ToolDefinition],
     truncated: usize,
 ) -> Vec<String> {

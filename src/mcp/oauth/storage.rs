@@ -54,11 +54,8 @@ impl OAuthToken {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn oauth_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(dir).join("dex/mcp");
-    }
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".local/share/dex/mcp"))
+    crate::runtime::logging::data_home()
+        .map(|base| base.join("dex/mcp"))
         .unwrap_or_else(|| PathBuf::from(".dex/mcp"))
 }
 

@@ -28,12 +28,17 @@ pub(crate) fn fg(color: ratatui::style::Color) -> Style {
 /// transcript indent together, which is what keeps them aligned.
 pub(crate) const HORIZONTAL_GUTTER: u16 = 1;
 // `VERTICAL_GUTTER` was removed: no stacked surface carries vertical air
-// between rows any more — transcript, activity strip, composer band and
-// status line all sit flush.
+// between rows any more — the only vertical air is `BLOCK_GAP_ROWS` between
+// transcript blocks, inserted by `rebuild_display_cache`.
 
 /// Left air of the transcript's shared grid, in cells. Derived from the
 /// gutter so tuning the gutter moves both at once.
 pub(crate) const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
+
+/// Blank rows `TranscriptView::render` inserts between any two transcript
+/// blocks (`rebuild_display_cache`); the sole source of inter-block spacing
+/// — blocks carry no baked air of their own.
+pub(crate) const BLOCK_GAP_ROWS: usize = 2;
 
 /// The composer's top/bottom hairline rules: one row each.
 pub(crate) const INPUT_BORDER_ROWS: u16 = 2;

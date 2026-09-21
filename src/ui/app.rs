@@ -32,8 +32,8 @@ pub(crate) const THINKING_TEXT_CAP: usize = 32 * 1024;
 pub(crate) const THINKING_TEXT_SLACK: usize = 4 * 1024;
 
 /// A semantic transcript block. Gaps between blocks are **not** stored;
-/// they are inserted by `TranscriptView::render` (`ui/render.rs`) as a
-/// single blank `Line` between any two blocks. This makes gutter handling
+/// they are inserted by `TranscriptView::render` (`ui/render.rs`) as
+/// `BLOCK_GAP_ROWS` blank `Line`s between any two blocks. This makes gutter handling
 /// canonical and removes the need for ad-hoc `push_transcript_gap` /
 /// `in_assistant_stream` bookkeeping at every call site.
 #[derive(Debug)]
@@ -263,7 +263,7 @@ pub(crate) struct App {
     /// Markdown gap state for the open assistant block. Survives throttled
     /// `flush_assistant` clears of `assistant_pending` so a heading/list at a
     /// window edge keeps its top air; reset on every fresh assistant block.
-    pub(crate) assistant_gap: crate::ui::theme::markdown::GapState,
+    pub(crate) assistant_gap: crate::render::theme::markdown::GapState,
     /// Last wall-clock markdown/thinking flush; gates `append_sink_line`
     /// throttling so the re-parse rate is frame-rate independent.
     pub(crate) stream_last_flush: Instant,
@@ -362,7 +362,7 @@ impl App {
             thinking_open: false,
             plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),
-            assistant_gap: crate::ui::theme::markdown::GapState::new(),
+            assistant_gap: crate::render::theme::markdown::GapState::new(),
             stream_last_flush: Instant::now(),
             wrapped_cache: Vec::new(),
             wrapped_width: 0,
@@ -480,12 +480,12 @@ impl PendingApproval {
         response: tokio::sync::mpsc::Sender<crate::protocol::ApprovalDecision>,
         agent: Option<String>,
     ) -> Self {
-        let has_then_run = crate::ui::format::input_has_then_run(&input);
-        let title = crate::ui::format::approval_title_with_then_run(&name, has_then_run);
-        let summary = crate::ui::format::approval_summary(&name, &input);
-        let details = crate::ui::format::approval_details(&name, &input);
+        let has_then_run = crate::render::format::input_has_then_run(&input);
+        let title = crate::render::format::approval_title_with_then_run(&name, has_then_run);
+        let summary = crate::render::format::approval_summary(&name, &input);
+        let details = crate::render::format::approval_details(&name, &input);
         let (risk_label, risk_color) =
-            crate::ui::format::approval_risk_with_then_run(&name, has_then_run);
+            crate::render::format::approval_risk_with_then_run(&name, has_then_run);
         Self {
             name,
             response,
@@ -508,15 +508,6 @@ pub(crate) struct AgentChip {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) tool: Option<String>,
-}
-
-pub(crate) fn format_tokens(tokens: u64) -> String {
-    match tokens {
-        // A trailing ".0" is wasted width in the status bar: 12.0k -> 12k.
-        t if t >= 1_000_000 => format!("{:.1}M", t as f64 / 1_000_000.0).replace(".0M", "M"),
-        t if t >= 1_000 => format!("{:.1}k", t as f64 / 1_000.0).replace(".0k", "k"),
-        t => t.to_string(),
-    }
 }
 
 pub(crate) struct TerminalCleanup;

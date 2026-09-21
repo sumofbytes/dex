@@ -3,7 +3,7 @@
 use super::super::status::{cell_safe, footer_text, status_pieces, ui_status};
 use super::*;
 use crate::protocol::{ApiProtocol, PermissionMode, Provider};
-use crate::ui::style::{composer_band, content_width as input_content_width};
+use crate::ui::style::{composer_band, content_width as input_content_width, BLOCK_GAP_ROWS};
 use ratatui::backend::TestBackend;
 use std::time::Instant;
 
@@ -275,7 +275,7 @@ fn test_app() -> super::super::App {
         thinking_open: false,
         plan: crate::protocol::Plan::default(),
         assistant_pending: String::new(),
-        assistant_gap: crate::ui::theme::markdown::GapState::new(),
+        assistant_gap: crate::render::theme::markdown::GapState::new(),
         stream_last_flush: std::time::Instant::now(),
         wrapped_cache: Vec::new(),
         wrapped_width: 0,
@@ -795,8 +795,8 @@ fn streamed_flush_merges_into_display_without_losing_blocks() {
     assert!(lines.iter().any(|l| l.contains("more text")));
     assert_eq!(
         lines.iter().filter(|l| l.is_empty()).count(),
-        1,
-        "exactly one gap between the two blocks"
+        BLOCK_GAP_ROWS,
+        "two blank rows between the two blocks"
     );
 }
 
@@ -1512,12 +1512,14 @@ fn assistant_text_is_gapped_after_tool_preview() {
         super::super::TranscriptBlock::Assistant { .. }
     ));
 
-    // Build the same flattened display TranscriptView uses and assert a
-    // single blank Line between the tool and assistant blocks.
+    // Build the same flattened display TranscriptView uses and assert
+    // blank gap rows between the tool and assistant blocks.
     let mut display: Vec<Line<'static>> = Vec::new();
     for (idx, block) in app.transcript.iter().enumerate() {
         if idx > 0 {
-            display.push(Line::default());
+            for _ in 0..BLOCK_GAP_ROWS {
+                display.push(Line::default());
+            }
         }
         for line in block.lines() {
             display.extend(wrap_line_display(line, 100, 0));
@@ -1534,9 +1536,10 @@ fn assistant_text_is_gapped_after_tool_preview() {
         })
         .expect("assistant in display");
     assert!(
-        display[assistant_display_idx - 1].spans.is_empty(),
-        "expected a blank gap line before assistant text in rendered display, got {:?}",
-        display[assistant_display_idx - 1]
+        (0..BLOCK_GAP_ROWS).all(|i| display[assistant_display_idx - BLOCK_GAP_ROWS + i]
+            .spans
+            .is_empty()),
+        "expected blank gap rows before assistant text in rendered display"
     );
 }
 
@@ -1978,10 +1981,11 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     let text_row = row_of("can you check pillar").expect("prompt text rendered");
     let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
     // Composer echo: content row, one air row, the inter-block gap
-    // row, the tool block's own top-air row, then the tool content.
+    // rows (BLOCK_GAP_ROWS) — the tool block adds no air of its own —
+    // then the tool content.
     assert_eq!(
         tool_row,
-        text_row + 4,
+        text_row + 2 + BLOCK_GAP_ROWS as u16,
         "a phantom row from Paragraph::wrap shifts the tool block down"
     );
     // On the shared transcript margin — the prompt row starts one gutter
@@ -2029,20 +2033,20 @@ fn submitted_prompt_is_one_row_above_tool_block() {
         gap.trim().is_empty(),
         "inter-block gap after the prompt must be blank: {gap:?}"
     );
-    // The tool block carries its own top-air row: blank, but on the
-    // terminal background so the content clears the edge.
-    let tool_air: String = (0..area.width)
+    // The tool block adds no baked air: the row right above the tool
+    // content is the universal inter-block gap (blank, terminal bg).
+    let tool_gap: String = (0..area.width)
         .map(|x| buffer.cell((x, tool_row - 1)).unwrap().symbol())
         .collect();
     assert!(
-        tool_air.trim().is_empty(),
-        "tool air above the content must be blank: {tool_air:?}"
+        tool_gap.trim().is_empty(),
+        "inter-block gap above the tool block must be blank: {tool_gap:?}"
     );
     for x in 0..area.width {
         assert_eq!(
             buffer.cell((x, tool_row - 1)).unwrap().bg,
             bg,
-            "tool air row must be the terminal background"
+            "inter-block gap row must be the terminal background"
         );
         assert_eq!(
             buffer.cell((x, text_row + 2)).unwrap().bg,
@@ -2056,7 +2060,7 @@ fn submitted_prompt_is_one_row_above_tool_block() {
 fn blank_runs_render_one_air_row() {
     // Double/triple blank lines collapse to one air row (CommonMark renders
     // a single separator for a blank run).
-    let src = crate::ui::theme::markdown::normalize_gaps(
+    let src = crate::render::theme::markdown::normalize_gaps(
         "",
         "para one\n\n\n\npara two\n\n\n- a\n- b\n\n\ntail",
     );
@@ -2076,7 +2080,7 @@ fn normalized_source_renders_gapped() {
     // The gap rule lives in `core::markdown` (unit-tested there); this
     // pins the render layer end to end: normalized dense source renders
     // the heading, list and table separated instead of wall-to-wall.
-    let src = crate::ui::theme::markdown::normalize_gaps(
+    let src = crate::render::theme::markdown::normalize_gaps(
         "",
         "text\n## Changes\n- a\n| A | B |\n|---|---|\n| 1 | 2 |",
     );
@@ -2211,7 +2215,7 @@ fn read_preview_error_header_stays_dim() {
     // spans[0] is the unstyled transcript indent; the rest stays dim.
     assert!(lines[0].spans[1..]
         .iter()
-        .all(|s| s.style.fg == Some(crate::ui::theme::tool_preview_fg())));
+        .all(|s| s.style.fg == Some(crate::render::theme::tool_preview_fg())));
 }
 
 #[test]
@@ -2240,7 +2244,7 @@ fn search_preview_highlights_hits_and_keeps_gutter_dim() {
         text(&lines[1])
     );
     // Gutter (spans[1] after the transcript indent) stays dim...
-    let dim = crate::ui::theme::tool_preview_fg();
+    let dim = crate::render::theme::tool_preview_fg();
     assert_eq!(lines[1].spans[1].style.fg, Some(dim));
     // ...and the code is tree-sitter highlighted, not one dim blob.
     assert!(lines[1].spans.len() > 2, "{:?}", lines[1]);
@@ -2260,7 +2264,7 @@ fn search_preview_keeps_prose_and_path_lists_dim() {
     ];
     let lines = render_search_preview(&preview);
     assert_eq!(lines.len(), 3);
-    let dim = crate::ui::theme::tool_preview_fg();
+    let dim = crate::render::theme::tool_preview_fg();
     let dim_after_indent = |l: &Line<'static>| l.spans[1..].iter().all(|s| s.style.fg == Some(dim));
     assert!(dim_after_indent(&lines[0]), "{:?}", lines[0]);
     assert!(dim_after_indent(&lines[1]), "{:?}", lines[1]);
@@ -2378,10 +2382,10 @@ fn streamed_table_renders_as_one_block() {
 fn table_rows_stay_tight_across_seams() {
     // A throttle seam between table rows must not insert air: that would
     // split one table into two blocks mid-column.
-    let out = crate::ui::theme::markdown::normalize_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
+    let out = crate::render::theme::markdown::normalize_gaps("| a | b |\n|---|---|\n", "| 1 | 2 |");
     assert_eq!(out, "| 1 | 2 |\n");
     // Same for the delimiter row following a header.
-    let out = crate::ui::theme::markdown::normalize_gaps("| a | b |\n", "|---|---|");
+    let out = crate::render::theme::markdown::normalize_gaps("| a | b |\n", "|---|---|");
     assert_eq!(out, "|---|---|\n");
 }
 
@@ -2588,4 +2592,60 @@ fn submitted_prompt_wraps_like_the_composer() {
             "echoed prompt must wrap identically to the composer at w {w}"
         );
     }
+}
+
+#[test]
+fn rebuild_truncation_counts_full_block_gap() {
+    // A dirty block at idx 2 re-extends from the byte offset of blocks 0-1.
+    // The truncation offset must account for BLOCK_GAP_ROWS rows per leading
+    // gap, not one — otherwise the gap above the dirty block grows by
+    // BLOCK_GAP_ROWS - 1 on every re-extend.
+    let mut app = test_app();
+    super::super::append_sink_line(&mut app, crate::protocol::SinkLine::System("one".into()));
+    super::super::append_sink_line(&mut app, crate::protocol::SinkLine::System("two".into()));
+    super::super::append_sink_line(
+        &mut app,
+        crate::protocol::SinkLine::Assistant("tail".into()),
+    );
+    let backend = TestBackend::new(80, 40);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render");
+    let text = |l: &Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+    let blanks = |app: &App, start: usize| -> usize {
+        app.display_cache[start..]
+            .iter()
+            .take_while(|l| text(l).trim().is_empty())
+            .count()
+    };
+    // Gap between block 1 and block 2, from block 1's end.
+    let block1_end =
+        app.wrapped_cache[0].rows.len() + BLOCK_GAP_ROWS + app.wrapped_cache[1].rows.len();
+    let before = blanks(&app, block1_end);
+    // Touch the tail block (idx 2) so re-extend starts past two gaps.
+    super::super::append_sink_line(
+        &mut app,
+        crate::protocol::SinkLine::Assistant(" more".into()),
+    );
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render");
+    let after = blanks(&app, block1_end);
+    assert_eq!(before, BLOCK_GAP_ROWS, "gap before first flush");
+    assert_eq!(
+        after, BLOCK_GAP_ROWS,
+        "gap must not grow when a later block re-extends"
+    );
+    // Truncation-offset invariant: re-extending from a dirty block at idx 2
+    // must reproduce byte-identical rows, so the offset it truncates to must
+    // count BLOCK_GAP_ROWS rows per leading gap (a 1-per-gap miscount cuts
+    // BLOCK_GAP_ROWS - 1 rows short and duplicates the tail of block 1).
+    let full = app.display_cache.clone();
+    super::super::render::rebuild_display_cache(&mut app, Some(2));
+    assert_eq!(
+        app.display_cache, full,
+        "re-extend from idx 2 drifted - truncation offset miscounts the {}-row gaps",
+        BLOCK_GAP_ROWS
+    );
 }
