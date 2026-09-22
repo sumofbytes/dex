@@ -69,11 +69,6 @@ fn read_limit(args: &Map<String, Value>, default: usize) -> usize {
 }
 
 fn parse_path_list(paths: &[Value]) -> Result<Vec<PathBuf>, ToolError> {
-    if paths.is_empty() {
-        return Err(ToolError::InvalidArgument(
-            "paths must not be empty".to_string(),
-        ));
-    }
     if paths.len() > READ_FANOUT_MAX_FILES {
         return Err(ToolError::InvalidArgument(format!(
             "paths accepts at most {READ_FANOUT_MAX_FILES} files per call (got {}); split into batches",
