@@ -231,7 +231,7 @@ mod tests {
             // Codex backend has no /chat/completions.
             cfg.provider = Provider::OpenAiCodex;
             assert!(!try_responses_fallback(&cfg, "500 boom"));
-            cfg.provider = Provider::Anthropic;
+            cfg.provider = Provider::Generic("zai".to_string());
             // Learned protocol overrides the configured default.
             assert_eq!(effective_api(&cfg), ApiProtocol::Responses);
             crate::llm::learned::remember_memory(

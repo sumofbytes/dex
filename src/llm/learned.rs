@@ -15,7 +15,8 @@ use crate::protocol::ApiProtocol;
 use crate::workspace::{cached_parse, xdg_path, FileCache};
 
 /// Models empirically switched to chat-completions after the responses API
-/// rejected them (e.g. glm-5.3-flash on zen/go 500s on `/responses`, 200s on
+/// rejected them (e.g. glm-5.3-flash on opencode's go endpoint 500s on
+/// `/responses`, 200s on
 /// `/chat/completions`). Keyed by (base_url, model).
 fn probed_apis() -> &'static Mutex<HashMap<(String, String), ApiProtocol>> {
     static MAP: OnceLock<Mutex<HashMap<(String, String), ApiProtocol>>> = OnceLock::new();

@@ -14,6 +14,12 @@ use unicode_width::UnicodeWidthStr;
 #[test]
 fn apply_model_routes_prefixed_selection_to_endpoint() {
     let mut cfg = test_cfg();
+    // A second endpoint for the routing step under test — production
+    // tables carry exactly one entry (the provider's own name).
+    cfg.endpoints.insert(
+        "go".to_string(),
+        "https://opencode.ai/zen/go/v1".to_string(),
+    );
     cfg.model = "gpt-5.6-luna".into();
     // Bare id keeps the current base_url.
     assert_eq!(cfg.apply_model("gpt-5.6-luna", false).unwrap(), None);
@@ -191,13 +197,13 @@ pub(crate) fn test_cfg() -> LlmConfig {
         base_url: "https://opencode.ai/zen/v1".into(),
         model: "m-r".into(),
         available_models: Vec::new(),
-        endpoints: [
-            ("zen".to_string(), "https://opencode.ai/zen/v1".to_string()),
-            (
-                "go".to_string(),
-                "https://opencode.ai/zen/go/v1".to_string(),
-            ),
-        ]
+        // Production shape: a generic exposes exactly one endpoint, named
+        // after the provider (`endpoints_for`) — tests that need a second
+        // one insert it explicitly.
+        endpoints: [(
+            "opencode".to_string(),
+            "https://opencode.ai/zen/v1".to_string(),
+        )]
         .into_iter()
         .collect(),
         api: ApiProtocol::Responses,
@@ -293,6 +299,12 @@ fn apply_model_full_selection_key_wins() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = model_apis_env("m-x=openai-completions,go/m-x=openai-responses");
     let mut cfg = test_cfg();
+    // The `endpoint/id` key needs a second endpoint; production tables
+    // carry one entry (the provider's own name), so insert it explicitly.
+    cfg.endpoints.insert(
+        "go".to_string(),
+        "https://opencode.ai/zen/go/v1".to_string(),
+    );
     cfg.apply_model("go/m-x", false).unwrap();
     assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
     assert_eq!(cfg.model, "m-x");
@@ -303,9 +315,10 @@ fn apply_model_full_selection_key_wins() {
 
 #[test]
 fn bare_unconfigured_catalog_provider_resolves_and_warns() {
-    // A selection naming an unconfigured catalog provider ("zai",
-    // bare or `zai/model`) rides the fallback provider as an opaque
-    // id: resolution succeeds and a one-time hint points at the fix.
+    // A selection naming an unconfigured models.dev provider ("zai",
+    // bare or `zai/model`) still rides the current provider as an
+    // opaque id at runtime: a one-time hint names the fix (at startup
+    // the same selection fails with the deposit pointer instead).
     // Already-served and known native ids are not mistakes.
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
@@ -316,8 +329,8 @@ fn bare_unconfigured_catalog_provider_resolves_and_warns() {
     let _cache = EnvRestore::take(&["XDG_CACHE_HOME"]);
     std::env::set_var("XDG_CACHE_HOME", &dir);
     let mut cfg = test_cfg();
-    // Unconfigured provider key: warns, resolution keeps zen and sends
-    // the name as a model id.
+    // Unconfigured provider key: warns; the bare name still rides the
+    // current endpoint as a model id.
     assert!(warn_provider_like_selection(
         "aaa-reseller",
         "opencode",
@@ -357,11 +370,11 @@ fn bare_unconfigured_catalog_provider_resolves_and_warns() {
 
 #[test]
 fn dex_model_bare_provider_name_resolves_as_model_id() {
-    // DEX_MODEL=opencode/aaa-reseller (an unconfigured catalog provider as
-    // the id) is not a provider switch: it rides the configured provider as
-    // a model id and the config builds — the hint warns instead of
-    // erroring. A prefixless selection carries no provider at all, so it is
-    // a setup error.
+    // `opencode/aaa-reseller` (an unconfigured catalog provider as the id)
+    // is not a provider switch: it rides the configured provider as a model
+    // id and the config builds — the runtime hint warns instead of
+    // erroring. A bare `aaa-reseller` carries no provider at all: the error
+    // names the provider it looks like and the deposit to configure.
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -387,9 +400,9 @@ fn dex_model_bare_provider_name_resolves_as_model_id() {
     std::env::set_var("DEX_CONTEXT_WINDOW", "1000");
     let err = match LlmConfig::from_env(None, Some("aaa-reseller".to_string()), None, &[]) {
         Err(e) => e.to_string(),
-        Ok(_) => panic!("expected the setup guide for a prefixless selection"),
+        Ok(_) => panic!("expected an unrouted-selection error for a bare id"),
     };
-    assert!(err.contains("no model configured"), "{err}");
+    assert!(err.contains("looks like provider 'aaa-reseller'"), "{err}");
     let cfg =
         LlmConfig::from_env(None, Some("opencode/aaa-reseller".to_string()), None, &[]).unwrap();
     assert_eq!(cfg.model, "aaa-reseller");
@@ -473,7 +486,7 @@ fn apply_model_switches_provider_and_sets_base_url_without_env() {
     std::env::set_var("OPENCODE_API_KEY", "test-key");
     std::env::set_var("CODEX_ACCESS_TOKEN", "codex-tok");
     let mut cfg = test_cfg();
-    // starts as OpenCode @ zen
+    // starts on the opencode provider's landing
     assert_eq!(cfg.provider, Provider::Generic("opencode".to_string()));
     // Switch to codex via provider-qualified model — no env base_url required
     cfg.apply_model("openai-codex/gpt-5.6-luna", false).unwrap();
@@ -494,8 +507,14 @@ fn apply_model_switches_provider_and_sets_base_url_without_env() {
     assert_eq!(cfg.provider, Provider::Generic("opencode-go".to_string()));
     assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
     assert_eq!(cfg.model, "kimi-k2");
-    // Bare endpoint still works without provider prefix
+    // A bare endpoint prefix still routes without a provider prefix (the
+    // second endpoint is inserted explicitly: production tables carry one
+    // entry, the provider's own name).
     cfg = test_cfg();
+    cfg.endpoints.insert(
+        "go".to_string(),
+        "https://opencode.ai/zen/go/v1".to_string(),
+    );
     cfg.apply_model("go/kimi-k2", false).unwrap();
     assert_eq!(cfg.base_url, "https://opencode.ai/zen/go/v1");
     assert_eq!(cfg.model, "kimi-k2");
@@ -525,7 +544,6 @@ fn endpoints_always_available_for_opencode_without_env() {
     write_cost_catalog(&dir);
     let _g = EnvRestore::take(&[
         "OPENCODE_API_KEY",
-        "DEX_PROVIDER",
         "DEX_MODELS",
         "DEX_CONFIG",
         "DEX_MODEL",
@@ -539,7 +557,6 @@ fn endpoints_always_available_for_opencode_without_env() {
     .unwrap();
     std::env::set_var("OPENCODE_API_KEY", "test-key2");
     std::env::remove_var("DEX_MODELS");
-    std::env::remove_var("DEX_PROVIDER");
     std::env::remove_var("DEX_MODEL");
     std::env::set_var("DEX_CONTEXT_WINDOW", "1000");
     std::env::set_var("XDG_CACHE_HOME", &dir);
@@ -599,7 +616,6 @@ fn custom_headers_layer_file_env_cli() {
         .unwrap_or_else(|e| e.into_inner());
     let _g = EnvRestore::take(&[
         "OPENCODE_API_KEY",
-        "DEX_PROVIDER",
         "DEX_MODELS",
         "DEX_CONFIG",
         "DEX_HEADERS",
@@ -699,6 +715,72 @@ fn custom_headers_config_text_and_list_shapes() {
     let out = load_config_headers(&file);
     assert_eq!(out.get("X-N").map(String::as_str), Some("42"));
     assert!(!out.contains_key("X-E"));
+}
+
+#[test]
+fn opencode_session_headers_gated_and_explicit_wins() {
+    use super::apply_opencode_session_headers;
+    // The opencode provider name + session id → both headers.
+    let mut cfg = test_cfg();
+    apply_opencode_session_headers(&mut cfg, "sess-1");
+    assert_eq!(
+        cfg.extra_headers
+            .get("x-opencode-session")
+            .map(String::as_str),
+        Some("sess-1")
+    );
+    assert_eq!(
+        cfg.extra_headers
+            .get("x-opencode-client")
+            .map(String::as_str),
+        Some("dex")
+    );
+    // Generic provider on another host → nothing.
+    let mut cfg = test_cfg();
+    cfg.provider = Provider::Generic("other".to_string());
+    cfg.base_url = "https://other.example/v1".into();
+    apply_opencode_session_headers(&mut cfg, "sess-1");
+    assert!(cfg.extra_headers.is_empty());
+    // Generic provider pointed at opencode.ai → headers (host fallback).
+    let mut cfg = test_cfg();
+    cfg.provider = Provider::Generic("proxy".to_string());
+    apply_opencode_session_headers(&mut cfg, "sess-1");
+    assert_eq!(cfg.extra_headers.len(), 2);
+    // Empty session id → nothing, even for opencode.
+    let mut cfg = test_cfg();
+    apply_opencode_session_headers(&mut cfg, "  ");
+    assert!(cfg.extra_headers.is_empty());
+    // Explicit user header wins (any casing); client header still fills.
+    let mut cfg = test_cfg();
+    cfg.extra_headers
+        .insert("X-Opencode-Session".to_string(), "mine".to_string());
+    apply_opencode_session_headers(&mut cfg, "sess-1");
+    assert_eq!(
+        cfg.extra_headers
+            .get("X-Opencode-Session")
+            .map(String::as_str),
+        Some("mine")
+    );
+    assert_eq!(
+        cfg.extra_headers
+            .get("x-opencode-client")
+            .map(String::as_str),
+        Some("dex")
+    );
+    // A FILE-layer pin must suppress the auto-fill too: `extra_headers`
+    // merges after both file layers, so injecting here would silently
+    // override the user's config-file header.
+    let mut cfg = test_cfg();
+    cfg.provider_headers
+        .insert("x-opencode-session".to_string(), "file".to_string());
+    apply_opencode_session_headers(&mut cfg, "sess-1");
+    assert!(!cfg.extra_headers.contains_key("x-opencode-session"));
+    assert_eq!(
+        cfg.extra_headers
+            .get("x-opencode-client")
+            .map(String::as_str),
+        Some("dex")
+    );
 }
 
 #[test]
@@ -838,7 +920,6 @@ fn builtin_default_missing_key_suggests_setup() {
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
         "DEX_MODEL",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "ANTHROPIC_API_KEY",
         "DEX_MODEL_APIS",
@@ -853,12 +934,7 @@ fn builtin_default_missing_key_suggests_setup() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     // Point at a path that does not exist: no file `model:`.
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-    for key in [
-        "DEX_MODEL",
-        "DEX_PROVIDER",
-        "OPENCODE_API_KEY",
-        "ANTHROPIC_API_KEY",
-    ] {
+    for key in ["DEX_MODEL", "OPENCODE_API_KEY", "ANTHROPIC_API_KEY"] {
         std::env::remove_var(key);
     }
     let err = match LlmConfig::from_env(None, None, None, &[]) {
@@ -890,12 +966,7 @@ fn explicit_base_url_without_selection_routes_to_custom_provider() {
     std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-    for key in [
-        "DEX_MODEL",
-        "DEX_PROVIDER",
-        "OPENCODE_API_KEY",
-        "ANTHROPIC_API_KEY",
-    ] {
+    for key in ["DEX_MODEL", "OPENCODE_API_KEY", "ANTHROPIC_API_KEY"] {
         std::env::remove_var(key);
     }
     let err = match LlmConfig::from_env(
@@ -937,19 +1008,14 @@ fn doctor_names_custom_provider_for_base_url_only_setup() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_PROVIDER",
-        "DEX_MODEL",
-        "OPENCODE_API_KEY",
-    ]);
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
     let dir = std::env::temp_dir().join(format!("dex-doc-custom-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("dex")).unwrap();
     std::fs::write(dir.join("dex/models.dev.json"), "{}").unwrap();
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
-    for key in ["DEX_PROVIDER", "OPENCODE_API_KEY", "DEX_MODEL"] {
+    for key in ["OPENCODE_API_KEY", "DEX_MODEL"] {
         std::env::remove_var(key);
     }
     let out = doctor(
@@ -968,16 +1034,38 @@ fn doctor_names_custom_provider_for_base_url_only_setup() {
 #[test]
 fn setup_guide_lists_every_builtin_first() {
     // The guide names every builtin provider before the generic shapes:
-    // anthropic, the opencode gateway, a custom gateway, then codex.
+    // anthropic, a generic openai-compatible gateway, a custom gateway,
+    // then codex.
     let guide = super::setup_guide_error();
     let anthropic = guide.find("anthropic: model:").unwrap();
-    let opencode = guide.find("openai-compatible gateway: model:").unwrap();
+    let gateway = guide.find("openai-compatible gateway: model:").unwrap();
     let custom = guide.find("custom gateway (Bearer").unwrap();
     let codex = guide.find("codex: model:").unwrap();
     assert!(
-        anthropic < opencode && opencode < custom && custom < codex,
+        anthropic < gateway && gateway < custom && custom < codex,
         "{guide}"
     );
+}
+
+#[test]
+fn unrouted_selection_error_names_the_fix() {
+    let known: BTreeSet<String> = ["opencode".to_string(), "opencode-go".to_string()]
+        .into_iter()
+        .collect();
+    // Retired endpoint prefixes point at the replacement provider.
+    let err = super::unrouted_selection_error("zen/gpt-5", &known);
+    assert!(err.contains("retired 'zen' endpoint prefix"), "{err}");
+    assert!(err.contains("'model: opencode/<model-id>'"), "{err}");
+    let err = super::unrouted_selection_error("go/kimi-k2", &known);
+    assert!(err.contains("'model: opencode-go/<model-id>'"), "{err}");
+    // A bare id names the selection, the shape, the builtins, what is
+    // already configured, and the config path — never "no model
+    // configured".
+    let err = super::unrouted_selection_error("gpt-5", &known);
+    assert!(err.contains("selection 'gpt-5' names no provider"), "{err}");
+    assert!(!err.contains("no model configured"), "{err}");
+    assert!(err.contains("anthropic, openai-codex"), "{err}");
+    assert!(err.contains("configured: opencode, opencode-go"), "{err}");
 }
 
 #[test]
@@ -989,7 +1077,6 @@ fn opencode_key_resolves_entry_then_own_env_var() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1064,7 +1151,6 @@ fn anthropic_key_resolves_cacheless_via_pinned_env_var() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "ANTHROPIC_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1135,7 +1221,6 @@ fn config_file_defaults_apply() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_CONTEXT_WINDOW",
@@ -1237,7 +1322,7 @@ fn bare_model_auto_routes_to_serving_endpoint() {
     // Back to a zen-only model.
     assert_eq!(
         cfg.apply_model("m-zen-only", false).unwrap().as_deref(),
-        Some("zen")
+        Some("opencode")
     );
     assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
     // A model the current endpoint serves never moves — dual-served ids
@@ -1264,7 +1349,6 @@ fn explicit_base_url_wins_over_catalog_routing() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1282,12 +1366,7 @@ fn explicit_base_url_wins_over_catalog_routing() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    for key in [
-        "DEX_PROVIDER",
-        "DEX_MODEL_APIS",
-        "DEX_MODELS",
-        "DEX_CONTEXT_WINDOW",
-    ] {
+    for key in ["DEX_MODEL_APIS", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
         std::env::remove_var(key);
     }
     // `--base-url` pin with a `--model` override.
@@ -1352,7 +1431,6 @@ fn generic_provider_resolves_endpoint_key_and_routing() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1367,7 +1445,6 @@ fn generic_provider_resolves_endpoint_key_and_routing() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     for key in [
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1418,7 +1495,6 @@ fn generic_provider_switch_and_completion_ids() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1432,7 +1508,6 @@ fn generic_provider_switch_and_completion_ids() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    std::env::remove_var("DEX_PROVIDER");
     // Completion list offers the configured provider's qualified ids.
     let ids = load_dex_models_cache().unwrap();
     assert!(ids.contains(&"glm-x".to_string()));
@@ -1493,7 +1568,6 @@ fn prefixed_selection_restores_protocol_on_restart() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1533,7 +1607,6 @@ fn persisted_selection_reloads_stripped() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1567,12 +1640,7 @@ fn persisted_selection_reloads_stripped() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    for key in [
-        "DEX_PROVIDER",
-        "DEX_MODEL_APIS",
-        "DEX_MODELS",
-        "DEX_CONTEXT_WINDOW",
-    ] {
+    for key in ["DEX_MODEL_APIS", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
         std::env::remove_var(key);
     }
     let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
@@ -1606,7 +1674,6 @@ fn pinned_base_url_still_resolves_per_model_protocol() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1626,7 +1693,7 @@ fn pinned_base_url_still_resolves_per_model_protocol() {
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    for key in ["DEX_PROVIDER", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
+    for key in ["DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
         std::env::remove_var(key);
     }
     // Per-model table entry wins over the responses default.
@@ -1708,7 +1775,6 @@ fn catalog_env_vars_tries_every_documented_name() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1740,7 +1806,6 @@ fn catalog_env_vars_tries_every_documented_name() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     for key in [
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1778,7 +1843,6 @@ fn legacy_provider_keys_ignored_and_dropped() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1798,12 +1862,7 @@ fn legacy_provider_keys_ignored_and_dropped() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", &path);
     std::env::remove_var("OPENCODE_API_KEY");
-    for key in [
-        "DEX_PROVIDER",
-        "DEX_MODEL_APIS",
-        "DEX_MODELS",
-        "DEX_CONTEXT_WINDOW",
-    ] {
+    for key in ["DEX_MODEL_APIS", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
         std::env::remove_var(key);
     }
     let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
@@ -1849,7 +1908,6 @@ fn api_pin_bakes_into_config() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1862,12 +1920,7 @@ fn api_pin_bakes_into_config() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    for key in [
-        "DEX_PROVIDER",
-        "DEX_MODEL_APIS",
-        "DEX_MODELS",
-        "DEX_CONTEXT_WINDOW",
-    ] {
+    for key in ["DEX_MODEL_APIS", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
         std::env::remove_var(key);
     }
     std::fs::write(
@@ -1915,7 +1968,6 @@ fn resolved_provider_bundles_entry_overrides() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -1933,12 +1985,7 @@ fn resolved_provider_bundles_entry_overrides() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    for key in [
-        "DEX_PROVIDER",
-        "DEX_MODEL_APIS",
-        "DEX_MODELS",
-        "DEX_CONTEXT_WINDOW",
-    ] {
+    for key in ["DEX_MODEL_APIS", "DEX_MODELS", "DEX_CONTEXT_WINDOW"] {
         std::env::remove_var(key);
     }
     let mut cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
@@ -2132,7 +2179,6 @@ fn thinking_effort_reads_file_key_under_env() {
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
@@ -2153,7 +2199,6 @@ fn thinking_effort_reads_file_key_under_env() {
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
     for key in [
-        "DEX_PROVIDER",
         "DEX_MODEL_APIS",
         "DEX_MODELS",
         "DEX_CONTEXT_WINDOW",
@@ -2186,7 +2231,6 @@ fn selection_prefix_and_dex_model_pick_provider_and_model() {
     std::env::set_var("XDG_CACHE_HOME", &dir); // hermetic: no real catalog
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "DEX_MODEL",
         "OPENCODE_API_KEY",
         "DEX_MODEL_APIS",
@@ -2237,12 +2281,7 @@ fn doctor_reports_selection_and_origins() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_PROVIDER",
-        "DEX_MODEL",
-        "OPENCODE_API_KEY",
-    ]);
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
     std::env::set_var("OPENCODE_API_KEY", "test-key");
     // Point at a missing file so the host config can't color the output.
     std::env::set_var(
@@ -2252,7 +2291,7 @@ fn doctor_reports_selection_and_origins() {
     let out = doctor(None, None, None, &[], None);
     assert!(out.contains("provider"), "{out}");
     assert!(out.contains("model"), "{out}");
-    assert!(out.contains("OPENCODE_API_KEY"), "{out}");
+    assert!(out.contains("key env:"), "{out}");
     assert!(out.contains("built-in default"), "{out}");
     assert!(out.contains("resolve"), "{out}");
 }
@@ -2296,12 +2335,7 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_PROVIDER",
-        "DEX_MODEL",
-        "OPENCODE_API_KEY",
-    ]);
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
     // Missing file, so the config row prints the path + a source note.
     std::env::set_var(
         "DEX_CONFIG",
@@ -2325,7 +2359,7 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
         let origin = lines.next().expect("origin line");
         assert_eq!(
             origin.find("missing or invalid"),
-            Some(23 + 46),
+            Some(24 + 46),
             "origin hangs at the origin column: {origin:?}"
         );
         return;
@@ -2334,18 +2368,13 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
 }
 
 /// Padding counts display columns: a CJK path is 31 chars but only 45
-/// columns wide, so the origin still lands on column 69.
+/// columns wide, so the origin still lands on column 70.
 #[test]
 fn doctor_pads_by_display_width() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_PROVIDER",
-        "DEX_MODEL",
-        "OPENCODE_API_KEY",
-    ]);
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
     // "/tmp/" (5 cols) + 14 CJK chars (28 cols) + "/config.yaml" (12 cols) = 45.
     std::env::set_var(
         "DEX_CONFIG",
@@ -2361,8 +2390,8 @@ fn doctor_pads_by_display_width() {
         .expect("origin inline on the value line");
     assert_eq!(
         UnicodeWidthStr::width(&line[..at]),
-        23 + 46,
-        "origin starts at display column 69: {line:?}"
+        24 + 46,
+        "origin starts at display column 70: {line:?}"
     );
 }
 
@@ -2381,7 +2410,6 @@ fn doctor_output_is_byte_stable() {
         "XDG_CACHE_HOME",
         "XDG_DATA_HOME",
         "XDG_CONFIG_HOME",
-        "DEX_PROVIDER",
         "DEX_MODEL",
         "DEX_MODELS",
         "DEX_CONTEXT_WINDOW",
@@ -2425,35 +2453,35 @@ fn doctor_output_is_byte_stable() {
             concat!(
                 concat!("dex ", env!("CARGO_PKG_VERSION"), "\n"),
                 "\n",
-                "config                 /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
-                "catalog                /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
-                "                                                                     missing — run `dex update --models`\n",
+                "config                  /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
+                "catalog                 /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
+                "                                                                      missing — run `dex update --models`\n",
                 "\n",
-                "provider               (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "provider                (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
             ),
             concat!(
-                "compaction             deterministic                                 built-in default\n",
-                "jev scorer             heuristic scorer                              no TYPESAFE_API_KEY\n",
-                "thinking               (unset)                                       model default\n",
-                "permission             trusted                                       built-in default\n",
-                "agent wake             on                                            built-in default\n",
-                "routing                off                                           built-in default\n",
-                "routing fast           (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing fast effort    (unset — keeps thinking_effort:)              unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)\n",
-                "routing balanced       (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing balanced effort(unset — keeps thinking_effort:)              unset (keeps thinking_effort:)\n",
-                "routing powerful       (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing powerful effort(unset — keeps thinking_effort:)              unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)\n",
-                "headers                0                                             none\n",
-                "system prompt          default                                       built-in default\n",
-                "extensions             none                                          cwd/.dex, XDG config dirs\n",
+                "compaction              deterministic                                 built-in default\n",
+                "jev scorer              heuristic scorer                              no TYPESAFE_API_KEY\n",
+                "thinking                (unset)                                       model default\n",
+                "permission              trusted                                       built-in default\n",
+                "agent wake              on                                            built-in default\n",
+                "routing                 off                                           built-in default\n",
+                "routing fast            (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing fast effort     (unset — keeps thinking_effort:)              unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)\n",
+                "routing balanced        (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing balanced effort (unset — keeps thinking_effort:)              unset (keeps thinking_effort:)\n",
+                "routing powerful        (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing powerful effort (unset — keeps thinking_effort:)              unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)\n",
+                "headers                 0                                             none\n",
+                "system prompt           default                                       built-in default\n",
+                "extensions              none                                          cwd/.dex, XDG config dirs\n",
                 "\n",
-                "resolve                ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
-                "                                                                       anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
-                "                                                                       openai-compatible gateway: model: opencode/<model-id> + providers.opencode: {base_url: https://opencode.ai/zen/v1, api_key} (key env: OPENCODE_API_KEY)\n",
-                "                                                                       custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
-                "                                                                       codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
-                "                                                                     config: /tmp/dex-doctor-snapshot/missing.yaml\n",
+                "resolve                 ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
+                "                                                                        anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
+                "                                                                        openai-compatible gateway: model: <gateway>/<model-id> + providers.<gateway>: {base_url: <url>, api_key} (key env: from the catalog entry)\n",
+                "                                                                        custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
+                "                                                                        codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
+                "                                                                      config: /tmp/dex-doctor-snapshot/missing.yaml\n",
             )
         );
     assert_eq!(out, expected, "doctor output drifted");
@@ -3124,7 +3152,6 @@ fn extension_model_snapshot_resolves_selection_and_endpoint() {
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
         "DEX_MODEL",
-        "DEX_PROVIDER",
         "DEX_MODEL_APIS",
         "XDG_CACHE_HOME",
     ]);
@@ -3134,7 +3161,7 @@ fn extension_model_snapshot_resolves_selection_and_endpoint() {
     write_extmodel_config(&dir);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-    for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_MODEL_APIS"] {
+    for key in ["DEX_MODEL", "DEX_MODEL_APIS"] {
         std::env::remove_var(key);
     }
     let snap = super::extension_model_snapshot().unwrap();
@@ -3158,16 +3185,14 @@ fn extension_model_snapshot_errors_without_selection() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "DEX_PROVIDER", "XDG_CACHE_HOME"]);
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "XDG_CACHE_HOME"]);
     let dir = std::env::temp_dir().join(format!("dex-extmodel-no-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.yaml"), "context_window: 1000\n").unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-    for key in ["DEX_MODEL", "DEX_PROVIDER"] {
-        std::env::remove_var(key);
-    }
+    std::env::remove_var("DEX_MODEL");
     let err = super::extension_model_snapshot().unwrap_err();
     assert!(err.contains("no model configured"), "got: {err}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -3178,13 +3203,7 @@ fn extension_model_auth_merges_headers_and_drops_authorization() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvRestore::take(&[
-        "DEX_CONFIG",
-        "DEX_MODEL",
-        "DEX_PROVIDER",
-        "DEX_HEADERS",
-        "XDG_CACHE_HOME",
-    ]);
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "DEX_HEADERS", "XDG_CACHE_HOME"]);
     let dir = std::env::temp_dir().join(format!("dex-extmodel-h-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -3195,7 +3214,7 @@ fn extension_model_auth_merges_headers_and_drops_authorization() {
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-    for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_HEADERS"] {
+    for key in ["DEX_MODEL", "DEX_HEADERS"] {
         std::env::remove_var(key);
     }
     let auth = super::extension_model_auth().unwrap();
@@ -3239,7 +3258,6 @@ fn extension_provider_auth_resolves_explicit_provider() {
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
         "DEX_MODEL",
-        "DEX_PROVIDER",
         "DEX_MODEL_APIS",
         "XDG_CACHE_HOME",
     ]);
@@ -3253,7 +3271,7 @@ fn extension_provider_auth_resolves_explicit_provider() {
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-    for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_MODEL_APIS"] {
+    for key in ["DEX_MODEL", "DEX_MODEL_APIS"] {
         std::env::remove_var(key);
     }
     // A configured provider with its own endpoint, key and wire pin.
@@ -3281,7 +3299,6 @@ fn extension_configured_providers_lists_resolvable_endpoints() {
     let _guard = EnvRestore::take(&[
         "DEX_CONFIG",
         "DEX_MODEL",
-        "DEX_PROVIDER",
         "DEX_MODEL_APIS",
         "XDG_CACHE_HOME",
     ]);
@@ -3295,7 +3312,7 @@ fn extension_configured_providers_lists_resolvable_endpoints() {
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-    for key in ["DEX_MODEL", "DEX_PROVIDER", "DEX_MODEL_APIS"] {
+    for key in ["DEX_MODEL", "DEX_MODEL_APIS"] {
         std::env::remove_var(key);
     }
     let providers: Vec<String> = super::extension_configured_providers()

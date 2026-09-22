@@ -176,8 +176,9 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     let mut config = config_result?;
     // Complexity router: an explicit `--model` always wins; otherwise the
     // classified tier resolves the `(model, thinking_effort)` tuple through
-    // routing.balanced:_ → top-level model: (model) and routing
-    // .balanced_effort: → keep thinking_effort: (effort), rebuilding once
+    // routing.balanced: → top-level model: (model) and
+    // routing.balanced_effort: → keep thinking_effort: (effort), rebuilding
+    // once
     // with the tier's model. The first build above is still needed on the
     // routed path: it validates the top-level selection in parallel with
     // the session load (and gates session creation), while routing needs
@@ -252,6 +253,11 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         let _ = session.append_message(&user);
     }
     messages.push(user);
+    // The opencode gateway rejects requests without `x-opencode-session`;
+    // explicit `--header` flags already baked into `extra_headers` still win.
+    if let Some(session) = session.as_ref() {
+        crate::llm::config::apply_opencode_session_headers(&mut config, session.id());
+    }
     let mut state = ToolState::load();
     let console = crate::runtime::console::Console::none();
     let result = crate::runtime::http::block_on(process_turn(AgentRuntime {

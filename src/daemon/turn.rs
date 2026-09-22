@@ -379,7 +379,7 @@ pub(crate) async fn run_turn_inner(
     };
     // Complexity router: an explicit per-request model always wins;
     // otherwise the classified tier resolves the `(model, thinking_effort)`
-    // tuple through routing.balanced:_ → top-level model: (model) and
+    // tuple through routing.balanced: → top-level model: (model) and
     // routing.balanced_effort: → keep thinking_effort: (effort).
     let explicit_model = req.model.clone().filter(|v| !v.is_empty());
     let routed = if explicit_model.is_none() {
@@ -420,6 +420,10 @@ pub(crate) async fn run_turn_inner(
         config.thinking_effort = Some(effort);
     }
     apply_thinking_override(&mut config, req.thinking_effort.as_deref());
+    // The opencode gateway rejects requests without `x-opencode-session`
+    // (`MissingSessionID`); auto-fill from the dex session id. Explicit
+    // per-request headers below still win on collision.
+    crate::llm::config::apply_opencode_session_headers(&mut config, session_id);
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
     // `insert_extra_header` drops empties + `authorization` and collapses

@@ -9,8 +9,8 @@ use std::str::FromStr;
 
 use std::env;
 
-/// One `DEX_FOO=…` integer knob
-/// unset or unparseable. Single-sources the
+/// One `DEX_FOO=…` integer knob: env value parsed, `default` when unset or
+/// unparseable. Single-sources the
 /// `env::var(..).ok().and_then(|v| v.parse().ok()).unwrap_or(..)` ladder
 /// repeated through `from_env`.
 pub(crate) fn env_parse<T: FromStr>(name: &str, default: T) -> T {

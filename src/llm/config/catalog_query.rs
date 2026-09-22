@@ -35,40 +35,58 @@ fn catalog_has_model(model: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// A selection naming an unconfigured models.dev provider — bare (`zai`)
-/// or qualified (`zai/glm-…`) — rides the fallback provider as an opaque
-/// id and dies later with an API error. Say so, once, with the fix.
-/// Returns whether it warned.
-pub(crate) fn warn_provider_like_selection(
+/// A selection shaped like a models.dev provider name rather than a model
+/// id — bare (`zai`) or qualified (`zai/glm-…`): `Some((provider, key env))`
+/// naming the deposit to configure. Served ids and unknown prefixes are not
+/// mistakes. Shared by [`warn_provider_like_selection`] (the id still rides
+/// a provider) and the setup error for a selection that resolves no
+/// provider at all (nothing is being sent).
+pub(crate) fn provider_like_candidate(
     selection: &str,
-    provider_name: &str,
     served: &[String],
-) -> bool {
-    // Ids the gateway serves and the resolved provider itself aren't mistakes.
-    if selection == provider_name || served.iter().any(|m| m.as_str() == selection) {
-        return false;
+) -> Option<(String, String)> {
+    // Ids the gateway serves aren't mistakes.
+    if served.iter().any(|m| m.as_str() == selection) {
+        return None;
     }
     // For `prefix/rest` the mistake candidate is the prefix; the full id
     // may still be legit (provider-native model ids like
     // `moonshotai/kimi-k2.6`, endpoint routes like `go/…`).
     let (candidate, qualified) = match selection.split_once('/') {
         Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => (prefix, true),
-        Some(_) => return false,
+        Some(_) => return None,
         None => (selection, false),
     };
-    if candidate == provider_name {
-        return false;
-    }
-    if catalog_api(candidate).is_none() {
-        return false;
-    }
+    catalog_api(candidate)?;
     if qualified && catalog_has_model(selection) {
-        return false;
+        return None;
     }
     let key_env = catalog_env_vars(candidate)
         .first()
         .cloned()
         .unwrap_or_else(|| "<key>".to_string());
+    Some((candidate.to_ascii_lowercase(), key_env))
+}
+
+/// A selection naming an unconfigured models.dev provider — bare (`zai`)
+/// or qualified (`zai/glm-…`) — is sent to the resolved provider as an
+/// opaque id and dies later with an API error. Say so, once, with the fix.
+/// Returns whether it warned.
+pub(crate) fn warn_provider_like_selection(
+    selection: &str,
+    provider_name: &str,
+    served: &[String],
+) -> bool {
+    // The resolved provider itself isn't a mistake.
+    if selection == provider_name {
+        return false;
+    }
+    let Some((candidate, key_env)) = provider_like_candidate(selection, served) else {
+        return false;
+    };
+    if candidate == provider_name {
+        return false;
+    }
     warn_once(
         &format!("hint:provider:{candidate}"),
         &format!(

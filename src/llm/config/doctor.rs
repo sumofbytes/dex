@@ -44,7 +44,7 @@ use std::env;
 /// wraps: the value prints in full on its own line and the origin hangs at the
 /// origin column, so long paths never run into the origin text.
 pub(crate) fn row(out: &mut String, key: &str, value: &str, source: &str) {
-    const KEY_COLS: usize = 23;
+    const KEY_COLS: usize = 24;
     const VALUE_COLS: usize = 46;
     // A key wider than its column would collapse the padding and shift every
     // origin column: fail in debug builds instead.

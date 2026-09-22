@@ -1555,7 +1555,7 @@ async fn net_fetch_allows_configured_provider_endpoints() {
         .lock()
         .await;
     let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
-    let _env = EnvRestore::take(&["DEX_CONFIG", "XDG_CACHE_HOME", "DEX_MODEL", "DEX_PROVIDER"]);
+    let _env = EnvRestore::take(&["DEX_CONFIG", "XDG_CACHE_HOME", "DEX_MODEL"]);
     let root = std::env::temp_dir().join(format!("dex-ext-netprov-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -1566,9 +1566,7 @@ async fn net_fetch_allows_configured_provider_endpoints() {
     .unwrap();
     std::env::set_var("DEX_CONFIG", root.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
-    for key in ["DEX_MODEL", "DEX_PROVIDER"] {
-        std::env::remove_var(key);
-    }
+    std::env::remove_var("DEX_MODEL");
     let mgr = global_manager();
     mgr.reset_for_tests().await;
     *LAST_MODEL.lock().expect("served model lock") =
@@ -1875,7 +1873,6 @@ async fn web_example_falls_back_to_override_model() {
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
         "DEX_MODEL",
-        "DEX_PROVIDER",
     ]);
     let root = std::env::temp_dir().join(format!("dex-ext-webfall-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1887,9 +1884,7 @@ async fn web_example_falls_back_to_override_model() {
     // Loopback must not ride a proxy, wherever the suite runs.
     let _proxy = EnvRestore::take(&["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]);
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-    for key in ["DEX_MODEL", "DEX_PROVIDER"] {
-        std::env::remove_var(key);
-    }
+    std::env::remove_var("DEX_MODEL");
 
     // 1. A codex-served model rides the OpenAI wire but serves no
     //    search tool: the extension must show nothing, not a tool

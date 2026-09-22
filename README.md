@@ -127,11 +127,11 @@ gateway — is an ordinary `providers:` entry resolved through the models.dev
 catalog.
 
 `model:` is the only selection knob and names provider _and_ model:
-`<provider>/<model>` (a bare provider name just switches provider). Write-back
-keeps that form: a `/model` or
-`/provider` pick updates `model:` in the file, so the switch becomes the default
-for later runs. Session state still re-applies the exact provider/model on
-`/resume`.
+`<provider>/<model>` — the stored key always carries a model id (an
+in-session `/model anthropic` may switch just the provider; the key stays
+qualified). Write-back keeps that form: a `/model` or `/provider` pick updates
+`model:` in the file, so the switch becomes the default for later runs. Session
+state still re-applies the exact provider/model on `/resume`.
 
 A minimal `~/.config/dex/config.yaml`:
 
@@ -143,11 +143,12 @@ providers:
 model: opencode/gpt-5.6-luna # provider / model
 ```
 
-A file naming only a provider also works (`model: anthropic` plus
-`ANTHROPIC_API_KEY`) — but a bare provider pick names no model, so export the
-provider's key and pass an id: `DEX_MODEL=anthropic/<model-id> dex`. The daemon
-bootstraps the models.dev catalog in the background, so a fresh install needs no
-manual `dex update --models`.
+The stored selection always carries a model id: a provider-only selection
+(`model: anthropic`) fails with a "names a provider but no model" error —
+export the provider's key and pass an id instead:
+`DEX_MODEL=anthropic/<model-id> dex`. The daemon bootstraps the models.dev
+catalog in the background, so a fresh install needs no manual
+`dex update --models`.
 
 Run `dex update --models` once to cache the models.dev catalog. After that a
 bare `/model <id>` stays on the current provider (`provider/<id>` switches to

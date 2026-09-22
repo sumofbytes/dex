@@ -424,7 +424,6 @@ fn client_end_to_end_hits_every_endpoint() {
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
         "DEX_CONFIG",
-        "DEX_PROVIDER",
         "OPENCODE_API_KEY",
         "DEX_PERMISSION",
         "DEX_VERIFY",
@@ -442,11 +441,10 @@ fn client_end_to_end_hits_every_endpoint() {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-    std::env::set_var("DEX_PROVIDER", "opencode");
     std::env::set_var("OPENCODE_API_KEY", "test-key");
     std::env::set_var("DEX_PERMISSION", "ask-writes");
     std::env::set_var("DEX_VERIFY", "false");

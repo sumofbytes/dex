@@ -46,10 +46,11 @@ pub(crate) struct ModelHint {
 /// Provider + cost per picker row, in one catalog-index pass (the popup
 /// runs per keystroke over thousands of ids — one stat + one map walk,
 /// never one lookup per row). A qualified `prefix/tail` keeps its prefix
-/// as the provider and prices that provider's entry (cheapest fallback);
-/// a bare id attributes the cheapest priced entry (`from` semantics: the
-/// row routes at pick time, the cheapest is the floor). `None` fields when
-/// the catalog has no entry for the id.
+/// as the provider and prices only that provider's own entry (a different
+/// provider's cheaper rate here would label the row `p` and bill it at
+/// `q`'s price); a bare id attributes the cheapest priced entry (`from`
+/// semantics: the row routes at pick time, the cheapest is the floor).
+/// `None` fields when the catalog has no entry for the id.
 pub(crate) fn model_hints_for(selections: &[String]) -> Vec<ModelHint> {
     with_catalog_index(|index| {
         selections
@@ -78,20 +79,21 @@ pub(crate) fn model_hints_for(selections: &[String]) -> Vec<ModelHint> {
                 let named = |e: &IndexedModel| (!e.provider.is_empty()).then(|| e.provider.clone());
                 match prefix {
                     Some(p) => {
+                        // Price only an entry of the NAMED provider;
+                        // catalog-key aliases ride the builtin's key list
+                        // (`openai-codex` → `codex`/`openai`), an unknown
+                        // prefix has no honestly attributable price.
+                        let keys: Vec<String> =
+                            Provider::parse_known(p, &std::collections::BTreeSet::new())
+                                .map(|pr| pr.catalog_keys())
+                                .unwrap_or_else(|| vec![p.to_ascii_lowercase()]);
                         let pick = entries
                             .iter()
                             .filter(priced)
-                            .find(|e| e.provider.eq_ignore_ascii_case(p))
-                            .or_else(|| entries.iter().filter(priced).min_by(cheapest));
-                        match pick {
-                            Some(e) => ModelHint {
-                                provider: Some(p.to_string()),
-                                cost: e.cost.as_ref().map(format_cost_label),
-                            },
-                            None => ModelHint {
-                                provider: Some(p.to_string()),
-                                cost: None,
-                            },
+                            .find(|e| keys.iter().any(|k| e.provider.eq_ignore_ascii_case(k)));
+                        ModelHint {
+                            provider: Some(p.to_string()),
+                            cost: pick.and_then(|e| e.cost.as_ref().map(format_cost_label)),
                         }
                     }
                     None => {

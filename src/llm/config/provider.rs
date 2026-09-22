@@ -1,5 +1,6 @@
 use super::catalog_query::endpoints_for;
 use super::catalog_query::landing_base_url_for;
+use super::catalog_query::provider_like_candidate;
 use super::config_file_path;
 use super::headers::config_headers_map;
 use super::load_config_str;
@@ -121,10 +122,60 @@ pub(crate) fn setup_guide_error() -> String {
     format!(
         "no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n\
          \u{20}\u{20}anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
-         \u{20}\u{20}openai-compatible gateway: model: opencode/<model-id> + providers.opencode: {{base_url: https://opencode.ai/zen/v1, api_key}} (key env: OPENCODE_API_KEY)\n\
+         \u{20}\u{20}openai-compatible gateway: model: <gateway>/<model-id> + providers.<gateway>: {{base_url: <url>, api_key}} (key env: from the catalog entry)\n\
          \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
          \u{20}\u{20}codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"
+    )
+}
+
+/// The selection parsed but resolved no provider: a bare id (`model:
+/// gpt-5`), a prefix that isn't configured (`DEX_MODEL=zai/glm-x` with no
+/// `providers.zai:` entry), or a retired `zen`/`go` endpoint prefix.
+/// Distinct from [`setup_guide_error`] — a model *is* set, it just cannot
+/// ride anywhere — so this names the selection and the one fix that
+/// applies: a provider-shaped selection gets the same pointer
+/// `warn_provider_like_selection` would give, promoted to an error here
+/// because nothing is being sent at all.
+pub(crate) fn unrouted_selection_error(selection: &str, known: &BTreeSet<String>) -> String {
+    let path = config_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/dex/config.yaml".to_string());
+    let selection = selection.trim();
+    let candidate = match selection.split_once('/') {
+        Some((prefix, rest)) if !prefix.trim().is_empty() && !rest.trim().is_empty() => {
+            prefix.trim()
+        }
+        Some(_) => "",
+        None => selection,
+    };
+    // Retired endpoint prefixes (the named `{zen, go}` table is gone):
+    // endpoints belong to ordinary providers now — name the replacement.
+    if matches!(candidate, "zen" | "go") {
+        let replacement = if candidate == "go" {
+            "opencode-go"
+        } else {
+            "opencode"
+        };
+        return format!(
+            "selection '{selection}' uses the retired '{candidate}' endpoint prefix — endpoints are named after their provider now: use 'model: {replacement}/<model-id>' with a 'providers: {replacement}:' entry (config: {path})"
+        );
+    }
+    if let Some((provider, key_env)) = provider_like_candidate(selection, &[]) {
+        return format!(
+            "selection '{selection}' looks like provider '{provider}', not a model id — add 'providers: {provider}: {{api_key: <key>}}' to config (key env: {key_env}), then set 'model: {provider}/<model-id>' (config: {path})"
+        );
+    }
+    let configured = if known.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " — configured: {}",
+            known.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    };
+    format!(
+        "selection '{selection}' names no provider — use '<provider>/<model>': a built-in (anthropic, openai-codex){configured}, an entry under 'providers:', or --base-url <url> to route a bare id via providers.custom (config: {path}); run `dex doctor`"
     )
 }
 
