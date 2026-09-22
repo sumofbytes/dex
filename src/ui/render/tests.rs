@@ -2848,3 +2848,119 @@ fn hang_overflow_regression() {
         );
     }
 }
+
+#[test]
+fn tool_input_wraps_under_the_glyph_column() {
+    // Regression: a long tool input wrapped flush at the margin, so
+    // continuations slid under the `$` glyph. The whole `$ bash ` prefix
+    // (glyph + name + gap) is structural and hangs on every continuation
+    // row, like the composer's glyph hang. `render_tool_input` already
+    // indents its line — no extra wrap here.
+    let text = |r: &Line<'static>| {
+        r.spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect::<String>()
+    };
+    let line = render_tool_input(
+        "bash",
+        "cargo build --release --features tui && cargo test --all-targets --quiet",
+    );
+    let rows = wrap_line_display(&line, 40, 0);
+    assert!(rows.len() > 1, "must wrap at 40 cols: {rows:?}");
+    let hang = "$ bash ".width();
+    for (i, row) in rows.iter().enumerate() {
+        let t = text(row);
+        let cont: String = t.chars().skip(TRANSCRIPT_INDENT).collect();
+        if i == 0 {
+            assert!(cont.starts_with("$ bash"), "row 0 heads the tool: {t:?}");
+        } else {
+            assert!(
+                cont.starts_with(&" ".repeat(hang)),
+                "continuation must hang under the glyph column: {t:?}"
+            );
+            assert!(
+                !cont[hang..].starts_with('$'),
+                "continuation must pad, not repeat the marker: {t:?}"
+            );
+        }
+        assert!(t.width() <= 40, "continuation overflow: {t:?}");
+    }
+
+    // A long arg that breaks inside its first word still hangs (no
+    // last-space break, no marker) — bash, a builtin and an MCP name.
+    for (name, glyph) in [("bash", "$"), ("read", "¶"), ("mcp__srv__tool", "⇄")] {
+        let line = render_tool_input(
+            name,
+            "a-very-long-unbroken-command-token-that-forces-a-hard-wrap-at-any-width",
+        );
+        let rows = wrap_line_display(&line, 40, 0);
+        assert!(rows.len() > 1, "{name}: must wrap at 40 cols: {rows:?}");
+        let hang = format!("{glyph} {name} ").width();
+        for (i, row) in rows.iter().enumerate() {
+            let t: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            let cont: String = t.chars().skip(TRANSCRIPT_INDENT).collect();
+            if i == 0 {
+                assert!(
+                    cont.trim_start().starts_with(&format!("{glyph} {name}")),
+                    "{name}: row 0 heads the tool: {t:?}"
+                );
+            } else {
+                assert!(
+                    cont.starts_with(&" ".repeat(hang)),
+                    "{name}: continuation must hang under the glyph column: {t:?}"
+                );
+            }
+            assert!(t.width() <= 40, "{name}: overflow: {t:?}");
+        }
+    }
+
+    // Non-tool rows keep their shape: a plain paragraph hangs nothing.
+    let line = super::super::indent_transcript_line(Line::from(
+        "plain prose keeps its flush-left margin even when it wraps around",
+    ));
+    let rows = wrap_line_display(&line, 40, 0);
+    for row in &rows[1..] {
+        let t: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        let cont: String = t.chars().skip(TRANSCRIPT_INDENT).collect();
+        assert!(
+            !cont.starts_with(' '),
+            "plain prose must stay flush left: {t:?}"
+        );
+    }
+
+    // The cap still bounds tool hangs: at w=15 `tool_cap` is 7, so the
+    // 7-cell `$ bash ` marker hangs exactly at the boundary, while the
+    // 17-cell `⇄ mcp__srv__tool ` prefix exceeds it and falls back to
+    // flush-left continuations (nothing overflows either way).
+    let line = render_tool_input(
+        "bash",
+        "supercalifragilisticexpialidocious-and-then-some-more-text-here",
+    );
+    let rows = wrap_line_display(&line, 15, 0);
+    assert!(rows.len() > 1, "must wrap at 15 cols: {rows:?}");
+    for r in &rows {
+        let t: String = r.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert!(t.width() <= 15, "overflow: {t:?}");
+    }
+    let cont: String = text(&rows[1]).chars().skip(TRANSCRIPT_INDENT).collect();
+    assert!(
+        cont.starts_with(&" ".repeat(7)),
+        "boundary hang kept: {cont:?}"
+    );
+    let line = render_tool_input(
+        "mcp__srv__tool",
+        "supercalifragilisticexpialidocious-and-then-some-more-text-here",
+    );
+    let rows = wrap_line_display(&line, 15, 0);
+    assert!(rows.len() > 1, "must wrap at 15 cols: {rows:?}");
+    for r in &rows {
+        let t: String = r.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert!(t.width() <= 15, "overflow: {t:?}");
+    }
+    let cont: String = text(&rows[1]).chars().skip(TRANSCRIPT_INDENT).collect();
+    assert!(
+        !cont.starts_with(' '),
+        "over-cap marker must not hang: {cont:?}"
+    );
+}

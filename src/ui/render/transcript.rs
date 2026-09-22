@@ -508,54 +508,113 @@ pub(crate) fn wrap_line_display(
         width: usize,
     }
 
-    /// Width of the leading marker of a wrapped first row to re-apply as
-    /// whitespace on every continuation row: either a ≥2-cell whitespace
-    /// indent (code blocks) or a list marker — a bullet glyph (`•`, `▸`,
-    /// task boxes, `-`/`*`) or an ordered `12.` run — plus its whitespace
-    /// gap, with non-whitespace content after it. Plain paragraphs (first
-    /// word, no marker) hang nothing, keeping their old flush-left
-    /// continuation shape. `cap` bounds the hang so a pathological marker
-    /// can't eat the row.
-    fn hang_width(row: &[Unit], cap: usize) -> usize {
-        if cap == 0 {
+    /// Tool names a transcript input row can lead with (`$ bash …`): the
+    /// name hangs with the glyph so wrapped payload lines align past the
+    /// command, not past `$ `. MCP tools (`⇄ mcp__<server>__<tool> …`)
+    /// match by prefix instead.
+    const TOOL_NAMES: &[&str] = &[
+        "bash", "read", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls", "git", "chain",
+    ];
+
+    /// One-cell glyphs that head a transcript tool-input row (`$ bash …`).
+    const TOOL_GLYPHS: &[&str] = &["▸", "$", "¶", "✎", "±", "/", "☰", "⎇", "→", "⇄"];
+
+    /// Cells of the wrapped first row's structural leading marker to carve
+    /// out of the wrap body and re-apply as whitespace on every continuation
+    /// row: a ≥2-cell whitespace indent (code blocks), a list marker — bullet
+    /// glyph (`•`, `▸`, task boxes, `-`/`*`) or ordered `12.` run — or a
+    /// tool-row glyph + tool name (`$ bash `). The carved marker wraps like
+    /// real content on row 0 (so a marker wider than the row still forces a
+    /// break instead of overflowing), and continuation rows lose the same
+    /// cells from their budget, so no width combination overflows. Plain
+    /// paragraphs (first word, no marker) hang nothing, keeping their old
+    /// flush-left continuation shape. `cap` bounds markdown markers so a
+    /// pathological one can't eat the row; tool prefixes are UI chrome with
+    /// bounded names, so `tool_cap` (remaining-width based, passed by the
+    /// caller) governs them instead.
+    fn marker_width(raw: &[(String, Style, bool)], cap: usize, tool_cap: usize) -> usize {
+        if cap == 0 && tool_cap == 0 || raw.is_empty() {
             return 0;
         }
-        let lead_ws = row
+        // A tool row is glyph + gap + tool name, then the payload; units
+        // are per-grapheme, so the name is matched as the grapheme run
+        // after the glyph's gap.
+        let is_tool =
+            TOOL_GLYPHS.contains(&raw[0].0.as_str()) && raw.get(1).is_some_and(|u| u.0 == " ");
+        let name = if is_tool {
+            let name_start = 2;
+            let len: usize = raw[name_start..]
+                .iter()
+                .take_while(|u| !u.0.chars().any(char::is_whitespace))
+                .map(|u| u.0.chars().count())
+                .sum();
+            let text: String = raw[name_start..name_start + len]
+                .iter()
+                .map(|u| u.0.as_str())
+                .collect();
+            Some(text)
+        } else {
+            None
+        };
+        let tool_marker = name
+            .as_deref()
+            .is_some_and(|n| n.starts_with("mcp__") || TOOL_NAMES.contains(&n));
+        let unit_w = |u: &(String, Style, bool)| {
+            u.0.chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>()
+                .max(1)
+        };
+        let lead_ws = raw
             .iter()
-            .take_while(|u| u.text.chars().all(char::is_whitespace))
+            .take_while(|u| u.0.chars().all(char::is_whitespace))
             .count();
-        let lead_width: usize = row[..lead_ws].iter().map(|u| u.width).sum();
-        if lead_width >= 2 {
-            return if lead_width > cap { 0 } else { lead_width };
-        }
-        let mut i = lead_ws;
-        let is_bullet = row
-            .get(i)
-            .is_some_and(|u| matches!(u.text.as_str(), "•" | "▸" | "☐" | "☑" | "-" | "*"));
-        let mut digits = 0;
-        while row
-            .get(i + digits)
-            .is_some_and(|u| u.text.chars().all(|c| c.is_ascii_digit()))
+        let lead_width: usize = raw[..lead_ws].iter().map(&unit_w).sum();
+        // `is_indent`: the marker is the whole leading whitespace run (a
+        // ≥2-cell indent), so there is no gap after it — `end` stays at
+        // `marker_end` and must not trip the missing-gap guard below.
+        let (marker_end, is_indent) = if tool_marker {
+            (lead_ws + 2 + name.unwrap().chars().count(), false)
+        } else if lead_width >= 2 {
+            (lead_ws, true)
+        } else if raw
+            .get(lead_ws)
+            .is_some_and(|u| matches!(u.0.as_str(), "•" | "▸" | "☐" | "☑" | "-" | "*"))
         {
-            digits += 1;
-        }
-        let is_ordered = digits > 0 && row.get(i + digits).is_some_and(|u| u.text == ".");
-        if !(is_bullet || is_ordered) {
-            return 0;
-        }
-        i += if is_bullet { 1 } else { digits + 1 };
-        let mut end = i;
-        while row
+            (lead_ws + 1, false)
+        } else {
+            let digits = raw[lead_ws..]
+                .iter()
+                .take_while(|u| u.0.chars().all(|c| c.is_ascii_digit()))
+                .count();
+            if digits > 0 && raw.get(lead_ws + digits).is_some_and(|u| u.0 == ".") {
+                (lead_ws + digits + 1, false)
+            } else {
+                return 0;
+            }
+        };
+        let mut end = marker_end;
+        while raw
             .get(end)
-            .is_some_and(|u| u.text.chars().all(char::is_whitespace))
+            .is_some_and(|u| u.0.chars().all(char::is_whitespace))
         {
             end += 1;
         }
-        if end == i || end >= row.len() {
+        // A matched marker (bullet/ordered/tool) needs a whitespace gap and
+        // payload after it; an indent marker only needs payload.
+        if end >= raw.len() || (end == marker_end && !is_indent) {
             return 0;
         }
-        let width: usize = row[lead_ws..end].iter().map(|u| u.width).sum();
-        if width > cap {
+        // An indent marker IS the leading whitespace run (`end == lead_ws`),
+        // so its width comes from that run; a bullet/ordered/tool marker
+        // starts at `lead_ws` and includes its trailing gap.
+        let width: usize = if is_indent {
+            lead_width
+        } else {
+            raw[lead_ws..end].iter().map(&unit_w).sum()
+        };
+        let limit = if tool_marker { tool_cap } else { cap };
+        if width > limit {
             return 0;
         }
         width
@@ -606,26 +665,47 @@ pub(crate) fn wrap_line_display(
             break;
         }
     }
+    // Carve the first row's structural marker (`$ bash `, a bullet, an
+    // ordered `12.` run, a ≥2-cell indent) out of the wrap body too: it is
+    // re-applied as whitespace on every continuation row, so continuations
+    // must not count it — one wrap budget for every row, no width
+    // combination overflows. Frozen upfront, not at the first break.
+    // Markdown markers hang only up to w/3 (a pathological one can't eat
+    // the row). Tool prefixes are bounded UI chrome — allow up to the whole
+    // row minus 8 payload cells, so wide names (`⇄ mcp__<server>__<tool> `)
+    // still hang while text stays readable.
+    let tool_cap = w.saturating_sub(8);
+    let hang = marker_width(&raw, w / 3, tool_cap);
+    let mut marker: Vec<(String, Style)> = Vec::new();
+    if hang > 0 {
+        let mut taken = 0usize;
+        while taken < hang {
+            let Some((text, _, _)) = raw.first() else {
+                break;
+            };
+            let width = text
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>()
+                .max(1);
+            let (text, style, _) = raw.remove(0);
+            taken += width;
+            marker.push((text, style));
+        }
+    }
 
     let mut rows: Vec<Vec<Unit>> = Vec::new();
     let mut row = Vec::new();
-    // Row 0 starts already carrying the transcript indent plus the echoed
-    // glyph, so its wrap width is reduced by both.
-    let mut row_width = (indent_width + glyph_width).min(w);
-    // Hanging indent: the first row's leading marker width (list bullet,
-    // ordered `12.` marker, or a code block's two-space indent) is
-    // re-applied as whitespace on every continuation row, so wrapped text
-    // aligns under the text column instead of sliding under the marker.
-    // Frozen at the first row break.
-    let mut hang: usize = 0;
-    // The echoed glyph is padded on continuation rows too (the composer
-    // hangs its glyph), so the continuation wrap budget loses it.
+    // Row 0 starts already carrying the transcript indent, the echoed glyph
+    // and the carved marker, so its wrap width is reduced by all three.
+    let mut row_width = (indent_width + glyph_width + hang).min(w);
+    // Continuations re-apply the carved marker as whitespace (like the
+    // composer hangs its glyph), so their wrap budget loses both.
     let glyph_pad = if first_row_overhang > 0 {
         glyph_width
     } else {
         0
     };
-    let mut first_row_done = false;
     let mut last_space: Option<usize> = None;
     for (symbol, style, is_tab) in raw {
         // Tab width is relative to the current column (row_width).
@@ -644,10 +724,6 @@ pub(crate) fn wrap_line_display(
             text = " ".repeat(width);
         }
         if row_width + width > w && !row.is_empty() {
-            if !first_row_done {
-                first_row_done = true;
-                hang = hang_width(&row, w / 3);
-            }
             if let Some(space) = last_space {
                 let remainder = row.split_off(space + 1);
                 row.truncate(space);
@@ -689,6 +765,13 @@ pub(crate) fn wrap_line_display(
             if i == 0 {
                 spans.extend(
                     glyph
+                        .iter()
+                        .map(|(text, style)| Span::styled(text.clone(), *style)),
+                );
+                // The carved marker is real content on row 0 — re-applied
+                // as whitespace (below) only on continuations.
+                spans.extend(
+                    marker
                         .iter()
                         .map(|(text, style)| Span::styled(text.clone(), *style)),
                 );
