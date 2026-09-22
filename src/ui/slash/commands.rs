@@ -528,7 +528,10 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
         return;
     }
     let old_provider = app.config.provider.clone();
-    let endpoint = match app.config.apply_model(&m, true) {
+    // Remote TUI: the daemon owns the real selection — resolve for display
+    // only, never write the config file back.
+    let persist = !app.remote_mode;
+    let endpoint = match app.config.apply_model(&m, persist) {
         Ok(endpoint) => endpoint,
         Err(error) => {
             push_info(app, format!("could not switch model: {error}"));
@@ -607,7 +610,7 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
                 format!("provider already selected: {}", provider.name()),
             );
         }
-        Some(provider) => match app.config.switch_provider(&provider, true) {
+        Some(provider) => match app.config.switch_provider(&provider, !app.remote_mode) {
             Ok(()) => {
                 let _ = app.session.set_state("provider", provider.name());
                 push_info(app, format!("switched to provider: {}", provider.name()));

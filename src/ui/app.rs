@@ -196,6 +196,11 @@ impl TranscriptBlock {
 /// turn execution lives either in the local engine or, in client-server
 /// mode, in `ui/remote.rs` which drives the same state from daemon events.
 pub(crate) struct App {
+    /// Remote (client-server) TUI: the daemon owns the real model/provider
+    /// selection, so `/model`/`/provider` must resolve locally for display
+    /// but never write the config file back (the client's default provider
+    /// would silently repoint the shared config).
+    pub(crate) remote_mode: bool,
     pub(crate) transcript: Vec<TranscriptBlock>,
     pub(crate) input: InputField,
     pub(crate) config: LlmConfig,
@@ -303,6 +308,7 @@ impl App {
     /// no skills, model "test". ui.rs and ui/slash.rs tests both build on it.
     pub(crate) fn test_app() -> App {
         App {
+            remote_mode: false,
             transcript: Vec::new(),
             input: crate::ui::input::InputField::new(),
             config: crate::llm::config::LlmConfig {
