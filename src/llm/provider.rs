@@ -17,7 +17,6 @@ impl Provider {
     /// `config::landing_base_url_for` resolves it).
     pub(crate) fn default_base_url(&self) -> Option<&'static str> {
         match self {
-            Self::OpenCode => Some("https://opencode.ai/zen/v1"),
             Self::OpenAiCodex => Some("https://chatgpt.com/backend-api/codex"),
             // Native Messages API landing; the request path appends
             // `/v1/messages` (see `anthropic::messages_url`).
@@ -37,23 +36,11 @@ impl Provider {
         }
     }
 
-    /// Named endpoints offered to `/model` routing (`zen/<id>`, `go/<id>`).
-    /// Generic providers carry a single implicit endpoint (their catalog
-    /// `api` URL, named after the provider); `LlmConfig` injects it.
+    /// Named endpoints offered to `/model` routing. Generic providers carry
+    /// a single implicit endpoint (their catalog `api` URL, named after the
+    /// provider); `LlmConfig` injects it.
     pub(crate) fn endpoints(&self) -> BTreeMap<String, String> {
-        match self {
-            // ponytail: static table, add dynamic registry if more than
-            // 3 builtin endpoints
-            Self::OpenCode => [
-                ("zen", "https://opencode.ai/zen/v1"),
-                ("go", "https://opencode.ai/zen/go/v1"),
-            ]
-            .into_iter()
-            .map(|(name, url)| (name.to_string(), url.to_string()))
-            .collect(),
-            // Generic endpoints live in LlmConfig (catalog/config-derived).
-            _ => BTreeMap::new(),
-        }
+        BTreeMap::new()
     }
 
     /// models.dev catalog keys that can serve this provider (pricing lookup).
@@ -61,10 +48,6 @@ impl Provider {
     /// OpenAI proper in models.dev, not a dex provider alias (there is none).
     pub(crate) fn catalog_keys(&self) -> Vec<String> {
         match self {
-            Self::OpenCode => ["opencode", "opencode-go", "openai"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
             Self::OpenAiCodex => ["openai-codex", "codex"]
                 .iter()
                 .map(|s| s.to_string())
@@ -152,19 +135,9 @@ mod tests {
 
     #[test]
     fn provider_spec_tables() {
-        assert_eq!(
-            Provider::OpenCode.endpoints().get("go").map(String::as_str),
-            Some("https://opencode.ai/zen/go/v1")
-        );
         assert!(Provider::OpenAiCodex.endpoints().is_empty());
-        assert!(Provider::OpenCode.has_protocol_fallback());
         assert!(!Provider::OpenAiCodex.has_protocol_fallback());
         assert!(Provider::OpenAiCodex.credentials_refreshable());
-        assert!(!Provider::OpenCode.credentials_refreshable());
-        assert!(matches!(
-            Provider::OpenCode.auth_scheme(),
-            AuthScheme::Bearer
-        ));
         assert!(matches!(
             Provider::OpenAiCodex.auth_scheme(),
             AuthScheme::Codex
@@ -226,10 +199,6 @@ mod tests {
         );
         assert!(req.headers().get("authorization").is_none());
         assert_eq!(
-            Provider::OpenCode.default_base_url(),
-            Some("https://opencode.ai/zen/v1")
-        );
-        assert_eq!(
             Provider::OpenAiCodex.default_base_url(),
             Some("https://chatgpt.com/backend-api/codex")
         );
@@ -244,7 +213,6 @@ mod tests {
             Provider::Anthropic.default_api(),
             Some(ApiProtocol::Anthropic)
         );
-        assert_eq!(Provider::OpenCode.default_api(), None);
         assert!(!Provider::Anthropic.has_protocol_fallback());
         // Pricing: a generic provider prices via its own catalog entry.
         assert_eq!(

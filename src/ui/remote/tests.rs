@@ -301,7 +301,7 @@ fn test_remote() -> RemoteApp {
         transcript: Vec::new(),
         input: crate::ui::input::InputField::new(),
         config: crate::llm::config::LlmConfig {
-            provider: Provider::OpenCode,
+            provider: Provider::Anthropic,
             api_key: String::new(),
             base_url: String::new(),
             model: "test".into(),

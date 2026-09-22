@@ -116,18 +116,19 @@ every resolved value with where it came from.
 | Layer (wins first)    | Example                                               |
 | --------------------- | ----------------------------------------------------- |
 | CLI flags             | `--model`, `--base-url`                               |
-| Environment variables | `DEX_MODEL`, `OPENCODE_API_KEY`, `DEX_HEADERS`        |
+| Environment variables | `DEX_MODEL`, provider key vars, `DEX_HEADERS`          |
 | Config file           | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 
-Nothing hardcodes a model: if no layer selects one, `dex` refuses to start and
-prints a setup guide instead of guessing. (`dex doctor` shows the same.) Only
-the provider *landing URL* for a bare model id (`model: m` with no
-`provider/` prefix) has a built-in default: opencode's gateway, so a bare id
-has somewhere to ride.
+Nothing hardcodes a model *or* a provider: if no layer selects one, `dex`
+refuses to start and prints a setup guide instead of guessing. (`dex doctor`
+shows the same.) Built-in providers are `anthropic` (native Messages wire) and
+`openai-codex` (ChatGPT OAuth); every other provider — including the opencode
+gateway — is an ordinary `providers:` entry resolved through the models.dev
+catalog.
 
 `model:` is the only selection knob and names provider _and_ model:
-`<provider>/<model>` (`<endpoint>/<model>` forces an endpoint; a bare provider
-name just switches provider). Write-back keeps that form: a `/model` or
+`<provider>/<model>` (a bare provider name just switches provider). Write-back
+keeps that form: a `/model` or
 `/provider` pick updates `model:` in the file, so the switch becomes the default
 for later runs. Session state still re-applies the exact provider/model on
 `/resume`.
@@ -138,19 +139,21 @@ A minimal `~/.config/dex/config.yaml`:
 providers:
   opencode:
     api_key: sk-... # the deposit place for this provider's key
-model: zen/gpt-5.6-luna # endpoint-or-provider / model
+    base_url: https://opencode.ai/zen/v1
+model: opencode/gpt-5.6-luna # provider / model
 ```
 
 A file naming only a provider also works (`model: anthropic` plus
 `ANTHROPIC_API_KEY`) — but a bare provider pick names no model, so export the
-provider's key and pass an id: `DEX_MODEL=opencode/<model-id> dex`. The daemon
+provider's key and pass an id: `DEX_MODEL=anthropic/<model-id> dex`. The daemon
 bootstraps the models.dev catalog in the background, so a fresh install needs no
 manual `dex update --models`.
 
 Run `dex update --models` once to cache the models.dev catalog. After that a
-bare `/model <id>` moves `base_url` to the endpoint serving that id, and the
-wire protocol follows the same way: a first `/responses` failure falls back to
-chat-completions once and is remembered, so per-model knowledge never needs
+bare `/model <id>` stays on the current provider (`provider/<id>` switches to
+another), and the wire protocol follows the same way: a first `/responses`
+failure falls back to chat-completions once and is remembered, so per-model
+knowledge never needs
 configuring. An explicit `--base-url` pins the endpoint — prefixes become naming
 only and are stripped. Manual overrides are escape hatches only:
 `DEX_MODEL_APIS="id=openai-completions,..."` seeds a model's protocol (full
@@ -162,12 +165,13 @@ the canonical spots:
 
 | Deprecated                                        | Replacement                                                                       |
 | ------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `active_provider:` / `provider:`                  | put the provider in `model:` as `provider/model`                                  |
 | top-level `base_url:`                             | `base_url:` under the provider's entry in `providers:`                            |
 | top-level `api:`                                  | `api:` under the provider's entry in `providers:`                                 |
 | top-level `headers:` / `http_headers:`            | `headers:` under the provider's entry (provider-scoped) or `DEX_HEADERS` (global) |
-| `DEX_PROVIDER` env                                | `DEX_MODEL=<provider>/<model>`                                                    |
 | `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` env | `DEX_HEADERS` (same syntax)                                                       |
+
+`active_provider:` / `provider:` (file) and `DEX_PROVIDER` (env) are no longer
+read at all: the provider lives in `model:` as `provider/model`.
 
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
 parse error lists the valid keys: `model`, `providers`, `context_window`,
@@ -272,8 +276,8 @@ providers:
 and reasoning options come from the cached models.dev catalog — run
 `dex update --models` once. The key resolves per provider: config
 `providers.<name>.api_key` > the provider's own documented env var (from the
-catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`); opencode's is
-`OPENCODE_API_KEY`. There is no per-provider default key var outside the catalog
+catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY`). There
+is no per-provider default key var outside the catalog
 — one provider's key never leaks into another. A model's advertised thinking
 options (e.g. `low/high/max`) are shown in the `/model` confirmation;
 `/thinking <level>` pins one per model (remembered per endpoint+model and
@@ -281,7 +285,8 @@ validated against the advertised list — unknown models accept anything, a stal
 catalog never blocks). `DEX_THINKING_EFFORT` is the fallback when nothing is
 pinned, and an effort no model advertises warns once instead of failing opaquely
 at the API. A file `thinking_effort:` default sits under both (stored choice >
-env > file). Wire protocol resolves like opencode: responses first, one fallback
+env > file). Wire protocol resolves like any OpenAI-compatible provider:
+responses first, one fallback
 to completions, remembered per endpoint+model. Native-protocol-only providers
 (no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
 selectable this way.
@@ -433,7 +438,7 @@ daemon's working directory.
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `--base-url <url>`               | Override the API base URL for this run (pins the endpoint; routing prefixes become naming only).                  |
 | `-H`, `--header <"Name: Value">` | Extra provider header (repeatable; `Name=Value` or JSON object also accepted).                                    |
-| `--model <name>`                 | Override the model for this run: `<provider>/<model>`, `<endpoint>/<model>`, or a bare provider name.             |
+| `--model <name>`                 | Override the model for this run: `<provider>/<model>` or a bare provider name.             |
 | `--system-prompt <text>`         | Replace the built-in base system prompt for this run (project/extensions/skills still append).                    |
 | `--system-prompt-file <path>`    | Read the replacement base system prompt from a file (client-side, so remote daemons work).                        |
 | `-s`, `--session <path>`         | Open/continue a specific session file.                                                                            |
@@ -781,11 +786,11 @@ discovered extension with its consent state.
 
 | Variable                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OPENCODE_API_KEY`                                            | API key for the opencode gateway (required for `opencode`; export it in your shell profile).                                                                                                                                                                                                                                                                                                                    |
+| `OPENCODE_API_KEY`                                            | API key env var of the `opencode` provider, learned from its models.dev catalog entry (set `providers.opencode.api_key` instead, or use whatever the catalog documents).                                                                                                                                                                                                                                          |
 | `ANTHROPIC_API_KEY`                                           | API key for the built-in `anthropic` provider (`model: anthropic/<model>`); resolves cache-less.                                                                                                                                                                                                                                                                                                                |
 | `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. `OPENAI_HEADERS`/`ANTHROPIC_CUSTOM_HEADERS` are deprecated aliases — use `DEX_HEADERS`.                                                                                    |
-| `DEX_MODEL`                                                   | Model selection, `provider/model` (`endpoint/model` or a bare provider name work too) — the same knob as the file's `model:` key.                                                                                                                                                                                                                                                                               |
-| `DEX_PROVIDER`                                                | Deprecated provider selection — use `DEX_MODEL=<provider>/<model>` (still honored with a one-time warning).                                                                                                                                                                                                                                                                                                     |
+| `DEX_MODEL`                                                   | Model selection, `provider/model` (a bare provider name works too) — the same knob as the file's `model:` key.                                                                                                                                                                                                                                                                               |
+| `DEX_PROVIDER`                                                | No longer read — use `DEX_MODEL=<provider>/<model>`.                                                                                                                                                                                                                                                                                             |
 | `CODEX_ACCESS_TOKEN`                                          | Optional Codex OAuth access-token override.                                                                                                                                                                                                                                                                                                                                                                     |
 | `CODEX_ACCOUNT_ID`                                            | Account ID paired with `CODEX_ACCESS_TOKEN`.                                                                                                                                                                                                                                                                                                                                                                    |
 | `DEX_MODELS`                                                  | Comma-separated models for `/model` autocomplete (default: catalog cache).                                                                                                                                                                                                                                                                                                                                      |
@@ -880,8 +885,7 @@ the same loop in-process with direct channels.
 
 `dex` interoperates with conventions from across the terminal-agent ecosystem:
 `CLAUDE.md` project instructions and `ANTHROPIC_CUSTOM_HEADERS` (Claude Code),
-session headers and response-first wire negotiation on the `opencode` gateway
-(OpenCode), OAuth via `codex --login` (Codex), token-based compaction settings
+response-first wire negotiation on OpenAI-compatible gateways, OAuth via `codex --login` (Codex), token-based compaction settings
 (`pi-mono`), and `fff-search` file search (`fff.nvim`). Model metadata comes
 from the models.dev catalog.
 

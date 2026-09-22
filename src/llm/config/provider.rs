@@ -3,7 +3,6 @@ use super::catalog_query::landing_base_url_for;
 use super::config_file_path;
 use super::headers::config_headers_map;
 use super::load_config_str;
-use super::warn_once;
 use crate::protocol::ApiProtocol;
 use crate::protocol::Provider;
 use std::collections::BTreeMap;
@@ -12,25 +11,6 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use std::env;
-
-/// Selection pointer fallback: `active_provider:` is deprecated — the
-/// provider now rides inside `model:` as `provider/model` (a legacy
-/// `provider:` key is honored with the same warning).
-pub(crate) fn load_provider_name(file: &Option<serde_yaml::Value>) -> Option<String> {
-    if let Some(name) = load_config_str(file, "active_provider") {
-        warn_once(
-            "config:active_provider",
-            "config key 'active_provider:' is deprecated — name the provider in 'model:' as 'provider/model' (e.g. 'model: zai/glm-5.3-flash')",
-        );
-        return Some(name);
-    }
-    let legacy = load_config_str(file, "provider")?;
-    warn_once(
-        "config:provider",
-        "config key 'provider:' is renamed — use 'model: <provider>/<model>' (e.g. 'model: opencode/gpt-5.6-luna')",
-    );
-    Some(legacy)
-}
 
 /// A configured provider (`providers:` map in config.yaml): the deposit
 /// place for that provider's API key plus optional overrides. Endpoint,
@@ -130,18 +110,18 @@ pub(crate) fn resolve_provider(
 }
 
 /// Neutral first-run hint when nothing selects a provider+model (no
-/// `--model`, `DEX_MODEL`, file `model:`, `DEX_PROVIDER`/`active_provider:`
-/// with an id). Names no favorite and no model id — the user picks; model
-/// ids come from the provider's catalog entry (or `dex doctor`), not a
-/// hardcoded default that can rot.
+/// `--model`, `DEX_MODEL`, or file `model:` with a provider prefix). Names
+/// no favorite and no model id — the user picks; model ids come from the
+/// provider's catalog entry (or `dex doctor`), not a hardcoded default that
+/// can rot.
 pub(crate) fn setup_guide_error() -> String {
     let path = config_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/dex/config.yaml".to_string());
     format!(
         "no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n\
-         \u{20}\u{20}opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
          \u{20}\u{20}anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
+         \u{20}\u{20}openai-compatible gateway: model: opencode/<model-id> + providers.opencode: {{base_url: https://opencode.ai/zen/v1, api_key}} (key env: OPENCODE_API_KEY)\n\
          \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
          \u{20}\u{20}codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
          config: {path}"

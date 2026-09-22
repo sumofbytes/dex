@@ -442,7 +442,7 @@ fn client_end_to_end_hits_every_endpoint() {
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));

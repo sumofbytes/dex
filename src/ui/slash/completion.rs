@@ -40,6 +40,9 @@ pub(crate) struct SlashKey {
     pub(crate) model: String,
     pub(crate) provider: String,
     pub(crate) models_hash: u64,
+    /// Configured `providers:` keys feed the `/provider` picker, so a
+    /// config edit without a model-list change must still miss.
+    pub(crate) providers_hash: u64,
     pub(crate) skills_hash: u64,
     /// Registered extension slash commands: `/extensions reload` (or a
     /// daemon push) changes what the popup may offer without touching
@@ -84,6 +87,13 @@ pub(crate) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
         model: app.config.model.clone(),
         provider: app.config.provider.name().to_string(),
         models_hash: str_list_hash(&app.config.available_models),
+        providers_hash: str_list_hash(
+            &app.config
+                .provider_entries
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
         skills_hash: str_list_hash(
             &app.skills
                 .iter()
@@ -117,7 +127,7 @@ pub(crate) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
 pub(super) fn compute_suggestions(app: &App, input: &str) -> Vec<(String, String)> {
     if let Some(query) = input.strip_prefix("/model ") {
         let query = query.to_ascii_lowercase();
-        return app
+        let filtered: Vec<String> = app
             .config
             .available_models
             .iter()
@@ -129,36 +139,66 @@ pub(super) fn compute_suggestions(app: &App, input: &str) -> Vec<(String, String
                         .next_back()
                         .is_some_and(|tail| tail.starts_with(&query))
             })
-            .map(|model| {
-                let is_current = model == &app.config.model
-                    || model.ends_with(&format!("/{}", app.config.model));
-                (
-                    format!("/model {model}"),
-                    if is_current {
-                        "Current model".to_string()
-                    } else if let Some((prov, _)) = model.split_once('/') {
-                        prov.to_string()
+            .cloned()
+            .collect();
+        // One catalog pass for every visible row: provider attribution
+        // (bare ids resolve to their cheapest server) plus `$in/$out` cost.
+        let hints = crate::llm::config::model_hints_for(&filtered);
+        return filtered
+            .into_iter()
+            .zip(hints)
+            .map(|(model, hint)| {
+                let is_current =
+                    model == app.config.model || model.ends_with(&format!("/{}", app.config.model));
+                let provider = match model.split_once('/') {
+                    Some((prov, _)) => Some(prov.to_string()),
+                    None => hint.provider.clone(),
+                };
+                let mut desc = if is_current {
+                    "Current model".to_string()
+                } else {
+                    provider.clone().unwrap_or_default()
+                };
+                if let Some(prov) = provider {
+                    if is_current && !prov.is_empty() {
+                        desc.push_str(&format!(" · {prov}"));
+                    }
+                }
+                if let Some(cost) = hint.cost {
+                    if desc.is_empty() {
+                        desc = cost;
                     } else {
-                        String::new()
-                    },
-                )
+                        desc.push_str(&format!(" · {cost}"));
+                    }
+                }
+                (format!("/model {model}"), desc)
             })
             .collect();
     }
     if let Some(query) = input.strip_prefix("/provider ") {
         let query = query.to_ascii_lowercase();
-        return ["opencode", "openai-codex"]
+        // Builtins plus every configured `providers:` entry plus the
+        // current selection, so a configured generic name is completable.
+        // The `codex` alias resolves to `openai-codex` downstream.
+        let mut names: std::collections::BTreeSet<String> = crate::protocol::Provider::BUILTINS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        names.extend(app.config.provider_entries.keys().cloned());
+        names.insert(app.config.provider.name().to_string());
+        let current = app.config.provider.name();
+        return names
             .into_iter()
             .filter(|provider| provider.starts_with(&query))
             .map(|provider| {
-                (
-                    format!("/provider {provider}"),
-                    if *provider == *app.config.provider.name() {
-                        "Current provider".to_string()
-                    } else {
-                        String::new()
-                    },
-                )
+                let desc = if provider == current {
+                    "Current provider".to_string()
+                } else if app.config.provider_entries.contains_key(&provider) {
+                    "configured".to_string()
+                } else {
+                    "built-in".to_string()
+                };
+                (format!("/provider {provider}"), desc)
             })
             .collect();
     }
