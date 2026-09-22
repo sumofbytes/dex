@@ -27,10 +27,12 @@ fn tool_glyph(name: &str) -> &'static str {
 }
 
 /// Transcript `▸ tool arg` row, headed by the tool's own glyph (`$ bash …`).
-/// Bash commands highlight via the compiled bash grammar (keywords/strings/
-/// flags read apart instead of one dim blob); every other tool keeps the dim
-/// arg. Unknown/unhighlightable bash falls back to dim, so this never
-/// regresses.
+/// The glyph + tool-name prefix is structural: `wrap_line_display` hangs it
+/// on wrapped rows so a long command aligns past the name instead of
+/// sliding under the glyph (see `hang_width`). Bash commands highlight via
+/// the compiled bash grammar (keywords/strings/flags read apart instead of
+/// one dim blob); every other tool keeps the dim arg. Unknown/unhighlightable
+/// bash falls back to dim, so this never regresses.
 pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
