@@ -196,10 +196,11 @@ impl TranscriptBlock {
 /// turn execution lives either in the local engine or, in client-server
 /// mode, in `ui/remote.rs` which drives the same state from daemon events.
 pub(crate) struct App {
-    /// Remote (client-server) TUI: the daemon owns the real model/provider
-    /// selection, so `/model`/`/provider` must resolve locally for display
-    /// but never write the config file back (the client's default provider
-    /// would silently repoint the shared config).
+    /// Remote (client-server) TUI: the daemon owns model/provider selection
+    /// (routing, credentials, config-file persistence), so `/model` only
+    /// updates the local display and the raw selection is forwarded — the
+    /// client never writes the config file back (its default provider would
+    /// silently repoint the shared config).
     pub(crate) remote_mode: bool,
     pub(crate) transcript: Vec<TranscriptBlock>,
     pub(crate) input: InputField,

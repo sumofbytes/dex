@@ -843,6 +843,19 @@ fn remote_model_switch_does_not_write_config_file_back() {
     remote.app.config.model = "opencode/other-model".into();
     handle_remote_slash(&mut remote, "/model other-model");
     assert!(remote.options.model.is_some(), "override still forwards");
+    assert_eq!(
+        remote.app.config.model, "other-model",
+        "display reflects the picked id without client-side resolution"
+    );
+    assert!(
+        remote
+            .app
+            .config
+            .available_models
+            .iter()
+            .any(|c| c == "other-model"),
+        "picked id stays completable in the input"
+    );
 
     // No config file may have been created for the write-back.
     let cfg = dir.join("dex/config.yaml");
