@@ -2622,3 +2622,199 @@ fn rebuild_truncation_counts_full_block_gap() {
         BLOCK_GAP_ROWS
     );
 }
+
+#[test]
+fn wrapped_transcript_rows_keep_the_text_column() {
+    // Continuation rows must hang under the first row's text column, not
+    // fall back to the margin: a list bullet, an ordered marker and a code
+    // block's two-space indent all re-apply to every wrapped row.
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "bullet",
+            "•  first item with quite a long line of text that wraps",
+        ),
+        (
+            "ordered",
+            "12. ordered item with quite a long line of text here ok",
+        ),
+        (
+            "indent",
+            "  code line that is quite long and wraps around a lot ok",
+        ),
+    ];
+    for (label, body) in cases {
+        let line = super::super::indent_transcript_line(Line::from(body));
+        let rows = wrap_line_display(&line, 20, 0);
+        assert!(rows.len() > 1, "{label}: must wrap at 20 cols: {rows:?}");
+        let text = |r: &Line<'static>| {
+            r.spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect::<String>()
+        };
+        // Row 0's own text column, minus the transcript indent: the
+        // marker (bullet/ordered) or whitespace indent, then content.
+        // Continuations must start at that same column — as padding,
+        // not a repeated marker.
+        let first = text(&rows[0]);
+        let prefix_width = first
+            .chars()
+            .skip(TRANSCRIPT_INDENT)
+            .take_while(|c| c.is_whitespace() || matches!(c, '•' | '▸' | '.' | '0'..='9'))
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum::<usize>();
+        assert!(
+            prefix_width >= 2,
+            "{label}: no hanging prefix found: {first:?}"
+        );
+        for row in &rows[1..] {
+            let t = text(row);
+            let cont: String = t.chars().skip(TRANSCRIPT_INDENT).collect();
+            let cont_lead: usize = cont
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+            assert_eq!(
+                cont_lead, prefix_width,
+                "{label}: continuation lost the text column: {t:?} ({prefix_width} cols)"
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_paragraph_continuations_stay_flush_left() {
+    // No marker, no indent: a plain wrapped paragraph keeps its old shape
+    // (margin only) — the hang applies to markers and indents, not prose.
+    let line = super::super::indent_transcript_line(Line::from(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+    ));
+    let rows = wrap_line_display(&line, 20, 0);
+    assert!(rows.len() > 1);
+    for row in &rows[1..] {
+        let t: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        let after_margin: String = t.chars().skip(TRANSCRIPT_INDENT).collect();
+        assert!(
+            !after_margin.starts_with(' '),
+            "continuation must start at the margin, not an indent: {t:?}"
+        );
+    }
+}
+
+#[test]
+fn composer_wrapped_rows_hang_under_the_prompt_glyph() {
+    // The `❯ ` glyph is on row 0 only; continuations must pad to the
+    // glyph's text column so typed text stays on one column.
+    let input = InputField::from_text("alpha beta gamma delta epsilon zeta eta theta iota kappa");
+    let (lines, _) = render_input(&input, input_content_width(20), false);
+    assert!(lines.len() > 1, "must wrap at 20 cols: {lines:?}");
+    for (i, l) in lines.iter().enumerate() {
+        let t: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        if i == 0 {
+            assert!(
+                t.starts_with(crate::ui::style::INPUT_PROMPT),
+                "row 0 carries the glyph: {t:?}"
+            );
+        } else {
+            assert_eq!(
+                &t[..crate::ui::style::INPUT_PROMPT_WIDTH],
+                " ".repeat(crate::ui::style::INPUT_PROMPT_WIDTH),
+                "continuation must hang under the glyph's text column: {t:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn echoed_prompt_narrows_only_the_first_logical_line() {
+    // The composer narrows only the first logical line for the glyph; the
+    // echo must match, or later lines wrap two cells early. Multi-line
+    // prompts: both logical lines wrap and hang identically on both sides.
+    let text = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll\nsecond logical line that also wraps around the twenty column mark";
+    let composer = render_input(&InputField::from_text(text), input_content_width(40), false).0;
+    let mut app = test_app();
+    super::super::render_user_prompt(&mut app, text);
+    let block = &app.transcript[1];
+    let rows = wrap_block(block, 40, false, false);
+    let row_text = |r: &Line<'static>| {
+        r.spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect::<String>()
+    };
+    assert_eq!(
+        composer.len(),
+        rows.len(),
+        "echo and composer wrap alike: composer {composer:?} echo {:?}",
+        rows.iter().map(row_text).collect::<Vec<_>>()
+    );
+    for (c, e) in composer.iter().zip(rows.iter()) {
+        let ce: String = c.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        let mut et = row_text(e);
+        // Echo rows carry the transcript indent; strip it for comparison.
+        if let Some(rest) = et.strip_prefix(crate::ui::transcript_indent().as_str()) {
+            et = rest.to_string();
+        }
+        // The echo hangs the glyph as spaces where the composer hangs the
+        // same spaces; content and wrap boundaries must line up.
+        assert_eq!(ce.trim_end(), et.trim_end(), "echoed wrap must match");
+    }
+}
+
+#[test]
+fn echoed_prompt_wraps_at_the_composer_content_width() {
+    // The composer wraps inside a band inset HORIZONTAL_GUTTER on both
+    // sides; the echo must wrap at the same content width, or a long
+    // first word that wraps while typed stays on one row after submit.
+    let text = "abcdefghijklmnop qrest";
+    let composer = render_input(&InputField::from_text(text), input_content_width(20), false).0;
+    let mut app = test_app();
+    super::super::render_user_prompt(&mut app, text);
+    let block = &app.transcript[1];
+    let rows = wrap_block(block, 20, false, false);
+    assert_eq!(
+        composer.len(),
+        rows.len(),
+        "echo must reflow like the composer: composer {} rows, echo {} rows",
+        composer.len(),
+        rows.len()
+    );
+}
+
+#[test]
+fn composer_cursor_sits_on_the_text_column_of_wrapped_rows() {
+    // Continuation rows of the first logical line carry the glyph-width
+    // hang pad; the cursor x must include it, or the caret lands left of
+    // the typed text on every wrapped row.
+    let text = "alpha beta gamma delta epsilon zeta";
+    for col in [12usize, 16, 18, 20, 24] {
+        let mut input = InputField::from_text(text);
+        input.col = col;
+        let (_, (r, x, _)) = render_input(&input, input_content_width(20), false);
+        // The caret must never sit under the hang pad (cols 0..2 on
+        // continuation rows) — it belongs on the text column.
+        if r > 0 {
+            assert!(
+                x >= crate::ui::style::INPUT_PROMPT_WIDTH as u16,
+                "col {col}: caret at x={x} on continuation row {r}, under the hang pad"
+            );
+        }
+        // And the char the caret covers must be the char at byte `col`.
+        let target = text[..col].chars().last().unwrap();
+        let (lines, _) = render_input(&input, input_content_width(20), false);
+        let row: String = lines[r as usize]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let x = x as usize;
+        let visible: Vec<char> = row.chars().collect();
+        let covered = visible.get(x.saturating_sub(1)).or_else(|| visible.last());
+        assert_eq!(
+            covered,
+            Some(&target),
+            "col {col}: caret x={x} on row {r} ({row:?}) not on {target:?}"
+        );
+    }
+}

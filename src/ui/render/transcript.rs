@@ -69,7 +69,14 @@ fn surface_rows(
     let w = width.max(1) as usize;
     lines
         .into_iter()
-        .flat_map(|l| wrap_line_display(&l, width, first_row_overhang))
+        .enumerate()
+        .flat_map(|(i, l)| {
+            // The echoed glyph lives on the block's first logical line only
+            // — the composer narrows just its first line, so the echo must
+            // too, or later lines wrap two cells early.
+            let overhang = if i == 0 { first_row_overhang } else { 0 };
+            wrap_line_display(&l, width, overhang)
+        })
         .map(|r| paint_surface_row(r, w, bg))
         .collect()
 }
@@ -122,11 +129,11 @@ pub(crate) fn wrap_block(
 /// blocks start unwrapped. Every transcript mutation must extend/truncate the
 /// cache alongside (or clear both, like `reset_session_state`): a missed site
 /// serves stale rows with no other signal, so the drift guard lives here.
-fn sync_wrapped_cache(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
-    if app.wrapped_width != area.width {
+fn sync_wrapped_cache(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
+    if app.wrapped_width != width {
         app.wrapped_cache.clear();
         app.display_cache.clear();
-        app.wrapped_width = area.width;
+        app.wrapped_width = width;
         // Every row is re-wrapped at the new width, so the old selection's row
         // coordinates (and the text they'd copy) are gone too.
         app.selection = None;
@@ -164,7 +171,7 @@ fn sync_wrapped_cache(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
 /// tail (§29): stored text is append-only below the cap, so rows before the
 /// last source line are final. A head-cut, reset, or rebuild resets stamps and
 /// takes the full wrap.
-fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
+fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
     for (idx, block) in app.transcript.iter().enumerate() {
         if app.wrapped_cache[idx].stamp == block.stamp() {
             continue;
@@ -172,7 +179,6 @@ fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
         if let super::super::TranscriptBlock::Thinking { text, .. } = block {
             if app.show_thinking {
                 let stamp = block.stamp();
-                let width = area.width;
                 let wb = &mut app.wrapped_cache[idx];
                 if wb.expanded {
                     let state = ThinkingWrap {
@@ -202,7 +208,7 @@ fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
                 continue;
             }
         }
-        let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
+        let rows = wrap_block(block, width, app.show_thinking, app.thinking_open);
         app.wrapped_cache[idx] = WrappedBlock {
             stamp: block.stamp(),
             rows,
@@ -245,6 +251,12 @@ pub(crate) fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
 
 impl TranscriptView {
     pub(crate) fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        // Right air: the composer band is inset `HORIZONTAL_GUTTER` on both
+        // sides, so its wrap width is `content_width`. Wrapping the transcript
+        // at the same width keeps typed and submitted prompts reflowing
+        // identically — a line that wraps in the composer must wrap the same
+        // way once echoed — and every surface keeps the same right margin.
+        let width = super::super::style::content_width(area.width);
         // Remember where the transcript lives so mouse events can be
         // translated into display rows between frames.
         app.transcript_area = Some(area);
@@ -268,8 +280,8 @@ impl TranscriptView {
         let mut mark = |idx: usize| {
             first_dirty = Some(first_dirty.map_or(idx, |first| first.min(idx)));
         };
-        sync_wrapped_cache(app, area, &mut mark);
-        wrap_dirty_blocks(app, area, &mut mark);
+        sync_wrapped_cache(app, width, &mut mark);
+        wrap_dirty_blocks(app, width, &mut mark);
         rebuild_display_cache(app, first_dirty);
         // The open thinking / activity rows animate: their lines are overlaid
         // on the rendered window (not written back into `display_cache`), so
@@ -346,16 +358,16 @@ impl TranscriptView {
         let scroll = app.scroll as usize;
         if let Some(row) = thinking_row {
             if row >= scroll && row - scroll < window.len() {
-                window[row - scroll] = thinking_indicator_line(true, None, app.tick, area.width);
+                window[row - scroll] = thinking_indicator_line(true, None, app.tick, width);
             }
         }
         if let Some(row) = activity_row {
             if row >= scroll && row - scroll < window.len() {
-                window[row - scroll] = activity_indicator_line(app.tick, area.width);
+                window[row - scroll] = activity_indicator_line(app.tick, width);
             }
         }
         if let Some(sel) = app.selection {
-            apply_selection(&mut window, app.scroll as usize, sel, area.width);
+            apply_selection(&mut window, app.scroll as usize, sel, width);
         }
         let transcript = Paragraph::new(window).style(Style::default().fg(Color::Gray));
         f.render_widget(transcript, area);
@@ -496,6 +508,59 @@ pub(crate) fn wrap_line_display(
         width: usize,
     }
 
+    /// Width of the leading marker of a wrapped first row to re-apply as
+    /// whitespace on every continuation row: either a ≥2-cell whitespace
+    /// indent (code blocks) or a list marker — a bullet glyph (`•`, `▸`,
+    /// task boxes, `-`/`*`) or an ordered `12.` run — plus its whitespace
+    /// gap, with non-whitespace content after it. Plain paragraphs (first
+    /// word, no marker) hang nothing, keeping their old flush-left
+    /// continuation shape. `cap` bounds the hang so a pathological marker
+    /// can't eat the row.
+    fn hang_width(row: &[Unit], cap: usize) -> usize {
+        if cap == 0 {
+            return 0;
+        }
+        let lead_ws = row
+            .iter()
+            .take_while(|u| u.text.chars().all(char::is_whitespace))
+            .count();
+        let lead_width: usize = row[..lead_ws].iter().map(|u| u.width).sum();
+        if lead_width >= 2 {
+            return lead_width;
+        }
+        let mut i = lead_ws;
+        let is_bullet = row
+            .get(i)
+            .is_some_and(|u| matches!(u.text.as_str(), "•" | "▸" | "☐" | "☑" | "-" | "*"));
+        let mut digits = 0;
+        while row
+            .get(i + digits)
+            .is_some_and(|u| u.text.chars().all(|c| c.is_ascii_digit()))
+        {
+            digits += 1;
+        }
+        let is_ordered = digits > 0 && row.get(i + digits).is_some_and(|u| u.text == ".");
+        if !(is_bullet || is_ordered) {
+            return 0;
+        }
+        i += if is_bullet { 1 } else { digits + 1 };
+        let mut end = i;
+        while row
+            .get(end)
+            .is_some_and(|u| u.text.chars().all(char::is_whitespace))
+        {
+            end += 1;
+        }
+        if end == i || end >= row.len() {
+            return 0;
+        }
+        let width: usize = row[lead_ws..end].iter().map(|u| u.width).sum();
+        if width > cap {
+            return 0;
+        }
+        width
+    }
+
     // Drop the whole leading indent span (TRANSCRIPT_INDENT cells), not just
     // one grapheme — the indent is re-added per wrapped row below.
     let graphemes = line
@@ -547,6 +612,20 @@ pub(crate) fn wrap_line_display(
     // Row 0 starts already carrying the transcript indent plus the echoed
     // glyph, so its wrap width is reduced by both.
     let mut row_width = (indent_width + glyph_width).min(w);
+    // Hanging indent: the first row's leading marker width (list bullet,
+    // ordered `12.` marker, or a code block's two-space indent) is
+    // re-applied as whitespace on every continuation row, so wrapped text
+    // aligns under the text column instead of sliding under the marker.
+    // Frozen at the first row break.
+    let mut hang: usize = 0;
+    // The echoed glyph is padded on continuation rows too (the composer
+    // hangs its glyph), so the continuation wrap budget loses it.
+    let glyph_pad = if first_row_overhang > 0 {
+        glyph_width
+    } else {
+        0
+    };
+    let mut first_row_done = false;
     let mut last_space: Option<usize> = None;
     for (symbol, style, is_tab) in raw {
         // Tab width is relative to the current column (row_width).
@@ -565,6 +644,10 @@ pub(crate) fn wrap_line_display(
             text = " ".repeat(width);
         }
         if row_width + width > w && !row.is_empty() {
+            if !first_row_done {
+                first_row_done = true;
+                hang = hang_width(&row, w / 3);
+            }
             if let Some(space) = last_space {
                 let remainder = row.split_off(space + 1);
                 row.truncate(space);
@@ -574,9 +657,10 @@ pub(crate) fn wrap_line_display(
                 rows.push(row);
                 row = Vec::new();
             }
-            // Only the first wrapped row is narrowed; continuations get the
-            // full width (minus the indent), like the composer.
-            row_width = indent_width + row.iter().map(|u: &Unit| u.width).sum::<usize>();
+            // Continuation rows carry the indent, the echoed-glyph pad and
+            // the hanging indent, so their wrap budget loses all three.
+            row_width =
+                indent_width + glyph_pad + hang + row.iter().map(|u: &Unit| u.width).sum::<usize>();
             last_space = None;
             if is_tab {
                 width = TAB_WIDTH - (row_width % TAB_WIDTH);
@@ -608,6 +692,12 @@ pub(crate) fn wrap_line_display(
                         .iter()
                         .map(|(text, style)| Span::styled(text.clone(), *style)),
                 );
+            } else {
+                // Continuations hang: the echoed glyph's pad (the composer
+                // hangs its glyph the same way) plus the first row's
+                // marker width as whitespace, so wrapped text stays on the
+                // text column instead of sliding under the marker.
+                spans.push(Span::raw(" ".repeat(glyph_pad + hang)));
             }
             spans.extend(row.into_iter().map(|u| Span::styled(u.text, u.style)));
             Line::from(spans)
