@@ -22,8 +22,7 @@ build, test, and submit changes. Please follow the
   reasoning effort.
 - **Agentic tool use** — the model can read files, run shell commands, write and
   edit files, and search the filesystem. External tools arrive via MCP servers
-  (stdio or HTTP/SSE, with OAuth). Extra built-ins (`git`, `chain`) sit behind
-  `DEX_EXTRA_TOOLS=1`. Tool output caching is off by default; set
+  (stdio or HTTP/SSE, with OAuth). Tool output caching is off by default; set
   `DEX_TOOL_CACHE=1` to opt in.
 - **Client–daemon architecture** — the TUI is a pure HTTP client; a daemon does
   the LLM calls, tools, and sessions. Attach from anywhere, reconnect with
@@ -627,18 +626,13 @@ schema):
 | `grep`             | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
 | `find`             | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
 | `ls`               | List files and directories (`path`, default `.`).                                                                                                                                                                                                                        |
-| `git`*             | Inspect repo status/diff (`mode`). Behind `DEX_EXTRA_TOOLS=1`.                                                                                                                                                                                                           |
-| `chain`*           | Bounded read-only search→read in one round trip. Behind `DEX_EXTRA_TOOLS=1`.                                                                                                                                                                                             |
-| `delegate`*        | Spawn a background sub-agent (`explorer`/`reviewer`/`tester`); `resume_from` continues one, `model` overrides (else inherits; resume keeps prior pick). Daemon sessions only. |
-| `delegate_output`* | Bounded wait (≤120 s) or poll for a delegated child's result.                                                                                                                                                                                                            |
-| `delegate_stop`*   | Cancel a running child and return its terminal result.                                                                                                                                                                                                                   |
-| `delegate_list`*   | List this session's children — live, finished, and interrupted on-disk runs — with resumability. Read-only.                                                                                                                                                              |
+| `delegate`*        | Sub-agents via `action`: `spawn` a background child (`explorer`/`reviewer`/`tester`; `resume_from` continues one, `model` overrides — else inherits; resume keeps prior pick), `wait` (bounded, ≤120 s) fetches its result, `stop` cancels it, `list` shows this session's children (live, finished, interrupted on-disk). Daemon sessions only. |
 
 The model-facing schema registers `grep` and `find`; both are also dispatched
 under their fff-engine names, `ffgrep`/`fffind` (`dex run ffgrep …` and older
 transcripts keep working).
 
-`*` behind `DEX_EXTRA_TOOLS=1` — default is 7 tools.
+`*` daemon sessions only (sub-agents); the default native schema is 7 tools.
 Tool results are truncated before being
 sent back to the model, and a result cache (`dex-tool-cache.json`) is kept only
 when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same
@@ -664,7 +658,8 @@ context, tool allowlist, and JSONL transcript
 (`$XDG_DATA_HOME/dex/sessions/<slug>/agents/*.jsonl`). Completions are announced
 at the next turn boundary and, while the session is idle with a client attached,
 a wake turn surfaces them immediately (off with `agent_wake: false` /
-`DEX_AGENT_WAKE=0`). `delegate_output` fetches a result on demand. Children may delegate
+`DEX_AGENT_WAKE=0`). The same `delegate` tool's `wait` action fetches a result on
+demand. Children may delegate
 further up to a nesting depth of 3. A recoverable ending — interrupted, timed
 out, or budget-exhausted with progress on disk — is marked `resumable` in its
 result: `delegate(resume_from: …)` continues that child from its transcript as
@@ -674,8 +669,8 @@ for or cancels a child and retries). Under `ask-*` modes a mutating call
 parks a labeled
 prompt in the session's approval queue — "explorer wants to run bash: …" —
 unanswered for five minutes it denies; session-level "allow" approvals apply to
-children too. `delegate_list` shows live, finished, and interrupted children.
-Set `DEX_SUBAGENTS=0` to unregister the tools.
+children too. The `list` action shows live, finished, and interrupted children.
+Set `DEX_SUBAGENTS=0` to unregister the tool.
 
 ### MCP servers
 
@@ -803,8 +798,7 @@ discovered extension with its consent state.
 | `TYPESAFE_JEV_URL`                                            | Override the Jev evaluation endpoint (default `https://api.typesafe.ai/v1/systemone`); tests and gateways.                                                                                                                                                                                                                                                                    |
 | `DEX_DURABLE`                                                 | `1` to `fsync` every session line (default only `turn_*`/`effect_*`).                                                                                                                                                                                                                                                                |
 | `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
-| `DEX_EXTRA_TOOLS`                                             | `1` to expose `git`+`chain` to the model (default 7 tools).                                                                                                                                                                                                                                                                                                                                                     |
-| `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate`/`delegate_output`/`delegate_stop`/`delegate_list` tools (default on in daemon sessions).                                                                                                                                                                                                                                                                                                       |
+| `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate` tool (default on in daemon sessions).                                                                                                                                                                                                                                                                                                                                                          |
 | `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
 | `DEX_ROUTING`                                                 | `1` to route each turn to a tiered model by complexity (default off). Tiers classify the prompt deterministically (no LLM call): `fast` (typos, trivial Q&A), `balanced` (normal work), `powerful` (multi-file, auth, migrations, security). An explicit `--model` / per-request model always wins; the routed tier is shown per turn, journaled on `turn_start`, and `dex doctor` shows each tier and where its model came from.                                                                                                   |
 | `DEX_ROUTING_<FAST|BALANCED|POWERFUL>`                        | Per-tier `provider/model` selection (same syntax as `DEX_MODEL`); wins over file `routing.<tier>:` for that tier. A tier with neither falls back to `routing.balanced:`, then to `model:`.                                                                                                                                                                                                                          |
@@ -825,7 +819,7 @@ discovered extension with its consent state.
 | `HOME`                                                        | Fallback when XDG vars are unset.                                                                                                                                                                                                                                                                                                                                                                               |
 
 Restore strict harness:
-`DEX_DURABLE=1 DEX_AUDIT=1 DEX_EXTRA_TOOLS=1 DEX_VERIFY=1 DEX_COMPACTION=llm dex`
+`DEX_DURABLE=1 DEX_AUDIT=1 DEX_VERIFY=1 DEX_COMPACTION=llm dex`
 
 ## Project structure
 

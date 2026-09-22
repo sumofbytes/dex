@@ -384,9 +384,9 @@ pub(crate) fn is_worthwhile(stats: &JevStats) -> bool {
 /// Tools whose output can be reproduced by re-running them — safe to drop
 /// verbatim when old and large. Single-sourced from the tool registry
 /// (`ToolMetadata::read_only + idempotent`) instead of a second tool list:
-/// pure reads (`read`, `ls`, the fff tools, `git`) drop when old and huge,
+/// pure reads (`read`, `ls`, the fff tools) drop when old and huge,
 /// while mutating / delegating / external tools (`bash`, `write`, `edit`,
-/// `chain`, `mcp__*`, extensions) only ever truncate, so file-op evidence
+/// `mcp__*`, extensions) only ever truncate, so file-op evidence
 /// and child answers survive. Unknown tools have no registry row and stay
 /// conservative: truncate, never drop.
 fn is_rerunnable(tool: &str) -> bool {

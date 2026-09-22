@@ -14,7 +14,8 @@ use super::super::SpawnMeta;
 use super::schema::is_delegation;
 use super::schema::status_word;
 use super::schema::AgentTurnContext;
-use super::schema::DELEGATION_TOOLS;
+use super::schema::DELEGATION_ACTIONS;
+use super::schema::DELEGATION_TOOL;
 use super::schema::MAX_AGENT_DEPTH;
 use super::schema::MAX_WAIT_SECONDS;
 use super::schema::WAIT_SLEEP;
@@ -46,9 +47,9 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-/// Dispatch the delegation tools from [`crate::tools::execute`]. The
-/// allowlist gate already ran (a child calling any delegation tool was
-/// rejected there, §11).
+/// Dispatch the `delegate` tool from [`crate::tools::execute`]. The
+/// allowlist gate already ran (a child calling it was rejected there, §11).
+/// One tool, four actions: spawn/wait/stop/list route on `args["action"]`.
 pub(crate) async fn execute_delegation(
     name: &str,
     args: &Map<String, Value>,
@@ -61,12 +62,19 @@ pub(crate) async fn execute_delegation(
              daemon-backed turn (one-shot and direct tool runs have no manager)"
         )));
     };
-    match name {
-        "delegate" => delegate(&ctx, args, policy).await,
-        "delegate_output" => delegate_output(&ctx, args, cancel).await,
-        "delegate_stop" => delegate_stop(&ctx, args).await,
-        "delegate_list" => delegate_list(&ctx).await,
-        _ => unreachable!("is_delegation and dispatch stay in sync"),
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("spawn");
+    match action {
+        "spawn" => delegate(&ctx, args, policy).await,
+        "wait" => delegate_output(&ctx, args, cancel).await,
+        "stop" => delegate_stop(&ctx, args).await,
+        "list" => delegate_list(&ctx).await,
+        other => Err(ToolError::InvalidArgument(format!(
+            "action must be one of {} (got '{other}')",
+            DELEGATION_ACTIONS.join(" | ")
+        ))),
     }
 }
 
@@ -389,7 +397,7 @@ pub(crate) fn parse_generation(file_name: &str) -> u32 {
 /// a retained terminal result that advertised one, else an interrupted
 /// on-disk run from a daemon-restart-killed child
 /// (`Session::list_children`). A live child is rejected — it needs
-/// `delegate_output`, not a second generation.
+/// a `delegate` `wait`, not a second generation.
 pub(crate) async fn resolve_resume_handle(
     ctx: &Arc<AgentTurnContext>,
     id: &AgentId,
@@ -400,14 +408,14 @@ pub(crate) async fn resolve_resume_handle(
                 return Ok(handle);
             }
             return Err(ToolError::InvalidArgument(format!(
-                "agent '{id}' ended {} and is not resumable; delegate_list shows resumable children",
+                "agent '{id}' ended {} and is not resumable; delegate action=list shows resumable children",
                 status_word(result.status)
             )));
         }
         WaitOutcome::Running(_) => {
             return Err(ToolError::InvalidArgument(format!(
-                "agent '{id}' is still running: use delegate_output to wait for it, \
-                 or delegate_stop first and then resume the terminal result"
+                "agent '{id}' is still running: use delegate action=wait for it, \
+                 or delegate action=stop first and then resume the terminal result"
             )));
         }
         WaitOutcome::Unknown => {}
@@ -448,7 +456,7 @@ pub(crate) async fn resolve_resume_handle(
     }
     Err(ToolError::InvalidArgument(format!(
         "unknown agent id '{id}': never spawned in this session, or its \
-         result aged out of retention; delegate_list shows live, retained, \
+         result aged out of retention; delegate action=list shows live, retained, \
          and interrupted children"
     )))
 }
@@ -762,7 +770,7 @@ async fn child_run(
     let open_out = open_calls.clone();
     // The child's sink lines drive three things: the §6 partial-summary
     // capture (last assistant text), the §15 progress label (the tool the
-    // child is currently running, read by `delegate_output`), and the §18
+    // child is currently running, read by the `wait` action), and the §18
     // usage tally (each `record_usage` emission folds into the result).
     let consumer = tokio::spawn(async move {
         while let Some(line) = sink_rx.recv().await {
@@ -815,7 +823,7 @@ async fn child_run(
         .cloned()
         .collect();
     if may_delegate {
-        allowed.extend(DELEGATION_TOOLS.iter().map(|t| t.to_string()));
+        allowed.insert(DELEGATION_TOOL.to_string());
     }
     let filter = ToolFilter {
         owner: def.name.clone(),

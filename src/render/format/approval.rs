@@ -26,8 +26,6 @@ pub(crate) fn approval_title_with_then_run(name: &str, has_then_run: bool) -> &'
         "grep" | "ffgrep" => "Search contents",
         "ls" => "List directory",
         "find" | "fffind" => "Find files",
-        "git" => "Git",
-        "chain" => "Chained read",
         _ => "Run tool",
     }
 }
@@ -111,20 +109,6 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
         "ls" => get("path")
             .map(|p| format!("ls: {}", p))
             .unwrap_or_else(|| "ls: .".to_string()),
-        "git" => get("mode")
-            .map(|m| format!("git {}", m))
-            .unwrap_or_else(|| "git".to_string()),
-        "chain" => obj
-            .and_then(|o| o.get("steps"))
-            .and_then(|v| v.as_array())
-            .map(|steps| {
-                let tools: Vec<&str> = steps
-                    .iter()
-                    .filter_map(|s| s.get("tool").and_then(|v| v.as_str()))
-                    .collect();
-                format!("{} steps: {}", steps.len(), tools.join(" → "))
-            })
-            .unwrap_or_else(|| "chain".to_string()),
         _ => short_arg(name, input),
     }
 }
@@ -292,13 +276,6 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                 vec![format!("path: {}", path)]
             } else {
                 vec!["path: .".to_string()]
-            }
-        }
-        "git" => {
-            if let Some(mode) = get("mode") {
-                vec![format!("git {}", mode)]
-            } else {
-                vec![input.to_string()]
             }
         }
         _ => vec![short_arg(name, input)],

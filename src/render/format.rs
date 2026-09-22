@@ -124,17 +124,6 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
         .and_then(|v| v.as_object().cloned());
     let get = |k: &str| obj.as_ref().and_then(|o| o.get(k)).and_then(|x| x.as_str());
     let primary: Option<String> = match name {
-        "chain" => obj
-            .as_ref()
-            .and_then(|o| o.get("steps"))
-            .and_then(Value::as_array)
-            .map(|steps| {
-                let tools: Vec<&str> = steps
-                    .iter()
-                    .filter_map(|step| step.get("tool").and_then(Value::as_str))
-                    .collect();
-                format!("{} steps: {}", steps.len(), tools.join(" → "))
-            }),
         "read" => read_short_arg(obj.as_ref()),
         "write" | "edit" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "glob" => get("path")
             .or_else(|| get("file"))
@@ -142,7 +131,6 @@ pub(crate) fn short_arg(name: &str, input: &str) -> String {
             .or_else(|| get("glob"))
             .map(str::to_string),
         // The input line already shows the tool name, so only the mode.
-        "git" => Some(get("mode").unwrap_or("status").to_string()),
         "bash" => get("command").map(str::to_string),
         _ => None,
     };
@@ -615,43 +603,6 @@ pub(crate) fn tool_result_summary(
                 )
             });
             format!("+{added} −{removed}{}", then_run_tail(text))
-        }
-        "chain" => {
-            let steps = obj
-                .as_ref()
-                .and_then(|o| o.get("steps"))
-                .and_then(Value::as_array)
-                .map(|steps| steps.len())
-                .unwrap_or(0);
-            // Each fan-out read emits a `==> path <==` section header. Step
-            // outputs are clamped, so their trailers are truncation notes —
-            // excluded from the line count and folded into `(+N more)`.
-            let files = text.matches("==> ").count();
-            let mut lines = 0usize;
-            let mut more = 0u64;
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if let Some(n) = trailer_more_lines(trimmed) {
-                    more += n;
-                    continue;
-                }
-                if trimmed.starts_with("[...") {
-                    continue;
-                }
-                lines += 1;
-            }
-            let mut out = format!(
-                "{steps} steps · {files} file{} · {lines} line{}",
-                if files == 1 { "" } else { "s" },
-                plural(lines)
-            );
-            if more > 0 {
-                out.push_str(&format!(" (+{more} more)"));
-            }
-            out
         }
         _ => match one_line_summary(text) {
             first if first.is_empty() => "(no output)".to_string(),
