@@ -297,6 +297,7 @@ fn esc_key() -> crossterm::event::KeyEvent {
 /// instead of hanging.
 fn test_remote() -> RemoteApp {
     let app = App {
+        remote_mode: true,
         transcript: Vec::new(),
         input: crate::ui::input::InputField::new(),
         config: crate::llm::config::LlmConfig {
@@ -808,6 +809,58 @@ fn remote_model_switch_drops_stale_thinking_override() {
         "model switch clears the old override so the daemon default applies"
     );
     assert!(remote.options.model.is_some(), "model still forwards");
+}
+
+#[test]
+fn remote_model_switch_does_not_write_config_file_back() {
+    // The daemon owns the real selection; the client's `/model` resolve is
+    // display-only. Without this, a remote `/model <bare-id>` persisted the
+    // client's view into the shared config file — silently repointing the
+    // default model (e.g. `opencode/x` to a bare id under whatever provider
+    // the client happened to resolve).
+    use crate::session::TEST_SESSIONS_ENV_LOCK;
+    let _lock = TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!(
+        "dex-remote-model-nofile-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = crate::session::EnvGuard(vec![
+        ("DEX_CONFIG", std::env::var_os("DEX_CONFIG")),
+        ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+    ]);
+    std::env::set_var("XDG_CONFIG_HOME", &dir);
+    std::env::remove_var("DEX_CONFIG");
+
+    let mut remote = test_remote();
+    remote.app.config.model = "opencode/other-model".into();
+    handle_remote_slash(&mut remote, "/model other-model");
+    assert!(remote.options.model.is_some(), "override still forwards");
+    assert_eq!(
+        remote.app.config.model, "other-model",
+        "display reflects the picked id without client-side resolution"
+    );
+    assert!(
+        remote
+            .app
+            .config
+            .available_models
+            .iter()
+            .any(|c| c == "other-model"),
+        "picked id stays completable in the input"
+    );
+
+    // No config file may have been created for the write-back.
+    let cfg = dir.join("dex/config.yaml");
+    assert!(!cfg.exists(), "remote /model wrote back the config file");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -528,6 +528,22 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
         return;
     }
     let old_provider = app.config.provider.clone();
+    // Remote TUI: the daemon owns endpoint routing and credentials — the
+    // client may not even have the target provider's key, so resolve
+    // nothing locally. Update the display; `handle_remote_slash` forwards
+    // the raw selection and the daemon persists it in the session state,
+    // never in the shared config file.
+    if app.remote_mode {
+        if !app.config.available_models.iter().any(|c| c == &m) {
+            app.config.available_models.push(m.clone());
+        }
+        app.config.model = m;
+        push_info(
+            app,
+            format!("model selection sent to the daemon: {}", app.config.model),
+        );
+        return;
+    }
     let endpoint = match app.config.apply_model(&m, true) {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -607,7 +623,10 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
                 format!("provider already selected: {}", provider.name()),
             );
         }
-        Some(provider) => match app.config.switch_provider(&provider, true) {
+        // Defensive: `handle_remote_slash` intercepts `/provider <name>`
+        // before this runs, so remote clients never reach it — the gate
+        // mirrors `cmd_model` in case that routing ever changes.
+        Some(provider) => match app.config.switch_provider(&provider, !app.remote_mode) {
             Ok(()) => {
                 let _ = app.session.set_state("provider", provider.name());
                 push_info(app, format!("switched to provider: {}", provider.name()));
