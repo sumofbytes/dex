@@ -272,6 +272,7 @@ pub(crate) fn bootstrap(
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let app = App {
+        remote_mode: true,
         transcript: Vec::new(),
         input: crate::ui::input::InputField::new(),
         config: display_config(&info),

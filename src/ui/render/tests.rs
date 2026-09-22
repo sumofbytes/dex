@@ -211,6 +211,7 @@ fn apply_selection_full_width_end_row_matches_whole_line() {
 fn test_app() -> super::super::App {
     let cwd = "/tmp/dex-ui-test".to_string();
     super::super::App {
+        remote_mode: false,
         transcript: vec![super::super::TranscriptBlock::Assistant {
             stamp: 0,
             lines: vec![super::super::indent_transcript_line(Line::from(
