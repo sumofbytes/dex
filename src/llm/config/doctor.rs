@@ -20,6 +20,7 @@ use super::provider::model_api_from_env;
 use super::provider::resolve_provider;
 use super::provider::ProviderEntry;
 use super::routing::classify::Tier;
+use super::routing::routing_effort_display;
 use super::routing::routing_resolution;
 use super::routing::routing_tier_display;
 use super::selection::classify_selection;
@@ -44,7 +45,7 @@ use std::env;
 /// wraps: the value prints in full on its own line and the origin hangs at the
 /// origin column, so long paths never run into the origin text.
 pub(crate) fn row(out: &mut String, key: &str, value: &str, source: &str) {
-    const KEY_COLS: usize = 18;
+    const KEY_COLS: usize = 23;
     const VALUE_COLS: usize = 46;
     // A key wider than its column would collapse the padding and shift every
     // origin column: fail in debug builds instead.
@@ -397,9 +398,10 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
         if wake { "on" } else { "off" },
         wake_source,
     );
-    // Complexity router (V1): one row per value — the switch plus each
-    // tier's resolved selection (tier miss → routing.balanced: →
-    // top-level model:), sharing `from_env`'s resolution.
+    // Complexity router: one row per value — the switch plus each tier's
+    // resolved (model, effort) tuple (model: tier miss → routing.balanced: →
+    // top-level model:; effort: tier miss → routing.balanced_effort: → keep
+    // thinking_effort:), sharing `from_env`'s resolution.
     let routing = routing_resolution(d.file);
     row(
         out,
@@ -415,6 +417,13 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
             d.routing_selection_source,
         );
         row(out, &format!("routing {}", tier.key()), &value, &origin);
+        let (effort, effort_origin) = routing_effort_display(tier, &routing);
+        row(
+            out,
+            &format!("routing {} effort", tier.key()),
+            &effort,
+            &effort_origin,
+        );
     }
 
     // Headers: count per layer, sources joined.

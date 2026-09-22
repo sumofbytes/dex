@@ -174,17 +174,18 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         (config_result, skills, sess)
     });
     let mut config = config_result?;
-    // Complexity router (V1): an explicit `--model` always wins;
-    // otherwise the classified tier resolves through routing.balanced: →
-    // top-level model:, rebuilding once with the tier's model. The first
-    // build above is still needed on the routed path: it validates the
-    // top-level selection in parallel with the session load (and gates
-    // session creation), while routing needs that load's history as its
-    // signal — so a routed turn builds twice (plus routing's own
-    // lightweight file read inside `route_turn`), an unrouted turn once. Both
-    // builds share the catalog cache, so the second is cheap. (The daemon
-    // loads history before its single `from_env_async`, so it always builds
-    // once.)
+    // Complexity router: an explicit `--model` always wins; otherwise the
+    // classified tier resolves the `(model, thinking_effort)` tuple through
+    // routing.balanced:_ → top-level model: (model) and routing
+    // .balanced_effort: → keep thinking_effort: (effort), rebuilding once
+    // with the tier's model. The first build above is still needed on the
+    // routed path: it validates the top-level selection in parallel with
+    // the session load (and gates session creation), while routing needs
+    // that load's history as its signal — so a routed turn builds twice
+    // (plus routing's own lightweight file read inside `route_turn`), an
+    // unrouted turn once. Both builds share the catalog cache, so the
+    // second is cheap. (The daemon loads history before its single
+    // `from_env_async`, so it always builds once.)
     let routed = if args.model.as_deref().is_some_and(|m| !m.trim().is_empty()) {
         None
     } else {
@@ -192,6 +193,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     };
     let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
     let routed_why = routed.as_ref().map(|r| r.reason_label());
+    let routed_effort = routed.as_ref().and_then(|r| r.effort_override.clone());
     if let Some(model) = routed.and_then(|r| r.model_override) {
         config = LlmConfig::from_env(
             args.base_url.clone(),
@@ -201,11 +203,22 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         )
         .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
     }
+    // No explicit thinking flag headlessly, so a routed effort always wins
+    // over the rebuilt config's stored/env/file default when set.
+    if let Some(effort) = routed_effort.clone() {
+        config.thinking_effort = Some(effort);
+    }
     // Surface the routed tier: headless users get no other signal that the
     // model changed under them (the tier is also journaled on `turn_start`).
     if let Some(tier) = routed_tier.as_deref() {
         let why = routed_why.as_deref().unwrap_or("ordinary work");
-        eprintln!("dex: routing → {tier} ({why}; model {})", config.model);
+        match routed_effort.as_deref() {
+            Some(effort) => eprintln!(
+                "dex: routing → {tier} ({why}; model {}, effort {effort})",
+                config.model
+            ),
+            None => eprintln!("dex: routing → {tier} ({why}; model {})", config.model),
+        }
     }
     // No TUI here, so stderr is safe: keep the mismatch hint CLI users had.
     if let Some(warning) = config.thinking_mismatch_warning() {

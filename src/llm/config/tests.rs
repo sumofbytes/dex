@@ -2321,7 +2321,7 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
         let origin = lines.next().expect("origin line");
         assert_eq!(
             origin.find("missing or invalid"),
-            Some(18 + 46),
+            Some(23 + 46),
             "origin hangs at the origin column: {origin:?}"
         );
         return;
@@ -2330,7 +2330,7 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
 }
 
 /// Padding counts display columns: a CJK path is 31 chars but only 45
-/// columns wide, so the origin still lands on column 64.
+/// columns wide, so the origin still lands on column 69.
 #[test]
 fn doctor_pads_by_display_width() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -2357,8 +2357,8 @@ fn doctor_pads_by_display_width() {
         .expect("origin inline on the value line");
     assert_eq!(
         UnicodeWidthStr::width(&line[..at]),
-        18 + 46,
-        "origin starts at display column 64: {line:?}"
+        23 + 46,
+        "origin starts at display column 69: {line:?}"
     );
 }
 
@@ -2421,47 +2421,51 @@ fn doctor_output_is_byte_stable() {
             concat!(
                 concat!("dex ", env!("CARGO_PKG_VERSION"), "\n"),
                 "\n",
-                "config            /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
-                "catalog           /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
-                "                                                                missing — run `dex update --models`\n",
+                "config                 /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
+                "catalog                /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
+                "                                                                     missing — run `dex update --models`\n",
                 "\n",
-                "provider          opencode                                      built-in default\n",
-                "model             (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "base_url          https://opencode.ai/zen/v1                    built-in default\n",
-                "api key           (hidden)                                      OPENCODE_API_KEY (environment)\n",
-                "protocol          openai-responses                              default (auto-fallback to completions)\n",
-                "context           UNKNOWN tokens                                no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW\n",
+                "provider               opencode                                      built-in default\n",
+                "model                  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "base_url               https://opencode.ai/zen/v1                    built-in default\n",
+                "api key                (hidden)                                      OPENCODE_API_KEY (environment)\n",
+                "protocol               openai-responses                              default (auto-fallback to completions)\n",
+                "context                UNKNOWN tokens                                no catalog entry for this model — set context_window: or DEX_CONTEXT_WINDOW\n",
             ),
             concat!(
-                "compaction        deterministic                                 built-in default\n",
-                "jev scorer        heuristic scorer                              no TYPESAFE_API_KEY\n",
-                "thinking          (unset)                                       model default\n",
-                "permission        trusted                                       built-in default\n",
-                "agent wake        on                                            built-in default\n",
-                "routing           off                                           built-in default\n",
-                "routing fast      (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing balanced  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "routing powerful  (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-                "headers           0                                             none\n",
-                "endpoints         go, zen                                       available to /model routing\n",
-                "system prompt     default                                       built-in default\n",
-                "extensions        none                                          cwd/.dex, XDG config dirs\n",
+                "compaction             deterministic                                 built-in default\n",
+                "jev scorer             heuristic scorer                              no TYPESAFE_API_KEY\n",
+                "thinking               (unset)                                       model default\n",
+                "permission             trusted                                       built-in default\n",
+                "agent wake             on                                            built-in default\n",
+                "routing                off                                           built-in default\n",
+                "routing fast           (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing fast effort    (unset — keeps thinking_effort:)              unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)\n",
+                "routing balanced       (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing balanced effort(unset — keeps thinking_effort:)              unset (keeps thinking_effort:)\n",
+                "routing powerful       (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
+                "routing powerful effort(unset — keeps thinking_effort:)              unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)\n",
+                "headers                0                                             none\n",
+                "endpoints              go, zen                                       available to /model routing\n",
+                "system prompt          default                                       built-in default\n",
+                "extensions             none                                          cwd/.dex, XDG config dirs\n",
                 "\n",
-                "resolve           ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
-                "                                                                  opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n",
-                "                                                                  anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
-                "                                                                  custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
-                "                                                                  codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
-                "                                                                config: /tmp/dex-doctor-snapshot/missing.yaml\n",
+                "resolve                ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
+                "                                                                       opencode: model: zen/<model-id> + providers.opencode.api_key (or OPENCODE_API_KEY)\n",
+                "                                                                       anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
+                "                                                                       custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
+                "                                                                       codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
+                "                                                                     config: /tmp/dex-doctor-snapshot/missing.yaml\n",
             )
         );
     assert_eq!(out, expected, "doctor output drifted");
 }
 
 /// Complexity router: off with unset tiers by default; file `routing:`
-/// parses the switch plus per-tier selections; env beats file per tier;
-/// an unknown tier key and a non-string tier warn and fall through
-/// instead of erroring (the typo policy `load_config_file` uses).
+/// parses the switch plus per-tier selections and efforts; env beats file
+/// per tier and per effort; an unknown tier key and a non-string tier warn
+/// and fall through instead of erroring (the typo policy
+/// `load_config_file` uses).
 #[test]
 fn routing_resolution_reads_switch_tiers_and_env() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -2473,6 +2477,9 @@ fn routing_resolution_reads_switch_tiers_and_env() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
         "XDG_CACHE_HOME",
     ]);
     for key in [
@@ -2480,27 +2487,34 @@ fn routing_resolution_reads_switch_tiers_and_env() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
     ] {
         std::env::remove_var(key);
     }
-    // Default: off, every tier unset.
+    // Default: off, every tier and effort unset.
     let r = super::routing_resolution(&None);
     assert!(!r.enabled);
     assert_eq!(r.enabled_origin, "built-in default");
     assert!(r.tiers.fast.is_empty());
     assert!(r.tiers.balanced.is_empty());
     assert!(r.tiers.powerful.is_empty());
+    assert!(r.efforts.fast.is_empty());
+    assert!(r.efforts.balanced.is_empty());
+    assert!(r.efforts.powerful.is_empty());
     // File switch + tiers; env wins one tier; garbage warns through.
     let dir = std::env::temp_dir().join(format!("dex-routing-res-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
             dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/mid\n  powerful: 7\n  bogus: myprov/nope\n",
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/mid\n  powerful: 7\n  bogus: myprov/nope\n  fast_effort: low\n  balanced_effort: medium\n",
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("DEX_ROUTING_POWERFUL", "myprov/fast");
+    std::env::set_var("DEX_ROUTING_POWERFUL_EFFORT", "high");
     let file = super::load_config_file();
     let r = super::routing_resolution(&file);
     assert!(r.enabled);
@@ -2511,8 +2525,17 @@ fn routing_resolution_reads_switch_tiers_and_env() {
     // Non-string file tier ignored; env fills the gap with env origin.
     assert_eq!(r.tiers.powerful, "myprov/fast");
     assert_eq!(r.tier_origins.powerful, "DEX_ROUTING_POWERFUL");
+    // Efforts resolve the same way: file tiers plus a tier env override.
+    assert_eq!(r.efforts.fast, "low");
+    assert_eq!(r.effort_origins.fast, "config routing.fast_effort:");
+    assert_eq!(r.efforts.balanced, "medium");
+    assert_eq!(r.effort_origins.balanced, "config routing.balanced_effort:");
+    assert_eq!(r.efforts.powerful, "high");
+    assert_eq!(r.effort_origins.powerful, "DEX_ROUTING_POWERFUL_EFFORT");
     std::env::remove_var("DEX_ROUTING_POWERFUL");
-    // Unknown tier keys are ignored: only fast/balanced/powerful exist.
+    std::env::remove_var("DEX_ROUTING_POWERFUL_EFFORT");
+    // Unknown routing keys are ignored: only enabled, the three tier
+    // models, and the three tier efforts exist.
     std::fs::write(
             dir.join("config.yaml"),
             "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  low: myprov/cheap\n  medium: myprov/mid\n",
@@ -2523,6 +2546,9 @@ fn routing_resolution_reads_switch_tiers_and_env() {
     assert!(r.tiers.fast.is_empty());
     assert!(r.tiers.balanced.is_empty());
     assert!(r.tiers.powerful.is_empty());
+    assert!(r.efforts.fast.is_empty());
+    assert!(r.efforts.balanced.is_empty());
+    assert!(r.efforts.powerful.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2540,6 +2566,9 @@ fn routing_switch_empty_and_garbage_fall_through_to_file() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
         "XDG_CACHE_HOME",
     ]);
     for key in [
@@ -2547,6 +2576,9 @@ fn routing_switch_empty_and_garbage_fall_through_to_file() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
     ] {
         std::env::remove_var(key);
     }
@@ -2594,6 +2626,9 @@ fn routing_tier_env_empty_falls_through_to_file() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
         "XDG_CACHE_HOME",
     ]);
     for key in [
@@ -2601,6 +2636,9 @@ fn routing_tier_env_empty_falls_through_to_file() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
     ] {
         std::env::remove_var(key);
     }
@@ -2630,8 +2668,10 @@ fn routing_tier_env_empty_falls_through_to_file() {
 }
 
 /// `route_turn`: `None` when routing is off; otherwise the classified
-/// tier resolves through `routing.balanced:` → `model:`, overriding only
-/// when the tier names a different selection (no pointless rebuilds).
+/// tier resolves the `(model, thinking_effort)` tuple through
+/// `routing.balanced:` → `model:` (model) and `routing.balanced_effort:`
+/// → keep `thinking_effort:` (effort), overriding each only when the tier
+/// names a different value (no pointless rebuilds).
 #[test]
 fn route_turn_classifies_and_overrides_only_on_change() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -2644,6 +2684,9 @@ fn route_turn_classifies_and_overrides_only_on_change() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
         "XDG_CACHE_HOME",
     ]);
     for key in [
@@ -2652,6 +2695,9 @@ fn route_turn_classifies_and_overrides_only_on_change() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
     ] {
         std::env::remove_var(key);
     }
@@ -2666,12 +2712,14 @@ fn route_turn_classifies_and_overrides_only_on_change() {
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
     // Trivial prompt → fast tier → override to the cheap model.
+    // No efforts configured yet → no effort override.
     let routed = super::route_turn("fix typo", &[]).expect("routing on");
     assert_eq!(
         routed.tier,
         crate::llm::config::routing::classify::Tier::Fast
     );
     assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
+    assert_eq!(routed.effort_override, None);
     assert_eq!(routed.reasons, vec!["typo"]);
     assert_eq!(routed.reason_label(), "typo");
     // Ordinary work with history behind it → balanced, which already is
@@ -2683,6 +2731,7 @@ fn route_turn_classifies_and_overrides_only_on_change() {
         crate::llm::config::routing::classify::Tier::Balanced
     );
     assert_eq!(routed.model_override, None);
+    assert_eq!(routed.effort_override, None);
     assert_eq!(routed.reason_label(), "ordinary work");
     // Migration work escalates; unset powerful falls back to balanced.
     let routed = super::route_turn("run the database migration", &[]).expect("routing on");
@@ -2691,6 +2740,30 @@ fn route_turn_classifies_and_overrides_only_on_change() {
         crate::llm::config::routing::classify::Tier::Powerful
     );
     assert_eq!(routed.model_override, None);
+    assert_eq!(routed.effort_override, None);
+    // Per-tier efforts turn the decision into a tuple: the tier's effort
+    // rides along, an unset tier effort falls back to `balanced_effort`,
+    // and a tier effort env var beats the file.
+    std::fs::write(
+            dir.join("config.yaml"),
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/m-7\n  fast_effort: low\n  balanced_effort: medium\n",
+        )
+        .unwrap();
+    let routed = super::route_turn("fix typo", &[]).expect("routing on");
+    assert_eq!(routed.model_override.as_deref(), Some("myprov/cheap"));
+    assert_eq!(routed.effort_override.as_deref(), Some("low"));
+    // Powerful has no effort of its own → the balanced effort applies.
+    let routed = super::route_turn("run the database migration", &[]).expect("routing on");
+    assert_eq!(
+        routed.tier,
+        crate::llm::config::routing::classify::Tier::Powerful
+    );
+    assert_eq!(routed.model_override, None);
+    assert_eq!(routed.effort_override.as_deref(), Some("medium"));
+    std::env::set_var("DEX_ROUTING_POWERFUL_EFFORT", "high");
+    let routed = super::route_turn("run the database migration", &[]).expect("routing on");
+    assert_eq!(routed.effort_override.as_deref(), Some("high"));
+    std::env::remove_var("DEX_ROUTING_POWERFUL_EFFORT");
     // Routing off → None even for a powerful-shaped prompt.
     std::fs::write(
             dir.join("config.yaml"),
@@ -2702,8 +2775,9 @@ fn route_turn_classifies_and_overrides_only_on_change() {
 }
 
 /// `dex doctor` shows the routing switch plus each tier's resolved
-/// model and origin — an unset tier displays the `balanced` fallback it
-/// would actually use at runtime.
+/// `(model, effort)` tuple and origin — an unset tier model displays the
+/// `balanced` fallback it would actually use at runtime, and an unset
+/// tier effort keeps `thinking_effort:`.
 #[test]
 fn doctor_shows_routing_tiers_with_origins() {
     let _env = crate::session::TEST_SESSIONS_ENV_LOCK
@@ -2716,6 +2790,9 @@ fn doctor_shows_routing_tiers_with_origins() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
         "OPENCODE_API_KEY",
         "XDG_CACHE_HOME",
     ]);
@@ -2725,6 +2802,9 @@ fn doctor_shows_routing_tiers_with_origins() {
         "DEX_ROUTING_FAST",
         "DEX_ROUTING_BALANCED",
         "DEX_ROUTING_POWERFUL",
+        "DEX_ROUTING_FAST_EFFORT",
+        "DEX_ROUTING_BALANCED_EFFORT",
+        "DEX_ROUTING_POWERFUL_EFFORT",
     ] {
         std::env::remove_var(key);
     }
@@ -2733,15 +2813,15 @@ fn doctor_shows_routing_tiers_with_origins() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
             dir.join("config.yaml"),
-            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/mid\n",
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\nrouting:\n  enabled: true\n  fast: myprov/cheap\n  balanced: myprov/mid\n  fast_effort: low\n  balanced_effort: medium\n",
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
     let out = super::doctor(None, None, None, &[], None);
-    // One switch row plus three tier rows.
+    // One switch row plus three tier rows plus three effort rows.
     let routing: Vec<&str> = out.lines().filter(|l| l.starts_with("routing")).collect();
-    assert_eq!(routing.len(), 4, "{out}");
+    assert_eq!(routing.len(), 7, "{out}");
     assert!(routing[0].contains("on"), "{}", routing[0]);
     assert!(
         routing[0].contains("config routing.enabled:"),
@@ -2754,13 +2834,40 @@ fn doctor_shows_routing_tiers_with_origins() {
         "{}",
         routing[1]
     );
-    // Unset powerful shows the balanced fallback with balanced's origin —
-    // the same chain `model_for` applies at runtime.
+    // Fast effort resolves from its own tier with its own origin.
+    assert!(routing[2].contains("low"), "{}", routing[2]);
+    assert!(
+        routing[2].contains("config routing.fast_effort:"),
+        "{}",
+        routing[2]
+    );
+    // Balanced tier resolves from its own entries.
     assert!(routing[3].contains("myprov/mid"), "{}", routing[3]);
     assert!(
         routing[3].contains("config routing.balanced:"),
         "{}",
         routing[3]
+    );
+    assert!(routing[4].contains("medium"), "{}", routing[4]);
+    assert!(
+        routing[4].contains("config routing.balanced_effort:"),
+        "{}",
+        routing[4]
+    );
+    // Unset powerful model shows the balanced fallback with balanced's
+    // origin — the same chain `model_for` applies at runtime.
+    assert!(routing[5].contains("myprov/mid"), "{}", routing[5]);
+    assert!(
+        routing[5].contains("config routing.balanced:"),
+        "{}",
+        routing[5]
+    );
+    // Unset powerful effort likewise falls back to the balanced effort.
+    assert!(routing[6].contains("medium"), "{}", routing[6]);
+    assert!(
+        routing[6].contains("config routing.balanced_effort:"),
+        "{}",
+        routing[6]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
