@@ -218,6 +218,24 @@ fn preview_budget_counts_display_columns_not_chars() {
     assert_eq!(clipped.chars().count(), 160, "159 wide chars + ellipsis");
 }
 
+/// Empty `paths`/`glob` arrive as schema defaults next to a real `path`;
+/// the approval surface must describe the read that will actually run.
+#[test]
+fn approval_read_treats_empty_paths_and_glob_as_absent() {
+    let input = r#"{"path":"src/a.rs","paths":[],"glob":""}"#;
+    assert_eq!(approval_summary("read", input), "src/a.rs");
+    assert_eq!(approval_details("read", input), vec!["path: src/a.rs"]);
+    // Populated variants keep their fan-out display.
+    assert_eq!(
+        approval_summary("read", r#"{"paths":["a","b"]}"#),
+        "2 files"
+    );
+    assert_eq!(
+        approval_summary("read", r#"{"glob":"src/**/*.rs"}"#),
+        "glob: src/**/*.rs"
+    );
+}
+
 #[test]
 fn summary_is_outcome_first_without_ok_prefix() {
     // A successful read whose content happens to contain the shell
