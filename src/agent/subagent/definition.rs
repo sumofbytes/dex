@@ -204,7 +204,7 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
 
 const EXPLORER_MD: &str = "---\nname: explorer\ndescription: Understand code without modifying it. Give it a question about the codebase; it returns findings in prose with file paths. Read-only: never modifies files or runs commands.\ntools: read, grep, find\n---\nYou are an explorer. Answer the task with findings in prose: file paths, relevant snippets, risks. Never modify files or run shell commands — you do not have those tools. If the task needs something outside your tools, say so in your result instead of working around it.\n";
 
-const REVIEWER_MD: &str = "---\nname: reviewer\ndescription: Review a diff or change for correctness and regressions. Give it what changed; it returns findings in prose. Read-only.\ntools: read, grep, find\n---\nYou are a reviewer. Review the change for correctness, regressions, and missed edge cases; report findings in prose with file paths and line references. Never modify files or run shell commands outside your tools.\n";
+const REVIEWER_MD: &str = "---\nname: reviewer\ndescription: Review a diff or change for correctness and regressions. Give it what changed; it returns findings in prose. Read-only in spirit: shell access exists so it can diff, never to mutate.\ntools: read, grep, find, bash\n---\nYou are a reviewer. Review the change for correctness, regressions, and missed edge cases; report findings in prose with file paths and line references. Your shell is for inspecting the change (git diff, git log, running tests) — never modify files, deploy, or delete; if a command would mutate the repo, report it as a finding instead of running it.\n";
 
 const TESTER_MD: &str = "---\nname: tester\ndescription: Investigate and run relevant tests. Give it what to verify; it reports pass/fail plus failures in prose. May run shell commands: they run under a trusted permission policy and are auto-denied otherwise.\ntools: read, grep, find, bash\n---\nYou are a tester. Investigate the requested area and run the relevant tests with your shell; report pass/fail plus the failures in prose with file paths. Keep commands read-only in spirit (run tests, do not deploy or delete). If a command is denied, report that instead of working around it.\n";
 
@@ -343,7 +343,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(tools("explorer"), ["find", "grep", "read"]);
-        assert_eq!(tools("reviewer"), ["find", "grep", "read"]);
+        assert_eq!(tools("reviewer"), ["bash", "find", "grep", "read"]);
         assert_eq!(tools("tester"), ["bash", "find", "grep", "read"]);
     }
 
