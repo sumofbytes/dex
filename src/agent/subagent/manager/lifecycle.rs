@@ -38,8 +38,8 @@ pub(crate) const MAX_CHILDREN: usize = 4;
 /// without bound.
 pub(crate) const MAX_NOTICES: usize = 32;
 
-/// Terminal results retained per session, so `wait` (and Phase 5's
-/// `delegate_output`) can fetch them after the notice is drained.
+/// Terminal results retained per session, so the `delegate` tool's
+/// `wait` action can fetch them after the notice is drained.
 const MAX_RESULTS: usize = 64;
 /// `wait` poll quantum: prompt completion delivery without busy-spinning.
 const WAIT_POLL: Duration = Duration::from_millis(25);
@@ -499,7 +499,7 @@ impl AgentManager {
     /// Current lifecycle state, live or terminal. `None` for unknown ids.
     /// Cancel-surfaced states arrive here once the wrapper funnels them
     /// through `finish` — `cancel` itself only signals the token.
-    /// Point-in-time view for `delegate_list` (§24.3): live children
+    /// Point-in-time view for the `delegate` `list` action (§24.3): live children
     /// with their progress label, plus retained terminal results with
     /// their resumability. Sorted by id for a stable render.
     pub(crate) fn snapshot(&self) -> Vec<ChildInfo> {

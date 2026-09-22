@@ -513,7 +513,7 @@ pub(crate) fn wrap_line_display(
     /// command, not past `$ `. MCP tools (`⇄ mcp__<server>__<tool> …`)
     /// match by prefix instead.
     const TOOL_NAMES: &[&str] = &[
-        "bash", "read", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls", "git", "chain",
+        "bash", "read", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls",
     ];
 
     /// One-cell glyphs that head a transcript tool-input row (`$ bash …`).
