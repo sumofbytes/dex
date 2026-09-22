@@ -377,7 +377,9 @@ pub(super) fn ui_status(app: &App) -> String {
 
 fn compact_pieces(app: &App) -> Vec<Piece> {
     // Narrow tier: cwd + branch + model + spend. Branch and cost share
-    // helpers with the full line so the tiers cannot drift.
+    // helpers with the full line so the tiers cannot drift. The model stays
+    // canonical `provider/model` like the full line — width tiers shed the
+    // cwd/branch first, never the provider.
     let mut pieces = vec![(compact_path(&app.cwd), fg(theme::accent_fg()))];
     let branch = branch_pieces(app);
     if !branch.is_empty() {
@@ -385,7 +387,7 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
         pieces.extend(branch);
     }
     push_sep(&mut pieces);
-    pieces.push(quiet(app.config.model.clone()));
+    pieces.push(quiet(model_label(app)));
     pieces.push(sep());
     pieces.push(mode_piece(app));
     pieces.extend(agents_pieces(app));
@@ -394,6 +396,8 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
 }
 
 fn bare_pieces(app: &App) -> Vec<Piece> {
+    // Narrowest tier: brevity beats precision — the bare id keeps the
+    // connection badge on screen when even `provider/model` won't fit.
     let mut pieces = vec![mode_piece(app)];
     push_sep(&mut pieces);
     pieces.push(quiet(app.config.model.clone()));

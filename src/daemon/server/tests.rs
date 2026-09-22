@@ -341,7 +341,7 @@ mod handler_tests {
     fn thinking_override_sets_clears_and_keeps_default() {
         // Pure override applied per turn: None keeps, "" clears, else sets.
         let mut config = LlmConfig {
-            provider: crate::protocol::Provider::OpenCode,
+            provider: crate::protocol::Provider::Anthropic,
             api_key: String::new(),
             base_url: String::new(),
             model: "m".into(),
@@ -1771,7 +1771,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -1964,7 +1964,7 @@ mod e2e_tests {
         .unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -2119,7 +2119,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -2320,7 +2320,7 @@ mod e2e_tests {
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "DEX_CONFIG",
-            "DEX_PROVIDER",
+            "DEX_MODEL",
             "OPENCODE_API_KEY",
             "DEX_PERMISSION",
             "DEX_DAEMON_TOKEN",
@@ -2342,7 +2342,6 @@ mod e2e_tests {
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_PERMISSION", "ask-writes");
         std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
@@ -2402,7 +2401,9 @@ mod e2e_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let info: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(info["provider"], "opencode");
+        // Nothing selects a provider (the file carries no `model:`), so the
+        // best-effort info keeps the empty default instead of guessing one.
+        assert_eq!(info["provider"], "");
         // `ask-writes` is the deprecated spelling of `ask`; `as_str` never
         // emits it, so `/api/config` reports the canonical value.
         assert_eq!(info["permission"], "ask");
@@ -2415,7 +2416,7 @@ mod e2e_tests {
         );
 
         // Incomplete config still renders (best-effort info, no error).
-        std::env::set_var("DEX_PROVIDER", "definitely-not-a-provider");
+        std::env::set_var("DEX_MODEL", "definitely-not-a-provider/m");
         let resp = http
             .get(url("/api/config"))
             .header("authorization", "Bearer s3cret-token")
@@ -2487,7 +2488,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));

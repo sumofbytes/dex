@@ -220,7 +220,7 @@ fn test_app() -> super::super::App {
         }],
         input: InputField::new(),
         config: super::super::LlmConfig {
-            provider: Provider::OpenCode,
+            provider: Provider::Anthropic,
             api_key: "test".to_string(),
             base_url: "http://localhost".to_string(),
             model: "test-model".to_string(),
@@ -950,16 +950,18 @@ fn status_separators_never_double_without_branch() {
     branched.git_branch = Some("main".into());
     let text = ui_status(&branched);
     assert!(
-        text.contains("/tmp/dex-ui-test · main · opencode/test-model"),
+        text.contains("/tmp/dex-ui-test · main · anthropic/test-model"),
         "{text}"
     );
-    // The compact tier (reached at 60 cols once the cumulative total
-    // widens the earlier tiers) keeps the same invariant.
+    // The compact tier (reached once the cumulative total widens the
+    // earlier tiers) keeps the same invariant. Width 72: the no-cwd full
+    // line no longer fits, but the canonical `provider/model` compact line
+    // (~70 cells with the badge) still does.
     let mut app = test_app();
     app.connection = Some("[L] 127.0.0.1".into());
     app.tool_state.total_usage = 45_100;
     app.tool_state.total_cost = 0.023;
-    let narrow = footer_text(&app, 60);
+    let narrow = footer_text(&app, 72);
     assert!(narrow.starts_with("/tmp/dex-ui-test"), "{narrow}");
     assert!(!narrow.contains("·  ·"), "{narrow}");
 }
@@ -1058,7 +1060,7 @@ fn footer_pins_connection_badge_right() {
     // Narrower: the static cwd is shed before the mode chip — the line
     // still opens with live facts, never a dangling separator.
     let text = footer_text(&app, 80);
-    assert!(text.starts_with("opencode/test-model"), "{text}");
+    assert!(text.starts_with("anthropic/test-model"), "{text}");
     assert!(text.ends_with("[R] daemon.internal"), "{text}");
     assert_eq!(UnicodeWidthStr::width(text.as_str()), 80);
     // Narrow: badge survives over the bare mode + model pair.

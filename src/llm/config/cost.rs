@@ -18,6 +18,133 @@ pub(crate) fn cost_rates(entry: &serde_json::Value) -> Option<CostRates> {
     })
 }
 
+/// Compact rate: up to 4 decimals, no trailing zeros (`0.5`, not `0.5000`).
+fn fmt_rate(v: f64) -> String {
+    let s = format!("{v:.4}");
+    format!("${}", s.trim_end_matches('0').trim_end_matches('.'))
+}
+
+/// `$in/$out per 1M` when input and output differ, else `$in per 1M`.
+/// Missing output bills at the input rate (same rule as `usage_cost`).
+pub(crate) fn format_cost_label(cost: &CostRates) -> String {
+    let input = fmt_rate(cost.input);
+    match cost.output {
+        Some(out) if (out - cost.input).abs() > 1e-9 => {
+            format!("{input}/{} per 1M", fmt_rate(out))
+        }
+        _ => format!("{input} per 1M"),
+    }
+}
+
+/// One picker row's attribution: who serves the id and at what price.
+/// Resolved in one catalog-index pass (see `model_hints_for`).
+pub(crate) struct ModelHint {
+    pub(crate) provider: Option<String>,
+    pub(crate) cost: Option<String>,
+}
+
+/// Provider + cost per picker row, in one catalog-index pass (the popup
+/// runs per keystroke over thousands of ids — one stat + one map walk,
+/// never one lookup per row). A qualified `prefix/tail` keeps its prefix
+/// as the provider and prices that provider's entry (cheapest fallback);
+/// a bare id attributes the cheapest priced entry (`from` semantics: the
+/// row routes at pick time, the cheapest is the floor). `None` fields when
+/// the catalog has no entry for the id.
+pub(crate) fn model_hints_for(selections: &[String]) -> Vec<ModelHint> {
+    with_catalog_index(|index| {
+        selections
+            .iter()
+            .map(|sel| {
+                let (prefix, id) = match sel.split_once('/') {
+                    Some((p, rest)) if !p.is_empty() && !rest.is_empty() => (Some(p), rest),
+                    _ => (None, sel.as_str()),
+                };
+                let entries = index.by_id.get(id.to_ascii_lowercase().as_str());
+                let Some(entries) = entries else {
+                    return ModelHint {
+                        provider: prefix.map(str::to_string),
+                        cost: None,
+                    };
+                };
+                let cheapest = |a: &&IndexedModel, b: &&IndexedModel| {
+                    a.cost
+                        .as_ref()
+                        .map(|c| c.input)
+                        .unwrap_or(f64::MAX)
+                        .partial_cmp(&b.cost.as_ref().map(|c| c.input).unwrap_or(f64::MAX))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                };
+                let priced = |e: &&IndexedModel| e.cost.is_some();
+                let named = |e: &IndexedModel| (!e.provider.is_empty()).then(|| e.provider.clone());
+                match prefix {
+                    Some(p) => {
+                        let pick = entries
+                            .iter()
+                            .filter(priced)
+                            .find(|e| e.provider.eq_ignore_ascii_case(p))
+                            .or_else(|| entries.iter().filter(priced).min_by(cheapest));
+                        match pick {
+                            Some(e) => ModelHint {
+                                provider: Some(p.to_string()),
+                                cost: e.cost.as_ref().map(format_cost_label),
+                            },
+                            None => ModelHint {
+                                provider: Some(p.to_string()),
+                                cost: None,
+                            },
+                        }
+                    }
+                    None => {
+                        if let Some(e) = entries.iter().filter(priced).min_by(cheapest) {
+                            ModelHint {
+                                provider: named(e),
+                                cost: e.cost.as_ref().map(format_cost_label),
+                            }
+                        } else {
+                            ModelHint {
+                                provider: entries.iter().find_map(named),
+                                cost: None,
+                            }
+                        }
+                    }
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_else(|| {
+        selections
+            .iter()
+            .map(|sel| match sel.split_once('/') {
+                Some((p, rest)) if !p.is_empty() && !rest.is_empty() => ModelHint {
+                    provider: Some(p.to_string()),
+                    cost: None,
+                },
+                _ => ModelHint {
+                    provider: None,
+                    cost: None,
+                },
+            })
+            .collect()
+    })
+}
+
+/// One display cost per picker row (batch wrapper over `model_hints_for`).
+/// `None` when the catalog has no priced entry for the id.
+pub(crate) fn cost_hints_for(selections: &[String]) -> Vec<Option<String>> {
+    model_hints_for(selections)
+        .into_iter()
+        .map(|h| h.cost)
+        .collect()
+}
+
+/// Single-row convenience for `/model` confirmations.
+pub(crate) fn cost_hint_for(selection: &str) -> Option<String> {
+    cost_hints_for(std::slice::from_ref(&selection.to_string()))
+        .into_iter()
+        .next()
+        .flatten()
+}
+
 /// Shared 3-tier model-cost lookup for `usage_cost`: the entry whose `api`
 /// matches the configured endpoint wins, then any catalog entry of the
 /// configured provider, then any provider at all. Served from the

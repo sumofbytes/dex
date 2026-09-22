@@ -24,7 +24,6 @@ use super::routing::routing_effort_display;
 use super::routing::routing_resolution;
 use super::routing::routing_tier_display;
 use super::selection::classify_selection;
-use super::selection::provider_fallback_with_origin;
 use super::selection::provider_without_prefix;
 use super::selection::resolve_selection;
 use super::selection::split_selection;
@@ -129,10 +128,7 @@ fn base_url_source(
         }
     } else if entry.and_then(|e| e.base_url.clone()).is_some() {
         "config providers.<name>.base_url".to_string()
-    } else if matches!(
-        provider,
-        Provider::OpenCode | Provider::OpenAiCodex | Provider::Anthropic
-    ) {
+    } else if matches!(provider, Provider::OpenAiCodex | Provider::Anthropic) {
         "built-in default".to_string()
     } else {
         "models.dev catalog".to_string()
@@ -253,6 +249,19 @@ fn thinking_source(
 /// build when it succeeds; otherwise the derived values still explain the
 /// setup (e.g. missing key). Origins mirror `from_env` exactly.
 fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
+    if d.provider_name.trim().is_empty() {
+        // Nothing selects a provider anywhere — no default exists. The
+        // resolve row carries the setup guide; the provider-independent
+        // rows below still explain the rest of the setup.
+        row(
+            out,
+            "provider",
+            "(unset)",
+            "UNCONFIGURED — set 'model: <provider>/<model>'",
+        );
+        shared_rows(out, d, None, None, "", "(unset)", None);
+        return;
+    }
     let provider_opt = Provider::parse_known(d.provider_name, d.known).or_else(|| {
         d.custom_route
             .then(|| Provider::Generic("custom".to_string()))
@@ -262,8 +271,9 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
             out,
             "provider",
             d.provider_name,
-            "UNSUPPORTED — use opencode, openai-codex, anthropic, or add it under 'providers:'",
+            "UNSUPPORTED — use openai-codex, anthropic, or add it under 'providers:'",
         );
+        shared_rows(out, d, None, None, "", "(unset)", None);
         return;
     };
     let live = d
@@ -327,6 +337,32 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
         .unwrap_or(chain_ctx);
     row(out, "context", &format!("{ctx} tokens"), ctx_source);
 
+    shared_rows(
+        out,
+        d,
+        live,
+        entry,
+        &base_url,
+        &model,
+        Some(&resolved.endpoints),
+    );
+}
+
+/// Rows that answer "why is dex doing X?" regardless of which provider (if
+/// any) resolved: compaction, jev, thinking effort, permission, agent wake,
+/// the complexity router (switch + per-tier `(model, effort)` tuple), the
+/// header layers, the named endpoints, and the configured `providers:` list.
+/// Printed even when no provider resolves — those rows are provider-
+/// independent, and skipping them would hide most of the setup.
+fn shared_rows(
+    out: &mut String,
+    d: &ProviderDoctor<'_>,
+    live: Option<&LlmConfig>,
+    entry: Option<&ProviderEntry>,
+    base_url: &str,
+    model: &str,
+    endpoints: Option<&BTreeMap<String, String>>,
+) {
     // Threshold-compaction mode: value and origin owned by the Jev module
     // next to its parse, so the row cannot drift from runtime behavior.
     // Printed unconditionally.
@@ -360,7 +396,7 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
     };
     row(out, "jev scorer", &jev_row.0, &jev_row.1);
 
-    let (chain_effort, effort_source) = thinking_source(d.file, &base_url, &model);
+    let (chain_effort, effort_source) = thinking_source(d.file, base_url, model);
     let effort = live
         .and_then(|c| c.thinking_effort.clone())
         .unwrap_or(chain_effort);
@@ -460,8 +496,10 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
         },
     );
 
-    if !resolved.endpoints.is_empty() {
-        let names: Vec<&str> = resolved.endpoints.keys().map(String::as_str).collect();
+    // Named endpoints only exist for a resolved provider: without one
+    // there is nothing to route onto.
+    if let Some(endpoints) = endpoints.filter(|e| !e.is_empty()) {
+        let names: Vec<&str> = endpoints.keys().map(String::as_str).collect();
         row(
             out,
             "endpoints",
@@ -635,15 +673,12 @@ pub(crate) fn doctor(
     };
     let (selection_provider, pre_model, bare_pick) =
         doctor_selection_parts(selection.as_deref(), &known);
-    // Provider fallback shares `from_env`'s chain (and its deprecation
-    // warning, deduped) so the origin row cannot drift from routing.
-    let (fallback_provider, fallback_origin) = provider_fallback_with_origin(&file);
-    let provider_name = selection_provider.clone().unwrap_or_else(|| {
-        provider_without_prefix(
-            (fallback_provider.clone(), fallback_origin),
-            flag_base_url.as_deref(),
-        )
-    });
+    // Provider fallback shares `from_env`'s routing (--base-url → custom;
+    // otherwise the selection must carry the prefix) so the origin row
+    // cannot drift from routing.
+    let provider_name = selection_provider
+        .clone()
+        .unwrap_or_else(|| provider_without_prefix(flag_base_url.as_deref()));
     let provider_source = match selection_provider {
         // A bare pick carries no prefix; the selection origin says it all.
         Some(_) if bare_pick => selection_source.clone(),
@@ -651,7 +686,7 @@ pub(crate) fn doctor(
         // Same routing as `from_env`: an explicit --base-url with no
         // selection prefix lands on providers.custom, not the builtin.
         None if provider_name == "custom" => "--base-url (pins endpoint)".to_string(),
-        None => fallback_origin.unwrap_or("built-in default").to_string(),
+        None => "(unset)".to_string(),
     };
     // The real build, once: rows below take values from it so `doctor`
     // agrees with runtime routing (catalog endpoint moves, prefix

@@ -1,9 +1,7 @@
 use super::config_file_path;
 use super::invalidate_config_cache;
 use super::load_config_str;
-use super::provider::load_provider_name;
 use super::provider::setup_guide_error;
-use super::warn_once;
 use crate::protocol::Provider;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -11,7 +9,7 @@ use std::str::FromStr;
 
 use std::env;
 
-/// One `DEX_FOO=…` integer knob: env value parsed, `default` when the var is
+/// One `DEX_FOO=…` integer knob
 /// unset or unparseable. Single-sources the
 /// `env::var(..).ok().and_then(|v| v.parse().ok()).unwrap_or(..)` ladder
 /// repeated through `from_env`.
@@ -64,48 +62,16 @@ pub(crate) fn resolve_selection(
     Ok(Resolved { value, origin })
 }
 
-/// Provider fallback when the selection carries no prefix: `DEX_PROVIDER`
-/// (deprecated) > file `active_provider:` (deprecated) > "opencode".
-/// Returns doctor's origin wording alongside the name; `from_env` ignores
-/// it. The `warn_once` fires here (deduped) so both entry points warn.
-pub(crate) fn provider_fallback_with_origin(
-    file: &Option<serde_yaml::Value>,
-) -> (String, Option<&'static str>) {
-    if let Ok(name) = env::var("DEX_PROVIDER") {
-        if !name.trim().is_empty() {
-            warn_once(
-                "env:DEX_PROVIDER",
-                "env var DEX_PROVIDER is deprecated — use DEX_MODEL=<provider>/<model> (e.g. DEX_MODEL=openai-codex)",
-            );
-            return (name, Some("DEX_PROVIDER (deprecated)"));
-        }
-    }
-    match load_provider_name(file) {
-        Some(name) => (name, Some("config active_provider: (deprecated)")),
-        // `None` origin = nothing the user said; the name only shapes the
-        // key-error text (`from_env` errors on the missing model id before
-        // any request is built).
-        None => ("opencode".to_string(), None),
-    }
-}
-
-/// Provider for a selection that names none: the fallback chain — unless
-/// that chain lands on the builtin default *and* an explicit `--base-url`
-/// names an endpoint. Then the URL, not the default provider, is what the
-/// user configured: it routes onto `providers.custom.*` so key errors name
-/// the right deposit and opencode-specific wiring (key requirement,
-/// session headers) never fires for a foreign endpoint. An explicit
-/// deprecated pointer (`DEX_PROVIDER` / `active_provider:`) still wins —
-/// the user named a provider.
-pub(crate) fn provider_without_prefix(
-    fallback: (String, Option<&'static str>),
-    base_url_override: Option<&str>,
-) -> String {
-    let custom = fallback.1.is_none() && base_url_override.is_some_and(|u| !u.trim().is_empty());
-    if custom {
+/// Provider for a selection that names none: `custom` when an explicit
+/// `--base-url` names an endpoint (the URL, not a provider entry, is what
+/// the user configured — it routes onto `providers.custom.*` so key errors
+/// name the right deposit). Empty otherwise: there is no default provider —
+/// the selection must carry a `provider/` prefix.
+pub(crate) fn provider_without_prefix(base_url_override: Option<&str>) -> String {
+    if base_url_override.is_some_and(|u| !u.trim().is_empty()) {
         "custom".to_string()
     } else {
-        fallback.0
+        String::new()
     }
 }
 

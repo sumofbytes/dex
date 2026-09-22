@@ -420,10 +420,6 @@ pub(crate) async fn run_turn_inner(
         config.thinking_effort = Some(effort);
     }
     apply_thinking_override(&mut config, req.thinking_effort.as_deref());
-    // Console Go routing requires `x-opencode-session`.
-    // Auto-fill from the dex session id; explicit per-request headers
-    // below still win on collision.
-    crate::llm::config::apply_opencode_session_headers(&mut config, session_id);
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
     // `insert_extra_header` drops empties + `authorization` and collapses

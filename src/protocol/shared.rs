@@ -278,7 +278,6 @@ impl ApiProtocol {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Provider {
-    OpenCode,
     OpenAiCodex,
     /// Native Anthropic Messages provider (`anthropic/<model>`): speaks
     /// `anthropic-messages`, authenticates with `x-api-key` +
@@ -298,7 +297,7 @@ impl Provider {
     /// `parse_known` accepts without consulting `known`, including the
     /// `codex` alias (alias spellings dedupe to one canonical provider
     /// downstream). Keep in sync with `parse_known` — a test pins this.
-    pub(crate) const BUILTINS: &[&str] = &["opencode", "openai-codex", "codex", "anthropic"];
+    pub(crate) const BUILTINS: &[&str] = &["openai-codex", "codex", "anthropic"];
 
     /// Resolve a provider name: builtins plus configured generic providers
     /// (`known`). Returns None for unknown names — call sites that route
@@ -311,7 +310,6 @@ impl Provider {
     ) -> Option<Self> {
         let lowered = value.trim().to_ascii_lowercase();
         match lowered.as_str() {
-            "opencode" => Some(Self::OpenCode),
             "openai-codex" | "codex" => Some(Self::OpenAiCodex),
             "anthropic" => Some(Self::Anthropic),
             _ => known
@@ -332,7 +330,6 @@ impl Provider {
 
     pub(crate) fn name(&self) -> &str {
         match self {
-            Self::OpenCode => "opencode",
             Self::OpenAiCodex => "openai-codex",
             Self::Anthropic => "anthropic",
             Self::Generic(name) => name,

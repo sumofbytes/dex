@@ -1,6 +1,4 @@
 use super::warn_once;
-use super::LlmConfig;
-use crate::protocol::Provider;
 use std::collections::BTreeMap;
 
 use std::env;
@@ -134,53 +132,6 @@ pub(crate) fn merge_header_layers(
         insert_extra_header(&mut out, name, value);
     }
     out
-}
-
-/// Console Go routing affinity: the zen/go endpoint rejects requests without
-/// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
-/// base URL, filled from the dex session id. Keys already present (any
-/// casing) are left alone — including in the two file layers, which merge
-/// BELOW `extra_headers` on the wire — so explicit user headers always win
-/// regardless of call order.
-pub(crate) fn apply_opencode_session_headers(config: &mut LlmConfig, session_id: &str) {
-    let session_id = session_id.trim();
-    if session_id.is_empty() {
-        return;
-    }
-    let base_url = config.base_url.as_str();
-    let is_opencode = matches!(config.provider, Provider::OpenCode)
-        || reqwest::Url::parse(base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .is_some_and(|h| h.eq_ignore_ascii_case("opencode.ai"));
-    if !is_opencode {
-        return;
-    }
-    // A name pinned in ANY layer — file (`global_headers`/`provider_headers`)
-    // or env/CLI/per-request (`extra_headers`) — suppresses the auto-fill:
-    // the function writes into `extra_headers`, which merges last, so a
-    // file-level user header would otherwise lose to it. Resolve both
-    // predicates before mutating (they borrow `config` immutably).
-    let taken = |name: &str| {
-        config
-            .global_headers
-            .keys()
-            .chain(config.provider_headers.keys())
-            .chain(config.extra_headers.keys())
-            .any(|k| k.eq_ignore_ascii_case(name))
-    };
-    let session_taken = taken("x-opencode-session");
-    let client_taken = taken("x-opencode-client");
-    if !session_taken {
-        config
-            .extra_headers
-            .insert("x-opencode-session".to_string(), session_id.to_string());
-    }
-    if !client_taken {
-        config
-            .extra_headers
-            .insert("x-opencode-client".to_string(), "dex".to_string());
-    }
 }
 
 fn merge_config_headers_map(out: &mut BTreeMap<String, String>, map: &serde_yaml::Mapping) {

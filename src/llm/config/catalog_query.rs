@@ -164,9 +164,9 @@ pub(crate) fn validate_thinking_effort(model: &str, pick: &str) -> Result<String
 }
 
 pub(crate) fn load_dex_models_cache() -> Option<Vec<String>> {
-    // dex cache is models.dev api.json — expose bare ids plus endpoint-qualified
-    // variants (`zen/<id>`, `go/<id>`) so a pick names the endpoint it targets;
-    // the prefixes are exactly the names `apply_model` routes on. The bare
+    // dex cache is models.dev api.json — expose bare ids plus provider-qualified
+    // variants (`opencode/<id>`) so a pick names the provider it targets; the
+    // prefixes are exactly the names `apply_model` routes on. The bare
     // (id, provider) pairs come from the per-generation index (no catalog
     // walk); the fully expanded list is cached per configured-provider set,
     // so repeat `from_env` calls clone one vec instead of re-sorting.
@@ -181,14 +181,13 @@ pub(crate) fn load_dex_models_cache() -> Option<Vec<String>> {
             return None;
         }
         let mut ids: Vec<String> = Vec::with_capacity(index.bare.len() * 2);
-        // Endpoint-qualified prefixes: builtins map to their named
-        // endpoints, configured generic providers to their own name. Flat-
-        // shape ids (empty provider key) ride bare, as before.
+        // Provider-qualified prefixes: `codex`/`openai-codex` catalog keys
+        // ride `openai-codex`, configured generic providers their own name;
+        // everything else (flat-shape ids, unconfigured providers) rides
+        // bare, as before.
         for (id, prov_key) in index.bare.iter() {
             ids.push(id.clone());
             let dex_prefix: Option<&str> = match prov_key.as_str() {
-                "opencode" => Some("zen"),
-                "opencode-go" => Some("go"),
                 "openai-codex" | "codex" => Some("openai-codex"),
                 other => configured.contains(other).then_some(other),
             };
@@ -213,7 +212,7 @@ pub(crate) fn load_dex_models_cache() -> Option<Vec<String>> {
 /// Refresh the dex models cache via models.dev.
 /// Fetches https://models.dev/api.json (no auth) and caches to
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
-/// and autocomplete without network. Falls back to opencode /models if needed.
+/// and autocomplete without network.
 pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
     // Shared client (pool reuse): the 30s total rides per-request — api.json
     // is a ~4MB body, and the old 10s cap failed on normal slow links while

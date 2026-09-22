@@ -192,7 +192,7 @@ mod tests {
             let _env = EnvGuard::clear(&["DEX_MODEL_APIS", "XDG_CACHE_HOME"])
                 .set("DEX_CONFIG", &absent)
                 .set("XDG_CACHE_HOME", &hermetic_xdg);
-            // Unpinned opencode model: fallback allowed.
+            // Unpinned model: fallback allowed.
             assert!(try_responses_fallback(&cfg, "500 Internal server error"));
             // Never on cancellation.
             assert!(!try_responses_fallback(&cfg, "cancelled"));
@@ -231,7 +231,7 @@ mod tests {
             // Codex backend has no /chat/completions.
             cfg.provider = Provider::OpenAiCodex;
             assert!(!try_responses_fallback(&cfg, "500 boom"));
-            cfg.provider = Provider::OpenCode;
+            cfg.provider = Provider::Anthropic;
             // Learned protocol overrides the configured default.
             assert_eq!(effective_api(&cfg), ApiProtocol::Responses);
             crate::llm::learned::remember_memory(
