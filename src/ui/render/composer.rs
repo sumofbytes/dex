@@ -94,13 +94,21 @@ pub(crate) fn render_input(
             let mut spans = Vec::new();
             if first && si == 0 {
                 spans.push(prompt_span.clone());
+            } else if first && si > 0 {
+                // Hang the wrapped rows under the glyph's text column so
+                // continuations align with the typed text instead of
+                // sliding under the `❯`.
+                spans.push(Span::raw(" ".repeat(INPUT_PROMPT_WIDTH)));
             }
             spans.push(Span::styled(seg.clone(), fg(text_fg)));
             lines.push(Line::from(spans));
         }
         if li == input.row {
             cur_row += seg_idx;
-            cur_x = if first && seg_idx == 0 {
+            cur_x = if first {
+                // Row 0 carries the glyph; wrapped continuations carry the
+                // hang pad — both shift the text column by the glyph's
+                // width, so the caret follows them onto the text column.
                 INPUT_PROMPT_WIDTH as u16 + x
             } else {
                 x

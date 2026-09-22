@@ -69,7 +69,14 @@ fn surface_rows(
     let w = width.max(1) as usize;
     lines
         .into_iter()
-        .flat_map(|l| wrap_line_display(&l, width, first_row_overhang))
+        .enumerate()
+        .flat_map(|(i, l)| {
+            // The echoed glyph lives on the block's first logical line only
+            // — the composer narrows just its first line, so the echo must
+            // too, or later lines wrap two cells early.
+            let overhang = if i == 0 { first_row_overhang } else { 0 };
+            wrap_line_display(&l, width, overhang)
+        })
         .map(|r| paint_surface_row(r, w, bg))
         .collect()
 }
@@ -122,11 +129,11 @@ pub(crate) fn wrap_block(
 /// blocks start unwrapped. Every transcript mutation must extend/truncate the
 /// cache alongside (or clear both, like `reset_session_state`): a missed site
 /// serves stale rows with no other signal, so the drift guard lives here.
-fn sync_wrapped_cache(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
-    if app.wrapped_width != area.width {
+fn sync_wrapped_cache(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
+    if app.wrapped_width != width {
         app.wrapped_cache.clear();
         app.display_cache.clear();
-        app.wrapped_width = area.width;
+        app.wrapped_width = width;
         // Every row is re-wrapped at the new width, so the old selection's row
         // coordinates (and the text they'd copy) are gone too.
         app.selection = None;
@@ -164,7 +171,7 @@ fn sync_wrapped_cache(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
 /// tail (§29): stored text is append-only below the cap, so rows before the
 /// last source line are final. A head-cut, reset, or rebuild resets stamps and
 /// takes the full wrap.
-fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
+fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
     for (idx, block) in app.transcript.iter().enumerate() {
         if app.wrapped_cache[idx].stamp == block.stamp() {
             continue;
@@ -172,7 +179,6 @@ fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
         if let super::super::TranscriptBlock::Thinking { text, .. } = block {
             if app.show_thinking {
                 let stamp = block.stamp();
-                let width = area.width;
                 let wb = &mut app.wrapped_cache[idx];
                 if wb.expanded {
                     let state = ThinkingWrap {
@@ -202,7 +208,7 @@ fn wrap_dirty_blocks(app: &mut App, area: Rect, mark: &mut impl FnMut(usize)) {
                 continue;
             }
         }
-        let rows = wrap_block(block, area.width, app.show_thinking, app.thinking_open);
+        let rows = wrap_block(block, width, app.show_thinking, app.thinking_open);
         app.wrapped_cache[idx] = WrappedBlock {
             stamp: block.stamp(),
             rows,
@@ -245,6 +251,12 @@ pub(crate) fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
 
 impl TranscriptView {
     pub(crate) fn render(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+        // Right air: the composer band is inset `HORIZONTAL_GUTTER` on both
+        // sides, so its wrap width is `content_width`. Wrapping the transcript
+        // at the same width keeps typed and submitted prompts reflowing
+        // identically — a line that wraps in the composer must wrap the same
+        // way once echoed — and every surface keeps the same right margin.
+        let width = super::super::style::content_width(area.width);
         // Remember where the transcript lives so mouse events can be
         // translated into display rows between frames.
         app.transcript_area = Some(area);
@@ -268,8 +280,8 @@ impl TranscriptView {
         let mut mark = |idx: usize| {
             first_dirty = Some(first_dirty.map_or(idx, |first| first.min(idx)));
         };
-        sync_wrapped_cache(app, area, &mut mark);
-        wrap_dirty_blocks(app, area, &mut mark);
+        sync_wrapped_cache(app, width, &mut mark);
+        wrap_dirty_blocks(app, width, &mut mark);
         rebuild_display_cache(app, first_dirty);
         // The open thinking / activity rows animate: their lines are overlaid
         // on the rendered window (not written back into `display_cache`), so
@@ -346,16 +358,16 @@ impl TranscriptView {
         let scroll = app.scroll as usize;
         if let Some(row) = thinking_row {
             if row >= scroll && row - scroll < window.len() {
-                window[row - scroll] = thinking_indicator_line(true, None, app.tick, area.width);
+                window[row - scroll] = thinking_indicator_line(true, None, app.tick, width);
             }
         }
         if let Some(row) = activity_row {
             if row >= scroll && row - scroll < window.len() {
-                window[row - scroll] = activity_indicator_line(app.tick, area.width);
+                window[row - scroll] = activity_indicator_line(app.tick, width);
             }
         }
         if let Some(sel) = app.selection {
-            apply_selection(&mut window, app.scroll as usize, sel, area.width);
+            apply_selection(&mut window, app.scroll as usize, sel, width);
         }
         let transcript = Paragraph::new(window).style(Style::default().fg(Color::Gray));
         f.render_widget(transcript, area);
@@ -496,6 +508,118 @@ pub(crate) fn wrap_line_display(
         width: usize,
     }
 
+    /// Tool names a transcript input row can lead with (`$ bash …`): the
+    /// name hangs with the glyph so wrapped payload lines align past the
+    /// command, not past `$ `. MCP tools (`⇄ mcp__<server>__<tool> …`)
+    /// match by prefix instead.
+    const TOOL_NAMES: &[&str] = &[
+        "bash", "read", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls", "git", "chain",
+    ];
+
+    /// One-cell glyphs that head a transcript tool-input row (`$ bash …`).
+    const TOOL_GLYPHS: &[&str] = &["▸", "$", "¶", "✎", "±", "/", "☰", "⎇", "→", "⇄"];
+
+    /// Cells of the wrapped first row's structural leading marker to carve
+    /// out of the wrap body and re-apply as whitespace on every continuation
+    /// row: a ≥2-cell whitespace indent (code blocks), a list marker — bullet
+    /// glyph (`•`, `▸`, task boxes, `-`/`*`) or ordered `12.` run — or a
+    /// tool-row glyph + tool name (`$ bash `). The carved marker wraps like
+    /// real content on row 0 (so a marker wider than the row still forces a
+    /// break instead of overflowing), and continuation rows lose the same
+    /// cells from their budget, so no width combination overflows. Plain
+    /// paragraphs (first word, no marker) hang nothing, keeping their old
+    /// flush-left continuation shape. `cap` bounds markdown markers so a
+    /// pathological one can't eat the row; tool prefixes are UI chrome with
+    /// bounded names, so `tool_cap` (remaining-width based, passed by the
+    /// caller) governs them instead.
+    fn marker_width(raw: &[(String, Style, bool)], cap: usize, tool_cap: usize) -> usize {
+        if cap == 0 && tool_cap == 0 || raw.is_empty() {
+            return 0;
+        }
+        // A tool row is glyph + gap + tool name, then the payload; units
+        // are per-grapheme, so the name is matched as the grapheme run
+        // after the glyph's gap.
+        let is_tool =
+            TOOL_GLYPHS.contains(&raw[0].0.as_str()) && raw.get(1).is_some_and(|u| u.0 == " ");
+        let name = if is_tool {
+            let name_start = 2;
+            let len: usize = raw[name_start..]
+                .iter()
+                .take_while(|u| !u.0.chars().any(char::is_whitespace))
+                .map(|u| u.0.chars().count())
+                .sum();
+            let text: String = raw[name_start..name_start + len]
+                .iter()
+                .map(|u| u.0.as_str())
+                .collect();
+            Some(text)
+        } else {
+            None
+        };
+        let tool_marker = name
+            .as_deref()
+            .is_some_and(|n| n.starts_with("mcp__") || TOOL_NAMES.contains(&n));
+        let unit_w = |u: &(String, Style, bool)| {
+            u.0.chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>()
+                .max(1)
+        };
+        let lead_ws = raw
+            .iter()
+            .take_while(|u| u.0.chars().all(char::is_whitespace))
+            .count();
+        let lead_width: usize = raw[..lead_ws].iter().map(&unit_w).sum();
+        // `is_indent`: the marker is the whole leading whitespace run (a
+        // ≥2-cell indent), so there is no gap after it — `end` stays at
+        // `marker_end` and must not trip the missing-gap guard below.
+        let (marker_end, is_indent) = if tool_marker {
+            (lead_ws + 2 + name.unwrap().chars().count(), false)
+        } else if lead_width >= 2 {
+            (lead_ws, true)
+        } else if raw
+            .get(lead_ws)
+            .is_some_and(|u| matches!(u.0.as_str(), "•" | "▸" | "☐" | "☑" | "-" | "*"))
+        {
+            (lead_ws + 1, false)
+        } else {
+            let digits = raw[lead_ws..]
+                .iter()
+                .take_while(|u| u.0.chars().all(|c| c.is_ascii_digit()))
+                .count();
+            if digits > 0 && raw.get(lead_ws + digits).is_some_and(|u| u.0 == ".") {
+                (lead_ws + digits + 1, false)
+            } else {
+                return 0;
+            }
+        };
+        let mut end = marker_end;
+        while raw
+            .get(end)
+            .is_some_and(|u| u.0.chars().all(char::is_whitespace))
+        {
+            end += 1;
+        }
+        // A matched marker (bullet/ordered/tool) needs a whitespace gap and
+        // payload after it; an indent marker only needs payload.
+        if end >= raw.len() || (end == marker_end && !is_indent) {
+            return 0;
+        }
+        // An indent marker IS the leading whitespace run (`end == lead_ws`),
+        // so its width comes from that run; a bullet/ordered/tool marker
+        // starts at `lead_ws` and includes its trailing gap.
+        let width: usize = if is_indent {
+            lead_width
+        } else {
+            raw[lead_ws..end].iter().map(&unit_w).sum()
+        };
+        let limit = if tool_marker { tool_cap } else { cap };
+        if width > limit {
+            return 0;
+        }
+        width
+    }
+
     // Drop the whole leading indent span (TRANSCRIPT_INDENT cells), not just
     // one grapheme — the indent is re-added per wrapped row below.
     let graphemes = line
@@ -541,12 +665,47 @@ pub(crate) fn wrap_line_display(
             break;
         }
     }
+    // Carve the first row's structural marker (`$ bash `, a bullet, an
+    // ordered `12.` run, a ≥2-cell indent) out of the wrap body too: it is
+    // re-applied as whitespace on every continuation row, so continuations
+    // must not count it — one wrap budget for every row, no width
+    // combination overflows. Frozen upfront, not at the first break.
+    // Markdown markers hang only up to w/3 (a pathological one can't eat
+    // the row). Tool prefixes are bounded UI chrome — allow up to the whole
+    // row minus 8 payload cells, so wide names (`⇄ mcp__<server>__<tool> `)
+    // still hang while text stays readable.
+    let tool_cap = w.saturating_sub(8);
+    let hang = marker_width(&raw, w / 3, tool_cap);
+    let mut marker: Vec<(String, Style)> = Vec::new();
+    if hang > 0 {
+        let mut taken = 0usize;
+        while taken < hang {
+            let Some((text, _, _)) = raw.first() else {
+                break;
+            };
+            let width = text
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>()
+                .max(1);
+            let (text, style, _) = raw.remove(0);
+            taken += width;
+            marker.push((text, style));
+        }
+    }
 
     let mut rows: Vec<Vec<Unit>> = Vec::new();
     let mut row = Vec::new();
-    // Row 0 starts already carrying the transcript indent plus the echoed
-    // glyph, so its wrap width is reduced by both.
-    let mut row_width = (indent_width + glyph_width).min(w);
+    // Row 0 starts already carrying the transcript indent, the echoed glyph
+    // and the carved marker, so its wrap width is reduced by all three.
+    let mut row_width = (indent_width + glyph_width + hang).min(w);
+    // Continuations re-apply the carved marker as whitespace (like the
+    // composer hangs its glyph), so their wrap budget loses both.
+    let glyph_pad = if first_row_overhang > 0 {
+        glyph_width
+    } else {
+        0
+    };
     let mut last_space: Option<usize> = None;
     for (symbol, style, is_tab) in raw {
         // Tab width is relative to the current column (row_width).
@@ -574,9 +733,10 @@ pub(crate) fn wrap_line_display(
                 rows.push(row);
                 row = Vec::new();
             }
-            // Only the first wrapped row is narrowed; continuations get the
-            // full width (minus the indent), like the composer.
-            row_width = indent_width + row.iter().map(|u: &Unit| u.width).sum::<usize>();
+            // Continuation rows carry the indent, the echoed-glyph pad and
+            // the hanging indent, so their wrap budget loses all three.
+            row_width =
+                indent_width + glyph_pad + hang + row.iter().map(|u: &Unit| u.width).sum::<usize>();
             last_space = None;
             if is_tab {
                 width = TAB_WIDTH - (row_width % TAB_WIDTH);
@@ -608,6 +768,19 @@ pub(crate) fn wrap_line_display(
                         .iter()
                         .map(|(text, style)| Span::styled(text.clone(), *style)),
                 );
+                // The carved marker is real content on row 0 — re-applied
+                // as whitespace (below) only on continuations.
+                spans.extend(
+                    marker
+                        .iter()
+                        .map(|(text, style)| Span::styled(text.clone(), *style)),
+                );
+            } else {
+                // Continuations hang: the echoed glyph's pad (the composer
+                // hangs its glyph the same way) plus the first row's
+                // marker width as whitespace, so wrapped text stays on the
+                // text column instead of sliding under the marker.
+                spans.push(Span::raw(" ".repeat(glyph_pad + hang)));
             }
             spans.extend(row.into_iter().map(|u| Span::styled(u.text, u.style)));
             Line::from(spans)
