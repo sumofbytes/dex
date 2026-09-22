@@ -36,10 +36,17 @@ pub(crate) const READ_FANOUT_PER_FILE_LINES: usize = 200;
 /// the call succeeds when at least one file is readable.
 pub(crate) async fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
     if let Some(paths) = args.get("paths").and_then(Value::as_array) {
-        return fanout_read(parse_path_list(paths)?, args).await;
+        // Some providers serialize schema optionals with empty defaults
+        // (`paths: []` next to a populated `path`); treat empty as absent so
+        // the single-file read below still runs instead of erroring.
+        if !paths.is_empty() {
+            return fanout_read(parse_path_list(paths)?, args).await;
+        }
     }
     if let Some(glob) = args.get("glob").and_then(Value::as_str) {
-        return fanout_read(expand_glob(glob).await?, args).await;
+        if !glob.trim().is_empty() {
+            return fanout_read(expand_glob(glob).await?, args).await;
+        }
     }
     let path = workspace_path(&arg_str(args, "path")?)?;
     let (body, _more) =
