@@ -864,7 +864,7 @@ async fn drain_agent_notices(
     if overflow > 0 {
         text.push_str(&format!(
             "\n\n{overflow} more children finished earlier than this notice could \
-             carry; their results are retained — use delegate_output with their ids."
+             carry; their results are retained — use delegate action=wait with their ids."
         ));
     }
     let message = ChatMessage::user_named(text, "agent-notifications");

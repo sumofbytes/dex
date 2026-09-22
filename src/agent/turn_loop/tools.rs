@@ -514,10 +514,7 @@ pub(super) async fn process_tool_result(
             if cache_hit {
                 summary = format!("cached · {summary}");
             }
-            let counts_only = matches!(
-                name,
-                "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" | "chain"
-            );
+            let counts_only = matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls");
             let skip_first = !counts_only || !ok;
             let preview = tool_preview(name, ok, diff.as_deref(), &result, skip_first);
             SinkLine::ToolOutput {

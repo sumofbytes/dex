@@ -12,7 +12,7 @@ pub(crate) const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(600);
 /// and bare `mcp__*` are accepted without further checks — the policy layer
 /// must not assume a closed enum (§11); MCP servers arrive dynamically.
 const KNOWN_TOOLS: &[&str] = &[
-    "read", "bash", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls", "git", "chain",
+    "read", "bash", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls",
 ];
 
 /// Safe default when a definition names no tools: the explorer trio.
@@ -64,10 +64,8 @@ pub(crate) struct AgentDefinition {
     /// aliases the catalog doesn't have, zero provider-specific logic here.
     pub(crate) model: Option<String>,
     /// Allowlist against the real registry. The spawn filter strips
-    /// delegation tools out of this set, then re-adds them when the child
-    /// may delegate (depth + 1 under the cap) — so a child filter may name
-    /// tools the parent schema hides (e.g. reviewer `git` under a parent
-    /// without `DEX_EXTRA_TOOLS`).
+    /// delegation tools out of this set, then re-adds `delegate` when the
+    /// child may delegate (depth + 1 under the cap).
     pub(crate) tools: BTreeSet<String>,
     /// Feeds the existing turn budget (`max_tool_iterations()`); `None`
     /// keeps the default. Same knob re-parameterized, not a second counter.
@@ -206,15 +204,13 @@ pub(crate) fn parse_definition(text: &str) -> Result<AgentDefinition, String> {
 
 const EXPLORER_MD: &str = "---\nname: explorer\ndescription: Understand code without modifying it. Give it a question about the codebase; it returns findings in prose with file paths. Read-only: never modifies files or runs commands.\ntools: read, grep, find\n---\nYou are an explorer. Answer the task with findings in prose: file paths, relevant snippets, risks. Never modify files or run shell commands — you do not have those tools. If the task needs something outside your tools, say so in your result instead of working around it.\n";
 
-const REVIEWER_MD: &str = "---\nname: reviewer\ndescription: Review a diff or change for correctness and regressions. Give it what changed; it returns findings in prose. Read-only.\ntools: read, grep, find, git\n---\nYou are a reviewer. Review the change for correctness, regressions, and missed edge cases; report findings in prose with file paths and line references. Never modify files or run shell commands outside your tools.\n";
+const REVIEWER_MD: &str = "---\nname: reviewer\ndescription: Review a diff or change for correctness and regressions. Give it what changed; it returns findings in prose. Read-only in spirit: shell access exists so it can diff, never to mutate.\ntools: read, grep, find, bash\n---\nYou are a reviewer. Review the change for correctness, regressions, and missed edge cases; report findings in prose with file paths and line references. Your shell is for inspecting the change (git diff, git log, running tests) — never modify files, deploy, or delete; if a command would mutate the repo, report it as a finding instead of running it.\n";
 
 const TESTER_MD: &str = "---\nname: tester\ndescription: Investigate and run relevant tests. Give it what to verify; it reports pass/fail plus failures in prose. May run shell commands: they run under a trusted permission policy and are auto-denied otherwise.\ntools: read, grep, find, bash\n---\nYou are a tester. Investigate the requested area and run the relevant tests with your shell; report pass/fail plus the failures in prose with file paths. Keep commands read-only in spirit (run tests, do not deploy or delete). If a command is denied, report that instead of working around it.\n";
 
 /// V1a ships three built-ins, zero required configuration (§19). Parsed
 /// through the same frontmatter parser user files will use, so the parser
-/// stays live. Child allowlists are independent of the parent prompt-token
-/// hiding (`DEX_EXTRA_TOOLS`): the reviewer keeps `git` even when the
-/// parent schema hides it.
+/// stays live.
 pub(crate) fn builtin_definitions() -> Vec<AgentDefinition> {
     [EXPLORER_MD, REVIEWER_MD, TESTER_MD]
         .into_iter()
@@ -347,9 +343,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(tools("explorer"), ["find", "grep", "read"]);
-        // The reviewer keeps `git` regardless of the parent's
-        // `DEX_EXTRA_TOOLS` prompt-token hiding (DEX-9).
-        assert_eq!(tools("reviewer"), ["find", "git", "grep", "read"]);
+        assert_eq!(tools("reviewer"), ["bash", "find", "grep", "read"]);
         assert_eq!(tools("tester"), ["bash", "find", "grep", "read"]);
     }
 

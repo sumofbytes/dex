@@ -6,9 +6,9 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
-/// Per-tool glyph heading the transcript input row — `$ bash git status` —
+/// Per-tool glyph heading the transcript input row — `$ bash ls -la` —
 /// standing in for the generic `▸`. Each reads like the tool's own notation:
-/// shell `$`, vim-style search `/`, diff `±` for edit, branch for git.
+/// shell `$`, vim-style search `/`, diff `±` for edit.
 /// Bold so it reads as an affordance rather than content. Unknown tools (and
 /// the replay fallback row) keep the generic `▸`.
 fn tool_glyph(name: &str) -> &'static str {
@@ -19,8 +19,6 @@ fn tool_glyph(name: &str) -> &'static str {
         "edit" => "±",
         "grep" | "ffgrep" | "find" | "fffind" => "/",
         "ls" => "☰",
-        "git" => "⎇",
-        "chain" => "→",
         name if name.starts_with("mcp__") => "⇄",
         _ => "▸",
     }
