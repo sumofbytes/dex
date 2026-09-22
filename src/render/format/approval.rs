@@ -88,9 +88,13 @@ pub(crate) fn approval_summary(name: &str, input: &str) -> String {
             format!("{} · -{} +{}{}", path, old, new, then_run_suffix(obj))
         }
         "read" => {
-            if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
+            if let Some(paths) = obj
+                .and_then(|o| o.get("paths"))
+                .and_then(|v| v.as_array())
+                .filter(|p| !p.is_empty())
+            {
                 format!("{} files", paths.len())
-            } else if let Some(glob) = get("glob") {
+            } else if let Some(glob) = get("glob").filter(|g| !g.trim().is_empty()) {
                 format!("glob: {}", glob)
             } else {
                 get("path")
@@ -238,7 +242,11 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
             fallback(out)
         }
         "read" => {
-            if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(|v| v.as_array()) {
+            if let Some(paths) = obj
+                .and_then(|o| o.get("paths"))
+                .and_then(|v| v.as_array())
+                .filter(|p| !p.is_empty())
+            {
                 let mut out = vec![format!("{} files:", paths.len())];
                 for p in paths.iter().take(6).filter_map(|v| v.as_str()) {
                     out.push(format!("  • {}", p));
@@ -247,7 +255,7 @@ pub(crate) fn approval_details(name: &str, input: &str) -> Vec<String> {
                     out.push(format!("  … +{} more", paths.len() - 6));
                 }
                 out
-            } else if let Some(glob) = get("glob") {
+            } else if let Some(glob) = get("glob").filter(|g| !g.trim().is_empty()) {
                 vec![format!("glob: {}", glob)]
             } else if let Some(path) = get("path") {
                 let mut out = vec![format!("path: {}", path)];
