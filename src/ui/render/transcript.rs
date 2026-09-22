@@ -526,7 +526,7 @@ pub(crate) fn wrap_line_display(
             .count();
         let lead_width: usize = row[..lead_ws].iter().map(|u| u.width).sum();
         if lead_width >= 2 {
-            return lead_width;
+            return if lead_width > cap { 0 } else { lead_width };
         }
         let mut i = lead_ws;
         let is_bullet = row

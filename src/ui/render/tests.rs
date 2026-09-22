@@ -2818,3 +2818,33 @@ fn composer_cursor_sits_on_the_text_column_of_wrapped_rows() {
         );
     }
 }
+
+#[test]
+fn hang_overflow_regression() {
+    // Regression: a leading indent wider than the hang cap (w/3) escaped
+    // the cap (the `lead_width >= 2` branch returned before it), so every
+    // continuation row overflowed the wrap width. w=15 -> cap 5, lead 8.
+    let line = super::super::indent_transcript_line(Line::from(
+        "        indented text that keeps going and going and going on",
+    ));
+    let rows = wrap_line_display(&line, 15, 0);
+    assert!(rows.len() > 1);
+    // At cap boundary: lead exactly w/3 still hangs.
+    let line = super::super::indent_transcript_line(Line::from(
+        "     indented text that keeps going and going and going on now",
+    ));
+    let rows = wrap_line_display(&line, 15, 0);
+    let t: String = rows[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    // row 1 = 1 indent + 5 hang + "text": the hang survived at the cap.
+    assert_eq!(t, "      text", "cap-boundary hang kept");
+    for r in &rows {
+        assert!(
+            r.width() <= 15,
+            "continuation overflow: {:?}",
+            r.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        );
+    }
+}
