@@ -815,7 +815,7 @@ mod handler_tests {
         // cleanup: the created session file lives under data_dir
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-    // ---- coverage fixes (docs/test-coverage.md §1) ----
+    // ---- coverage fixes ----
 
     #[tokio::test]
     async fn steer_and_followup_land_on_the_turn_queue() {
@@ -2304,7 +2304,7 @@ mod e2e_tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-    // ---- coverage fixes (docs/test-coverage.md §1) ----
+    // ---- coverage fixes ----
 
     /// Bearer gate over real HTTP: `/health` stays open, every `/api/*` route
     /// requires `Authorization: Bearer <token>` when the daemon requires a

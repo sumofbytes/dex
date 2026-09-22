@@ -3,7 +3,6 @@
 //! The manifest is parsed with `serde_yaml` and never executed. It declares
 //! the extension identity, the capabilities the code may use (the engine
 //! withholds `dex.*` subtrees that are not declared), and the tool schemas.
-//! See `docs/lua-extensions-plan.md` §5.2.
 
 use serde::Deserialize;
 

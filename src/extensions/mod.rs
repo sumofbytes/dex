@@ -3,8 +3,7 @@
 //! Mirrors `mcp.rs`: loaded once at daemon bootstrap (not per turn), with
 //! `cached_tools()` / `cached_schema_tokens()` / `call_global()` sync
 //! surfaces for the schema + dispatch paths. A failed extension is skipped
-//! whole — its tools never enter the schema. See
-//! `docs/lua-extensions-plan.md` §§6/9/11 (P0).
+//! whole — its tools never enter the schema.
 
 #[cfg(test)]
 use std::path::PathBuf;

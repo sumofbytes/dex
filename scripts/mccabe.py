@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Approximate McCabe cyclomatic complexity for Rust via token scan.
 
-Used by the complexity ledger (docs/complexity-issues.md) to rank functions.
+Used to rank functions by complexity.
 Counts if/while/for/loop/match + match arms (`=>`) + `&&`/`||`/`?` per fn body.
 Inflates absolute numbers slightly (every `=>` is a point) — use for ranking,
 and cross-check with `cargo clippy -- -W clippy::cognitive_complexity`.
