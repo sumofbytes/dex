@@ -19,7 +19,9 @@ mod write;
 pub(crate) use dispatch::{dispatch_original, execute, execute_outcome, execute_sync};
 pub(crate) use error::ToolError;
 pub(crate) use outcome::ToolOutcome;
-pub(crate) use policy::{metadata, PermissionRequirement, ToolFilter};
+#[cfg(test)]
+pub(crate) use policy::PermissionRequirement;
+pub(crate) use policy::{metadata, ToolFilter};
 pub(crate) use sandbox::{
     normalize_conflict_path, resolve_workspace_path, workspace_path, workspace_root,
 };

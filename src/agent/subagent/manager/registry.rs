@@ -68,7 +68,7 @@ impl AgentNotice {
     }
 }
 
-/// One row of the `delegate_list` view (§24.3): live or retained.
+/// One row of the `delegate` `list` view (§24.3): live or retained.
 #[derive(Clone, Debug)]
 pub(crate) struct ChildInfo {
     pub(crate) agent_id: AgentId,
@@ -144,7 +144,7 @@ pub(crate) struct Inner {
     pub(crate) running: HashMap<AgentId, RunningChild>,
     pub(crate) results: HashMap<AgentId, AgentResult>,
     /// Display names for retained results (results carry no name — the
-    /// parent's `delegate_list` needs one). Pruned with `results`.
+    /// parent's `delegate` `list` action needs one). Pruned with `results`.
     pub(crate) names: HashMap<AgentId, String>,
     /// Insertion order of `results`, for oldest-first eviction.
     pub(crate) result_order: VecDeque<AgentId>,

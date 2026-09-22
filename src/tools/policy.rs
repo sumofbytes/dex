@@ -46,20 +46,6 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
 pub(crate) fn metadata_native(name: &str) -> Option<ToolMetadata> {
     Some(match name {
         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => READONLY,
-        "git" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: true,
-            requires_shell: true,
-            permission: PermissionRequirement::Read,
-        },
-        "chain" => ToolMetadata {
-            read_only: true,
-            mutating: false,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Read,
-        },
         "bash" => ToolMetadata {
             read_only: false,
             mutating: true,
