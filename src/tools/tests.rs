@@ -1013,6 +1013,21 @@ async fn read_fanout_reads_many_files_in_one_call() {
     assert!(outcome.text.contains("a.txt"), "{}", outcome.text);
     assert!(outcome.text.contains("b.txt"), "{}", outcome.text);
 
+    // Some providers send every schema key with empty defaults alongside a
+    // populated `path`; empty `paths`/`glob` must fall through to the
+    // single-file read, not error.
+    let mut args = Map::new();
+    args.insert(
+        "path".into(),
+        Value::String(root.join("a.txt").display().to_string()),
+    );
+    args.insert("paths".into(), Value::Array(vec![]));
+    args.insert("glob".into(), Value::String(String::new()));
+    let outcome =
+        execute_outcome("read", &args, &GlobalCancellation, &Policy::trusted(), None).await;
+    assert!(outcome.ok, "{}", outcome.text);
+    assert!(outcome.text.contains("   1  alpha"), "{}", outcome.text);
+
     let _ = fs::remove_dir_all(root);
 }
 
