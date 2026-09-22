@@ -502,8 +502,6 @@ fn short_arg_covers_every_tool_without_raw_json() {
     );
     assert_eq!(short_arg("ffgrep", r#"{"pattern": "TODO"}"#), "TODO");
     assert_eq!(short_arg("fffind", r#"{"pattern": "*.rs"}"#), "*.rs");
-    assert_eq!(short_arg("git", r#"{"mode": "diff"}"#), "diff");
-    assert_eq!(short_arg("git", "{}"), "status");
 }
 
 #[test]
@@ -535,16 +533,6 @@ fn entry_summaries_exclude_truncation_trailers() {
         "2 entries (+7 more)"
     );
     assert_eq!(summary("ls", "{}", "(empty)", true), "empty");
-    // chain: step-output trailers stay out of the line count.
-    assert_eq!(
-        summary(
-            "chain",
-            r#"{"steps":[{"tool":"ls"},{"tool":"ls"}]}"#,
-            "==> src/a.rs <==\nmain.rs\n[... 4 of 10 lines truncated ...]",
-            true
-        ),
-        "2 steps · 1 file · 2 lines (+4 more)"
-    );
 }
 
 #[test]

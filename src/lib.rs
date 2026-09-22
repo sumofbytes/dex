@@ -714,6 +714,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_surface_matches_docs() {
+        let schema = crate::llm::protocol::tools_schema();
+        let names: Vec<&str> = schema.iter().map(|t| t.function.name.as_str()).collect();
+        for expected in ["read", "bash", "write", "edit", "grep", "find", "ls"] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        assert!(!names.contains(&"git"), "git must be gone");
+        assert!(!names.contains(&"chain"), "chain must be gone");
+        assert!(!names.contains(&"delegate_output"), "merged into delegate");
+        assert!(!names.contains(&"delegate_stop"), "merged into delegate");
+        assert!(!names.contains(&"delegate_list"), "merged into delegate");
+    }
+
+    #[test]
     fn spend_summary_gates_and_formats() {
         assert_eq!(spend_summary(0, 0, 0.0), None);
         // Output-only usage still summarizes (prompt may be unreported).

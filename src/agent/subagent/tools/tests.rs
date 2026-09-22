@@ -4,10 +4,9 @@ use super::*;
 use crate::agent::state::GlobalCancellation;
 
 #[test]
-fn delegation_names_are_recognized() {
-    for name in DELEGATION_TOOLS {
-        assert!(is_delegation(name), "{name}");
-    }
+fn delegation_is_one_tool_with_four_actions() {
+    assert!(is_delegation(DELEGATION_TOOL));
+    assert_eq!(DELEGATION_ACTIONS, ["spawn", "wait", "stop", "list"]);
     assert!(!is_delegation("read"));
     assert!(!is_delegation("mcp__x__y"));
 }
@@ -16,14 +15,15 @@ fn delegation_names_are_recognized() {
 async fn delegation_without_a_daemon_context_rejects_cleanly() {
     // OneShot / `dex run` shape: no manager anywhere to spawn into.
     let policy = Policy::trusted();
-    let args = Map::new();
-    for name in DELEGATION_TOOLS {
-        let error = execute_delegation(name, &args, &GlobalCancellation, &policy)
+    let mut args = Map::new();
+    for action in DELEGATION_ACTIONS {
+        args.insert("action".into(), json!(action));
+        let error = execute_delegation(DELEGATION_TOOL, &args, &GlobalCancellation, &policy)
             .await
             .unwrap_err();
         assert!(
             error.to_string().contains("daemon-backed"),
-            "{name}: {error}"
+            "{action}: {error}"
         );
     }
 }
@@ -579,7 +579,7 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
     let error = resolve_resume_handle(&ctx, &AgentId("sess-9".to_string()))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("delegate_list"), "{error}");
+    assert!(error.to_string().contains("action=list"), "{error}");
     manager.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

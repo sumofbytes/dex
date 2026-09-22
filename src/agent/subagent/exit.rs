@@ -19,7 +19,7 @@ use std::path::Path;
 pub(crate) enum ExitReason {
     /// The child emitted its final assistant message.
     Normal,
-    /// `delegate_stop`, parent-turn cancel, session close, daemon
+    /// The `stop` action, parent-turn cancel, session close, daemon
     /// shutdown. Never resumable: stopping was the intent.
     ShutDown,
     /// Environment flake a re-entry could survive: body panic, transport
