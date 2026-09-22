@@ -2384,8 +2384,6 @@ fn tool_glyphs_head_the_input_row() {
     assert!(text("grep", "pat").starts_with("/ grep pat"));
     assert!(text("fffind", "*.rs").starts_with("/ fffind *.rs"));
     assert!(text("ls", ".").starts_with("☰ ls ."));
-    assert!(text("git", "status").starts_with("⎇ git status"));
-    assert!(text("chain", "2 steps").starts_with("→ chain 2 steps"));
     assert!(text("mcp__srv__t", "{}").starts_with("⇄ mcp__srv__t"));
     assert!(text("mystery", "x").starts_with("▸ mystery x"));
 }

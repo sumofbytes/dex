@@ -9,16 +9,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The four model-facing delegation tools (§10, §24.3). Background is the
-/// only spawn mode — no `run_in_background` flag to forget.
-pub(crate) const DELEGATION_TOOLS: [&str; 4] = [
-    "delegate",
-    "delegate_output",
-    "delegate_stop",
-    "delegate_list",
-];
+/// The one model-facing delegation tool (§10, §24.3): `delegate` with an
+/// `action` — spawn (the only mode; background), wait, stop, list.
+pub(crate) const DELEGATION_TOOL: &str = "delegate";
 
-/// `delegate_output`'s wait ceiling (§10.2): a bounded poll-wait, never an
+/// The actions `delegate`'s `action` argument accepts, in schema order.
+pub(crate) const DELEGATION_ACTIONS: [&str; 4] = ["spawn", "wait", "stop", "list"];
+
+/// The `wait` action's ceiling (§10.2): a bounded poll-wait, never an
 /// unbounded block.
 pub(crate) const MAX_WAIT_SECONDS: u64 = 120;
 
@@ -27,13 +25,13 @@ pub(crate) const MAX_WAIT_SECONDS: u64 = 120;
 /// at depth 0; each delegation runs at parent depth + 1.
 pub(crate) const MAX_AGENT_DEPTH: u32 = 3;
 
-/// Sleep quantum of the `delegate_output` wait loop: steering sent during a
+/// Sleep quantum of the `wait` action's poll loop: steering sent during a
 /// wait is acted on at most one interval after the wait returns (§10.2 — the
 /// documented latency, not a claimed interrupt that cannot exist).
 pub(crate) const WAIT_SLEEP: Duration = Duration::from_millis(250);
 
 pub(crate) fn is_delegation(name: &str) -> bool {
-    DELEGATION_TOOLS.contains(&name)
+    name == DELEGATION_TOOL
 }
 
 /// Lowercase status word for the §15 lifecycle lines and tool results

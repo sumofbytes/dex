@@ -1,7 +1,5 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
-#[cfg(not(test))]
-use std::sync::OnceLock;
 
 use crate::protocol::{
     ChatMessage, FunctionCall, FunctionDef, LlmToolCall, Role, StreamToolCall, ToolDefinition,
@@ -77,14 +75,9 @@ pub(crate) fn tools_schema_parts() -> (
 }
 
 /// Native schema: everything `tools_schema()` owns itself.
-/// Built fresh per call (small: ~11 defs); the MCP + extension slices ride
+/// Built fresh per call (small: ~9 defs); the MCP + extension slices ride
 /// alongside as borrowed `Arc`s.
 fn native_tools() -> Vec<ToolDefinition> {
-    // Six default tools. `chain` and `git`
-    // cost ~800 prompt tokens per request and are rarely used — `read`
-    // fan-out + parallel calls cover the same, and `git` is reachable via
-    // `bash "git ..."`. Gate them behind DEX_EXTRA_TOOLS=1 for compat.
-    let extra = extra_tools_enabled();
     let mut tools = vec![
         ToolDefinition {
             tool_type: "function".to_string(),
@@ -196,131 +189,39 @@ fn native_tools() -> Vec<ToolDefinition> {
                     },
                     "required": []
                 }),
-            },
-        },
-    ];
+              },
+          },
+      ];
     // Sub-agent delegation (§10): background spawn + bounded wait + stop.
     // Registered only in daemon-linked processes with the kill switch unset;
-    // OneShot/direct runs reject them at dispatch (no manager to spawn into).
-    // Descriptions carry the usage guidance (AGENTS.md: behavior detail
-    // lives at the tool decision, not in prompt.rs).
+    // OneShot/direct runs reject it at dispatch (no manager to spawn into).
+    // One tool with an `action` — spawn/wait/stop/list share one definition,
+    // so the schema stays small and the four verbs stay discoverable.
     if crate::agent::subagent::delegation_enabled() {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
-              function: FunctionDef {
-                  name: "delegate".to_string(),
-                  description: "Delegate a task to a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing. Pass resume_from (a prior agent_id) to continue a resumable child from its transcript as a new generation — task is then optional and instruction plus file_hints fold into the continuation note; delegate_list shows resumable children. Omit model to inherit this turn's model (on resume, to keep the prior generation's model); pass provider/model only when the task's complexity needs a different trade-off (stronger for hard reasoning, cheaper for simple lookups).".to_string(),
-                  parameters: json!({
-                      "type": "object",
-                      "properties": {
-                          "agent": { "type": "string", "description": "agent name: explorer | reviewer | tester" },
-                          "task": { "type": "string", "description": "what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation; required unless resume_from is set" },
-                          "file_hints": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths the child should start from" },
-                          "model": { "type": "string", "description": "optional model override (provider/model, same knob as --model); omit to inherit this turn's model" },
-                          "resume_from": { "type": "string", "description": "prior agent_id to resume from its transcript as a new generation" },
-                          "instruction": { "type": "string", "description": "refined instruction folded into the resume continuation note" }
-                      },
-                      "required": ["agent"]
-                  }),
-            },
-        });
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
             function: FunctionDef {
-                name: "delegate_output".to_string(),
-                description: "Fetch a delegated child's result. Returns the terminal result (status, summary, error) as soon as it is done; otherwise the current state plus what it is running now. wait_seconds (0-120, default 0) bounds the wait: 0 polls and returns immediately. The wait returns early if this turn is cancelled; steering sent while waiting is acted on right after it returns. Finished results stay fetchable after their announcement.".to_string(),
+                name: "delegate".to_string(),
+                description: "Sub-agents. action=spawn: run a task in a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing. Pass resume_from (a prior agent_id) to continue a resumable child from its transcript as a new generation — task is then optional and instruction plus file_hints fold into the continuation note; action=list shows resumable children. Omit model to inherit this turn's model (on resume, to keep the prior generation's model); pass provider/model only when the task's complexity needs a different trade-off (stronger for hard reasoning, cheaper for simple lookups). action=wait: fetch a child's result — terminal result (status, summary, error) as soon as it is done, otherwise the current state plus what it is running now; wait_seconds (0-120, default 0) bounds the wait, 0 polls, the wait returns early on cancel, and steering sent while waiting is acted on right after it returns; finished results stay fetchable after their announcement. action=stop: cancel a running child and return its terminal result (status cancelled); safe on ids that already finished. action=list: this session's sub-agent children — live ones with progress, finished ones with status and resumability, and interrupted on-disk runs a daemon restart left behind; read-only; use when spawn-result lines scrolled away or after compaction.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "agent_id": { "type": "string", "description": "id returned by delegate" },
-                        "wait_seconds": { "type": "integer", "description": "how long to wait for completion (0-120, default 0)" }
+                        "action": { "type": "string", "enum": ["spawn", "wait", "stop", "list"], "description": "spawn a child, wait for/fetch its result, stop it, or list this session's children" },
+                        "agent": { "type": "string", "description": "spawn: agent name — explorer | reviewer | tester" },
+                        "task": { "type": "string", "description": "spawn: what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation; required unless resume_from is set" },
+                        "file_hints": { "type": "array", "items": { "type": "string" }, "description": "spawn: workspace-relative paths the child should start from" },
+                        "model": { "type": "string", "description": "spawn: optional model override (provider/model, same knob as --model); omit to inherit this turn's model" },
+                        "resume_from": { "type": "string", "description": "spawn: prior agent_id to resume from its transcript as a new generation" },
+                        "instruction": { "type": "string", "description": "spawn: refined instruction folded into the resume continuation note" },
+                        "agent_id": { "type": "string", "description": "wait/stop: id returned by a spawn" },
+                        "wait_seconds": { "type": "integer", "description": "wait: how long to wait for completion (0-120, default 0)" }
                     },
-                    "required": ["agent_id"]
+                    "required": ["action"]
                 }),
             },
         });
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "delegate_stop".to_string(),
-                description: "Cancel a running delegated child and return its terminal result (status cancelled). Safe on ids that already finished: it returns their recorded result instead.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "agent_id": { "type": "string", "description": "id returned by delegate" }
-                    },
-                    "required": ["agent_id"]
-                }),
-            },
-        });
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "delegate_list".to_string(),
-                description: "List this session's sub-agent children: live ones with their progress, finished ones with status and resumability, and interrupted on-disk runs a daemon restart left behind. Read-only. Use it when spawn-result lines scrolled away or after compaction.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            },
-        });
-    }
-    if extra {
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "git".to_string(),
-                description: "Inspect repository status or diff (read-only).".to_string(),
-                parameters: json!({"type":"object","properties":{"mode":{"type":"string","enum":["status","diff"]}}}),
-            },
-        });
-        tools.push(ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDef {
-                name: "chain".to_string(),
-                description: "Run a bounded read-only sequence in ONE round trip: a search step (grep files-mode or find) followed by read steps that consume the matched files via from/take. Use when later steps depend on earlier output; for independent calls, batch them as parallel calls instead. Mutating and shell tools are not allowed in chains.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "steps": {
-                            "type": "array",
-                            "maxItems": 4,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "tool": { "type": "string", "description": "read, grep, find, or git" },
-                                    "args": { "type": "object", "description": "arguments passed to that tool" },
-                                    "from": { "type": "integer", "description": "index of an earlier step whose matched files this read consumes" },
-                                    "take": { "type": "string", "enum": ["paths"], "description": "route the referenced step's file paths into this read" },
-                                    "max_files": { "type": "integer", "description": "cap on files read when routing from a search step (default 5, max 10)" }
-                                },
-                                "required": ["tool"]
-                            }
-                        }
-                    },
-                    "required": ["steps"]
-                }),
-            },
-          });
     }
     tools
-}
-
-/// `DEX_EXTRA_TOOLS` flag, cached process-wide: `tools_schema()` runs per
-/// model call and the env lookup is pure overhead after boot. Tests bypass
-/// the cache — they flip the var mid-process and expect the schema to
-/// follow.
-fn extra_tools_enabled() -> bool {
-    #[cfg(test)]
-    {
-        std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1")
-    }
-    #[cfg(not(test))]
-    {
-        static EXTRA_TOOLS: OnceLock<bool> = OnceLock::new();
-        *EXTRA_TOOLS.get_or_init(|| std::env::var("DEX_EXTRA_TOOLS").as_deref() == Ok("1"))
-    }
 }
 
 /// Chat-completions wire messages: borrowed [`WireMessage`] views, serialized

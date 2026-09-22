@@ -68,11 +68,11 @@ pub(crate) use exec::{
     parse_generation, resolve_child_config, resolve_resume_handle, resume_messages, resume_nudge,
     seed_task_text,
 };
-#[cfg(test)]
-pub(crate) use schema::DELEGATION_TOOLS;
 pub(crate) use schema::{
     delegation_enabled, is_delegation, set_daemon_linked, status_word, AgentTurnContext,
 };
+#[cfg(test)]
+pub(crate) use schema::{DELEGATION_ACTIONS, DELEGATION_TOOL};
 
 #[cfg(test)]
 mod tests;

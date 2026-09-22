@@ -5,7 +5,7 @@ use crate::runtime::cancel::CancellationSource;
 use super::audit::audit;
 use super::edit::{change_diff_async, tool_edit};
 use super::error::ToolError;
-use super::meta::{tool_chain, tool_git, tool_ls, Policy};
+use super::meta::{tool_ls, Policy};
 use super::outcome::ToolOutcome;
 use super::policy::{enforce_policy, metadata, metadata_native, PermissionRequirement, ToolFilter};
 use super::read::tool_read;
@@ -242,8 +242,6 @@ async fn dispatch_tool(
         "edit" => tool_edit(args).await,
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
         "ls" => tool_ls(args).await,
-        "git" => tool_git(args, cancel).await,
-        "chain" => tool_chain(args, cancel, policy, filter).await,
         _ => unreachable!("metadata and dispatch must stay in sync"),
     }
 }
