@@ -337,7 +337,7 @@ pub(crate) async fn post_with_retry(
             crate::log!(Warn, "api error {status}: {}", error_head(&body_text, 400));
             // Opaque 5xx / missing route from `/responses` usually means the
             // model only speaks chat-completions (proven for e.g.
-            // glm-5.3-flash on zen/go) — point at the per-model override
+            // glm-5.3-flash on opencode's go endpoint) — point at the per-model override
             // instead of a bare body. Auth and rate-limit failures say
             // nothing about the protocol, and a pinned `api:` means the user
             // already decided.

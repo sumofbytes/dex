@@ -57,14 +57,15 @@ pub(crate) use extension_model::{
     ExtensionModelSnapshot,
 };
 pub(crate) use headers::{
-    custom_headers_from_env, insert_extra_header, insert_parsed_headers, load_config_headers,
-    merge_header_layers, parse_headers_str,
+    apply_opencode_session_headers, custom_headers_from_env, insert_extra_header,
+    insert_parsed_headers, load_config_headers, merge_header_layers, parse_headers_str,
 };
 pub(crate) use permission::permission_from_env;
 pub(crate) use prompt_source::{resolve_cli_system_prompt, system_prompt_origin};
 pub(crate) use provider::{
     known_providers, load_provider_entries, model_api_from_env, resolve_provider,
-    set_cli_model_overrides, setup_guide_error, ProviderEntry, ResolvedProvider,
+    set_cli_model_overrides, setup_guide_error, unrouted_selection_error, ProviderEntry,
+    ResolvedProvider,
 };
 pub(crate) use routing::route_turn;
 #[cfg(test)]
@@ -114,15 +115,24 @@ pub(crate) fn load_config_file() -> Option<serde_yaml::Value> {
                         .filter(|k| !KNOWN_FILE_KEYS.contains(k))
                         .collect();
                     if !unknown.is_empty() {
-                        warn_once(
-                            "config:unknown-keys",
-                            &format!(
-                                "unknown config key(s) {} in {} — valid keys: {}",
-                                unknown.join(", "),
-                                path.display(),
-                                KNOWN_FILE_KEYS.join(", ")
-                            ),
+                        let mut msg = format!(
+                            "unknown config key(s) {} in {} — valid keys: {}",
+                            unknown.join(", "),
+                            path.display(),
+                            KNOWN_FILE_KEYS.join(", ")
                         );
+                        // The retired selection pointers are gone for good
+                        // (no rename warning anymore), so the unknown-key
+                        // report carries the migration pointer instead.
+                        if unknown
+                            .iter()
+                            .any(|k| *k == "active_provider" || *k == "provider")
+                        {
+                            msg.push_str(
+                                " — 'active_provider:'/'provider:' are no longer read: put the provider in 'model:' as 'model: <provider>/<model>'",
+                            );
+                        }
+                        warn_once("config:unknown-keys", &msg);
                     }
                 }
                 Some(value)
@@ -533,7 +543,14 @@ impl LlmConfig {
             None => provider_without_prefix(base_url_override.as_deref()),
         };
         if provider_name.is_empty() {
-            return Err(setup_guide_error().into());
+            // The selection exists but resolves no provider (a bare id, an
+            // unconfigured `prefix/rest`, a retired `zen/…`): name it and say
+            // what fixes it — "no model configured" would be a lie here.
+            return Err(match &selection {
+                Ok(resolved) => unrouted_selection_error(&resolved.value, &known),
+                Err(guide) => guide.clone(),
+            }
+            .into());
         }
         // `custom` from `provider_without_prefix` is URL-backed even when
         // no `providers.custom:` entry exists yet; parse_known already
