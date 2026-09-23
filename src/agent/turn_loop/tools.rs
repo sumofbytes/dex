@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::apply_queue_msg;
 use crate::agent::compaction::compact_history;
 use crate::agent::compaction::verbatim::summary_mode;
-use crate::agent::state::{cache_fingerprint, CancellationSource, ToolState};
+use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
 use crate::protocol::{ChatMessage, LlmToolCall, QueueMsg, SinkLine, Usage};
@@ -19,6 +19,7 @@ use crate::render::format::{
 use crate::runtime::console::{
     with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK, TOOL_OUTPUT_COLOR,
 };
+use crate::runtime::unwind::CatchUnwind;
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
@@ -345,8 +346,9 @@ pub(super) async fn note_tool_start(console: &Console, call: &LlmToolCall) {
 }
 
 /// Execute one batch of tool calls: serialized under the mutation lock when
-/// the calls conflict, else fanned out on JoinSet tasks (input-ordered via
-/// indexed results + sort; panics surface as tool errors).
+/// the calls conflict, else fanned out on JoinSet tasks (bounded to
+/// `BATCH_MAX_CONCURRENT` permits, aborted promptly on cancel; input-ordered
+/// via indexed slots, panics surface as tool errors).
 pub(super) async fn run_tool_batch<X>(
     calls: &[LlmToolCall],
     cancel: &X,
@@ -361,6 +363,19 @@ where
         let _guard = TOOL_MUTATION_LOCK.lock().await;
         let mut out = Vec::new();
         for call in calls {
+            if cancel.is_cancelled() {
+                out.push((
+                    call.function.name.clone(),
+                    call.function.arguments.clone(),
+                    ToolOutcome {
+                        text: "Error: cancelled by user".into(),
+                        ok: false,
+                        diff: None,
+                    },
+                    Duration::ZERO,
+                ));
+                continue;
+            }
             let started = Instant::now();
             note_tool_start(console, call).await;
             let (name, input, outcome) = execute_tool_call(
@@ -374,11 +389,15 @@ where
         }
         out
     } else {
-        // One `tokio::spawn` per call, awaited in input order: tasks still
-        // run concurrently, but each handle stays paired with its own index,
-        // so a panicking worker is attributed to its own call instead of
-        // landing on a positional guess after a completion-order sort (S3).
-        let mut handles = Vec::with_capacity(calls.len());
+        // Bounded fan-out on a JoinSet: tasks still run concurrently (total
+        // ~max, not sum), each result carries its own index so the transcript
+        // stays in input order. A semaphore caps fd/thread pressure no matter
+        // how many calls the model packed into one batch; `select!` on
+        // `wait_cancelled` aborts the stragglers instead of waiting for the
+        // slowest tool after Ctrl+C.
+        const BATCH_MAX_CONCURRENT: usize = 10;
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(BATCH_MAX_CONCURRENT));
+        let mut set = tokio::task::JoinSet::new();
         for (idx, call) in calls.iter().enumerate() {
             let call = call.clone();
             let cancel = cancel.clone();
@@ -387,42 +406,131 @@ where
             // cannot hold the turn's borrowed filter — same shape
             // as the per-task policy clone above.
             let filter = filter.cloned();
-            // Same for the start-of-call announce below: each task emits
-            // its own `ToolInput` (paired later by call id), so the TUI
-            // opens every parallel block up front instead of only after
-            // the whole batch completes.
+            // Each task announces its own start (paired later by call
+            // id), but only as semaphore permits free up: ~max blocks
+            // open at once, in permit order rather than input order.
             let task_console = console.clone();
-            handles.push((
-                idx,
-                tokio::spawn(async move {
-                    let started = Instant::now();
-                    note_tool_start(&task_console, &call).await;
-                    let (name, input, outcome) =
-                        execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
-                    (name, input, outcome, started.elapsed())
-                }),
-            ));
-        }
-        let mut out = Vec::with_capacity(calls.len());
-        for (idx, handle) in handles {
-            match handle.await {
-                Ok((name, input, outcome, elapsed)) => out.push((name, input, outcome, elapsed)),
-                Err(_) => {
-                    let call = &calls[idx];
-                    out.push((
+            let sem = sem.clone();
+            set.spawn(async move {
+                // The semaphore is never closed, but fail closed with
+                // the index intact rather than run unpermitted.
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return (
+                        idx,
                         call.function.name.clone(),
                         call.function.arguments.clone(),
                         ToolOutcome {
-                            text: "Error: tool worker panicked".into(),
+                            text: "Error: tool worker missing".into(),
                             ok: false,
                             diff: None,
                         },
                         Duration::ZERO,
-                    ))
+                    );
+                };
+                let started = Instant::now();
+                note_tool_start(&task_console, &call).await;
+                // `CatchUnwind` keeps the index on the panic path: a
+                // panicking worker reports against its own call instead
+                // of landing on a positional guess (JoinSet's JoinError
+                // carries no task payload).
+                let work = async {
+                    let (name, input, outcome) =
+                        execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
+                    (name, input, outcome, started.elapsed())
+                };
+                match CatchUnwind::new(Box::pin(work), "tool worker panicked").await {
+                    Ok((name, input, outcome, elapsed)) => (idx, name, input, outcome, elapsed),
+                    Err(text) => (
+                        idx,
+                        call.function.name.clone(),
+                        call.function.arguments.clone(),
+                        ToolOutcome {
+                            text: format!("Error: {text}"),
+                            ok: false,
+                            diff: None,
+                        },
+                        Duration::ZERO,
+                    ),
+                }
+            });
+        }
+        let mut slots: Vec<Option<(String, String, ToolOutcome, Duration)>> =
+            Vec::with_capacity(calls.len());
+        slots.resize_with(calls.len(), || None);
+        let mut remaining = calls.len();
+        let cancel_ref = cancel as &(dyn CancellationSource + Send + Sync);
+        while remaining > 0 {
+            tokio::select! {
+                res = set.join_next() => {
+                    match res {
+                        Some(Ok((idx, name, input, outcome, elapsed))) => {
+                            slots[idx] = Some((name, input, outcome, elapsed));
+                            remaining -= 1;
+                        }
+                        Some(Err(_)) => {
+                            // Only panics outside the `CatchUnwind`
+                            // wrapper reach here (permit acquire, start
+                            // announce): attribute to the first empty
+                            // slot. Panics are rare, count stays exact.
+                            if let Some(hole) = slots.iter().position(|s| s.is_none()) {
+                                let call = &calls[hole];
+                                slots[hole] = Some((
+                                    call.function.name.clone(),
+                                    call.function.arguments.clone(),
+                                    ToolOutcome {
+                                        text: "Error: tool worker panicked".into(),
+                                        ok: false,
+                                        diff: None,
+                                    },
+                                    Duration::ZERO,
+                                ));
+                            }
+                            remaining -= 1;
+                        }
+                        None => break,
+                    }
+                }
+                _ = wait_cancelled(cancel_ref) => {
+                    set.abort_all();
+                    while set.join_next().await.is_some() {}
+                    for (i, slot) in slots.iter_mut().enumerate() {
+                        if slot.is_none() {
+                            let call = &calls[i];
+                            *slot = Some((
+                                call.function.name.clone(),
+                                call.function.arguments.clone(),
+                                ToolOutcome {
+                                    text: "Error: cancelled by user".into(),
+                                    ok: false,
+                                    diff: None,
+                                },
+                                Duration::ZERO,
+                            ));
+                        }
+                    }
+                    break;
                 }
             }
         }
-        out
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                s.unwrap_or_else(|| {
+                    let call = &calls[i];
+                    (
+                        call.function.name.clone(),
+                        call.function.arguments.clone(),
+                        ToolOutcome {
+                            text: "Error: tool worker missing".into(),
+                            ok: false,
+                            diff: None,
+                        },
+                        Duration::ZERO,
+                    )
+                })
+            })
+            .collect()
     }
 }
 

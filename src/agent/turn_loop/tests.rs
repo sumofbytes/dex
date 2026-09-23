@@ -49,6 +49,18 @@ impl CancellationSource for NeverCancel {
     }
 }
 
+#[derive(Clone)]
+struct AlwaysCancel;
+
+impl CancellationSource for AlwaysCancel {
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+    fn take_cancelled(&self) -> bool {
+        true
+    }
+}
+
 fn test_config() -> LlmConfig {
     LlmConfig {
         provider: Provider::Anthropic,
@@ -470,6 +482,72 @@ async fn parallel_batch_preserves_input_order() {
     }
     announced.sort();
     assert_eq!(announced, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[tokio::test]
+async fn serial_batch_cancel_fills_every_slot() {
+    // Conflicting calls serialize under the mutation lock; a cancel set
+    // before the batch must short-circuit every call — no tool runs, and
+    // every slot still files a result so the transcript count stays exact.
+    use crate::tools::Policy;
+    let call = |id: &str| crate::protocol::LlmToolCall {
+        id: id.into(),
+        call_type: "function".into(),
+        function: crate::protocol::FunctionCall {
+            name: "edit".into(),
+            arguments: r#"{"path":"same.rs"}"#.into(),
+        },
+    };
+    let calls = vec![call("a"), call("b"), call("c")];
+    assert!(tool_calls_conflict(&calls));
+    let (sink_tx, _sink_rx) = mpsc::channel(32);
+    let (approval_tx, _approval_rx) = mpsc::channel(16);
+    let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
+    let results = run_tool_batch(&calls, &AlwaysCancel, &Policy::trusted(), None, &console).await;
+    assert_eq!(results.len(), calls.len());
+    for (result, call) in results.iter().zip(calls.iter()) {
+        assert_eq!(result.0, "edit");
+        assert_eq!(result.1, call.function.arguments);
+        assert!(!result.2.ok);
+        assert_eq!(result.2.text, "Error: cancelled by user");
+    }
+}
+
+#[tokio::test]
+async fn parallel_batch_cancel_keeps_order_and_count() {
+    // A cancel racing the fan-out must still file exactly one result per
+    // call, each paired with its own call: workers that finish first keep
+    // real results, the rest file cancelled errors. Over the semaphore
+    // bound (10) so the abort-and-fill path actually runs.
+    use crate::tools::Policy;
+    let call = |id: &str, path: &str| crate::protocol::LlmToolCall {
+        id: id.into(),
+        call_type: "function".into(),
+        function: crate::protocol::FunctionCall {
+            name: "read".into(),
+            arguments: format!(r#"{{"path":"{path}"}}"#),
+        },
+    };
+    let calls: Vec<_> = (0..25)
+        .map(|i| call(&format!("c{i}"), &format!("definitely-not-here-{i}.rs")))
+        .collect();
+    assert!(!tool_calls_conflict(&calls));
+    let (sink_tx, _sink_rx) = mpsc::channel(64);
+    let (approval_tx, _approval_rx) = mpsc::channel(16);
+    let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
+    let results = run_tool_batch(&calls, &AlwaysCancel, &Policy::trusted(), None, &console).await;
+    assert_eq!(results.len(), calls.len());
+    for (result, call) in results.iter().zip(calls.iter()) {
+        assert_eq!(result.0, "read", "result keeps its own call's name");
+        assert_eq!(
+            result.1, call.function.arguments,
+            "result keeps its own call's input"
+        );
+        assert!(
+            !result.2.text.is_empty(),
+            "every slot files a result, cancelled or real"
+        );
+    }
 }
 
 #[test]
