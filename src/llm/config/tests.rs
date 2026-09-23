@@ -1093,6 +1093,44 @@ fn provider_samples_stay_consistent() {
             "samples file lost its {provider} block"
         );
     }
+    // Every sample block names its own `model:` selection (active or
+    // commented): a renamed provider with a stale model line would
+    // otherwise pass the substring check above.
+    for provider in [
+        "opencode/",
+        "anthropic/",
+        "openai-codex/",
+        "google/",
+        "openai/",
+        "deepseek/",
+        "moonshotai/",
+        "openrouter/",
+        "commandcode/",
+    ] {
+        assert!(
+            text.contains(&format!("model: {provider}")),
+            "samples file lost its `{provider}` model line"
+        );
+    }
+    // Providers with no catalog endpoint must document their `base_url:`
+    // (and the custom-gateway template its `context_window:` fallback,
+    // since nothing sizes a model outside the catalog).
+    for url in [
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "https://api.openai.com/v1",
+        "https://commandcode.example/v1",
+        "https://gateway.example/v1",
+    ] {
+        assert!(text.contains(url), "samples file lost base_url {url}");
+    }
+    assert!(
+        text.contains("api: anthropic-messages"),
+        "samples file lost its Anthropic-wire pin"
+    );
+    assert!(
+        text.contains("context_window:"),
+        "samples file lost its custom-gateway context_window hint"
+    );
     // The guide's concrete happy-path id must match the active sample, so
     // the two cannot drift apart.
     assert!(
@@ -2345,7 +2383,11 @@ fn doctor_reports_selection_and_origins() {
     let out = doctor(None, None, None, &[], None).0;
     assert!(out.contains("provider"), "{out}");
     assert!(out.contains("model"), "{out}");
-    assert!(out.contains("key env"), "{out}");
+    // Pin the guide's key-env wording, not a generic substring: the
+    // unconfigured report has no `api key` row (no provider resolved),
+    // so a bare "key env" assert would pass on guide text alone and
+    // mask a key-row regression elsewhere.
+    assert!(out.contains("endpoint + key env from the catalog"), "{out}");
     assert!(out.contains("built-in default"), "{out}");
     assert!(out.contains("resolve"), "{out}");
 }

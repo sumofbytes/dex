@@ -660,6 +660,10 @@ pub fn run() {
                 system_prompt,
             );
             print!("{report}");
+            // `print!` is block-buffered when piped (the script-checkable
+            // case); `process::exit` skips `Stdout` flush, so flush first
+            // or the `resolve ERROR` tail can be lost.
+            let _ = io::stdout().flush();
             // Script-checkable (pi's `auth check` pattern): 0 when the
             // config builds cleanly, 1 on `resolve ERROR` so setup
             // failures gate scripts instead of passing silently.

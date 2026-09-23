@@ -147,13 +147,15 @@ model: opencode/gpt-5-nano # provider / model
 ### Provider examples
 
 Copy-paste samples for popular providers live in `examples/config.yaml`
-(one block per provider — uncomment a single block). The short version:
+(copy ONE block into your config file — the checked-in file keeps exactly
+one active block, so uncommenting in place would leave duplicate keys).
+The short version:
 
 | Provider | `model:` | Key | `base_url:` needed? |
 |---|---|---|---|
 | opencode (Zen gateway) | `opencode/gpt-5-nano` | `providers.opencode.api_key` or `OPENCODE_API_KEY` | no (catalog) |
 | anthropic (built in) | `anthropic/claude-sonnet-4-5` | `providers.anthropic.api_key` or `ANTHROPIC_API_KEY` | no (built in) |
-| openai-codex (built in) | `openai-codex/<model-id>` | none — run `codex --login` first | no (built in) |
+| openai-codex (built in) | `openai-codex/gpt-5.6-luna` | none — run `codex --login` first | no (built in) |
 | gemini | `google/gemini-3.1-pro-preview` | `providers.google.api_key` or `GEMINI_API_KEY` | yes — `https://generativelanguage.googleapis.com/v1beta/openai/` |
 | openai | `openai/gpt-5-nano` | `providers.openai.api_key` or `OPENAI_API_KEY` | yes — `https://api.openai.com/v1` |
 | deepseek | `deepseek/deepseek-v4-flash` | `providers.deepseek.api_key` or `DEEPSEEK_API_KEY` | no (catalog) |

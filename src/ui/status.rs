@@ -402,9 +402,16 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
 fn bare_pieces(app: &App) -> Vec<Piece> {
     // Narrowest tier: brevity beats precision — the bare id keeps the
     // connection badge on screen when even `provider/model` won't fit.
+    // Still `unconfigured` when the daemon resolved no config yet, never
+    // `unknown` or an empty string.
     let mut pieces = vec![mode_piece(app)];
     push_sep(&mut pieces);
-    pieces.push(quiet(app.config.model.clone()));
+    let bare = if app.config.provider.name().is_empty() {
+        "unconfigured".to_string()
+    } else {
+        app.config.model.clone()
+    };
+    pieces.push(quiet(bare));
     push_cost(&mut pieces, app);
     pieces
 }
@@ -508,7 +515,12 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
         return to_line(left);
     }
     let mut left = hint;
-    left.push(quiet(app.config.model.clone()));
+    let last_resort = if app.config.provider.name().is_empty() {
+        "unconfigured".to_string()
+    } else {
+        app.config.model.clone()
+    };
+    left.push(quiet(last_resort));
     to_line(truncate_pieces(left, width))
 }
 
