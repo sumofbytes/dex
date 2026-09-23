@@ -13,6 +13,7 @@ use std::time::Duration;
 mod catalog_index;
 mod catalog_query;
 mod cost;
+mod credentials;
 mod ctx_index;
 mod doctor;
 mod extension_model;
@@ -21,10 +22,6 @@ mod permission;
 mod prompt_source;
 mod provider;
 mod selection;
-/// Builtin providers whose canonical key env var is pinned in dex rather
-/// than catalog-discovered — see `llm::auth` (single owner of key
-/// resolution); re-exported so existing `config::...` paths keep working.
-pub(crate) use super::auth::{pinned_key_env, resolve_credentials};
 /// Per-model reasoning effort — see `llm::thinking` (single owner of
 /// `thinking-effort.json`); re-exported so existing `config::...` paths
 /// keep working.
@@ -34,6 +31,10 @@ pub(crate) use super::auth::{pinned_key_env, resolve_credentials};
 pub(crate) use super::thinking::{remember_thinking_effort, stored_thinking_effort};
 #[cfg(test)]
 pub(crate) use crate::workspace::unique_tmp_path;
+/// Builtin providers whose canonical key env var is pinned in dex rather
+/// than catalog-discovered — see `config::credentials` (single owner of key
+/// resolution); re-exported so existing `config::...` paths keep working.
+pub(crate) use credentials::{pinned_key_env, resolve_credentials};
 // `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub(crate) use catalog_query::{
@@ -120,6 +121,11 @@ pub(crate) fn load_config_file() -> Option<serde_yaml::Value> {
                         // The retired selection pointers are gone for good
                         // (no rename warning anymore), so the unknown-key
                         // report carries the migration pointer instead.
+                        if unknown.contains(&"routing") {
+                            msg.push_str(
+                                " — 'routing:' is no longer read: set 'model:' directly",
+                            );
+                        }
                         if unknown
                             .iter()
                             .any(|k| *k == "active_provider" || *k == "provider")
