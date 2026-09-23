@@ -43,7 +43,7 @@ pub(crate) use catalog_query::{
 };
 #[cfg(test)]
 pub(crate) use cost::resolve_model_cost;
-pub(crate) use cost::usage_cost;
+pub(crate) use cost::{cost_hint_for, model_hints_for, usage_cost};
 #[cfg(test)]
 pub(crate) use ctx_index::{build_ctx_map, write_ctx_index};
 pub(crate) use ctx_index::{
@@ -63,15 +63,16 @@ pub(crate) use headers::{
 pub(crate) use permission::permission_from_env;
 pub(crate) use prompt_source::{resolve_cli_system_prompt, system_prompt_origin};
 pub(crate) use provider::{
-    known_providers, load_provider_entries, load_provider_name, model_api_from_env,
-    resolve_provider, set_cli_model_overrides, setup_guide_error, ProviderEntry, ResolvedProvider,
+    known_providers, load_provider_entries, model_api_from_env, resolve_provider,
+    set_cli_model_overrides, setup_guide_error, unrouted_selection_error, ProviderEntry,
+    ResolvedProvider,
 };
 pub(crate) use routing::route_turn;
 #[cfg(test)]
 pub(crate) use routing::routing_resolution;
 pub(crate) use selection::{
-    classify_selection, env_parse, persist_selection, provider_fallback_with_origin,
-    provider_without_prefix, resolve_selection, split_selection, Resolved, SelectionRoute,
+    classify_selection, env_parse, persist_selection, provider_without_prefix, resolve_selection,
+    split_selection, Resolved, SelectionRoute,
 };
 
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
@@ -114,15 +115,24 @@ pub(crate) fn load_config_file() -> Option<serde_yaml::Value> {
                         .filter(|k| !KNOWN_FILE_KEYS.contains(k))
                         .collect();
                     if !unknown.is_empty() {
-                        warn_once(
-                            "config:unknown-keys",
-                            &format!(
-                                "unknown config key(s) {} in {} — valid keys: {}",
-                                unknown.join(", "),
-                                path.display(),
-                                KNOWN_FILE_KEYS.join(", ")
-                            ),
+                        let mut msg = format!(
+                            "unknown config key(s) {} in {} — valid keys: {}",
+                            unknown.join(", "),
+                            path.display(),
+                            KNOWN_FILE_KEYS.join(", ")
                         );
+                        // The retired selection pointers are gone for good
+                        // (no rename warning anymore), so the unknown-key
+                        // report carries the migration pointer instead.
+                        if unknown
+                            .iter()
+                            .any(|k| *k == "active_provider" || *k == "provider")
+                        {
+                            msg.push_str(
+                                " — 'active_provider:'/'provider:' are no longer read: put the provider in 'model:' as 'model: <provider>/<model>'",
+                            );
+                        }
+                        warn_once("config:unknown-keys", &msg);
                     }
                 }
                 Some(value)
@@ -229,8 +239,6 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "extensions",
     "jev",
     // Deprecated but still honored for old files:
-    "active_provider",
-    "provider",
     "base_url",
     "api",
     "headers",
@@ -368,8 +376,8 @@ pub(crate) fn base_protocol(
 }
 
 /// Nothing anywhere names a provider/model/endpoint: the "no provider
-/// configured" guide is the honest error then, not "opencode is broken".
-/// Shares `from_env`'s own check so the setup error and resolution agree.
+/// configured" guide is the honest error then. Shares `from_env`'s own
+/// check so the setup error and resolution agree.
 fn selection_is_unconfigured(
     model_override: Option<&str>,
     base_url_override: Option<&str>,
@@ -381,11 +389,6 @@ fn selection_is_unconfigured(
             .filter(|m| !m.trim().is_empty())
             .is_none()
         && load_config_str(file, "model").is_none()
-        && env::var("DEX_PROVIDER")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .is_none()
-        && load_provider_name(file).is_none()
         // `--base-url` is a setup pointer too: the user configured an endpoint,
         // so a missing key names providers.custom, not the generic guide.
         && base_url_override.is_none()
@@ -399,32 +402,33 @@ fn provider_from_name(name: &str, known: &BTreeSet<String>) -> Option<Provider> 
 }
 
 /// The `provider`/`model` pair for the selection. When nothing selected a
-/// model, still resolve the provider the same way `from_env` would (deprecated
-/// pointer > the `--base-url` custom route > the opencode landing default) so
-/// the key/endpoint error names the right deposit; the missing-model guide
-/// comes last.
+/// model, still resolve the provider the same way `from_env` would (the
+/// `--base-url` custom route) so the key/endpoint error names the right
+/// deposit; the missing-model guide comes last.
 fn selection_provider_and_model(
     selection: &Result<Resolved<String>, String>,
     known: &BTreeSet<String>,
-    file: &Option<serde_yaml::Value>,
     base_url_override: Option<&str>,
     provider_entries: &BTreeMap<String, ProviderEntry>,
     using_builtin_default: bool,
 ) -> Result<(Option<String>, String), Box<dyn std::error::Error>> {
     let Ok(resolved) = selection else {
         let guide = selection.as_ref().err().expect("selection is Err");
-        let (fallback, origin) = provider_fallback_with_origin(file);
-        let name = provider_without_prefix((fallback, origin), base_url_override);
+        let name = provider_without_prefix(base_url_override);
         let provider = provider_from_name(&name, known).ok_or_else(|| guide.clone())?;
-        let key_err = resolve_credentials(&provider, provider_entries)
-            .err()
-            .map(|e| {
-                if using_builtin_default {
-                    guide.clone()
-                } else {
-                    e.to_string()
-                }
-            });
+        let key_err = if name.is_empty() {
+            None
+        } else {
+            resolve_credentials(&provider, provider_entries)
+                .err()
+                .map(|e| {
+                    if using_builtin_default {
+                        guide.clone()
+                    } else {
+                        e.to_string()
+                    }
+                })
+        };
         return Err(key_err.unwrap_or_else(|| guide.clone()).into());
     };
     let (provider, model) = split_selection(&resolved.value, known)?;
@@ -510,10 +514,9 @@ impl LlmConfig {
         }
         let provider_entries = load_provider_entries(&file);
         let known = known_providers(&provider_entries);
-        // Untouched builtin default (no flag/env/file pointer anywhere):
-        // a missing key then means "nothing configured", not "opencode
-        // is broken" — the error guides setup instead of endorsing one
-        // provider.
+        // Untouched default (no flag/env/file pointer anywhere): a missing
+        // key then means "nothing configured" — the error guides setup
+        // instead of endorsing one provider.
         let using_builtin_default = selection_is_unconfigured(
             model_override.as_deref(),
             base_url_override.as_deref(),
@@ -522,36 +525,42 @@ impl LlmConfig {
         // One selection knob names provider *and* model: `provider/model`
         // (`endpoint/model` or a bare provider name work too). Precedence:
         // `--model` > `DEX_MODEL` > file `model:` — nothing set anywhere is
-        // a setup error, not a silent builtin default. When the selection
-        // carries no provider, `DEX_PROVIDER` / `active_provider:` (both
-        // deprecated) still pick one. Model resolution is deferred to just
+        // a setup error, not a silent builtin default. A selection without
+        // a prefix rides `--base-url` (custom) or errors: no provider means
+        // no key, no endpoint, no wire. Model resolution is deferred to just
         // before the build: credential/endpoint problems are reported
         // first, they are the more actionable fix.
         let selection = resolve_selection(model_override, &file);
         let (selection_provider, model) = selection_provider_and_model(
             &selection,
             &known,
-            &file,
             base_url_override.as_deref(),
             &provider_entries,
             using_builtin_default,
         )?;
         let provider_name = match selection_provider.as_deref() {
             Some(name) => name.to_string(),
-            None => provider_without_prefix(
-                provider_fallback_with_origin(&file),
-                base_url_override.as_deref(),
-            ),
+            None => provider_without_prefix(base_url_override.as_deref()),
         };
+        if provider_name.is_empty() {
+            // The selection exists but resolves no provider (a bare id, an
+            // unconfigured `prefix/rest`, a retired `zen/…`): name it and say
+            // what fixes it — "no model configured" would be a lie here.
+            return Err(match &selection {
+                Ok(resolved) => unrouted_selection_error(&resolved.value, &known),
+                Err(guide) => guide.clone(),
+            }
+            .into());
+        }
         // `custom` from `provider_without_prefix` is URL-backed even when
         // no `providers.custom:` entry exists yet; parse_known already
         // covers the configured case, this catches the bare `--base-url`
-        // route so the key error names the right deposit.
-        let provider = provider_from_name(&provider_name, &known).ok_or_else(|| {
-            format!(
-                "unsupported provider '{provider_name}'; use opencode, openai-codex, anthropic, or add it under 'providers:' (e.g. providers.custom: {{base_url: ..., api_key: ...}})"
-            )
-        })?;
+        // route so the key error names the right deposit. Any other
+        // unprefixed name still resolves as a generic provider: the key
+        // error names `providers.<name>.api_key`, the catalog (once
+        // fetched) supplies the URL and the provider's key env var.
+        let provider = provider_from_name(&provider_name, &known)
+            .unwrap_or_else(|| Provider::Generic(provider_name.to_ascii_lowercase()));
         let mut available_models = env_models();
         let file_base_url = load_config_str(&file, "base_url");
         if file_base_url.is_some() {
@@ -755,9 +764,9 @@ impl LlmConfig {
     ) -> Result<Option<String>, String> {
         let prev_model = self.model.clone();
         let prev_provider = self.provider.clone();
-        // Provider-qualified: "opencode/gpt-..." or "openai-codex/gpt-..."
+        // Provider-qualified: "anthropic/..." or "openai-codex/..."
         // switches provider (and its base_url) without env. A bare provider
-        // name ("/model opencode") switches provider and keeps the model —
+        // name ("/model anthropic") switches provider and keeps the model —
         // it names a provider, not a model id.
         let sel: String;
         let mut keep_model = false;

@@ -51,7 +51,7 @@ impl CancellationSource for NeverCancel {
 
 fn test_config() -> LlmConfig {
     LlmConfig {
-        provider: Provider::OpenCode,
+        provider: Provider::Anthropic,
         api_key: String::new(),
         base_url: String::new(),
         model: "mock".into(),

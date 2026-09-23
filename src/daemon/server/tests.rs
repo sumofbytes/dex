@@ -341,7 +341,7 @@ mod handler_tests {
     fn thinking_override_sets_clears_and_keeps_default() {
         // Pure override applied per turn: None keeps, "" clears, else sets.
         let mut config = LlmConfig {
-            provider: crate::protocol::Provider::OpenCode,
+            provider: crate::protocol::Provider::Anthropic,
             api_key: String::new(),
             base_url: String::new(),
             model: "m".into(),
@@ -1507,15 +1507,11 @@ mod permission_gate_tests {
 
         // Hermetic session storage.
         let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-            "XDG_DATA_HOME",
-            "DEX_PERMISSION",
-            "DEX_PROVIDER",
-            "OPENCODE_API_KEY",
-        ]
-        .iter()
-        .map(|k| (*k, std::env::var_os(k)))
-        .collect();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["XDG_DATA_HOME", "DEX_PERMISSION", "OPENCODE_API_KEY"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
         let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
@@ -1529,14 +1525,12 @@ mod permission_gate_tests {
         // network) — endpoint overrides are per-request/file, never env.
         // Set before the state exists: the ceiling is resolved once at
         // `DaemonState::new()` (§3.1), so a later env change must not move it.
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            ["DEX_PERMISSION", "DEX_PROVIDER", "OPENCODE_API_KEY"]
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["DEX_PERMISSION", "OPENCODE_API_KEY"]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
         let _env2 = crate::session::EnvGuard(saved);
         std::env::set_var("DEX_PERMISSION", "read-only");
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
 
         let state = Arc::new(DaemonState::new());
@@ -1751,7 +1745,6 @@ mod e2e_tests {
             "XDG_DATA_HOME",
             "DEX_CONFIG",
             "DEX_PERMISSION",
-            "DEX_PROVIDER",
             "OPENCODE_API_KEY",
             "DEX_MODELS",
             "DEX_MODEL_APIS",
@@ -1771,12 +1764,11 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("DEX_PERMISSION", "ask-writes");
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
         // Clear the rest for hermeticity.
@@ -1928,7 +1920,6 @@ mod e2e_tests {
             "XDG_DATA_HOME",
             "DEX_CONFIG",
             "DEX_PERMISSION",
-            "DEX_PROVIDER",
             "OPENCODE_API_KEY",
             "DEX_MODELS",
             "DEX_MODEL_APIS",
@@ -1964,12 +1955,11 @@ mod e2e_tests {
         .unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("DEX_PERMISSION", "trusted");
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
         for v in [
@@ -2103,7 +2093,6 @@ mod e2e_tests {
             "XDG_DATA_HOME",
             "DEX_CONFIG",
             "DEX_PERMISSION",
-            "DEX_PROVIDER",
             "OPENCODE_API_KEY",
             "DEX_MODELS",
             "DEX_MODEL_APIS",
@@ -2119,12 +2108,11 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("DEX_PERMISSION", "ask-writes");
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
         for v in [
@@ -2320,7 +2308,7 @@ mod e2e_tests {
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "DEX_CONFIG",
-            "DEX_PROVIDER",
+            "DEX_MODEL",
             "OPENCODE_API_KEY",
             "DEX_PERMISSION",
             "DEX_DAEMON_TOKEN",
@@ -2336,13 +2324,8 @@ mod e2e_tests {
         let _env = crate::session::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
-        std::fs::write(
-            data_dir.join("config.yaml"),
-            "active_provider: opencode\napi: openai-completions\n",
-        )
-        .unwrap();
+        std::fs::write(data_dir.join("config.yaml"), "api: openai-completions\n").unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_PERMISSION", "ask-writes");
         std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
@@ -2402,7 +2385,9 @@ mod e2e_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let info: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(info["provider"], "opencode");
+        // Nothing selects a provider (the file carries no `model:`), so the
+        // best-effort info keeps the empty default instead of guessing one.
+        assert_eq!(info["provider"], "");
         // `ask-writes` is the deprecated spelling of `ask`; `as_str` never
         // emits it, so `/api/config` reports the canonical value.
         assert_eq!(info["permission"], "ask");
@@ -2415,7 +2400,7 @@ mod e2e_tests {
         );
 
         // Incomplete config still renders (best-effort info, no error).
-        std::env::set_var("DEX_PROVIDER", "definitely-not-a-provider");
+        std::env::set_var("DEX_MODEL", "definitely-not-a-provider/m");
         let resp = http
             .get(url("/api/config"))
             .header("authorization", "Bearer s3cret-token")
@@ -2469,7 +2454,6 @@ mod e2e_tests {
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
             "DEX_CONFIG",
-            "DEX_PROVIDER",
             "OPENCODE_API_KEY",
             "DEX_PERMISSION",
             "DEX_MODELS",
@@ -2487,11 +2471,10 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("active_provider: opencode\nmodel: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-        std::env::set_var("DEX_PROVIDER", "opencode");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_PERMISSION", "ask-writes");
         std::env::set_var("DEX_VERIFY", "false");

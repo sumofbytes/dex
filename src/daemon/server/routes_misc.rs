@@ -136,8 +136,9 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
 
 impl DaemonInfo {
     /// `/api/config` shape when the daemon has no usable config yet:
-    /// provider/model from env fallbacks, empty model list. The live-config
-    /// arm overwrites the derived fields on top of this.
+    /// empty model list and an empty provider name (no built-in default —
+    /// display-only, see `display_config`). The live-config arm overwrites
+    /// the derived fields on top of this.
     fn default_for(
         cwd: String,
         git_branch: Option<String>,
@@ -145,9 +146,7 @@ impl DaemonInfo {
         permission: String,
     ) -> Self {
         Self {
-            provider: std::env::var("DEX_PROVIDER")
-                .ok()
-                .unwrap_or_else(|| "opencode".to_string()),
+            provider: String::new(),
             model: "unknown".to_string(),
             api: "openai-responses".to_string(),
             available_models: Vec::new(),

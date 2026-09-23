@@ -116,21 +116,22 @@ every resolved value with where it came from.
 | Layer (wins first)    | Example                                               |
 | --------------------- | ----------------------------------------------------- |
 | CLI flags             | `--model`, `--base-url`                               |
-| Environment variables | `DEX_MODEL`, `OPENCODE_API_KEY`, `DEX_HEADERS`        |
+| Environment variables | `DEX_MODEL`, provider key vars, `DEX_HEADERS`          |
 | Config file           | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
 
-Nothing hardcodes a model: if no layer selects one, `dex` refuses to start and
-prints a setup guide instead of guessing. (`dex doctor` shows the same.) Only
-the provider *landing URL* for a bare model id (`model: m` with no
-`provider/` prefix) has a built-in default: opencode's gateway, so a bare id
-has somewhere to ride.
+Nothing hardcodes a model *or* a provider: if no layer selects one, `dex`
+refuses to start and prints a setup guide instead of guessing. (`dex doctor`
+shows the same.) Built-in providers are `anthropic` (native Messages wire) and
+`openai-codex` (ChatGPT OAuth); every other provider — including the opencode
+gateway — is an ordinary `providers:` entry resolved through the models.dev
+catalog.
 
 `model:` is the only selection knob and names provider _and_ model:
-`<provider>/<model>` (`<endpoint>/<model>` forces an endpoint; a bare provider
-name just switches provider). Write-back keeps that form: a `/model` or
-`/provider` pick updates `model:` in the file, so the switch becomes the default
-for later runs. Session state still re-applies the exact provider/model on
-`/resume`.
+`<provider>/<model>` — the stored key always carries a model id (an
+in-session `/model anthropic` may switch just the provider; the key stays
+qualified). Write-back keeps that form: a `/model` or `/provider` pick updates
+`model:` in the file, so the switch becomes the default for later runs. Session
+state still re-applies the exact provider/model on `/resume`.
 
 A minimal `~/.config/dex/config.yaml`:
 
@@ -138,19 +139,22 @@ A minimal `~/.config/dex/config.yaml`:
 providers:
   opencode:
     api_key: sk-... # the deposit place for this provider's key
-model: zen/gpt-5.6-luna # endpoint-or-provider / model
+    base_url: https://opencode.ai/zen/v1
+model: opencode/gpt-5.6-luna # provider / model
 ```
 
-A file naming only a provider also works (`model: anthropic` plus
-`ANTHROPIC_API_KEY`) — but a bare provider pick names no model, so export the
-provider's key and pass an id: `DEX_MODEL=opencode/<model-id> dex`. The daemon
-bootstraps the models.dev catalog in the background, so a fresh install needs no
-manual `dex update --models`.
+The stored selection always carries a model id: a provider-only selection
+(`model: anthropic`) fails with a "names a provider but no model" error —
+export the provider's key and pass an id instead:
+`DEX_MODEL=anthropic/<model-id> dex`. The daemon bootstraps the models.dev
+catalog in the background, so a fresh install needs no manual
+`dex update --models`.
 
 Run `dex update --models` once to cache the models.dev catalog. After that a
-bare `/model <id>` moves `base_url` to the endpoint serving that id, and the
-wire protocol follows the same way: a first `/responses` failure falls back to
-chat-completions once and is remembered, so per-model knowledge never needs
+bare `/model <id>` stays on the current provider (`provider/<id>` switches to
+another), and the wire protocol follows the same way: a first `/responses`
+failure falls back to chat-completions once and is remembered, so per-model
+knowledge never needs
 configuring. An explicit `--base-url` pins the endpoint — prefixes become naming
 only and are stripped. Manual overrides are escape hatches only:
 `DEX_MODEL_APIS="id=openai-completions,..."` seeds a model's protocol (full
@@ -162,12 +166,13 @@ the canonical spots:
 
 | Deprecated                                        | Replacement                                                                       |
 | ------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `active_provider:` / `provider:`                  | put the provider in `model:` as `provider/model`                                  |
 | top-level `base_url:`                             | `base_url:` under the provider's entry in `providers:`                            |
 | top-level `api:`                                  | `api:` under the provider's entry in `providers:`                                 |
 | top-level `headers:` / `http_headers:`            | `headers:` under the provider's entry (provider-scoped) or `DEX_HEADERS` (global) |
-| `DEX_PROVIDER` env                                | `DEX_MODEL=<provider>/<model>`                                                    |
 | `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` env | `DEX_HEADERS` (same syntax)                                                       |
+
+`active_provider:` / `provider:` (file) and `DEX_PROVIDER` (env) are no longer
+read at all: the provider lives in `model:` as `provider/model`.
 
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
 parse error lists the valid keys: `model`, `providers`, `context_window`,
@@ -178,14 +183,15 @@ ones above). Other keys are preserved untouched.
 ### Complexity routing
 
 `DEX_ROUTING=1` (or file `routing:` with `enabled: true`) routes each turn
-to a tiered model by prompt complexity — cheap models for typos and trivial
-Q&A, stronger ones for refactors, migrations and security-sensitive work.
+to a tiered `(model, thinking_effort)` tuple by prompt complexity — cheap
+models for typos and trivial Q&A, stronger ones for refactors, migrations
+and security-sensitive work.
 Classification is single-pass stem/weight scoring (no LLM call):
 the prompt is tokenized once, stems corroborate toward a tier
 (a lone `auth` stays put; `auth` + `refactor` escalates), and file
 paths, code fences, and real session tool activity weigh in;
 the routed tier is shown per turn with its top reason and journaled on
-the turn's `turn_start` marker. `dex doctor` shows the switch plus each tier's resolved model and
+the turn's `turn_start` marker. `dex doctor` shows the switch plus each tier's resolved model, effort and
 origin.
 
 Tiers mirror the vendors' three capability buckets (`fast` ≈ OpenAI
@@ -198,6 +204,9 @@ routing:
   fast: myprov/cheap-model # trivial prompts
   balanced: myprov/workhorse # normal work (also the fallback tier)
   powerful: myprov/best # multi-file, auth, migrations, security
+  fast_effort: low # reasoning effort per tier (optional)
+  balanced_effort: medium
+  powerful_effort: high
 ```
 
 Each tier takes a full `provider/model` selection, so catalog endpoints and
@@ -205,9 +214,15 @@ Each tier takes a full `provider/model` selection, so catalog endpoints and
 `DEX_ROUTING_<FAST|BALANCED|POWERFUL>` overrides one tier. A tier with
 neither falls back to `routing.balanced:`, then to `model:` — so setting only
 `balanced` (or nothing, keeping `model:`) is a valid setup.
+Each tier may also name a reasoning effort (`routing.<tier>_effort:`, or
+`DEX_ROUTING_<TIER>_EFFORT` which wins over the file). A tier with neither
+falls back to `routing.balanced_effort:`, then keeps the turn's
+`thinking_effort:` (stored `/thinking` choice > `DEX_THINKING_EFFORT` >
+file) — so efforts are purely opt-in per tier.
 
   Explicit picks always win: `--model` / a per-request model skips routing
-  entirely (no classification runs), and `/model` sets top-level `model:`,
+  entirely (no classification runs), a per-request thinking effort wins over
+  the routed effort, and `/model` sets top-level `model:`,
   which is the fallback every tier resolves to — so with an explicit pick
   every tier would land on the picked model until per-tier selections are
   set. (`dex doctor` still shows each tier's resolved row as the hypothetical
@@ -262,8 +277,8 @@ providers:
 and reasoning options come from the cached models.dev catalog — run
 `dex update --models` once. The key resolves per provider: config
 `providers.<name>.api_key` > the provider's own documented env var (from the
-catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`); opencode's is
-`OPENCODE_API_KEY`. There is no per-provider default key var outside the catalog
+catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY`). There
+is no per-provider default key var outside the catalog
 — one provider's key never leaks into another. A model's advertised thinking
 options (e.g. `low/high/max`) are shown in the `/model` confirmation;
 `/thinking <level>` pins one per model (remembered per endpoint+model and
@@ -271,7 +286,8 @@ validated against the advertised list — unknown models accept anything, a stal
 catalog never blocks). `DEX_THINKING_EFFORT` is the fallback when nothing is
 pinned, and an effort no model advertises warns once instead of failing opaquely
 at the API. A file `thinking_effort:` default sits under both (stored choice >
-env > file). Wire protocol resolves like opencode: responses first, one fallback
+env > file). Wire protocol resolves like any OpenAI-compatible provider:
+responses first, one fallback
 to completions, remembered per endpoint+model. Native-protocol-only providers
 (no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
 selectable this way.
@@ -423,7 +439,7 @@ daemon's working directory.
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `--base-url <url>`               | Override the API base URL for this run (pins the endpoint; routing prefixes become naming only).                  |
 | `-H`, `--header <"Name: Value">` | Extra provider header (repeatable; `Name=Value` or JSON object also accepted).                                    |
-| `--model <name>`                 | Override the model for this run: `<provider>/<model>`, `<endpoint>/<model>`, or a bare provider name.             |
+| `--model <name>`                 | Override the model for this run: `<provider>/<model>` or a bare provider name.             |
 | `--system-prompt <text>`         | Replace the built-in base system prompt for this run (project/extensions/skills still append).                    |
 | `--system-prompt-file <path>`    | Read the replacement base system prompt from a file (client-side, so remote daemons work).                        |
 | `-s`, `--session <path>`         | Open/continue a specific session file.                                                                            |
@@ -771,11 +787,11 @@ discovered extension with its consent state.
 
 | Variable                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OPENCODE_API_KEY`                                            | API key for the opencode gateway (required for `opencode`; export it in your shell profile).                                                                                                                                                                                                                                                                                                                    |
+| `OPENCODE_API_KEY`                                            | API key env var of the `opencode` provider, learned from its models.dev catalog entry (set `providers.opencode.api_key` instead, or use whatever the catalog documents).                                                                                                                                                                                                                                          |
 | `ANTHROPIC_API_KEY`                                           | API key for the built-in `anthropic` provider (`model: anthropic/<model>`); resolves cache-less.                                                                                                                                                                                                                                                                                                                |
 | `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. `OPENAI_HEADERS`/`ANTHROPIC_CUSTOM_HEADERS` are deprecated aliases — use `DEX_HEADERS`.                                                                                    |
-| `DEX_MODEL`                                                   | Model selection, `provider/model` (`endpoint/model` or a bare provider name work too) — the same knob as the file's `model:` key.                                                                                                                                                                                                                                                                               |
-| `DEX_PROVIDER`                                                | Deprecated provider selection — use `DEX_MODEL=<provider>/<model>` (still honored with a one-time warning).                                                                                                                                                                                                                                                                                                     |
+| `DEX_MODEL`                                                   | Model selection, `provider/model` (a bare provider name works too) — the same knob as the file's `model:` key.                                                                                                                                                                                                                                                                               |
+| `DEX_PROVIDER`                                                | No longer read — use `DEX_MODEL=<provider>/<model>`.                                                                                                                                                                                                                                                                                             |
 | `CODEX_ACCESS_TOKEN`                                          | Optional Codex OAuth access-token override.                                                                                                                                                                                                                                                                                                                                                                     |
 | `CODEX_ACCOUNT_ID`                                            | Account ID paired with `CODEX_ACCESS_TOKEN`.                                                                                                                                                                                                                                                                                                                                                                    |
 | `DEX_MODELS`                                                  | Comma-separated models for `/model` autocomplete (default: catalog cache).                                                                                                                                                                                                                                                                                                                                      |
@@ -800,8 +816,9 @@ discovered extension with its consent state.
 | `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
 | `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate` tool (default on in daemon sessions).                                                                                                                                                                                                                                                                                                                                                          |
 | `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
-| `DEX_ROUTING`                                                 | `1` to route each turn to a tiered model by complexity (default off). Tiers classify the prompt deterministically (no LLM call): `fast` (typos, trivial Q&A), `balanced` (normal work), `powerful` (multi-file, auth, migrations, security). An explicit `--model` / per-request model always wins; the routed tier is shown per turn, journaled on `turn_start`, and `dex doctor` shows each tier and where its model came from.                                                                                                   |
+| `DEX_ROUTING`                                                 | `1` to route each turn to a tiered `(model, thinking_effort)` tuple by complexity (default off). Tiers classify the prompt deterministically (no LLM call): `fast` (typos, trivial Q&A), `balanced` (normal work), `powerful` (multi-file, auth, migrations, security). An explicit `--model` / per-request model always wins (a per-request thinking effort wins over the routed effort); the routed tier is shown per turn, journaled on `turn_start`, and `dex doctor` shows each tier and where its model and effort came from.                                                                                                   |
 | `DEX_ROUTING_<FAST|BALANCED|POWERFUL>`                        | Per-tier `provider/model` selection (same syntax as `DEX_MODEL`); wins over file `routing.<tier>:` for that tier. A tier with neither falls back to `routing.balanced:`, then to `model:`.                                                                                                                                                                                                                          |
+| `DEX_ROUTING_<FAST|BALANCED|POWERFUL>_EFFORT`                 | Per-tier reasoning effort; wins over file `routing.<tier>_effort:` for that tier. A tier with neither falls back to `routing.balanced_effort:`, then keeps the turn's `thinking_effort:`.                                                                                                                                                                                                                          |
 | `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
 | `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
 | `DEX_MCP_MAX_TOOLS`                                           | Cap on merged MCP schema tools (default 200; head kept sorted by name).                                                                                                                                                                                                                                                                                                                                         |
@@ -869,8 +886,7 @@ the same loop in-process with direct channels.
 
 `dex` interoperates with conventions from across the terminal-agent ecosystem:
 `CLAUDE.md` project instructions and `ANTHROPIC_CUSTOM_HEADERS` (Claude Code),
-session headers and response-first wire negotiation on the `opencode` gateway
-(OpenCode), OAuth via `codex --login` (Codex), token-based compaction settings
+response-first wire negotiation on OpenAI-compatible gateways, OAuth via `codex --login` (Codex), token-based compaction settings
 (`pi-mono`), and `fff-search` file search (`fff.nvim`). Model metadata comes
 from the models.dev catalog.
 

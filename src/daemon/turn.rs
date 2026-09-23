@@ -377,9 +377,10 @@ pub(crate) async fn run_turn_inner(
     } else {
         Vec::new()
     };
-    // Complexity router (V1): an explicit per-request model always wins;
-    // otherwise the classified tier resolves through routing.balanced: →
-    // top-level model:.
+    // Complexity router: an explicit per-request model always wins;
+    // otherwise the classified tier resolves the `(model, thinking_effort)`
+    // tuple through routing.balanced: → top-level model: (model) and
+    // routing.balanced_effort: → keep thinking_effort: (effort).
     let explicit_model = req.model.clone().filter(|v| !v.is_empty());
     let routed = if explicit_model.is_none() {
         // The history load above doubles as the routing signal (token size
@@ -391,6 +392,7 @@ pub(crate) async fn run_turn_inner(
     };
     let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
     let routed_why = routed.as_ref().map(|r| r.reason_label());
+    let routed_effort = routed.as_ref().and_then(|r| r.effort_override.clone());
     let model_override = explicit_model.or_else(|| routed.and_then(|r| r.model_override));
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
@@ -412,10 +414,15 @@ pub(crate) async fn run_turn_inner(
     )
     .await
     .map_err(|e| format!("failed to build config: {e}"))?;
+    // A routed effort beats the rebuilt config's stored/env/file default
+    // when set; an explicit per-request effort still wins over routing.
+    if let Some(effort) = routed_effort.clone() {
+        config.thinking_effort = Some(effort);
+    }
     apply_thinking_override(&mut config, req.thinking_effort.as_deref());
-    // Console Go routing requires `x-opencode-session`.
-    // Auto-fill from the dex session id; explicit per-request headers
-    // below still win on collision.
+    // The opencode gateway rejects requests without `x-opencode-session`
+    // (`MissingSessionID`); auto-fill from the dex session id. Explicit
+    // per-request headers below still win on collision.
     crate::llm::config::apply_opencode_session_headers(&mut config, session_id);
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
@@ -577,10 +584,16 @@ pub(crate) async fn run_turn_inner(
     // on `turn_start`).
     if let Some(tier) = routed_tier.as_deref() {
         let why = routed_why.as_deref().unwrap_or("ordinary work");
-        console.emit(SinkLine::System(format!(
-            "routing → {tier} ({why}; model {})",
-            config.model
-        )));
+        match routed_effort.as_deref() {
+            Some(effort) => console.emit(SinkLine::System(format!(
+                "routing → {tier} ({why}; model {}, effort {effort})",
+                config.model
+            ))),
+            None => console.emit(SinkLine::System(format!(
+                "routing → {tier} ({why}; model {})",
+                config.model
+            ))),
+        }
     }
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).

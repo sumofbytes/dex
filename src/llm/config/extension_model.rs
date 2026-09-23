@@ -13,8 +13,8 @@ use super::provider::known_providers;
 use super::provider::load_provider_entries;
 use super::provider::model_api_from_env;
 use super::provider::resolve_provider;
+use super::provider::unrouted_selection_error;
 use super::provider::ProviderEntry;
-use super::selection::provider_fallback_with_origin;
 use super::selection::provider_without_prefix;
 use super::selection::resolve_selection;
 use super::selection::split_selection;
@@ -76,11 +76,15 @@ fn extension_model_parts() -> Result<ExtensionModelParts, String> {
         split_selection(&raw_selection, &known).map_err(|e| e.to_string())?;
     let provider_name = match selection_provider {
         Some(name) => name,
-        None => provider_without_prefix(
-            provider_fallback_with_origin(&file),
-            cli_base_url.as_deref(),
-        ),
+        None => provider_without_prefix(cli_base_url.as_deref()),
     };
+    if provider_name.is_empty() {
+        // The selection exists but resolved no provider (bare id,
+        // unconfigured `prefix/rest`, retired `zen/…`): name it and the
+        // fix — "unsupported provider ''" (or "no model configured")
+        // would be a lie.
+        return Err(unrouted_selection_error(&raw_selection, &known));
+    }
     let provider = Provider::parse_known(&provider_name, &known)
         .or_else(|| (provider_name == "custom").then(|| Provider::Generic("custom".to_string())))
         .ok_or_else(|| {

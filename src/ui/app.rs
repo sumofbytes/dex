@@ -313,7 +313,7 @@ impl App {
             transcript: Vec::new(),
             input: crate::ui::input::InputField::new(),
             config: crate::llm::config::LlmConfig {
-                provider: crate::protocol::Provider::OpenCode,
+                provider: crate::protocol::Provider::Anthropic,
                 api_key: String::new(),
                 base_url: String::new(),
                 model: "test".into(),
