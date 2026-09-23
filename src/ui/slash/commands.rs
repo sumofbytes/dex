@@ -529,8 +529,13 @@ fn known_provider_names(app: &App) -> Vec<String> {
 
 /// Canonical `provider/model` identity for every user surface (status bar,
 /// `/model` output, switch confirmations). The stored model id is already
-/// routing-stripped; the provider prefix is what selects it.
+/// routing-stripped; the provider prefix is what selects it. An empty
+/// provider (daemon resolved no config yet) renders `unconfigured`, never
+/// `/unknown`.
 fn canonical_model(app: &App) -> String {
+    if app.config.provider.name().is_empty() {
+        return "unconfigured".to_string();
+    }
     let model = app.config.model.as_str();
     if model.contains('/') {
         model.to_string()

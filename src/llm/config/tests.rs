@@ -947,7 +947,7 @@ fn builtin_default_missing_key_suggests_setup() {
     assert!(err.contains("openai-codex"), "{err}");
     assert!(!err.contains("no API key for provider"), "{err}");
     // The same guide surfaces in `dex doctor`'s resolve row.
-    let report = doctor(None, None, None, &[], None);
+    let report = doctor(None, None, None, &[], None).0;
     assert!(report.contains("no model configured"), "{report}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1024,7 +1024,8 @@ fn doctor_names_custom_provider_for_base_url_only_setup() {
         None,
         &[],
         None,
-    );
+    )
+    .0;
     let prow = out.lines().find(|l| l.starts_with("provider ")).unwrap();
     assert!(prow.contains("custom"), "{prow}");
     assert!(prow.contains("--base-url"), "{prow}");
@@ -1033,17 +1034,70 @@ fn doctor_names_custom_provider_for_base_url_only_setup() {
 
 #[test]
 fn setup_guide_lists_every_builtin_first() {
-    // The guide names every builtin provider before the generic shapes:
-    // anthropic, a generic openai-compatible gateway, a custom gateway,
-    // then codex.
+    // The guide leads with a concrete gateway shape, then builtins, then
+    // the generic shapes: opencode, anthropic, a generic gateway, a custom
+    // endpoint, then codex.
     let guide = super::setup_guide_error();
+    let opencode = guide.find("quickest (OpenCode Zen gateway)").unwrap();
     let anthropic = guide.find("anthropic: model:").unwrap();
-    let gateway = guide.find("openai-compatible gateway: model:").unwrap();
-    let custom = guide.find("custom gateway (Bearer").unwrap();
+    let gateway = guide.find("other gateways: model:").unwrap();
+    let custom = guide.find("custom endpoint (Bearer").unwrap();
     let codex = guide.find("codex: model:").unwrap();
     assert!(
-        anthropic < gateway && gateway < custom && custom < codex,
+        opencode < anthropic && anthropic < gateway && gateway < custom && custom < codex,
         "{guide}"
+    );
+}
+
+#[test]
+fn provider_samples_stay_consistent() {
+    // `examples/config.yaml` is what the setup guide points at: it must
+    // parse, its active block must be self-consistent (the `model:` prefix
+    // names its `providers:` entry or a builtin), and every advertised
+    // provider must still have a block.
+    let text =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/config.yaml"))
+            .expect("examples/config.yaml must exist");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&text).expect("samples file must parse");
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .expect("samples file needs one active model:");
+    let (prefix, rest) = model
+        .split_once('/')
+        .expect("active sample model must be provider-qualified");
+    assert!(!rest.trim().is_empty(), "active sample needs a model id");
+    let builtin = ["anthropic", "openai-codex", "codex"];
+    if !builtin.contains(&prefix) {
+        assert!(
+            parsed
+                .get("providers")
+                .and_then(|p| p.get(prefix))
+                .is_some(),
+            "active sample provider '{prefix}' needs a providers: entry"
+        );
+    }
+    for provider in [
+        "opencode",
+        "anthropic",
+        "openai-codex",
+        "google",
+        "openai",
+        "deepseek",
+        "moonshotai",
+        "openrouter",
+        "commandcode",
+    ] {
+        assert!(
+            text.contains(provider),
+            "samples file lost its {provider} block"
+        );
+    }
+    // The guide's concrete happy-path id must match the active sample, so
+    // the two cannot drift apart.
+    assert!(
+        super::setup_guide_error().contains(&format!("model: {model}")),
+        "guide and samples disagree on the happy path"
     );
 }
 
@@ -2288,10 +2342,10 @@ fn doctor_reports_selection_and_origins() {
         "DEX_CONFIG",
         std::env::temp_dir().join(format!("dex-missing-doctor-{}", std::process::id())),
     );
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     assert!(out.contains("provider"), "{out}");
     assert!(out.contains("model"), "{out}");
-    assert!(out.contains("key env:"), "{out}");
+    assert!(out.contains("key env"), "{out}");
     assert!(out.contains("built-in default"), "{out}");
     assert!(out.contains("resolve"), "{out}");
 }
@@ -2312,7 +2366,7 @@ fn doctor_shows_bare_provider_pick_as_provider() {
         "DEX_CONFIG",
         std::env::temp_dir().join(format!("dex-bare-doctor-{}", std::process::id())),
     );
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     let prov = out
         .lines()
         .find(|l| l.starts_with("provider "))
@@ -2344,7 +2398,7 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
             std::env::temp_dir().display()
         ),
     );
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     let mut lines = out.lines();
     while let Some(line) = lines.next() {
         if !line.starts_with("config ") {
@@ -2380,7 +2434,7 @@ fn doctor_pads_by_display_width() {
         "DEX_CONFIG",
         format!("/tmp/{}/config.yaml", "配置文件配置文件配置文件配置"),
     );
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     let line = out
         .lines()
         .find(|l| l.starts_with("config "))
@@ -2447,7 +2501,7 @@ fn doctor_output_is_byte_stable() {
     // Hermetic extension discovery too: the extensions row reads the
     // XDG config dir, which must not see the developer's real installs.
     std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     let expected = format!(
             "{}{}",
             concat!(
@@ -2477,10 +2531,12 @@ fn doctor_output_is_byte_stable() {
                 "extensions              none                                          cwd/.dex, XDG config dirs\n",
                 "\n",
                 "resolve                 ERROR                                         no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n",
+                "                                                                        quickest (OpenCode Zen gateway): model: opencode/gpt-5-nano + providers.opencode.api_key (or OPENCODE_API_KEY)\n",
                 "                                                                        anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n",
-                "                                                                        openai-compatible gateway: model: <gateway>/<model-id> + providers.<gateway>: {base_url: <url>, api_key} (key env: from the catalog entry)\n",
-                "                                                                        custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
+                "                                                                        other gateways: model: <provider>/<model-id> + providers.<provider>: {api_key} (endpoint + key env from the catalog — run `dex update --models` first)\n",
+                "                                                                        custom endpoint (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {base_url: https://gateway.example/v1, api_key, api: anthropic-messages}\n",
                 "                                                                        codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n",
+                "                                                                        more copy-paste samples: examples/config.yaml\n",
                 "                                                                      config: /tmp/dex-doctor-snapshot/missing.yaml\n",
             )
         );
@@ -2844,7 +2900,7 @@ fn doctor_shows_routing_tiers_with_origins() {
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
-    let out = super::doctor(None, None, None, &[], None);
+    let out = super::doctor(None, None, None, &[], None).0;
     // One switch row plus three tier rows plus three effort rows.
     let routing: Vec<&str> = out.lines().filter(|l| l.starts_with("routing")).collect();
     assert_eq!(routing.len(), 7, "{out}");
@@ -3060,7 +3116,7 @@ fn doctor_system_prompt_row_names_origin() {
     for key in ["DEX_MODEL", "DEX_SYSTEM_PROMPT", "DEX_SYSTEM_PROMPT_FILE"] {
         std::env::remove_var(key);
     }
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     let prow = out
         .lines()
         .find(|l| l.starts_with("system prompt "))
@@ -3068,7 +3124,7 @@ fn doctor_system_prompt_row_names_origin() {
     assert!(prow.contains("default"), "{prow}");
     assert!(prow.contains("built-in default"), "{prow}");
     std::env::set_var("DEX_SYSTEM_PROMPT", "custom base");
-    let out = doctor(None, None, None, &[], None);
+    let out = doctor(None, None, None, &[], None).0;
     let prow = out
         .lines()
         .find(|l| l.starts_with("system prompt "))
@@ -3082,7 +3138,8 @@ fn doctor_system_prompt_row_names_origin() {
         None,
         &[],
         Some(("cli".to_string(), "--system-prompt")),
-    );
+    )
+    .0;
     let prow = out
         .lines()
         .find(|l| l.starts_with("system prompt "))
@@ -3095,7 +3152,8 @@ fn doctor_system_prompt_row_names_origin() {
         None,
         &[],
         Some(("cli".to_string(), "--system-prompt-file")),
-    );
+    )
+    .0;
     let prow = out
         .lines()
         .find(|l| l.starts_with("system prompt "))

@@ -136,8 +136,12 @@ fn cost_piece(app: &App) -> Option<Piece> {
 
 /// Model identity as one run: `provider/model`. Model ids that already
 /// carry a provider prefix (OpenRouter-style `openai/gpt-5.2`) render
-/// as-is instead of doubling it.
+/// as-is instead of doubling it. An empty provider (daemon resolved no
+/// config yet) renders `unconfigured`, never `/unknown`.
 fn model_label(app: &App) -> String {
+    if app.config.provider.name().is_empty() {
+        return "unconfigured".to_string();
+    }
     let model = app.config.model.as_str();
     if model.contains('/') {
         model.to_string()
