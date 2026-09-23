@@ -110,21 +110,24 @@ pub(crate) fn resolve_provider(
     }
 }
 
-/// Neutral first-run hint when nothing selects a provider+model (no
-/// `--model`, `DEX_MODEL`, or file `model:` with a provider prefix). Names
-/// no favorite and no model id — the user picks; model ids come from the
-/// provider's catalog entry (or `dex doctor`), not a hardcoded default that
-/// can rot.
+/// First-run hint when nothing selects a provider+model (no `--model`,
+/// `DEX_MODEL`, or file `model:` with a provider prefix). Leads with one
+/// concrete, copy-pasteable gateway shape (opencode) so a fresh user has a
+/// working example; model ids come from the provider's catalog entry (or
+/// `/model`), not a hardcoded default that can rot — the one id below is
+/// pinned to the active sample by `provider_samples_stay_consistent`.
 pub(crate) fn setup_guide_error() -> String {
     let path = config_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/dex/config.yaml".to_string());
     format!(
         "no model configured — set 'model: <provider>/<model>' in the config, then run `dex doctor`:\n\
+         \u{20}\u{20}quickest (OpenCode Zen gateway): model: opencode/gpt-5-nano + providers.opencode.api_key (or OPENCODE_API_KEY)\n\
          \u{20}\u{20}anthropic: model: anthropic/<model-id> + providers.anthropic.api_key (or ANTHROPIC_API_KEY)\n\
-         \u{20}\u{20}openai-compatible gateway: model: <gateway>/<model-id> + providers.<gateway>: {{base_url: <url>, api_key}} (key env: from the catalog entry)\n\
-         \u{20}\u{20}custom gateway (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
+         \u{20}\u{20}other gateways: model: <provider>/<model-id> + providers.<provider>: {{api_key}} (endpoint + key env from the catalog — run `dex update --models` first)\n\
+         \u{20}\u{20}custom endpoint (Bearer + Anthropic wire): model: gateway/<model-id> + providers.gateway: {{base_url: https://gateway.example/v1, api_key, api: anthropic-messages}}\n\
          \u{20}\u{20}codex: model: openai-codex/<model-id> + run `codex --login` (or CODEX_ACCESS_TOKEN)\n\
+         \u{20}\u{20}more copy-paste samples: examples/config.yaml\n\
          config: {path}"
     )
 }

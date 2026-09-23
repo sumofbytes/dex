@@ -521,6 +521,19 @@ pub(crate) fn bootstrap(
         launch_time_line(launch_start.elapsed().as_secs_f64()),
     ];
     push_banner(&mut remote.app, header);
+    // Lazy-auth empty state (the pi/opencode pattern): the daemon reports
+    // an empty provider exactly when its config build fails (missing key,
+    // bare provider pick, no selection — see `resolve_daemon_info_async`'s
+    // `Err` arm), so say so once here instead of failing the first turn
+    // with a bare config error.
+    if info.provider.is_empty() {
+        push_info(
+            &mut remote.app,
+            "no model configured — copy a sample from examples/config.yaml, \
+             set 'model: <provider>/<model>', then run `dex doctor`"
+                .to_string(),
+        );
+    }
     // A mismatched `thinking_effort:` (config.yaml names a level the model
     // doesn't advertise) used to `eprintln!` from the daemon thread here —
     // mid OSC theme query / alternate screen — corrupting the display and
