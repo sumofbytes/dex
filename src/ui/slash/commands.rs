@@ -631,6 +631,11 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
     let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
         let names = known_provider_names(app);
         let current = app.config.provider.name();
+        let current_display = if current.is_empty() {
+            "unconfigured"
+        } else {
+            current
+        };
         let listed = names
             .iter()
             .map(|n| {
@@ -642,7 +647,7 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        push_info(app, format!("current provider: {current}"));
+        push_info(app, format!("current provider: {current_display}"));
         push_info(app, format!("providers: {listed}"));
         push_info(app, "usage: /provider <name>".to_string());
         return;

@@ -13,7 +13,11 @@
 #   `base_url:` in their entry: openai, google (gemini), and any custom
 #   gateway missing from the catalog.
 # - Model ids rotate: `dex update --models`, then `/model` in the TUI lists
-#   current ids. The ids below were valid when this file was written.
+#   current ids. The ids below were valid on 2026-09-23; re-verify with
+#   `dex update --models` + `dex doctor` before treating them as current.
+# - Copy, don't uncomment in place: the file keeps exactly one active
+#   `providers:`/`model:` pair, so uncommenting a second block would leave
+#   duplicate keys (YAML last-wins, silently).
 
 # --- Quickest: OpenCode Zen gateway (endpoint from catalog) ---
 providers:
@@ -68,11 +72,14 @@ model: opencode/gpt-5-nano
 
 # --- commandcode / any custom OpenAI-compatible gateway (base_url required:
 # --- it has no catalog entry, so dex cannot learn the endpoint) ---
+# --- also set `context_window:` (or `DEX_CONTEXT_WINDOW`): nothing sizes
+# --- a model outside the catalog. ---
 # providers:
 #   commandcode:
 #     api_key: ... # or export the gateway's key env var instead
 #     base_url: https://commandcode.example/v1
 # model: commandcode/<model-id>
+# context_window: 128000 # replace with the gateway model's real window
 #
 # If the custom endpoint speaks the Anthropic Messages API instead of an
 # OpenAI-compatible one, pin the wire explicitly:
@@ -82,3 +89,4 @@ model: opencode/gpt-5-nano
 #     base_url: https://gateway.example/v1
 #     api: anthropic-messages
 # model: gateway/<model-id>
+# context_window: 128000 # replace with the gateway model's real window
