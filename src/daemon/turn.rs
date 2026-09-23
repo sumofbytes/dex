@@ -364,10 +364,8 @@ pub(crate) async fn run_turn_inner(
             ));
         }
     }
-    // Complexity-router signal: history tokens come from the same
-    // model-bound load the turn rebuilds below, so routing sees what the
-    // turn will send. Loaded before the config build so the routed model
-    // rides the single `from_env_async` — no second build.
+    // Model-bound history load: `!!` shell runs stay out of the LLM
+    // context, and the turn below reuses exactly these messages.
     let history = if let Some(path) = session.path().map(|p| p.to_path_buf()) {
         tokio::task::spawn_blocking(move || {
             session::load_llm_messages_from_session(&path).unwrap_or_default()
@@ -377,23 +375,7 @@ pub(crate) async fn run_turn_inner(
     } else {
         Vec::new()
     };
-    // Complexity router: an explicit per-request model always wins;
-    // otherwise the classified tier resolves the `(model, thinking_effort)`
-    // tuple through routing.balanced: → top-level model: (model) and
-    // routing.balanced_effort: → keep thinking_effort: (effort).
     let explicit_model = req.model.clone().filter(|v| !v.is_empty());
-    let routed = if explicit_model.is_none() {
-        // The history load above doubles as the routing signal (token size
-        // plus real tool-call counts) and is reused for the turn below, so
-        // routing sees exactly what the turn will send at no extra load.
-        crate::llm::config::route_turn(&req.prompt, &history)
-    } else {
-        None
-    };
-    let routed_tier = routed.as_ref().map(|r| r.tier.to_string());
-    let routed_why = routed.as_ref().map(|r| r.reason_label());
-    let routed_effort = routed.as_ref().and_then(|r| r.effort_override.clone());
-    let model_override = explicit_model.or_else(|| routed.and_then(|r| r.model_override));
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
     // Async: cache hits are a mutex bump inline; misses parse the 4MB catalog
@@ -408,17 +390,12 @@ pub(crate) async fn run_turn_inner(
     };
     let mut config = LlmConfig::from_env_async(
         req.base_url.clone().filter(|v| !v.is_empty()),
-        model_override,
+        explicit_model,
         perm_override,
         Vec::new(),
     )
     .await
     .map_err(|e| format!("failed to build config: {e}"))?;
-    // A routed effort beats the rebuilt config's stored/env/file default
-    // when set; an explicit per-request effort still wins over routing.
-    if let Some(effort) = routed_effort.clone() {
-        config.thinking_effort = Some(effort);
-    }
     apply_thinking_override(&mut config, req.thinking_effort.as_deref());
     // The opencode gateway rejects requests without `x-opencode-session`
     // (`MissingSessionID`); auto-fill from the dex session id. Explicit
@@ -548,8 +525,7 @@ pub(crate) async fn run_turn_inner(
         Some(std::path::Path::new(&entry.cwd)),
         agent_mode.is_some_and(crate::protocol::AgentMode::is_plan),
     )));
-    // History was loaded up front for the routing signal; reuse it here
-    // so the turn sends exactly what routing saw.
+    // The history above is the exact message list the turn sends.
     messages.extend(history);
     let user_message = ChatMessage::user(req.prompt.clone());
     // §10b V1a: completion notices queued while no turn was live drain at
@@ -561,11 +537,10 @@ pub(crate) async fn run_turn_inner(
     session
         .turn_event_with_mode(
             "turn_start",
-            routed_tier.as_deref(),
             // Journal the governing mode so a reattach restores the
             // client's last selector instead of reseeding from the
             // ceiling (plan mode must survive a reconnect on a trusted
-            // daemon). Best-effort like the tier.
+            // daemon).
             agent_mode.map(|m| m.as_str()),
         )
         .map_err(|e| format!("failed to record turn_start: {e}"))?;
@@ -579,22 +554,6 @@ pub(crate) async fn run_turn_inner(
     let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>(256);
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(16);
     let console = Console::daemon(sink_tx, approval_tx);
-    // Surface the routed tier in the transcript: daemon users get no other
-    // signal that the model changed under them (the tier is also journaled
-    // on `turn_start`).
-    if let Some(tier) = routed_tier.as_deref() {
-        let why = routed_why.as_deref().unwrap_or("ordinary work");
-        match routed_effort.as_deref() {
-            Some(effort) => console.emit(SinkLine::System(format!(
-                "routing → {tier} ({why}; model {}, effort {effort})",
-                config.model
-            ))),
-            None => console.emit(SinkLine::System(format!(
-                "routing → {tier} ({why}; model {})",
-                config.model
-            ))),
-        }
-    }
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
     if let Some(set) = lock_map(&state.session_approvals).get(session_id).cloned() {

@@ -287,14 +287,6 @@ impl Console {
         self.approval.as_ref()
     }
 
-    /// Sync emit for legacy sync callers (printer, tool summaries): never
-    /// blocks, drops when full like the old `.send().ok()`.
-    pub(crate) fn emit(&self, line: SinkLine) {
-        if let Some(sink) = &self.sink {
-            let _ = sink.try_send(line);
-        }
-    }
-
     /// Async emit for async turn/SSE/tool paths: back-pressured `send().await`.
     pub(crate) async fn emit_async(&self, line: SinkLine) {
         if let Some(sink) = &self.sink {
