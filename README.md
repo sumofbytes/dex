@@ -73,10 +73,11 @@ curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/sumofbytes/dex/releases).
 
-No further setup: dex runs with no config (defaults build cleanly), and the
+First run needs one thing: a model. Copy a sample from
+`examples/config.yaml`, set `model: <provider>/<model>` in the config, and
+run `dex doctor` to verify (exit 1 means setup is still incomplete). The
 daemon fetches the models.dev catalog in the background on first start
-(`dex update --models` for a manual refresh). `dex doctor` prints every resolved
-value with its origin.
+(`dex update --models` for a manual refresh).
 
 ## Building
 
@@ -133,15 +134,38 @@ qualified). Write-back keeps that form: a `/model` or `/provider` pick updates
 `model:` in the file, so the switch becomes the default for later runs. Session
 state still re-applies the exact provider/model on `/resume`.
 
-A minimal `~/.config/dex/config.yaml`:
+A minimal `~/.config/dex/config.yaml` (the endpoint comes from the
+models.dev catalog, so no `base_url:` is needed here):
 
 ```yaml
 providers:
   opencode:
     api_key: sk-... # the deposit place for this provider's key
-    base_url: https://opencode.ai/zen/v1
-model: opencode/gpt-5.6-luna # provider / model
+model: opencode/gpt-5-nano # provider / model
 ```
+
+### Provider examples
+
+Copy-paste samples for popular providers live in `examples/config.yaml`
+(one block per provider — uncomment a single block). The short version:
+
+| Provider | `model:` | Key | `base_url:` needed? |
+|---|---|---|---|
+| opencode (Zen gateway) | `opencode/gpt-5-nano` | `providers.opencode.api_key` or `OPENCODE_API_KEY` | no (catalog) |
+| anthropic (built in) | `anthropic/claude-sonnet-4-5` | `providers.anthropic.api_key` or `ANTHROPIC_API_KEY` | no (built in) |
+| openai-codex (built in) | `openai-codex/<model-id>` | none — run `codex --login` first | no (built in) |
+| gemini | `google/gemini-3.1-pro-preview` | `providers.google.api_key` or `GEMINI_API_KEY` | yes — `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| openai | `openai/gpt-5-nano` | `providers.openai.api_key` or `OPENAI_API_KEY` | yes — `https://api.openai.com/v1` |
+| deepseek | `deepseek/deepseek-v4-flash` | `providers.deepseek.api_key` or `DEEPSEEK_API_KEY` | no (catalog) |
+| moonshot / Kimi | `moonshotai/kimi-k2.6` | `providers.moonshotai.api_key` or `MOONSHOT_API_KEY` | no (catalog) |
+| openrouter | `openrouter/qwen/qwen3-coder-flash` | `providers.openrouter.api_key` or `OPENROUTER_API_KEY` | no (catalog) |
+| commandcode / custom gateway | `commandcode/<model-id>` | `providers.commandcode.api_key` | yes — the gateway URL (no catalog entry) |
+
+Notes: the provider name must match the catalog key (`moonshotai`, not
+`moonshot`; gemini lives under `google`). Model ids rotate — run
+`dex update --models`, then `/model` lists current ids. A gateway outside
+the catalog additionally needs `context_window:` (or `DEX_CONTEXT_WINDOW`)
+since nothing sizes its models.
 
 The stored selection always carries a model id: a provider-only selection
 (`model: anthropic`) fails with a "names a provider but no model" error —
@@ -321,7 +345,8 @@ Ask it to do something:
 `dex doctor` shows the fully resolved configuration — provider, endpoint, model,
 wire protocol, key source, thinking effort, catalog state — each with the origin
 (flag > env > file > default). It never touches the network and is the first
-thing to run when setup misbehaves.
+thing to run when setup misbehaves. Exit 0 means the config builds cleanly,
+exit 1 means `resolve ERROR` (script-checkable).
 
 ```sh
 dex doctor

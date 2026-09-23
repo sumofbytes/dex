@@ -616,14 +616,16 @@ fn tail_rows(
 /// answers "why is dex using X?" without archaeology. Takes the same
 /// overrides as `from_env` so flags (`--model`, `--base-url`,
 /// `--permission`, `--header`, `--system-prompt` / `--system-prompt-file`
-/// resolved text) are reflected, not silently dropped.
+/// resolved text) are reflected, not silently dropped. Returns the report
+/// plus whether the config builds cleanly (the `resolve` row), so callers
+/// like `dex doctor` can exit non-zero on ERROR for scripts.
 pub(crate) fn doctor(
     base_url_override: Option<String>,
     model_override: Option<String>,
     permission_override: Option<PermissionMode>,
     header_overrides: &[String],
     system_prompt_override: Option<(String, &'static str)>,
-) -> String {
+) -> (String, bool) {
     let mut out = String::new();
     out.push_str(&format!("dex {}\n\n", env!("CARGO_PKG_VERSION")));
 
@@ -720,5 +722,5 @@ pub(crate) fn doctor(
         },
     );
     tail_rows(&mut out, &system_prompt_override, &cfg_result);
-    out
+    (out, cfg_result.is_ok())
 }

@@ -392,7 +392,10 @@ fn print_help() {
         -H/--header <\"Name: Value\">  (repeatable) extra provider headers\n  \
         -s/--session <path>  --no-session  -n/--new  --name <name>  --skill <dir>\n  \
         --extensions-dir <dir>  (repeatable) extra extension search dirs\n  \
-        -h/--help  -V/--version",
+        -h/--help  -V/--version\n\
+        \n\
+        First run: copy a sample from examples/config.yaml,\n  \
+        set 'model: <provider>/<model>', then run `dex doctor`",
         version = env!("CARGO_PKG_VERSION")
     );
 }
@@ -649,16 +652,20 @@ pub fn run() {
         }
         Mode::Doctor => {
             let system_prompt = cli_system_prompt(&args);
-            print!(
-                "{}",
-                crate::llm::config::doctor(
-                    args.base_url.clone(),
-                    args.model.clone(),
-                    args.permission,
-                    &args.headers,
-                    system_prompt,
-                )
+            let (report, ok) = crate::llm::config::doctor(
+                args.base_url.clone(),
+                args.model.clone(),
+                args.permission,
+                &args.headers,
+                system_prompt,
             );
+            print!("{report}");
+            // Script-checkable (pi's `auth check` pattern): 0 when the
+            // config builds cleanly, 1 on `resolve ERROR` so setup
+            // failures gate scripts instead of passing silently.
+            if !ok {
+                std::process::exit(1);
+            }
         }
         Mode::Update { models, all } => {
             // Bare `dex update` self-updates the binary; `--models` keeps the
