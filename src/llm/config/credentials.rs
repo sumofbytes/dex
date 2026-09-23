@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use crate::protocol::Provider;
 
-use super::config::{catalog_env_vars, ProviderEntry};
+use super::catalog_query::catalog_env_vars;
+use super::provider::ProviderEntry;
 
 #[derive(Deserialize)]
 pub(crate) struct CodexAuthFile {

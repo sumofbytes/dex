@@ -97,14 +97,14 @@ fn agent_id_arg(args: &Map<String, Value>) -> Result<AgentId, ToolError> {
 /// arguments (the parent model writes the task itself; dex never
 /// auto-copies transcript, §5), spawn, return immediately. `model` is the
 /// same single-knob selection as the main agent (`provider/model`); when
-/// present it overrides the definition for this spawn (complexity-based
+/// present it overrides the definition for this spawn (explicit
 /// pick), otherwise the child inherits this turn's resolved model (§13).
 /// Resume: `resume_from` names a terminal child whose transcript replays as
 /// generation + 1 with an interruption nudge (§24.1–§24.3); `task` is
 /// then unneeded, and `instruction` (plus `file_hints`) folds into the
 /// nudge instead of replacing the original task. A resume without its own
 /// `model` keeps the finished generation's model (handle-carried), so a
-/// complexity-chosen model survives generations unless overridden.
+/// per-spawn model survives generations unless overridden.
 pub(crate) fn effective_child_model(
     explicit: Option<String>,
     handle_model: Option<&str>,
@@ -833,7 +833,7 @@ async fn child_run(
     // the session coordinates, manager, and approval bridges — only the
     // depth advances. The config is the child's *resolved* model (parent
     // model plus definition / per-spawn `model` override), so a grandchild
-    // without its own override inherits the complexity-chosen model rather
+    // without its own override inherits the per-spawn model rather
     // than skipping back to the root.
     let child_ctx: Option<Arc<AgentTurnContext>> = if may_delegate {
         Some(Arc::new(AgentTurnContext {

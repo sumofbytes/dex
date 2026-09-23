@@ -10,8 +10,8 @@
 #   known, see below).
 # - Endpoint comes from the models.dev catalog (`dex update --models`
 #   refreshes it). Providers with NO catalog endpoint need an explicit
-#   `base_url:` in their entry: openai, google (gemini), and any custom
-#   gateway missing from the catalog.
+#   `base_url:` in their entry: openai, google (gemini), xai, groq, mistral,
+#   cerebras, and any custom gateway missing from the catalog.
 # - Model ids rotate: `dex update --models`, then `/model` in the TUI lists
 #   current ids. The ids below were valid on 2026-09-23; re-verify with
 #   `dex update --models` + `dex doctor` before treating them as current.
@@ -69,6 +69,45 @@ model: opencode/gpt-5-nano
 #   openrouter:
 #     api_key: ... # or export OPENROUTER_API_KEY instead
 # model: openrouter/qwen/qwen3-coder-flash
+
+# --- xAI / Grok (base_url required: the catalog documents the key env
+# --- but no endpoint) ---
+# providers:
+#   xai:
+#     api_key: ... # or export XAI_API_KEY instead
+#     base_url: https://api.x.ai/v1
+# model: xai/grok-4.6
+
+# --- Groq (base_url required: the catalog documents the key env but no
+# --- endpoint; model ids keep their `vendor/model` shape after the
+# --- provider prefix) ---
+# providers:
+#   groq:
+#     api_key: ... # or export GROQ_API_KEY instead
+#     base_url: https://api.groq.com/openai/v1
+# model: groq/openai/gpt-oss-120b
+
+# --- Mistral (base_url required: the catalog documents the key env but no
+# --- endpoint; devstral is the coding model) ---
+# providers:
+#   mistral:
+#     api_key: ... # or export MISTRAL_API_KEY instead
+#     base_url: https://api.mistral.ai/v1
+# model: mistral/devstral-2512
+
+# --- Cerebras (base_url required: the catalog documents the key env but
+# --- no endpoint) ---
+# providers:
+#   cerebras:
+#     api_key: ... # or export CEREBRAS_API_KEY instead
+#     base_url: https://api.cerebras.ai/v1
+# model: cerebras/gpt-oss-120b
+
+# --- Z.AI / GLM (endpoint from catalog) ---
+# providers:
+#   zai:
+#     api_key: ... # or export ZHIPU_API_KEY instead
+# model: zai/glm-5.3-flash
 
 # --- commandcode / any custom OpenAI-compatible gateway (base_url required:
 # --- it has no catalog entry, so dex cannot learn the endpoint) ---

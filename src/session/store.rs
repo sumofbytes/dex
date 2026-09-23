@@ -678,20 +678,7 @@ impl Session {
     }
 
     pub(crate) fn turn_event(&mut self, event: &str) -> io::Result<()> {
-        self.turn_event_with_tier(event, None)
-    }
-
-    /// `turn_start` carrying the complexity-router tier that chose the
-    /// turn's model (`None` = routing off or an explicit model pick).
-    /// The tier rides the existing event — no new log — and recovery
-    /// still keys on the `turn_start` type alone, so a crash loses at
-    /// most the in-flight event.
-    pub(crate) fn turn_event_with_tier(
-        &mut self,
-        event: &str,
-        tier: Option<&str>,
-    ) -> io::Result<()> {
-        self.turn_event_full(event, tier, None)
+        self.turn_event_full(event, None)
     }
 
     /// `turn_start` that also records the governing agent mode so a
@@ -700,23 +687,16 @@ impl Session {
     pub(crate) fn turn_event_with_mode(
         &mut self,
         event: &str,
-        tier: Option<&str>,
         mode: Option<&str>,
     ) -> io::Result<()> {
-        self.turn_event_full(event, tier, mode)
+        self.turn_event_full(event, mode)
     }
 
-    fn turn_event_full(
-        &mut self,
-        event: &str,
-        tier: Option<&str>,
-        mode: Option<&str>,
-    ) -> io::Result<()> {
+    fn turn_event_full(&mut self, event: &str, mode: Option<&str>) -> io::Result<()> {
         let entry = SessionEventEntry {
             entry_type: event.to_string(),
             id: self.next_id(),
             timestamp: Self::now_iso(),
-            tier: tier.map(str::to_string),
             mode: mode.map(str::to_string),
         };
         self.append_line(&entry)
