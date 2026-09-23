@@ -38,9 +38,10 @@ pub(crate) use credentials::{pinned_key_env, resolve_credentials};
 // `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub(crate) use catalog_query::{
-    catalog_env_vars, load_dex_models_cache, reasoning_options_for, refresh_models_cache,
-    refresh_models_cache_async, validate_thinking_effort, warn_provider_like_selection,
+    load_dex_models_cache, reasoning_options_for, refresh_models_cache, refresh_models_cache_async,
+    validate_thinking_effort, warn_provider_like_selection,
 };
+
 #[cfg(test)]
 pub(crate) use cost::resolve_model_cost;
 pub(crate) use cost::{cost_hint_for, model_hints_for, usage_cost};
