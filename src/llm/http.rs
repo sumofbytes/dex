@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::llm::config::{merge_header_layers, ProviderEntry};
+use crate::llm::config::{merge_header_layers, resolve_credentials, ProviderEntry};
 use crate::llm::provider::AuthScheme;
 use crate::protocol::{Provider, SinkLine};
 use crate::runtime::console::with_console;
@@ -304,9 +304,7 @@ pub(crate) async fn post_with_retry(
                 (status, active.refresh.as_ref())
             {
                 if attempt < MAX_HTTP_RETRIES {
-                    if let Ok((token, account)) =
-                        crate::llm::auth::resolve_credentials(provider, entries)
-                    {
+                    if let Ok((token, account)) = resolve_credentials(provider, entries) {
                         let mut next = refreshed.take().unwrap_or_else(|| call.clone());
                         next.api_key = token;
                         next.account_id = account;

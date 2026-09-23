@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use crate::client::options::{chat_options_from_args, cli_system_prompt};
 use crate::telemetry::spend_summary;
 
-/// Shared session-open ladder/// Shared session-open ladder: `--new` creates a fresh session, otherwise
+/// Shared session-open ladder: `--new` creates a fresh session, otherwise
 /// open/continue `--session` (or the newest one). On failure, warn to
 /// stderr and return `None` so the caller continues without persistence;
 /// `--name` renaming stays with the callers that do it.

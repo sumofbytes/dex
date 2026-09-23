@@ -161,6 +161,11 @@ The short version:
 | deepseek | `deepseek/deepseek-v4-flash` | `providers.deepseek.api_key` or `DEEPSEEK_API_KEY` | no (catalog) |
 | moonshot / Kimi | `moonshotai/kimi-k2.6` | `providers.moonshotai.api_key` or `MOONSHOT_API_KEY` | no (catalog) |
 | openrouter | `openrouter/qwen/qwen3-coder-flash` | `providers.openrouter.api_key` or `OPENROUTER_API_KEY` | no (catalog) |
+| xai (Grok) | `xai/grok-4.6` | `providers.xai.api_key` or `XAI_API_KEY` | yes — `https://api.x.ai/v1` |
+| groq | `groq/openai/gpt-oss-120b` | `providers.groq.api_key` or `GROQ_API_KEY` | yes — `https://api.groq.com/openai/v1` |
+| mistral | `mistral/devstral-2512` | `providers.mistral.api_key` or `MISTRAL_API_KEY` | yes — `https://api.mistral.ai/v1` |
+| cerebras | `cerebras/gpt-oss-120b` | `providers.cerebras.api_key` or `CEREBRAS_API_KEY` | yes — `https://api.cerebras.ai/v1` |
+| zai (Zhipu / GLM) | `zai/glm-5.3-flash` | `providers.zai.api_key` or `ZHIPU_API_KEY` | no (catalog) |
 | commandcode / custom gateway | `commandcode/<model-id>` | `providers.commandcode.api_key` | yes — the gateway URL (no catalog entry) |
 
 Notes: the provider name must match the catalog key (`moonshotai`, not
