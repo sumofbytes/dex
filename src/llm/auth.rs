@@ -100,7 +100,7 @@ pub(crate) fn resolve_credentials(
         }
     }
     Err(format!(
-        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}",
+        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}:\n  providers:\n    {name}:\n      api_key: <key>",
         if env_names.is_empty() {
             " or export the provider's key env var (run `dex update --models` to learn its name)"
                 .to_string()

@@ -136,8 +136,12 @@ fn cost_piece(app: &App) -> Option<Piece> {
 
 /// Model identity as one run: `provider/model`. Model ids that already
 /// carry a provider prefix (OpenRouter-style `openai/gpt-5.2`) render
-/// as-is instead of doubling it.
+/// as-is instead of doubling it. An empty provider (daemon resolved no
+/// config yet) renders `unconfigured`, never `/unknown`.
 fn model_label(app: &App) -> String {
+    if app.config.provider.name().is_empty() {
+        return "unconfigured".to_string();
+    }
     let model = app.config.model.as_str();
     if model.contains('/') {
         model.to_string()
@@ -398,9 +402,16 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
 fn bare_pieces(app: &App) -> Vec<Piece> {
     // Narrowest tier: brevity beats precision — the bare id keeps the
     // connection badge on screen when even `provider/model` won't fit.
+    // Still `unconfigured` when the daemon resolved no config yet, never
+    // `unknown` or an empty string.
     let mut pieces = vec![mode_piece(app)];
     push_sep(&mut pieces);
-    pieces.push(quiet(app.config.model.clone()));
+    let bare = if app.config.provider.name().is_empty() {
+        "unconfigured".to_string()
+    } else {
+        app.config.model.clone()
+    };
+    pieces.push(quiet(bare));
     push_cost(&mut pieces, app);
     pieces
 }
@@ -504,7 +515,12 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
         return to_line(left);
     }
     let mut left = hint;
-    left.push(quiet(app.config.model.clone()));
+    let last_resort = if app.config.provider.name().is_empty() {
+        "unconfigured".to_string()
+    } else {
+        app.config.model.clone()
+    };
+    left.push(quiet(last_resort));
     to_line(truncate_pieces(left, width))
 }
 

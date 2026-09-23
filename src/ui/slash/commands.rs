@@ -529,8 +529,13 @@ fn known_provider_names(app: &App) -> Vec<String> {
 
 /// Canonical `provider/model` identity for every user surface (status bar,
 /// `/model` output, switch confirmations). The stored model id is already
-/// routing-stripped; the provider prefix is what selects it.
+/// routing-stripped; the provider prefix is what selects it. An empty
+/// provider (daemon resolved no config yet) renders `unconfigured`, never
+/// `/unknown`.
 fn canonical_model(app: &App) -> String {
+    if app.config.provider.name().is_empty() {
+        return "unconfigured".to_string();
+    }
     let model = app.config.model.as_str();
     if model.contains('/') {
         model.to_string()
@@ -626,6 +631,11 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
     let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
         let names = known_provider_names(app);
         let current = app.config.provider.name();
+        let current_display = if current.is_empty() {
+            "unconfigured"
+        } else {
+            current
+        };
         let listed = names
             .iter()
             .map(|n| {
@@ -637,7 +647,7 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        push_info(app, format!("current provider: {current}"));
+        push_info(app, format!("current provider: {current_display}"));
         push_info(app, format!("providers: {listed}"));
         push_info(app, "usage: /provider <name>".to_string());
         return;
