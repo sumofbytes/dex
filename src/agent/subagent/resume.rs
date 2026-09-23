@@ -23,7 +23,7 @@ pub(crate) struct ResumeHandle {
     /// Effective model override of the finished generation (`def.model` at
     /// spawn: per-spawn pick else frontmatter); `None` = inherited the
     /// parent model. A resume without its own `model` re-applies this so a
-    /// complexity-chosen model survives generations; on-disk handles predate
+    /// per-spawn model survives generations; on-disk handles predate
     /// it and resume under the definition.
     pub(crate) model: Option<String>,
     /// Why it died, in one line — becomes the interruption nudge.

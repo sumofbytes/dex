@@ -20,7 +20,6 @@ mod headers;
 mod permission;
 mod prompt_source;
 mod provider;
-mod routing;
 mod selection;
 /// Builtin providers whose canonical key env var is pinned in dex rather
 /// than catalog-discovered — see `llm::auth` (single owner of key
@@ -67,9 +66,6 @@ pub(crate) use provider::{
     set_cli_model_overrides, setup_guide_error, unrouted_selection_error, ProviderEntry,
     ResolvedProvider,
 };
-pub(crate) use routing::route_turn;
-#[cfg(test)]
-pub(crate) use routing::routing_resolution;
 pub(crate) use selection::{
     classify_selection, env_parse, persist_selection, provider_without_prefix, resolve_selection,
     split_selection, Resolved, SelectionRoute,
@@ -235,7 +231,6 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "system_prompt_file",
     "mcp_servers",
     "agent_wake",
-    "routing",
     "extensions",
     "jev",
     // Deprecated but still honored for old files:

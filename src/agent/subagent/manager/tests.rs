@@ -789,7 +789,7 @@ async fn wrapper_synthesized_ending_reconciles_the_spend_meter() {
 #[tokio::test(flavor = "current_thread")]
 async fn escalated_handle_carries_def_model_for_resume_inheritance() {
     // A generation spawned with `def.model` advertises it on the handle,
-    // so a resume without its own `model` keeps the complexity-chosen
+    // so a resume without its own `model` keeps the per-spawn
     // model instead of resetting to the parent. `None` stays `None`.
     let dir = PathBuf::from("/tmp/dex-supervision-handle-model");
     let agents = dir.join("agents");

@@ -19,10 +19,6 @@ use super::provider::load_provider_entries;
 use super::provider::model_api_from_env;
 use super::provider::resolve_provider;
 use super::provider::ProviderEntry;
-use super::routing::classify::Tier;
-use super::routing::routing_effort_display;
-use super::routing::routing_resolution;
-use super::routing::routing_tier_display;
 use super::selection::classify_selection;
 use super::selection::provider_without_prefix;
 use super::selection::resolve_selection;
@@ -91,8 +87,6 @@ struct ProviderDoctor<'a> {
     pub(crate) provider_source: &'a str,
     pub(crate) selection_source: &'a str,
     pub(crate) has_selection: bool,
-    pub(crate) routing_selection: Option<&'a str>,
-    pub(crate) routing_selection_source: &'a str,
     pub(crate) pre_model: &'a str,
     pub(crate) cfg_result: &'a Result<LlmConfig, Box<dyn std::error::Error>>,
     pub(crate) flag_base_url: Option<&'a str>,
@@ -350,8 +344,8 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
 
 /// Rows that answer "why is dex doing X?" regardless of which provider (if
 /// any) resolved: compaction, jev, thinking effort, permission, agent wake,
-/// the complexity router (switch + per-tier `(model, effort)` tuple), the
-/// header layers, the named endpoints, and the configured `providers:` list.
+/// the header layers, the named endpoints, and the configured `providers:`
+/// list.
 /// Printed even when no provider resolves — those rows are provider-
 /// independent, and skipping them would hide most of the setup.
 fn shared_rows(
@@ -434,34 +428,6 @@ fn shared_rows(
         if wake { "on" } else { "off" },
         wake_source,
     );
-    // Complexity router: one row per value — the switch plus each tier's
-    // resolved (model, effort) tuple (model: tier miss → routing.balanced: →
-    // top-level model:; effort: tier miss → routing.balanced_effort: → keep
-    // thinking_effort:), sharing `from_env`'s resolution.
-    let routing = routing_resolution(d.file);
-    row(
-        out,
-        "routing",
-        if routing.enabled { "on" } else { "off" },
-        routing.enabled_origin,
-    );
-    for tier in Tier::ALL {
-        let (value, origin) = routing_tier_display(
-            tier,
-            &routing,
-            d.routing_selection,
-            d.routing_selection_source,
-        );
-        row(out, &format!("routing {}", tier.key()), &value, &origin);
-        let (effort, effort_origin) = routing_effort_display(tier, &routing);
-        row(
-            out,
-            &format!("routing {} effort", tier.key()),
-            &effort,
-            &effort_origin,
-        );
-    }
-
     // Headers: count per layer, sources joined.
     let mut header_count = 0;
     let mut header_sources: Vec<&str> = Vec::new();
@@ -716,8 +682,6 @@ pub(crate) fn doctor(
             flag_base_url: flag_base_url.as_deref(),
             permission_override,
             header_overrides,
-            routing_selection: selection.as_deref(),
-            routing_selection_source: &selection_source,
             custom_route: selection_provider.is_none() && provider_name == "custom",
         },
     );

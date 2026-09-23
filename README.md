@@ -203,56 +203,8 @@ read at all: the provider lives in `model:` as `provider/model`.
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
 parse error lists the valid keys: `model`, `providers`, `context_window`,
 `thinking_effort`, `system_prompt`, `system_prompt_file`, `mcp_servers`,
-`agent_wake`, `routing`, `extensions` (+ the deprecated
+`agent_wake`, `extensions` (+ the deprecated
 ones above). Other keys are preserved untouched.
-
-### Complexity routing
-
-`DEX_ROUTING=1` (or file `routing:` with `enabled: true`) routes each turn
-to a tiered `(model, thinking_effort)` tuple by prompt complexity — cheap
-models for typos and trivial Q&A, stronger ones for refactors, migrations
-and security-sensitive work.
-Classification is single-pass stem/weight scoring (no LLM call):
-the prompt is tokenized once, stems corroborate toward a tier
-(a lone `auth` stays put; `auth` + `refactor` escalates), and file
-paths, code fences, and real session tool activity weigh in;
-the routed tier is shown per turn with its top reason and journaled on
-the turn's `turn_start` marker. `dex doctor` shows the switch plus each tier's resolved model, effort and
-origin.
-
-Tiers mirror the vendors' three capability buckets (`fast` ≈ OpenAI
-`nano`/`Luna` and Anthropic `Haiku`; `balanced` ≈ `mini`/`Terra` and
-`Sonnet`; `powerful` ≈ flagship/`Sol` and `Opus`):
-
-```yaml
-routing:
-  enabled: true
-  fast: myprov/cheap-model # trivial prompts
-  balanced: myprov/workhorse # normal work (also the fallback tier)
-  powerful: myprov/best # multi-file, auth, migrations, security
-  fast_effort: low # reasoning effort per tier (optional)
-  balanced_effort: medium
-  powerful_effort: high
-```
-
-Each tier takes a full `provider/model` selection, so catalog endpoints and
-`providers.<name>.api:` pins keep working.
-`DEX_ROUTING_<FAST|BALANCED|POWERFUL>` overrides one tier. A tier with
-neither falls back to `routing.balanced:`, then to `model:` — so setting only
-`balanced` (or nothing, keeping `model:`) is a valid setup.
-Each tier may also name a reasoning effort (`routing.<tier>_effort:`, or
-`DEX_ROUTING_<TIER>_EFFORT` which wins over the file). A tier with neither
-falls back to `routing.balanced_effort:`, then keeps the turn's
-`thinking_effort:` (stored `/thinking` choice > `DEX_THINKING_EFFORT` >
-file) — so efforts are purely opt-in per tier.
-
-  Explicit picks always win: `--model` / a per-request model skips routing
-  entirely (no classification runs), a per-request thinking effort wins over
-  the routed effort, and `/model` sets top-level `model:`,
-  which is the fallback every tier resolves to — so with an explicit pick
-  every tier would land on the picked model until per-tier selections are
-  set. (`dex doctor` still shows each tier's resolved row as the hypothetical
-  routing outcome.) To turn routing off: `DEX_ROUTING=0`.
 
 ### System prompt
 
@@ -843,9 +795,6 @@ discovered extension with its consent state.
 | `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
 | `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate` tool (default on in daemon sessions).                                                                                                                                                                                                                                                                                                                                                          |
 | `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
-| `DEX_ROUTING`                                                 | `1` to route each turn to a tiered `(model, thinking_effort)` tuple by complexity (default off). Tiers classify the prompt deterministically (no LLM call): `fast` (typos, trivial Q&A), `balanced` (normal work), `powerful` (multi-file, auth, migrations, security). An explicit `--model` / per-request model always wins (a per-request thinking effort wins over the routed effort); the routed tier is shown per turn, journaled on `turn_start`, and `dex doctor` shows each tier and where its model and effort came from.                                                                                                   |
-| `DEX_ROUTING_<FAST|BALANCED|POWERFUL>`                        | Per-tier `provider/model` selection (same syntax as `DEX_MODEL`); wins over file `routing.<tier>:` for that tier. A tier with neither falls back to `routing.balanced:`, then to `model:`.                                                                                                                                                                                                                          |
-| `DEX_ROUTING_<FAST|BALANCED|POWERFUL>_EFFORT`                 | Per-tier reasoning effort; wins over file `routing.<tier>_effort:` for that tier. A tier with neither falls back to `routing.balanced_effort:`, then keeps the turn's `thinking_effort:`.                                                                                                                                                                                                                          |
 | `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
 | `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
 | `DEX_MCP_MAX_TOOLS`                                           | Cap on merged MCP schema tools (default 200; head kept sorted by name).                                                                                                                                                                                                                                                                                                                                         |
