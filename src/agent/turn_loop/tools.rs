@@ -19,6 +19,7 @@ use crate::render::format::{
 use crate::runtime::console::{
     with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK, TOOL_OUTPUT_COLOR,
 };
+use crate::runtime::unwind::CatchUnwind;
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
@@ -405,19 +406,52 @@ where
             // cannot hold the turn's borrowed filter — same shape
             // as the per-task policy clone above.
             let filter = filter.cloned();
-            // Same for the start-of-call announce below: each task emits
-            // its own `ToolInput` (paired later by call id), so the TUI
-            // opens every parallel block up front instead of only after
-            // the whole batch completes.
+            // Each task announces its own start (paired later by call
+            // id), but only as semaphore permits free up: ~max blocks
+            // open at once, in permit order rather than input order.
             let task_console = console.clone();
             let sem = sem.clone();
             set.spawn(async move {
-                let _permit = sem.acquire_owned().await;
+                // The semaphore is never closed, but fail closed with
+                // the index intact rather than run unpermitted.
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return (
+                        idx,
+                        call.function.name.clone(),
+                        call.function.arguments.clone(),
+                        ToolOutcome {
+                            text: "Error: tool worker missing".into(),
+                            ok: false,
+                            diff: None,
+                        },
+                        Duration::ZERO,
+                    );
+                };
                 let started = Instant::now();
                 note_tool_start(&task_console, &call).await;
-                let (name, input, outcome) =
-                    execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
-                (idx, name, input, outcome, started.elapsed())
+                // `CatchUnwind` keeps the index on the panic path: a
+                // panicking worker reports against its own call instead
+                // of landing on a positional guess (JoinSet's JoinError
+                // carries no task payload).
+                let work = async {
+                    let (name, input, outcome) =
+                        execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
+                    (name, input, outcome, started.elapsed())
+                };
+                match CatchUnwind::new(Box::pin(work), "tool worker panicked").await {
+                    Ok((name, input, outcome, elapsed)) => (idx, name, input, outcome, elapsed),
+                    Err(text) => (
+                        idx,
+                        call.function.name.clone(),
+                        call.function.arguments.clone(),
+                        ToolOutcome {
+                            text: format!("Error: {text}"),
+                            ok: false,
+                            diff: None,
+                        },
+                        Duration::ZERO,
+                    ),
+                }
             });
         }
         let mut slots: Vec<Option<(String, String, ToolOutcome, Duration)>> =
@@ -434,9 +468,10 @@ where
                             remaining -= 1;
                         }
                         Some(Err(_)) => {
-                            // The panicking task's index is lost with the
-                            // JoinError: attribute it to the first empty slot.
-                            // Panics are rare, and the count stays exact.
+                            // Only panics outside the `CatchUnwind`
+                            // wrapper reach here (permit acquire, start
+                            // announce): attribute to the first empty
+                            // slot. Panics are rare, count stays exact.
                             if let Some(hole) = slots.iter().position(|s| s.is_none()) {
                                 let call = &calls[hole];
                                 slots[hole] = Some((
