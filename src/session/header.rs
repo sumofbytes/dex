@@ -71,11 +71,6 @@ pub(crate) struct SessionEventEntry {
     pub(crate) entry_type: String,
     pub(crate) id: String,
     pub(crate) timestamp: String,
-    /// Complexity-router tier that chose this turn's model (`turn_start`
-    /// only, routing enabled). Absent otherwise, so unrouted journals
-    /// stay byte-identical to before.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tier: Option<String>,
     /// Agent mode (`plan`/`manual`/`auto`) that governed the turn
     /// (`turn_start` only). Absent for legacy journals and subagent
     /// turns, so a reattach can restore the client's last selector.

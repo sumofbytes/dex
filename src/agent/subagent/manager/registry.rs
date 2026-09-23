@@ -166,7 +166,7 @@ pub(crate) struct Record {
     pub(crate) allowance: Option<usize>,
     /// Effective model override at spawn (`def.model`); carried into the
     /// resume handle so a generation without its own `model` keeps the
-    /// complexity-chosen model instead of resetting to the parent.
+    /// per-spawn model instead of resetting to the parent.
     pub(crate) model: Option<String>,
 }
 

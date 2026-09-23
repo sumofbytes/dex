@@ -629,28 +629,7 @@ fn effect_journal_records_intent_and_outcome() {
     }
 }
 
-/// The routed tier rides the `turn_start` marker (`None` serializes to
-/// nothing, so unrouted journals stay byte-identical), and recovery
-/// still keys on the marker type alone.
-#[test]
-fn turn_start_carries_routing_tier() {
-    let _lock = TEST_SESSIONS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut s = Session::new("/tmp/dex-tier-test".into(), None).unwrap();
-    s.turn_event_with_tier("turn_start", Some("powerful"))
-        .unwrap();
-    s.turn_event("turn_complete").unwrap();
-    let text = fs::read_to_string(s.path().unwrap()).unwrap();
-    assert!(text.contains(r#""type":"turn_start""#), "{text}");
-    assert!(text.contains(r#""tier":"powerful""#), "{text}");
-    assert!(Session::last_turn_state(s.path().unwrap()) == "complete");
-    if let Some(p) = s.path() {
-        let _ = fs::remove_file(p);
-    }
-}
-
-/// The agent mode rides `turn_start` too, so a reattach/`/resume` can
+/// The agent mode rides `turn_start`, so a reattach/`/resume` can
 /// restore the client's last selector instead of reseeding from the
 /// ceiling. Legacy rows (no `mode`) read back as `None`.
 #[test]
@@ -661,15 +640,16 @@ fn turn_start_carries_agent_mode() {
     let mut s = Session::new("/tmp/dex-mode-test".into(), None).unwrap();
     s.turn_event("turn_start").unwrap();
     s.turn_event("turn_complete").unwrap();
-    s.turn_event_with_mode("turn_start", None, Some("plan"))
-        .unwrap();
+    s.turn_event_with_mode("turn_start", Some("plan")).unwrap();
     let path = s.path().unwrap().to_path_buf();
     assert_eq!(Session::last_turn_mode(&path).as_deref(), Some("plan"));
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains(r#""mode":"plan""#), "{text}");
-    // And the plain-`turn_event` helpers serialize without the field.
-    let first_line = text.lines().find(|l| l.contains(r#""tier""#));
-    assert!(first_line.is_none(), "unmoded rows must omit tier/mode");
+    // And the plain-`turn_event` helper serializes without the field.
+    let first_line = text
+        .lines()
+        .find(|l| l.contains(r#""mode""#) && !l.contains(r#""mode":"plan""#));
+    assert!(first_line.is_none(), "unmoded rows must omit mode");
     let _ = fs::remove_file(&path);
 }
 
