@@ -1058,7 +1058,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config.yaml");
-        std::fs::write(&cfg, "model: zen/m\n").unwrap();
+        std::fs::write(&cfg, "model: opencode/m\n").unwrap();
         crate::llm::config::invalidate_config_cache();
         // Guard entries record the PREVIOUS value, restored on drop — never
         // the test's own value (that would leak `DEX_CONFIG` into later

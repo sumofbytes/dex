@@ -35,40 +35,58 @@ fn catalog_has_model(model: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// A selection naming an unconfigured models.dev provider — bare (`zai`)
-/// or qualified (`zai/glm-…`) — rides the fallback provider as an opaque
-/// id and dies later with an API error. Say so, once, with the fix.
-/// Returns whether it warned.
-pub(crate) fn warn_provider_like_selection(
+/// A selection shaped like a models.dev provider name rather than a model
+/// id — bare (`zai`) or qualified (`zai/glm-…`): `Some((provider, key env))`
+/// naming the deposit to configure. Served ids and unknown prefixes are not
+/// mistakes. Shared by [`warn_provider_like_selection`] (the id still rides
+/// a provider) and the setup error for a selection that resolves no
+/// provider at all (nothing is being sent).
+pub(crate) fn provider_like_candidate(
     selection: &str,
-    provider_name: &str,
     served: &[String],
-) -> bool {
-    // Ids the gateway serves and the resolved provider itself aren't mistakes.
-    if selection == provider_name || served.iter().any(|m| m.as_str() == selection) {
-        return false;
+) -> Option<(String, String)> {
+    // Ids the gateway serves aren't mistakes.
+    if served.iter().any(|m| m.as_str() == selection) {
+        return None;
     }
     // For `prefix/rest` the mistake candidate is the prefix; the full id
     // may still be legit (provider-native model ids like
     // `moonshotai/kimi-k2.6`, endpoint routes like `go/…`).
     let (candidate, qualified) = match selection.split_once('/') {
         Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => (prefix, true),
-        Some(_) => return false,
+        Some(_) => return None,
         None => (selection, false),
     };
-    if candidate == provider_name {
-        return false;
-    }
-    if catalog_api(candidate).is_none() {
-        return false;
-    }
+    catalog_api(candidate)?;
     if qualified && catalog_has_model(selection) {
-        return false;
+        return None;
     }
     let key_env = catalog_env_vars(candidate)
         .first()
         .cloned()
         .unwrap_or_else(|| "<key>".to_string());
+    Some((candidate.to_ascii_lowercase(), key_env))
+}
+
+/// A selection naming an unconfigured models.dev provider — bare (`zai`)
+/// or qualified (`zai/glm-…`) — is sent to the resolved provider as an
+/// opaque id and dies later with an API error. Say so, once, with the fix.
+/// Returns whether it warned.
+pub(crate) fn warn_provider_like_selection(
+    selection: &str,
+    provider_name: &str,
+    served: &[String],
+) -> bool {
+    // The resolved provider itself isn't a mistake.
+    if selection == provider_name {
+        return false;
+    }
+    let Some((candidate, key_env)) = provider_like_candidate(selection, served) else {
+        return false;
+    };
+    if candidate == provider_name {
+        return false;
+    }
     warn_once(
         &format!("hint:provider:{candidate}"),
         &format!(
@@ -164,9 +182,9 @@ pub(crate) fn validate_thinking_effort(model: &str, pick: &str) -> Result<String
 }
 
 pub(crate) fn load_dex_models_cache() -> Option<Vec<String>> {
-    // dex cache is models.dev api.json — expose bare ids plus endpoint-qualified
-    // variants (`zen/<id>`, `go/<id>`) so a pick names the endpoint it targets;
-    // the prefixes are exactly the names `apply_model` routes on. The bare
+    // dex cache is models.dev api.json — expose bare ids plus provider-qualified
+    // variants (`opencode/<id>`) so a pick names the provider it targets; the
+    // prefixes are exactly the names `apply_model` routes on. The bare
     // (id, provider) pairs come from the per-generation index (no catalog
     // walk); the fully expanded list is cached per configured-provider set,
     // so repeat `from_env` calls clone one vec instead of re-sorting.
@@ -181,14 +199,13 @@ pub(crate) fn load_dex_models_cache() -> Option<Vec<String>> {
             return None;
         }
         let mut ids: Vec<String> = Vec::with_capacity(index.bare.len() * 2);
-        // Endpoint-qualified prefixes: builtins map to their named
-        // endpoints, configured generic providers to their own name. Flat-
-        // shape ids (empty provider key) ride bare, as before.
+        // Provider-qualified prefixes: `codex`/`openai-codex` catalog keys
+        // ride `openai-codex`, configured generic providers their own name;
+        // everything else (flat-shape ids, unconfigured providers) rides
+        // bare, as before.
         for (id, prov_key) in index.bare.iter() {
             ids.push(id.clone());
             let dex_prefix: Option<&str> = match prov_key.as_str() {
-                "opencode" => Some("zen"),
-                "opencode-go" => Some("go"),
                 "openai-codex" | "codex" => Some("openai-codex"),
                 other => configured.contains(other).then_some(other),
             };
@@ -213,7 +230,7 @@ pub(crate) fn load_dex_models_cache() -> Option<Vec<String>> {
 /// Refresh the dex models cache via models.dev.
 /// Fetches https://models.dev/api.json (no auth) and caches to
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
-/// and autocomplete without network. Falls back to opencode /models if needed.
+/// and autocomplete without network.
 pub(crate) async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
     // Shared client (pool reuse): the 30s total rides per-request — api.json
     // is a ~4MB body, and the old 10s cap failed on normal slow links while

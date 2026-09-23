@@ -1,6 +1,5 @@
 use super::warn_once;
 use super::LlmConfig;
-use crate::protocol::Provider;
 use std::collections::BTreeMap;
 
 use std::env;
@@ -136,9 +135,12 @@ pub(crate) fn merge_header_layers(
     out
 }
 
-/// Console Go routing affinity: the zen/go endpoint rejects requests without
-/// `x-opencode-session` (`MissingSessionID`): gated to the opencode provider or an opencode.ai
-/// base URL, filled from the dex session id. Keys already present (any
+/// Gateway routing affinity: the opencode zen/go endpoints reject requests
+/// without `x-opencode-session` (`MissingSessionID`). opencode is an
+/// ordinary provider now — no builtin enum arm — so the gate is the
+/// *destination*: the provider name (`opencode`/`opencode-go`) or an
+/// `opencode.ai` base URL (covers a generic alias pointed at the same
+/// gateway). Filled from the dex session id. Keys already present (any
 /// casing) are left alone — including in the two file layers, which merge
 /// BELOW `extra_headers` on the wire — so explicit user headers always win
 /// regardless of call order.
@@ -147,9 +149,8 @@ pub(crate) fn apply_opencode_session_headers(config: &mut LlmConfig, session_id:
     if session_id.is_empty() {
         return;
     }
-    let base_url = config.base_url.as_str();
-    let is_opencode = matches!(config.provider, Provider::OpenCode)
-        || reqwest::Url::parse(base_url)
+    let is_opencode = matches!(config.provider.name(), "opencode" | "opencode-go")
+        || reqwest::Url::parse(config.base_url.as_str())
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
             .is_some_and(|h| h.eq_ignore_ascii_case("opencode.ai"));

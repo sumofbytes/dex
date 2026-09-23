@@ -166,13 +166,17 @@ fn model_and_provider_pickers_filter_and_mark_current() {
     let got = slash_suggestions(&app);
     assert_eq!(
         got,
-        vec![
-            (
-                "/provider opencode".to_string(),
-                "Current provider".to_string()
-            ),
-            ("/provider openai-codex".to_string(), String::new()),
-        ]
+        vec![("/provider openai-codex".to_string(), "built-in".to_string())],
+    );
+
+    type_input(&mut app, "/provider an");
+    let got = slash_suggestions(&app);
+    assert_eq!(
+        got,
+        vec![(
+            "/provider anthropic".to_string(),
+            "Current provider".to_string()
+        )]
     );
 
     type_input(&mut app, "/provider zzz");
@@ -655,8 +659,8 @@ fn handle_slash_provider_known_and_unknown() {
     assert!(has_info(&app, "unknown provider: nope"));
 
     let mut app = new_app();
-    assert!(!handle_slash(&mut app, "/provider opencode"));
-    assert!(has_info(&app, "provider already selected: opencode"));
+    assert!(!handle_slash(&mut app, "/provider anthropic"));
+    assert!(has_info(&app, "provider already selected: anthropic"));
 }
 
 #[test]
@@ -690,7 +694,7 @@ fn handle_slash_model_switch_and_persist_is_hermetic() {
     app.session = Session::from_path(&session_path).unwrap();
     assert!(!handle_slash(&mut app, "/model beta-model"));
     assert!(
-        has_info(&app, "switched to model: beta-model"),
+        has_info(&app, "switched to anthropic/beta-model"),
         "{}",
         info_texts(&app).join(" | ")
     );
@@ -754,7 +758,10 @@ fn apply_session_state_restores_plan_and_reports_model_errors() {
     assert_eq!(app.plan.steps.len(), 2);
     // apply_model does not validate against the catalog: the stored id is
     // adopted as-is and reported.
-    assert!(texts.contains("restored model: not-a-model"), "{texts}");
+    assert!(
+        texts.contains("restored model: anthropic/not-a-model"),
+        "{texts}"
+    );
     assert_eq!(app.config.model, "not-a-model");
     let _ = std::fs::remove_dir_all(&dir);
 }

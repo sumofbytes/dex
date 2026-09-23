@@ -17,10 +17,19 @@ use crate::protocol::ChatMessage;
 
 use std::env;
 
-/// Valid keys under the `routing:` mapping (`enabled` plus one per tier).
+/// Valid keys under the `routing:` mapping (`enabled` plus one per tier,
+/// plus one effort key per tier for the `(model, thinking_effort)` tuple).
 /// Used for typo hints: an unknown nested key warns instead of silently
 /// doing nothing (the typo policy `load_config_file` uses for top level).
-const KNOWN_ROUTING_KEYS: &[&str] = &["enabled", "fast", "balanced", "powerful"];
+const KNOWN_ROUTING_KEYS: &[&str] = &[
+    "enabled",
+    "fast",
+    "balanced",
+    "powerful",
+    "fast_effort",
+    "balanced_effort",
+    "powerful_effort",
+];
 
 /// Complexity-router switch (`routing.enabled:`) and per-tier env vars.
 /// Env beats file, per the standard precedence; tiers name full
@@ -30,6 +39,10 @@ pub(crate) const ROUTING_ENV: &str = "DEX_ROUTING";
 pub(crate) const ROUTING_FAST_ENV: &str = "DEX_ROUTING_FAST";
 pub(crate) const ROUTING_BALANCED_ENV: &str = "DEX_ROUTING_BALANCED";
 pub(crate) const ROUTING_POWERFUL_ENV: &str = "DEX_ROUTING_POWERFUL";
+/// Per-tier reasoning-effort overrides (`DEX_ROUTING_<TIER>_EFFORT`).
+pub(crate) const ROUTING_FAST_EFFORT_ENV: &str = "DEX_ROUTING_FAST_EFFORT";
+pub(crate) const ROUTING_BALANCED_EFFORT_ENV: &str = "DEX_ROUTING_BALANCED_EFFORT";
+pub(crate) const ROUTING_POWERFUL_EFFORT_ENV: &str = "DEX_ROUTING_POWERFUL_EFFORT";
 /// Env var holding a tier's selection (`DEX_ROUTING_FAST`…).
 fn routing_tier_env(tier: Tier) -> &'static str {
     match tier {
@@ -39,12 +52,39 @@ fn routing_tier_env(tier: Tier) -> &'static str {
     }
 }
 
+/// Env var holding a tier's reasoning effort (`DEX_ROUTING_FAST_EFFORT`…).
+fn routing_effort_env(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Fast => ROUTING_FAST_EFFORT_ENV,
+        Tier::Balanced => ROUTING_BALANCED_EFFORT_ENV,
+        Tier::Powerful => ROUTING_POWERFUL_EFFORT_ENV,
+    }
+}
+
 /// Origin wording for a tier's file selection (`config routing.fast:`…).
 fn routing_file_origin(tier: Tier) -> &'static str {
     match tier {
         Tier::Fast => "config routing.fast:",
         Tier::Balanced => "config routing.balanced:",
         Tier::Powerful => "config routing.powerful:",
+    }
+}
+
+/// Origin wording for a tier's file effort (`config routing.fast_effort:`…).
+fn routing_effort_file_origin(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Fast => "config routing.fast_effort:",
+        Tier::Balanced => "config routing.balanced_effort:",
+        Tier::Powerful => "config routing.powerful_effort:",
+    }
+}
+
+/// File key fragment for a tier's effort (`fast_effort`…).
+fn effort_key(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Fast => "fast_effort",
+        Tier::Balanced => "balanced_effort",
+        Tier::Powerful => "powerful_effort",
     }
 }
 
@@ -68,19 +108,32 @@ impl TierOrigins {
 }
 
 /// The resolved `routing:` knob: the switch plus the raw per-tier
-/// selections (empty = unset). `from_env` and `doctor` share this
-/// resolution so the origin rows cannot drift from runtime routing.
+/// selections (empty = unset) and the per-tier reasoning efforts
+/// (empty = unset, keep the turn's `thinking_effort:`). `from_env` and
+/// `doctor` share this resolution so the origin rows cannot drift from
+/// runtime routing.
 pub(crate) struct RoutingResolution {
     pub(crate) enabled: bool,
     pub(crate) enabled_origin: &'static str,
     pub(crate) tiers: TierMap,
     pub(crate) tier_origins: TierOrigins,
+    pub(crate) efforts: TierMap,
+    pub(crate) effort_origins: TierOrigins,
 }
 
 /// One file key's trimmed selection (`None` = missing, empty, or
 /// non-string). A present-but-empty or non-string value warns once and
 /// falls through like a miss, never a hard error.
 fn routing_file_key(file: &Option<serde_yaml::Value>, key: &str) -> Option<String> {
+    routing_file_key_with_hint(file, key, "set a 'provider/model' selection string")
+}
+
+/// Same as [`routing_file_key`] with a caller-chosen hint for the warning.
+fn routing_file_key_with_hint(
+    file: &Option<serde_yaml::Value>,
+    key: &str,
+    hint: &str,
+) -> Option<String> {
     let value = file
         .as_ref()
         .and_then(|f| f.get("routing"))
@@ -91,7 +144,7 @@ fn routing_file_key(file: &Option<serde_yaml::Value>, key: &str) -> Option<Strin
         None => {
             warn_once(
                 &format!("config:routing:{key}"),
-                &format!("ignoring routing.{key}: — set a 'provider/model' selection string"),
+                &format!("ignoring routing.{key}: — {hint}"),
             );
             None
         }
@@ -119,8 +172,32 @@ fn routing_tier_value(
     (String::new(), miss_origin)
 }
 
+/// One tier's raw effort: `DEX_ROUTING_<TIER>_EFFORT` > file
+/// `routing.<tier>_effort:`. Empty/missing at every layer is not an error —
+/// `effort_for` falls through to `balanced` effort, then to no override
+/// (the turn keeps its `thinking_effort:`).
+fn routing_effort_value(
+    file: &Option<serde_yaml::Value>,
+    tier: Tier,
+    miss_origin: &'static str,
+) -> (String, &'static str) {
+    let env_var = routing_effort_env(tier);
+    if let Ok(raw) = env::var(env_var) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return (trimmed, env_var);
+        }
+    }
+    if let Some(effort) =
+        routing_file_key_with_hint(file, effort_key(tier), "set a reasoning effort string")
+    {
+        return (effort, routing_effort_file_origin(tier));
+    }
+    (String::new(), miss_origin)
+}
+
 /// Shared `routing:` resolution: `DEX_ROUTING` > file `routing.enabled:`
-/// > off, plus each tier's selection. Default off — routing is opt-in.
+/// > off, plus each tier's selection and effort. Default off — routing is opt-in.
 pub(crate) fn routing_resolution(file: &Option<serde_yaml::Value>) -> RoutingResolution {
     const BALANCED_MISS: &str = "unset (falls back to model:)";
     const TIER_MISS: &str = "unset (falls back to routing.balanced:, then model:)";
@@ -218,24 +295,62 @@ pub(crate) fn routing_resolution(file: &Option<serde_yaml::Value>) -> RoutingRes
             }
         }
     }
+    const EFFORT_BALANCED_MISS: &str = "unset (keeps thinking_effort:)";
+    const EFFORT_TIER_MISS: &str =
+        "unset (falls back to routing.balanced_effort:, then keeps thinking_effort:)";
+    let mut efforts = TierMap::default();
+    let mut effort_origins = TierOrigins {
+        fast: EFFORT_TIER_MISS,
+        balanced: EFFORT_BALANCED_MISS,
+        powerful: EFFORT_TIER_MISS,
+    };
+    for tier in Tier::ALL {
+        let miss = if tier == Tier::Balanced {
+            EFFORT_BALANCED_MISS
+        } else {
+            EFFORT_TIER_MISS
+        };
+        let (value, origin) = routing_effort_value(file, tier, miss);
+        match tier {
+            Tier::Fast => {
+                efforts.fast = value;
+                effort_origins.fast = origin;
+            }
+            Tier::Balanced => {
+                efforts.balanced = value;
+                effort_origins.balanced = origin;
+            }
+            Tier::Powerful => {
+                efforts.powerful = value;
+                effort_origins.powerful = origin;
+            }
+        }
+    }
     RoutingResolution {
         enabled,
         enabled_origin,
         tiers,
         tier_origins: origins,
+        efforts,
+        effort_origins,
     }
 }
 
-/// One routed turn: classify the prompt and resolve the tier's model
-/// through `model_for` (tier miss → `balanced` → top-level `model:`).
+/// One routed turn: classify the prompt and resolve the tier's `(model,
+/// thinking_effort)` tuple — the model through `model_for` (tier miss →
+/// `balanced` → top-level `model:`), the effort through `effort_for`
+/// (tier miss → `balanced` effort → no override, keep `thinking_effort:`).
 /// `None` when routing is off or nothing selects a model (the normal
 /// `from_env` setup error then explains itself). `model_override` is
 /// `Some` only when the tier resolves away from the current selection,
-/// so an unrouted turn rebuilds nothing. Callers with an explicit
-/// `--model` / per-request model skip this — the explicit pick wins.
+/// so an unrouted turn rebuilds nothing. `effort_override` is `Some` only
+/// when the tier names an effort. Callers with an explicit `--model` /
+/// per-request model skip this — the explicit pick wins; an explicit
+/// per-request thinking effort likewise wins over the routed effort.
 pub(crate) struct RoutedTurn {
     pub(crate) tier: Tier,
     pub(crate) model_override: Option<String>,
+    pub(crate) effort_override: Option<String>,
     /// Classification hits in classification order, for the per-turn log
     /// line (see [`reason_label`][Self::reason_label]).
     pub(crate) reasons: Vec<&'static str>,
@@ -266,6 +381,7 @@ pub(crate) fn route_turn(prompt: &str, history: &[ChatMessage]) -> Option<Routed
     Some(finish_route(
         &selection.value,
         &routing.tiers,
+        &routing.efforts,
         decision.tier,
         decision.reasons,
     ))
@@ -284,18 +400,40 @@ fn routing_signal(prompt: &str, history: &[ChatMessage]) -> TaskSignal {
     }
 }
 
+/// Resolve the reasoning effort for a tier: tier miss → `balanced`
+/// effort → unset (empty). Unlike [`model_for`] there is no top-level
+/// fallback here — unset means no override, the turn keeps whatever
+/// `refresh_thinking_effort` resolved (`stored` > env > file).
+pub(crate) fn effort_for(tier: Tier, map: &TierMap) -> &str {
+    match effort_for_source(tier, map) {
+        ModelForSource::Tier => map.get(tier),
+        ModelForSource::Balanced => &map.balanced,
+        ModelForSource::Fallback => "",
+    }
+}
+
+/// Which layer [`effort_for`] resolves from; shared with [`model_for_source`]
+/// so `doctor` origins mirror the runtime chain.
+pub(crate) fn effort_for_source(tier: Tier, map: &TierMap) -> ModelForSource {
+    model_for_source(tier, map)
+}
+
 /// Shared tail: resolve the tier's model through `model_for` (tier miss →
-/// `balanced` → top-level `model:`), overriding only on change.
+/// `balanced` → top-level `model:`) and its effort through `effort_for`
+/// (tier miss → `balanced` effort → no override), overriding each only on change.
 fn finish_route(
     selection_value: &str,
     tiers: &TierMap,
+    efforts: &TierMap,
     tier: Tier,
     reasons: Vec<&'static str>,
 ) -> RoutedTurn {
     let model = model_for(tier, tiers, selection_value);
+    let effort = effort_for(tier, efforts);
     RoutedTurn {
         tier,
         model_override: (model != selection_value).then(|| model.to_string()),
+        effort_override: (!effort.is_empty()).then(|| effort.to_string()),
         reasons,
     }
 }
@@ -320,6 +458,24 @@ pub(crate) fn routing_tier_display(
             Some(_) => selection_source,
             None => "UNCONFIGURED — set 'model: <provider>/<model>'",
         },
+    };
+    (value, origin.to_string())
+}
+
+/// What `doctor` shows per tier effort: the tier's effective effort through
+/// [`effort_for`] (tier miss → `balanced` effort → unset, keep
+/// `thinking_effort:`) plus where it came from.
+pub(crate) fn routing_effort_display(tier: Tier, routing: &RoutingResolution) -> (String, String) {
+    let effort = effort_for(tier, &routing.efforts);
+    let value = if effort.is_empty() {
+        "(unset — keeps thinking_effort:)".to_string()
+    } else {
+        effort.to_string()
+    };
+    let origin = match effort_for_source(tier, &routing.efforts) {
+        ModelForSource::Tier => routing.effort_origins.get(tier),
+        ModelForSource::Balanced => routing.effort_origins.balanced,
+        ModelForSource::Fallback => routing.effort_origins.get(tier),
     };
     (value, origin.to_string())
 }

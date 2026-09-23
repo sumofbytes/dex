@@ -56,7 +56,6 @@ pub(crate) fn load_codex_credentials(
 /// key-origin row.
 pub(crate) fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
     match provider {
-        Provider::OpenCode => Some("OPENCODE_API_KEY"),
         Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
         _ => None,
     }

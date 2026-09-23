@@ -514,17 +514,50 @@ fn cmd_skill(app: &mut App, name: Option<&str>) {
     }
 }
 
+/// All selectable provider names: builtins (incl. the `codex` alias) plus
+/// every configured `providers:` entry. Shared by the `/provider` picker
+/// (`completion.rs`) and the bare `/model` + `/provider` listings below so
+/// discovery never drifts.
+fn known_provider_names(app: &App) -> Vec<String> {
+    let mut names: std::collections::BTreeSet<String> = crate::protocol::Provider::BUILTINS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.extend(app.config.provider_entries.keys().cloned());
+    names.into_iter().collect()
+}
+
+/// Canonical `provider/model` identity for every user surface (status bar,
+/// `/model` output, switch confirmations). The stored model id is already
+/// routing-stripped; the provider prefix is what selects it.
+fn canonical_model(app: &App) -> String {
+    let model = app.config.model.as_str();
+    if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{}/{}", app.config.provider.name(), model)
+    }
+}
+
 fn cmd_model(app: &mut App, arg: Option<&str>) {
     let m = arg.unwrap_or("").trim().to_string();
     if m.is_empty() {
+        let current = canonical_model(app);
+        let cost = crate::llm::config::cost_hint_for(&current)
+            .or_else(|| crate::llm::config::cost_hint_for(&app.config.model));
         push_info(
             app,
             format!(
-                "current model: {} ({})",
-                app.config.model,
-                app.config.api.name()
+                "current model: {current} ({}{})",
+                app.config.api.name(),
+                cost.map(|c| format!(", {c}")).unwrap_or_default(),
             ),
         );
+        push_info(
+            app,
+            format!("providers: {}", known_provider_names(app).join(", ")),
+        );
+        push_info(app, "usage: /model <provider>/<id>".to_string());
         return;
     }
     let old_provider = app.config.provider.clone();
@@ -565,53 +598,48 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
             .session
             .set_state("provider", app.config.provider.name());
     }
-    let provider_suffix = if app.config.provider != old_provider {
-        format!(" via {}", app.config.provider.name())
-    } else {
-        String::new()
-    };
     // Surface the thinking knob when the picked model advertises reasoning
     // options (models.dev reasoning_options).
     let thinking_suffix = crate::llm::config::reasoning_options_for(&app.config.model)
-        .map(|options| format!(" (thinking: {})", options.join(", ")))
+        .map(|options| format!(", thinking: {}", options.join(", ")))
         .unwrap_or_default();
-    match endpoint {
-        Some(name) => push_info(
-            app,
-            format!(
-                "switched to model: {} @ {} ({}, {}){}{}",
-                app.config.model,
-                name,
-                app.config.base_url,
-                app.config.api.name(),
-                provider_suffix,
-                thinking_suffix
-            ),
+    let cost_suffix = crate::llm::config::cost_hint_for(&canonical_model(app))
+        .or_else(|| crate::llm::config::cost_hint_for(&app.config.model))
+        .map(|c| format!(", {c}"))
+        .unwrap_or_default();
+    let endpoint_suffix = endpoint
+        .map(|name| format!(" via endpoint {name}"))
+        .unwrap_or_default();
+    push_info(
+        app,
+        format!(
+            "switched to {} ({}{}{}){endpoint_suffix}",
+            canonical_model(app),
+            app.config.api.name(),
+            cost_suffix,
+            thinking_suffix,
         ),
-        None => push_info(
-            app,
-            format!(
-                "switched to model: {} ({}, {}){}{}",
-                app.config.model,
-                app.config.api.name(),
-                app.config.base_url,
-                provider_suffix,
-                thinking_suffix
-            ),
-        ),
-    }
+    );
 }
 
 fn cmd_provider(app: &mut App, arg: Option<&str>) {
     let Some(name) = arg.filter(|s| !s.trim().is_empty()) else {
-        push_info(
-            app,
-            format!("current provider: {}", app.config.provider.name()),
-        );
-        push_info(
-            app,
-            "available providers: opencode, openai-codex, anthropic".to_string(),
-        );
+        let names = known_provider_names(app);
+        let current = app.config.provider.name();
+        let listed = names
+            .iter()
+            .map(|n| {
+                if n == current {
+                    format!("{n} (current)")
+                } else {
+                    n.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_info(app, format!("current provider: {current}"));
+        push_info(app, format!("providers: {listed}"));
+        push_info(app, "usage: /provider <name>".to_string());
         return;
     };
     let known: std::collections::BTreeSet<String> =
@@ -635,7 +663,10 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
         },
         None => push_info(
             app,
-            format!("unknown provider: {name}; use opencode, openai-codex or a providers: entry"),
+            format!(
+                "unknown provider: {name}; available: {}",
+                known_provider_names(app).join(", ")
+            ),
         ),
     }
 }
@@ -776,22 +807,13 @@ pub(crate) fn apply_session_state(app: &mut App, session_path: Option<&Path>) {
             {
                 app.config.available_models.push(model.clone());
             }
-            match endpoint {
-                Some(name) => push_info(
-                    app,
-                    format!(
-                        "restored model: {} @ {} ({}, {})",
-                        app.config.model,
-                        name,
-                        app.config.base_url,
-                        app.config.api.name()
-                    ),
-                ),
-                None => push_info(
-                    app,
-                    format!("restored model: {} ({})", model, app.config.api.name()),
-                ),
-            }
+            let via = endpoint
+                .map(|name| format!(" via endpoint {name}"))
+                .unwrap_or_default();
+            push_info(
+                app,
+                format!("restored model: {}{via}", canonical_model(app)),
+            );
         }
     }
     if let Some(plan_json) = state.get("plan") {

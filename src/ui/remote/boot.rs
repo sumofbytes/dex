@@ -49,6 +49,8 @@ use tokio::sync::mpsc;
 /// client never talks to the model provider itself; this only feeds the
 /// status footer and slash-command suggestions.
 fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
+    // An empty daemon provider (no config resolved yet) stays an empty
+    // generic name here — display-only, never resolved against a catalog.
     let provider = Provider::from_display(&info.provider);
     crate::llm::config::LlmConfig {
         provider: provider.clone(),
