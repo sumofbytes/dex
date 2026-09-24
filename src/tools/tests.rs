@@ -2,6 +2,7 @@
 
 use super::then_run::then_run_command;
 use super::*;
+use crate::cli::parse_shell_escape;
 use crate::runtime::cancel::GlobalCancellation;
 use serde_json::json;
 use serde_json::{Map, Value};

@@ -1,5 +1,6 @@
 mod agent;
 pub mod app;
+mod auth;
 pub mod cli;
 pub mod client;
 pub mod daemon;

@@ -3,6 +3,7 @@ use super::ChatMessage;
 /// Token overhead per message (role, formatting, turn boundary).
 pub(crate) const PER_MESSAGE_OVERHEAD: u64 = 12;
 
+#[cfg_attr(not(any(feature = "tui", test)), allow(dead_code))]
 pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
     // Content + tool call payload + name/role + replayed reasoning
     // (reasoning_items blobs and reasoning_content are re-sent verbatim next

@@ -277,7 +277,7 @@ fn cmd_extension(app: &mut App, line: &str) {
     // read-only policy — a slash command is not a permission gate.
     let (ext_id, name, arg) = split_extension_command(line);
     let label = format!("{name}@{ext_id}");
-    let cancel = crate::agent::state::GlobalCancellation;
+    let cancel = crate::runtime::cancel::GlobalCancellation;
     crate::runtime::http::spawn_task(async move {
         match crate::extensions::run_command_global(&ext_id, &name, &arg, &cancel).await {
             Ok(out) => eprintln!("dex: [extensions] /{name}: {out}"),

@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::App;
-use crate::agent::tokens::format_tokens;
+use crate::protocol::tokens::format_tokens;
 use crate::render::theme;
 
 pub(super) fn compact_path(path: &str) -> String {
@@ -206,7 +206,7 @@ pub(super) fn status_tokens(app: &App) -> u64 {
     if (n, f) == key {
         return tokens;
     }
-    let tokens = crate::agent::compaction::estimate_tokens(&app.messages);
+    let tokens = crate::protocol::tokens::estimate_tokens(&app.messages);
     app.status_tokens_cache.set((key.0, key.1, tokens));
     tokens
 }

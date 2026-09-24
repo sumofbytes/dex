@@ -176,24 +176,6 @@ async fn kill_process_group_async(pid: Option<u32>, child: &mut tokio::process::
     let _ = child.kill().await;
 }
 
-/// Split a `!`/`!!` shell escape into `(command, exclude_from_context)`.
-/// `!cmd` feeds the next turn; `!!cmd` stays out of the LLM context. Returns
-/// `None` when the line isn't a shell escape — including a bare `!`/`!!`,
-/// which falls through to the agent instead of erroring. Everything
-/// after the prefix is the command, newlines included.
-pub(crate) fn parse_shell_escape(line: &str) -> Option<(String, bool)> {
-    let (rest, excluded) = match line.strip_prefix("!!") {
-        Some(rest) => (rest, true),
-        None => (line.strip_prefix('!')?, false),
-    };
-    let command = rest.trim().to_string();
-    if command.is_empty() {
-        None
-    } else {
-        Some((command, excluded))
-    }
-}
-
 /// Spawn the workspace shell. Unix gets `sh -c` in a fresh session so tool
 /// children can never write to or race the user's terminal for input: a child
 /// that probes the terminal (e.g. `cargo test` running the theme tests →

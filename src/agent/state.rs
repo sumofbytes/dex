@@ -4,24 +4,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-pub(crate) use crate::runtime::cancel::CancellationSource;
-
-pub(crate) use crate::runtime::cancel::wait_cancelled;
-
-/// Process-global cancellation (Ctrl+C) used by the non-TUI paths
-/// (`dex "prompt"` and `dex --tool`). The TUI/daemon paths use a per-session
-/// `CancellationToken` instead, so a cancel never leaks across sessions.
-#[derive(Clone)]
-pub(crate) struct GlobalCancellation;
-
-impl CancellationSource for GlobalCancellation {
-    fn is_cancelled(&self) -> bool {
-        crate::runtime::console::is_interrupted()
-    }
-    fn take_cancelled(&self) -> bool {
-        crate::runtime::console::take_interrupt()
-    }
-}
+pub(crate) use crate::runtime::cancel::{wait_cancelled, CancellationSource, GlobalCancellation};
 
 pub(crate) const CACHE_FILE_NAME: &str = "dex-tool-cache.json";
 
@@ -76,15 +59,6 @@ pub(crate) struct ToolState {
     /// Accumulated per `Usage` event from provider pricing (catalog) or
     /// `DEX_COST_PER_1K` fallback. In-memory only, like `total_usage`.
     pub(crate) total_cost: f64,
-    /// Output-token rate (tokens/s) of the most recent LLM call, computed
-    /// client-side from the Usage event's completion count and the
-    /// daemon-measured call duration (`gen_ms`). Display-only; `None` until
-    /// the first timed call and reset by `/new`.
-    // Written by the TUI (`ui::status`, `/clear`); unread in headless builds.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) last_tok_s: Option<f64>,
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) verify_dirty: bool,
 }
 
 impl ToolState {
