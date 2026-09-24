@@ -218,7 +218,7 @@ pub(crate) async fn session_events(
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(crate::session::EVENTS_PAGE_LIMIT);
+        .unwrap_or(crate::protocol::EVENTS_PAGE_LIMIT);
     let events = tokio::task::spawn_blocking(move || {
         let mut events = Vec::new();
         let mut last_raw: Option<u64> = None;
