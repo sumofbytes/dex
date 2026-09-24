@@ -6,5 +6,5 @@ pub(crate) fn permission_from_env() -> Result<PermissionMode, Box<dyn std::error
     let value = env::var("DEX_PERMISSION")
         .ok()
         .unwrap_or_else(|| "trusted".to_string());
-    PermissionMode::parse(&value).map_err(Into::into)
+    crate::protocol::parse_permission_mode(&value).map_err(Into::into)
 }

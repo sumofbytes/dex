@@ -1,257 +1,29 @@
-//! Anthropic Messages wire protocol (`anthropic-messages`). This module is
-//! the request side: history → `POST /v1/messages` body. The response side
-//! is the SSE parser in `sse::AnthropicParser`, and auth is
-//! `provider::AuthScheme::Anthropic` — the same one-module-per-protocol
-//! split the OpenAI pair (`protocol.rs` + `stream.rs` parsers) uses, so a
-//! wire detail is only ever touched in one place.
+//! Dex adapter for Anthropic Messages request construction. Catalog lookup stays
+//! in dex; protocol formatting lives in `dex-ai`.
+#[cfg(test)]
+use crate::protocol::LlmToolCall;
+use crate::protocol::{ChatMessage, ToolDefinition};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
-use serde_json::{json, Value};
+pub(crate) use dex_ai::anthropic::messages_url;
+#[cfg(test)]
+use dex_ai::anthropic::{messages_input, tool_use_block};
 
-use crate::llm::protocol::wire_tools;
-use crate::protocol::{ChatMessage, LlmToolCall, Role};
-
-/// Required `max_tokens` cap. Deliberately a constant, not a knob: it only
-/// bounds output. The models.dev catalog's `limit.output` clamps it tighter
-/// when the model caps lower (see `max_tokens_and_budget`); a stale catalog
-/// fails with a named 400, not a hang.
-const DEFAULT_MAX_TOKENS: u64 = 16_384;
-
-/// Headroom the thinking budget must keep below `max_tokens`.
-const THINKING_HEADROOM: u64 = 4096;
-
-/// Messages request path. Native base (`https://api.anthropic.com`) gets
-/// `/v1/messages`; a base already ending in `/v1` (gateways that mirror the
-/// official path layout) gets `/messages` so the version segment never
-/// doubles.
-pub(crate) fn messages_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/v1/messages")
-    }
-}
-
-/// `thinking_effort` knob → Anthropic `budget_tokens`. Anthropic has no
-/// effort names, so the OpenAI-style vocabulary maps onto budgets (the
-/// API floor is 1024). Unknown picks get the middle bucket.
-fn thinking_budget(effort: &str) -> u64 {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "minimal" => 1024,
-        "low" => 4096,
-        "high" => 16_384,
-        "xhigh" => 32_768,
-        _ => 8192,
-    }
-}
-
-/// Request body for `POST /v1/messages`. `with_tools` false keeps `tools`
-/// off entirely (compaction/summary calls stay plain-text).
-///
-/// Prompt caching is always on: breakpoints mark the ends of the three
-/// reusable prefixes (system, tool schemas, conversation-so-far) so each
-/// turn reuses the previous turn's cached prefix instead of re-reading it.
 pub(crate) fn messages_body(
     model: &str,
     thinking_effort: Option<&str>,
     messages: &[ChatMessage],
-    with_tools: bool,
+    tools: &[ToolDefinition],
 ) -> Value {
-    let (system, mut msgs) = messages_input(messages);
-    if let Some(last) = msgs.last_mut() {
-        mark_cacheable(last);
-    }
-    let (max_tokens, budget) = max_tokens_and_budget(model, thinking_effort);
-    let mut body = json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": msgs,
-        "stream": true,
-    });
-    if let Some(system) = system {
-        body["system"] = json!([{ "type": "text", "text": system, "cache_control": cache_mark() }]);
-    }
-    if with_tools {
-        let mut tools = anthropic_tools();
-        if let Some(last) = tools.last_mut() {
-            last["cache_control"] = cache_mark();
-        }
-        body["tools"] = json!(tools);
-    }
-    if let Some(budget) = budget {
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-    }
-    body
-}
-
-/// `max_tokens` plus the optional thinking budget. `DEFAULT_MAX_TOKENS`
-/// stands unless the catalog knows a tighter `limit.output` for the model;
-/// the thinking budget adds headroom, and on capped models shrinks toward
-/// the API floor (1024) so it stays strictly below `max_tokens`.
-fn max_tokens_and_budget(model: &str, thinking_effort: Option<&str>) -> (u64, Option<u64>) {
-    let cap = crate::llm::config::catalog_output_limit_for(model);
-    let budget = thinking_effort.map(thinking_budget);
-    let budget = match (budget, cap) {
-        (Some(b), Some(cap)) if b + THINKING_HEADROOM > cap => {
-            Some(b.min(cap.saturating_sub(THINKING_HEADROOM)).max(1024))
-        }
-        (budget, _) => budget,
-    };
-    let desired = DEFAULT_MAX_TOKENS.max(budget.unwrap_or(0) + THINKING_HEADROOM);
-    let max_tokens = cap.map_or(desired, |cap| desired.min(cap));
-    (max_tokens, budget)
-}
-
-/// Prompt-caching marker: the prefix ending at the marked block is cached
-/// server-side (a few breakpoints per request are allowed).
-fn cache_mark() -> Value {
-    json!({ "type": "ephemeral" })
-}
-
-/// Mark the last block that can carry a cache breakpoint — thinking blocks
-/// can't, so the newest replayable text/tool block wins.
-fn mark_cacheable(message: &mut Value) {
-    let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let Some(block) = blocks.iter_mut().rev().find(|block| {
-        !matches!(
-            block.get("type").and_then(Value::as_str),
-            Some("thinking") | Some("redacted_thinking")
-        )
-    }) else {
-        return;
-    };
-    block["cache_control"] = cache_mark();
-}
-
-/// History → `messages` array, with system messages pulled out into the
-/// top-level `system` string (mirror of `protocol::responses_input`).
-/// Anthropic quirks encoded here:
-/// - roles must alternate, so consecutive tool results merge into ONE user
-///   message carrying one `tool_result` block each;
-/// - an assistant turn is a block array: replayed `thinking` blocks first
-///   (only signature-carrying ones — the API rejects unsigned thinking),
-///   then text, then `tool_use` with arguments parsed into an object.
-pub(crate) fn messages_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
-    let mut system = Vec::new();
-    let mut out: Vec<Value> = Vec::new();
-    let mut pending_tool_results: Vec<Value> = Vec::new();
-    for message in messages {
-        match message.role {
-            Role::System => {
-                if let Some(content) = &message.content {
-                    system.push(content.clone());
-                }
-            }
-            Role::Tool => {
-                pending_tool_results.push(tool_result_block(message));
-            }
-            Role::Assistant => {
-                if !pending_tool_results.is_empty() {
-                    out.push(json!({
-                        "role": "user",
-                        "content": std::mem::take(&mut pending_tool_results),
-                    }));
-                }
-                let blocks = assistant_blocks(message);
-                if !blocks.is_empty() {
-                    out.push(json!({ "role": "assistant", "content": blocks }));
-                }
-            }
-            Role::User => {
-                if !pending_tool_results.is_empty() {
-                    out.push(json!({
-                        "role": "user",
-                        "content": std::mem::take(&mut pending_tool_results),
-                    }));
-                }
-                out.push(json!({
-                    "role": "user",
-                    "content": [{ "type": "text", "text": message.content_str() }],
-                }));
-            }
-        }
-    }
-    if !pending_tool_results.is_empty() {
-        out.push(json!({
-            "role": "user",
-            "content": pending_tool_results,
-        }));
-    }
-    (
-        if system.is_empty() {
-            None
-        } else {
-            Some(system.join("\n\n"))
-        },
-        out,
+    dex_ai::anthropic::messages_body(
+        model,
+        crate::llm::config::catalog_output_limit_for(model),
+        thinking_effort,
+        messages,
+        tools,
     )
-}
-
-/// Replayed thinking blocks first (signature check keeps foreign
-/// `reasoning_items` — e.g. sessions that started on an OpenAI protocol —
-/// from being sent as garbage blocks), then text, then tool_use.
-fn assistant_blocks(message: &ChatMessage) -> Vec<Value> {
-    let mut blocks: Vec<Value> = message
-        .reasoning_items
-        .iter()
-        .flatten()
-        .filter(|item| {
-            matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("thinking") | Some("redacted_thinking")
-            )
-        })
-        .cloned()
-        .collect();
-    if let Some(content) = &message.content {
-        if !content.is_empty() {
-            blocks.push(json!({ "type": "text", "text": content }));
-        }
-    }
-    for call in message.tool_calls.as_deref().unwrap_or_default() {
-        blocks.push(tool_use_block(call));
-    }
-    blocks
-}
-
-/// OpenAI-shaped tool call → Anthropic `tool_use` block. `input` must be a
-/// JSON object; unparsable arguments degrade to `{}` rather than failing
-/// the whole request.
-fn tool_use_block(call: &LlmToolCall) -> Value {
-    let input = serde_json::from_str::<Value>(&call.function.arguments)
-        .ok()
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
-    json!({
-        "type": "tool_use",
-        "id": call.id,
-        "name": call.function.name,
-        "input": input,
-    })
-}
-
-fn tool_result_block(message: &ChatMessage) -> Value {
-    json!({
-        "type": "tool_result",
-        "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-        "content": message.content_str(),
-    })
-}
-
-/// Shared tool schemas → Anthropic shape (`input_schema` instead of the
-/// OpenAI `function.parameters` wrapper). Merge + tail-sort via
-/// [`wire_tools`](crate::llm::protocol::wire_tools); only the per-tool
-/// mapping differs per wire shape.
-pub(crate) fn anthropic_tools() -> Vec<Value> {
-    wire_tools(|tool| {
-        json!({
-            "name": tool.function.name,
-            "description": tool.function.description,
-            "input_schema": tool.function.parameters,
-        })
-    })
 }
 
 #[cfg(test)]
@@ -396,9 +168,10 @@ mod tests {
     fn messages_body_keeps_system_and_tools_stable_across_appends() {
         let _catalog = HermeticCatalog::empty("prefix-stable");
         let mut base = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let body1 = messages_body("m-r", None, &base, true);
+        let tools = crate::llm::protocol::tools_schema();
+        let body1 = messages_body("m-r", None, &base, &tools);
         base.push(ChatMessage::user("follow-up"));
-        let body2 = messages_body("m-r", None, &base, true);
+        let body2 = messages_body("m-r", None, &base, &tools);
         assert_eq!(body1["system"], body2["system"]);
         assert_eq!(body1["tools"], body2["tools"]);
     }
@@ -472,7 +245,7 @@ mod tests {
         // hold regardless of the machine's real models.dev cache.
         let _catalog = HermeticCatalog::empty("body-shape");
         let model = "claude-sonnet-4-5";
-        let body = messages_body(model, None, &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, None, &[ChatMessage::user("hi")], &[]);
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["max_tokens"], 16_384);
         assert_eq!(body["stream"], true);
@@ -488,7 +261,8 @@ mod tests {
 
         // Thinking enabled: budget maps from the effort knob and sits
         // strictly below max_tokens.
-        let body = messages_body(model, Some("low"), &[ChatMessage::user("hi")], true);
+        let tools = crate::llm::protocol::tools_schema();
+        let body = messages_body(model, Some("low"), &[ChatMessage::user("hi")], &tools);
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
         assert_eq!(body["max_tokens"], 16_384);
         let tools = body["tools"].as_array().unwrap();
@@ -498,12 +272,12 @@ mod tests {
         // Tool-schema breakpoint marks the last definition.
         assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
 
-        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], &[]);
         assert_eq!(body["thinking"]["budget_tokens"], 32_768);
         assert_eq!(body["max_tokens"], 36_864);
 
         // Unknown / non-OpenAI-vocabulary picks land on the middle bucket.
-        let body = messages_body(model, Some("mystery"), &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, Some("mystery"), &[ChatMessage::user("hi")], &[]);
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
 
         // System content lands in the top-level `system` block array with
@@ -512,7 +286,7 @@ mod tests {
             model,
             Some("mystery"),
             &[ChatMessage::system("be brief"), ChatMessage::user("hi")],
-            false,
+            &[],
         );
         assert_eq!(body["system"][0]["text"], "be brief");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
@@ -527,11 +301,11 @@ mod tests {
         let model = "claude-haiku-mini";
 
         // No thinking: the cap replaces the constant outright.
-        let body = messages_body(model, None, &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, None, &[ChatMessage::user("hi")], &[]);
         assert_eq!(body["max_tokens"], 8_192);
 
         // Thinking: the budget shrinks so it stays strictly below the cap.
-        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], false);
+        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], &[]);
         assert_eq!(body["max_tokens"], 8_192);
         assert_eq!(body["thinking"]["budget_tokens"], 4_096);
     }
@@ -553,7 +327,7 @@ mod tests {
         msg.reasoning_items = Some(vec![
             json!({"type": "thinking", "thinking": "hmm", "signature": "sig1"}),
         ]);
-        let body = messages_body("m-r", None, &[msg], false);
+        let body = messages_body("m-r", None, &[msg], &[]);
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         // The marker lands on the tool_use block; the thinking block —
         // which can't carry cache_control — stays untouched.

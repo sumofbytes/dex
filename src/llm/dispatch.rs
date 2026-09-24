@@ -5,7 +5,7 @@ use crate::llm::client::WireProtocol;
 use crate::llm::config::LlmConfig;
 use crate::llm::transport::sse::is_mid_stream;
 use crate::llm::transport::sse::Turn;
-use crate::protocol::{ApiProtocol, ChatMessage, SinkLine};
+use crate::protocol::{ApiProtocol, ChatMessage, ModelEvent};
 
 /// Wire protocol for this call: an explicit pin (config-file `api:` or the
 /// provider entry's, baked into `config.api_pinned`) or a `DEX_MODEL_APIS`
@@ -57,8 +57,8 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
 pub(crate) async fn complete(
     config: &LlmConfig,
     messages: &[ChatMessage],
-    with_tools: bool,
-    sink: Option<tokio::sync::mpsc::Sender<crate::protocol::SinkLine>>,
+    tools: &[crate::protocol::ToolDefinition],
+    sink: Option<tokio::sync::mpsc::Sender<crate::protocol::ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     match effective_api(config) {
@@ -69,7 +69,7 @@ pub(crate) async fn complete(
                 None,
             );
             crate::llm::client::ChatCompletions
-                .stream(&call, messages, with_tools, sink, cancel)
+                .stream(&call, messages, tools, sink, cancel)
                 .await
         }
         // Native Messages endpoint: no empirical fallback — the endpoint
@@ -82,7 +82,7 @@ pub(crate) async fn complete(
                 None,
             );
             crate::llm::client::AnthropicMessages
-                .stream(&call, messages, with_tools, sink, cancel)
+                .stream(&call, messages, tools, sink, cancel)
                 .await
         }
         ApiProtocol::Responses => {
@@ -95,7 +95,7 @@ pub(crate) async fn complete(
                 hint_model,
             );
             match crate::llm::client::Responses
-                .stream(&call, messages, with_tools, sink.clone(), cancel)
+                .stream(&call, messages, tools, sink.clone(), cancel)
                 .await
             {
                 Ok(ok) => Ok(ok),
@@ -108,7 +108,7 @@ pub(crate) async fn complete(
                     // streamed, MidStreamError blocks the retry so a partial
                     // transcript is never duplicated.
                     match crate::llm::client::ChatCompletions
-                        .stream(&call, messages, with_tools, sink.clone(), cancel)
+                        .stream(&call, messages, tools, sink.clone(), cancel)
                         .await
                     {
                         Ok(ok) => {
@@ -121,7 +121,7 @@ pub(crate) async fn complete(
                             );
                             if let Some(sink) = &sink {
                                 let _ = sink
-                                    .send(SinkLine::System(format!(
+                                    .send(ModelEvent::System(format!(
                                         "auto: {} speaks openai-completions (responses API failed); remembered for future runs",
                                         config.model
                                     )))

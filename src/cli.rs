@@ -156,7 +156,7 @@ pub fn parse_args() -> Args {
             "--name" => session_name = Some(required(&mut input, "--name")),
             "--permission" => {
                 permission = Some(
-                    PermissionMode::parse(&required(&mut input, "--permission"))
+                    crate::protocol::parse_permission_mode(&required(&mut input, "--permission"))
                         .unwrap_or_else(|error| fail(&error)),
                 );
             }

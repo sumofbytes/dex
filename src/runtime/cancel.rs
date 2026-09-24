@@ -2,11 +2,8 @@
 //! Moved down from `agent::state` so `tools` no longer imports `agent`
 //! (direction is `agent→tools→workspace/runtime`).
 
-/// Sync cancellation probe (Ctrl+C, per-session token, test doubles).
-pub(crate) trait CancellationSource: Send + Sync {
-    fn is_cancelled(&self) -> bool;
-    fn take_cancelled(&self) -> bool;
-}
+/// Shared cancellation contract used by the provider client and agent loop.
+pub(crate) use dex_ai::CancellationSource;
 
 /// Async wait for cancellation on the sync trait: polls with async sleep
 /// (10ms) so `select!` wakes within ~10ms.
