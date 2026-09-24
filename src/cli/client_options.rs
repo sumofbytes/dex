@@ -1,4 +1,4 @@
-//! Per-request overrides from CLI flags — shared by TUI remote client and `dex connect` one-shot.
+//! Translate CLI flags into daemon-client request options.
 
 use crate::cli::Args;
 

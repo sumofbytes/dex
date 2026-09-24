@@ -12,9 +12,9 @@ use std::time::Duration;
 
 mod catalog_index;
 mod catalog_query;
+mod context_index;
 mod cost;
 mod credentials;
-mod ctx_index;
 mod doctor;
 mod extension_model;
 mod headers;
@@ -43,14 +43,16 @@ pub(crate) use catalog_query::{
 };
 
 #[cfg(test)]
-pub(crate) use cost::resolve_model_cost;
-pub(crate) use cost::{cost_hint_for, model_hints_for, usage_cost};
-#[cfg(test)]
-pub(crate) use ctx_index::{build_ctx_map, write_ctx_index};
-pub(crate) use ctx_index::{
+pub(crate) use context_index::{build_ctx_map, write_ctx_index};
+pub(crate) use context_index::{
     catalog_cache_missing, catalog_context_window, catalog_endpoint_for_model,
     catalog_output_limit_for, ctx_from_index, ensure_ctx_index, load_dex_catalog,
 };
+#[cfg(test)]
+pub(crate) use cost::resolve_model_cost;
+pub(crate) use cost::usage_cost;
+#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
+pub(crate) use cost::{cost_hint_for, model_hints_for};
 pub(crate) use doctor::doctor;
 pub(crate) use extension_model::{
     extension_configured_providers, extension_model_api, extension_model_auth,

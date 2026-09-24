@@ -52,16 +52,7 @@ pub(crate) struct HttpCall {
     pub(crate) idle_timeout: Option<Duration>,
 }
 
-pub(crate) fn error_chain_message(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut msg = e.to_string();
-    let mut src = std::error::Error::source(e);
-    while let Some(s) = src {
-        msg.push_str(": ");
-        msg.push_str(&s.to_string());
-        src = s.source();
-    }
-    msg
-}
+pub(crate) use crate::runtime::error::chain_message as error_chain_message;
 
 /// Single owner of the "was this a cancellation?" wording gate. Cancellation
 /// surfaces as message text on several paths (stream driver, tool IO, agent

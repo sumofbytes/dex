@@ -3,7 +3,6 @@ use super::selection::b64;
 use super::selection::Selection;
 use super::selection::SetClipboard;
 use super::slash;
-use crate::agent::state::ToolState;
 use crate::llm::config::LlmConfig;
 use crate::session::Session;
 use crossterm::Command;
@@ -206,7 +205,7 @@ pub(crate) struct App {
     pub(crate) input: InputField,
     pub(crate) config: LlmConfig,
     pub(crate) messages: Vec<crate::protocol::ChatMessage>,
-    pub(crate) tool_state: ToolState,
+    pub(crate) tool_state: super::UsageState,
     pub(crate) session: Session,
     pub(crate) skills: Vec<crate::protocol::Skill>,
     pub(crate) turn_start: usize,
@@ -336,7 +335,7 @@ impl App {
                 request_timeout_secs: 300,
             },
             messages: Vec::new(),
-            tool_state: crate::agent::state::ToolState::default(),
+            tool_state: super::UsageState::default(),
             session: crate::session::Session::in_memory("/tmp".into()),
             skills: Vec::new(),
             turn_start: 0,

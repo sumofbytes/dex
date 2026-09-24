@@ -4,7 +4,7 @@ use crate::protocol::{ApprovalDecision, StreamEvent};
 use crate::runtime::console::{AGENT_COLOR, RESET};
 use crate::runtime::format_runtime::agent_lifecycle;
 
-use super::http::{ChatOptions, DaemonClient};
+use crate::client::http::{ChatOptions, DaemonClient};
 
 fn prompt_for_approval(name: &str, input: &str) -> ApprovalDecision {
     use crate::render::format::{approval_details, approval_summary, approval_title};
@@ -161,7 +161,7 @@ pub(crate) fn one_shot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `!`/`!!` shell escape: run directly on the daemon, no agent
     // turn. The daemon saves the run to the new session's history.
-    if let Some((command, excluded)) = crate::tools::parse_shell_escape(prompt.trim()) {
+    if let Some((command, excluded)) = crate::cli::parse_shell_escape(prompt.trim()) {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -210,4 +210,5 @@ fn one_shot_chat(
 }
 
 #[cfg(test)]
+#[path = "connect/tests.rs"]
 mod tests;

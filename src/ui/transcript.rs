@@ -8,7 +8,7 @@ use super::status;
 use super::style::fg;
 use super::style::INPUT_PROMPT;
 use super::style::TRANSCRIPT_INDENT;
-use crate::agent::tokens::format_tokens;
+use crate::protocol::tokens::format_tokens;
 use crate::protocol::Role;
 use crate::protocol::SinkLine;
 use crate::render::format::short_arg;
