@@ -20,10 +20,10 @@ use super::{file_id, FileId, PathCache};
 /// checkpoints (first seq per 64 KiB chunk) so a poll seeks past
 /// already-served rows. The idle 2 s poll with no new rows is then one
 /// `stat` and no file open.
-pub(crate) struct EventsCursor {
-    pub(crate) id: FileId,
-    pub(crate) max_seq: Option<u64>,
-    pub(crate) checkpoints: Vec<(u64, u64)>,
+pub struct EventsCursor {
+    pub id: FileId,
+    pub max_seq: Option<u64>,
+    pub checkpoints: Vec<(u64, u64)>,
     /// The scan that published this entry reached EOF. A page-limited scan
     /// (§1) stops early, so the fast path must not treat its `max_seq` as
     /// the file tip — the next poll re-scans from its checkpoint instead.
@@ -35,7 +35,7 @@ pub(crate) struct EventsCursor {
 const EVENTS_CHECKPOINT_BYTES: u64 = 64 * 1024;
 /// Checkpoint count cap per journal (perf-only: ancient cursors scan more).
 const EVENTS_CHECKPOINT_CAP: usize = 4096;
-pub(crate) fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
+pub fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
     static CACHE: OnceLock<Mutex<PathCache<EventsCursor>>> = OnceLock::new();
     CACHE.get_or_init(|| {
         Mutex::new(PathCache {
@@ -52,7 +52,7 @@ pub(crate) fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
 /// tip and checkpoints describe bytes we didn't write — a tip below the
 /// foreign row would then starve a poller parked at that row. Detect it by
 /// the length delta and drop the cursor rather than publish it.
-pub(crate) fn events_cache_touched(events_path: &Path, seq: u64, written: u64) {
+pub fn events_cache_touched(events_path: &Path, seq: u64, written: u64) {
     let Some(id) = file_id(events_path) else {
         return;
     };
@@ -267,7 +267,7 @@ fn scan_events(
 /// Served from the steady-state cursor when the journal hasn't grown
 /// (one `stat`, no file open — perf doc §12), otherwise scanned from
 /// the newest checkpoint at or before `since`.
-pub(crate) fn load_events(path: &Path, since: u64, limit: usize) -> io::Result<Vec<(u64, String)>> {
+pub fn load_events(path: &Path, since: u64, limit: usize) -> io::Result<Vec<(u64, String)>> {
     let events_path = path.with_extension("events.jsonl");
     Ok(scan_events(&events_path, since, true, limit)?.0)
 }
@@ -276,7 +276,7 @@ pub(crate) fn load_events(path: &Path, since: u64, limit: usize) -> io::Result<V
 /// journaled yet — distinct from a journal holding exactly seq 0).
 /// Served from the cursor without opening the file when the journal
 /// hasn't grown (perf doc §12).
-pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
+pub fn max_event_seq(path: &Path) -> Option<u64> {
     let events_path = path.with_extension("events.jsonl");
     // The tip query must see the whole file (a limit here would corrupt
     // seq seeding) — only serving scans page (§1).

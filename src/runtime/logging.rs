@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn redirect_with_off_ceiling_creates_no_log_file() {
         let _state = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("dex-log-off-{}", std::process::id()));

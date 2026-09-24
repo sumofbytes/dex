@@ -5,7 +5,7 @@ pub(crate) mod dispatch;
 pub(crate) mod http;
 pub(crate) mod learned;
 pub(crate) mod prompt;
-pub(crate) mod protocol;
 pub(crate) mod provider;
 pub(crate) mod thinking;
+pub(crate) mod tool_descriptions;
 pub(crate) mod transport;

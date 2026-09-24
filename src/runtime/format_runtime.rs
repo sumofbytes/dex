@@ -38,7 +38,7 @@ pub(crate) fn bash_context_text(
 }
 
 /// Child-agent lifecycle system lines (`[agent <name>:<id>] started|finished
-/// …`, formatted in `subagent/tools.rs` / `subagent/manager.rs`) get their own
+/// …`, formatted in `delegate/tools.rs` / `delegate/manager.rs`) get their own
 /// spawn/terminal marker so a delegation pops out of the muted system notes,
 /// like the per-tool glyphs do. One owner for the TUI and the headless REPL —
 /// the format lives in two emit sites, so the parser must not be duplicated.
@@ -119,8 +119,8 @@ mod tests {
 
     #[test]
     fn agent_lifecycle_markers() {
-        // The two emit formats (spawn in `subagent/tools.rs`, terminal in
-        // `subagent/manager.rs`) must both parse — a wording change here
+        // The two emit formats (spawn in `delegate/tools.rs`, terminal in
+        // `delegate/manager.rs`) must both parse — a wording change here
         // downgrades the lines to muted system notes.
         let (marker, rest) = agent_lifecycle("[agent explorer:sess-1] started").unwrap();
         assert_eq!(marker, "◈");

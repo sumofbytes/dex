@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn fallback_gate_and_learned_protocol() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut cfg = test_cfg();
@@ -252,7 +252,7 @@ mod tests {
         // A pinned endpoint skips `apply_model`, so `config.api` may still
         // hold the global default while the table names completions — the
         // request must follow the table, not the stale default.
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let hermetic_xdg = std::env::temp_dir().join("dex-learned-hermetic");

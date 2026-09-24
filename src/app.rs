@@ -12,7 +12,7 @@ use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override;
 use crate::protocol::ChatMessage;
 use crate::runtime::console::install_sigint_handler;
-use crate::skills::{discover_skills, skill_dirs};
+use dex_skills::{discover_skills, skill_dirs};
 
 use serde_json::{json, Map, Value};
 use std::env;
@@ -535,7 +535,7 @@ pub fn run() {
     // Delegation tools register only in daemon-backed processes (§10): a
     // one-shot run has no manager to spawn into, so the tools stay out of
     // its schema entirely. Dispatch rejects them there regardless (§11).
-    crate::agent::subagent::set_daemon_linked(matches!(mode, Mode::Serve { .. } | Mode::Default));
+    crate::agent::delegate::set_daemon_linked(matches!(mode, Mode::Serve { .. } | Mode::Default));
     // Extension search dirs: process-global, read by the manager at
     // bootstrap (daemon) and before the in-process one-shot turn.
     crate::extensions::set_extra_dirs(args.extension_dirs.clone());
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn schema_surface_matches_docs() {
-        let schema = crate::llm::protocol::tools_schema();
+        let schema = crate::llm::tool_descriptions::tools_schema();
         let names: Vec<&str> = schema.iter().map(|t| t.function.name.as_str()).collect();
         for expected in ["read", "bash", "write", "edit", "grep", "find", "ls"] {
             assert!(

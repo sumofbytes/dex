@@ -11,8 +11,8 @@ keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
-members = ["crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client"]
-default-members = [".", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client"]
+members = ["crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
+default-members = [".", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
 resolver = "2"
 
 [features]
@@ -36,6 +36,8 @@ dex-ai = { version = "0.1.0", path = "crates/dex-ai" }
 dex-agent-core = { version = "0.1.0", path = "crates/dex-agent-core" }
 dex-coding-agent = { version = "0.1.0", path = "crates/dex-coding-agent" }
 dex-client = { version = "0.1.0", path = "crates/dex-client" }
+dex-skills = { version = "0.1.0", path = "crates/dex-skills" }
+dex-session = { version = "0.1.0", path = "crates/dex-session" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

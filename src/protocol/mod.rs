@@ -24,6 +24,9 @@ pub(crate) mod tokens;
 #[path = "domain.rs"]
 pub(crate) mod domain;
 
+/// Skill records come from the standalone discovery crate; the daemon wire
+/// maps them to `SkillInfo` on the way out.
+pub(crate) use dex_skills::Skill;
 pub(crate) use domain::*;
 
 /// Wire schema for chat messages, tool definitions and stream chunk

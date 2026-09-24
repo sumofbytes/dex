@@ -9,7 +9,7 @@ use crate::llm::http::{
     backoff_delay, error_chain_message, is_cancelled_message, is_rate_limited, merged_headers,
     post_with_retry, HttpCall,
 };
-use crate::llm::protocol::{chat_completions_messages, responses_input, responses_tools};
+use crate::llm::tool_descriptions::{chat_completions_messages, responses_input, responses_tools};
 use crate::llm::transport::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
 use crate::protocol::{ChatCompletionsRequest, ChatMessage, ModelEvent, StreamOptions};
 use crate::runtime::console::with_console;

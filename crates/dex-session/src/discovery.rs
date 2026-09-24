@@ -17,7 +17,7 @@ use super::{Session, SessionHeader};
 /// bad JSON) drop the entry — only the header is needed, and session files
 /// grow large, so listings stream just the first line. Callers apply
 /// `sort_newest_first` for the canonical newest-first order.
-pub(crate) fn scan_jsonl_dir(dir: &Path) -> Vec<(PathBuf, SessionHeader)> {
+pub fn scan_jsonl_dir(dir: &Path) -> Vec<(PathBuf, SessionHeader)> {
     let mut sessions = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -35,7 +35,7 @@ pub(crate) fn scan_jsonl_dir(dir: &Path) -> Vec<(PathBuf, SessionHeader)> {
 }
 
 /// Canonical listing order: header timestamp, newest first.
-pub(crate) fn sort_newest_first(sessions: &mut [(PathBuf, SessionHeader)]) {
+pub fn sort_newest_first(sessions: &mut [(PathBuf, SessionHeader)]) {
     sessions.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
 }
 
@@ -52,8 +52,8 @@ fn read_first_line(path: &Path) -> Option<String> {
 
 // Session pickers (`/resume` sheet, remote UI) are the only runtime
 // callers; tests exercise them directly.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
-pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+
+pub fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     let dir = Session::session_dir().join(Session::cwd_slug(cwd));
     let mut sessions = scan_jsonl_dir(&dir);
     sort_newest_first(&mut sessions);
@@ -62,15 +62,15 @@ pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
 
 // Session pickers (`/resume` sheet, remote UI) are the only runtime
 // callers; tests exercise them directly.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
-pub(crate) fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
+
+pub fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
     std::fs::metadata(Session::session_dir().join(Session::cwd_slug(cwd)))
         .ok()?
         .modified()
         .ok()
 }
 
-pub(crate) fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+pub fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     let base = Session::session_dir();
     let mut sessions = Vec::new();
     if let Ok(entries) = fs::read_dir(&base) {
@@ -86,7 +86,7 @@ pub(crate) fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     Ok(sessions)
 }
 
-pub(crate) fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
+pub fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
     let q = sid.to_ascii_lowercase();
     let mut exact: Option<PathBuf> = None;
     let mut prefixed: Vec<PathBuf> = Vec::new();
@@ -140,7 +140,7 @@ pub(crate) fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
     })
 }
 
-pub(crate) async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+pub async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
     let base = Session::session_dir();
     let mut dirs = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&base).await {
