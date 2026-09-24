@@ -52,7 +52,7 @@ pub fn thinking_budget(effort: &str) -> u64 {
 /// turn reuses the previous turn's cached prefix instead of re-reading it.
 pub fn messages_body(
     model: &str,
-    output_limit: Option<u64>,
+    max_output_tokens: Option<u64>,
     thinking_effort: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
@@ -61,7 +61,7 @@ pub fn messages_body(
     if let Some(last) = msgs.last_mut() {
         mark_cacheable(last);
     }
-    let (max_tokens, budget) = max_tokens_and_budget(output_limit, thinking_effort);
+    let (max_tokens, budget) = max_tokens_and_budget(max_output_tokens, thinking_effort);
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -85,22 +85,22 @@ pub fn messages_body(
 }
 
 /// `max_tokens` plus the optional thinking budget. `DEFAULT_MAX_TOKENS`
-/// stands unless the host supplies a tighter output limit; the thinking
-/// budget adds headroom and shrinks on capped models to stay below
+/// stands unless the host supplies a tighter `max_output_tokens`; the
+/// thinking budget adds headroom and shrinks on capped models to stay below
 /// `max_tokens`.
 pub fn max_tokens_and_budget(
-    cap: Option<u64>,
+    max_output_tokens: Option<u64>,
     thinking_effort: Option<&str>,
 ) -> (u64, Option<u64>) {
     let budget = thinking_effort.map(thinking_budget);
-    let budget = match (budget, cap) {
+    let budget = match (budget, max_output_tokens) {
         (Some(b), Some(cap)) if b + THINKING_HEADROOM > cap => {
             Some(b.min(cap.saturating_sub(THINKING_HEADROOM)).max(1024))
         }
         (budget, _) => budget,
     };
     let desired = DEFAULT_MAX_TOKENS.max(budget.unwrap_or(0) + THINKING_HEADROOM);
-    let max_tokens = cap.map_or(desired, |cap| desired.min(cap));
+    let max_tokens = max_output_tokens.map_or(desired, |cap| desired.min(cap));
     (max_tokens, budget)
 }
 
