@@ -12,8 +12,8 @@ use crate::llm::config::LlmConfig;
 use crate::llm::dispatch::complete as call_llm;
 use crate::protocol::{ChatMessage, Role, Usage};
 
-// Tests + the TUI status bar (`crate::agent::compaction::estimate_tokens`).
-#[cfg_attr(not(any(test, feature = "tui")), allow(unused_imports))]
+// The compaction tests share the pure estimator from the protocol layer.
+#[cfg(test)]
 pub(crate) use super::tokens::estimate_tokens;
 
 /// Compaction settings — token-based keep-recent with a message-count fallback.

@@ -133,9 +133,10 @@ pub(crate) fn spawn_approval_poster(
             .approve_async(&session_id, &request_id, decision)
             .await
         {
-            crate::llm::http::provider_log(
-                "approval_delivery_failed",
-                &crate::llm::http::error_chain_message(&*e),
+            crate::log!(
+                Warn,
+                "daemon approval delivery failed: {}",
+                crate::runtime::error::chain_message(&*e)
             );
         }
     });

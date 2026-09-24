@@ -254,7 +254,7 @@ pub(crate) fn bootstrap(
     // needs skills, only the session-start listing does.
 
     // Per-request overrides so client flags keep working in remote mode.
-    let mut options = crate::client::options::chat_options_from_args(args);
+    let mut options = crate::cli::chat_options_from_args(args);
     // Seed the mode from an explicit client `--permission` (a stricter
     // per-run choice), else from the daemon's reported ceiling. Clamp to
     // the ceiling, which a client may only go stricter than.
@@ -279,7 +279,7 @@ pub(crate) fn bootstrap(
         input: crate::ui::input::InputField::new(),
         config: display_config(&info),
         messages: Vec::new(),
-        tool_state: crate::agent::state::ToolState::default(),
+        tool_state: crate::ui::UsageState::default(),
         session: Session::in_memory(info.cwd.clone()),
         plan: crate::protocol::Plan::default(),
         skills: Vec::new(),

@@ -1,9 +1,12 @@
 // Process entry orchestration: Mode dispatch + one-shot/serve/tool runners.
+#[path = "app/connect.rs"]
+pub(crate) mod connect;
+
 use crate::cli::{Args, Mode};
 use crate::session::{load_llm_messages_from_session, Session};
 use crate::tools::execute_sync as execute;
 
-use crate::agent::state::{GlobalCancellation, ToolState};
+use crate::agent::state::ToolState;
 use crate::agent::turn_loop::{process_turn, AgentRuntime};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override;
@@ -15,7 +18,7 @@ use serde_json::{json, Map, Value};
 use std::env;
 use std::io::{self, Write};
 
-use crate::client::options::{chat_options_from_args, cli_system_prompt};
+use crate::cli::{chat_options_from_args, cli_system_prompt};
 use crate::telemetry::spend_summary;
 
 /// Shared session-open ladder: `--new` creates a fresh session, otherwise
@@ -46,10 +49,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // through to the agent. The run is saved to the session so a
     // later turn sees it (`!` in context, `!!` excluded); `--no-session`
     // keeps it ephemeral.
-    if let Some((command, excluded)) = crate::tools::parse_shell_escape(prompt.trim()) {
+    if let Some((command, excluded)) = crate::cli::parse_shell_escape(prompt.trim()) {
         let mut map = Map::new();
         map.insert("command".to_string(), Value::String(command.clone()));
-        let result = execute("bash", &map, &GlobalCancellation);
+        let result = execute("bash", &map, &crate::runtime::cancel::GlobalCancellation);
         let (output, success, code) = match &result {
             Ok(out) => (out.clone(), true, Some(0)),
             Err(error) => {
@@ -204,7 +207,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         steering_accepted_tx: None,
         session: session.as_mut(),
         client: &config,
-        cancel: &crate::agent::state::GlobalCancellation,
+        cancel: &crate::runtime::cancel::GlobalCancellation,
         console: &console,
         filter: None,
         agent_ctx: None,
@@ -263,7 +266,7 @@ fn run_interactive() {
             Some(a) => a.clone(),
             None => Map::new(),
         };
-        let result = match execute(name, &args, &GlobalCancellation) {
+        let result = match execute(name, &args, &crate::runtime::cancel::GlobalCancellation) {
             Ok(out) => json!({"ok": out}),
             Err(e) => json!({"err": e.to_string()}),
         };
@@ -424,7 +427,7 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
             }
         }
     }
-    match execute(name, &parsed, &GlobalCancellation) {
+    match execute(name, &parsed, &crate::runtime::cancel::GlobalCancellation) {
         Ok(out) => print!("{out}"),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -566,7 +569,7 @@ pub fn run() {
             let result = match prompt {
                 Some(prompt) => crate::client::http::DaemonClient::new(&url).and_then(|client| {
                     client.wait_until_ready(std::time::Duration::from_secs(10))?;
-                    crate::client::repl::one_shot(
+                    crate::app::connect::one_shot(
                         &client,
                         &prompt,
                         &chat_options_from_args(&args),

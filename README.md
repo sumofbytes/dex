@@ -278,8 +278,12 @@ selectable this way.
 For ChatGPT-backed Codex, first run `codex --login`, then:
 
 ```sh
-DEX_MODEL=openai-codex dex
+DEX_MODEL=openai-codex/gpt-5.6-luna dex
 ```
+
+Replace `gpt-5.6-luna` with the model id you want to use. A bare provider
+name such as `DEX_MODEL=openai-codex` does not select a model and will fail
+with a “provider but no model” error.
 
 `dex` reads the current access token and account ID from
 `CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or `$CODEX_HOME/auth.json` (default
@@ -423,7 +427,7 @@ daemon's working directory.
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `--base-url <url>`               | Override the API base URL for this run (pins the endpoint; routing prefixes become naming only).                  |
 | `-H`, `--header <"Name: Value">` | Extra provider header (repeatable; `Name=Value` or JSON object also accepted).                                    |
-| `--model <name>`                 | Override the model for this run: `<provider>/<model>` or a bare provider name.             |
+| `--model <name>`                 | Override the model for this run: `<provider>/<model>` (a bare provider name has no model and is rejected). |
 | `--system-prompt <text>`         | Replace the built-in base system prompt for this run (project/extensions/skills still append).                    |
 | `--system-prompt-file <path>`    | Read the replacement base system prompt from a file (client-side, so remote daemons work).                        |
 | `-s`, `--session <path>`         | Open/continue a specific session file.                                                                            |
@@ -774,7 +778,7 @@ discovered extension with its consent state.
 | `OPENCODE_API_KEY`                                            | API key env var of the `opencode` provider, learned from its models.dev catalog entry (set `providers.opencode.api_key` instead, or use whatever the catalog documents).                                                                                                                                                                                                                                          |
 | `ANTHROPIC_API_KEY`                                           | API key for the built-in `anthropic` provider (`model: anthropic/<model>`); resolves cache-less.                                                                                                                                                                                                                                                                                                                |
 | `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. `OPENAI_HEADERS`/`ANTHROPIC_CUSTOM_HEADERS` are deprecated aliases — use `DEX_HEADERS`.                                                                                    |
-| `DEX_MODEL`                                                   | Model selection, `provider/model` (a bare provider name works too) — the same knob as the file's `model:` key.                                                                                                                                                                                                                                                                               |
+| `DEX_MODEL`                                                   | Model selection, `provider/model` — the same knob as the file's `model:` key. A bare provider name has no model and is rejected.                                                                                                                                                                                                                                                                               |
 | `DEX_PROVIDER`                                                | No longer read — use `DEX_MODEL=<provider>/<model>`.                                                                                                                                                                                                                                                                                             |
 | `CODEX_ACCESS_TOKEN`                                          | Optional Codex OAuth access-token override.                                                                                                                                                                                                                                                                                                                                                                     |
 | `CODEX_ACCOUNT_ID`                                            | Account ID paired with `CODEX_ACCESS_TOKEN`.                                                                                                                                                                                                                                                                                                                                                                    |

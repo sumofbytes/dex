@@ -48,22 +48,6 @@ pub struct DaemonClient {
     token: Option<String>,
 }
 
-/// Credential a client presents to a dex daemon. Same resolution as
-/// `daemon::daemon_token_file`; kept client-side so `dex connect` and the
-/// in-process TUI need no setup beyond copying the file's contents.
-fn client_daemon_token() -> Option<String> {
-    if let Ok(t) = std::env::var("DEX_DAEMON_TOKEN") {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Some(t);
-        }
-    }
-    crate::daemon::daemon_token_file()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-}
-
 /// Auth lines from a `GET /api/mcp` body: the non-null `auth` fields in
 /// server order. `null` means stdio (no login possible) — skipped, so
 /// `/mcp` never nags about servers that can't take a login.
@@ -93,11 +77,23 @@ pub fn mcp_auth_lines(body: &serde_json::Value) -> Vec<String> {
 
 impl DaemonClient {
     pub fn new(base_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_token(base_url, crate::auth::client_daemon_token())
+    }
+
+    /// Create a client with an explicitly supplied daemon token. This is the
+    /// reusable constructor for embedders that manage credentials themselves;
+    /// `None` means send unauthenticated requests.
+    pub fn with_token(
+        base_url: &str,
+        token: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let base_url = base_url.trim_end_matches('/').to_string();
         Ok(Self {
             base_url,
             http: shared_async_client(),
-            token: client_daemon_token(),
+            token: token
+                .map(|token| token.trim().to_string())
+                .filter(|t| !t.is_empty()),
         })
     }
 
@@ -386,9 +382,10 @@ impl DaemonClient {
                 let request_id = request_id.clone();
                 let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
                 if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
-                    crate::llm::http::provider_log(
-                        "approval_delivery_failed",
-                        &crate::llm::http::error_chain_message(&*e),
+                    crate::log!(
+                        Warn,
+                        "daemon approval delivery failed: {}",
+                        crate::runtime::error::chain_message(&*e)
                     );
                 }
                 continue;
@@ -585,7 +582,7 @@ impl DaemonClient {
                 "{}?since={}&limit={}",
                 self.session_url(session_id, "events"),
                 since,
-                crate::session::EVENTS_PAGE_LIMIT,
+                crate::protocol::EVENTS_PAGE_LIMIT,
             ))
             .headers(self.api_headers())
             .send()

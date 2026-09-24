@@ -1,6 +1,6 @@
+use super::context_index::dex_catalog_cache_path;
+use super::context_index::load_dex_catalog;
 use super::cost::cost_rates;
-use super::ctx_index::dex_catalog_cache_path;
-use super::ctx_index::load_dex_catalog;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Mutex;

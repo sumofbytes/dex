@@ -1,7 +1,7 @@
 use super::resolve_credentials;
 
 use super::base_protocol;
-use super::ctx_index::catalog_endpoint_for_model;
+use super::context_index::catalog_endpoint_for_model;
 use super::headers::custom_headers_from_env;
 use super::headers::insert_parsed_headers;
 use super::headers::load_config_headers;

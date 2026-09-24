@@ -243,7 +243,7 @@ fn test_app() -> super::super::App {
             request_timeout_secs: 300,
         },
         messages: Vec::new(),
-        tool_state: super::super::ToolState::default(),
+        tool_state: super::super::UsageState::default(),
         session: super::super::Session::in_memory(cwd.clone()),
         skills: Vec::new(),
         turn_start: 0,

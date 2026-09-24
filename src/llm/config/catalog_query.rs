@@ -1,9 +1,9 @@
 use super::catalog_index::with_catalog_index;
 use super::catalog_index::with_catalog_index_mut;
-use super::ctx_index::build_ctx_map;
-use super::ctx_index::dex_catalog_cache_path;
-use super::ctx_index::load_dex_catalog;
-use super::ctx_index::write_ctx_index;
+use super::context_index::build_ctx_map;
+use super::context_index::dex_catalog_cache_path;
+use super::context_index::load_dex_catalog;
+use super::context_index::write_ctx_index;
 use super::load_config_file;
 use super::provider::load_provider_entries;
 use super::provider::ProviderEntry;

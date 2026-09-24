@@ -4,10 +4,8 @@ pub(crate) mod events;
 pub(crate) mod header;
 pub(crate) mod store;
 
-// The undo ledger lives in `changes.rs`, the events journal in `events.rs`;
-// re-exported here so existing `session::...` paths keep working.
+// The undo ledger lives in `changes.rs`, the events journal in `events.rs`.
 pub(crate) use changes::undo_last_change;
-pub(crate) use events::EVENTS_PAGE_LIMIT;
 pub(crate) use header::{file_id, FileId, PathCache, SessionHeader};
 // `load_messages_and_plan`/`load_messages_from_session` only serve the TUI
 // (remote reattach, `/resume` body view) at runtime.
