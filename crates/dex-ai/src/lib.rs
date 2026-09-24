@@ -3,6 +3,7 @@
 //! These types form the shared API surface between dex provider clients and
 //! the agent runtime; this crate does not depend on the dex application.
 
+pub mod anthropic;
 pub mod provider;
 pub mod transport;
 pub mod streaming {

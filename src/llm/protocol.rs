@@ -1,7 +1,5 @@
 use crate::protocol::{FunctionDef, ToolDefinition};
-pub(crate) use dex_ai::wire::{
-    chat_completions_messages, responses_input, responses_tools, wire_tools,
-};
+pub(crate) use dex_ai::wire::{chat_completions_messages, responses_input, responses_tools};
 #[cfg(test)]
 use dex_ai::wire::{merge_chat_tool_call, response_call_index, response_tool_call};
 use serde_json::json;
