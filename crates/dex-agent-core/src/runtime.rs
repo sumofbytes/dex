@@ -7,7 +7,9 @@ use dex_ai::{
 };
 use tokio::sync::mpsc;
 
-use crate::{apply_model_turn, TokenLedger, ToolRoundBudget, ToolRoundOutcome};
+use crate::{
+    apply_model_turn, tool_budget_exhausted_note, TokenLedger, ToolRoundBudget, ToolRoundOutcome,
+};
 
 pub type AgentTurnError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -178,10 +180,7 @@ where
             let outcome = rounds.complete_round();
             host.on_tool_round(outcome, messages, &mut ledger).await?;
             if let ToolRoundOutcome::Exhausted { completed, .. } = outcome {
-                return Err(format!(
-                    "turn budget exhausted after {completed} tool rounds; partial progress preserved — send another prompt to continue"
-                )
-                .into());
+                return Err(tool_budget_exhausted_note(completed).into());
             }
         } else {
             let response = applied.response;

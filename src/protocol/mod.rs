@@ -1,5 +1,11 @@
 pub use dex_agent_core::{AgentMode, PermissionMode, Plan};
-pub use dex_ai::*;
+/// Explicit root re-export from `dex-ai` (no glob: the crate also publishes
+/// `transport`/`streaming`/`wire` modules we keep behind `dex_ai::` paths).
+pub use dex_ai::{
+    ApiProtocol, ChatCompletionsRequest, ChatMessage, FunctionCall, FunctionDef, LlmToolCall,
+    ModelEvent, Provider, Role, StopReason, StreamDelta, StreamFunctionCall, StreamOptions,
+    StreamToolCall, StreamUsage, ToolDefinition, Usage, BASH_EXCLUDED_NAME,
+};
 pub use dex_protocol::*;
 
 pub(crate) fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
