@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Default maximum number of event-journal rows returned by one page.
+pub const EVENTS_PAGE_LIMIT: usize = 1000;
+
 /// Request to create a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {

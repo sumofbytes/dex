@@ -4,8 +4,6 @@
 //! this surface. Wire types live in [`crate::protocol`].
 
 pub mod http;
-pub(crate) mod options;
-pub(crate) mod repl;
 pub(crate) mod runtime;
 pub(crate) mod sse;
 

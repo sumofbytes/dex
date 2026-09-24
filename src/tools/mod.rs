@@ -32,7 +32,6 @@ use edit::{apply_edit, apply_edit_batch, change_diff_async, parse_edit_ops};
 pub(crate) use meta::Policy;
 #[cfg(test)]
 use read::expand_glob_in;
-pub(crate) use shell::parse_shell_escape;
 #[cfg(test)]
 use shell::run_bash_with_limits;
 pub(crate) use write::hash_file;

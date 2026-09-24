@@ -15,7 +15,7 @@ pub(crate) mod wake;
 // `daemon::...` paths keep working.
 #[cfg(test)]
 pub(crate) use auth::reset_daemon_token_for_tests;
-pub(crate) use auth::{daemon_token_file, prepare_daemon_token, required_token};
+pub(crate) use auth::{prepare_daemon_token, required_token};
 
 pub mod serve;
 pub(crate) mod state;

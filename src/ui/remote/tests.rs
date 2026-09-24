@@ -324,7 +324,7 @@ fn test_remote() -> RemoteApp {
             request_timeout_secs: 300,
         },
         messages: Vec::new(),
-        tool_state: crate::agent::state::ToolState::default(),
+        tool_state: crate::ui::UsageState::default(),
         session: Session::in_memory("/tmp".into()),
         skills: Vec::new(),
         turn_start: 0,

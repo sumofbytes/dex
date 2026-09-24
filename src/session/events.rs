@@ -35,12 +35,6 @@ pub(crate) struct EventsCursor {
 const EVENTS_CHECKPOINT_BYTES: u64 = 64 * 1024;
 /// Checkpoint count cap per journal (perf-only: ancient cursors scan more).
 const EVENTS_CHECKPOINT_CAP: usize = 4096;
-/// Rows served per events-journal page (§1): the startup replay loops pages
-/// with a paint between instead of slurping a giant journal in one HTTP
-/// round trip, and the idle poller self-paces on reconnect backlogs.
-/// Absent `?limit=` means this (old clients keep working, now bounded).
-pub(crate) const EVENTS_PAGE_LIMIT: usize = 1000;
-
 pub(crate) fn events_cache() -> &'static Mutex<PathCache<EventsCursor>> {
     static CACHE: OnceLock<Mutex<PathCache<EventsCursor>>> = OnceLock::new();
     CACHE.get_or_init(|| {

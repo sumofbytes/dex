@@ -14,12 +14,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use super::lock_map;
-
-/// Where the daemon publishes its auto-generated bearer token for clients
-/// (`$XDG_DATA_HOME/dex/daemon.token`, 0600).
-pub(crate) fn daemon_token_file() -> Option<PathBuf> {
-    crate::runtime::logging::data_home().map(|base| base.join("dex/daemon.token"))
-}
+pub(crate) use crate::auth::daemon_token_file;
 
 static REQUIRED_TOKEN: Mutex<Option<Option<String>>> = Mutex::new(None);
 
