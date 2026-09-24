@@ -2,7 +2,10 @@ use crate::client::{ChatOptions, DaemonClient};
 use crate::protocol::{ApprovalDecision, StreamEvent};
 use std::time::Duration;
 
-fn spawn_daemon_sync(app: axum::Router) -> String {
+/// Bind a stub axum app on an ephemeral port and return its base URL.
+/// Shared with `src/app/connect/tests.rs`; the app e2e uses the real daemon
+/// router, the connect tests a stub, so one sync helper serves both.
+pub(crate) fn spawn_daemon_sync(app: axum::Router) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<String>();

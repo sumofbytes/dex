@@ -2,6 +2,7 @@
 use super::*;
 
 use crate::sse::SseFramer;
+use axum::response::IntoResponse;
 
 #[test]
 fn mcp_auth_lines_skips_null_stdio() {
@@ -366,4 +367,135 @@ async fn chat_stream_carries_thinking_override() {
     let reqs = seen.lock().unwrap();
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].thinking_effort.as_deref(), Some("high"));
+}
+
+fn spawn_stub(app: axum::Router) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tx.send(listener.local_addr().unwrap().to_string()).ok();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .map(|addr| format!("http://{addr}"))
+        .expect("stub address")
+}
+
+#[test]
+fn error_chain_message_walks_sources() {
+    // reqwest-style: outer Display names the context, the cause lives in
+    // `source()`. `to_string()` alone drops it; the chain keeps it.
+    let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+    let chained = std::io::Error::new(std::io::ErrorKind::TimedOut, io);
+    let msg = error_chain_message(&chained);
+    assert!(msg.contains("connection refused"), "chain kept: {msg}");
+}
+
+#[test]
+fn default_constructor_resolves_token_and_sync_wrappers() {
+    const TOKEN: &str = "crate-e2e-token";
+    std::env::set_var("DEX_DAEMON_TOKEN", TOKEN);
+    let require_bearer = axum::routing::get(|headers: axum::http::HeaderMap| async move {
+        if headers.get("authorization").and_then(|v| v.to_str().ok())
+            != Some(&format!("Bearer {TOKEN}"))
+        {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+        axum::Json(serde_json::json!({
+            "provider": "stub",
+            "model": "stub-model",
+            "available_models": ["stub-model"],
+            "context_window": 128000,
+            "permission": "trusted",
+            "cwd": "/",
+            "git_branch": null,
+            "git_dirty": false,
+        }))
+        .into_response()
+    });
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/api/config", require_bearer);
+    let base = spawn_stub(app);
+
+    // `new` exercises the crate-default path end to end: local token lookup
+    // (env var), the crate's own HTTP pools, and the default stderr warnings.
+    let client = DaemonClient::new(&base).unwrap();
+    client
+        .wait_until_ready(std::time::Duration::from_secs(5))
+        .unwrap();
+    let info = client.get_config().unwrap();
+    assert_eq!(info.model, "stub-model");
+    assert_eq!(info.provider, "stub");
+    std::env::remove_var("DEX_DAEMON_TOKEN");
+
+    // File fallback: `$XDG_DATA_HOME/dex/daemon.token` trims whitespace.
+    let data = std::env::temp_dir().join(format!("dex-client-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(data.join("dex")).unwrap();
+    std::fs::write(data.join("dex/daemon.token"), "file-token\n").unwrap();
+    let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", &data);
+    assert_eq!(
+        crate::auth::client_daemon_token().as_deref(),
+        Some("file-token")
+    );
+    match saved_xdg {
+        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+    assert!(std::fs::remove_dir_all(&data).is_ok());
+}
+
+#[test]
+fn approval_delivery_failure_warns_through_warning_handler() {
+    const SSE: &str = concat!(
+        "data: {\"seq\":0,\"type\":\"approval_required\",\"data\":",
+        "{\"request_id\":\"r1\",\"name\":\"bash\",\"input\":\"ls\"}}\n\n",
+        "data: {\"seq\":1,\"type\":\"turn_complete\",\"data\":{\"response\":\"done\"}}\n\n",
+    );
+    let app = axum::Router::new()
+        .route(
+            "/api/sessions/s1/chat",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    SSE,
+                )
+            }),
+        )
+        .route(
+            "/api/sessions/s1/approve",
+            axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+    let base = spawn_stub(app);
+
+    let warnings: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let sink = warnings.clone();
+    let client = DaemonClient::with_token(&base, None)
+        .unwrap()
+        .with_warning_handler(move |message| sink.lock().unwrap().push(message.to_string()));
+
+    let mut on_event = |event: StreamEvent| match &event {
+        StreamEvent::ApprovalRequired { .. } => Some(crate::protocol::ApprovalDecision::AllowOnce),
+        _ => None,
+    };
+    client
+        .chat("s1", "hi", ChatOptions::default(), &mut on_event)
+        .unwrap();
+    let captured = warnings.lock().unwrap();
+    assert!(
+        captured
+            .iter()
+            .any(|w| w.starts_with("daemon approval delivery failed:")),
+        "warning captured: {captured:?}"
+    );
 }

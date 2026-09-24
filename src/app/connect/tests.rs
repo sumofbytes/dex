@@ -1,27 +1,8 @@
 //! Tests, split out of the module body so it stays implementation.
 
 use super::*;
+use crate::client::e2e_tests::spawn_daemon_sync;
 use crate::protocol::StreamEvent;
-
-fn spawn_daemon_sync(app: axum::Router) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-            tx.send(listener.local_addr().unwrap().to_string()).ok();
-            axum::serve(listener, app).await.unwrap();
-        });
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(5))
-        .map(|addr| format!("http://{addr}"))
-        .expect("daemon address")
-}
 
 #[test]
 fn approval_answers_fail_closed() {
