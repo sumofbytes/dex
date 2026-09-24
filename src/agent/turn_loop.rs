@@ -262,6 +262,7 @@ where
 }
 
 mod host;
+mod tool_results;
 mod tools;
 
 use tools::max_tool_iterations;

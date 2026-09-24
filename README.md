@@ -59,10 +59,10 @@ build, test, and submit changes. Please follow the
 
 ## Workspace crates
 
-The Cargo workspace contains the `dex` application and three reusable crates.
-They have no dependency on dex's TUI, daemon, session store, or tools. The app
-continues to re-export existing types from `dex::protocol` for source
-compatibility.
+The Cargo workspace contains the `dex` application and five reusable crates.
+They have no dependency on dex's TUI, daemon implementation, session store, or
+workspace tool implementations. The app continues to re-export existing types
+from `dex::protocol` and `dex::client` for source compatibility.
 
 - `dex-protocol` owns serializable HTTP/SSE wire types shared by clients and
   daemons.
@@ -75,12 +75,22 @@ compatibility.
   budget policies, the model-response-to-history transition, and the generic
   model/tool turn engine. Dex implements the engine's host interface for its
   compaction backends, tools, sessions, steering, extensions, and UI.
+- `dex-coding-agent` owns the built-in coding tool catalog, stable composition
+  with host-provided tool schemas, built-in permission metadata, and
+  host-independent cache/repeated-call result policy. Dex supplies delegation
+  availability, MCP/extension tools, tool execution, output rendering, and
+  cache persistence.
+- `dex-client` is a standalone HTTP/SSE daemon client over `dex-protocol`.
+  It can be embedded without pulling in the daemon, TUI, session store, or
+  workspace tools; callers can provide credentials with `with_token`.
 
 ```toml
 [dependencies]
 dex-protocol = { git = "https://github.com/sumofbytes/dex" }
 dex-ai = { git = "https://github.com/sumofbytes/dex" }
 dex-agent-core = { git = "https://github.com/sumofbytes/dex" }
+dex-coding-agent = { git = "https://github.com/sumofbytes/dex" }
+dex-client = { git = "https://github.com/sumofbytes/dex" }
 ```
 
 ## Install
@@ -856,7 +866,9 @@ dex/
 ├── crates/
 │   ├── dex-protocol/     # reusable HTTP + SSE wire types
 │   ├── dex-ai/           # model API, provider wiring, shared AI types
-│   └── dex-agent-core/   # reusable agent engine and policies
+│   ├── dex-agent-core/   # reusable agent engine and policies
+│   ├── dex-coding-agent/ # tool catalog, tool policies, schema composition
+│   └── dex-client/       # standalone HTTP/SSE daemon client
 ├── .dex/
 │   └── skills/           # (optional) project-level agent skills
 ├── target/

@@ -482,6 +482,8 @@ dependencies = [
  "crossterm",
  "dex-agent-core",
  "dex-ai",
+ "dex-client",
+ "dex-coding-agent",
  "dex-protocol",
  "fff-search",
  "futures-core",
@@ -520,6 +522,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dex-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dex-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dex-coding-agent"
+version = "0.1.0"
+dependencies = [
+ "dex-agent-core",
+ "dex-ai",
+ "serde_json",
 ]
 
 [[package]]

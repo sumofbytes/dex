@@ -1,0 +1,24 @@
+[package]
+name = "dex-client"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP and SSE client for the dex daemon"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sumofbytes/dex"
+
+[dependencies]
+dex-protocol = { version = "0.1.0", path = "../dex-protocol" }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+    "http2",
+    "system-proxy",
+    "socks",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+
+[dev-dependencies]
+axum = "0.8"
