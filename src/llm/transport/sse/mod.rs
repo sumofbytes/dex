@@ -5,8 +5,7 @@
 //! is written once and a new protocol plugs in as another [`StreamParser`].
 
 #[cfg(test)]
-use crate::protocol::SinkLine;
-#[cfg(test)]
+use crate::protocol::ModelEvent;
 #[cfg(test)]
 use crate::protocol::StreamDelta;
 #[cfg(test)]
@@ -18,6 +17,7 @@ use tokio::sync::mpsc;
 
 mod parser;
 mod turn;
+pub(crate) use dex_ai::Turn;
 #[cfg(test)]
 pub(crate) use parser::{
     delta_thought, AnthropicParser, ChatCompletionsParser, ResponsesParser, StreamParser,
@@ -29,7 +29,7 @@ pub(crate) use turn::{
 };
 pub(crate) use turn::{
     is_dropped_connection, is_mid_stream, is_stream_idle_error, is_transport_error,
-    read_anthropic_stream, read_responses_stream, read_stream, stream_idle_timeout_for, Turn,
+    read_anthropic_stream, read_responses_stream, read_stream, stream_idle_timeout_for,
 };
 
 /// Test-only driver over in-memory lines (no HTTP): parser tests need no
@@ -37,7 +37,7 @@ pub(crate) use turn::{
 #[cfg(test)]
 async fn run_sse_lines<P: StreamParser>(
     lines: &[&str],
-    sink: Option<mpsc::Sender<SinkLine>>,
+    sink: Option<mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     mut parser: P,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
