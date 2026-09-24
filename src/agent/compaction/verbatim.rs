@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn summary_mode_parses_compaction_knob() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os(COMPACTION_ENV);
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_credentials_require_key_and_config_opt_in() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Hermetic env + config file: a plain config with no `jev:` table
@@ -1063,7 +1063,7 @@ mod tests {
         // Guard entries record the PREVIOUS value, restored on drop — never
         // the test's own value (that would leak `DEX_CONFIG` into later
         // tests). The vars are then set for the test body below.
-        let _guard = crate::session::EnvGuard(vec![
+        let _guard = crate::test_env::EnvGuard(vec![
             (JEV_KEY_ENV, std::env::var_os(JEV_KEY_ENV)),
             (JEV_URL_ENV, std::env::var_os(JEV_URL_ENV)),
             ("DEX_CONFIG", std::env::var_os("DEX_CONFIG")),

@@ -33,7 +33,7 @@ pub(crate) fn spawn_daemon_sync(app: axum::Router) -> String {
 /// wrappers `block_on` the async bodies, so both are exercised.
 #[test]
 fn client_end_to_end_hits_every_endpoint() {
-    let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _guard = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     const DONE_SSE: &str =
@@ -70,7 +70,7 @@ fn client_end_to_end_hits_every_endpoint() {
     .iter()
     .map(|k| (*k, std::env::var_os(k)))
     .collect();
-    let _env = crate::session::EnvGuard(saved);
+    let _env = crate::test_env::EnvGuard(saved);
     std::env::set_var("XDG_DATA_HOME", &data_dir);
     std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
     std::fs::create_dir_all(&data_dir).unwrap();

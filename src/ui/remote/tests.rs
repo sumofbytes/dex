@@ -208,11 +208,12 @@ fn local_session_file_resolves_by_id_when_files_are_shared() {
     // `/resume` resolves the daemon sid (an id, not an index/path), so the
     // local lookup must handle ids — `Session::resume` only handles
     // index/path and silently missed, leaving a blank terminal.
-    let _guard = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _guard = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-resume-{}", std::process::id()));
-    let _env = crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+    let _env =
+        crate::test_env::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
     std::env::set_var("XDG_DATA_HOME", &dir);
     let mut s = crate::session::Session::new("/tmp/dex-resume-cwd".into(), None).unwrap();
     s.append_message(&crate::protocol::ChatMessage::user("hi".to_string()))
@@ -818,7 +819,7 @@ fn remote_model_switch_does_not_write_config_file_back() {
     // client's view into the shared config file — silently repointing the
     // default model (e.g. `opencode/x` to a bare id under whatever provider
     // the client happened to resolve).
-    use crate::session::TEST_SESSIONS_ENV_LOCK;
+    use crate::test_env::TEST_SESSIONS_ENV_LOCK;
     let _lock = TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -832,7 +833,7 @@ fn remote_model_switch_does_not_write_config_file_back() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let _guard = crate::session::EnvGuard(vec![
+    let _guard = crate::test_env::EnvGuard(vec![
         ("DEX_CONFIG", std::env::var_os("DEX_CONFIG")),
         ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
     ]);

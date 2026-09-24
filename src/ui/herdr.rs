@@ -171,7 +171,7 @@ impl Reporter {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::session::{EnvGuard, TEST_SESSIONS_ENV_LOCK};
+    use crate::test_env::{EnvGuard, TEST_SESSIONS_ENV_LOCK};
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};

@@ -11,8 +11,9 @@ pub mod protocol;
 mod render;
 mod runtime;
 mod session;
-mod skills;
 mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_env;
 mod tools;
 #[cfg(feature = "tui")]
 mod ui;

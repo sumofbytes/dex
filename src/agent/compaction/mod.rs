@@ -866,7 +866,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
     async fn repeated_compaction_keeps_a_single_summary() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
@@ -920,7 +920,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
     async fn stacked_summaries_heal_to_a_single_summary() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
@@ -974,7 +974,7 @@ mod tests {
         // Global env-guarded locks, taken in the shared order
         // sessions -> turn -> manager (see the extensions tests) so no
         // two tests can acquire them in opposite order and deadlock.
-        let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _env_lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // The fixture loads into the process-global extension manager, which
@@ -1050,7 +1050,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
     async fn emergency_compaction_cuts_below_the_comfort_floor() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
@@ -1110,7 +1110,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env must stay `=jev` across the compaction await
     async fn jev_prunes_tool_heavy_history_without_a_summary() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&["DEX_COMPACTION"]);
@@ -1169,7 +1169,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env must stay `=jev` across the compaction await
     async fn jev_falls_back_to_deterministic_when_pruning_does_not_pay() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&["DEX_COMPACTION"]);
@@ -1210,7 +1210,7 @@ mod tests {
     async fn threshold_compaction_summarizes_by_default() {
         // The threshold path follows `DEX_COMPACTION`: unset means the
         // deterministic summary covers a tool-heavy span (no verbatim prune).
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&["DEX_COMPACTION"]);
@@ -1262,7 +1262,7 @@ mod tests {
     async fn live_jev_compaction_uses_the_typesafe_api() {
         use std::sync::{Arc, Mutex};
 
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvRestore::take(&["DEX_COMPACTION"]);

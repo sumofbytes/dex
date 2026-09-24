@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use crate::skills::unquote;
+use dex_skills::unquote;
 
 /// Default child timeout (§14): a run exceeding it ends `TimedOut` with a
 /// synthesized partial-status error. Per-definition `timeout_secs`

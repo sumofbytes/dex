@@ -485,6 +485,8 @@ dependencies = [
  "dex-client",
  "dex-coding-agent",
  "dex-protocol",
+ "dex-session",
+ "dex-skills",
  "fff-search",
  "futures-core",
  "http",
@@ -551,6 +553,27 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dex-session"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dex-agent-core",
+ "dex-ai",
+ "dex-skills",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "dex-skills"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

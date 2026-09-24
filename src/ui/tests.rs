@@ -1197,11 +1197,12 @@ fn slash_typing_narrows_to_matching_command() {
 fn resume_lists_sessions_regardless_of_content() {
     // `/resume` picks by index/time: a header-only session (no messages
     // yet) is listed too — resuming it just shows an empty transcript.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-resume-empty-{}", std::process::id()));
-    let _env = crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+    let _env =
+        crate::test_env::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
     std::env::set_var("XDG_DATA_HOME", &dir);
     let session = crate::session::Session::new("/tmp".into(), Some("empty-one".into())).unwrap();
     let name = session.name().unwrap().to_string();

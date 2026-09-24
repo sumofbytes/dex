@@ -48,7 +48,7 @@ pub(crate) fn tools_schema_parts() -> (
 
 /// Native schema is coding-agent behavior; the host decides whether delegation is available.
 fn native_tools() -> Vec<ToolDefinition> {
-    dex_coding_agent::builtin_tools(crate::agent::subagent::delegation_enabled())
+    dex_coding_agent::builtin_tools(crate::agent::delegate::delegation_enabled())
 }
 
 #[cfg(test)]

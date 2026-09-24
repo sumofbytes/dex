@@ -644,7 +644,7 @@ async fn escalate_clamps_exhausted_meter_to_full_cap() {
                     summary: "partial".to_string(),
                     error: Some("timed out after 600s".to_string()),
                     usage: None,
-                    reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                    reason: ExitReason::Exhausted(crate::agent::delegate::ExhaustKind::Timeout),
                     tool_calls: 2,
                     resume: None,
                 }
@@ -665,7 +665,7 @@ async fn escalate_clamps_exhausted_meter_to_full_cap() {
                     summary: "partial".to_string(),
                     error: Some("timed out after 600s".to_string()),
                     usage: None,
-                    reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                    reason: ExitReason::Exhausted(crate::agent::delegate::ExhaustKind::Timeout),
                     tool_calls: 1,
                     resume: None,
                 }

@@ -2,7 +2,7 @@
 //! from `mod.rs` so the facade stays under the 100-LOC budget.
 
 use super::*;
-use crate::agent::subagent::{
+use crate::agent::delegate::{
     AgentDefinition, AgentResult, AgentState, ContextSeed, ExitReason, ProgressReporter, SpawnMeta,
     WaitOutcome,
 };
@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
-    let mut def = crate::agent::subagent::builtin_definitions()
+    let mut def = crate::agent::delegate::builtin_definitions()
         .into_iter()
         .next()
         .expect("built-in agents");
@@ -27,7 +27,7 @@ fn agent_test_parts(name: &str) -> (AgentDefinition, ContextSeed) {
 async fn done_body(
     _token: CancellationToken,
     _progress: ProgressReporter,
-    _id: crate::agent::subagent::AgentId,
+    _id: crate::agent::delegate::AgentId,
 ) -> AgentResult {
     AgentResult {
         status: AgentState::Completed,
@@ -43,7 +43,7 @@ async fn done_body(
 async fn cancel_body(
     token: CancellationToken,
     _progress: ProgressReporter,
-    _id: crate::agent::subagent::AgentId,
+    _id: crate::agent::delegate::AgentId,
 ) -> AgentResult {
     token.cancelled().await;
     AgentResult {
@@ -254,7 +254,7 @@ async fn shutdown_agents_joins_every_session() {
 #[test]
 fn event_seq_is_seeded_from_disk_after_restart() {
     // Touches the shared sessions dir; serialize against env-redirecting tests.
-    let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     // Simulate a prior run: a session with events already journaled.
     let mut s = crate::session::Session::new("/tmp/dex-seq-test".into(), None).unwrap();
     s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
@@ -305,7 +305,7 @@ fn hermetic_xdg() -> HermeticXdg {
 async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
     // Hermetic sessions dir: rebuild_async scans everything under
     // XDG_DATA_HOME, so concurrent test binaries must not see each other.
-    let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _env_guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _xdg_guard = hermetic_xdg();
     // A session killed mid-turn: turn_start with no terminal entry.
     let mut s = crate::session::Session::new("/tmp/dex-rebuild-test".into(), None).unwrap();
@@ -338,7 +338,7 @@ async fn rebuild_marks_interrupted_turns_failed_and_registers_sessions() {
 fn event_seq_seed_advances_past_a_single_seq_zero() {
     // `max_event_seq` is None when empty but Some(0) for a journal
     // holding exactly seq 0; the seed must not reuse seq 0.
-    let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let mut s = crate::session::Session::new("/tmp/dex-seq-zero-test".into(), None).unwrap();
     s.append_event(0, "{\"type\":\"system\",\"data\":\"x\"}")
         .unwrap();
@@ -356,7 +356,7 @@ async fn rebuild_skips_failed_marking_for_live_turns() {
     // A reattach + chat racing the background rebuild owns the journal:
     // stamping `turn_failed` under its live `turn_start` would corrupt it.
     // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
-    let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _env_guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _xdg_guard = hermetic_xdg();
     let mut s = crate::session::Session::new("/tmp/dex-rebuild-live-test".into(), None).unwrap();
     let id = s.id().to_string();
@@ -382,7 +382,7 @@ async fn rebuild_registry_merge_keeps_live_entries() {
     // Sessions claimed (reattached/created) mid-rebuild win over disk via
     // `or_insert` — the rebuild must not clobber them.
     // Hermetic sessions dir — see rebuild_marks_interrupted_turns_failed.
-    let _env_guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _env_guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _xdg_guard = hermetic_xdg();
     let s = crate::session::Session::new("/tmp/dex-rebuild-wins-test".into(), None).unwrap();
     let id = s.id().to_string();
@@ -434,7 +434,7 @@ async fn bearer_token_generated_for_non_loopback_bind_and_enforced() {
             reset_daemon_token_for_tests();
         }
     }
-    let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _restore = Restore {
         xdg: std::env::var_os("XDG_DATA_HOME"),
         token: std::env::var_os("DEX_DAEMON_TOKEN"),

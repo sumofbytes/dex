@@ -1,0 +1,13 @@
+[package]
+name = "dex-skills"
+version = "0.1.0"
+edition = "2021"
+description = "SKILL.md discovery and frontmatter parsing for dex"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sumofbytes/dex"
+
+[dependencies]
+tokio = { version = "1", features = ["fs", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }

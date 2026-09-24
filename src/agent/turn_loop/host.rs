@@ -158,7 +158,7 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
     }
 
     fn tool_schemas(&self) -> Vec<dex_ai::ToolDefinition> {
-        crate::llm::protocol::tools_schema()
+        crate::llm::tool_descriptions::tools_schema()
     }
 
     fn start_model_events(&mut self) -> Option<mpsc::Sender<ModelEvent>> {
@@ -403,7 +403,7 @@ pub(super) fn make_host<'a, X: CancellationSource + Clone + 'static>(
     cancel: &'a X,
     console: &'a Console,
     filter: Option<&'a ToolFilter>,
-    agent_ctx: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
+    agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
     messages_len: usize,
 ) -> DexTurnHost<'a, X> {
     let mut policy = Policy::turn(config.permission, console);

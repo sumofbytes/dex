@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use crate::protocol::ApprovalDecision;
 /// Lifecycle snapshot of one MCP server for status lines and the UI panels.
 /// Plain data so `render` can depend on it without reaching upward into
@@ -13,14 +11,6 @@ pub(crate) struct ServerStatus {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Skill {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) path: PathBuf,
-}
-
-/// An approval request parked in the daemon state or the tools policy
-/// layer while the human decides. `response` carries the decision back.
 pub(crate) struct ApprovalRequest {
     pub name: String,
     pub input: String,

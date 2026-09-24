@@ -8,12 +8,12 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::protocol::{ChatMessage, Role};
+use dex_ai::{ChatMessage, Role};
 
 use super::Session;
 
 impl Session {
-    pub(crate) fn append_event(&mut self, seq: u64, payload: &str) -> io::Result<()> {
+    pub fn append_event(&mut self, seq: u64, payload: &str) -> io::Result<()> {
         // events_path() allocates (with_extension) — only compute it when the
         // handle needs to be opened, not once per streamed delta.
         if self.events_journal.is_none() {
@@ -52,22 +52,18 @@ impl Session {
     }
 
     /// Replay stream events with `seq >= since` — see `events::load_events`.
-    pub(crate) fn load_events(
-        path: &Path,
-        since: u64,
-        limit: usize,
-    ) -> io::Result<Vec<(u64, String)>> {
+    pub fn load_events(path: &Path, since: u64, limit: usize) -> io::Result<Vec<(u64, String)>> {
         super::super::events::load_events(path, since, limit)
     }
 
     /// Highest event seq recorded for a session — see `events::max_event_seq`.
-    pub(crate) fn max_event_seq(path: &Path) -> Option<u64> {
+    pub fn max_event_seq(path: &Path) -> Option<u64> {
         super::super::events::max_event_seq(path)
     }
 
     /// Terminal state of the most recent turn: "complete", "failed", or
     /// "interrupted" when a `turn_start` has no terminal entry after it.
-    pub(crate) fn last_turn_state(path: &Path) -> &'static str {
+    pub fn last_turn_state(path: &Path) -> &'static str {
         // Streamed via `for_each_line`; sessions hold thousands of
         // non-marker entries. Open failure still reads as "unknown"; the
         // helper stops mid-scan on read errors like EOF.
@@ -98,8 +94,7 @@ impl Session {
     /// `turn_event_with_mode`): the client's last selector, restored on
     /// reattach. `None` for legacy journals and subagent turns.
     // Remote UI reattach (TUI) is the only runtime caller.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) fn last_turn_mode(path: &Path) -> Option<String> {
+    pub fn last_turn_mode(path: &Path) -> Option<String> {
         let mut mode: Option<String> = None;
         let scan = super::for_each_line(path, |line| {
             if !line.contains("\"type\":\"turn_start\"") {
@@ -129,7 +124,7 @@ impl Session {
     /// skipped); open failure is an `Err` (callers map it to `unknown` / 0
     /// as today). Stays quiet on malformed lines — unlike the loader, this
     /// runs per file per listing.
-    pub(crate) fn scan_summary(path: &Path) -> io::Result<(usize, String)> {
+    pub fn scan_summary(path: &Path) -> io::Result<(usize, String)> {
         let mut reader = BufReader::new(File::open(path)?);
         let mut count = 0usize;
         let mut state = "none";

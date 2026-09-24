@@ -63,5 +63,5 @@ pub(crate) struct Policy {
     /// spawnable; children and every non-daemon path carry `None`, so a
     /// `delegate` call from either is rejected at dispatch (§11, no
     /// recursion — the depth cap in code, not in the prompt).
-    pub(crate) agent: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
+    pub(crate) agent: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
 }
