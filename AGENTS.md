@@ -15,11 +15,14 @@ Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX
 
 ## Structure
 
+- `crates/dex-protocol/` — standalone shared HTTP/SSE wire types used by dex clients and daemons; `src/protocol/` re-exports it for internal compatibility and keeps app-domain types private.
+- `crates/dex-ai/` — provider-neutral model/message API, wire mapping, SSE parsers, and reusable HTTP auth/retry policy. Model discovery/configuration, credential refresh, and UI streaming remain app-owned in `src/llm/`.
+- `crates/dex-agent-core/` — reusable permission/agent modes, plans, token accounting, deterministic compaction, context/tool-round budget policies, text limits, normalized model-response history transition, and generic model/tool turn engine (`AgentHost` boundary). Dex implements app integrations in `src/agent/turn_loop/host.rs`.
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
 - `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Doctor`/`Update`/`Mcp`/`Extensions`/`Usage`/`Help`/`Version`)
 - `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
-- `src/agent/` — `turn_loop.rs` + `turn_loop/` turn loop, `state.rs`, `compaction/`, `subagent/` (definitions, manager, delegate tool)
-- `src/llm/` — provider clients, streaming parsers, `config/` (provider/model/endpoint resolution, `/model` write-back, `dex doctor`), `prompt.rs` (system prompt)
+- `src/agent/` — `turn_loop.rs` lifecycle wrapper plus `turn_loop/host.rs` dex `AgentHost` adapter, `state.rs`, app compaction backend, `subagent/` (definitions, manager, delegate tool)
+- `src/llm/` — provider clients and adapters, `config/` (provider/model/endpoint resolution, `/model` write-back, `dex doctor`), `prompt.rs` (system prompt)
 - `src/tools/` — workspace-confined tools (`mod.rs`, `search.rs` for the fff engine backing `grep`/`find`, `shell.rs` exposes `$DEX_BIN`)
 - `src/mcp/` — MCP client (stdio/HTTP/SSE, OAuth, `mcp_servers:` config)
 - `src/session/` — append-only JSONL (`store.rs`, `header.rs`, `journal.rs`; `$XDG_DATA_HOME/dex/sessions/<slug>/*.jsonl`)

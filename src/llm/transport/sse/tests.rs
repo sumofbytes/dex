@@ -2,7 +2,7 @@
 
 use super::{
     delta_thought, driver_err, is_dropped_connection, is_mid_stream, is_transport_error,
-    read_stream, stream_err, stream_idle_timeout_for, SinkLine, SseDriver, StreamDelta,
+    read_stream, stream_err, stream_idle_timeout_for, ModelEvent, SseDriver, StreamDelta,
     StreamPrinter, Usage,
 };
 use crate::protocol::{StopReason, StreamUsage};
@@ -28,7 +28,7 @@ async fn stream_printer_with_sink_routes_lines_to_channel_not_stdout() {
     printer.feed_line_async("```").await;
     printer.finish_async().await;
 
-    let lines: Vec<SinkLine> = {
+    let lines: Vec<ModelEvent> = {
         let mut out = Vec::new();
         while let Ok(v) = rx.try_recv() {
             out.push(v);
@@ -37,10 +37,10 @@ async fn stream_printer_with_sink_routes_lines_to_channel_not_stdout() {
     };
     assert!(lines
         .iter()
-        .any(|l| matches!(l, SinkLine::Assistant(s) if s.contains("Key facts"))));
+        .any(|l| matches!(l, ModelEvent::Assistant(s) if s.contains("Key facts"))));
     assert!(lines
         .iter()
-        .any(|l| matches!(l, SinkLine::Assistant(s) if s.contains("fn main"))));
+        .any(|l| matches!(l, ModelEvent::Assistant(s) if s.contains("fn main"))));
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn stream_usage_parses_cached_tokens_with_and_without_detail() {
 
 async fn read_chat_lines(
     lines: &[&str],
-    sink: Option<tokio::sync::mpsc::Sender<SinkLine>>,
+    sink: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
     super::run_sse_lines(lines, sink, cancel, super::ChatCompletionsParser::default()).await
@@ -88,7 +88,7 @@ async fn read_chat_lines(
 
 async fn read_responses_lines(
     lines: &[&str],
-    sink: Option<tokio::sync::mpsc::Sender<SinkLine>>,
+    sink: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
     super::run_sse_lines(lines, sink, cancel, super::ResponsesParser::default()).await
@@ -96,7 +96,7 @@ async fn read_responses_lines(
 
 async fn read_anthropic_lines(
     lines: &[&str],
-    sink: Option<tokio::sync::mpsc::Sender<SinkLine>>,
+    sink: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
 ) -> Result<super::Turn, Box<dyn std::error::Error + Send + Sync>> {
     super::run_sse_lines(lines, sink, cancel, super::AnthropicParser::default()).await
@@ -173,15 +173,15 @@ async fn anthropic_stream_captures_replayable_thinking() {
     assert_eq!(items[0]["signature"], "sig1");
     assert_eq!(items[1]["type"], "redacted_thinking");
     assert_eq!(items[1]["data"], "encrypted-blob");
-    let lines: Vec<SinkLine> = {
+    let lines: Vec<ModelEvent> = {
         let mut out = Vec::new();
         while let Ok(v) = rx.try_recv() {
             out.push(v);
         }
         out
     };
-    assert!(matches!(&lines[0], SinkLine::Thinking(s) if s == "step "));
-    assert!(matches!(&lines[1], SinkLine::Thinking(s) if s == "one"));
+    assert!(matches!(&lines[0], ModelEvent::Thinking(s) if s == "step "));
+    assert!(matches!(&lines[1], ModelEvent::Thinking(s) if s == "one"));
 }
 
 /// Anthropic stop reasons map onto the normalized set; unknown reasons
@@ -378,15 +378,15 @@ async fn chat_stream_assembles_content_tools_and_usage() {
             cached_tokens: Some(7)
         })
     );
-    let lines: Vec<SinkLine> = {
+    let lines: Vec<ModelEvent> = {
         let mut out = Vec::new();
         while let Ok(v) = rx.try_recv() {
             out.push(v);
         }
         out
     };
-    assert!(matches!(&lines[0], SinkLine::Assistant(s) if s == "hello world"));
-    assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "second line"));
+    assert!(matches!(&lines[0], ModelEvent::Assistant(s) if s == "hello world"));
+    assert!(matches!(&lines[1], ModelEvent::Assistant(s) if s == "second line"));
 }
 
 /// SSE allows `data:{...}` without the space: a chat-completions
@@ -426,7 +426,7 @@ async fn chat_stream_buffers_code_fences() {
         msg.content.as_deref(),
         Some("```rust\nfn main() {}\n```\ntrailing prose")
     );
-    let lines: Vec<SinkLine> = {
+    let lines: Vec<ModelEvent> = {
         let mut out = Vec::new();
         while let Ok(v) = rx.try_recv() {
             out.push(v);
@@ -436,11 +436,11 @@ async fn chat_stream_buffers_code_fences() {
     // The fence body keeps its streamed trailing newline and the close
     // adds one more — current sink contract; consumers re-parse the block.
     assert!(
-        matches!(&lines[0], SinkLine::Assistant(s)
+        matches!(&lines[0], ModelEvent::Assistant(s)
               if s == "```rust:\nfn main() {}\n\n```"),
         "{lines:?}"
     );
-    assert!(matches!(&lines[1], SinkLine::Assistant(s) if s == "trailing prose"));
+    assert!(matches!(&lines[1], ModelEvent::Assistant(s) if s == "trailing prose"));
 }
 
 /// `finish_reason` on the final chunk maps onto the normalized
@@ -550,15 +550,15 @@ async fn responses_stream_tolerates_garbage_and_extracts_reasoning() {
     assert_eq!(turn.message.content, None);
     assert!(turn.message.tool_calls.is_none());
     assert_eq!(turn.usage, None);
-    let lines: Vec<SinkLine> = {
+    let lines: Vec<ModelEvent> = {
         let mut out = Vec::new();
         while let Ok(v) = rx.try_recv() {
             out.push(v);
         }
         out
     };
-    assert!(matches!(&lines[0], SinkLine::Thinking(s) if s == "thinking"));
-    assert!(matches!(&lines[1], SinkLine::Thinking(s) if s == " more"));
+    assert!(matches!(&lines[0], ModelEvent::Thinking(s) if s == "thinking"));
+    assert!(matches!(&lines[1], ModelEvent::Thinking(s) if s == " more"));
 }
 
 /// `response.completed` normalizes to a clean stop; `response.incomplete`

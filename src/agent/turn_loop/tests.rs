@@ -21,8 +21,8 @@ impl ModelClient for MockModel {
     async fn complete(
         &self,
         _messages: &[ChatMessage],
-        _with_tools: bool,
-        _sink: Option<mpsc::Sender<SinkLine>>,
+        _tools: &[crate::protocol::ToolDefinition],
+        _sink: Option<mpsc::Sender<ModelEvent>>,
         _cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Turn {
@@ -204,8 +204,8 @@ async fn before_agent_start_appends_system_prompt_and_restores() {
         async fn complete(
             &self,
             messages: &[ChatMessage],
-            _with_tools: bool,
-            _sink: Option<mpsc::Sender<SinkLine>>,
+            _tools: &[crate::protocol::ToolDefinition],
+            _sink: Option<mpsc::Sender<ModelEvent>>,
             _cancel: &(dyn CancellationSource + Send + Sync),
         ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             let first = messages.first().map(|m| m.content.clone());
@@ -304,8 +304,8 @@ impl ModelClient for ToolThenAnswer {
     async fn complete(
         &self,
         _messages: &[ChatMessage],
-        _with_tools: bool,
-        _sink: Option<mpsc::Sender<SinkLine>>,
+        _tools: &[crate::protocol::ToolDefinition],
+        _sink: Option<mpsc::Sender<ModelEvent>>,
         _cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -625,8 +625,8 @@ async fn turn_budget_stops_an_endless_tool_loop() {
         async fn complete(
             &self,
             _m: &[ChatMessage],
-            _w: bool,
-            _s: Option<mpsc::Sender<SinkLine>>,
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
             _c: &(dyn CancellationSource + Send + Sync),
         ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Turn {
@@ -708,8 +708,8 @@ async fn context_overflow_compacts_and_retries_once() {
         async fn complete(
             &self,
             messages: &[ChatMessage],
-            _w: bool,
-            _s: Option<mpsc::Sender<SinkLine>>,
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
             _c: &(dyn CancellationSource + Send + Sync),
         ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -783,8 +783,8 @@ async fn cancel_during_llm_call_unwinds_promptly() {
         async fn complete(
             &self,
             _m: &[ChatMessage],
-            _w: bool,
-            _s: Option<mpsc::Sender<SinkLine>>,
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
             _c: &(dyn CancellationSource + Send + Sync),
         ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -838,8 +838,8 @@ async fn cancel_during_tool_io_suppresses_result_fanout() {
         async fn complete(
             &self,
             _m: &[ChatMessage],
-            _w: bool,
-            _s: Option<mpsc::Sender<SinkLine>>,
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
             _c: &(dyn CancellationSource + Send + Sync),
         ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -928,8 +928,8 @@ impl ModelClient for RepeatedGuardScript {
     async fn complete(
         &self,
         _m: &[ChatMessage],
-        _w: bool,
-        _s: Option<mpsc::Sender<SinkLine>>,
+        _tools: &[crate::protocol::ToolDefinition],
+        _s: Option<mpsc::Sender<ModelEvent>>,
         _c: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1072,8 +1072,8 @@ impl ModelClient for FilterProbe {
     async fn complete(
         &self,
         _messages: &[ChatMessage],
-        _with_tools: bool,
-        _sink: Option<mpsc::Sender<SinkLine>>,
+        _tools: &[crate::protocol::ToolDefinition],
+        _sink: Option<mpsc::Sender<ModelEvent>>,
         _cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

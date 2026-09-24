@@ -1,0 +1,21 @@
+[package]
+name = "dex-ai"
+version = "0.1.0"
+edition = "2021"
+description = "Provider-neutral LLM messages and streaming types for dex"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sumofbytes/dex"
+
+[dependencies]
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+    "http2",
+    "system-proxy",
+    "socks",
+] }
+tokio = { version = "1", features = ["sync"] }
