@@ -1,7 +1,9 @@
 //! Tests, split out of the module body so it stays implementation.
 
 use super::*;
+use crate::client::e2e_tests::spawn_daemon_sync;
 use crate::protocol::StreamEvent;
+
 #[test]
 fn approval_answers_fail_closed() {
     use crate::protocol::ApprovalDecision as D;
@@ -117,9 +119,9 @@ fn one_shot_shell_escape_runs_on_the_daemon() {
     std::env::set_var("XDG_DATA_HOME", &data_dir);
 
     // The real daemon router (no LLM involved).
-    let daemon_base = crate::client::http::tests::spawn_daemon_sync(crate::daemon::server::router(
-        std::sync::Arc::new(crate::daemon::DaemonState::new()),
-    ));
+    let daemon_base = spawn_daemon_sync(crate::daemon::server::router(std::sync::Arc::new(
+        crate::daemon::DaemonState::new(),
+    )));
 
     let client = DaemonClient::new(&daemon_base).unwrap();
     client.wait_until_ready(Duration::from_secs(10)).unwrap();

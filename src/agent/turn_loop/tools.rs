@@ -1,6 +1,6 @@
-//! Tool-execution half of the turn loop: tool-call batching, per-result
-//! bookkeeping (cache, transcript), steering injection, and the
-//! console/sink note emitters.
+//! Dex tool execution, history persistence, steering, and shared turn notes.
+//! Completed execution results are applied by the sibling `tool_results`
+//! module so dispatch stays separate from transcript/session bookkeeping.
 
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -9,16 +9,12 @@ use tokio::sync::mpsc;
 use super::apply_queue_msg;
 use crate::agent::compaction::compact_history;
 use crate::agent::compaction::verbatim::summary_mode;
-use crate::agent::state::{cache_fingerprint, wait_cancelled, CancellationSource, ToolState};
+use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
 use crate::protocol::{ChatMessage, LlmToolCall, QueueMsg, SinkLine, Usage};
-use crate::render::format::{
-    model_tool_result, short_arg, tool_preview, tool_preview_body, tool_result_summary,
-};
-use crate::runtime::console::{
-    with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK, TOOL_OUTPUT_COLOR,
-};
+use crate::render::format::short_arg;
+use crate::runtime::console::{with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK};
 use crate::runtime::unwind::CatchUnwind;
 use crate::session::Session;
 use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
@@ -532,129 +528,4 @@ where
             })
             .collect()
     }
-}
-
-/// Everything one tool result in a completed batch touches, bundled so
-/// `process_tool_result` stays a plain function instead of a 7-arg one.
-/// `'b` is the per-batch scope the mutable state is reborrowed for.
-pub(super) struct ToolResultCtx<'a, 'b> {
-    pub(super) console: &'a Console,
-    pub(super) state: &'b mut ToolState,
-    pub(super) messages: &'b mut Vec<ChatMessage>,
-    pub(super) session: &'b mut Option<&'a mut Session>,
-    pub(super) persisted_cursor: &'b mut usize,
-    pub(super) last_tools: &'b mut Vec<String>,
-    pub(super) ledger: &'b mut TokenLedger,
-}
-
-/// Process one tool result from a completed batch: repeated-call guard,
-/// cache, sink emit, and transcript append. Moved verbatim from the inline
-/// per-result loop body.
-pub(super) async fn process_tool_result(
-    ctx: &mut ToolResultCtx<'_, '_>,
-    call: &LlmToolCall,
-    turn_cwd: &str,
-    name: &str,
-    input: &str,
-    outcome: ToolOutcome,
-    elapsed: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let console: &Console = ctx.console;
-    let state: &mut ToolState = ctx.state;
-    let messages: &mut Vec<ChatMessage> = ctx.messages;
-    let session: &mut Option<&mut Session> = ctx.session;
-    let persisted_cursor: &mut usize = ctx.persisted_cursor;
-    let last_tools: &mut Vec<String> = ctx.last_tools;
-    let ledger: &mut TokenLedger = ctx.ledger;
-    let cache_key = format!(
-        "{}:{}:{}{}",
-        turn_cwd,
-        name,
-        input,
-        cache_fingerprint(name, input)
-    );
-    let succeeded = outcome.ok;
-    // Captured before `outcome.text` is moved below: the
-    // pre-mutation unified diff for write/edit results.
-    let diff = outcome.diff.clone();
-    // Occurrences counted AFTER the push: when the ring is full
-    // the evicted front entry may itself be a match, so a
-    // pre-push count over-counts by one and can trip the
-    // `>= 3` guard a call early (regression:
-    // repeated_tool_guard_counts_after_ring_eviction). The
-    // filter borrows `cache_key`; that borrow ends before the
-    // `state.insert` move below.
-    if succeeded {
-        if last_tools.len() >= 6 {
-            last_tools.remove(0);
-        }
-        last_tools.push(cache_key.clone());
-    }
-    let repeated_count = last_tools.iter().filter(|k| **k == cache_key).count();
-    // No `ToolInput` here: the start of the call was already announced by
-    // `note_tool_start` when execution began (serial and parallel paths),
-    // so the block is open long before this completion line lands.
-
-    let cacheable = matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls");
-    let mut cache_hit = false;
-    let mut ok = succeeded;
-    let result = if repeated_count >= 3 {
-        ok = false;
-        "Error: repeated identical tool call; choose a different action or finish.".to_string()
-    } else if cacheable && succeeded {
-        if let Some(cached) = state.cache.get(&cache_key) {
-            cache_hit = true;
-            cached.clone()
-        } else {
-            state.insert(cache_key, outcome.text.clone());
-            outcome.text
-        }
-    } else {
-        if matches!(name, "write" | "edit") {
-            state.clear();
-        }
-        outcome.text
-    };
-    note_sink(
-        console,
-        || {
-            let mut summary = tool_result_summary(name, input, &result, ok, diff.as_deref());
-            if cache_hit {
-                summary = format!("cached · {summary}");
-            }
-            let counts_only = matches!(name, "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls");
-            let skip_first = !counts_only || !ok;
-            let preview = tool_preview(name, ok, diff.as_deref(), &result, skip_first);
-            SinkLine::ToolOutput {
-                // Pairs with the `ToolInput` announced at execution start:
-                // UIs match by id so parallel-batch outputs land on their
-                // own open block instead of the transcript tail.
-                id: call.id.clone(),
-                name: name.to_string(),
-                summary,
-                success: ok,
-                preview,
-                duration: elapsed.as_secs_f64(),
-            }
-        },
-        || {
-            let body = tool_preview_body(name, ok, diff.as_deref(), &result);
-            format!(
-                "{}[tool output] {}:\n{}{}",
-                TOOL_OUTPUT_COLOR, name, body, RESET
-            )
-        },
-    )
-    .await;
-    // The tool result lands before any system note so the transcript
-    // stays assistant → tool_result → note.
-    let mut result_message = ChatMessage::tool_result(call.id.clone(), model_tool_result(&result));
-    // Internal-only metadata (`chat_completions_messages` strips `name`
-    // from the wire): lets the transcript label which tool produced the
-    // result.
-    result_message.name = Some(name.to_string());
-    messages.push(result_message);
-    ledger.push(messages.last().expect("just pushed"));
-    persist_pending(session, messages, persisted_cursor)?;
-    Ok(())
 }

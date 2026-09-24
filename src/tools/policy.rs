@@ -1,28 +1,6 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ToolMetadata {
-    pub read_only: bool,
-    pub mutating: bool,
-    pub idempotent: bool,
-    pub requires_shell: bool,
-    pub permission: PermissionRequirement,
-}
+use dex_coding_agent::{native_tool_metadata, needs_approval};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PermissionRequirement {
-    Read,
-    Write,
-    Shell,
-}
-
-/// One row shared by the six tools that neither mutate nor shell out:
-/// `read`, `ls`, and the in-process fff tools (`grep`/`ffgrep`/`find`/`fffind`).
-const READONLY: ToolMetadata = ToolMetadata {
-    read_only: true,
-    mutating: false,
-    idempotent: true,
-    requires_shell: false,
-    permission: PermissionRequirement::Read,
-};
+pub(crate) use dex_coding_agent::{PermissionRequirement, ToolMetadata};
 
 pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
     if crate::extensions::is_shadowed(name) {
@@ -44,22 +22,10 @@ pub(crate) fn metadata(name: &str) -> Option<ToolMetadata> {
 /// — re-reading the shadow's row here would prompt twice for one wrapped
 /// call in `ask` mode.
 pub(crate) fn metadata_native(name: &str) -> Option<ToolMetadata> {
+    if let Some(metadata) = native_tool_metadata(name) {
+        return Some(metadata);
+    }
     Some(match name {
-        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => READONLY,
-        "bash" => ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        },
-        "write" | "edit" => ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: false,
-            permission: PermissionRequirement::Write,
-        },
         // Extension tools are untrusted third-party code in a sandbox:
         // most restrictive gate (`ask` unless trusted), same as shell/MCP.
         // Resolved dynamically so loaded extensions don't need a static
@@ -129,11 +95,7 @@ pub(crate) async fn enforce_policy(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
 ) -> Result<(), ToolError> {
-    let needs_approval = !matches!(
-        (requirement, policy.mode),
-        (PermissionRequirement::Read, _) | (_, PermissionMode::Trusted)
-    );
-    if !needs_approval {
+    if !needs_approval(requirement, policy.mode) {
         return Ok(());
     }
     if policy.mode == PermissionMode::ReadOnly {
