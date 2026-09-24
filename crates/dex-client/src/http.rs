@@ -11,6 +11,20 @@ use crate::protocol::{
 use super::runtime::{block_on, shared_async_client, shared_streaming_client};
 pub use super::sse::ChatStream;
 
+/// Flatten an error's `source()` chain into one message. `to_string()` alone
+/// drops the root cause (e.g. hyper/timeout detail under a reqwest wrapper),
+/// so warnings and surfaced errors walk the chain like `anyhow` would.
+fn error_chain_message(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 /// Per-request overrides forwarded to the daemon with a chat turn.
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
@@ -168,6 +182,9 @@ impl DaemonClient {
         Ok(info)
     }
 
+    /// Blocking wrapper. Test-only in the app: the TUI and one-shot CLI drive
+    /// `get_config_async` on the shared runtime, and the app-side e2e reaches
+    /// this sync form through `Deref`.
     pub fn get_config(&self) -> Result<DaemonInfo, Box<dyn std::error::Error>> {
         block_on(self.get_config_async())
     }
@@ -255,6 +272,8 @@ impl DaemonClient {
         Ok(info)
     }
 
+    /// Blocking wrapper. Test-only in the app: the footer polls
+    /// `get_git_async`; the app-side e2e reaches this sync form through `Deref`.
     pub fn get_git(&self) -> Result<GitInfo, Box<dyn std::error::Error>> {
         block_on(self.get_git_async()).map_err(|e| -> Box<dyn std::error::Error> { e })
     }
@@ -406,7 +425,10 @@ impl DaemonClient {
                 let request_id = request_id.clone();
                 let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
                 if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
-                    (self.warning)(&format!("daemon approval delivery failed: {e}"));
+                    (self.warning)(&format!(
+                        "daemon approval delivery failed: {}",
+                        error_chain_message(e.as_ref())
+                    ));
                 }
                 continue;
             }
@@ -452,6 +474,9 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Blocking wrapper. Test-only in the app: live clients answer approvals
+    /// through the `chat`/`chat_stream` callbacks or `approve_async`; the
+    /// app-side e2e reaches this sync form through `Deref`.
     pub fn approve(
         &self,
         session_id: &str,
@@ -643,6 +668,8 @@ impl DaemonClient {
         Ok(resp["trace"].as_array().cloned().unwrap_or_default())
     }
 
+    /// Blocking wrapper. Test-only: the UI never renders the raw trace rows;
+    /// the app-side e2e reaches this sync form through `Deref`.
     pub fn trace(
         &self,
         session_id: &str,

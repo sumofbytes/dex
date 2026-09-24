@@ -11,7 +11,7 @@ pub struct DaemonClient(dex_client::DaemonClient);
 
 impl DaemonClient {
     pub fn new(base_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::with_token(base_url, crate::auth::client_daemon_token())
+        Self::with_token(base_url, dex_client::client_daemon_token())
     }
 
     pub fn with_token(

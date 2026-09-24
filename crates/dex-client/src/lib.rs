@@ -4,7 +4,7 @@
 //! defaults. Applications can use `DaemonClient::with_token` when they own
 //! credential lookup themselves.
 
-mod auth;
+pub mod auth;
 pub mod http;
 pub mod protocol {
     pub use dex_protocol::*;
@@ -12,4 +12,5 @@ pub mod protocol {
 pub mod runtime;
 pub mod sse;
 
+pub use auth::client_daemon_token;
 pub use http::{ChatOptions, DaemonClient};
