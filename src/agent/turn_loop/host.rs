@@ -16,7 +16,9 @@ use crate::protocol::{ChatMessage, ModelEvent, QueueMsg, SinkLine, StopReason};
 use crate::runtime::console::{Console, RESET, TOOL_OUTPUT_COLOR};
 use crate::session::Session;
 use crate::tools::{Policy, ToolFilter};
-use dex_agent_core::{AgentHost, AgentTurnError, CompactionBudget, ToolRoundOutcome};
+use dex_agent_core::{
+    tool_budget_exhausted_note, AgentHost, AgentTurnError, CompactionBudget, ToolRoundOutcome,
+};
 
 async fn forward_model_events(
     mut events: mpsc::Receiver<ModelEvent>,
@@ -94,7 +96,6 @@ async fn compaction_gate(
                 continue;
             }
             Ok((false, _)) => break,
-            Err(e) if e.contains("cancelled") => return Err(e.into()),
             Err(e) => return Err(e.into()),
         }
     }
@@ -298,10 +299,8 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
     ) -> Result<(), AgentTurnError> {
         match outcome {
             ToolRoundOutcome::Exhausted { completed, .. } => {
-                let note = format!(
-                    "turn budget exhausted after {completed} tool rounds; partial progress preserved — send another prompt to continue"
-                );
-                messages.push(ChatMessage::user_named(note, "budget"));
+                let note = tool_budget_exhausted_note(completed);
+                messages.push(ChatMessage::user_named(&note, "budget"));
                 ledger.push(messages.last().expect("just pushed"));
                 let _ = persist_pending(&mut self.session, messages, &mut self.persisted_cursor);
                 return Ok(());

@@ -35,6 +35,15 @@ pub enum ToolRoundOutcome {
     Exhausted { completed: usize, limit: usize },
 }
 
+/// Wording shared by the transcript marker and the returned error when a
+/// turn's tool-round budget is exhausted (host pushes the marker, the engine
+/// returns the error — one source so they can't drift).
+pub fn tool_budget_exhausted_note(completed: usize) -> String {
+    format!(
+        "turn budget exhausted after {completed} tool rounds; partial progress preserved — send another prompt to continue"
+    )
+}
+
 /// Counts completed tool batches and emits a single near-limit warning.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolRoundBudget {

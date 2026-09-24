@@ -12,7 +12,9 @@ mod text;
 mod tokens;
 mod turn;
 
-pub use budgets::{CompactionBudget, ToolRoundBudget, ToolRoundOutcome};
+pub use budgets::{
+    tool_budget_exhausted_note, CompactionBudget, ToolRoundBudget, ToolRoundOutcome,
+};
 pub use compaction::{
     attach_file_section, deterministic_summary, extract_file_ops_from_message, FileOps,
 };
