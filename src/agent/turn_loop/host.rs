@@ -3,9 +3,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::tool_results::prepare_tool_result;
 use super::tools::{
     emergency_compact, inject_steering, is_context_overflow, note_sink, persist_pending,
-    process_tool_result, record_usage, rewrite_session, run_tool_batch, system_note, ToolResultCtx,
+    record_usage, rewrite_session, run_tool_batch, system_note,
 };
 use crate::agent::compaction::verbatim::summary_mode;
 use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
@@ -13,6 +14,9 @@ use crate::agent::state::{CancellationSource, ToolState};
 use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
 use crate::llm::config::LlmConfig;
 use crate::protocol::{ChatMessage, ModelEvent, QueueMsg, SinkLine, StopReason};
+use crate::render::format::{
+    model_tool_result, tool_preview, tool_preview_body, tool_result_summary,
+};
 use crate::runtime::console::{Console, RESET, TOOL_OUTPUT_COLOR};
 use crate::session::Session;
 use crate::tools::{Policy, ToolFilter};
@@ -276,17 +280,66 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut ctx = ToolResultCtx {
-            console: self.console,
-            state: self.state,
-            messages,
-            session: &mut self.session,
-            persisted_cursor: &mut self.persisted_cursor,
-            last_tools: &mut self.last_tools,
-            ledger,
-        };
         for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
-            process_tool_result(&mut ctx, call, &turn_cwd, &name, &input, outcome, elapsed).await?;
+            let result = prepare_tool_result(
+                self.state,
+                &mut self.last_tools,
+                &turn_cwd,
+                &name,
+                &input,
+                outcome,
+            );
+            let succeeded = result.ok;
+            note_sink(
+                self.console,
+                || {
+                    let mut summary = tool_result_summary(
+                        &name,
+                        &input,
+                        &result.text,
+                        succeeded,
+                        result.diff.as_deref(),
+                    );
+                    if result.cache_hit {
+                        summary = format!("cached · {summary}");
+                    }
+                    let counts_only = matches!(
+                        name.as_str(),
+                        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls"
+                    );
+                    let preview = tool_preview(
+                        &name,
+                        succeeded,
+                        result.diff.as_deref(),
+                        &result.text,
+                        !counts_only || !succeeded,
+                    );
+                    SinkLine::ToolOutput {
+                        id: call.id.clone(),
+                        name: name.clone(),
+                        summary,
+                        success: succeeded,
+                        preview,
+                        duration: elapsed.as_secs_f64(),
+                    }
+                },
+                || {
+                    let body =
+                        tool_preview_body(&name, succeeded, result.diff.as_deref(), &result.text);
+                    format!(
+                        "{}[tool output] {}:\n{}{}",
+                        TOOL_OUTPUT_COLOR, name, body, RESET
+                    )
+                },
+            )
+            .await;
+
+            let mut result_message =
+                ChatMessage::tool_result(call.id.clone(), model_tool_result(&result.text));
+            result_message.name = Some(name);
+            messages.push(result_message);
+            ledger.push(messages.last().expect("just pushed"));
+            persist_pending(&mut self.session, messages, &mut self.persisted_cursor)?;
         }
         Ok(())
     }

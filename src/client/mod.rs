@@ -1,10 +1,8 @@
-//! Reusable daemon client library: `DaemonClient` speaks the full daemon
-//! HTTP+SSE protocol (sessions, chat streaming, approvals, steering, shell)
-//! and is the seam any custom UI builds on — the built-in TUI uses exactly
-//! this surface. Wire types live in [`crate::protocol`].
+//! Compatibility exports for the standalone HTTP/SSE daemon client crate.
 
 pub mod http;
-pub(crate) mod runtime;
-pub(crate) mod sse;
-
+pub use dex_client::{protocol, runtime, sse};
 pub use http::{ChatOptions, DaemonClient};
+
+#[cfg(test)]
+mod e2e_tests;

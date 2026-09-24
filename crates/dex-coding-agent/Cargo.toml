@@ -1,0 +1,12 @@
+[package]
+name = "dex-coding-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Coding-agent tool definitions and schema composition for dex"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sumofbytes/dex"
+
+[dependencies]
+dex-ai = { version = "0.1.0", path = "../dex-ai" }
+dex-agent-core = { version = "0.1.0", path = "../dex-agent-core" }
+serde_json = "1"
