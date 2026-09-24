@@ -79,11 +79,13 @@ impl ToolState {
         state
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, key: String, value: String) {
         self.cache.insert(key, value);
         self.dirty = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         if !self.cache.is_empty() {
             self.cache.clear();

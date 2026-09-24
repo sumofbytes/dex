@@ -18,6 +18,8 @@ Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX
 - `crates/dex-protocol/` — standalone shared HTTP/SSE wire types used by dex clients and daemons; `src/protocol/` re-exports it for internal compatibility and keeps app-domain types private.
 - `crates/dex-ai/` — provider-neutral model/message API, wire mapping, SSE parsers, and reusable HTTP auth/retry policy. Model discovery/configuration, credential refresh, and UI streaming remain app-owned in `src/llm/`.
 - `crates/dex-agent-core/` — reusable permission/agent modes, plans, token accounting, deterministic compaction, context/tool-round budget policies, text limits, normalized model-response history transition, and generic model/tool turn engine (`AgentHost` boundary). Dex implements app integrations in `src/agent/turn_loop/host.rs`.
+- `crates/dex-coding-agent/` — coding-agent built-in tool catalog and deterministic schema composition, native permission metadata, and host-independent tool-result cache/repeat-call policy. Dex supplies dynamic MCP/extension schemas, tool execution, rendering, and cache persistence.
+- `crates/dex-client/` — standalone HTTP/SSE daemon client over `dex-protocol`; `src/client/` re-exports it for in-repo compatibility. It owns its runtime/HTTP defaults and optional local token lookup, with `with_token` for embedding hosts.
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
 - `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Doctor`/`Update`/`Mcp`/`Extensions`/`Usage`/`Help`/`Version`)
 - `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
