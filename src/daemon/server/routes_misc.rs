@@ -134,30 +134,27 @@ async fn cached_git_context_async(cwd: &str) -> (Option<String>, bool) {
     (branch, dirty)
 }
 
-impl DaemonInfo {
-    /// `/api/config` shape when the daemon has no usable config yet:
-    /// empty model list and an empty provider name (no built-in default —
-    /// display-only, see `display_config`). The live-config arm overwrites
-    /// the derived fields on top of this.
-    fn default_for(
-        cwd: String,
-        git_branch: Option<String>,
-        git_dirty: bool,
-        permission: String,
-    ) -> Self {
-        Self {
-            provider: String::new(),
-            model: "unknown".to_string(),
-            api: "openai-responses".to_string(),
-            available_models: Vec::new(),
-            context_window: 128_000,
-            permission,
-            cwd,
-            git_branch,
-            git_dirty,
-            thinking_effort: None,
-            thinking_warning: None,
-        }
+/// `/api/config` shape when the daemon has no usable config yet: empty model
+/// list and provider name (no built-in default — display-only, see
+/// `display_config`). The live-config arm overwrites the derived fields.
+fn default_daemon_info(
+    cwd: String,
+    git_branch: Option<String>,
+    git_dirty: bool,
+    permission: String,
+) -> DaemonInfo {
+    DaemonInfo {
+        provider: String::new(),
+        model: "unknown".to_string(),
+        api: "openai-responses".to_string(),
+        available_models: Vec::new(),
+        context_window: 128_000,
+        permission,
+        cwd,
+        git_branch,
+        git_dirty,
+        thinking_effort: None,
+        thinking_warning: None,
     }
 }
 
@@ -174,7 +171,7 @@ async fn resolve_daemon_info_async(ceiling: crate::protocol::PermissionMode) -> 
     match config {
         Ok(config) => {
             let mut info =
-                DaemonInfo::default_for(cwd, git_branch, git_dirty, ceiling.as_str().to_string());
+                default_daemon_info(cwd, git_branch, git_dirty, ceiling.as_str().to_string());
             info.thinking_warning = config.thinking_mismatch_warning();
             info.provider = config.provider.name().to_string();
             info.api = config.api.name().to_string();
@@ -188,7 +185,7 @@ async fn resolve_daemon_info_async(ceiling: crate::protocol::PermissionMode) -> 
             // Config is incomplete (e.g. no API key yet); report what we can
             // so the client still renders. The ceiling is the daemon's own
             // resolved value, not a fresh env read (§3.1).
-            DaemonInfo::default_for(cwd, git_branch, git_dirty, ceiling.as_str().to_string())
+            default_daemon_info(cwd, git_branch, git_dirty, ceiling.as_str().to_string())
         }
     }
 }

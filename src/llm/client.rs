@@ -9,36 +9,21 @@ use crate::llm::http::{
     backoff_delay, error_chain_message, is_cancelled_message, is_rate_limited, merged_headers,
     post_with_retry, HttpCall,
 };
-use crate::llm::protocol::{
-    chat_completions_messages, responses_input, responses_tools, tools_schema,
-};
+use crate::llm::protocol::{chat_completions_messages, responses_input, responses_tools};
 use crate::llm::transport::sse::{read_anthropic_stream, read_responses_stream, read_stream, Turn};
-use crate::protocol::{ChatCompletionsRequest, ChatMessage, SinkLine, StreamOptions};
+use crate::protocol::{ChatCompletionsRequest, ChatMessage, ModelEvent, StreamOptions};
 use crate::runtime::console::with_console;
-
-/// Agent-loop model seam: `process_turn` is generic over this so tests run
-/// deterministic doubles; the single production impl is `LlmConfig` (via
-/// `dispatch::complete`). New provider behavior lands in the [`WireProtocol`]
-/// impls below, not behind this trait.
-pub(crate) trait ModelClient: Clone + Send + Sync {
-    async fn complete(
-        &self,
-        messages: &[ChatMessage],
-        with_tools: bool,
-        sink: Option<mpsc::Sender<SinkLine>>,
-        cancel: &(dyn CancellationSource + Send + Sync),
-    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>>;
-}
+pub(crate) use dex_ai::ModelClient;
 
 impl ModelClient for LlmConfig {
     async fn complete(
         &self,
         messages: &[ChatMessage],
-        with_tools: bool,
-        sink: Option<mpsc::Sender<SinkLine>>,
+        tools: &[crate::protocol::ToolDefinition],
+        sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-        crate::llm::dispatch::complete(self, messages, with_tools, sink, cancel)
+        crate::llm::dispatch::complete(self, messages, tools, sink, cancel)
             .await
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(error_chain_message(&*e)))
     }
@@ -85,8 +70,8 @@ pub(crate) trait WireProtocol {
         &self,
         call: &HttpCall,
         messages: &[ChatMessage],
-        with_tools: bool,
-        sink: Option<mpsc::Sender<SinkLine>>,
+        tools: &[crate::protocol::ToolDefinition],
+        sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>>;
 }
@@ -99,18 +84,14 @@ impl WireProtocol for ChatCompletions {
         &self,
         call: &HttpCall,
         messages: &[ChatMessage],
-        with_tools: bool,
-        sink: Option<mpsc::Sender<SinkLine>>,
+        tools: &[crate::protocol::ToolDefinition],
+        sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let req = ChatCompletionsRequest {
             model: &call.model,
             messages: chat_completions_messages(messages),
-            tools: if with_tools {
-                tools_schema()
-            } else {
-                Vec::new()
-            },
+            tools: tools.to_vec(),
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -138,8 +119,8 @@ impl WireProtocol for Responses {
         &self,
         call: &HttpCall,
         messages: &[ChatMessage],
-        with_tools: bool,
-        sink: Option<mpsc::Sender<SinkLine>>,
+        tools: &[crate::protocol::ToolDefinition],
+        sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let (instructions, input) = responses_input(messages);
@@ -156,8 +137,8 @@ impl WireProtocol for Responses {
         if let Some(instructions) = instructions {
             body["instructions"] = json!(instructions);
         }
-        if with_tools {
-            body["tools"] = json!(responses_tools());
+        if !tools.is_empty() {
+            body["tools"] = json!(responses_tools(tools));
         }
         if let Some(effort) = &call.thinking_effort {
             body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
@@ -183,15 +164,15 @@ impl WireProtocol for AnthropicMessages {
         &self,
         call: &HttpCall,
         messages: &[ChatMessage],
-        with_tools: bool,
-        sink: Option<mpsc::Sender<SinkLine>>,
+        tools: &[crate::protocol::ToolDefinition],
+        sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
         let body = crate::llm::anthropic::messages_body(
             &call.model,
             call.thinking_effort.as_deref(),
             messages,
-            with_tools,
+            tools,
         );
         // Anthropic can report rate limits as a terminal `error` event on a
         // 200 body (no HTTP status to trigger `post_with_retry`), so a
@@ -228,12 +209,12 @@ impl WireProtocol for AnthropicMessages {
 async fn run_streaming_call(
     call: &HttpCall,
     body: &impl serde::Serialize,
-    sink: Option<mpsc::Sender<SinkLine>>,
+    sink: Option<mpsc::Sender<ModelEvent>>,
     cancel: &(dyn CancellationSource + Send + Sync),
     stream_rate_limit_retries: u32,
     read: impl for<'a> Fn(
         reqwest::Response,
-        Option<mpsc::Sender<SinkLine>>,
+        Option<mpsc::Sender<ModelEvent>>,
         &'a (dyn CancellationSource + Send + Sync),
         Option<Duration>,
     ) -> std::pin::Pin<
@@ -311,7 +292,7 @@ fn should_retry_dropped(err: &(dyn std::error::Error + 'static), attempt: u32) -
 
 /// Visible retry notice: headless logs to stderr, TUI gets a transcript
 /// `System` line (console IO is suppressed under a sink).
-async fn note_idle_retry(sink: &Option<mpsc::Sender<SinkLine>>, attempt: u32, message: &str) {
+async fn note_idle_retry(sink: &Option<mpsc::Sender<ModelEvent>>, attempt: u32, message: &str) {
     let delay = backoff_delay(attempt, None);
     with_console(sink.is_some(), || {
         eprintln!(
@@ -323,7 +304,7 @@ async fn note_idle_retry(sink: &Option<mpsc::Sender<SinkLine>>, attempt: u32, me
     });
     if let Some(sink) = sink {
         let _ = sink
-            .send(SinkLine::System(format!(
+            .send(ModelEvent::System(format!(
                 "stream interrupted ({message}); retrying automatically (attempt {}/{})",
                 attempt + 2,
                 MAX_IDLE_STREAM_RETRIES + 1,
@@ -359,8 +340,8 @@ mod tests {
         async fn complete(
             &self,
             _messages: &[ChatMessage],
-            _with_tools: bool,
-            _sink: Option<mpsc::Sender<SinkLine>>,
+            _tools: &[crate::protocol::ToolDefinition],
+            _sink: Option<mpsc::Sender<ModelEvent>>,
             _cancel: &(dyn CancellationSource + Send + Sync),
         ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Turn {
@@ -570,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn model_boundary_supports_deterministic_mock() {
         let turn = MockModel
-            .complete(&[], false, None, &crate::agent::state::GlobalCancellation)
+            .complete(&[], &[], None, &crate::agent::state::GlobalCancellation)
             .await
             .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("mock response"));

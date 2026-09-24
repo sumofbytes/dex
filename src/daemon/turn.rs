@@ -355,7 +355,7 @@ pub(crate) async fn run_turn_inner(
     if let Some(req_perm) = derived_perm.or_else(|| {
         req.permission
             .as_deref()
-            .and_then(|s| crate::protocol::PermissionMode::parse(s).ok())
+            .and_then(|s| crate::protocol::parse_permission_mode(s).ok())
     }) {
         if req_perm.permissiveness() > daemon_perm.permissiveness() {
             return Err(format!(
@@ -385,7 +385,7 @@ pub(crate) async fn run_turn_inner(
         None => req
             .permission
             .as_deref()
-            .map(crate::protocol::PermissionMode::parse)
+            .map(crate::protocol::parse_permission_mode)
             .transpose()?,
     };
     let mut config = LlmConfig::from_env_async(

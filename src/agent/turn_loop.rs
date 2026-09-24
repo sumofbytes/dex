@@ -1,20 +1,27 @@
-//! Agent turn state machine (`process_turn`/`AgentRuntime`): owns the model↔tool loop.
-//! Boundary: `daemon::turn` is the HTTP handler (auth, idempotency, SSE emit) and calls into here; no HTTP here.
+//! Dex turn lifecycle wrapper and host adapter setup for `dex-agent-core`.
+//! `daemon::turn` handles HTTP/auth/idempotency/SSE and calls `process_turn`; no HTTP here.
 
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::agent::compaction::verbatim::summary_mode;
-use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
-use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
-use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
+use crate::agent::state::{CancellationSource, ToolState};
 use crate::llm::client::ModelClient;
 use crate::llm::config::LlmConfig;
+#[cfg(test)]
 use crate::llm::transport::sse::Turn;
-use crate::protocol::{ChatMessage, QueueMsg, Role, SinkLine, StopReason};
-use crate::runtime::console::{Console, SpinnerGuard, RESET, TOOL_OUTPUT_COLOR};
+#[cfg(test)]
+use crate::protocol::Role;
+use crate::protocol::{ChatMessage, QueueMsg};
+#[cfg(test)]
+use crate::protocol::{ModelEvent, SinkLine};
+use crate::runtime::console::{Console, SpinnerGuard};
 use crate::session::Session;
-use crate::tools::{Policy, ToolFilter};
+use crate::tools::Policy;
+use crate::tools::ToolFilter;
+#[cfg(test)]
+use tools::record_usage;
+#[cfg(test)]
+use tools::{is_context_overflow, run_tool_batch};
 
 /// The per-agent capability bundle for [`process_turn`] (Phase 2 runtime
 /// extraction; plan §8). One loop serves main agent and children — the
@@ -51,7 +58,7 @@ pub(crate) struct AgentRuntime<'a, C, X> {
 ///
 /// # Drain points (the steering contract)
 ///
-/// Queued messages are drained only at two points in `process_turn_inner`,
+/// Queued messages are drained only at two points in the agent engine,
 /// both *before a model call* — never mid-batch, never between a tool call
 /// and its result:
 ///
@@ -73,70 +80,6 @@ pub(crate) fn apply_queue_msg(pending: &mut Vec<String>, msg: QueueMsg) {
             }
         }
     }
-}
-
-/// Proactive compaction gate, run before every model call: compact while
-/// the stored context exceeds the token threshold or the message-count cap,
-/// at most three attempts.
-/// The budget is re-derived from the ledger after every cut: re-checking a
-/// stale pre-cut number forces up to three compactions even when the first
-/// already fit. The gate reads the stored history, not a projection: it
-/// guards the window AND the journal, so the stored history can't grow
-/// unbounded while the gate defers.
-#[allow(clippy::too_many_arguments)]
-async fn compaction_gate(
-    config: &LlmConfig,
-    console: &Console,
-    messages: &mut Vec<ChatMessage>,
-    // Ephemeral + schema overhead for this iteration (call-time preamble +
-    // tool schemas, never stored): the gate adds the ledger's stored total
-    // fresh each attempt.
-    budget_overhead: u64,
-    cancel: &(dyn CancellationSource + Send + Sync),
-    mut session: Option<&mut Session>,
-    persisted_cursor: &mut usize,
-    state: &mut ToolState,
-    ledger: &mut TokenLedger,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut compaction_attempts = 0;
-    while compaction_attempts < 3 {
-        let eff = ledger.stored_tokens() + budget_overhead;
-        let need_by_tokens = eff > config.compaction_threshold();
-        let need_by_count = messages.len() > 1 + KEEP_RECENT_MESSAGES;
-        if !need_by_tokens && !need_by_count {
-            break;
-        }
-        // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
-        // one parse selects both the prune and the fallback summarizer.
-        let summarizer = summary_mode();
-        match compact_history(
-            config,
-            messages,
-            cancel,
-            false,
-            summarizer.prunes_jev(),
-            summarizer,
-        )
-        .await
-        {
-            Ok((true, compacted)) => {
-                compaction_attempts += 1;
-                // History was rewritten: re-measure once for the next attempt.
-                *ledger = TokenLedger::rebuild(messages);
-                // Summarizer calls are billed like any other; account
-                // them so the status-bar spend includes compaction.
-                if let Some(u) = compacted {
-                    record_usage(config, state, console, u, None).await;
-                }
-                rewrite_session(session.as_deref_mut(), messages, persisted_cursor)?;
-                continue;
-            }
-            Ok((false, _)) => break,
-            Err(e) if e.contains("cancelled") => return Err(e.into()),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
 }
 
 pub(crate) async fn process_turn<C, X>(
@@ -226,7 +169,7 @@ where
         agent_ctx,
         tool_budget,
     } = rt;
-    let result = process_turn_inner(ProcessTurnArgs {
+    let result = run_agent_engine(DexHostSetup {
         config,
         messages: &mut *messages,
         state,
@@ -257,11 +200,9 @@ where
     result
 }
 
-/// The unbundled runtime `process_turn_inner` works on: same fields as
-/// [`AgentRuntime`], destructured once in `process_turn` so the turn wrapper
-/// keeps mutable access to `messages` after the call (lifecycle-hook
-/// restoration).
-struct ProcessTurnArgs<'a, C, X> {
+/// Dex host construction inputs, kept bundled while the lifecycle wrapper
+/// retains its mutable access to history for restoring the prompt appendix.
+struct DexHostSetup<'a, C, X> {
     config: &'a LlmConfig,
     messages: &'a mut Vec<ChatMessage>,
     state: &'a mut ToolState,
@@ -277,310 +218,53 @@ struct ProcessTurnArgs<'a, C, X> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_turn_inner<C, X>(
-    ProcessTurnArgs {
+async fn run_agent_engine<C, X>(
+    DexHostSetup {
         config,
         messages,
         state,
-        mut steering_rx,
+        steering_rx,
         steering_accepted_tx,
-        mut session,
+        session,
         client,
         cancel,
         console,
         filter,
         agent_ctx,
         tool_budget,
-    }: ProcessTurnArgs<'_, C, X>,
+    }: DexHostSetup<'_, C, X>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
 where
     C: ModelClient + 'static,
     X: CancellationSource + Clone + 'static,
 {
     let _working = SpinnerGuard::start(console, "Working");
-    let mut last_tools: Vec<String> = Vec::new();
-    let mut last_usage: Option<u64> = state.last_usage;
-    let cancellation = cancel;
-    let mut persisted_cursor = messages.len();
-    let tool_budget = tool_budget.unwrap_or_else(max_tool_iterations);
-    let mut tool_iterations = 0usize;
-    // One context-overflow retry per turn: after an emergency compaction the
-    // model call is re-issued exactly once; a second overflow is a real
-    // failure (single message too large), not something more slicing fixes.
-    let mut overflow_retried = false;
-    let mut budget_warned = false;
-    // Phase 0 gate context: every tool call this turn runs under the
-    // turn's permission mode + approval channel. One policy for the whole
-    // turn so same-turn allow-for-session records are shared. The daemon
-    // context (Phase 5) rides along for the delegation tools.
-    let mut policy = Policy::turn(config.permission, console);
-    policy.agent = agent_ctx;
-    // Running token total over the stored history: one full walk per turn
-    // (here); appended messages update it, compaction rebuilds it. Every
-    // per-iteration budget below reads this instead of re-walking history.
-    let mut ledger = TokenLedger::rebuild(messages);
-
-    loop {
-        persist_pending(&mut session, messages, &mut persisted_cursor)?;
-        if cancellation.is_cancelled() {
-            let _ = cancellation.take_cancelled();
-            return Err("cancelled by user".into());
-        }
-        if let Some(rx) = steering_rx.as_mut() {
-            let injected = inject_steering(rx, steering_accepted_tx, messages).await;
-            if injected {
-                // Steering appends user messages outside the tracked pushes.
-                ledger = TokenLedger::rebuild(messages);
-                persist_pending(&mut session, messages, &mut persisted_cursor)?;
-            }
-        }
-
-        // Proactive compaction BEFORE model call
-        // Ephemeral MCP status line: priced in the budget below but never
-        // stored in `messages` (call-time preamble, not transcript).
-        // Sync snapshot, never initializes the manager: no MCP tools are
-        // in the schema before bootstrap either, so the budget stays exact
-        // and a budget probe never spawns the background refresh.
-        let ephemerals = [crate::mcp::ephemeral_line()];
-        // Stored-budget overhead for the gate: the gate re-derives
-        // ledger + overhead per attempt (see `compaction_gate`).
-        let budget_overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
-        compaction_gate(
-            config,
-            console,
-            messages,
-            budget_overhead,
-            cancellation,
-            session.as_deref_mut(),
-            &mut persisted_cursor,
-            state,
-            &mut ledger,
-        )
-        .await?;
-
-        // Async LLM call with prompt cancel: `select!(cancelled, complete)`
-        // wakes within ~10ms.
-        let cancel_ref: &(dyn CancellationSource + Send + Sync) = cancel;
-        let call_started = std::time::Instant::now();
-        let wire: &[ChatMessage] = messages;
-        let turn: Turn = tokio::select! {
-            _ = wait_cancelled(cancel_ref) => {
-                return Err("cancelled by user".into());
-            }
-            r = client.complete(wire, true, console.sink().cloned(), cancel_ref) => match r {
-                Ok(result) => result,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg == "interrupted" || msg == "cancelled" {
-                        return Err("cancelled by user".into());
-                    }
-                    // The provider rejected the request because the input no
-                    // longer fits: emergency-compact and re-issue once
-                    // instead of failing the whole turn. The proactive
-                    // compaction above runs on an estimate; real provider
-                    // limits (tool schemas, a huge single tool result) can
-                    // still overshoot it.
-                      if !overflow_retried && is_context_overflow(&msg) {
-                          overflow_retried = true;
-                          match emergency_compact(
-                              config,
-                              messages,
-                              state,
-                              cancellation,
-                              console,
-                              &mut ledger,
-                          )
-                          .await
-                          {
-                            Ok(true) => {
-                                rewrite_session(
-                                    session.as_deref_mut(),
-                                    messages,
-                                    &mut persisted_cursor,
-                                )?;
-                                continue;
-                            }
-                            _ => return Err(msg.into()),
-                        }
-                    }
-                    return Err(msg.into());
-                }
-            },
-        };
-        // Whole-call wall clock (connect + first token + stream): the honest
-        // denominator for the footer's output tokens/s rate.
-        let gen_ms = u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Some(u) = turn.usage {
-            last_usage = Some(u.prompt_tokens);
-            record_usage(config, state, console, u, Some(gen_ms)).await;
-        }
-        // The provider cut the reply off mid-generation (output-token limit
-        // or a content filter): whatever landed is likely incomplete. Say so
-        // instead of silently keeping a truncated reply as if it were complete.
-        let truncation = match turn.stop_reason {
-            Some(StopReason::Length) => {
-                Some("model output hit the output-token limit and may be truncated")
-            }
-            Some(StopReason::ContentFilter) => {
-                Some("model output was cut off by a content filter and may be incomplete")
-            }
-            _ => None,
-        };
-        if let Some(note) = truncation {
-            note_sink(
-                console,
-                || SinkLine::System(note.to_string()),
-                || format!("[dex] {note}"),
-            )
-            .await;
-        }
-        let mut message = turn.message;
-
-        if let Some(calls) = message.tool_calls.take() {
-            messages.push(ChatMessage {
-                role: Role::Assistant,
-                content: message.content,
-                tool_calls: Some(calls.clone()),
-                tool_call_id: None,
-                name: None,
-                reasoning_items: message.reasoning_items,
-                reasoning_content: message.reasoning_content,
-            });
-            ledger.push(messages.last().expect("just pushed"));
-
-            let results = run_tool_batch(&calls, cancel, &policy, filter, console).await;
-
-            // Cancel landed during tool IO: the per-tool "cancelled"
-            // errors above are shutdown noise, not model input. Suppress
-            // the fan-out and unwind — the turn was going to abort at the
-            // next loop-top check anyway, and skipping the persist keeps
-            // a transcript the model never saw out of the session.
-            if cancellation.is_cancelled() {
-                let _ = cancellation.take_cancelled();
-                // Every call already announced its start, so close each
-                // open block explicitly — otherwise the TUI spinner (and
-                // any remote transcript) lingers on calls that will never
-                // complete.
-                for call in &calls {
-                    let name = call.function.name.clone();
-                    note_sink(
-                        console,
-                        || SinkLine::ToolOutput {
-                            id: call.id.clone(),
-                            name: name.clone(),
-                            summary: "cancelled by user".to_string(),
-                            success: false,
-                            preview: Vec::new(),
-                            duration: 0.0,
-                        },
-                        || {
-                            format!(
-                                "{}[tool output] {}:\ncancelled by user{}",
-                                TOOL_OUTPUT_COLOR, name, RESET
-                            )
-                        },
-                    )
-                    .await;
-                }
-                return Err("cancelled by user".into());
-            }
-
-            // Hoisted: one getcwd per iteration, not per tool result.
-            let turn_cwd = std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            {
-                let mut ctx = ToolResultCtx {
-                    console,
-                    state: &mut *state,
-                    messages: &mut *messages,
-                    session: &mut session,
-                    persisted_cursor: &mut persisted_cursor,
-                    last_tools: &mut last_tools,
-                    ledger: &mut ledger,
-                };
-                for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
-                    process_tool_result(&mut ctx, call, &turn_cwd, &name, &input, outcome, elapsed)
-                        .await?;
-                }
-            }
-            // Per-turn tool budget: a model that churns without converging
-            // (rephrasing the same failing call, ping-ponging two files)
-            // burns unbounded tokens; the repeated-call detector only stops
-            // bit-identical repeats. The completed batch above is persisted
-            // first, so the transcript stays coherent for the next prompt.
-            // Counts batches (rounds), not individual calls: one fan-out of
-            // N parallel calls is one round.
-            tool_iterations += 1;
-            if tool_iterations >= tool_budget {
-                let note = format!(
-                    "turn budget exhausted after {tool_iterations} tool rounds; partial progress preserved — send another prompt to continue"
-                );
-                // No sink line here: the Err below surfaces the note exactly
-                // once on every surface (`agent error:` headless, TurnFailed
-                // in the daemon transcript and events journal).
-                // Leave a transcript marker so the resume shows why the
-                // turn stopped (User-role + name tag, like steering/summary).
-                messages.push(ChatMessage::user_named(note.clone(), "budget"));
-                ledger.push(messages.last().expect("just pushed"));
-                let _ = persist_pending(&mut session, messages, &mut persisted_cursor);
-                return Err(note.into());
-            }
-            if !budget_warned && tool_iterations * 5 >= tool_budget * 4 {
-                budget_warned = true;
-                let note = format!("{tool_iterations}/{tool_budget} tool rounds used this turn");
-                system_note(console, &note).await;
-            }
-            // Write-through persist (best-effort, tiny JSON): awaited so a
-            // process exit right after the turn can't lose it — a detached
-            // spawn would be dropped on shutdown before it ever ran. Clone
-            // keeps the saved field list compiler-enforced (state.rs disables
-            // dead_code lints, so a hand-written literal could forget one).
-            if state.dirty {
-                state.save_async().await;
-                state.dirty = false;
-            }
-        } else {
-            let text = message.content.unwrap_or_default();
-            messages.push(ChatMessage {
-                role: Role::Assistant,
-                content: Some(text.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                reasoning_items: message.reasoning_items,
-                reasoning_content: message.reasoning_content,
-            });
-            ledger.push(messages.last().expect("just pushed"));
-            if let Some(rx) = steering_rx.as_mut() {
-                let injected = inject_steering(rx, steering_accepted_tx, messages).await;
-                if injected {
-                    state.last_usage = last_usage;
-                    // Steering appended outside the tracked pushes.
-                    ledger = TokenLedger::rebuild(messages);
-                    continue;
-                }
-            }
-            state.last_usage = last_usage;
-            persist_pending(&mut session, messages, &mut persisted_cursor)?;
-            return Ok(text);
-        }
-    }
-    // The `loop` above never breaks — every path returns or continues — so
-    // this expression is unreachable; kept for exhaustiveness (AGT-2), the
-    // failure wording stays documented at the end of the turn pipeline.
-    #[allow(unreachable_code)]
-    Err("turn did not complete after many tool iterations; partial progress preserved.".into())
+    let mut host = host::make_host(
+        config,
+        state,
+        steering_rx,
+        steering_accepted_tx,
+        session,
+        cancel,
+        console,
+        filter,
+        agent_ctx,
+        messages.len(),
+    );
+    dex_agent_core::run_turn(
+        client,
+        cancel,
+        messages,
+        &mut host,
+        tool_budget.unwrap_or_else(max_tool_iterations),
+    )
+    .await
 }
 
+mod host;
 mod tools;
 
-use tools::{
-    emergency_compact, inject_steering, is_context_overflow, max_tool_iterations, note_sink,
-    persist_pending, process_tool_result, record_usage, rewrite_session, run_tool_batch,
-    system_note, ToolResultCtx,
-};
+use tools::max_tool_iterations;
 
 #[cfg(test)]
 pub(crate) mod tests;

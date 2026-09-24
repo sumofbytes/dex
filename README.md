@@ -57,6 +57,32 @@ build, test, and submit changes. Please follow the
 - **No telemetry** — dex makes network calls only to the LLM providers you
   configure (plus `models.dev` for the model catalog). Nothing else.
 
+## Workspace crates
+
+The Cargo workspace contains the `dex` application and three reusable crates.
+They have no dependency on dex's TUI, daemon, session store, or tools. The app
+continues to re-export existing types from `dex::protocol` for source
+compatibility.
+
+- `dex-protocol` owns serializable HTTP/SSE wire types shared by clients and
+  daemons.
+- `dex-ai` owns provider-neutral message and tool types, provider wire mapping,
+  SSE parsers, HTTP auth/retry policy, and the model-client API. Dex still owns
+  model discovery, configuration resolution, credential refresh, UI streaming,
+  and CLI behavior.
+- `dex-agent-core` owns permission/agent modes, plans, token accounting,
+  deterministic compaction, text limits, context compaction and tool-round
+  budget policies, the model-response-to-history transition, and the generic
+  model/tool turn engine. Dex implements the engine's host interface for its
+  compaction backends, tools, sessions, steering, extensions, and UI.
+
+```toml
+[dependencies]
+dex-protocol = { git = "https://github.com/sumofbytes/dex" }
+dex-ai = { git = "https://github.com/sumofbytes/dex" }
+dex-agent-core = { git = "https://github.com/sumofbytes/dex" }
+```
+
 ## Install
 
 Every `v*` tag builds binaries for `x86_64`/`aarch64` Linux (static musl — runs
@@ -827,6 +853,10 @@ Restore strict harness:
 
 ```text
 dex/
+├── crates/
+│   ├── dex-protocol/     # reusable HTTP + SSE wire types
+│   ├── dex-ai/           # model API, provider wiring, shared AI types
+│   └── dex-agent-core/   # reusable agent engine and policies
 ├── .dex/
 │   └── skills/           # (optional) project-level agent skills
 ├── target/
@@ -836,35 +866,38 @@ dex/
 └── src/
     ├── main.rs           # entry point: mode resolution, daemon bootstrap
     ├── cli.rs            # argument parsing / invocation mode
-    ├── protocol/         # client<->daemon wire types (HTTP + SSE events)
+    ├── app/              # client/oneshot entry orchestration
+    ├── protocol/         # compatibility exports + app-specific protocol glue
     ├── client/           # HTTP client: SSE turn streaming, approvals, REPL
     ├── daemon/           # axum daemon: sessions, chat SSE, approve, cancel
-    ├── agent/            # turn loop, steering, compaction, tool state
-    ├── core/             # console sinks, formatting, highlighting, types
-    ├── llm/              # provider clients, streaming parsers, auth, config
-    ├── session.rs        # JSONL session persistence
-    ├── tools/            # builtin tools: read, bash, write, edit, grep, find, ls (fff engine; aliases ffgrep/fffind)
-    ├── mcp.rs + mcp/     # MCP client: stdio/HTTP/SSE servers, OAuth login
-    ├── skills.rs         # skill discovery
-    └── ui.rs + ui/       # ratatui TUI (local event loop + remote client UI)
+    ├── agent/            # lifecycle wrapper, AgentHost adapter, app integrations
+    ├── runtime/          # console sinks, cancellation, logging
+    ├── llm/              # model config, provider resolution, app transport glue
+    ├── session/          # JSONL session persistence and journal
+    ├── tools/            # workspace tools: read, bash, write, edit, grep, find, ls
+    ├── mcp/              # MCP client: stdio/HTTP/SSE servers, OAuth login
+    ├── skills/           # skill discovery and parsing
+    ├── extensions/       # Lua extension engine and host APIs
+    ├── workspace/        # workspace paths and repository context
+    └── ui/               # ratatui local/remote TUI
 ```
 
 ## How it works
 
-A turn runs in `src/agent/loop.rs` (`process_turn`): it repeatedly calls the
-model with tools enabled, executes any requested tool calls in parallel
-(`write`/`edit` on distinct files in parallel; `bash`, any `then_run`, or same
-`path` serializes), feeds results back, and compacts history deterministically
-once `tokens > contextWindow - reserveTokens` (`reserve=16384`,
-`keepRecent=20000` tokens, per-model `contextWindow` from
-catalog/`DEX_CONTEXT_WINDOW`). The optional `DEX_VERIFY` hook is off by default.
-Progress is reported through a `Console` (streamed lines + approval requests).
+A turn enters through dex's `process_turn` lifecycle wrapper and runs the
+model/tool state machine in `dex-agent-core::run_turn`. Dex implements the
+`AgentHost` callbacks for compaction, steering, session writes, tool execution,
+usage accounting, and transcript events. Tool calls may run in parallel
+(`write`/`edit` on distinct files); `bash`, `then_run`, or conflicting paths
+serialize. The host compacts history to keep model requests within the
+configured context budget. Progress is reported through a dex `Console`
+(streamed lines + approval requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and
-translates console output into `StreamEvent`s over SSE (`src/daemon/server.rs`).
-The TUI (`src/ui/remote.rs`) consumes those events from a worker thread and
+translates console output into `StreamEvent`s over SSE (`src/daemon/server/`).
+The TUI (`src/ui/remote/`) consumes those events from a worker thread and
 renders them live; approvals and cancellation are round-tripped over
-`POST .../approve` and `POST .../cancel`. The local TUI (`src/ui/event.rs`) runs
+`POST .../approve` and `POST .../cancel`. The local TUI (`src/ui/app.rs`) runs
 the same loop in-process with direct channels.
 
 ## Acknowledgments

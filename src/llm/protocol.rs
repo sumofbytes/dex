@@ -1,41 +1,20 @@
-use serde_json::{json, Value};
-use std::sync::Arc;
-
-use crate::protocol::{
-    ChatMessage, FunctionCall, FunctionDef, LlmToolCall, Role, StreamToolCall, ToolDefinition,
-    WireMessage,
+use crate::protocol::{FunctionDef, ToolDefinition};
+pub(crate) use dex_ai::wire::{
+    chat_completions_messages, responses_input, responses_tools, wire_tools,
 };
-
-pub(crate) fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
-    while calls.len() <= delta.index {
-        calls.push(LlmToolCall {
-            id: String::new(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: String::new(),
-                arguments: String::new(),
-            },
-        });
-    }
-    let call = &mut calls[delta.index];
-    if let Some(id) = delta.id {
-        call.id = id;
-    }
-    if let Some(function) = delta.function {
-        if let Some(name) = function.name {
-            call.function.name.push_str(&name);
-        }
-        if let Some(arguments) = function.arguments {
-            call.function.arguments.push_str(&arguments);
-        }
-    }
-}
+#[cfg(test)]
+use dex_ai::wire::{merge_chat_tool_call, response_call_index, response_tool_call};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
+use std::sync::Arc;
 
 pub(crate) fn sort_tool_defs_by_name(tail: &mut [ToolDefinition]) {
     tail.sort_by(|a, b| a.function.name.cmp(&b.function.name));
 }
 
-pub(crate) fn sort_wire_tools_by_name(tail: &mut [Value]) {
+#[cfg(test)]
+fn sort_wire_tools_by_name(tail: &mut [Value]) {
     tail.sort_by(|a, b| {
         a.get("name")
             .and_then(Value::as_str)
@@ -224,142 +203,15 @@ fn native_tools() -> Vec<ToolDefinition> {
     tools
 }
 
-/// Chat-completions wire messages: borrowed [`WireMessage`] views, serialized
-/// straight to bytes by reqwest — no `Value` middleman (perf doc §8). `name`
-/// is a local tag (`steering`, `skill`, `summary`, `follow-up`,
-/// `agent-notifications`) that the model never needs and strict
-/// OpenAI-compatible endpoints reject (`messages[i]: "name" is not supported
-/// by this endpoint`). `reasoning_items` are Responses-API blobs the
-/// Responses wire replays inside `input` (and the Anthropic wire filters in
-/// `assistant_blocks`) — as a chat-completions field they would be garbage.
-/// `reasoning_content` stays: it is the model-facing DeepSeek field.
-pub(crate) fn chat_completions_messages(messages: &[ChatMessage]) -> Vec<WireMessage<'_>> {
-    messages.iter().map(ChatMessage::wire).collect()
-}
-
-pub(crate) fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
-    let mut instructions = Vec::new();
-    let mut input = Vec::new();
-    for message in messages {
-        match message.role {
-            Role::System => {
-                if let Some(content) = &message.content {
-                    instructions.push(content.clone());
-                }
-            }
-            Role::Tool => {
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "output": message.content_str(),
-                }));
-            }
-            Role::Assistant => {
-                // Replay the model's own reasoning items first: with store:false
-                // the request is stateless, and the model only keeps its
-                // reasoning thread if we hand it back.
-                input.extend(message.reasoning_items.iter().flatten().cloned());
-                if let Some(content) = &message.content {
-                    if !content.is_empty() {
-                        input.push(json!({ "role": "assistant", "content": content }));
-                    }
-                }
-                for call in message.tool_calls.as_deref().unwrap_or_default() {
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.function.name,
-                        "arguments": call.function.arguments,
-                    }));
-                }
-            }
-            Role::User => {
-                input.push(json!({
-                    "role": "user",
-                    "content": message.content_str(),
-                }));
-            }
-        }
-    }
-    (
-        if instructions.is_empty() {
-            None
-        } else {
-            Some(instructions.join("\n\n"))
-        },
-        input,
-    )
-}
-
-pub(crate) fn responses_tools() -> Vec<Value> {
-    wire_tools(|tool| {
-        json!({
-            "type": "function",
-            "name": tool.function.name,
-            "description": tool.function.description,
-            "parameters": tool.function.parameters,
-        })
-    })
-}
-
-/// Native + MCP + extension schemas mapped to one wire shape: native order
-/// is fixed, the MCP + extension tail is sorted by name so refresh
-/// completion order can't reorder the schema (deterministic bytes;
-/// adding/removing a tool still shifts the tail). Borrowed slices: no
-/// merged-schema copy on the wire path. Shared by the OpenAI
-/// (`responses_tools`) and Anthropic (`anthropic_tools`) wire shapes — the
-/// only difference is the per-tool mapping.
-pub(crate) fn wire_tools(map: impl Fn(&ToolDefinition) -> Value) -> Vec<Value> {
-    let (native, mcp, ext) = tools_schema_parts();
-    let mut out: Vec<Value> = native.iter().map(&map).collect();
-    let mut tail: Vec<Value> = mcp.iter().chain(ext.iter()).map(map).collect();
-    sort_wire_tools_by_name(&mut tail);
-    out.extend(tail);
-    out
-}
-
-pub(crate) fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) {
-    while calls.len() <= index {
-        calls.push(LlmToolCall {
-            id: String::new(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: String::new(),
-                arguments: String::new(),
-            },
-        });
-    }
-    let call = &mut calls[index];
-    if let Some(id) = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(Value::as_str)
-    {
-        call.id = id.to_string();
-    }
-    if let Some(name) = item.get("name").and_then(Value::as_str) {
-        call.function.name = name.to_string();
-    }
-    if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
-        call.function.arguments = arguments.to_string();
-    }
-}
-
-pub(crate) fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Value) -> usize {
-    item.get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(Value::as_str)
-        .and_then(|id| calls.iter().position(|call| call.id == id))
-        .unwrap_or(index)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         chat_completions_messages, merge_chat_tool_call, response_call_index, response_tool_call,
-        responses_input, ChatMessage, FunctionCall, LlmToolCall, StreamToolCall,
+        responses_input,
     };
-    use crate::protocol::StreamFunctionCall;
+    use crate::protocol::{
+        ChatMessage, FunctionCall, LlmToolCall, StreamFunctionCall, StreamToolCall,
+    };
     use serde_json::json;
 
     #[test]
@@ -535,8 +387,9 @@ mod tests {
     fn wire_tools_serialize_deterministically() {
         // Consecutive serializations agree exactly: background MCP/extension
         // refreshes landing between calls must not reorder the schema.
-        let a = super::responses_tools();
-        let b = super::responses_tools();
+        let tools = super::tools_schema();
+        let a = super::responses_tools(&tools);
+        let b = super::responses_tools(&tools);
         assert_eq!(a, b);
         let c = super::tools_schema();
         let d = super::tools_schema();

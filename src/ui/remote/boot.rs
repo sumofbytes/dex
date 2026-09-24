@@ -72,7 +72,8 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         context_window: info.context_window,
         reserve_tokens: 16_384,
         keep_recent_tokens: 20_000,
-        permission: PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask),
+        permission: crate::protocol::parse_permission_mode(&info.permission)
+            .unwrap_or(PermissionMode::Ask),
         verify_command: None,
         extra_headers: Default::default(),
         global_headers: Default::default(),
@@ -261,9 +262,10 @@ pub(crate) fn bootstrap(
     let explicit = args.permission.or_else(|| {
         std::env::var("DEX_PERMISSION")
             .ok()
-            .and_then(|v| PermissionMode::parse(&v).ok())
+            .and_then(|v| crate::protocol::parse_permission_mode(&v).ok())
     });
-    let ceiling = PermissionMode::parse(&info.permission).unwrap_or(PermissionMode::Ask);
+    let ceiling =
+        crate::protocol::parse_permission_mode(&info.permission).unwrap_or(PermissionMode::Ask);
     let mode = seed_mode(explicit, ceiling);
     options.mode = Some(mode.as_str().to_string());
     // `permission` still rides along (derived) so an older daemon that

@@ -4,13 +4,14 @@ use super::parser::ResponsesParser;
 use super::parser::StreamEvent;
 use super::parser::StreamParser;
 use crate::protocol::ChatMessage;
+use crate::protocol::ModelEvent;
 use crate::protocol::Role;
-use crate::protocol::SinkLine;
 use crate::protocol::StopReason;
 use crate::protocol::Usage;
 use crate::render::theme::print_code_block;
 use crate::render::theme::print_markdown_text;
 use crate::runtime::console::with_console;
+use dex_ai::Turn;
 use std::io::{self, Write};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -23,7 +24,7 @@ pub(crate) struct StreamPrinter {
     pub(crate) in_code: bool,
     pub(crate) code_lang: String,
     pub(crate) code_body: String,
-    pub(crate) sink: Option<mpsc::Sender<SinkLine>>,
+    pub(crate) sink: Option<mpsc::Sender<ModelEvent>>,
     /// Headless (no-sink) gap state so plain-terminal output follows the same
     /// blanks-around-blocks rule as the TUI (MD022/MD031/MD032/MD058).
     /// `prev` is the last printed prose line (trimmed-start); `air` mirrors
@@ -34,7 +35,7 @@ pub(crate) struct StreamPrinter {
 }
 
 impl StreamPrinter {
-    pub(crate) fn new(sink: Option<mpsc::Sender<SinkLine>>) -> Self {
+    pub(crate) fn new(sink: Option<mpsc::Sender<ModelEvent>>) -> Self {
         Self {
             in_code: false,
             code_lang: String::new(),
@@ -120,7 +121,7 @@ impl StreamPrinter {
         if trimmed.starts_with("```") {
             if self.in_code {
                 if let Some(sink) = &self.sink {
-                    let _ = sink.try_send(SinkLine::Assistant(format!(
+                    let _ = sink.try_send(ModelEvent::Assistant(format!(
                         "```{}:\n{}\n```",
                         self.code_lang, self.code_body
                     )));
@@ -141,7 +142,7 @@ impl StreamPrinter {
             self.code_body.push('\n');
         } else {
             if let Some(sink) = &self.sink {
-                let _ = sink.try_send(SinkLine::Assistant(line.to_string()));
+                let _ = sink.try_send(ModelEvent::Assistant(line.to_string()));
             } else {
                 self.headless_on_prose(line);
             }
@@ -154,7 +155,7 @@ impl StreamPrinter {
             if self.in_code {
                 if let Some(sink) = &self.sink {
                     let _ = sink
-                        .send(SinkLine::Assistant(format!(
+                        .send(ModelEvent::Assistant(format!(
                             "```{}:\n{}\n```",
                             self.code_lang, self.code_body
                         )))
@@ -175,7 +176,7 @@ impl StreamPrinter {
             self.code_body.push_str(line);
             self.code_body.push('\n');
         } else if let Some(sink) = &self.sink {
-            let _ = sink.send(SinkLine::Assistant(line.to_string())).await;
+            let _ = sink.send(ModelEvent::Assistant(line.to_string())).await;
         } else {
             self.headless_on_prose(line);
         }
@@ -185,7 +186,7 @@ impl StreamPrinter {
         if self.in_code && !self.code_body.is_empty() {
             if let Some(sink) = &self.sink {
                 let _ = sink
-                    .send(SinkLine::Assistant(format!(
+                    .send(ModelEvent::Assistant(format!(
                         "```{}:\n{}\n```",
                         self.code_lang, self.code_body
                     )))
@@ -266,17 +267,6 @@ fn driver_err_transport(
     }
 }
 
-/// One model turn read off the wire: the assembled assistant message, the
-/// last reported usage, and the provider-reported terminal condition (`None`
-/// when the stream ended without one — mid-stream drop, or a provider that
-/// omits `finish_reason`).
-#[derive(Debug)]
-pub(crate) struct Turn {
-    pub(crate) message: ChatMessage,
-    pub(crate) usage: Option<Usage>,
-    pub(crate) stop_reason: Option<StopReason>,
-}
-
 /// Shared SSE driver state: feeds each line to the parser, prints
 /// text/reasoning as it arrives, tracks usage and the terminal condition,
 /// and assembles the final turn. Fails with [`MidStreamError`] once any
@@ -293,7 +283,7 @@ pub(crate) struct SseDriver {
 }
 
 impl SseDriver {
-    pub(crate) fn new(sink: Option<mpsc::Sender<SinkLine>>) -> Self {
+    pub(crate) fn new(sink: Option<mpsc::Sender<ModelEvent>>) -> Self {
         Self {
             content: String::new(),
             pending: String::new(),
@@ -305,7 +295,7 @@ impl SseDriver {
         }
     }
 
-    fn sink(&self) -> Option<&mpsc::Sender<SinkLine>> {
+    fn sink(&self) -> Option<&mpsc::Sender<ModelEvent>> {
         self.printer.sink.as_ref()
     }
 
@@ -355,7 +345,7 @@ impl SseDriver {
                     // session journal. Deliberate — don't narrow this to Text.
                     self.output_flowed = true;
                     if let Some(sink) = self.sink() {
-                        let _ = sink.send(SinkLine::Thinking(thought)).await;
+                        let _ = sink.send(ModelEvent::Thinking(thought)).await;
                     } else {
                         self.print_thinking(&thought);
                     }
@@ -539,7 +529,7 @@ fn env_secs(name: &str) -> Option<u64> {
 /// `MidStreamError` semantics exactly.
 async fn run_sse<P: StreamParser>(
     mut response: reqwest::Response,
-    sink: Option<mpsc::Sender<SinkLine>>,
+    sink: Option<mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     idle_timeout: Option<Duration>,
     mut parser: P,
@@ -662,7 +652,7 @@ async fn cancel_cancelled(cancel: &(dyn crate::agent::state::CancellationSource 
 /// Read a chat-completions SSE body into a turn.
 pub(crate) async fn read_stream(
     response: reqwest::Response,
-    sink: Option<mpsc::Sender<SinkLine>>,
+    sink: Option<mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     idle_timeout: Option<Duration>,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
@@ -679,7 +669,7 @@ pub(crate) async fn read_stream(
 /// Read a responses-API SSE body into a turn.
 pub(crate) async fn read_responses_stream(
     response: reqwest::Response,
-    sink: Option<mpsc::Sender<SinkLine>>,
+    sink: Option<mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     idle_timeout: Option<Duration>,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
@@ -696,7 +686,7 @@ pub(crate) async fn read_responses_stream(
 /// Read an Anthropic Messages SSE body into a turn.
 pub(crate) async fn read_anthropic_stream(
     response: reqwest::Response,
-    sink: Option<mpsc::Sender<SinkLine>>,
+    sink: Option<mpsc::Sender<ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
     idle_timeout: Option<Duration>,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
