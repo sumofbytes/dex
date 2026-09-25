@@ -133,7 +133,7 @@ pub(crate) fn spawn_approval_poster(
             .approve_async(&session_id, &request_id, decision)
             .await
         {
-            crate::log!(
+            dex_runtime::log!(
                 Warn,
                 "daemon approval delivery failed: {}",
                 crate::runtime::error::chain_message(&*e)

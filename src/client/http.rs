@@ -24,7 +24,7 @@ impl DaemonClient {
             crate::runtime::http::shared_async_client(),
             crate::runtime::http::shared_streaming_client(),
         )?
-        .with_warning_handler(|message| crate::log!(Warn, "{message}"));
+        .with_warning_handler(|message| dex_runtime::log!(Warn, "{message}"));
         Ok(Self(client))
     }
 }

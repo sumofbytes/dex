@@ -15,33 +15,31 @@ Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX
 
 ## Structure
 
-- `crates/dex-protocol/` — standalone shared HTTP/SSE wire types used by dex clients and daemons; `src/protocol/` re-exports it for internal compatibility and keeps app-domain types private.
-- `crates/dex-ai/` — provider-neutral model/message API, wire mapping, SSE parsers, and reusable HTTP auth/retry policy. Model discovery/configuration, credential refresh, and UI streaming remain app-owned in `src/llm/`.
-- `crates/dex-agent-core/` — reusable permission/agent modes, plans, token accounting, deterministic compaction, context/tool-round budget policies, text limits, normalized model-response history transition, and generic model/tool turn engine (`AgentHost` boundary). Dex implements app integrations in `src/agent/turn_loop/host.rs`.
-- `crates/dex-coding-agent/` — coding-agent built-in tool catalog and deterministic schema composition, native permission metadata, and host-independent tool-result cache/repeat-call policy. Dex supplies dynamic MCP/extension schemas, tool execution, rendering, and cache persistence.
+- `crates/dex-protocol/` — standalone shared HTTP/SSE wire types used by dex clients and daemons; `crates/dex-server/src/protocol/` re-exports it plus the shared transcript/approval vocabulary for internal compatibility.
+- `crates/dex-runtime/` — process-global runtime shared by server and client: console/TTY, `log!` macro, shared async HTTP client pools, cancellation, dedup'd warnings (`notice`), unwind guards, headless text formatting, and the in-process transcript/approval vocabulary (`runtime::lines::{SinkLine, ApprovalRequest}`).
+- `crates/dex-ai/` — provider-neutral model/message API, wire mapping, SSE parsers, and reusable HTTP auth/retry policy. Model discovery/configuration, credential refresh, and UI streaming live in the server crate.
+- `crates/dex-agent-core/` — reusable permission/agent modes, plans, token accounting, deterministic compaction, context/tool-round budget policies, text limits, normalized model-response history transition, and generic model/tool turn engine (`AgentHost` boundary). Dex implements app integrations in `crates/dex-server/src/agent/turn_loop/host.rs`.
+- `crates/dex-coding-agent/` — coding-agent built-in tool catalog and deterministic schema composition, native permission metadata, and host-independent tool-result cache/repeat-call policy. The server supplies dynamic MCP/extension schemas, tool execution, rendering, and cache persistence.
 - `crates/dex-client/` — standalone HTTP/SSE daemon client over `dex-protocol`; `src/client/` re-exports it for in-repo compatibility. It owns its runtime/HTTP defaults and optional local token lookup, with `with_token` for embedding hosts.
-- `crates/dex-skills/` — SKILL.md discovery + frontmatter parsing; `Skill` is re-exported via `src/protocol/`.
-- `crates/dex-session/` — append-only JSONL session store (header, journals, state, loaders); `src/session.rs` re-exports it and adds plan persistence + the undo ledger (`changes.rs`).
+- `crates/dex-skills/` — SKILL.md discovery + frontmatter parsing; `Skill` is re-exported via the server's `protocol` module.
+- `crates/dex-session/` — append-only JSONL session store (header, journals, state, loaders); `crates/dex-server/src/session.rs` re-exports it and adds plan persistence + the undo ledger (`changes.rs`).
+- `crates/dex-server/` — the server side with a public API: `daemon/` (axum + SSE), `agent/` (`turn_loop.rs` lifecycle wrapper + `turn_loop/host.rs` dex `AgentHost` adapter, `state.rs`, app compaction backend, `delegate/`), `llm/` (provider clients/adapters, `config/` with provider/model/endpoint resolution, `/model` write-back, `dex doctor`; `prompt.rs` system prompt), `tools/` (workspace-confined; `search.rs` backs `grep`/`find`, `shell.rs` exposes `$DEX_BIN`), `mcp/` (stdio/HTTP/SSE, OAuth, `mcp_servers:` config), `extensions/` (Lua engine), `render/` (headless format/theme; TUI bits behind its `tui` feature), `telemetry/`, `auth/`, `workspace/`. The `dex` binary re-exports these via compat shims (`crate::agent`, `crate::llm`, … still resolve).
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
 - `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Doctor`/`Update`/`Mcp`/`Extensions`/`Usage`/`Help`/`Version`)
-- `src/daemon/` + `src/protocol/` + `src/client/` — daemon (axum + SSE), wire types, client
-- `src/agent/` — `turn_loop.rs` lifecycle wrapper plus `turn_loop/host.rs` dex `AgentHost` adapter, `state.rs`, app compaction backend, `delegate/` (definitions, manager, delegate tool)
-- `src/llm/` — provider clients and adapters, `config/` (provider/model/endpoint resolution, `/model` write-back, `dex doctor`), `prompt.rs` (system prompt)
-- `src/tools/` — workspace-confined tools (`mod.rs`, `search.rs` for the fff engine backing `grep`/`find`, `shell.rs` exposes `$DEX_BIN`)
-- `src/mcp/` — MCP client (stdio/HTTP/SSE, OAuth, `mcp_servers:` config)
-- `src/session.rs` / `src/ui/` — session re-exports + plan/undo glue, TUI (`app.rs`, `render/`, `remote/`, `slash/`)
-- This file + `CLAUDE.md` (if present, nearest parent wins) is auto-appended to the system prompt via `src/llm/prompt.rs:project_context()`.
+- `src/app/` + `src/client/` — thin-client glue: in-process/daemon bootstrap (`app.rs`), connect/one-shot, `DaemonClient` configuration; the TUI path only talks HTTP+SSE
+- `src/ui/` — TUI (`app.rs`, `render/`, `remote/`, `slash/`)
+- This file + `CLAUDE.md` (if present, nearest parent wins) is auto-appended to the system prompt via `crates/dex-server/src/llm/prompt.rs:project_context()`.
 
 ## Config surface
 
-All of this lives in `src/llm/config/` — don't add a second way to express any of it:
+All of this lives in `crates/dex-server/src/llm/config/` — don't add a second way to express any of it:
 
 - One selection knob: `model: <provider|endpoint>/<model>` (file `model:`, env `DEX_MODEL`, flag `--model`; bare provider name switches provider and keeps the model). `/model`/`/provider` write back that single key and drop the deprecated ones — never write back `active_provider:`/`provider:`/top-level `base_url:`.
 - Endpoints, model lists, pricing, context windows come from the models.dev catalog (cache via `dex update --models`); wire protocol is learned per endpoint+model (`learned-apis.json`), with `providers.<name>.api:` as the pin.
 - Per-provider keys live in `providers.<name>.api_key` or the provider's own catalog env var (opencode: `OPENCODE_API_KEY`). Never add per-provider default key env vars.
 - Extra headers precedence: file (provider-scoped `headers:` > global, per-key) < env (`ANTHROPIC_CUSTOM_HEADERS` < `OPENAI_HEADERS` < `DEX_HEADERS`) < `--header`; `authorization` can't be overridden.
 - Deprecated keys/env stay honored with `warn_once` + a pointer at the replacement; new knobs must do the same, add themselves to the unknown-key list in `load_config_file` (`config/mod.rs`), add a `dex doctor` origin row, and appear in the README env table.
-- `dex doctor` prints every resolved value with its origin — keep it in sync with `from_env` when resolution changes. Config tests use `EnvRestore` + `TEST_SESSIONS_ENV_LOCK` and hermetic `XDG_CACHE_HOME`/`DEX_CONFIG` paths.
+- `dex doctor` prints every resolved value with its origin — keep it in sync with `from_env` when resolution changes. Config tests use `EnvRestore` + `TEST_SESSIONS_ENV_LOCK` (in `dex-runtime::test_env`) and hermetic `XDG_CACHE_HOME`/`DEX_CONFIG` paths.
 - Lua extensions (`dex extensions`, `Mode::Extensions`) are the scripting surface; don't add parallel knob types elsewhere.
 
 ## Working rules
@@ -57,7 +55,7 @@ All of this lives in `src/llm/config/` — don't add a second way to express any
 
 - No new dependencies without clear need — check `Cargo.toml` first, prefer stdlib/native.
 - Worktrees live outside this repo (`git worktree add ../dex-<name> <branch>`), not in `.worktrees/` — in-repo worktrees are gitignored, so `ffgrep`/`fffind` never index them and they'd show duplicate hits if un-ignored. When working in a worktree, remember: only the main checkout's `grep`/`find` cover the main checkout.
-- Keep `src/llm/prompt.rs` minimal; tool behavior belongs in `src/llm/tool_descriptions.rs`, not the prompt. Schema surface is guarded by `schema_surface_matches_docs` (`src/lib.rs`) — git/chain stay dropped, delegate stays one tool with `action: spawn|wait|stop|list`.
+- Keep `crates/dex-server/src/llm/prompt.rs` minimal; tool behavior belongs in `crates/dex-server/src/llm/tool_descriptions.rs`, not the prompt. Schema surface is guarded by `schema_surface_matches_docs` (`src/app.rs`) — git/chain stay dropped, delegate stays one tool with `action: spawn|wait|stop|list`.
 - Skills: directory with `SKILL.md` frontmatter (`name`, `description`). Discovered via `skill_dirs()` (`crates/dex-skills/src/discovery.rs`) — cwd `.dex/skills`, `.agents/skills`, then `$XDG_CONFIG_HOME/dex/skills`. Sorted, first `name` wins, duplicates warned.
 - Permissions default `trusted` (`read-only`/`ask`/`trusted`; deprecated `ask-writes`/`ask-shell` map to `ask`); `bash` is mutating. Native schema: `read`/`bash`/`write`/`edit`/`grep`/`find`/`ls` plus `delegate` (sub-agents, one tool with `action: spawn|wait|stop|list`, daemon sessions only).
 - Compaction is deterministic by default (`DEX_COMPACTION=llm` for LLM, `=jev` for verbatim tool-output pruning). Keep `tokens > contextWindow - reserveTokens` logic intact.
