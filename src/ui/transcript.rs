@@ -6,6 +6,7 @@ use super::app::THINKING_TEXT_SLACK;
 use super::render;
 use super::status;
 use super::style::fg;
+use super::style::BLOCK_GAP_ROWS;
 use super::style::INPUT_PROMPT;
 use super::style::TRANSCRIPT_INDENT;
 use crate::protocol::tokens::format_tokens;
@@ -549,13 +550,20 @@ pub(crate) fn start_activity(app: &mut App) {
 /// streaming appends that re-trail the activity spinner.
 fn drop_shifted_selection(app: &mut App, pos: usize) {
     // Start row of block `pos` in display space: cached rows plus the
-    // 1-row separator before each non-empty block after the first.
+    // `BLOCK_GAP_ROWS` separator before each non-empty block after the first.
     let first_shifted: usize = app
         .wrapped_cache
         .iter()
         .take(pos)
         .enumerate()
-        .map(|(j, wb)| wb.rows.len() + usize::from(j > 0 && !wb.rows.is_empty()))
+        .map(|(j, wb)| {
+            wb.rows.len()
+                + if j > 0 && !wb.rows.is_empty() {
+                    BLOCK_GAP_ROWS
+                } else {
+                    0
+                }
+        })
         .sum();
     if let Some(sel) = app.selection {
         if sel.norm().1 .0 >= first_shifted {
@@ -683,7 +691,8 @@ pub(crate) fn render_user_prompt(app: &mut App, line: &str) {
     close_thinking(app);
     app.assistant_open = false;
     // No background is stored here: `wrap_block` pads every row to the
-    // full width at wrap time; spacing is the inter-block gap.
+    // full width and frames the box with the composer's top/bottom
+    // hairlines at wrap time; spacing is the inter-block gap.
     let user_style = fg(theme::user_fg());
     let mut block_lines = Vec::new();
     for (i, sub) in line.split('\n').enumerate() {
