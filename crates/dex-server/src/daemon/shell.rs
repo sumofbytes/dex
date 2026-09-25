@@ -125,7 +125,13 @@ pub(crate) async fn session_shell(
     let short = crate::render::format::short_arg("bash", &input_json);
     let summary =
         crate::render::format::tool_result_summary("bash", &input_json, &output, success, None);
-    let preview = crate::render::format::tool_preview("bash", success, None, &output, true);
+    let preview = crate::render::format::tool_preview(
+        "bash",
+        success,
+        None,
+        &output,
+        crate::render::format::preview_skips_first_line("bash", success, &output),
+    );
     let (call_seq, result_seq) = state.next_seq_pair(&session_id);
     // Unique id shared by the pair so concurrent runs can't steal each
     // other's half even if the two pairs interleave in the journal. The

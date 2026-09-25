@@ -252,7 +252,7 @@ fn summary_is_outcome_first_without_ok_prefix() {
     // A genuinely failed tool reports failure with its first output line.
     assert_eq!(
         summary("bash", "{}", "ls: no such file\n[exit 2]", false),
-        "failed · ls: no such file"
+        "failed (exit 2) · ls: no such file"
     );
     // grep defaults to files mode: the summary counts files, not matches.
     assert_eq!(summary("grep", "{}", "", true), "0 files matched");
@@ -307,9 +307,11 @@ fn summary_is_outcome_first_without_ok_prefix() {
     );
     // Empty successful output says so instead of a bare "ok".
     assert_eq!(summary("bash", "{}", "", true), "(no output)");
+    assert_eq!(summary("bash", "{}", "hello world", true), "hello world");
+    assert_eq!(summary("bash", "{}", "hello world\nrest", true), "2 lines");
     assert_eq!(
-        summary("bash", "{}", "hello world\nrest", true),
-        "hello world"
+        summary("bash", "{}", "hello world\nrest\nthird", true),
+        "3 lines"
     );
 }
 
@@ -626,4 +628,47 @@ fn render_mcp_panel_empty_and_truncated() {
         .last()
         .unwrap()
         .contains("3 more tools hidden by the schema cap"));
+}
+
+#[test]
+fn freeform_summaries_count_lines_and_carry_exit_codes() {
+    // Multi-line bash collapses to a count; the preview carries content.
+    assert_eq!(summary("bash", "{}", "one\ntwo\nthree", true), "3 lines");
+    // Unknown/generic tools behave the same.
+    assert_eq!(summary("mcp__gh__search", "{}", "a\nb", true), "2 lines");
+    assert_eq!(summary("mcp__gh__search", "{}", "solo", true), "solo");
+    assert_eq!(summary("mcp__gh__search", "{}", "", true), "(no output)");
+    // Structural rows are not content: stderr separator, trailers, and the
+    // exit marker never inflate the count or echo as the summary.
+    assert_eq!(
+        summary("bash", "{}", "out\n--- stderr ---\nerr", true),
+        "2 lines"
+    );
+    assert_eq!(
+        summary("bash", "{}", "out\n[... 3 of 5 lines truncated ...]", true),
+        "out"
+    );
+    // Failures keep the first content line but carry the exit code.
+    assert_eq!(
+        summary("bash", "{}", "boom\n[exit 3]", false),
+        "failed (exit 3) · boom"
+    );
+    assert_eq!(summary("bash", "{}", "[exit 3]", false), "failed (exit 3)");
+    assert_eq!(
+        summary("bash", "{}", "Error: timed out", false),
+        "failed · Error: timed out"
+    );
+    assert_eq!(summary("bash", "{}", "", false), "failed");
+}
+
+#[test]
+fn preview_skip_matches_summary_echo() {
+    // Counts-only successes show everything; failures skip the echoed line.
+    assert!(!preview_skips_first_line("read", true, "a\nb"));
+    assert!(preview_skips_first_line("read", false, "a\nb"));
+    // Bash/generic: single-line echoes (skip), multi-line counts (keep).
+    assert!(preview_skips_first_line("bash", true, "solo"));
+    assert!(!preview_skips_first_line("bash", true, "one\ntwo"));
+    assert!(!preview_skips_first_line("mcp__x__y", true, "one\ntwo"));
+    assert!(preview_skips_first_line("bash", false, "boom\n[exit 1]"));
 }
