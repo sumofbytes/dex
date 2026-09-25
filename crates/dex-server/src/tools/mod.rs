@@ -34,7 +34,7 @@ pub(crate) use meta::Policy;
 use read::expand_glob_in;
 #[cfg(test)]
 use shell::run_bash_with_limits;
-pub(crate) use write::hash_file;
+pub(crate) use write::{hash_bytes, hash_file};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
