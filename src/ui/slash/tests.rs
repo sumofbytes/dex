@@ -185,7 +185,7 @@ fn model_and_provider_pickers_filter_and_mark_current() {
 
 #[test]
 fn resume_picker_lists_other_sessions() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let data_dir = std::env::temp_dir().join(format!("dex-slash-resume-{}", std::process::id()));
@@ -194,7 +194,7 @@ fn resume_picker_lists_other_sessions() {
         [("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]
             .into_iter()
             .collect();
-    let _env = crate::session::EnvGuard(saved);
+    let _env = crate::test_env::EnvGuard(saved);
     std::env::set_var("XDG_DATA_HOME", &data_dir);
     // The session file stays on disk after the handle drops — `Session`
     // has no `Drop` impl and appends are synchronous writes.
@@ -540,7 +540,7 @@ fn handle_slash_skill_load_and_miss() {
 
 #[test]
 fn handle_slash_thinking_show_set_and_clear() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let cache = std::env::temp_dir().join(format!("dex-slash-think-{}", std::process::id()));
@@ -555,7 +555,7 @@ fn handle_slash_thinking_show_set_and_clear() {
     ]
     .into_iter()
     .collect();
-    let _env = crate::session::EnvGuard(saved);
+    let _env = crate::test_env::EnvGuard(saved);
     std::env::set_var("XDG_CACHE_HOME", &cache);
     std::env::remove_var("DEX_THINKING_EFFORT");
     // No user config: a file `thinking_effort:` must not leak into the
@@ -665,7 +665,7 @@ fn handle_slash_provider_known_and_unknown() {
 
 #[test]
 fn handle_slash_model_switch_and_persist_is_hermetic() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-slash-model-{}", std::process::id()));
@@ -678,7 +678,7 @@ fn handle_slash_model_switch_and_persist_is_hermetic() {
     ]
     .into_iter()
     .collect();
-    let _env = crate::session::EnvGuard(saved);
+    let _env = crate::test_env::EnvGuard(saved);
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
     std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
     std::env::remove_var("DEX_CONTEXT_WINDOW");

@@ -464,7 +464,7 @@ async fn memory_blowup_fails_the_load_not_the_process() {
 
 #[test]
 fn consent_and_remove_reject_non_segment_ids() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _env = EnvRestore::take(&["XDG_DATA_HOME"]);
@@ -645,7 +645,7 @@ fn config_paths_parse_and_layer_env_over_file() {
 
 #[test]
 fn config_paths_reach_discovery_as_user_scope() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _env = EnvRestore::take(&["XDG_CONFIG_HOME", "XDG_DATA_HOME", "DEX_EXTENSIONS_PATHS"]);
@@ -689,7 +689,7 @@ fn config_paths_reach_discovery_as_user_scope() {
 
 #[test]
 fn markers_gate_scopes_and_doctor_discovery() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _env = EnvRestore::take(&["XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
@@ -1016,7 +1016,7 @@ async fn model_select_fires_once_per_change_and_fails_open() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1077,7 +1077,7 @@ async fn model_select_is_zero_cost_without_subscribers() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1106,7 +1106,7 @@ async fn model_select_records_routing_headers() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1184,7 +1184,7 @@ async fn drive_model_scope_shadows_global_fallback() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1344,7 +1344,7 @@ async fn dex_model_tables_read_snapshot_and_gate_capability() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1441,7 +1441,7 @@ async fn net_fetch_confines_to_model_endpoint() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1548,7 +1548,7 @@ async fn net_fetch_allows_configured_provider_endpoints() {
     // sessions-locked config tests also mutate — serialize against
     // them (consistent order: sessions -> turn -> manager, like the
     // other extension tests, so the global locks can't deadlock).
-    let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env_lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
@@ -1635,7 +1635,7 @@ async fn net_fetch_returns_values_against_loopback() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1702,7 +1702,7 @@ async fn net_fetch_does_not_follow_redirects() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1758,7 +1758,7 @@ async fn web_example_loads_and_gates_tools() {
     // TEST_SESSIONS_ENV_LOCK; take it first (consistent order) so a
     // concurrent daemon turn can't slip a snapshot in between
     // `reset_for_tests()` and the first fire (previous != nil).
-    let _sessions = crate::daemon::state::lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
         .lock()
         .await;
@@ -1836,7 +1836,7 @@ async fn web_example_falls_back_to_override_model() {
     // Same race as above: this test redirects DEX_CONFIG/XDG_* while
     // sessions-locked config tests assume exclusive env access. Take the
     // sessions lock first (consistent order: sessions -> turn -> manager).
-    let _env_lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env_lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK

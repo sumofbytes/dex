@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::{AgentId, AgentManager};
+use crate::agent::delegate::{AgentId, AgentManager};
 use crate::protocol::{ApprovalDecision, ApprovalRequest};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 

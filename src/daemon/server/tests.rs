@@ -272,7 +272,7 @@ mod handler_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env must stay redirected across the reloads
     async fn extensions_endpoints_report_shape_and_reload() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
@@ -280,7 +280,7 @@ mod handler_tests {
             .await;
         // Hermetic: the manager must not see the developer's real installs.
         let keys: [(&'static str, bool); 2] = [("XDG_CONFIG_HOME", true), ("XDG_DATA_HOME", true)];
-        let saved = crate::session::EnvGuard(
+        let saved = crate::test_env::EnvGuard(
             keys.iter()
                 .map(|(k, _)| (*k, std::env::var_os(k)))
                 .collect(),
@@ -374,7 +374,7 @@ mod handler_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env lock guards the manager reset below
     async fn extensions_run_rejects_unknown_and_empty() {
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Empty name is a bad request, unknown names are 404 so the remote
@@ -558,7 +558,7 @@ mod handler_tests {
         // Resolving the deny below writes an audit row from the ambient
         // XDG_DATA_HOME; hold the env lock so the row can't land in a test
         // that is concurrently redirecting it.
-        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _lock = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let state = Arc::new(DaemonState::new());
         // no such request_id -> 404
         let r = approve(
@@ -781,10 +781,10 @@ mod handler_tests {
     async fn create_session_registers_and_lists_from_disk() {
         // Redirects where ALL sessions live; serialize against other tests
         // that read/write the sessions dir.
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-srv-create-{}", std::process::id()));
         let _env =
-            crate::session::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
+            crate::test_env::EnvGuard(vec![("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
         let state = Arc::new(DaemonState::new());
@@ -920,14 +920,14 @@ mod handler_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     async fn approve_allow_session_records_approval_and_writes_audit() {
-        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _lock = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-srv-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
             [("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]
                 .into_iter()
                 .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
         let state = Arc::new(DaemonState::new());
@@ -1160,7 +1160,7 @@ this line is torn and not json
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
     async fn lookup_entry_disk_fallback_and_reattach_seed_from_disk() {
-        let _lock = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _lock = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let data_dir =
             std::env::temp_dir().join(format!("dex-srv-fallback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -1168,7 +1168,7 @@ this line is torn and not json
             [("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]
                 .into_iter()
                 .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         let dir = data_dir.join("dex/sessions/fb");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1503,7 +1503,7 @@ mod permission_gate_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn permission_ceiling_blocks_client_escalation_and_bad_plan() {
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
 
         // Hermetic session storage.
         let data_dir = std::env::temp_dir().join(format!("dex-perm-{}", std::process::id()));
@@ -1512,7 +1512,7 @@ mod permission_gate_tests {
                 .iter()
                 .map(|k| (*k, std::env::var_os(k)))
                 .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
 
         let session = Session::new("/tmp/dex-perm-cwd".into(), None).unwrap();
@@ -1529,7 +1529,7 @@ mod permission_gate_tests {
             .iter()
             .map(|k| (*k, std::env::var_os(k)))
             .collect();
-        let _env2 = crate::session::EnvGuard(saved);
+        let _env2 = crate::test_env::EnvGuard(saved);
         std::env::set_var("DEX_PERMISSION", "read-only");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
 
@@ -1706,7 +1706,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn client_denies_write_then_turn_completes() {
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
 
         // Fake provider: request 0 asks for a write; later requests finish.
         const TOOL_SSE: &str = concat!(
@@ -1755,7 +1755,7 @@ mod e2e_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         // No real user config may leak in: point the daemon at the fake
         // provider through a real config file (a machine's config.yaml
@@ -1866,7 +1866,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn agent_lifecycle_hooks_fire_around_a_child_run() {
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
             .lock()
             .await;
@@ -1930,7 +1930,7 @@ mod e2e_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         std::env::set_var("XDG_CONFIG_HOME", data_dir.join("config"));
         std::fs::create_dir_all(data_dir.join("config/dex/extensions/aghook")).unwrap();
@@ -2027,7 +2027,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn delegate_runs_child_and_notice_drains_next_turn() {
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
 
         const DELEGATE_SSE: &str = concat!(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"delegate","arguments":"{\"agent\":\"explorer\",\"task\":\"find where the gate lives\"}"}}]}}]}"#,
@@ -2103,7 +2103,7 @@ mod e2e_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
@@ -2187,8 +2187,8 @@ mod e2e_tests {
         loop {
             if daemon_state
                 .manager_for(&session_id)
-                .status(&crate::agent::subagent::AgentId(agent_id.clone()))
-                == Some(crate::agent::subagent::AgentState::Completed)
+                .status(&crate::agent::delegate::AgentId(agent_id.clone()))
+                == Some(crate::agent::delegate::AgentState::Completed)
             {
                 break;
             }
@@ -2300,7 +2300,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env + token global must stay pinned
     async fn bearer_gate_blocks_api_routes_and_config_reports_info() {
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-e2e-bearer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -2321,7 +2321,7 @@ mod e2e_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
         std::fs::write(data_dir.join("config.yaml"), "api: openai-completions\n").unwrap();
@@ -2425,7 +2425,7 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
     async fn idempotent_chat_replays_the_recorded_terminal_event() {
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         const DONE_SSE: &str =
             "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\ndata: [DONE]\n\n";
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2465,7 +2465,7 @@ mod e2e_tests {
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
-        let _env = crate::session::EnvGuard(saved);
+        let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -2563,7 +2563,7 @@ mod async_parallel_tests {
     #[allow(clippy::await_holding_lock)]
     async fn list_sessions_joins_parallel_and_sorts() {
         // TDD Phase 4 (S2): JoinSet per-file scans, join, sort — same as sequential, ~50ms not ~500ms.
-        let _guard = lock_map(&crate::session::TEST_SESSIONS_ENV_LOCK);
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
         let data_dir = std::env::temp_dir().join(format!("dex-list-par-{}", std::process::id()));
         let saved = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &data_dir);

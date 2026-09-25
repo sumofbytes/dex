@@ -125,7 +125,7 @@ pub(crate) fn project_context_for(dir: &Path) -> Option<String> {
 }
 
 /// Base system prompt: identity plus imperative working rules.
-/// Tool-behavior detail lives in the tool descriptions (src/llm/protocol.rs),
+/// Tool-behavior detail lives in the tool descriptions (src/llm/tool_descriptions.rs),
 /// where the model sees it at each tool decision — never duplicated here.
 ///
 /// A custom `system_prompt:` / `DEX_SYSTEM_PROMPT` / `--system-prompt` (or its
@@ -306,7 +306,7 @@ mod tests {
                 }
             }
         }
-        let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Hermetic: ignore any developer shell/config override for this assertion.

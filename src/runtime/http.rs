@@ -140,7 +140,7 @@ mod tests {
     use super::*;
 
     fn with_env(value: Option<&str>, f: impl FnOnce()) {
-        let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+        let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();

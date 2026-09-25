@@ -84,7 +84,7 @@ fn write_cost_catalog(dir: &std::path::Path) {
 #[test]
 fn usage_cost_prefers_endpoint_then_provider_pricing() {
     // Serializes process-env redirection against other tests.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-cost-{}", std::process::id()));
@@ -164,7 +164,7 @@ fn resolve_model_cost_ignores_trailing_slash() {
     // Serializes process-env redirection against other tests. Hermetic
     // catalog via `XDG_CACHE_HOME` — the lookup is index-backed, so the
     // catalog arrives as a file, not a `Value`.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-cost-slash-{}", std::process::id()));
@@ -280,7 +280,7 @@ fn model_apis_env(table: &str) -> EnvRestore {
 fn apply_model_follows_model_apis() {
     // Serializes process-env redirection (DEX_MODEL_APIS/DEX_API)
     // against daemon tests holding the same guard.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = model_apis_env("m-c=openai-completions");
@@ -294,7 +294,7 @@ fn apply_model_follows_model_apis() {
 
 #[test]
 fn apply_model_full_selection_key_wins() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = model_apis_env("m-x=openai-completions,go/m-x=openai-responses");
@@ -320,7 +320,7 @@ fn bare_unconfigured_catalog_provider_resolves_and_warns() {
     // opaque id at runtime: a one-time hint names the fix (at startup
     // the same selection fails with the deposit pointer instead).
     // Already-served and known native ids are not mistakes.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-providerlike-{}", std::process::id()));
@@ -375,7 +375,7 @@ fn dex_model_bare_provider_name_resolves_as_model_id() {
     // id and the config builds — the runtime hint warns instead of
     // erroring. A bare `aaa-reseller` carries no provider at all: the error
     // names the provider it looks like and the deposit to configure.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-bareprov-{}", std::process::id()));
@@ -413,7 +413,7 @@ fn dex_model_bare_provider_name_resolves_as_model_id() {
 
 #[test]
 fn model_api_from_env_ignores_malformed_entries() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_MODEL_APIS"]);
@@ -479,7 +479,7 @@ fn selection_trims_whitespace_around_provider_and_model() {
 
 #[test]
 fn apply_model_switches_provider_and_sets_base_url_without_env() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _g = EnvRestore::take(&["OPENCODE_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID"]);
@@ -536,7 +536,7 @@ fn apply_model_switches_provider_and_sets_base_url_without_env() {
 
 #[test]
 fn endpoints_always_available_for_opencode_without_env() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-oc-eps-{}", std::process::id()));
@@ -611,7 +611,7 @@ fn custom_headers_parse_json_and_pairs() {
 fn custom_headers_layer_file_env_cli() {
     use std::collections::BTreeMap;
 
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _g = EnvRestore::take(&[
@@ -810,7 +810,7 @@ fn permission_parse_and_ordering() {
 /// covered by `detect_verify_command_selects_by_manifest`.
 #[test]
 fn apply_verify_optin_explicit_command_wins() {
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut config = test_cfg();
@@ -849,7 +849,7 @@ fn detect_verify_command_selects_by_manifest() {
 
 #[test]
 fn catalog_cache_missing_reports_fresh_installs() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
@@ -870,7 +870,7 @@ fn catalog_cache_missing_reports_fresh_installs() {
 
 #[test]
 fn concurrent_ctx_index_writes_leave_no_torn_file() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
@@ -914,7 +914,7 @@ fn concurrent_ctx_index_writes_leave_no_torn_file() {
 fn builtin_default_missing_key_suggests_setup() {
     // Nothing selects a provider (no flag/env/file pointer): the
     // missing-key error must guide setup, not endorse opencode.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -957,7 +957,7 @@ fn explicit_base_url_without_selection_routes_to_custom_provider() {
     // `--base-url` + no provider pointer anywhere must NOT ride the
     // builtin default: key errors name providers.custom.api_key, and
     // no OPENCODE_API_KEY is demanded for a foreign endpoint.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-custom-{}", std::process::id()));
@@ -1005,7 +1005,7 @@ fn explicit_base_url_without_selection_routes_to_custom_provider() {
 
 #[test]
 fn doctor_names_custom_provider_for_base_url_only_setup() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
@@ -1164,7 +1164,7 @@ fn unrouted_selection_error_names_the_fix() {
 fn opencode_key_resolves_entry_then_own_env_var() {
     // Deposit order: providers.opencode.api_key > OPENCODE_API_KEY
     // (opencode's gateway key).
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1238,7 +1238,7 @@ fn anthropic_key_resolves_cacheless_via_pinned_env_var() {
     // resolve because builtin native providers pin their canonical var
     // (see `pinned_key_env`). Deposit order matches opencode:
     // providers.anthropic.api_key > ANTHROPIC_API_KEY.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1308,7 +1308,7 @@ fn config_file_defaults_apply() {
     // Model, endpoint and protocol come from `--model`/`--base-url`,
     // the file, or builtins — never env vars (those are provider
     // properties, not agent globals).
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1392,7 +1392,7 @@ fn write_routing_catalog(dir: &std::path::Path) {
 
 #[test]
 fn bare_model_auto_routes_to_serving_endpoint() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["XDG_CACHE_HOME", "DEX_MODEL_APIS"]);
@@ -1436,7 +1436,7 @@ fn explicit_base_url_wins_over_catalog_routing() {
     // go-only model stays on the pinned URL instead of being silently
     // rerouted to the serving endpoint. Pins are `--base-url` and file
     // `base_url:` only — endpoint properties, not env globals.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1518,7 +1518,7 @@ fn generic_config(dir: &std::path::Path, providers_yaml: &str) {
 
 #[test]
 fn generic_provider_resolves_endpoint_key_and_routing() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1582,7 +1582,7 @@ fn generic_provider_resolves_endpoint_key_and_routing() {
 
 #[test]
 fn generic_provider_switch_and_completion_ids() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1625,7 +1625,7 @@ fn generic_provider_switch_and_completion_ids() {
 
 #[test]
 fn models_cache_offers_provider_qualified_ids() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["XDG_CACHE_HOME", "DEX_CONFIG"]);
@@ -1655,7 +1655,7 @@ fn prefixed_selection_restores_protocol_on_restart() {
     // A provider-prefixed `model:` in the config file must honor a bare-id
     // `DEX_MODEL_APIS` entry: the full selection key is tried first,
     // then the stripped id.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1694,7 +1694,7 @@ fn persisted_selection_reloads_stripped() {
     // raw prefix: `from_env` treats a file `base_url:` as an explicit
     // pin and skips routing, so a stored `go/<id>` would otherwise be
     // sent to the API verbatim after restart.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1761,7 +1761,7 @@ fn pinned_base_url_still_resolves_per_model_protocol() {
     // retries `/responses` on every restart and a `DEX_MODEL_APIS` pin
     // is ignored for the request yet blocks the fallback — the exact
     // error loop in the glm-5.3-flash report.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1811,7 +1811,7 @@ fn apply_model_refuses_provider_switch_without_credentials_or_endpoint() {
     // A provider-qualified pick is atomic: without credentials or a
     // known endpoint the switch is refused and the old key/URL stay
     // put — never one provider's key against another's endpoint.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1862,7 +1862,7 @@ fn apply_model_refuses_provider_switch_without_credentials_or_endpoint() {
 fn catalog_env_vars_tries_every_documented_name() {
     // A provider documenting several key env vars accepts any of them —
     // not just the first key in the catalog `env` map.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1930,7 +1930,7 @@ fn legacy_provider_keys_ignored_and_dropped() {
     // pointer; neither is read anymore (selection lives in `model:`), the
     // file still loads, and write-back drops them — with top-level
     // `base_url:` — for the one-knob schema.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -1995,7 +1995,7 @@ fn legacy_provider_keys_ignored_and_dropped() {
 fn api_pin_bakes_into_config() {
     // The global protocol pin is computed once in `from_env` (file or
     // provider entry) so hot paths never re-read the file.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2055,7 +2055,7 @@ fn resolved_provider_bundles_entry_overrides() {
     // catalog URL, entry `api:` pins (and bakes `api_pinned`), entry
     // `headers:` land in `provider_headers` — and all three refresh on
     // a provider switch.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2132,7 +2132,7 @@ fn ctx_map_covers_both_catalog_shapes_lowercased() {
 fn thinking_effort_resolves_stored_then_env() {
     // Precedence: stored `/thinking` choice > `DEX_THINKING_EFFORT` >
     // unset; clearing falls back down the chain.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2176,7 +2176,7 @@ fn thinking_effort_resolves_stored_then_env() {
 
 #[test]
 fn thinking_pick_validates_against_advertised_options() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
@@ -2207,7 +2207,7 @@ fn thinking_mismatch_warning_is_data_not_stderr() {
     // The mismatch hint must be returnable data (transcript line), never
     // an `eprintln!` from config code: the daemon shares the TUI's
     // terminal, where stderr corrupts the alternate screen / OSC query.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
@@ -2236,7 +2236,7 @@ fn thinking_mismatch_warning_is_data_not_stderr() {
 fn apply_model_swaps_effort_with_the_model() {
     // A model switch moves the thinking knob to the new model's stored
     // choice instead of leaking the old one.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2266,7 +2266,7 @@ fn apply_model_swaps_effort_with_the_model() {
 fn thinking_effort_reads_file_key_under_env() {
     // File `thinking_effort:` is the default under a stored choice and
     // the env var: stored > env > file > unset.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2313,7 +2313,7 @@ fn thinking_effort_reads_file_key_under_env() {
 /// knob: the prefix picks the provider, the rest the model.
 #[test]
 fn selection_prefix_and_dex_model_pick_provider_and_model() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-selection-{}", std::process::id()));
@@ -2370,7 +2370,7 @@ fn selection_prefix_and_dex_model_pick_provider_and_model() {
 
 #[test]
 fn doctor_reports_selection_and_origins() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
@@ -2397,7 +2397,7 @@ fn doctor_reports_selection_and_origins() {
 /// as its origin) and the resolve row carries the fix.
 #[test]
 fn doctor_shows_bare_provider_pick_as_provider() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
@@ -2428,7 +2428,7 @@ fn doctor_shows_bare_provider_pick_as_provider() {
 /// column (display columns 18+46 = 64).
 #[test]
 fn doctor_wraps_overlong_value_and_hangs_origin() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
@@ -2467,7 +2467,7 @@ fn doctor_wraps_overlong_value_and_hangs_origin() {
 /// columns wide, so the origin still lands on column 70.
 #[test]
 fn doctor_pads_by_display_width() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "OPENCODE_API_KEY"]);
@@ -2498,7 +2498,7 @@ fn doctor_pads_by_display_width() {
 /// keep the snapshot stable across runs and machines.
 #[test]
 fn doctor_output_is_byte_stable() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2572,7 +2572,7 @@ fn doctor_output_is_byte_stable() {
 
 #[test]
 fn system_prompt_precedence_is_cli_env_file_default() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2636,7 +2636,7 @@ fn system_prompt_precedence_is_cli_env_file_default() {
 
 #[test]
 fn system_prompt_file_layer_reads_absolute_path() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2709,7 +2709,7 @@ fn resolve_cli_system_prompt_prefers_inline_and_errors_on_missing_file() {
 
 #[test]
 fn doctor_system_prompt_row_names_origin() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2779,7 +2779,7 @@ fn doctor_system_prompt_row_names_origin() {
 
 #[test]
 fn whitespace_file_inline_system_prompt_falls_through_to_default() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2820,7 +2820,7 @@ fn write_extmodel_config(dir: &std::path::Path) {
 
 #[test]
 fn extension_model_snapshot_resolves_selection_and_endpoint() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2856,7 +2856,7 @@ fn extension_model_snapshot_resolves_selection_and_endpoint() {
 
 #[test]
 fn extension_model_snapshot_errors_without_selection() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "XDG_CACHE_HOME"]);
@@ -2874,7 +2874,7 @@ fn extension_model_snapshot_errors_without_selection() {
 
 #[test]
 fn extension_model_auth_merges_headers_and_drops_authorization() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&["DEX_CONFIG", "DEX_MODEL", "DEX_HEADERS", "XDG_CACHE_HOME"]);
@@ -2926,7 +2926,7 @@ fn builtin_provider_names_stay_in_sync_with_parse_known() {
 
 #[test]
 fn extension_provider_auth_resolves_explicit_provider() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[
@@ -2967,7 +2967,7 @@ fn extension_provider_auth_resolves_explicit_provider() {
 
 #[test]
 fn extension_configured_providers_lists_resolvable_endpoints() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _guard = EnvRestore::take(&[

@@ -1,0 +1,20 @@
+[package]
+name = "dex-session"
+version = "0.1.0"
+edition = "2021"
+description = "Append-only JSONL session store for dex: header, journals, state, undo-agnostic primitives"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sumofbytes/dex"
+
+[dependencies]
+dex-ai = { version = "0.1.0", path = "../dex-ai" }
+dex-agent-core = { version = "0.1.0", path = "../dex-agent-core" }
+dex-skills = { version = "0.1.0", path = "../dex-skills" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+chrono = "0.4"
+tokio = { version = "1", features = ["fs", "rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }

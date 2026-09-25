@@ -1,4 +1,4 @@
-use crate::runtime::logging::data_home;
+use crate::data_home;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::protocol::{ChatMessage, Role};
+use dex_ai::{ChatMessage, Role};
 
 use super::discovery;
 use super::header::{
@@ -21,10 +21,10 @@ use super::header::{
 #[cfg(test)]
 use super::header::SessionEffectEntry;
 #[cfg(test)]
-use super::{undo_last_change, EnvGuard, TEST_SESSIONS_ENV_LOCK};
+use crate::test_support::{EnvGuard, TEST_SESSIONS_ENV_LOCK};
 
 #[derive(Debug)]
-pub(crate) struct Session {
+pub struct Session {
     header: SessionHeader,
     path: Option<PathBuf>,
     /// Reused append handle for the main JSONL, opened lazily on first write;
@@ -140,13 +140,13 @@ fn history_cache_touch(path: &Path, appended: u64) {
 }
 
 impl Session {
-    pub(crate) fn session_dir() -> PathBuf {
+    pub fn session_dir() -> PathBuf {
         data_home()
             .map(|base| base.join("dex/sessions"))
             .unwrap_or_else(|| PathBuf::from(".dex/sessions"))
     }
 
-    pub(crate) fn cwd_slug(cwd: &str) -> String {
+    pub fn cwd_slug(cwd: &str) -> String {
         let mut hash = 2166136261u64;
         for byte in cwd.as_bytes() {
             hash = (hash ^ u64::from(*byte)).wrapping_mul(16777619);
@@ -158,7 +158,7 @@ impl Session {
     /// The workspace part is the lowercased cwd basename with anything
     /// outside `[a-z0-9]` folded to `-`; the suffix is 7 k8s-style
     /// `[a-z0-9]` chars, unique per session (see `Session::new`).
-    pub(crate) fn default_session_name(cwd: &str) -> String {
+    pub fn default_session_name(cwd: &str) -> String {
         format!("{}-{}", Self::workspace_slug(cwd), Self::random_suffix(7))
     }
 
@@ -220,7 +220,7 @@ impl Session {
         format!("{}-{}", Self::workspace_slug(cwd), Self::random_suffix(16))
     }
 
-    pub(crate) fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
+    pub fn new(cwd: String, name: Option<String>) -> io::Result<Self> {
         // Unnamed sessions default to `<workspace>-<7 chars>`; an explicit
         // `--name`/`/name` (or `Some` from the daemon request) always wins.
         let name = match name {
@@ -264,7 +264,7 @@ impl Session {
             journal: None,
             events_journal: None,
         };
-        let skills = crate::skills::discover_skills(&crate::skills::skill_dirs());
+        let skills = dex_skills::discover_skills(&dex_skills::skill_dirs());
         session.record_skills(&skills);
         Ok(session)
     }
@@ -273,7 +273,7 @@ impl Session {
     /// entry (key `skills`), so the JSONL documents which skills the system
     /// prompt advertised at session start. Failures are swallowed: a bad
     /// skills record must not fail session creation.
-    fn record_skills(&mut self, skills: &[crate::protocol::Skill]) {
+    fn record_skills(&mut self, skills: &[dex_skills::Skill]) {
         if skills.is_empty() {
             return;
         }
@@ -312,7 +312,7 @@ impl Session {
         Ok(header)
     }
 
-    pub(crate) fn from_path(path: &Path) -> io::Result<Self> {
+    pub fn from_path(path: &Path) -> io::Result<Self> {
         // Header only: entry ids are random (see `next_id`), so opening never
         // needs the old line-count scan — O(1) no matter the history size
         // (perf doc §§22/28).
@@ -331,7 +331,7 @@ impl Session {
     /// turn. Same header-only open as `from_path`; the separate name documents
     /// that only `append_event` (whose seq comes from the daemon) ever runs
     /// on this handle.
-    pub(crate) fn from_path_for_events(path: &Path) -> io::Result<Self> {
+    pub fn from_path_for_events(path: &Path) -> io::Result<Self> {
         Self::from_path(path)
     }
 
@@ -340,12 +340,7 @@ impl Session {
     /// scheme; resume generations append `.g<N>` so a resume never
     /// clobbers its parent. The manager and the child body both derive
     /// through here, so registry and file agree by construction.
-    pub(crate) fn child_path(
-        parent_path: &Path,
-        agent_id: &str,
-        name: &str,
-        generation: u32,
-    ) -> PathBuf {
+    pub fn child_path(parent_path: &Path, agent_id: &str, name: &str, generation: u32) -> PathBuf {
         let dir = parent_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -364,7 +359,7 @@ impl Session {
     /// parent transcript: `list_all`/`list` read only direct `.jsonl`
     /// files in each session directory and the loaders take explicit
     /// paths, so `agents/*` is never ingested into the parent history.
-    pub(crate) fn child(
+    pub fn child(
         parent_path: &Path,
         cwd: &str,
         agent_id: &str,
@@ -412,7 +407,7 @@ impl Session {
         })
     }
 
-    pub(crate) fn in_memory(cwd: String) -> Self {
+    pub fn in_memory(cwd: String) -> Self {
         Self {
             header: SessionHeader {
                 entry_type: "session".to_string(),
@@ -428,7 +423,7 @@ impl Session {
         }
     }
 
-    pub(crate) fn open_or_continue(
+    pub fn open_or_continue(
         cwd: String,
         session_path: Option<&Path>,
         no_session: bool,
@@ -446,8 +441,8 @@ impl Session {
 
     // Session pickers (`/resume` sheet, remote UI) are the only runtime
     // callers; tests exercise them directly.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+
+    pub fn list(cwd: &str) -> io::Result<Vec<(PathBuf, SessionHeader)>> {
         discovery::list(cwd)
     }
 
@@ -456,14 +451,13 @@ impl Session {
     /// frame while `/resume ...` sits in the composer.
     // Session pickers (`/resume` sheet, remote UI) are the only runtime
     // callers; tests exercise them directly.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
+    pub fn list_dir_mtime(cwd: &str) -> Option<SystemTime> {
         discovery::list_dir_mtime(cwd)
     }
 
     /// List every persisted session across all workspaces (registry rebuild
     /// and disk-backed `GET /api/sessions`).
-    pub(crate) fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+    pub fn list_all() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
         discovery::list_all()
     }
 
@@ -473,7 +467,7 @@ impl Session {
     /// to locate a single session. Each filename hit is confirmed by one
     /// header-only `from_path` read; anything unconfirmed (renamed stems,
     /// legacy files) falls through to the `list_all` scan at the caller.
-    pub(crate) fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
+    pub fn find_by_id_filename(sid: &str) -> Option<PathBuf> {
         discovery::find_by_id_filename(sid)
     }
 
@@ -483,7 +477,7 @@ impl Session {
     /// or daemon-restart-killed child). Deliberately separate from
     /// `list`/`list_all`, whose loaders must keep excluding `agents/*`.
     /// Sorted by header timestamp, newest first, like the other listings.
-    pub(crate) fn list_children(
+    pub fn list_children(
         parent_path: &Path,
     ) -> io::Result<Vec<(PathBuf, SessionHeader, &'static str)>> {
         let dir = Self::agents_dir(parent_path);
@@ -503,7 +497,7 @@ impl Session {
     /// Directory holding a session's child-agent transcripts (`agents/`
     /// beside the session file). Single spelling shared by `list_children`
     /// and the §31 listing pre-scan.
-    pub(crate) fn agents_dir(parent_path: &Path) -> PathBuf {
+    pub fn agents_dir(parent_path: &Path) -> PathBuf {
         parent_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -514,7 +508,7 @@ impl Session {
     /// total runs plus interrupted ones. One header-only dir scan plus one
     /// turn-state scan per child; `list_sessions` calls it once per distinct
     /// dir instead of once per session file.
-    pub(crate) fn count_children(dir: &Path) -> (usize, usize) {
+    pub fn count_children(dir: &Path) -> (usize, usize) {
         let children = discovery::scan_jsonl_dir(dir);
         let interrupted = children
             .iter()
@@ -523,7 +517,7 @@ impl Session {
         (children.len(), interrupted)
     }
 
-    pub(crate) fn set_name(&mut self, name: String) -> io::Result<()> {
+    pub fn set_name(&mut self, name: String) -> io::Result<()> {
         self.header.name = Some(name.clone());
         let entry = SessionInfoEntry {
             entry_type: "session_info".to_string(),
@@ -534,7 +528,7 @@ impl Session {
         self.append_line(&entry)
     }
 
-    pub(crate) fn append_message(&mut self, message: &ChatMessage) -> io::Result<()> {
+    pub fn append_message(&mut self, message: &ChatMessage) -> io::Result<()> {
         let id = self.next_id();
         let timestamp = Self::now_iso();
         self.append_line_inner(
@@ -562,8 +556,8 @@ impl Session {
     }
 
     // `/clear` (TUI) is the only runtime caller; tests exercise it directly.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) fn clear_messages(&mut self) -> io::Result<()> {
+
+    pub fn clear_messages(&mut self) -> io::Result<()> {
         let entry = SessionClearEntry {
             entry_type: "clear".into(),
             id: self.next_id(),
@@ -590,7 +584,7 @@ impl Session {
     /// pointed at the renamed-away inode) and the snapshot publishes fused
     /// with its new identity, mirroring the loader (System role skipped).
     /// In-memory sessions (no path) are a no-op, like the appends were.
-    pub(crate) fn rewrite_messages(&mut self, messages: &[ChatMessage]) -> io::Result<()> {
+    pub fn rewrite_messages(&mut self, messages: &[ChatMessage]) -> io::Result<()> {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
@@ -677,18 +671,14 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn turn_event(&mut self, event: &str) -> io::Result<()> {
+    pub fn turn_event(&mut self, event: &str) -> io::Result<()> {
         self.turn_event_full(event, None)
     }
 
     /// `turn_start` that also records the governing agent mode so a
     /// reattach restores the client's last selector (`None` = no mode,
     /// legacy/subagent rows serialize unchanged).
-    pub(crate) fn turn_event_with_mode(
-        &mut self,
-        event: &str,
-        mode: Option<&str>,
-    ) -> io::Result<()> {
+    pub fn turn_event_with_mode(&mut self, event: &str, mode: Option<&str>) -> io::Result<()> {
         self.turn_event_full(event, mode)
     }
 
@@ -705,7 +695,7 @@ impl Session {
     /// Durable side-effect intent: recorded BEFORE the tool executes so a
     /// restart can see effects that started but never completed.
     #[cfg(test)]
-    pub(crate) fn effect_start(
+    pub fn effect_start(
         &mut self,
         tool_call_id: &str,
         name: &str,
@@ -725,7 +715,7 @@ impl Session {
 
     /// Durable side-effect outcome: recorded AFTER the tool executed.
     #[cfg(test)]
-    pub(crate) fn effect_result(&mut self, tool_call_id: &str, ok: bool) -> io::Result<()> {
+    pub fn effect_result(&mut self, tool_call_id: &str, ok: bool) -> io::Result<()> {
         let entry = SessionEffectEntry {
             entry_type: "effect_result".into(),
             id: self.next_id(),
@@ -738,7 +728,7 @@ impl Session {
         self.append_line(&entry)
     }
 
-    pub(crate) fn set_state(&mut self, key: &str, value: &str) -> io::Result<()> {
+    pub fn set_state(&mut self, key: &str, value: &str) -> io::Result<()> {
         let entry = SessionStateEntry {
             entry_type: "session_state".into(),
             id: self.next_id(),
@@ -816,19 +806,19 @@ impl Session {
             .unwrap_or_default()
             .to_rfc3339()
     }
-    pub(crate) fn id(&self) -> &str {
+    pub fn id(&self) -> &str {
         &self.header.id
     }
     /// The workspace the session was recorded from (its header cwd). The tool
     /// workspace is the daemon's cwd, so the two differ after a cross-directory
     /// reattach.
-    pub(crate) fn cwd(&self) -> &str {
+    pub fn cwd(&self) -> &str {
         &self.header.cwd
     }
-    pub(crate) fn name(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&str> {
         self.header.name.as_deref()
     }
-    pub(crate) fn path(&self) -> Option<&Path> {
+    pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
     /// Display helper for `/session`: number of recorded turns
@@ -836,8 +826,7 @@ impl Session {
     /// streaming scan is fine — and it matches the label better than the
     /// old journal-line counter did.
     // `/resume` sheet (TUI) is the only runtime caller.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) fn count_turns(&self) -> usize {
+    pub fn count_turns(&self) -> usize {
         let Some(path) = self.path.as_deref() else {
             return 0;
         };
@@ -850,20 +839,20 @@ impl Session {
         turns
     }
     // `/resume` sheet (TUI) is the only runtime caller.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    pub(crate) fn display_name(&self) -> String {
+
+    pub fn display_name(&self) -> String {
         self.name().unwrap_or(self.id()).to_string()
     }
 
     /// Path of the per-session SSE event journal (`<id>.events.jsonl`).
-    pub(crate) fn events_path(&self) -> Option<PathBuf> {
+    pub fn events_path(&self) -> Option<PathBuf> {
         self.path.as_ref().map(|p| p.with_extension("events.jsonl"))
     }
 }
 
 /// Serialize discovered skills for the session-start `skills` state entry:
 /// a JSON array of `{name, description, path}` objects.
-fn skills_state_value(skills: &[crate::protocol::Skill]) -> String {
+fn skills_state_value(skills: &[dex_skills::Skill]) -> String {
     let entries: Vec<serde_json::Value> = skills
         .iter()
         .map(|s| {
@@ -877,7 +866,7 @@ fn skills_state_value(skills: &[crate::protocol::Skill]) -> String {
     serde_json::to_string(&entries).unwrap_or_default()
 }
 
-pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
+pub fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
     // Snapshot hit: byte-identical to a previous parse — no file IO at all.
     if let Some(mut messages) = history_cache_get(path) {
         repair_dangling_tool_calls(&mut messages);
@@ -894,21 +883,17 @@ pub(crate) fn load_messages_from_session(path: &Path) -> io::Result<Vec<ChatMess
 /// two passes (the snapshot stores messages only); the cold path — the one
 /// that blocks first paint — pays one.
 // Remote UI reattach (TUI) is the only runtime caller.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
-pub(crate) fn load_messages_and_plan(
-    path: &Path,
-) -> io::Result<(Vec<ChatMessage>, crate::protocol::Plan)> {
+pub fn load_messages_and_plan_raw(path: &Path) -> io::Result<(Vec<ChatMessage>, Option<String>)> {
     if let Some(mut messages) = history_cache_get(path) {
         repair_dangling_tool_calls(&mut messages);
-        return Ok((messages, load_plan(path)));
+        let plan = load_session_state(path)
+            .ok()
+            .and_then(|m| m.get("plan").cloned());
+        return Ok((messages, plan));
     }
     let (mut messages, plan) = scan_history(path)?;
     repair_dangling_tool_calls(&mut messages);
-    Ok((
-        messages,
-        plan.map(|s| crate::protocol::Plan::from_json(&s))
-            .unwrap_or_default(),
-    ))
+    Ok((messages, plan))
 }
 
 /// Streaming history scan shared by the message loaders: message/clear
@@ -987,7 +972,7 @@ fn scan_history(path: &Path) -> io::Result<(Vec<ChatMessage>, Option<String>)> {
 /// to history and shown in the TUI, but never sent to the LLM). Transcript
 /// rebuilds keep the unfiltered [`load_messages_from_session`] so `!!`
 /// stays visible there.
-pub(crate) fn load_llm_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
+pub fn load_llm_messages_from_session(path: &Path) -> io::Result<Vec<ChatMessage>> {
     Ok(load_messages_from_session(path)?
         .into_iter()
         .filter(|m| !m.is_context_excluded())
@@ -1036,7 +1021,7 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
             pos,
             ChatMessage::tool_result(
                 id,
-                crate::render::format::model_tool_result(
+                model_tool_result(
                     "Error: tool result missing — the agent exited before it was recorded; the call may have executed. Verify the effect on disk before retrying.",
                 ),
             ),
@@ -1048,9 +1033,7 @@ fn repair_dangling_tool_calls(messages: &mut Vec<ChatMessage>) {
 /// No async production consumer yet (the TUI replays via SSE); test-only
 /// until one lands.
 #[cfg(test)]
-pub(crate) async fn load_messages_from_session_async(
-    path: PathBuf,
-) -> io::Result<Vec<ChatMessage>> {
+pub async fn load_messages_from_session_async(path: PathBuf) -> io::Result<Vec<ChatMessage>> {
     tokio::task::spawn_blocking(move || load_messages_from_session(&path))
         .await
         .map_err(io::Error::other)?
@@ -1059,29 +1042,19 @@ pub(crate) async fn load_messages_from_session_async(
 impl Session {
     /// Async `list_all`: `JoinSet` (`spawn_blocking` per file, join, sort) —
     /// fixes the linear scan (S2 cold-start 50x10ms ~500ms → ~50ms parallel).
-    pub(crate) async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
+    pub async fn list_all_async() -> io::Result<Vec<(PathBuf, SessionHeader)>> {
         discovery::list_all_async().await
     }
 }
 
-// `load_messages_and_plan` (TUI-only reattach) is the only caller.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
-pub(crate) fn load_plan(path: &Path) -> crate::protocol::Plan {
-    load_session_state(path)
-        .ok()
-        .and_then(|m| m.get("plan").cloned())
-        .map(|s| crate::protocol::Plan::from_json(&s))
-        .unwrap_or_default()
+/// Cap + shape of tool results the model sees (50 KiB / 2 lines); mirrors
+/// the app-side `render::format::model_tool_result` so synthesized repair
+/// messages match real tool output shaping.
+fn model_tool_result(text: &str) -> String {
+    dex_agent_core::truncate_text(text, 50 * 1024, 2_000)
 }
 
-#[allow(dead_code)]
-pub(crate) fn save_plan(session: &mut Session, plan: &crate::protocol::Plan) -> io::Result<()> {
-    session.set_state("plan", &plan.to_json())
-}
-
-pub(crate) fn load_session_state(
-    path: &Path,
-) -> io::Result<std::collections::HashMap<String, String>> {
+pub fn load_session_state(path: &Path) -> io::Result<std::collections::HashMap<String, String>> {
     let mut state = std::collections::HashMap::new();
     let mut header = true;
     for_each_line(path, |line| {

@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::protocol::Skill;
+use crate::Skill;
 
-use super::parse::{parse_frontmatter, parse_skill, skill_name_ok};
+use crate::parse::{parse_frontmatter, parse_skill, skill_name_ok};
 
-pub(crate) fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
+pub fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
     // The daemon calls this per chat turn (system prompt) and per
     // `/api/skills`; each call scans 4+ dirs + parses SKILL.md frontmatter.
     // Cache 10s keyed by the dir list — skill edits appear within seconds,
@@ -40,7 +40,7 @@ pub(crate) fn discover_skills(dirs: &[PathBuf]) -> Vec<Skill> {
     skills
 }
 
-pub(crate) fn discover_skills_fresh(dirs: &[PathBuf]) -> Vec<Skill> {
+pub fn discover_skills_fresh(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in dirs {
@@ -70,7 +70,7 @@ pub(crate) fn discover_skills_fresh(dirs: &[PathBuf]) -> Vec<Skill> {
     skills
 }
 
-pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> {
+pub async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> {
     // Async dir scans (`read_dir`, concurrent `SKILL.md` reads): 10s cache
     // lives in `discover_skills`; explicit `/skill` loads bypass it.
     let mut dir_entries: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
@@ -123,7 +123,7 @@ pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> 
             });
         }
     }
-    let mut found: Vec<(usize, crate::protocol::Skill)> = Vec::new();
+    let mut found: Vec<(usize, crate::Skill)> = Vec::new();
     while let Some(r) = set.join_next().await {
         if let Ok(Some(s)) = r {
             found.push(s);
@@ -152,7 +152,7 @@ pub(crate) async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> 
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) async fn discover_skills_async(dirs: &[PathBuf]) -> Vec<Skill> {
+pub async fn discover_skills_async(dirs: &[PathBuf]) -> Vec<Skill> {
     // 10s cache keyed by dir list (same as sync); hits are a mutex bump inline,
     // misses run the async scan above (no spawn_blocking needed — dir scans are async).
     static CACHE_ASYNC: std::sync::OnceLock<
@@ -176,7 +176,7 @@ pub(crate) async fn discover_skills_async(dirs: &[PathBuf]) -> Vec<Skill> {
     skills
 }
 
-pub(crate) fn skill_dirs() -> Vec<PathBuf> {
+pub fn skill_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // Project-level skills
     if let Ok(cwd) = env::current_dir() {

@@ -106,7 +106,7 @@ fn handle_event_prints_and_only_asks_on_approvals() {
 #[test]
 fn one_shot_shell_escape_runs_on_the_daemon() {
     use std::time::Duration;
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let data_dir = std::env::temp_dir().join(format!("dex-repl-shell-{}", std::process::id()));
@@ -115,7 +115,7 @@ fn one_shot_shell_escape_runs_on_the_daemon() {
         [("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME"))]
             .into_iter()
             .collect();
-    let _env = crate::session::EnvGuard(saved);
+    let _env = crate::test_env::EnvGuard(saved);
     std::env::set_var("XDG_DATA_HOME", &data_dir);
 
     // The real daemon router (no LLM involved).

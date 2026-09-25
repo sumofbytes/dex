@@ -94,7 +94,7 @@ async fn delegate_rejects_unresolvable_model_before_spawning() {
     // Complexity-based override fails fast: an unresolvable `model`
     // returns InvalidArgument without spawning a child (no Running
     // entry the parent must poll to discover the error).
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let saved = [
@@ -184,7 +184,7 @@ fn resolve_child_config_applies_override_once_and_inherits_on_none() {
     // Success path the failure test above doesn't cover: a same-provider
     // bare id resolves without credentials, `None` clones the parent,
     // and the resolved config is what the child (and grandchild) runs.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("dex-delegate-model-ok-{}", std::process::id()));
@@ -287,7 +287,7 @@ async fn resume_messages_reapplies_persona_and_appends_nudge() {
     // §24.3 (review fix): the journal never stores the System role, so
     // `resume_messages` must re-apply the persona from the definition —
     // a resumed child runs with the same persona it started with.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = PathBuf::from("/tmp/dex-supervision-resume-msgs");
@@ -364,7 +364,7 @@ async fn resume_messages_rejects_an_empty_transcript_loudly() {
     // §24.3 review fix: an empty replay (turn_start without any message
     // line) must NOT fall back to the degenerate seed task — it fails
     // Permanent so the parent re-delegates with a fresh task.
-    let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = PathBuf::from("/tmp/dex-supervision-resume-empty");
@@ -526,7 +526,7 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
                         summary: "partial".to_string(),
                         error: Some("timed out after 600s".to_string()),
                         usage: None,
-                        reason: ExitReason::Exhausted(crate::agent::subagent::ExhaustKind::Timeout),
+                        reason: ExitReason::Exhausted(crate::agent::delegate::ExhaustKind::Timeout),
                         tool_calls: 4,
                         resume: Some(ResumeHandle {
                             agent_id: AgentId("sess-0".to_string()),
