@@ -135,7 +135,7 @@ pub(crate) fn system_prompt(skills: &[Skill]) -> String {
     system_prompt_with_override(skills, None)
 }
 
-/// Same as [`system_prompt`], with an explicit per-request/CLI text override
+/// Same as `system_prompt`, with an explicit per-request/CLI text override
 /// (already resolved client-side, so remote daemons need no file access).
 /// `Some` replaces the built-in base; `None` falls back to the env/file
 /// layers via `system_prompt_origin`.

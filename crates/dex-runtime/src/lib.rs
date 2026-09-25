@@ -2,9 +2,11 @@
 //! logging (`log!`), shared async HTTP client pools, cancellation, dedup'd
 //! warnings (`notice`), unwind guards, and headless text formatting.
 //!
-//! This crate is intentionally small and dependency-light: it is the base
-//! of the dependency graph, so both the server (`dex-server`) and the thin
-//! client (`dex`) can link it.
+//! This crate sits at the base of the dependency graph, so both the server
+//! (`dex-server`) and the thin client (`dex`) can link it. It is small, but
+//! not dependency-free: it pulls `dex-ai` (model/message types),
+//! `dex-protocol` (wire vocabulary), `dex-agent-core` (agent vocabulary),
+//! `reqwest`, and full-feature `tokio`.
 
 pub mod runtime;
 pub use runtime::*;

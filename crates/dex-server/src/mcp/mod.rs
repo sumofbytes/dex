@@ -8,7 +8,7 @@
 //! allowlist/denylist per server, a schema cap so one chatty server cannot
 //! flood the context. See `SECURITY.md` (MCP section) for the threat model.
 //!
-//! Performance: one shared reqwest client, cached [`ToolDefinition`]s merged
+//! Performance: one shared reqwest client, cached `ToolDefinition`s merged
 //! synchronously into `tools_schema()` (never blocks the turn loop), fan-out
 //! refresh via `JoinSet`, per-server timeout, 32 KiB output clamp. One bad
 //! server goes `down` and never breaks the turn.

@@ -1,7 +1,7 @@
 //! Pure fence-tag / file-path language mapping and the tone-tagged generic
 //! fallback lexer. No terminal dependency: both the TUI highlighter
 //! (`theme::highlight`) and the headless ANSI printer consume these and
-//! resolve [`Tone`] to their own color representation.
+//! resolve `Tone` to their own color representation.
 
 /// Semantic token class emitted by the fallback lexer; resolved to a terminal
 /// color by the consumer (TUI spans or headless SGR).
@@ -74,7 +74,7 @@ pub fn lang_from_path(path: &str) -> &'static str {
 /// Fence info string -> highlight key (`ratatui-markdown::get_lang` only
 /// matches exact lowercase tags). Strips our legacy trailing `:`, drops
 /// params (`rust ignore`, `js linenums`), lowercases, then canonicalizes
-/// through [`canonical_lang`]. Unknown tags pass through raw so `get_lang`
+/// through `canonical_lang`. Unknown tags pass through raw so `get_lang`
 /// can still match its own native aliases; plain-text tags stay empty (dim).
 /// Shared by the TUI renderer (`ui::render::split_markdown`) and the headless
 /// `print_code_block`, so both paths agree on every fence.

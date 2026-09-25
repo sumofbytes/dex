@@ -225,7 +225,7 @@ pub fn load_dex_models_cache() -> Option<Vec<String>> {
 }
 
 /// Refresh the dex models cache via models.dev.
-/// Fetches https://models.dev/api.json (no auth) and caches to
+/// Fetches `https://models.dev/api.json` (no auth) and caches to
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
 /// and autocomplete without network.
 pub async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {

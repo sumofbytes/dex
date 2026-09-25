@@ -243,8 +243,8 @@ fn tool_result_block(message: &ChatMessage) -> Value {
 }
 
 /// Shared tool schemas → Anthropic shape (`input_schema` instead of the
-/// OpenAI `function.parameters` wrapper). Merge + tail-sort via
-/// [`wire_tools`](crate::llm::protocol::wire_tools); only the per-tool
+/// OpenAI `function.parameters` wrapper). Merge + tail-sort via `wire_tools`;
+/// only the per-tool
 /// mapping differs per wire shape.
 pub fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     wire_tools(tools, |tool| {
