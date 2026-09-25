@@ -11,19 +11,20 @@ keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
-members = ["crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
-default-members = [".", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
+members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
+default-members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
 resolver = "2"
 
 [features]
 # `tui` owns every terminal-UI dependency (ratatui, crossterm,
-# ratatui-markdown/tree-sitter highlighters, terminal-colorsaurus). The
-# daemon + client library build without it: `cargo build
-# --no-default-features` produces a headless binary/library that never
-# links the TUI stack, so an embedder can ship their own UI against
-# `dex::client` + `dex::daemon` with a much smaller dependency tree.
+# ratatui-markdown/tree-sitter highlighters). The daemon + client library
+# build without it: `cargo build --no-default-features` produces a headless
+# binary/library that never links the TUI stack, so an embedder can ship
+# their own UI against `dex::client` + `dex_server::daemon` with a much
+# smaller dependency tree.
 default = ["tui"]
 tui = [
+    "dex-server/tui",
     "dep:ratatui",
     "dep:crossterm",
     "dep:ratatui-markdown",
@@ -31,30 +32,12 @@ tui = [
 network-tests = []
 
 [dependencies]
-dex-protocol = { version = "0.1.0", path = "crates/dex-protocol" }
-dex-ai = { version = "0.1.0", path = "crates/dex-ai" }
-dex-agent-core = { version = "0.1.0", path = "crates/dex-agent-core" }
-dex-coding-agent = { version = "0.1.0", path = "crates/dex-coding-agent" }
+dex-server = { version = "0.1.0", path = "crates/dex-server" }
+dex-runtime = { version = "0.1.0", path = "crates/dex-runtime" }
 dex-client = { version = "0.1.0", path = "crates/dex-client" }
 dex-skills = { version = "0.1.0", path = "crates/dex-skills" }
-dex-session = { version = "0.1.0", path = "crates/dex-session" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
-# http2: chatgpt/codex negotiates h2 (curl + codex CLI do); without it dex
-# forces h1 and gets a transport reset while they succeed. system-proxy:
-# macOS Settings proxy that curl/codex honor; dex did not, so direct
-# connect failed behind it while they worked. socks: SOCKS proxies
-# (127.0.0.1:8081-style) that curl supports; without it dex ignores the
-# env proxy and tries direct connect.
-  reqwest = { version = "0.13", default-features = false, features = [
-      "json",
-      "stream",
-      "rustls",
-      "http2",
-      "system-proxy",
-      "socks",
-  ] }
 chrono = "0.4"
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
@@ -92,27 +75,14 @@ ratatui-markdown = { version = "0.3.6", optional = true, default-features = fals
     "highlight-lang-xml",
 ] }
 unicode-width = "0.2"
-similar = "3"
-terminal-colorsaurus = "1.0.3"
+http = "1"
 
 # Client-server architecture
-axum = "0.8"
   tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util", "signal"] }
-futures-core = "0.3"
 uuid = { version = "1", features = ["v4"] }
-fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
-# MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
-base64 = "0.23"
-sha2 = "0.11"
-# Lua extension runtime: sandboxed scripting VM for harness extensions
-# (Lua extensions plan, removed from the repo). Vendored: no system lua dependency.
-# lua54: battle-tested over lua55 (plan §13.2). async: host capabilities
-# awaited from Lua (P1+ hooks). No `send`: each VM is pinned to its own
-# worker thread (engine.rs), so Lua values never cross threads.
-mlua = { version = "0.12", features = ["lua54", "vendored", "async"] }
 
 [dev-dependencies]
-http = "1"
+axum = "0.8"
 
 # Symbols for profilers (parca-agent / perf / heaptrack) without touching
 # release output: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling

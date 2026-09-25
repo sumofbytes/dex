@@ -477,29 +477,17 @@ name = "dex"
 version = "0.14.0"
 dependencies = [
  "axum",
- "base64 0.23.1",
  "chrono",
  "crossterm",
- "dex-agent-core",
- "dex-ai",
  "dex-client",
- "dex-coding-agent",
- "dex-protocol",
- "dex-session",
+ "dex-runtime",
+ "dex-server",
  "dex-skills",
- "fff-search",
- "futures-core",
  "http",
- "mlua",
  "ratatui",
  "ratatui-markdown",
- "reqwest",
  "serde",
  "serde_json",
- "serde_yaml",
- "sha2",
- "similar",
- "terminal-colorsaurus",
  "tokio",
  "unicode-width 0.2.0",
  "uuid",
@@ -553,6 +541,52 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dex-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dex-agent-core",
+ "dex-ai",
+ "dex-protocol",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "dex-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "dex-agent-core",
+ "dex-ai",
+ "dex-client",
+ "dex-coding-agent",
+ "dex-protocol",
+ "dex-runtime",
+ "dex-session",
+ "dex-skills",
+ "fff-search",
+ "futures-core",
+ "http",
+ "mlua",
+ "ratatui",
+ "ratatui-markdown",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "similar",
+ "terminal-colorsaurus",
+ "tokio",
+ "unicode-width 0.2.0",
+ "uuid",
 ]
 
 [[package]]

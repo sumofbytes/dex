@@ -8,18 +8,6 @@ use crate::protocol::PermissionMode;
 mod client_options;
 pub(crate) use client_options::{chat_options_from_args, cli_system_prompt};
 
-/// Split a `!`/`!!` shell escape into `(command, exclude_from_context)`.
-/// `!cmd` feeds the next turn; `!!cmd` stays out of model context. Bare
-/// prefixes fall through to normal prompt handling.
-pub(crate) fn parse_shell_escape(line: &str) -> Option<(String, bool)> {
-    let (rest, excluded) = match line.strip_prefix("!!") {
-        Some(rest) => (rest, true),
-        None => (line.strip_prefix('!')?, false),
-    };
-    let command = rest.trim().to_string();
-    (!command.is_empty()).then_some((command, excluded))
-}
-
 #[derive(Clone)]
 pub struct Args {
     pub base_url: Option<String>,

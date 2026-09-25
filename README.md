@@ -906,7 +906,7 @@ configured context budget. Progress is reported through a dex `Console`
 (streamed lines + approval requests).
 
 In client–server mode the daemon runs `process_turn` on a blocking thread and
-translates console output into `StreamEvent`s over SSE (`src/daemon/server/`).
+translates console output into `StreamEvent`s over SSE (`crates/dex-server/src/daemon/server/`).
 The TUI (`src/ui/remote/`) consumes those events from a worker thread and
 renders them live; approvals and cancellation are round-tripped over
 `POST .../approve` and `POST .../cancel`. The local TUI (`src/ui/app.rs`) runs
