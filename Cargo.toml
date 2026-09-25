@@ -75,7 +75,6 @@ ratatui-markdown = { version = "0.3.6", optional = true, default-features = fals
     "highlight-lang-xml",
 ] }
 unicode-width = "0.2"
-http = "1"
 
 # Client-server architecture
   tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util", "signal"] }

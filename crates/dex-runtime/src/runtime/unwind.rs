@@ -3,7 +3,7 @@
 //! `Err(message)` instead of aborting its task. Shared by the daemon turn
 //! runner (a panicking turn must still deliver `TurnFailed`) and the
 //! sub-agent manager (a panicking child body must still file a `Failed`
-//! result — plan §14: no terminal path may orphan a registry entry).
+//! result — no terminal path may orphan a registry entry).
 
 pub struct CatchUnwind<F> {
     inner: std::pin::Pin<Box<F>>,

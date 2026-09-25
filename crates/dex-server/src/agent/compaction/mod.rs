@@ -22,16 +22,11 @@ pub(crate) use super::tokens::estimate_tokens;
 pub(crate) const KEEP_RECENT_MESSAGES: usize = 12;
 pub(crate) const MIN_MESSAGES_TO_SUMMARIZE: usize = 8;
 
-// ---------------------------------------------------------------------------
-// Helpers: cut points, turn starts, file ops, serialization
-// ---------------------------------------------------------------------------
-
 fn is_cut_point_message(msg: &ChatMessage) -> bool {
     matches!(msg.role, Role::User | Role::Assistant)
 }
 
 fn is_turn_start_message(msg: &ChatMessage) -> bool {
-    // Only user messages start a turn.
     msg.role == Role::User
 }
 

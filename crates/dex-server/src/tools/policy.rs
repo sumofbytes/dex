@@ -80,7 +80,7 @@ impl Policy {
     }
 }
 
-/// Phase 0 approval gate: dispatch consults the turn's policy before any
+/// Approval gate: dispatch consults the turn's policy before any
 /// tool runs. Reads always pass; `trusted` passes everything; otherwise
 /// mutating tools park an `ApprovalRequest` on the console's approval
 /// channel and block for the verdict, with session approvals
@@ -168,7 +168,7 @@ pub async fn enforce_policy(
     }
 }
 
-/// Allowlist enforced at dispatch (Phase 2 runtime extraction; plan §11).
+/// Allowlist enforced at dispatch.
 /// `owner` names the agent the set belongs to and appears in denial errors
 /// so the model can self-correct; `allowed` holds exact tool names plus
 /// `prefix*` wildcards (`mcp__gh__*` covers one server; `mcp__*` covers all
