@@ -15,8 +15,7 @@ use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, Toke
 use crate::llm::config::LlmConfig;
 use crate::protocol::{ChatMessage, ModelEvent, QueueMsg, SinkLine, StopReason};
 use crate::render::format::{
-    model_tool_result, preview_skips_first_line, tool_preview, tool_preview_body,
-    tool_result_summary,
+    model_tool_result, tool_preview, tool_preview_body, tool_result_summary,
 };
 use crate::runtime::console::{Console, RESET, TOOL_OUTPUT_COLOR};
 use crate::session::Session;
@@ -304,13 +303,8 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                     if result.cache_hit {
                         summary = format!("cached · {summary}");
                     }
-                    let preview = tool_preview(
-                        &name,
-                        succeeded,
-                        result.diff.as_deref(),
-                        &result.text,
-                        preview_skips_first_line(&name, succeeded, &result.text),
-                    );
+                    let preview =
+                        tool_preview(&name, succeeded, result.diff.as_deref(), &result.text);
                     SinkLine::ToolOutput {
                         id: call.id.clone(),
                         name: name.clone(),

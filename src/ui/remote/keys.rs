@@ -511,13 +511,7 @@ pub(crate) fn finish_shell_command(
     if excluded {
         summary.push_str(" · excluded from context");
     }
-    let preview = crate::render::format::tool_preview(
-        "bash",
-        success,
-        None,
-        output,
-        crate::render::format::preview_skips_first_line("bash", success, output),
-    );
+    let preview = crate::render::format::tool_preview("bash", success, None, output);
     append_sink_line(
         &mut remote.app,
         SinkLine::ToolOutput {

@@ -20,6 +20,18 @@ fn clipped_at_budget() -> String {
     format!("{}…", "l".repeat(PREVIEW_LINE_COLS - 1))
 }
 
+/// First non-empty, trimmed line of a tool result, truncated to the shared
+/// [`PREVIEW_LINE_COLS`] display-column budget with a visible `…` on cut —
+/// the same standard as the tool-input preview row.
+fn one_line_summary(text: &str) -> String {
+    let stripped = strip_ansi(text);
+    let line = stripped
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    truncate_cols(line.trim(), PREVIEW_LINE_COLS)
+}
+
 /// The approval prompt must show the `then_run` shell command. An
 /// approver who only sees the file diff is approving something broader than
 /// what the summary describes.
@@ -663,12 +675,46 @@ fn freeform_summaries_count_lines_and_carry_exit_codes() {
 
 #[test]
 fn preview_skip_matches_summary_echo() {
-    // Counts-only successes show everything; failures skip the echoed line.
-    assert!(!preview_skips_first_line("read", true, "a\nb"));
-    assert!(preview_skips_first_line("read", false, "a\nb"));
-    // Bash/generic: single-line echoes (skip), multi-line counts (keep).
-    assert!(preview_skips_first_line("bash", true, "solo"));
-    assert!(!preview_skips_first_line("bash", true, "one\ntwo"));
-    assert!(!preview_skips_first_line("mcp__x__y", true, "one\ntwo"));
-    assert!(preview_skips_first_line("bash", false, "boom\n[exit 1]"));
+    // Failures skip the echoed first line and never repeat the exit code
+    // the summary already carries (`failed (exit 1) · boom`).
+    assert_eq!(
+        tool_preview("bash", false, None, "boom\n[exit 1]"),
+        Vec::<String>::new()
+    );
+    // Bash/generic: single-line successes echo in the summary (skip);
+    // multi-line ones collapse to a count, so the preview keeps all lines.
+    assert_eq!(
+        tool_preview("bash", true, None, "solo"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        tool_preview("bash", true, None, "one\ntwo"),
+        vec!["one", "two"]
+    );
+    // Counts-only successes show everything.
+    assert_eq!(
+        tool_preview("grep", true, None, "a.rs\nb.rs"),
+        vec!["a.rs", "b.rs"]
+    );
+    // write/edit success skips the echoed result line when there is no diff.
+    assert_eq!(
+        tool_preview("write", true, None, "wrote x\nbody"),
+        vec!["body"]
+    );
+}
+
+#[test]
+fn exit_code_requires_a_marker_shaped_line() {
+    // A `[exit …]` mention inside ordinary output is not an exit code:
+    // the summary stays `failed · …` without a spurious code, and the
+    // mention survives as content.
+    assert_eq!(
+        summary("bash", "{}", "error: bad [exit 1]", false),
+        "failed · error: bad [exit 1]"
+    );
+    // A real trailing marker is recognized even after stderr content.
+    assert_eq!(
+        summary("bash", "{}", "boom\n--- stderr ---\nerr\n[exit 2]", false),
+        "failed (exit 2) · boom"
+    );
 }
