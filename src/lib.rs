@@ -2,7 +2,7 @@
 //!
 //! The server side (daemon, agent turn engine, provider clients, tools,
 //! MCP, extensions, sessions, headless rendering) lives in the standalone
-//! [`dex-server`](https://docs.rs/dex-server) crate; this crate is a thin
+//! `dex-server` crate; this crate is a thin
 //! client that talks to it over HTTP+SSE via [`client`] (or an in-process
 //! loopback socket for `dex`'s default mode). It re-exports the server API
 //! so `dex serve` and embedders can bootstrap a daemon from the binary.

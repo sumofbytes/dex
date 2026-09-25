@@ -139,8 +139,11 @@ fn render_inline_ansi(text: &str) -> String {
     out.push_str(rest);
     out
 }
+// Unconditional: `VOICE_SERIAL` below is a test helper also reached from
+// the `dex` client tests, and the headless build must still compile it.
+use std::sync::Mutex;
 #[cfg(feature = "tui")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 #[cfg(feature = "tui")]
 use ratatui::style::Color;

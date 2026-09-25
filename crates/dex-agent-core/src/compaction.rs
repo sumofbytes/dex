@@ -85,7 +85,7 @@ fn format_file_operations(read_files: &[String], modified_files: &[String]) -> S
 
 /// Deterministic fallback when the LLM summarizer fails or is cancelled.
 /// Structured summary: Goal, Constraints, Progress, Key Decisions, Next Steps, Critical Context,
-/// plus <read-files>/<modified-files>. Keeps file ops and verification failures.
+/// plus `<read-files>`/`<modified-files>`. Keeps file ops and verification failures.
 pub fn deterministic_summary(
     old: &[ChatMessage],
     turn_prefix: &[ChatMessage],

@@ -9,17 +9,30 @@
 //! a thin client over this API: its TUI talks to the daemon through
 //! `dex-client` over HTTP+SSE (or an in-process loopback socket).
 
+/// Historical `crate::agent::` paths for the turn-loop lifecycle wrapper.
+/// Internal: was `pub(crate)` before the crate split; `#[doc(hidden)]` is an
+/// interim signal until the embedder surface is curated.
+#[doc(hidden)]
 pub mod agent;
+#[doc(hidden)]
 pub mod auth;
 pub mod daemon;
 pub mod extensions;
 pub mod llm;
 pub mod mcp;
 pub mod protocol;
+/// Historical `crate::render::` paths for the headless format/theme.
+/// Internal: was `pub(crate)` before the crate split.
+#[doc(hidden)]
 pub mod render;
 pub mod session;
+#[doc(hidden)]
 pub mod telemetry;
+/// Historical `crate::tools::` paths for the workspace-confined tools.
+/// Internal: was `pub(crate)` before the crate split.
+#[doc(hidden)]
 pub mod tools;
+#[doc(hidden)]
 pub mod workspace;
 
 /// Process-global runtime lives in the standalone `dex-runtime` crate; the

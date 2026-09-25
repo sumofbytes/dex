@@ -82,7 +82,7 @@ pub struct AgentTurnContext {
     pub config: Arc<LlmConfig>,
     pub manager: AgentManager,
     /// Snapshot of the parent session's "allow for session" keys (same
-    /// scope as [`Console::approval_key`]) — children outlive the turn that
+    /// scope as `Console::approval_key`) — children outlive the turn that
     /// spawned them, so the set they inherit is seeded at spawn (§12; the
     /// live-consulted variant is V1b).
     pub session_approvals: HashSet<String>,

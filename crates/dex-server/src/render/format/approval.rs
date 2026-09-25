@@ -9,7 +9,7 @@ pub fn approval_title(name: &str, input: &str) -> &'static str {
     approval_title_with_then_run(name, input_has_then_run(input))
 }
 
-/// [`approval_title`] with a precomputed `then_run` flag: [`PendingApproval::new`]
+/// `approval_title` with a precomputed `then_run` flag: `PendingApproval::new`
 /// parses the input once and shares the flag across title/risk instead of
 /// parsing 2× (plus summary/details = 4× per enqueue).
 pub fn approval_title_with_then_run(name: &str, has_then_run: bool) -> &'static str {
@@ -35,7 +35,7 @@ pub(crate) fn approval_risk(name: &str, input: &str) -> (&'static str, ratatui::
     approval_risk_with_then_run(name, input_has_then_run(input))
 }
 
-/// [`approval_risk`] with a precomputed flag (see [`approval_title_with_then_run`]).
+/// `approval_risk` with a precomputed flag (see `approval_title_with_then_run`).
 #[cfg(feature = "tui")]
 pub fn approval_risk_with_then_run(
     name: &str,

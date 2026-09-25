@@ -38,7 +38,7 @@ pub enum StreamEvent {
     /// Provider-reported failure (e.g. Anthropic's terminal `error` event
     /// on a 200 body). Honors the same output-flowed rule as transport
     /// failures: before any output it stays retryable, after it becomes a
-    /// [`MidStreamError`].
+    /// `MidStreamError`.
     Fail(String),
 }
 

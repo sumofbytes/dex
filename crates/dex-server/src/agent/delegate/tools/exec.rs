@@ -537,7 +537,7 @@ fn running_json(id: &AgentId, progress: Option<String>) -> String {
 /// interruption nudge last. `Err` = the replay came back empty (crash
 /// between `turn_start` and the first `append_message`, or an unreadable
 /// journal): a resume with no history would run the degenerate seed task
-/// ("resume <id> generation N"), which is worse than failing loudly — the
+/// ("`resume <id> generation N`"), which is worse than failing loudly — the
 /// parent re-delegates with a fresh task instead.
 pub fn resume_messages(
     def: &AgentDefinition,

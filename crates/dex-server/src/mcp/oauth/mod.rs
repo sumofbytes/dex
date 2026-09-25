@@ -4,7 +4,7 @@
 //!
 //! `dex mcp login <server>` exchanges a browser approval for tokens stored
 //! in `$XDG_DATA_HOME/dex/mcp/<server>.json` (0600, never in sessions or
-//! logs). [`super::HttpTransport`] injects a valid token per request and
+//! logs). `super::HttpTransport` injects a valid token per request and
 //! turns a `Bearer` 401 into a login hint; a stored refresh token is tried
 //! once before the hint surfaces.
 
