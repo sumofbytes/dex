@@ -18,6 +18,7 @@ use crate::render::format::{
     model_tool_result, tool_preview, tool_preview_body, tool_result_summary,
 };
 use crate::runtime::console::{Console, RESET, TOOL_OUTPUT_COLOR};
+use crate::session::changes::{track_end, track_start, TrackedCall};
 use crate::session::Session;
 use crate::tools::{Policy, ToolFilter};
 use dex_agent_core::{
@@ -248,6 +249,20 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         messages: &mut Vec<ChatMessage>,
         ledger: &mut TokenLedger,
     ) -> Result<(), AgentTurnError> {
+        // Durable intent + `/undo` before-state, recorded BEFORE execution:
+        // a crash mid-tool leaves an `effect_start` without its
+        // `effect_result`, which is exactly the restart-recovery signal.
+        let tracked: Vec<Option<TrackedCall>> = calls
+            .iter()
+            .map(|call| {
+                track_start(
+                    self.session.as_deref_mut(),
+                    &call.id,
+                    &call.function.name,
+                    &call.function.arguments,
+                )
+            })
+            .collect();
         let results =
             run_tool_batch(calls, self.cancel, &self.policy, self.filter, self.console).await;
         if self.cancel.is_cancelled() {
@@ -273,6 +288,11 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                 )
                 .await;
             }
+            // Cancelled calls never completed: close their journal intents
+            // so a restart doesn't read them as in-flight effects.
+            for tracked in tracked {
+                track_end(self.session.as_deref_mut(), tracked, false);
+            }
             return Err("cancelled by user".into());
         }
 
@@ -280,7 +300,9 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        for (call, (name, input, outcome, elapsed)) in calls.iter().zip(results) {
+        for ((call, (name, input, outcome, elapsed)), tracked) in
+            calls.iter().zip(results).zip(tracked)
+        {
             let result = prepare_tool_result(
                 self.state,
                 &mut self.last_tools,
@@ -290,6 +312,7 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                 outcome,
             );
             let succeeded = result.ok;
+            track_end(self.session.as_deref_mut(), tracked, succeeded);
             note_sink(
                 self.console,
                 || {

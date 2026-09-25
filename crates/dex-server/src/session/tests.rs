@@ -130,3 +130,64 @@ fn undo_refuses_when_file_moved_on() {
         let _ = fs::remove_file(p);
     }
 }
+
+#[test]
+fn tracked_write_journals_intent_and_lands_in_undo_ledger() {
+    use crate::session::changes::{track_end, track_start};
+    use crate::test_env::TEST_SESSIONS_ENV_LOCK;
+    // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+    let _lock = TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new("/tmp/dex-track-test".into(), None).unwrap();
+    let work = s.path().unwrap().parent().unwrap().join("tracked.txt");
+    fs::write(&work, b"before\n").unwrap();
+    let work_str = work.display().to_string();
+
+    // Read-only tools are never tracked — no journal, no ledger.
+    assert!(track_start(Some(&mut s), "c0", "read", r#"{"path":"x"}"#).is_none());
+    let text = fs::read_to_string(s.path().unwrap()).unwrap();
+    assert!(!text.contains("effect_start"));
+
+    // A write call: intent journaled before, before-state captured.
+    let tracked = track_start(
+        Some(&mut s),
+        "c1",
+        "write",
+        &format!(r#"{{"path":"{work_str}"}}"#),
+    )
+    .expect("mutating write is tracked");
+    let text = fs::read_to_string(s.path().unwrap()).unwrap();
+    assert!(text.contains("effect_start"));
+    assert!(text.contains("write"));
+
+    // Execute (simulate the tool), then close: outcome + ledger record.
+    fs::write(&work, b"after\n").unwrap();
+    track_end(Some(&mut s), Some(tracked), true);
+
+    let text = fs::read_to_string(s.path().unwrap()).unwrap();
+    assert!(text.contains("effect_result"));
+    let changes = crate::session::changes::load_changes(s.path().unwrap());
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].tool, "write");
+    assert_eq!(changes[0].before.as_deref(), Some("before\n"));
+    assert_eq!(changes[0].after.as_deref(), Some("after\n"));
+
+    // The recorded change is undoable back to the pre-call content.
+    let msg = undo_last_change(&mut s).unwrap();
+    assert!(msg.contains("undid write"));
+    assert_eq!(fs::read_to_string(&work).unwrap(), "before\n");
+
+    // bash is mutating (journaled) but has no single file to snapshot.
+    let tracked =
+        track_start(Some(&mut s), "c2", "bash", r#"{"command":"ls"}"#).expect("bash is tracked");
+    track_end(Some(&mut s), Some(tracked), true);
+    let text = fs::read_to_string(s.path().unwrap()).unwrap();
+    assert!(text.contains("\"tool_call_id\":\"c2\""));
+    assert!(crate::session::changes::load_changes(s.path().unwrap()).is_empty());
+
+    let _ = fs::remove_file(&work);
+    if let Some(p) = s.path() {
+        let _ = fs::remove_file(p);
+    }
+}
