@@ -1,0 +1,22 @@
+[package]
+name = "dex-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Process-global runtime for dex: console/TTY, logging, async HTTP client pools, cancellation, notice dedup, and headless text formatting."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+dex-agent-core = { version = "0.1.0", path = "../dex-agent-core" }
+dex-protocol = { version = "0.1.0", path = "../dex-protocol" }
+dex-ai = { version = "0.1.0", path = "../dex-ai" }
+chrono = "0.4"
+serde_json = "1"
+  reqwest = { version = "0.13", default-features = false, features = [
+      "json",
+      "stream",
+      "rustls",
+      "http2",
+      "system-proxy",
+      "socks",
+  ] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util", "signal"] }

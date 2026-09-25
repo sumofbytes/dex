@@ -161,7 +161,7 @@ pub(crate) fn one_shot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `!`/`!!` shell escape: run directly on the daemon, no agent
     // turn. The daemon saves the run to the new session's history.
-    if let Some((command, excluded)) = crate::cli::parse_shell_escape(prompt.trim()) {
+    if let Some((command, excluded)) = crate::tools::parse_shell_escape(prompt.trim()) {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
