@@ -38,7 +38,7 @@ pub(crate) const TRANSCRIPT_INDENT: usize = HORIZONTAL_GUTTER as usize;
 /// Blank rows `TranscriptView::render` inserts between any two transcript
 /// blocks (`rebuild_display_cache`); the sole source of inter-block spacing
 /// — blocks carry no baked air of their own.
-pub(crate) const BLOCK_GAP_ROWS: usize = 2;
+pub(crate) const BLOCK_GAP_ROWS: usize = 1;
 
 /// The composer's top/bottom hairline rules: one row each.
 pub(crate) const INPUT_BORDER_ROWS: u16 = 2;

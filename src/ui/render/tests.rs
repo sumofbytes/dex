@@ -1681,13 +1681,32 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
     for w in [80, 90, 100, 120, 70, 50, 40] {
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, long);
-        // The submitted prompt is the composer's echo: `wrap_block`
-        // pads every row out to the full width on the terminal background,
-        // with no baked air rows (spacing is the inter-block gap).
+        // The submitted prompt is the composer's echo boxed in the same
+        // top/bottom hairlines: `wrap_block` pads every row out to the
+        // full width on the terminal background (spacing outside the box
+        // is the inter-block gap).
         let block = &app.transcript[1]; // 0 is hello, 1 is user
         let rows = wrap_block(block, w, false, false);
         let bg = Color::Reset;
         assert!(!rows.is_empty(), "user block must hold content at w {w}");
+        // Box frame: first/last rows are the hairline rules.
+        assert!(
+            rows.len() >= 3,
+            "user box must hold top rule + content + bottom rule at w {w}"
+        );
+        for rule in [&rows[0], &rows[rows.len() - 1]] {
+            let s: String = rule.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            assert!(
+                s.trim().chars().all(|c| c == '─'),
+                "box edge must be a clean ─ rule at w {w}: {s:?}"
+            );
+            assert!(
+                rule.spans
+                    .iter()
+                    .any(|sp| sp.style.fg == Some(theme::hairline_fg())),
+                "box edge must wear the composer hairline color at w {w}: {rule:?}"
+            );
+        }
         for row in &rows {
             let s: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert_eq!(
@@ -1707,7 +1726,8 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
             );
             assert_eq!(row.style.bg, Some(bg), "user row line bg at w {w}");
         }
-        // No baked air: every row is wrapped content.
+        // No baked air: every inner row is wrapped content; the two
+        // outer rows are the box frame rules.
         let text = |row: &Line<'static>| {
             row.spans
                 .iter()
@@ -1921,10 +1941,10 @@ fn consecutive_assistant_chunks_do_not_add_gaps() {
         "streamed assistant chunks must stay flush inside one block"
     );
 }
-/// Regression: the submitted prompt renders as the composer's echo — a
-/// full-width block with no baked air rows (spacing is the inter-block
-/// gap), headed by the composer glyph. The transcript Paragraph must NOT
-/// enable `Wrap`:
+/// Regression: the submitted prompt renders as the composer's echo boxed
+/// in top/bottom hairlines — a full-width box (spacing outside it is the
+/// inter-block gap), headed by the composer glyph. The transcript
+/// Paragraph must NOT enable `Wrap`:
 /// the display cache is already pre-wrapped, and ratatui 0.29's WordWrapper
 /// emits a phantom empty row before any all-whitespace line exactly
 /// `area.width` wide, which would shift the tool block down.
@@ -1969,12 +1989,12 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     };
     let text_row = row_of("can you check pillar").expect("prompt text rendered");
     let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
-    // Composer echo: content row, then the inter-block gap rows
-    // (BLOCK_GAP_ROWS) — the prompt and tool blocks add no air of their
-    // own — then the tool content.
+    // Boxed composer echo: top rule, content row, bottom rule, then the
+    // inter-block gap rows (BLOCK_GAP_ROWS) — the tool block adds no air
+    // of its own — then the tool content.
     assert_eq!(
         tool_row,
-        text_row + 1 + BLOCK_GAP_ROWS as u16,
+        text_row + 2 + BLOCK_GAP_ROWS as u16,
         "a phantom row from Paragraph::wrap shifts the tool block down"
     );
     // On the shared transcript margin — the prompt row starts one gutter
@@ -2000,15 +2020,35 @@ fn submitted_prompt_is_one_row_above_tool_block() {
         assert_eq!(
             buffer.cell((x, text_row - 1)).unwrap().bg,
             bg,
-            "gap above the content must be the terminal background"
+            "box top rule must be the terminal background"
+        );
+        assert_eq!(
+            buffer.cell((x, text_row + 1)).unwrap().bg,
+            bg,
+            "box bottom rule must be the terminal background"
+        );
+    }
+    // The box frame: ─ rules directly above and below the content row.
+    for dy in [-1i16, 1] {
+        let rule: String = (0..area.width)
+            .map(|x| {
+                buffer
+                    .cell((x, (text_row as i16 + dy) as u16))
+                    .unwrap()
+                    .symbol()
+            })
+            .collect();
+        assert!(
+            rule.trim().chars().all(|c| c == '─'),
+            "box edge must be a clean ─ rule: {rule:?}"
         );
     }
     let gap: String = (0..area.width)
-        .map(|x| buffer.cell((x, text_row + 1)).unwrap().symbol())
+        .map(|x| buffer.cell((x, text_row + 2)).unwrap().symbol())
         .collect();
     assert!(
         gap.trim().is_empty(),
-        "inter-block gap after the prompt must be blank: {gap:?}"
+        "inter-block gap after the prompt box must be blank: {gap:?}"
     );
     // The tool block adds no baked air: the row right above the tool
     // content is the universal inter-block gap (blank, terminal bg).
@@ -2026,7 +2066,7 @@ fn submitted_prompt_is_one_row_above_tool_block() {
             "inter-block gap row must be the terminal background"
         );
         assert_eq!(
-            buffer.cell((x, text_row + 1)).unwrap().bg,
+            buffer.cell((x, text_row + 2)).unwrap().bg,
             ratatui::style::Color::Reset,
             "inter-block gap must stay terminal background"
         );
@@ -2530,15 +2570,28 @@ fn submitted_prompt_wraps_like_the_composer() {
     for w in [40u16, 60, 80] {
         // Live composer rows at this width.
         let composer = render_input(&InputField::from_text(text), input_content_width(w), false).0;
-        // Echoed prompt rows at the same width.
+        // Echoed prompt rows at the same width (boxed: top rule +
+        // content + bottom rule).
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, text);
         let block = &app.transcript[1];
         let echo = wrap_block(block, w, false, false);
-        // Strip the echo's leading transcript indent (the composer lives
-        // inside the band and has no indent span) and trailing pad fill,
-        // so both sides compare as bare text lines.
-        let echo_text: Vec<String> = echo
+        // Box frame around the content rows.
+        assert!(
+            echo.len() == composer.len() + 2,
+            "echo must be content rows plus top/bottom rules at w {w}"
+        );
+        for rule in [&echo[0], &echo[echo.len() - 1]] {
+            let s: String = rule.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            assert!(
+                s.trim().chars().all(|c| c == '─'),
+                "echo edge must be a ─ rule at w {w}: {s:?}"
+            );
+        }
+        // Strip the frame plus the echo's leading transcript indent (the
+        // composer lives inside the band and has no indent span) and
+        // trailing pad fill, so both sides compare as bare text lines.
+        let echo_text: Vec<String> = echo[1..echo.len() - 1]
             .iter()
             .map(|r| {
                 let mut s: String = r
@@ -2744,13 +2797,15 @@ fn echoed_prompt_narrows_only_the_first_logical_line() {
             .map(|sp| sp.content.as_ref())
             .collect::<String>()
     };
+    // Boxed echo: content rows plus the top/bottom rules.
+    let content = &rows[1..rows.len() - 1];
     assert_eq!(
         composer.len(),
-        rows.len(),
+        content.len(),
         "echo and composer wrap alike: composer {composer:?} echo {:?}",
-        rows.iter().map(row_text).collect::<Vec<_>>()
+        content.iter().map(row_text).collect::<Vec<_>>()
     );
-    for (c, e) in composer.iter().zip(rows.iter()) {
+    for (c, e) in composer.iter().zip(content.iter()) {
         let ce: String = c.spans.iter().map(|sp| sp.content.as_ref()).collect();
         let mut et = row_text(e);
         // Echo rows carry the transcript indent; strip it for comparison.
@@ -2775,7 +2830,7 @@ fn echoed_prompt_wraps_at_the_composer_content_width() {
     let block = &app.transcript[1];
     let rows = wrap_block(block, 20, false, false);
     assert_eq!(
-        composer.len(),
+        composer.len() + 2,
         rows.len(),
         "echo must reflow like the composer: composer {} rows, echo {} rows",
         composer.len(),
