@@ -28,7 +28,9 @@ fn load_state_file(ext_id: &str) -> BTreeMap<String, serde_json::Value> {
 }
 
 fn with_state<R>(ext_id: &str, f: impl FnOnce(&mut BTreeMap<String, serde_json::Value>) -> R) -> R {
-    let mut guard = STATE.lock().expect("state lock");
+    let mut guard = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let map = guard
         .entry(ext_id.to_string())
         .or_insert_with(|| load_state_file(ext_id));
@@ -46,7 +48,9 @@ fn with_state_read<R>(
     ext_id: &str,
     f: impl FnOnce(&BTreeMap<String, serde_json::Value>) -> R,
 ) -> R {
-    let mut guard = STATE.lock().expect("state lock");
+    let mut guard = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let map = guard
         .entry(ext_id.to_string())
         .or_insert_with(|| load_state_file(ext_id));

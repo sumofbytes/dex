@@ -4,7 +4,16 @@ use crate::{
 };
 use serde_json::{json, Value};
 
+/// Upper bound on tool calls merged from one provider stream. Both merge
+/// helpers below grow the vec from a provider-controlled `index`, so a
+/// malicious or buggy provider sending `index: usize::MAX` would otherwise
+/// allocate until OOM. Real turns issue at most a few dozen calls.
+const MAX_MERGED_TOOL_CALLS: usize = 1024;
+
 pub fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
+    if delta.index >= MAX_MERGED_TOOL_CALLS {
+        return;
+    }
     while calls.len() <= delta.index {
         calls.push(LlmToolCall {
             id: String::new(),
@@ -119,6 +128,9 @@ pub fn wire_tools(tools: &[ToolDefinition], map: impl Fn(&ToolDefinition) -> Val
 }
 
 pub fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) {
+    if index >= MAX_MERGED_TOOL_CALLS {
+        return;
+    }
     while calls.len() <= index {
         calls.push(LlmToolCall {
             id: String::new(),
