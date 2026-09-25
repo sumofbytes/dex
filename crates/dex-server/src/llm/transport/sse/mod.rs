@@ -11,8 +11,6 @@ use crate::protocol::StreamDelta;
 #[cfg(test)]
 use crate::protocol::Usage;
 #[cfg(test)]
-#[cfg(test)]
-#[cfg(test)]
 use tokio::sync::mpsc;
 
 mod parser;
@@ -33,7 +31,7 @@ pub(crate) use turn::{
 };
 
 /// Test-only driver over in-memory lines (no HTTP): parser tests need no
-/// server, per plan Phase 1.
+/// server.
 #[cfg(test)]
 async fn run_sse_lines<P: StreamParser>(
     lines: &[&str],

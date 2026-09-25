@@ -92,8 +92,8 @@ pub struct DaemonState {
     /// scope as `Console::approval_key`). Lives on the daemon so a decision
     /// survives across turns; previously `Console` was per-turn and lost it.
     pub session_approvals: Mutex<HashMap<String, HashSet<String>>>,
-    /// Per-session child-agent managers (Phase 4 lifecycle: spawn cap,
-    /// cancel, completion notices). Lazily created by `manager_for`;
+    /// Per-session child-agent managers (spawn cap, cancel, completion
+    /// notices). Lazily created by `manager_for`;
     /// `shutdown_agents` joins everything on the ctrl-C exit, and
     /// `remove_session_agents` drops a session's manager once session
     /// delete/reset endpoints exist. Managers are closed on shutdown, so
@@ -306,7 +306,6 @@ impl DaemonState {
     /// a state → manager → hook cycle; `shutdown_agents` and
     /// `remove_session_agents` take the managers out of the map, which
     /// drops the hooks and breaks it — nothing leaks.
-    /// Phase 5's delegate tool is the first caller.
     pub(crate) fn manager_for(self: &Arc<Self>, session_id: &str) -> AgentManager {
         let mut agents = lock_map(&self.agents);
         agents
@@ -324,8 +323,8 @@ impl DaemonState {
     /// Cancel + join a session's children, then drop its manager, so no
     /// orphaned child task survives its session. `shutdown` marks the
     /// manager closed, so stale clones cannot respawn into the dropped
-    /// registry. Session delete/reset hook — wired to those endpoints when
-    /// they land (Phase 5/6); until then it stays `dead_code`.
+    /// registry. Session delete/reset hook — currently only reached from
+    /// tests until those endpoints exist, hence `dead_code`.
     #[allow(dead_code)]
     pub(crate) async fn remove_session_agents(&self, session_id: &str) {
         // The children are about to be cancelled: deny their still-parked

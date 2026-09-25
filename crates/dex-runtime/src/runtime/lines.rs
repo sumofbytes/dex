@@ -68,11 +68,11 @@ pub enum SinkLine {
 pub struct ApprovalRequest {
     pub name: String,
     pub input: String,
-    /// Set when the requester is a background child agent (plan §12 V1b):
+    /// Set when the requester is a background child agent:
     /// children outlive the parent turn, so turn-end teardown must not deny
     /// their parked approvals. `None` for the parent turn's own tools.
     pub agent_id: Option<String>,
-    /// The child's definition name for the labeled prompt (V1b): rendered
+    /// The child's definition name for the labeled prompt: rendered
     /// as "explorer wants to run bash: …". `None` for the parent's own.
     pub agent: Option<String>,
     pub response: tokio::sync::mpsc::Sender<ApprovalDecision>,

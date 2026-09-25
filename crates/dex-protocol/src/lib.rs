@@ -147,9 +147,7 @@ pub struct ApprovalResponse {
     pub decision: ApprovalDecision,
 }
 
-// Single enum for the wire AND the agent loop (merged from the old
-// `protocol::ApprovalDecision` + `core::types::ApprovalDecision` bridge in
-// plan §4 Phase 3). Serde spellings are the wire contract ("allow_once" /
+// Single enum for the wire AND the agent loop. Serde spellings are the wire contract ("allow_once" /
 // "allow_session" / "deny"); `as_str` is the audit spelling ("once" /
 // "session" / "deny") — single source so audit rows never drift from the
 // wire.

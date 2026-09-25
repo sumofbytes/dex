@@ -65,7 +65,6 @@ fn shared_rt() -> &'static tokio::runtime::Runtime {
 }
 
 /// Block on an async future from sync code (CLI/one-shot/`dex run` paths).
-/// No async CLI plumbing needed per plan §5.
 pub fn block_on<F>(fut: F) -> F::Output
 where
     F: std::future::Future,

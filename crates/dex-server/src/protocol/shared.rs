@@ -1,6 +1,5 @@
-//! Shared message/role/approval/permission vocabulary (from the old
-//! core/types.rs;
-//! dissolving in Phase 3 — see protocol/shared.rs for the split map).
+//! Shared message/role/approval/permission vocabulary for agent, tools,
+//! session, and UI.
 
 /// Transcript lines live in `dex-runtime` (they are carried by
 /// `runtime::console::Console`, which both server and client link);

@@ -44,7 +44,7 @@ pub async fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
     Ok(limited)
 }
 
-/// The permission context a tool call runs under (Phase 0 gate). `mode`
+/// The permission context a tool call runs under. `mode`
 /// is the turn's `PermissionMode` (from `LlmConfig::permission`);
 /// `console` carries the approval channel plus the live session-approval
 /// set. Owned (not borrowed) so concurrent fan-out tasks can each hold a
@@ -58,10 +58,10 @@ pub async fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
 pub struct Policy {
     pub mode: PermissionMode,
     pub console: Option<Console>,
-    /// The daemon-backed turn context (Phase 5): `Some` only for parent
+    /// The daemon-backed turn context: `Some` only for parent
     /// turns inside the daemon. It is what makes the delegation tools
     /// spawnable; children and every non-daemon path carry `None`, so a
-    /// `delegate` call from either is rejected at dispatch (§11, no
-    /// recursion — the depth cap in code, not in the prompt).
+    /// `delegate` call from either is rejected at dispatch (no recursion
+    /// — the depth cap in code, not in the prompt).
     pub agent: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
 }

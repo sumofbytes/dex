@@ -23,8 +23,7 @@ use tools::record_usage;
 #[cfg(test)]
 use tools::{is_context_overflow, run_tool_batch};
 
-/// The per-agent capability bundle for [`process_turn`] (Phase 2 runtime
-/// extraction; plan §8). One loop serves main agent and children — the
+/// The per-agent capability bundle for [`process_turn`]. One loop serves main agent and children — the
 /// bundle decides what each run gets: the main agent passes its steering
 /// channels, session, and `filter: None`; a child passes `steering_rx:
 /// None`, its own seed messages, its own JSONL session, its own console,
@@ -41,12 +40,12 @@ pub struct AgentRuntime<'a, C, X> {
     pub cancel: &'a X,
     pub console: &'a Console,
     pub filter: Option<&'a ToolFilter>,
-    /// The daemon-backed turn context (Phase 5): `Some` for parent turns
+    /// The daemon-backed turn context: `Some` for parent turns
     /// inside the daemon — it is what makes `delegate` spawnable — and
     /// for children under the depth cap (one level deeper). At-cap
     /// children and every non-daemon path pass `None` (no delegation).
     pub agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
-    /// Turn budget override (plan §4: a definition's `max_tool_iterations`
+    /// Turn budget override (a definition's `max_tool_iterations`
     /// feeds the existing budget knob; `None` = the default/env value).
     pub tool_budget: Option<usize>,
 }
