@@ -1,6 +1,5 @@
 //! Cancellation primitives: sync source trait + async wait + process-global Ctrl+C.
-//! Moved down from `agent::state` so `tools` no longer imports `agent`
-//! (direction is `agent→tools→workspace/runtime`).
+//! Layer direction is `agent→tools→workspace/runtime`.
 
 /// Shared cancellation contract used by the provider client and agent loop.
 pub use dex_ai::CancellationSource;

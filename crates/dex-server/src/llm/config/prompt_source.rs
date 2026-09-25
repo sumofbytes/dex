@@ -28,7 +28,7 @@ fn read_prompt_file(path: &str, warn_id: &str) -> Option<String> {
 /// ignores CLI flags and falls back to its own env/file layers unless the
 /// client forwards per-request text. Precedence mirrors every other knob —
 /// explicit per-request/CLI text > env inline > env file > file inline >
-/// file file > built-in default (`None`). Inline beats file within a layer;
+/// file path > built-in default (`None`). Inline beats file within a layer;
 /// any CLI beats any env beats any file. Empty/whitespace-only values count
 /// as unset at every layer and fall through. Returns the text plus its
 /// origin for `doctor`.
