@@ -161,7 +161,6 @@ pub fn deterministic_summary(
     let (read_files, modified_files) = compute_file_lists(file_ops);
     let file_section = format_file_operations(&read_files, &modified_files);
 
-    // Build the structured summary
     let mut out = String::new();
     out.push_str("## Goal\n");
     out.push_str(&goal);

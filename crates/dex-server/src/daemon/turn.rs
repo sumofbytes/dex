@@ -378,8 +378,7 @@ pub(crate) async fn run_turn_inner(
     let explicit_model = req.model.clone().filter(|v| !v.is_empty());
     // Build the config from the daemon's own environment, with
     // optional per-request overrides sent by the client (now validated).
-    // Async: cache hits are a mutex bump inline; misses parse the 4MB catalog
-    // in `spawn_blocking` (Phase 6 `from_env_async`).
+    // Async: catalog misses parse off-thread in `spawn_blocking`.
     let perm_override = match derived_perm {
         Some(mode) => Some(mode),
         None => req
@@ -490,9 +489,9 @@ pub(crate) async fn run_turn_inner(
         })
     };
 
-    // The delegation context (Phase 5): built once per parent turn — the
+    // The delegation context: built once per parent turn — the
     // manager handle, the parent session path/cwd, and the resolved config
-    // the child inherits (cloning its own per definition, §13).
+    // the child inherits (cloning its own per definition).
     let agent_ctx = Arc::new(AgentTurnContext {
         depth: 0,
         session_id: session_id.to_string(),
@@ -509,7 +508,6 @@ pub(crate) async fn run_turn_inner(
     });
 
     // Skills are resolved on the daemon (its filesystem is the workspace).
-    // Async dir scans + concurrent reads (Phase 6).
     let mut dirs = skill_dirs();
     dirs.extend(req.skill_dirs.iter().map(std::path::PathBuf::from));
     let skills = discover_skills_async(&dirs).await;

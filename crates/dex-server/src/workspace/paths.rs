@@ -1,4 +1,4 @@
-//! Workspace paths: the single owner of "which paths may tools touch": the single owner of "which paths may tools touch".
+//! Workspace paths: the single owner of "which paths may tools touch".
 //!
 //! Existing path components are canonicalized so symlinks cannot silently
 //! escape the workspace; for a new file, the existing parent is

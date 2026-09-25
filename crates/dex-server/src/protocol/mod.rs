@@ -19,8 +19,7 @@ pub fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
 pub mod tokens;
 
 /// Domain vocabulary shared across agent/tools/session/ui and persisted in
-/// session JSONL (plan §4 Phase 3: wire-schema items went to `shared.rs`,
-/// these stay domain — sessions are the wire).
+/// session JSONL (wire-schema items live in `shared.rs`).
 #[path = "domain.rs"]
 pub mod domain;
 
@@ -30,7 +29,7 @@ pub use dex_skills::Skill;
 pub use domain::*;
 
 /// Wire schema for chat messages, tool definitions and stream chunk
-/// parsing (plan §4 Phase 3: formerly `core/types.rs`).
+/// parsing.
 #[path = "shared.rs"]
 pub mod shared;
 

@@ -24,7 +24,7 @@ pub async fn execute(
     policy: &Policy,
     filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
-    // H1 (`tool.before`, plan §8): mutate/deny seam before every gate.
+    // `tool.before` hook: mutate/deny seam before every gate.
     // Delegation tools skip it — the child allowlist sees the call the
     // parent issued, unmodified by a third party.
     let owned_args: Map<String, Value>;
@@ -140,10 +140,10 @@ async fn dispatch_tool(
     filter: Option<&ToolFilter>,
     resolve_shadow: bool,
 ) -> Result<String, ToolError> {
-    // Delegation tools route first (Phase 5): they are not workspace tools
+    // Delegation tools route first: they are not workspace tools
     // and have no static registry entry. The child allowlist never contains
     // one, so the same availability gate rejects a child's call before any
-    // delegation logic runs (§11 — at-cap children carry no delegation tools).
+    // delegation logic runs (at-cap children carry no delegation tools).
     if crate::agent::delegate::is_delegation(name) {
         if let Some(filter) = filter {
             if !filter.allows(name) {
@@ -179,7 +179,7 @@ async fn dispatch_tool(
         None => return Err(ToolError::Unknown(name.to_string())),
     };
     // Availability before approval: a sharper, cheaper rejection naming the
-    // agent's allowlist (plan §11 — the model self-corrects, never executes).
+    // agent's allowlist (the model self-corrects, never executes).
     // Checked before `enforce_policy` so a denied tool never prompts.
     if let Some(filter) = filter {
         let error = if !filter.allows(name) {
@@ -284,8 +284,7 @@ pub async fn execute_outcome(
     }
 }
 
-/// Sync wrappers for `dex run <tool>` / `dex --tool` raw paths (no async CLI
-/// plumbing needed per plan §5). Explicit user invocations run trusted —
+/// Sync wrappers for `dex run <tool>` / `dex --tool` raw paths. Explicit user invocations run trusted —
 /// the command itself is the approval — so no policy parameter; unfiltered
 /// too (explicit invocations run the full toolset, never a child allowlist).
 pub fn execute_sync(
