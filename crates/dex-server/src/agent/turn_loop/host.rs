@@ -327,17 +327,8 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                     if result.cache_hit {
                         summary = format!("cached · {summary}");
                     }
-                    let counts_only = matches!(
-                        name.as_str(),
-                        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls"
-                    );
-                    let preview = tool_preview(
-                        &name,
-                        succeeded,
-                        result.diff.as_deref(),
-                        &result.text,
-                        !counts_only || !succeeded,
-                    );
+                    let preview =
+                        tool_preview(&name, succeeded, result.diff.as_deref(), &result.text);
                     SinkLine::ToolOutput {
                         id: call.id.clone(),
                         name: name.clone(),
