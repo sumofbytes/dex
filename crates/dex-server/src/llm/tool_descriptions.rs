@@ -112,6 +112,35 @@ mod tests {
         assert!(calls[0].id.is_empty());
     }
 
+    /// Indices at/after the merge cap are dropped and reported, not
+    /// silently swallowed — the caller warns so a truncating provider
+    /// stream is debuggable.
+    #[test]
+    fn merge_chat_tool_call_reports_drops_past_cap() {
+        let mut calls = Vec::new();
+        let dropped = merge_chat_tool_call(
+            &mut calls,
+            StreamToolCall {
+                index: 1024,
+                id: Some("late".into()),
+                function: None,
+            },
+        );
+        assert!(dropped);
+        assert!(calls.is_empty());
+        // In-bounds deltas still merge and report false.
+        let dropped = merge_chat_tool_call(
+            &mut calls,
+            StreamToolCall {
+                index: 0,
+                id: Some("a".into()),
+                function: None,
+            },
+        );
+        assert!(!dropped);
+        assert_eq!(calls[0].id, "a");
+    }
+
     #[test]
     fn responses_input_splits_system_and_tool_output() {
         let msgs = vec![

@@ -259,7 +259,7 @@ async fn chat_async_callback_path_still_forwards_and_approves() {
     // `ChatStream` framing; approvals resolve via the callback return.
     let approvals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let body = format!(
-        "{}{}",
+        "{}{}{}",
         sse_data(&StreamEvent::AssistantText("hi".to_string()), 1),
         sse_data(
             &StreamEvent::ApprovalRequired {
@@ -269,6 +269,14 @@ async fn chat_async_callback_path_still_forwards_and_approves() {
                 agent: None,
             },
             2
+        ),
+        sse_data(
+            &StreamEvent::TurnComplete {
+                response: String::new(),
+                usage: None,
+                cached: None,
+            },
+            3
         )
     );
     let base = mock_chat_server(body, 200, approvals.clone()).await;
@@ -283,8 +291,25 @@ async fn chat_async_callback_path_still_forwards_and_approves() {
         })
         .await
         .expect("chat must succeed");
-    assert_eq!(seen, vec![false, true]);
+    assert_eq!(seen, vec![false, true, false]);
     assert_eq!(*approvals.lock().unwrap(), vec![ApprovalDecision::Deny]);
+}
+
+#[tokio::test]
+async fn chat_async_reports_premature_close_without_terminal() {
+    // A stream that closes without TurnComplete/TurnFailed is a transport
+    // failure: callers must not record the turn as done.
+    let approvals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let body = sse_data(&StreamEvent::AssistantText("hi".to_string()), 1);
+    let base = mock_chat_server(body, 200, approvals).await;
+    let client = DaemonClient::new(&base).unwrap();
+    let err = client
+        .chat_async("s1", "hi", ChatOptions::default(), &mut |_| None)
+        .await;
+    assert!(
+        err.is_err(),
+        "a close without a terminal event must be an error: {err:?}"
+    );
 }
 
 #[tokio::test]
