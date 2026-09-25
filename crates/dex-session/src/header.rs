@@ -79,11 +79,9 @@ pub struct SessionEventEntry {
 }
 
 /// Durable record of one side effect: intent (before execution) and outcome
-/// (after). Written around every tool execution so a restart can reconcile
-/// what happened vs. what completed (P8 journal). Nothing wires it into the
-/// turn loop yet — test-only until a producer lands.
+/// (after). Written around every mutating tool execution so a restart can
+/// reconcile what started vs. what completed (P8 journal).
 #[derive(Serialize)]
-#[cfg(test)]
 pub struct SessionEffectEntry {
     #[serde(rename = "type")]
     pub entry_type: String,
