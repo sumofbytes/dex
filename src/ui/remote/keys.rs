@@ -30,6 +30,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+/// Mid-turn reconnect attempts (with 0.5s/1s/2s backoff) before a transport
+/// failure is surfaced to the user instead of retried.
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
 fn composer_at_end(app: &App) -> bool {
     let row = app.input.row.min(app.input.lines.len().saturating_sub(1));
     row + 1 >= app.input.lines.len() && app.input.col >= app.input.lines[row].len()
@@ -702,8 +706,11 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
         // Journal cursor: highest seq delivered to the UI; a reconnect
         // replays only what came after it.
         let mut last_seq = 0u64;
-        // One reconnect attempt per turn — beyond that the failure is real.
-        let mut recovered = false;
+        // Reconnect attempts per turn, with backoff between them — a
+        // daemon restart or network blip gets a few chances to settle
+        // before the failure is surfaced as real. Retries are safe: each
+        // re-POST reuses the same idempotency key.
+        let mut reconnect_attempts = 0u32;
         let mut stream = match client
             .chat_stream(&session_id, &prompt, options.clone())
             .await
@@ -752,8 +759,12 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
                         let _ = event_tx.send(WorkerMessage::Finished(None)).await;
                         return;
                     }
-                    if !recovered {
-                        recovered = true;
+                    if reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
+                        reconnect_attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(
+                            500 * (1 << (reconnect_attempts - 1)),
+                        ))
+                        .await;
                         match try_reconnect(
                             &client,
                             &session_id,

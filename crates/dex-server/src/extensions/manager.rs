@@ -715,14 +715,22 @@ impl ExtensionManager {
     /// the cache (a load-time call races the cache rebuild, so dropping here
     /// would wedge the schema to empty on a fresh process).
     pub async fn set_active(&self, tools: Vec<String>) {
-        *self.active.write().expect("active lock") = Some(tools);
+        *self
+            .active
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tools);
     }
 
     /// The schema slice after the `set_active` filter.
     #[cfg(test)]
     pub async fn active_cached(&self) -> Vec<ToolDefinition> {
         let all = self.cached.read().await.clone();
-        match self.active.read().expect("active lock").clone() {
+        match self
+            .active
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
             None => all.iter().cloned().collect(),
             Some(active) => {
                 let known: HashSet<String> = all.iter().map(|d| d.function.name.clone()).collect();

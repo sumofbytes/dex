@@ -437,6 +437,11 @@ impl SseDriver {
 pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
 pub(crate) const REASONING_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Cap on one buffered (unterminated) SSE line. Legit provider events are
+/// small JSON frames; a provider that never sends a newline would otherwise
+/// grow `buf` without bound for the whole stream and OOM the daemon.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
 pub(crate) fn is_stream_idle_error(message: &str) -> bool {
     message.contains("stream idle for over")
 }
@@ -598,6 +603,12 @@ async fn run_sse<P: StreamParser>(
                     Ok(None) => break,
                     Ok(Some(bytes)) => {
                         buf.extend_from_slice(&bytes);
+                        if buf.len() > MAX_SSE_LINE_BYTES {
+                            return Err(driver_err(
+                                &mut driver,
+                                "SSE line exceeded 1 MiB without a newline; protocol violation",
+                            ));
+                        }
                         // Extract complete lines; keep partial tail buffered.
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             // Borrow the line before draining: skips a
