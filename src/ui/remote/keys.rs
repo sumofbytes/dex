@@ -587,7 +587,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     // the agent loop, so there is no turn to steer — and it may run
     // alongside one (only one shell at a time per session; Esc cancels it).
     // A bare `!`/`!!` falls through to the agent.
-    if let Some((command, excluded)) = crate::cli::parse_shell_escape(&line) {
+    if let Some((command, excluded)) = crate::tools::parse_shell_escape(&line) {
         remote.app.history_push(line.clone());
         remote.app.input.reset();
         if remote.shell_running {

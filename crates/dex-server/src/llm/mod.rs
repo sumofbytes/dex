@@ -1,0 +1,11 @@
+pub(crate) mod anthropic;
+pub(crate) mod client;
+pub mod config;
+pub(crate) mod dispatch;
+pub(crate) mod http;
+pub(crate) mod learned;
+pub mod prompt;
+pub(crate) mod provider;
+pub(crate) mod thinking;
+pub mod tool_descriptions;
+pub(crate) mod transport;

@@ -49,7 +49,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // through to the agent. The run is saved to the session so a
     // later turn sees it (`!` in context, `!!` excluded); `--no-session`
     // keeps it ephemeral.
-    if let Some((command, excluded)) = crate::cli::parse_shell_escape(prompt.trim()) {
+    if let Some((command, excluded)) = crate::tools::parse_shell_escape(prompt.trim()) {
         let mut map = Map::new();
         map.insert("command".to_string(), Value::String(command.clone()));
         let result = execute("bash", &map, &crate::runtime::cancel::GlobalCancellation);
