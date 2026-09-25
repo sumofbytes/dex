@@ -58,7 +58,7 @@ pub fn short_arg(name: &str, input: &str) -> String {
 }
 
 /// Display-column budget shared by every transcript tool row: the input
-/// `▸` preview (`short_arg`), the output summary (`one_line_summary`), and
+/// `▸` preview (`short_arg`), the output summary (`content_first_line`), and
 /// every preview flavor (`tool_result_preview`, `read_preview_lines`,
 /// `diff_preview_lines`). The TUI word-wraps rows, so one generous cap just
 /// bounds the damage for pathological lines; `truncate_cols` measures real
@@ -114,18 +114,6 @@ fn read_short_arg(obj: Option<&serde_json::Map<String, Value>>) -> Option<String
     }
 }
 
-/// First non-empty, trimmed line of a tool result, truncated to the shared
-/// [`PREVIEW_LINE_COLS`] display-column budget with a visible `…` on cut —
-/// the same standard as the tool-input preview row.
-pub(crate) fn one_line_summary(text: &str) -> String {
-    let stripped = strip_ansi(text);
-    let line = stripped
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    truncate_cols(line.trim(), PREVIEW_LINE_COLS)
-}
-
 /// Drop ANSI escape sequences (colors, cursor movement) and carriage
 /// returns/bells so tool output renders as plain text in the transcript.
 fn strip_ansi(text: &str) -> String {
@@ -176,16 +164,21 @@ fn strip_ansi(text: &str) -> String {
 /// A few informational lines from a tool result, rendered dim under the
 /// one-line summary: enough to see *what* happened without flooding the
 /// transcript. Lines are trimmed on the right only, so indentation (tree
-/// output, indented code, nested listings) survives; blank lines and ANSI
-/// escapes are removed, long lines clipped to [`PREVIEW_LINE_COLS`] display
-/// columns, and overflow folds into a `… +N more lines` tail. `skip_first`
-/// lets callers omit the line the one-line summary already shows.
+/// output, indented code, nested listings) survives; blank lines, ANSI
+/// escapes, and shell `[exit N]` failure markers (the summary already
+/// carries the exit code) are removed, long lines clipped to
+/// [`PREVIEW_LINE_COLS`] display columns, and overflow folds into a
+/// `… +N more lines` tail. `skip_first` lets callers omit the line the
+/// one-line summary already shows.
 pub(crate) fn tool_result_preview(text: &str, max_lines: usize, skip_first: bool) -> Vec<String> {
     let mut lines = text
         .lines()
         .map(strip_ansi)
         .map(|line| line.trim_end().to_string())
-        .filter(|line| !line.trim().is_empty());
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !is_exit_marker_line(trimmed)
+        });
     if skip_first {
         lines.next();
     }
@@ -285,14 +278,10 @@ pub(crate) fn diff_preview_lines(diff: &str, max: usize) -> Vec<String> {
 /// Canonical tool-output preview dispatch shared by the TUI transcript and
 /// the headless console path: write/edit show the unified diff on success,
 /// read shows its numbered snippet, everything else (and every failure)
-/// shares the generic preview so the error stays visible.
-pub fn tool_preview(
-    name: &str,
-    ok: bool,
-    diff: Option<&str>,
-    result: &str,
-    skip_first: bool,
-) -> Vec<String> {
+/// shares the generic preview so the error stays visible. The summary row
+/// decides which lines the preview must not repeat (see
+/// [`preview_skips_first_line`]).
+pub fn tool_preview(name: &str, ok: bool, diff: Option<&str>, result: &str) -> Vec<String> {
     if let Some(diff) = diff {
         if matches!(name, "write" | "edit") && ok {
             return diff_preview_lines(diff, 30);
@@ -301,7 +290,11 @@ pub fn tool_preview(
     if name == "read" && ok {
         return read_preview_lines(result, TRANSCRIPT_PREVIEW_LINES);
     }
-    tool_result_preview(result, TRANSCRIPT_PREVIEW_LINES, skip_first)
+    tool_result_preview(
+        result,
+        TRANSCRIPT_PREVIEW_LINES,
+        preview_skips_first_line(name, ok, result),
+    )
 }
 
 /// Headless one-shot body for the same dispatch: GitHub-style diff snippet
@@ -414,7 +407,13 @@ pub fn tool_result_summary(
     diff: Option<&str>,
 ) -> String {
     if !ok {
-        return format!("failed · {}", one_line_summary(text));
+        let first = content_first_line(text);
+        return match exit_code(text) {
+            Some(code) if first.is_empty() => format!("failed (exit {code})"),
+            Some(code) => format!("failed (exit {code}) · {first}"),
+            None if first.is_empty() => "failed".to_string(),
+            None => format!("failed · {first}"),
+        };
     }
     let obj = serde_json::from_str::<Value>(input)
         .ok()
@@ -491,10 +490,7 @@ pub fn tool_result_summary(
             }
             out
         }
-        "bash" => match one_line_summary(text) {
-            first if first.is_empty() => "(no output)".to_string(),
-            first => first,
-        },
+        "bash" => overall_summary(text),
         "write" => {
             let written = get("content").unwrap_or_default().lines().count();
             format!(
@@ -516,10 +512,7 @@ pub fn tool_result_summary(
             });
             format!("+{added} −{removed}{}", then_run_tail(text))
         }
-        _ => match one_line_summary(text) {
-            first if first.is_empty() => "(no output)".to_string(),
-            first => first,
-        },
+        _ => overall_summary(text),
     }
 }
 
@@ -529,6 +522,83 @@ pub(super) fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// Overall summary for free-form output (`bash`, unknown/MCP/delegate
+/// tools): a single line echoes itself (it *is* the whole result), empty
+/// output says so, and anything longer collapses to a line count — the
+/// preview below carries the content. This keeps the colored `└` row as
+/// metadata instead of an arbitrary content line painted green.
+fn overall_summary(text: &str) -> String {
+    let n = content_line_count(text);
+    if n == 0 {
+        "(no output)".to_string()
+    } else if n == 1 {
+        content_first_line(text)
+    } else {
+        format!("{n} lines")
+    }
+}
+
+/// Whether the summary already shows the first output line, so the preview
+/// below should skip it instead of repeating it. Failures always echo the
+/// first line (`failed · …`); counts-only tools never do; `bash`/generic
+/// successes echo only the single-line case.
+fn preview_skips_first_line(name: &str, ok: bool, text: &str) -> bool {
+    if !ok {
+        return true;
+    }
+    match name {
+        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => false,
+        "write" | "edit" => true,
+        _ => content_line_count(text) <= 1,
+    }
+}
+
+/// Content lines of free-form output: non-empty, ANSI-stripped, without our
+/// own structural rows (the `--- stderr ---` separator, `[...]` truncation
+/// trailers, and `[exit N]` markers) so counts and echoes describe what the
+/// command actually printed.
+fn content_lines(text: &str) -> Vec<String> {
+    strip_ansi(text)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.starts_with("[...") && *l != "--- stderr ---" && !is_exit_marker_line(l))
+        .map(str::to_string)
+        .collect()
+}
+
+fn content_line_count(text: &str) -> usize {
+    content_lines(text).len()
+}
+
+fn content_first_line(text: &str) -> String {
+    content_lines(text)
+        .into_iter()
+        .next()
+        .map(|l| truncate_cols(&l, PREVIEW_LINE_COLS))
+        .unwrap_or_default()
+}
+
+/// A shell `[exit N]` marker line appended by `ToolError::Shell`'s Display.
+fn is_exit_marker_line(line: &str) -> bool {
+    line.starts_with("[exit ") && line.ends_with(']')
+}
+
+/// The exit code inside the last `[exit N]` marker *line* in `text`, if
+/// any. Marker-shaped lines only — a `[exit …]` mention inside ordinary
+/// output is not an exit code (same standard as [`is_exit_marker_line`]).
+fn exit_code(text: &str) -> Option<String> {
+    let stripped = strip_ansi(text);
+    let marker = stripped
+        .lines()
+        .rev()
+        .find(|l| is_exit_marker_line(l.trim()))?;
+    let rest = marker.trim().strip_prefix("[exit ")?.strip_suffix(']')?;
+    let code = rest.trim();
+    code.parse::<i32>().ok()?;
+    Some(code.to_string())
 }
 
 /// The ` · then_run: …` tail for a `write`/`edit` summary whose result carries
