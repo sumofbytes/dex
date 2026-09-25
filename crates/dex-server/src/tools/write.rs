@@ -128,9 +128,9 @@ async fn check_expected_hash(args: &Map<String, Value>, path: &Path) -> Result<(
     Ok(())
 }
 
-/// FNV-1a 64-bit hex hash of a file's bytes. An absent file hashes as empty
-/// content (the before-hash of a `write` creating a new file).
-fn hash_bytes(bytes: &[u8]) -> String {
+/// FNV-1a 64-bit hex hash of raw bytes — shared with the effect journal's
+/// `hash_input` so persisted hashes stay stable across compiler versions.
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let mut hash = 2166136261u64;
     for b in bytes {
         hash = (hash ^ u64::from(*b)).wrapping_mul(16777619);

@@ -288,10 +288,11 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                 )
                 .await;
             }
-            // Cancelled calls never completed: close their journal intents
-            // so a restart doesn't read them as in-flight effects.
-            for tracked in tracked {
-                track_end(self.session.as_deref_mut(), tracked, false);
+            // Cancelled calls close their journal intents with their real
+            // outcome: completed calls keep their result (their file changes
+            // still land in the undo ledger), never-ran ones record failed.
+            for ((_, _, outcome, _), tracked) in results.into_iter().zip(tracked) {
+                track_end(self.session.as_deref_mut(), tracked, outcome.ok);
             }
             return Err("cancelled by user".into());
         }

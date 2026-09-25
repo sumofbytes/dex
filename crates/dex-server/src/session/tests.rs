@@ -178,6 +178,21 @@ fn tracked_write_journals_intent_and_lands_in_undo_ledger() {
     assert!(msg.contains("undid write"));
     assert_eq!(fs::read_to_string(&work).unwrap(), "before\n");
 
+    // A failed or denied write never touched the file: `effect_result(false)`
+    // closes the journal intent, but no ledger record lands (before == after
+    // would be a no-op entry `/undo` could not actually undo).
+    let tracked = track_start(
+        Some(&mut s),
+        "c3",
+        "write",
+        &format!(r#"{{"path":"{work_str}"}}"#),
+    )
+    .expect("mutating write is tracked");
+    track_end(Some(&mut s), Some(tracked), false);
+    let text = fs::read_to_string(s.path().unwrap()).unwrap();
+    assert!(text.contains("\"tool_call_id\":\"c3\""));
+    assert!(crate::session::changes::load_changes(s.path().unwrap()).is_empty());
+
     // bash is mutating (journaled) but has no single file to snapshot.
     let tracked =
         track_start(Some(&mut s), "c2", "bash", r#"{"command":"ls"}"#).expect("bash is tracked");

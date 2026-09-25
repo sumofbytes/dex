@@ -63,13 +63,11 @@ pub(crate) fn record_change(
 }
 
 /// Hash that identifies a call's input (tool name + raw arguments) in the
-/// effect journal — restart recovery matches intents, not contents.
+/// effect journal — restart recovery matches intents, not contents. FNV-1a
+/// (via [`crate::tools::hash_bytes`]) so the persisted hash is stable
+/// across compiler versions, unlike `DefaultHasher`.
 fn hash_input(tool: &str, raw_args: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tool.hash(&mut hasher);
-    raw_args.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    crate::tools::hash_bytes(format!("{tool}\0{raw_args}").as_bytes())
 }
 
 /// Before-state captured for one write/edit call, for `/undo`.
@@ -141,14 +139,19 @@ pub(crate) fn track_start(
 
 /// Close one tracked call AFTER execution: `effect_result` in the journal
 /// (so a crash mid-tool leaves the `effect_start` visibly open) and, for
-/// write/edit, the post-execution file state in the `/undo` ledger. `None`
-/// (an untracked, read-only call) is a no-op.
+/// write/edit, the post-execution file state in the `/undo` ledger —
+/// skipped when the file is unchanged (denied, failed, or a content
+/// no-op), so `/undo` never pops a no-op entry. `None` (an untracked,
+/// read-only call) is a no-op.
 pub(crate) fn track_end(session: Option<&mut Session>, tracked: Option<TrackedCall>, ok: bool) {
     let Some(tracked) = tracked else { return };
     let Some(session) = session else { return };
     let _ = session.effect_result(&tracked.call_id, ok);
     let Some(file) = tracked.file else { return };
     let after_hash = crate::tools::hash_file(&file.path);
+    if after_hash == file.before_hash {
+        return;
+    }
     let after = fs::metadata(&file.path)
         .ok()
         .filter(|m| m.len() <= CHANGE_CONTENT_CAP as u64)
@@ -193,7 +196,8 @@ pub fn undo_last_change(session: &mut Session) -> io::Result<String> {
     let Some(before) = &record.before else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} is too large for undo", record.path),
+            // Covers >64 KiB (hashes-only record) and non-UTF8 content.
+            format!("{} content not recoverable for undo", record.path),
         ));
     };
     fs::write(&record.path, before).map_err(io::Error::other)?;
