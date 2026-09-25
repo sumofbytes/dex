@@ -407,6 +407,13 @@ impl SseDriver {
             let _ = io::stdout().flush();
         }
         let parsed = parser.finish();
+        if parsed.dropped_tool_calls > 0 {
+            dex_runtime::log!(
+                Warn,
+                "provider sent tool-call indices past the merge cap; {} tool call(s) dropped from this turn",
+                parsed.dropped_tool_calls
+            );
+        }
         Ok(Turn {
             message: ChatMessage {
                 role: Role::Assistant,
@@ -603,12 +610,6 @@ async fn run_sse<P: StreamParser>(
                     Ok(None) => break,
                     Ok(Some(bytes)) => {
                         buf.extend_from_slice(&bytes);
-                        if buf.len() > MAX_SSE_LINE_BYTES {
-                            return Err(driver_err(
-                                &mut driver,
-                                "SSE line exceeded 1 MiB without a newline; protocol violation",
-                            ));
-                        }
                         // Extract complete lines; keep partial tail buffered.
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             // Borrow the line before draining: skips a
@@ -621,6 +622,15 @@ async fn run_sse<P: StreamParser>(
                                 let sink_is_some = sink.is_some();
                                 return driver.finish_turn_async(parser, sink_is_some).await;
                             }
+                        }
+                        // Checked after draining: `buf` is now exactly the
+                        // unterminated tail, so one oversized chunk holding
+                        // many complete lines can't false-positive here.
+                        if buf.len() > MAX_SSE_LINE_BYTES {
+                            return Err(driver_err(
+                                &mut driver,
+                                "SSE line exceeded 1 MiB without a newline; protocol violation",
+                            ));
                         }
                     }
                 }

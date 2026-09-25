@@ -10,9 +10,11 @@ use serde_json::{json, Value};
 /// allocate until OOM. Real turns issue at most a few dozen calls.
 const MAX_MERGED_TOOL_CALLS: usize = 1024;
 
-pub fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) {
+/// Returns `true` when the delta was dropped (index at or past the cap) so
+/// callers can surface the truncation instead of silently losing calls.
+pub fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall) -> bool {
     if delta.index >= MAX_MERGED_TOOL_CALLS {
-        return;
+        return true;
     }
     while calls.len() <= delta.index {
         calls.push(LlmToolCall {
@@ -36,6 +38,7 @@ pub fn merge_chat_tool_call(calls: &mut Vec<LlmToolCall>, delta: StreamToolCall)
             call.function.arguments.push_str(&arguments);
         }
     }
+    false
 }
 
 /// Chat-completions wire messages: borrowed [`WireMessage`] views, serialized
@@ -127,9 +130,10 @@ pub fn wire_tools(tools: &[ToolDefinition], map: impl Fn(&ToolDefinition) -> Val
     tools.iter().map(map).collect()
 }
 
-pub fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) {
+/// Returns `true` when the item was dropped (index at or past the cap).
+pub fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Value) -> bool {
     if index >= MAX_MERGED_TOOL_CALLS {
-        return;
+        return true;
     }
     while calls.len() <= index {
         calls.push(LlmToolCall {
@@ -155,6 +159,7 @@ pub fn response_tool_call(calls: &mut Vec<LlmToolCall>, index: usize, item: &Val
     if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
         call.function.arguments = arguments.to_string();
     }
+    false
 }
 
 pub fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Value) -> usize {
