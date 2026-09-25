@@ -30,7 +30,7 @@ pub(crate) async fn execute(
     let owned_args: Map<String, Value>;
     let mut hooks_ran = false;
     // Zero-cost when no extension subscribes: the args pass through uncloned.
-    let args = if crate::agent::subagent::is_delegation(name)
+    let args = if crate::agent::delegate::is_delegation(name)
         || !crate::extensions::has_event_handlers("tool.before")
     {
         args
@@ -144,7 +144,7 @@ async fn dispatch_tool(
     // and have no static registry entry. The child allowlist never contains
     // one, so the same availability gate rejects a child's call before any
     // delegation logic runs (§11 — at-cap children carry no delegation tools).
-    if crate::agent::subagent::is_delegation(name) {
+    if crate::agent::delegate::is_delegation(name) {
         if let Some(filter) = filter {
             if !filter.allows(name) {
                 return Err(ToolError::Denied(format!(
@@ -153,7 +153,7 @@ async fn dispatch_tool(
                 )));
             }
         }
-        return crate::agent::subagent::execute_delegation(name, args, cancel, policy).await;
+        return crate::agent::delegate::execute_delegation(name, args, cancel, policy).await;
     }
     // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
     // Shell row must not raise the gate again — use the native requirement.

@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use crate::protocol::Skill;
+use crate::Skill;
 
-pub(crate) fn parse_skill(path: &Path) -> Option<Skill> {
+pub fn parse_skill(path: &Path) -> Option<Skill> {
     let content = fs::read_to_string(path).ok()?;
     let (name, description) = parse_frontmatter(&content)?;
     if !skill_name_ok(&name, path) {
@@ -19,7 +19,7 @@ pub(crate) fn parse_skill(path: &Path) -> Option<Skill> {
 /// Parse a SKILL.md frontmatter block into `(name, description)`; `None`
 /// when the file doesn't start with `---` or has no `name:` key. Shared by
 /// the sync and async discovery paths so the frontmatter rules can't drift.
-pub(crate) fn parse_frontmatter(content: &str) -> Option<(String, String)> {
+pub fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     let mut lines = content.lines();
     let first = lines.next()?;
     if first.trim() != "---" {
@@ -45,7 +45,7 @@ pub(crate) fn parse_frontmatter(content: &str) -> Option<(String, String)> {
 /// Name validity shared by both parse paths; an invalid name warns to stderr
 /// with the sync path's exact wording (the async path used to drop it) and
 /// rejects the skill.
-pub(crate) fn skill_name_ok(name: &str, path: &Path) -> bool {
+pub fn skill_name_ok(name: &str, path: &Path) -> bool {
     let ok = !name.is_empty()
         && name
             .chars()
@@ -62,7 +62,7 @@ pub(crate) fn skill_name_ok(name: &str, path: &Path) -> bool {
 
 /// Strip a single layer of surrounding quotes (single or double) from a YAML
 /// scalar value, so `description: "Short description"` yields the bare value.
-pub(crate) fn unquote(s: &str) -> String {
+pub fn unquote(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2 {
         let first = s.chars().next().unwrap();

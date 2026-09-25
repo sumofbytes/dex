@@ -2,8 +2,8 @@
 //! `Session` load/append/undo implementation).
 
 use super::*;
-use crate::session::changes::{load_changes, make_change_record, record_change};
-use crate::session::events::events_cache;
+
+use crate::events::events_cache;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -124,7 +124,7 @@ fn llm_history_drops_excluded_shell_runs_but_transcript_keeps_them() {
     // `!!`: saved to history and shown in the TUI, never sent to
     // the LLM. The transcript rebuild uses the full load; the
     // model-bound load filters.
-    use crate::protocol::BASH_EXCLUDED_NAME;
+    use dex_ai::BASH_EXCLUDED_NAME;
     let path = unique_path("dex-session-shell-exclude");
     let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
     fs::write(&path, format!("{header}\n")).unwrap();
@@ -207,7 +207,7 @@ fn history_cache_serves_appends_without_rescan() {
 
 #[test]
 fn history_cache_hit_repairs_dangling_tool_calls_idempotently() {
-    use crate::protocol::{FunctionCall, LlmToolCall};
+    use dex_ai::{FunctionCall, LlmToolCall};
     let path = unique_path("dex-history-cache-repair");
     let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
     fs::write(&path, format!("{header}\n")).unwrap();
@@ -508,106 +508,6 @@ fn find_by_id_filename_resolves_exact_and_prefix() {
 }
 
 #[test]
-fn load_messages_and_plan_matches_separate_loads() {
-    let path = unique_path("dex-messages-plan");
-    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
-    let user = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"hi"}"#;
-    let want = crate::protocol::Plan {
-        goal: Some("g".into()),
-        steps: vec![("s".into(), false)],
-        constraints: Vec::new(),
-        acceptance: Vec::new(),
-    };
-    let state = format!(
-        r#"{{"type":"session_state","id":"2","timestamp":"2020-01-01T00:00:00Z","key":"plan","value":{}}}"#,
-        serde_json::to_string(&want.to_json()).unwrap()
-    );
-    fs::write(&path, format!("{header}\n{user}\n{state}\n")).unwrap();
-    let (messages, plan) = load_messages_and_plan(&path).unwrap();
-    // Same messages as the standalone loader, same plan as the
-    // standalone second pass — from one scan.
-    assert_eq!(
-        serde_json::to_string(&messages).unwrap(),
-        serde_json::to_string(&load_messages_from_session(&path).unwrap()).unwrap()
-    );
-    assert_eq!(plan, load_plan(&path));
-    assert_eq!(plan, want);
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn change_ledger_records_then_undo_restores() {
-    // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
-    let _lock = TEST_SESSIONS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut s = Session::new("/tmp/dex-undo-test".into(), None).unwrap();
-    let work = s.path().unwrap().parent().unwrap().join("work.txt");
-    fs::write(&work, b"before\n").unwrap();
-    let h_before = crate::tools::hash_file(&work.display().to_string());
-    fs::write(&work, b"after\n").unwrap();
-    let h_after = crate::tools::hash_file(&work.display().to_string());
-    record_change(
-        &mut s,
-        make_change_record(
-            "write",
-            &work.display().to_string(),
-            Some("before\n"),
-            Some("after\n"),
-            &h_before,
-            &h_after,
-        ),
-    )
-    .unwrap();
-    // File is currently "after" — matches after_hash, so undo applies.
-    let changes = load_changes(s.path().unwrap());
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].after_hash, h_after);
-    let msg = undo_last_change(&mut s).unwrap();
-    assert!(msg.contains("undid write"));
-    assert_eq!(fs::read_to_string(&work).unwrap(), "before\n");
-    assert!(load_changes(s.path().unwrap()).is_empty());
-    let _ = fs::remove_file(&work);
-    if let Some(p) = s.path() {
-        let _ = fs::remove_file(p);
-    }
-}
-
-#[test]
-fn undo_refuses_when_file_moved_on() {
-    // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
-    let _lock = TEST_SESSIONS_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut s = Session::new("/tmp/dex-undo-concurrent".into(), None).unwrap();
-    let work = s.path().unwrap().parent().unwrap().join("c.txt");
-    fs::write(&work, b"v1\n").unwrap();
-    let h = crate::tools::hash_file(&work.display().to_string());
-    record_change(
-        &mut s,
-        make_change_record(
-            "write",
-            &work.display().to_string(),
-            Some("v1\n"),
-            Some("v2\n"),
-            &h,
-            &h,
-        ),
-    )
-    .unwrap();
-    // Rewrite the file afterwards but keep the same hash (hash is of
-    // content; simulate a concurrent edit changing it):
-    // A concurrent edit changes the content -> new hash -> refuse.
-    fs::write(&work, b"vX\n").unwrap();
-    let err = undo_last_change(&mut s).unwrap_err();
-    assert!(err.to_string().contains("refusing to undo"));
-    let _ = fs::remove_file(&work);
-    if let Some(p) = s.path() {
-        let _ = fs::remove_file(p);
-    }
-}
-
-#[test]
 fn effect_journal_records_intent_and_outcome() {
     // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
     let _lock = TEST_SESSIONS_ENV_LOCK
@@ -659,7 +559,7 @@ fn record_skills_writes_session_state_entry() {
     let _lock = TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let skills = vec![crate::protocol::Skill {
+    let skills = vec![dex_skills::Skill {
         name: "demo".into(),
         description: "does demo things".into(),
         path: std::path::PathBuf::from("/tmp/demo/SKILL.md"),
@@ -793,10 +693,10 @@ fn dangling_tool_call_is_synthesized_on_load() {
     s.append_message(&ChatMessage::user("goal")).unwrap();
     s.append_message(&ChatMessage::assistant_calls(
         None,
-        vec![crate::protocol::LlmToolCall {
+        vec![dex_ai::LlmToolCall {
             id: "call-1".into(),
             call_type: "function".into(),
-            function: crate::protocol::FunctionCall {
+            function: dex_ai::FunctionCall {
                 name: "edit".into(),
                 arguments: r#"{"path":"a.rs"}"#.into(),
             },
@@ -812,7 +712,7 @@ fn dangling_tool_call_is_synthesized_on_load() {
         "assistant call must get a synthesized result"
     );
     let last = messages.last().unwrap();
-    assert_eq!(last.role, crate::protocol::Role::Tool);
+    assert_eq!(last.role, dex_ai::Role::Tool);
     assert_eq!(last.tool_call_id.as_deref(), Some("call-1"));
     assert!(
         last.content
@@ -836,10 +736,10 @@ fn complete_tool_batch_loads_without_synthesis() {
     let mut s = Session::new("/tmp/dex-clean-cwd".into(), None).unwrap();
     s.append_message(&ChatMessage::assistant_calls(
         None,
-        vec![crate::protocol::LlmToolCall {
+        vec![dex_ai::LlmToolCall {
             id: "call-1".into(),
             call_type: "function".into(),
-            function: crate::protocol::FunctionCall {
+            function: dex_ai::FunctionCall {
                 name: "read".into(),
                 arguments: "{}".into(),
             },
@@ -863,10 +763,10 @@ fn dangling_middle_batch_repairs_in_place_not_at_end() {
         ChatMessage::user("goal"),
         ChatMessage::assistant_calls(
             None,
-            vec![crate::protocol::LlmToolCall {
+            vec![dex_ai::LlmToolCall {
                 id: "mid-1".into(),
                 call_type: "function".into(),
-                function: crate::protocol::FunctionCall {
+                function: dex_ai::FunctionCall {
                     name: "read".into(),
                     arguments: "{}".into(),
                 },
@@ -876,7 +776,7 @@ fn dangling_middle_batch_repairs_in_place_not_at_end() {
     ];
     super::repair_dangling_tool_calls(&mut messages);
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[2].role, crate::protocol::Role::Tool);
+    assert_eq!(messages[2].role, dex_ai::Role::Tool);
     assert_eq!(messages[2].tool_call_id.as_deref(), Some("mid-1"));
     assert_eq!(messages[3].content.as_deref(), Some("follow-up"));
 }

@@ -45,7 +45,7 @@ pub(crate) struct AgentRuntime<'a, C, X> {
     /// inside the daemon — it is what makes `delegate` spawnable — and
     /// for children under the depth cap (one level deeper). At-cap
     /// children and every non-daemon path pass `None` (no delegation).
-    pub(crate) agent_ctx: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
+    pub(crate) agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
     /// Turn budget override (plan §4: a definition's `max_tool_iterations`
     /// feeds the existing budget knob; `None` = the default/env value).
     pub(crate) tool_budget: Option<usize>,
@@ -213,7 +213,7 @@ struct DexHostSetup<'a, C, X> {
     cancel: &'a X,
     console: &'a Console,
     filter: Option<&'a ToolFilter>,
-    agent_ctx: Option<Arc<crate::agent::subagent::AgentTurnContext>>,
+    agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
     tool_budget: Option<usize>,
 }
 

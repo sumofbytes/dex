@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::agent::delegate::{AgentTurnContext, WaitOutcome};
 use crate::agent::state::ToolState;
-use crate::agent::subagent::{AgentTurnContext, WaitOutcome};
 use crate::agent::turn_loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override_for;
@@ -16,7 +16,7 @@ use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
 use crate::runtime::console::{CancellationToken, Console};
 use crate::runtime::unwind::CatchUnwind;
 use crate::session::{self, Session};
-use crate::skills::{discover_skills_async, skill_dirs};
+use dex_skills::{discover_skills_async, skill_dirs};
 
 use super::approvals::child_approval_bridge;
 use super::lookup::persisted_current;
@@ -801,7 +801,7 @@ pub(crate) async fn run_turn_inner(
 /// Drain queued child completion notices into ONE user-role message
 /// ("agent-notifications") prepended to the next turn's context (§10b V1a:
 /// results land only at real turn boundaries — never mid-turn, never via
-/// the steering channel). The retained [`AgentResult`](crate::agent::subagent::AgentResult)
+/// the steering channel). The retained [`AgentResult`](crate::agent::delegate::AgentResult)
 /// is the source of truth: the child's final text is what the parent
 /// consumes.
 async fn drain_agent_notices(

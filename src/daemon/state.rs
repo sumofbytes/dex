@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::agent::subagent::{AgentEvent, AgentManager};
+use crate::agent::delegate::{AgentEvent, AgentManager};
 use crate::protocol::{ApprovalDecision, PermissionMode, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 use crate::runtime::console::CancellationToken;
@@ -590,7 +590,7 @@ pub(crate) fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, ev
         AgentEvent::Completed(notice) => (
             StreamEvent::AgentCompleted {
                 agent_id: notice.agent_id.to_string(),
-                status: crate::agent::subagent::status_word(notice.status).to_string(),
+                status: crate::agent::delegate::status_word(notice.status).to_string(),
             },
             Some(notice.text()),
         ),

@@ -168,7 +168,7 @@ mod tests {
     fn messages_body_keeps_system_and_tools_stable_across_appends() {
         let _catalog = HermeticCatalog::empty("prefix-stable");
         let mut base = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let tools = crate::llm::protocol::tools_schema();
+        let tools = crate::llm::tool_descriptions::tools_schema();
         let body1 = messages_body("m-r", None, &base, &tools);
         base.push(ChatMessage::user("follow-up"));
         let body2 = messages_body("m-r", None, &base, &tools);
@@ -211,7 +211,7 @@ mod tests {
 
     impl HermeticCatalog {
         fn set(name: &str, catalog: &str) -> Self {
-            let _lock = crate::session::TEST_SESSIONS_ENV_LOCK
+            let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir()
@@ -261,7 +261,7 @@ mod tests {
 
         // Thinking enabled: budget maps from the effort knob and sits
         // strictly below max_tokens.
-        let tools = crate::llm::protocol::tools_schema();
+        let tools = crate::llm::tool_descriptions::tools_schema();
         let body = messages_body(model, Some("low"), &[ChatMessage::user("hi")], &tools);
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
         assert_eq!(body["max_tokens"], 16_384);

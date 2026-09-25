@@ -4,33 +4,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::protocol::ChatMessage;
+use dex_ai::ChatMessage;
 
-pub(crate) const SESSION_VERSION: u32 = 1;
+pub const SESSION_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct SessionHeader {
+pub struct SessionHeader {
     #[serde(rename = "type")]
-    pub(crate) entry_type: String,
-    pub(crate) version: u32,
-    pub(crate) id: String,
-    pub(crate) timestamp: String,
-    pub(crate) cwd: String,
+    pub entry_type: String,
+    pub version: u32,
+    pub id: String,
+    pub timestamp: String,
+    pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
 }
 
 impl SessionHeader {
-    pub(crate) fn name(&self) -> Option<&str> {
+    pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
-    pub(crate) fn id(&self) -> &str {
+    pub fn id(&self) -> &str {
         &self.id
     }
-    pub(crate) fn cwd(&self) -> &str {
+    pub fn cwd(&self) -> &str {
         &self.cwd
     }
-    pub(crate) fn timestamp(&self) -> &str {
+    pub fn timestamp(&self) -> &str {
         &self.timestamp
     }
 }
@@ -39,43 +39,43 @@ impl SessionHeader {
 /// line is built from references, so appending never clones the message.
 /// Reads parse entries back through `serde_json::Value`, not this struct.
 #[derive(Serialize)]
-pub(crate) struct SessionMessageEntry<'a> {
+pub struct SessionMessageEntry<'a> {
     #[serde(rename = "type")]
-    pub(crate) entry_type: &'a str,
-    pub(crate) id: &'a str,
-    pub(crate) timestamp: &'a str,
+    pub entry_type: &'a str,
+    pub id: &'a str,
+    pub timestamp: &'a str,
     #[serde(flatten)]
-    pub(crate) message: &'a ChatMessage,
+    pub message: &'a ChatMessage,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct SessionInfoEntry {
+pub struct SessionInfoEntry {
     #[serde(rename = "type")]
-    pub(crate) entry_type: String,
-    pub(crate) id: String,
-    pub(crate) timestamp: String,
-    pub(crate) name: String,
+    pub entry_type: String,
+    pub id: String,
+    pub timestamp: String,
+    pub name: String,
 }
 
 #[derive(Serialize)]
-pub(crate) struct SessionClearEntry {
+pub struct SessionClearEntry {
     #[serde(rename = "type")]
-    pub(crate) entry_type: String,
-    pub(crate) id: String,
-    pub(crate) timestamp: String,
+    pub entry_type: String,
+    pub id: String,
+    pub timestamp: String,
 }
 
 #[derive(Serialize)]
-pub(crate) struct SessionEventEntry {
+pub struct SessionEventEntry {
     #[serde(rename = "type")]
-    pub(crate) entry_type: String,
-    pub(crate) id: String,
-    pub(crate) timestamp: String,
+    pub entry_type: String,
+    pub id: String,
+    pub timestamp: String,
     /// Agent mode (`plan`/`manual`/`auto`) that governed the turn
     /// (`turn_start` only). Absent for legacy journals and subagent
     /// turns, so a reattach can restore the client's last selector.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) mode: Option<String>,
+    pub mode: Option<String>,
 }
 
 /// Durable record of one side effect: intent (before execution) and outcome
@@ -84,26 +84,26 @@ pub(crate) struct SessionEventEntry {
 /// turn loop yet — test-only until a producer lands.
 #[derive(Serialize)]
 #[cfg(test)]
-pub(crate) struct SessionEffectEntry {
+pub struct SessionEffectEntry {
     #[serde(rename = "type")]
-    pub(crate) entry_type: String,
-    pub(crate) id: String,
-    pub(crate) timestamp: String,
-    pub(crate) tool_call_id: String,
-    pub(crate) name: String,
-    pub(crate) input_hash: String,
+    pub entry_type: String,
+    pub id: String,
+    pub timestamp: String,
+    pub tool_call_id: String,
+    pub name: String,
+    pub input_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) ok: Option<bool>,
+    pub ok: Option<bool>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct SessionStateEntry {
+pub struct SessionStateEntry {
     #[serde(rename = "type")]
-    pub(crate) entry_type: String,
-    pub(crate) id: String,
-    pub(crate) timestamp: String,
-    pub(crate) key: String,
-    pub(crate) value: String,
+    pub entry_type: String,
+    pub id: String,
+    pub timestamp: String,
+    pub key: String,
+    pub value: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,12 +125,12 @@ pub(crate) struct SessionStateEntry {
 /// `(mtime, len)` identity for a journal snapshot. Shared by the history
 /// and events caches (`events.rs`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FileId {
-    pub(crate) mtime: SystemTime,
-    pub(crate) len: u64,
+pub struct FileId {
+    pub mtime: SystemTime,
+    pub len: u64,
 }
 
-pub(crate) fn file_id(path: &Path) -> Option<FileId> {
+pub fn file_id(path: &Path) -> Option<FileId> {
     fs::metadata(path).ok().and_then(|m| {
         m.modified().ok().map(|mtime| FileId {
             mtime,
@@ -141,15 +141,15 @@ pub(crate) fn file_id(path: &Path) -> Option<FileId> {
 
 /// FIFO-capped process-global cache keyed by journal path. Shared by the
 /// history and events caches (`events.rs`).
-pub(crate) struct PathCache<V> {
-    pub(crate) map: HashMap<PathBuf, V>,
-    pub(crate) order: VecDeque<PathBuf>,
+pub struct PathCache<V> {
+    pub map: HashMap<PathBuf, V>,
+    pub order: VecDeque<PathBuf>,
 }
 
 impl<V> PathCache<V> {
     const CAP: usize = 32;
 
-    pub(crate) fn insert(&mut self, path: &Path, value: V) {
+    pub fn insert(&mut self, path: &Path, value: V) {
         if !self.map.contains_key(path) {
             self.order.push_back(path.to_path_buf());
             while self.order.len() > Self::CAP {
@@ -166,15 +166,15 @@ impl<V> PathCache<V> {
         self.map.insert(path.to_path_buf(), value);
     }
 
-    pub(crate) fn get(&self, path: &Path) -> Option<&V> {
+    pub fn get(&self, path: &Path) -> Option<&V> {
         self.map.get(path)
     }
 
-    pub(crate) fn get_mut(&mut self, path: &Path) -> Option<&mut V> {
+    pub fn get_mut(&mut self, path: &Path) -> Option<&mut V> {
         self.map.get_mut(path)
     }
 
-    pub(crate) fn evict(&mut self, path: &Path) {
+    pub fn evict(&mut self, path: &Path) {
         self.map.remove(path);
     }
 }

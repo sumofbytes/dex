@@ -720,7 +720,7 @@ data: {"type":"response.output_text.delta","delta":"!"}"#;
 
 #[test]
 fn idle_timeout_env_parses() {
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
@@ -753,7 +753,7 @@ fn idle_timeout_default_is_per_model() {
     // No env override (lock held so a parallel env-mutating test can't
     // leak in); an unknown model is never reasoning-capable, so the
     // default must not depend on whatever catalog cache the machine has.
-    let _env = crate::session::TEST_SESSIONS_ENV_LOCK
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("DEX_STREAM_IDLE_TIMEOUT_SECS").ok();
