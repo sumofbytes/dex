@@ -616,6 +616,9 @@ pub(crate) fn format_duration(secs: f64) -> String {
 }
 
 pub(crate) fn model_tool_result(text: &str) -> String {
+    // Limits must match the journal-side copy in
+    // `dex_session::store::model_tool_result` (and vice versa) so replayed
+    // history and rendered output agree on what got truncated.
     truncate_text(text, 50 * 1024, 2_000)
 }
 
