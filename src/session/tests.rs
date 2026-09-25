@@ -120,9 +120,8 @@ fn undo_refuses_when_file_moved_on() {
         ),
     )
     .unwrap();
-    // Rewrite the file afterwards but keep the same hash (hash is of
-    // content; simulate a concurrent edit changing it):
-    // A concurrent edit changes the content -> new hash -> refuse.
+    // Simulate a concurrent edit: the content (and therefore its hash)
+    // changed after the record was written, so undo must refuse.
     fs::write(&work, b"vX\n").unwrap();
     let err = undo_last_change(&mut s).unwrap_err();
     assert!(err.to_string().contains("refusing to undo"));

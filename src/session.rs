@@ -36,21 +36,14 @@ pub(crate) fn load_messages_and_plan(path: &Path) -> io::Result<(Vec<ChatMessage
 }
 
 // App-side callers don't load the plan standalone today (reattach rides the
-// single-scan loader); kept for `/resume`-style consumers and tests.
-#[cfg_attr(not(test), allow(dead_code))]
+// single-scan loader); test-only.
+#[cfg(test)]
 pub(crate) fn load_plan(path: &Path) -> Plan {
     dex_session::load_session_state(path)
         .ok()
         .and_then(|m| m.get("plan").cloned())
         .map(|s| Plan::from_json(&s))
         .unwrap_or_default()
-}
-
-// No production caller yet (plan writes go through the turn loop's state
-// path); kept so the app-side plan representation has one save entry point.
-#[allow(dead_code)]
-pub(crate) fn save_plan(session: &mut Session, plan: &Plan) -> io::Result<()> {
-    session.set_state("plan", &plan.to_json())
 }
 
 #[cfg(test)]
