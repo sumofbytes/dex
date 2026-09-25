@@ -1431,13 +1431,21 @@ fn phase0_write_args(path: &str) -> Map<String, Value> {
     args
 }
 
+/// `target/<name>` relative to the test cwd, creating `target/` first:
+/// a fresh checkout only has the workspace-root `target/`, not the
+/// crate-local one these tests write through.
+fn phase0_rel(name: &str) -> String {
+    fs::create_dir_all("target").unwrap();
+    format!("target/{name}")
+}
+
 #[tokio::test]
 async fn ask_writes_parks_write_and_blocks_until_allowed() {
-    let rel = "target/phase0-allow.txt";
-    let _ = fs::remove_file(rel);
+    let rel = phase0_rel("phase0-allow.txt");
+    let _ = fs::remove_file(&rel);
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::Ask, &console);
-    let args = phase0_write_args(rel);
+    let args = phase0_write_args(&rel);
     let expected_input = Value::Object(args.clone()).to_string();
     let mut handle = tokio::spawn(async move {
         execute_outcome("write", &args, &GlobalCancellation, &policy, None).await
@@ -1466,21 +1474,21 @@ async fn ask_writes_parks_write_and_blocks_until_allowed() {
         .expect("verdict must unblock the call")
         .expect("worker panicked");
     assert!(outcome.ok, "{}", outcome.text);
-    assert_eq!(fs::read_to_string(rel).unwrap(), "phase0\n");
+    assert_eq!(fs::read_to_string(&rel).unwrap(), "phase0\n");
     assert!(
         approval_rx.try_recv().is_err(),
         "exactly one prompt must be parked"
     );
-    let _ = fs::remove_file(rel);
+    let _ = fs::remove_file(&rel);
 }
 
 #[tokio::test]
 async fn ask_writes_deny_blocks_the_write() {
-    let rel = "target/phase0-deny.txt";
-    let _ = fs::remove_file(rel);
+    let rel = phase0_rel("phase0-deny.txt");
+    let _ = fs::remove_file(&rel);
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::Ask, &console);
-    let args = phase0_write_args(rel);
+    let args = phase0_write_args(&rel);
     let handle = tokio::spawn(async move {
         execute_outcome("write", &args, &GlobalCancellation, &policy, None).await
     });
@@ -1499,17 +1507,17 @@ async fn ask_writes_deny_blocks_the_write() {
         .expect("worker panicked");
     assert!(!outcome.ok);
     assert!(outcome.text.contains("denied"), "{}", outcome.text);
-    assert!(!std::path::Path::new(rel).exists(), "deny must not write");
+    assert!(!std::path::Path::new(&rel).exists(), "deny must not write");
 }
 
 #[tokio::test]
 async fn ask_writes_allow_session_skips_the_second_prompt() {
-    let rel = "target/phase0-session.txt";
-    let _ = fs::remove_file(rel);
+    let rel = phase0_rel("phase0-session.txt");
+    let _ = fs::remove_file(&rel);
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::Ask, &console);
     // First identical call prompts; deny it to release the worker.
-    let args = phase0_write_args(rel);
+    let args = phase0_write_args(&rel);
     let policy2 = policy.clone();
     let first = tokio::spawn(async move {
         execute_outcome("write", &args, &GlobalCancellation, &policy2, None).await
@@ -1528,9 +1536,9 @@ async fn ask_writes_allow_session_skips_the_second_prompt() {
         .expect("verdict must unblock the call")
         .expect("worker panicked");
     assert!(!outcome.ok);
-    assert!(!std::path::Path::new(rel).exists(), "deny must not write");
+    assert!(!std::path::Path::new(&rel).exists(), "deny must not write");
     // Second identical call prompts again; allow for session.
-    let args2 = phase0_write_args(rel);
+    let args2 = phase0_write_args(&rel);
     let policy3 = policy.clone();
     let second = tokio::spawn(async move {
         execute_outcome("write", &args2, &GlobalCancellation, &policy3, None).await
@@ -1550,7 +1558,7 @@ async fn ask_writes_allow_session_skips_the_second_prompt() {
         .expect("worker panicked");
     assert!(outcome2.ok, "{}", outcome2.text);
     // Same-turn repeat: no new prompt, straight through.
-    let args3 = phase0_write_args(rel);
+    let args3 = phase0_write_args(&rel);
     let outcome3 = tokio::time::timeout(
         Duration::from_secs(10),
         execute_outcome("write", &args3, &GlobalCancellation, &policy, None),
@@ -1562,16 +1570,16 @@ async fn ask_writes_allow_session_skips_the_second_prompt() {
         approval_rx.try_recv().is_err(),
         "no further prompt after allow-for-session"
     );
-    let _ = fs::remove_file(rel);
+    let _ = fs::remove_file(&rel);
 }
 
 #[tokio::test]
 async fn read_only_rejects_write_without_prompt() {
-    let rel = "target/phase0-readonly.txt";
-    let _ = fs::remove_file(rel);
+    let rel = phase0_rel("phase0-readonly.txt");
+    let _ = fs::remove_file(&rel);
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::ReadOnly, &console);
-    let args = phase0_write_args(rel);
+    let args = phase0_write_args(&rel);
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         execute_outcome("write", &args, &GlobalCancellation, &policy, None),
@@ -1584,7 +1592,7 @@ async fn read_only_rejects_write_without_prompt() {
         approval_rx.try_recv().is_err(),
         "read-only must reject, never prompt"
     );
-    assert!(!std::path::Path::new(rel).exists());
+    assert!(!std::path::Path::new(&rel).exists());
 
     // Plan mode (`read-only`) still permits reads — its directive asks the
     // model to explore, so the read gate must not block that.
@@ -1601,9 +1609,9 @@ async fn read_only_rejects_write_without_prompt() {
 
 #[tokio::test]
 async fn trusted_runs_mutations_with_no_channel() {
-    let rel = "target/phase0-trusted.txt";
-    let _ = fs::remove_file(rel);
-    let args = phase0_write_args(rel);
+    let rel = phase0_rel("phase0-trusted.txt");
+    let _ = fs::remove_file(&rel);
+    let args = phase0_write_args(&rel);
     let outcome = execute_outcome(
         "write",
         &args,
@@ -1613,19 +1621,19 @@ async fn trusted_runs_mutations_with_no_channel() {
     )
     .await;
     assert!(outcome.ok, "{}", outcome.text);
-    assert_eq!(fs::read_to_string(rel).unwrap(), "phase0\n");
-    let _ = fs::remove_file(rel);
+    assert_eq!(fs::read_to_string(&rel).unwrap(), "phase0\n");
+    let _ = fs::remove_file(&rel);
 }
 
 #[tokio::test]
 async fn ask_permits_reads_but_prompts_writes_and_shell() {
     // A write under `ask` parks exactly one prompt and blocks for the
     // verdict (no console attached here, so it surfaces as a denial).
-    let rel = "target/phase0-ask.txt";
-    let _ = fs::remove_file(rel);
+    let rel = phase0_rel("phase0-ask.txt");
+    let _ = fs::remove_file(&rel);
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::Ask, &console);
-    let args = phase0_write_args(rel);
+    let args = phase0_write_args(&rel);
     let policy2 = policy.clone();
     let mut handle = tokio::spawn(async move {
         execute_outcome("write", &args, &GlobalCancellation, &policy2, None).await
@@ -1653,8 +1661,8 @@ async fn ask_permits_reads_but_prompts_writes_and_shell() {
         .expect("verdict must unblock the call")
         .expect("worker panicked");
     assert!(outcome.ok, "{}", outcome.text);
-    assert_eq!(fs::read_to_string(rel).unwrap(), "phase0\n");
-    let _ = fs::remove_file(rel);
+    assert_eq!(fs::read_to_string(&rel).unwrap(), "phase0\n");
+    let _ = fs::remove_file(&rel);
 
     // A read is free under `ask` — it never touches the approval channel.
     let mut args = Map::new();
@@ -1675,13 +1683,13 @@ async fn ask_permits_reads_but_prompts_writes_and_shell() {
 #[tokio::test]
 async fn approval_wait_unwinds_on_cancel() {
     use crate::runtime::console::CancellationToken;
-    let rel = "target/phase0-cancel.txt";
-    let _ = fs::remove_file(rel);
+    let rel = phase0_rel("phase0-cancel.txt");
+    let _ = fs::remove_file(&rel);
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::Ask, &console);
     let cancel = CancellationToken::new();
     let cancel2 = cancel.clone();
-    let args = phase0_write_args(rel);
+    let args = phase0_write_args(&rel);
     let handle =
         tokio::spawn(async move { execute_outcome("write", &args, &cancel2, &policy, None).await });
     // Wait for the parked prompt, then cancel instead of answering.
@@ -1696,7 +1704,7 @@ async fn approval_wait_unwinds_on_cancel() {
         .expect("worker panicked");
     assert!(!outcome.ok);
     assert!(outcome.text.contains("cancelled"), "{}", outcome.text);
-    assert!(!std::path::Path::new(rel).exists());
+    assert!(!std::path::Path::new(&rel).exists());
 }
 
 // Phase 2 (runtime extraction): the explicit ToolFilter allowlist,
@@ -1751,7 +1759,8 @@ async fn filtered_out_tool_rejects_before_approval_without_prompt() {
     let (console, mut approval_rx) = phase0_console();
     let policy = Policy::turn(PermissionMode::Ask, &console);
     let filter = ToolFilter::new("explorer", ["read"]);
-    let args = phase0_write_args("target/phase0-filter-no-prompt.txt");
+    let rel = phase0_rel("phase0-filter-no-prompt.txt");
+    let args = phase0_write_args(&rel);
     let outcome = tokio::time::timeout(
         Duration::from_secs(10),
         execute_outcome("write", &args, &GlobalCancellation, &policy, Some(&filter)),
@@ -1764,7 +1773,7 @@ async fn filtered_out_tool_rejects_before_approval_without_prompt() {
         approval_rx.try_recv().is_err(),
         "filtered-out tool must reject, never prompt"
     );
-    assert!(!std::path::Path::new("target/phase0-filter-no-prompt.txt").exists());
+    assert!(!std::path::Path::new(&rel).exists());
 }
 
 #[tokio::test]
