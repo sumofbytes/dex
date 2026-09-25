@@ -853,6 +853,67 @@ async fn pre_output_drop_preserves_typed_transport_error() {
     assert!(found_cause, "marker keeps the reqwest cause in-chain");
 }
 
+/// A single chunk > 1 MiB made of many complete SSE lines must stream
+/// fine: the 1 MiB cap guards the *unterminated tail* of the read buffer,
+/// not the chunk size or the total body.
+#[tokio::test]
+async fn oversized_chunk_of_complete_lines_streams() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // Drain the request before responding: dropping the socket with
+        // unread request bytes queued sends RST and kills the body.
+        let mut head = vec![0u8; 8192];
+        loop {
+            use tokio::io::AsyncReadExt as _;
+            let n = socket.read(&mut head).await.unwrap();
+            if n == 0 || head[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // One chunked-transfer chunk > 1 MiB of complete SSE lines,
+        // terminated by [DONE]; connection close ends the body.
+        let filler = "x".repeat(500);
+        let mut body = String::new();
+        for _ in 0..2500 {
+            body.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{filler}\"}}}}]}}\n\n"
+            ));
+        }
+        body.push_str("data: [DONE]\n\n");
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket
+            .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        socket.write_all(body.as_bytes()).await.unwrap();
+        socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+    });
+    let client = crate::runtime::http::shared_streaming_client();
+    let response = client
+        .get(format!("http://{addr}/v1/chat/completions"))
+        .send()
+        .await
+        .unwrap();
+    let turn = read_stream(
+        response,
+        None,
+        &CancellationToken::new(),
+        Some(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    let content = turn.message.content.unwrap_or_default();
+    assert!(
+        content.len() > 1024 * 1024,
+        "all complete lines of the oversized chunk must stream, got {} bytes",
+        content.len()
+    );
+}
+
 /// A provider that sends response headers and then never sends a byte
 /// must not park the turn forever: the idle watchdog fails the stream
 /// with a diagnosable error instead of an opaque hang.

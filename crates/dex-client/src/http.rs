@@ -419,8 +419,19 @@ impl DaemonClient {
             .chat_stream(session_id, prompt, options)
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+        // The daemon always sends TurnComplete/TurnFailed before closing; a
+        // stream that ends without one is a transport failure, not a
+        // successful turn (callers would otherwise record a dead turn as
+        // done and skip retry/reconnect logic).
+        let mut saw_terminal = false;
         while let Some(item) = stream.next_event().await {
             let event = item.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if matches!(
+                &event,
+                StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. }
+            ) {
+                saw_terminal = true;
+            }
             if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
                 let request_id = request_id.clone();
                 let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
@@ -434,7 +445,11 @@ impl DaemonClient {
             }
             on_event(event);
         }
-        Ok(())
+        if saw_terminal {
+            Ok(())
+        } else {
+            Err("connection closed before the turn completed".into())
+        }
     }
 
     /// Submit a chat prompt and process `StreamEvent`s as they arrive.

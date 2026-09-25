@@ -11,7 +11,9 @@ pub(crate) static PROMPT_APPENDIX: std::sync::Mutex<Vec<(String, String)>> =
 /// Composition sorts by id (`prompt_appendix`), so push order never leaks
 /// into the system prefix.
 pub fn push_prompt_appendix(ext_id: &str, text: String) {
-    let mut guard = PROMPT_APPENDIX.lock().expect("prompt appendix lock");
+    let mut guard = PROMPT_APPENDIX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match guard.iter_mut().find(|(id, _)| id == ext_id) {
         Some(entry) => entry.1.push_str(&text),
         None => guard.push((ext_id.to_string(), text)),
@@ -22,7 +24,7 @@ pub fn push_prompt_appendix(ext_id: &str, text: String) {
 pub(crate) fn remove_prompt_appendix(ext_id: &str) {
     PROMPT_APPENDIX
         .lock()
-        .expect("prompt appendix lock")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|(id, _)| id != ext_id);
 }
 
@@ -31,7 +33,9 @@ pub(crate) fn remove_prompt_appendix(ext_id: &str) {
 /// system prefix is byte-identical across reload orders — prompt-cache
 /// stability: any reorder would invalidate the cached system prefix.
 pub fn prompt_appendix() -> String {
-    let guard = PROMPT_APPENDIX.lock().expect("prompt appendix lock");
+    let guard = PROMPT_APPENDIX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut entries: Vec<(&str, &str)> = guard
         .iter()
         .map(|(id, text)| (id.as_str(), text.as_str()))

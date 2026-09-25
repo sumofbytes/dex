@@ -58,7 +58,12 @@ pub fn cached_tools() -> Arc<[ToolDefinition]> {
         return Arc::new([]);
     };
     let all = spin_read(&m.cached).unwrap_or_else(|| Arc::new([]));
-    match m.active.read().expect("active lock").clone() {
+    match m
+        .active
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         None => all,
         // Filtered here, not at set time: a load-time `set_active` races
         // the cache rebuild, and dropping unknown names there would wedge
@@ -85,7 +90,12 @@ pub fn cached_schema_tokens() -> u64 {
     let Some(m) = GLOBAL.get() else {
         return 0;
     };
-    if let Some(active) = m.active.read().expect("active lock").clone() {
+    if let Some(active) = m
+        .active
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         let wanted: HashSet<String> = active.into_iter().collect();
         if let Some(costs) = spin_read(&m.cached_costs) {
             // Same sum-then-divide formula as `schema_token_estimate`, on
@@ -374,7 +384,9 @@ pub async fn fire_model_select_if_changed(
     let snapshot = served_snapshot_for(config);
     let id = snapshot.id();
     let previous = {
-        let mut guard = LAST_MODEL.lock().expect("served model lock");
+        let mut guard = LAST_MODEL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = guard.clone().map(|s| s.id());
         *guard = Some(snapshot);
         prev
@@ -383,7 +395,9 @@ pub async fn fire_model_select_if_changed(
     // turn's `extra_headers` ride along so `dex.net.fetch` serves the same
     // endpoint without tripping `MissingSessionID`.
     {
-        let mut guard = LAST_ROUTING_HEADERS.lock().expect("routing headers lock");
+        let mut guard = LAST_ROUTING_HEADERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = harvest_routing_headers(&config_header_layers(config));
     }
     if previous.as_deref() == Some(id.as_str()) || !has_event_handlers("model_select") {
