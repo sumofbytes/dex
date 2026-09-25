@@ -14,12 +14,9 @@ use dex_ai::{ChatMessage, Role};
 
 use super::discovery;
 use super::header::{
-    file_id, FileId, PathCache, SessionClearEntry, SessionEventEntry, SessionHeader,
-    SessionInfoEntry, SessionMessageEntry, SessionStateEntry, SESSION_VERSION,
+    file_id, FileId, PathCache, SessionClearEntry, SessionEffectEntry, SessionEventEntry,
+    SessionHeader, SessionInfoEntry, SessionMessageEntry, SessionStateEntry, SESSION_VERSION,
 };
-
-#[cfg(test)]
-use super::header::SessionEffectEntry;
 #[cfg(test)]
 use crate::test_support::{EnvGuard, TEST_SESSIONS_ENV_LOCK};
 
@@ -694,7 +691,6 @@ impl Session {
 
     /// Durable side-effect intent: recorded BEFORE the tool executes so a
     /// restart can see effects that started but never completed.
-    #[cfg(test)]
     pub fn effect_start(
         &mut self,
         tool_call_id: &str,
@@ -714,7 +710,6 @@ impl Session {
     }
 
     /// Durable side-effect outcome: recorded AFTER the tool executed.
-    #[cfg(test)]
     pub fn effect_result(&mut self, tool_call_id: &str, ok: bool) -> io::Result<()> {
         let entry = SessionEffectEntry {
             entry_type: "effect_result".into(),
