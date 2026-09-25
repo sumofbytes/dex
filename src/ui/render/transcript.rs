@@ -31,11 +31,13 @@ pub(crate) struct TranscriptView;
 /// turn-activity block wraps to zero rows while a thinking block streams:
 /// Working shows only when busy-but-not-thinking, so the transcript never
 /// stacks two live spinners.
-/// Submitted prompts read as the composer's echo: the same `❯ ` glyph as
+/// Submitted prompts read as the composer's echo boxed in the same
+/// top/bottom `─` hairlines as the live composer: the same `❯ ` glyph as
 /// the live composer, on the terminal's own background, so a sent prompt
 /// keeps the wrap/column shape it had while typed (spacing differs: the
 /// live composer has air below short text, the echo has none). Stored
-/// lines stay unpadded
+/// lines stay unpadded (the rules are added here at wrap time, keeping
+/// `wrap_line_display`'s indent logic intact); each wrapped row is padded
 /// (width-dependent fill happens here at wrap time, keeping
 /// `wrap_line_display`'s indent logic intact); each wrapped row is padded
 /// out to the full width. Vertical spacing comes solely from the universal
@@ -81,6 +83,25 @@ fn surface_rows(
         .collect()
 }
 
+/// One `─` hairline framing a submitted prompt, same style as the live
+/// composer's top/bottom rules (`input_block`: `hairline_fg()`). The row is
+/// inset by the shared transcript indent so its dashes start on the text
+/// column — the same cell the composer's band starts on — and padded out to
+/// the full wrap width on the terminal background like every other echo row.
+fn user_rule_row(width: u16) -> Line<'static> {
+    use super::super::style::fg;
+    use crate::render::theme;
+    let w = width.max(1) as usize;
+    let indent = TRANSCRIPT_INDENT.min(w);
+    let dashes = w.saturating_sub(indent);
+    let mut row = Line::from(vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled("─".repeat(dashes), fg(theme::hairline_fg())),
+    ]);
+    row.style.bg = Some(Color::Reset);
+    row
+}
+
 pub(crate) fn wrap_block(
     block: &super::super::TranscriptBlock,
     width: u16,
@@ -89,12 +110,19 @@ pub(crate) fn wrap_block(
 ) -> Vec<Line<'static>> {
     match block {
         super::super::TranscriptBlock::User { lines, .. } => {
-            // No band: the prompt keeps the terminal's own background and is
-            // separated from neighbours solely by the universal inter-block
-            // gap. The first row wraps `INPUT_PROMPT_WIDTH` narrower for the
-            // echoed glyph — the same wrap the live composer applies, so
-            // typed and submitted prompts reflow identically.
-            surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH)
+            // Submitted input box: the prompt keeps the terminal's own
+            // background, framed by the same top/bottom `─` hairlines as
+            // the live composer (`input_block`). The first content row
+            // wraps `INPUT_PROMPT_WIDTH` narrower for the echoed glyph —
+            // the same wrap the live composer applies, so typed and
+            // submitted prompts reflow identically. Separation from
+            // neighbours is still the universal inter-block gap outside
+            // the box.
+            let mut rows = Vec::new();
+            rows.push(user_rule_row(width));
+            rows.extend(surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH));
+            rows.push(user_rule_row(width));
+            rows
         }
         super::super::TranscriptBlock::Tool { .. } => {
             // Spacing between tool steps comes solely from the universal
