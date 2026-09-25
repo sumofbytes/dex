@@ -46,6 +46,9 @@ pub enum StreamEvent {
 /// `content` and assembles the message itself.
 pub struct ParsedMessage {
     pub tool_calls: Vec<LlmToolCall>,
+    /// Deltas past the merge cap (provider-controlled indices); surfaced so
+    /// the driver can warn instead of silently truncating the call list.
+    pub dropped_tool_calls: usize,
     pub reasoning_items: Option<Vec<Value>>,
     pub reasoning_content: Option<String>,
 }
@@ -76,6 +79,8 @@ pub struct ChatCompletionsParser {
     pub tool_calls: Vec<LlmToolCall>,
     /// DeepSeek-style reasoning text, replayed on the assistant message.
     pub reasoning: String,
+    /// Deltas past the merge cap.
+    pub dropped_tool_calls: usize,
 }
 
 impl StreamParser for ChatCompletionsParser {
@@ -121,7 +126,9 @@ impl StreamParser for ChatCompletionsParser {
                 events.push(StreamEvent::Text(text));
             }
             for delta in choice.delta.tool_calls.unwrap_or_default() {
-                merge_chat_tool_call(&mut self.tool_calls, delta);
+                if merge_chat_tool_call(&mut self.tool_calls, delta) {
+                    self.dropped_tool_calls += 1;
+                }
             }
             if let Some(reason) = &choice.finish_reason {
                 if let Some(stop) = stop_reason_from_finish(reason) {
@@ -135,6 +142,7 @@ impl StreamParser for ChatCompletionsParser {
     fn finish(self) -> ParsedMessage {
         ParsedMessage {
             tool_calls: self.tool_calls,
+            dropped_tool_calls: self.dropped_tool_calls,
             reasoning_items: None,
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
         }
@@ -148,6 +156,8 @@ pub struct ResponsesParser {
     pub tool_calls: Vec<LlmToolCall>,
     pub response_items: HashMap<String, usize>,
     pub pending_arguments: HashMap<String, String>,
+    /// Items past the merge cap.
+    pub dropped_tool_calls: usize,
     pub reasoning_items: Vec<Value>,
 }
 
@@ -201,7 +211,9 @@ impl ResponsesParser {
                 .unwrap_or(self.tool_calls.len() as u64) as usize,
             item,
         );
-        response_tool_call(&mut self.tool_calls, index, item);
+        if response_tool_call(&mut self.tool_calls, index, item) {
+            self.dropped_tool_calls += 1;
+        }
         if let Some(item_id) = item.get("id").and_then(Value::as_str) {
             self.response_items.insert(item_id.to_string(), index);
             if let Some(arguments) = self.pending_arguments.remove(item_id) {
@@ -299,11 +311,11 @@ impl StreamParser for ResponsesParser {
     }
 
     fn finish(self) -> ParsedMessage {
-        // Completed calls without an id must be dropped, not executed.
         let mut tool_calls = self.tool_calls;
         tool_calls.retain(|call| !call.id.is_empty() && !call.function.name.is_empty());
         ParsedMessage {
             tool_calls,
+            dropped_tool_calls: self.dropped_tool_calls,
             reasoning_items: (!self.reasoning_items.is_empty()).then_some(self.reasoning_items),
             reasoning_content: None,
         }
@@ -567,10 +579,13 @@ impl StreamParser for AnthropicParser {
 
     fn finish(self) -> ParsedMessage {
         // Completed calls without an id must be dropped, not executed.
+        // (Anthropic tool calls merge by content-block index inside the
+        // parser, not through the wire merge cap, so nothing is clamped.)
         let mut tool_calls = self.tool_calls;
         tool_calls.retain(|call| !call.id.is_empty() && !call.function.name.is_empty());
         ParsedMessage {
             tool_calls,
+            dropped_tool_calls: 0,
             reasoning_items: (!self.reasoning_items.is_empty()).then_some(self.reasoning_items),
             reasoning_content: None,
         }
