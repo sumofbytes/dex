@@ -36,11 +36,10 @@ pub(crate) struct TranscriptView;
 /// the live composer, on the terminal's own background, so a sent prompt
 /// keeps the wrap/column shape it had while typed (spacing differs: the
 /// live composer has air below short text, the echo has none). Stored
-/// lines stay unpadded (the rules are added here at wrap time, keeping
-/// `wrap_line_display`'s indent logic intact); each wrapped row is padded
-/// (width-dependent fill happens here at wrap time, keeping
-/// `wrap_line_display`'s indent logic intact); each wrapped row is padded
-/// out to the full width. Vertical spacing comes solely from the universal
+/// lines stay unpadded; the rules are added here at wrap time and each
+/// wrapped row is padded out to the full width (width-dependent fill
+/// happens here at wrap time, keeping `wrap_line_display`'s indent logic
+/// intact). Vertical spacing comes solely from the universal
 /// inter-block gap — no baked air rows.
 fn paint_surface_row(mut row: Line<'static>, width: usize, bg: Color) -> Line<'static> {
     // `Line` renders each span as `line.style.patch(span.style)`, so one
