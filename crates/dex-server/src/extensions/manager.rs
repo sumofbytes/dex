@@ -295,13 +295,60 @@ impl ExtensionManager {
 
     /// The agent-loop slot (spec §9): first loaded extension that registered
     /// one via `dex.replace("agent_loop", …)`. Load order is sorted by id,
-    /// so first-wins is deterministic. `None` = the Rust `run_turn` default.
+    /// so first-wins is deterministic; a collision warns once, naming every
+    /// claimant. `None` = the Rust `run_turn` default.
     pub async fn agent_loop(&self) -> Option<(String, ExtensionEngine)> {
-        self.engines.read().await.values().find_map(|e| {
-            e.agent_loop
-                .as_ref()
-                .map(|id| (id.clone(), e.engine.clone()))
-        })
+        let engines = self.engines.read().await;
+        let mut claimants: Vec<&str> = Vec::new();
+        let mut picked: Option<(String, ExtensionEngine)> = None;
+        for (ext_id, e) in engines.iter() {
+            if let Some(id) = &e.agent_loop {
+                claimants.push(ext_id);
+                if picked.is_none() {
+                    picked = Some((id.clone(), e.engine.clone()));
+                }
+            }
+        }
+        if claimants.len() > 1 {
+            crate::runtime::notice::warn_once(
+                "ext.agent-loop.collision",
+                &format!(
+                    "{} extensions registered an agent_loop ({}); '{}' wins (first by extension id) — disable the rest to change this",
+                    claimants.len(),
+                    claimants.join(", "),
+                    claimants[0]
+                ),
+            );
+        }
+        picked
+    }
+
+    /// Harness decision points where Lua currently participates, for
+    /// `dex runtime graph`: registry slot name (or the Lua-only slot
+    /// name) → participating extension ids. Participation is a consulted
+    /// opinion, not a replacement — the first opinion wins, an absent or
+    /// failing one falls back to the Rust default (the hook contract).
+    pub async fn lua_opinion_holders(&self) -> Vec<(&'static str, Vec<String>)> {
+        const LUA_OPINIONS: &[(&str, &str)] = &[
+            ("trigger", "harness.compact"),
+            ("overflow", "harness.overflow"),
+            ("conflict", "harness.conflict"),
+            ("summarizer", "harness.summarize"),
+            ("model_selector", "model_selector"),
+            ("tool_catalog", "tool_catalog"),
+        ];
+        let engines = self.engines.read().await;
+        LUA_OPINIONS
+            .iter()
+            .filter_map(|(slot, event)| {
+                let holders: Vec<String> = engines
+                    .values()
+                    .filter(|e| e.serves(event))
+                    .map(|e| e.manifest.id.clone())
+                    .collect();
+                (!holders.is_empty()).then_some((*slot, holders))
+            })
+            .collect()
     }
 
     /// Ensure one extension is loaded, booting just it on first use (§26):
