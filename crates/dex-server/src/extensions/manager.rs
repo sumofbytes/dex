@@ -2,6 +2,7 @@
 
 use crate::protocol::{FunctionDef, ToolDefinition};
 use std::collections::{BTreeMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,6 +16,23 @@ use super::{
     AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx,
     SupervisorAction, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
 };
+
+/// Directive shared by `before_agent_start` and `llm.before`: an optional
+/// non-empty `append` string; appends concatenate in load order. Fail-open —
+/// a missing/bad envelope contributes nothing.
+fn fold_append(
+    envelope: Result<serde_json::Map<String, serde_json::Value>, String>,
+    mut appends: Vec<String>,
+) -> Vec<String> {
+    if let Some(append) = envelope
+        .ok()
+        .and_then(|m| m.get("append").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+    {
+        appends.push(append);
+    }
+    appends
+}
 
 pub struct LoadedExtension {
     pub manifest: Manifest,
@@ -585,71 +603,87 @@ impl ExtensionManager {
         args: &serde_json::Map<String, serde_json::Value>,
         host: &HostCtx<'_>,
     ) -> BeforeOutcome {
-        let mut current = args.clone();
-        let mut mutated_by = Vec::new();
-        let subs: Vec<(String, bool)> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"tool.before".to_string()))
-                .map(|e| (e.manifest.id.clone(), e.manifest.strict))
-                .collect()
-        };
-        for (id, strict) in subs {
-            let payload = serde_json::json!({"tool": tool, "args": current});
-            let envelope = match self.run_event(&id, "tool.before", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool.before failed: {error}");
-                    if strict {
-                        return BeforeOutcome::Denied {
-                            by: id,
-                            reason: format!("hook failed (strict): {error}"),
-                        };
-                    }
-                    continue;
-                }
-            };
-            let envelope: serde_json::Map<String, serde_json::Value> =
-                match serde_json::from_str(&envelope) {
-                    Ok(serde_json::Value::Object(map)) => map,
-                    _ => {
-                        eprintln!("dex: [extensions] '{id}' tool.before returned bad envelope");
-                        if strict {
-                            return BeforeOutcome::Denied {
-                                by: id,
-                                reason: "hook failed (strict): bad envelope".to_string(),
-                            };
-                        }
-                        continue;
+        self.run_chain(
+            "tool.before",
+            host,
+            BeforeOutcome::Proceed {
+                args: args.clone(),
+                mutated_by: Vec::new(),
+            },
+            |_| false,
+            |acc| {
+                let current = match acc {
+                    BeforeOutcome::Proceed { args, .. } => args,
+                    BeforeOutcome::Denied { .. } => {
+                        unreachable!("a deny breaks the chain before the next payload")
                     }
                 };
-            let (next, deny) = match hooks::parse_before(&envelope) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool.before failed: {error}");
-                    if strict {
-                        return BeforeOutcome::Denied {
-                            by: id,
-                            reason: format!("hook failed (strict): {error}"),
+                serde_json::json!({ "tool": tool, "args": current })
+            },
+            |id, strict, envelope, acc| {
+                let BeforeOutcome::Proceed {
+                    args: current,
+                    mutated_by,
+                } = acc
+                else {
+                    return ControlFlow::Break(acc);
+                };
+                let map = match envelope {
+                    Ok(map) => map,
+                    // The engine logged it; `strict` turns the failure into
+                    // a deny, fail-open keeps the current args.
+                    Err(error) => {
+                        return if strict {
+                            ControlFlow::Break(BeforeOutcome::Denied {
+                                by: id.to_string(),
+                                reason: format!("hook failed (strict): {error}"),
+                            })
+                        } else {
+                            ControlFlow::Continue(BeforeOutcome::Proceed {
+                                args: current,
+                                mutated_by,
+                            })
                         };
                     }
-                    continue;
+                };
+                let (next, deny) = match hooks::parse_before(&map) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        eprintln!("dex: [extensions] '{id}' tool.before failed: {error}");
+                        return if strict {
+                            ControlFlow::Break(BeforeOutcome::Denied {
+                                by: id.to_string(),
+                                reason: format!("hook failed (strict): {error}"),
+                            })
+                        } else {
+                            ControlFlow::Continue(BeforeOutcome::Proceed {
+                                args: current,
+                                mutated_by,
+                            })
+                        };
+                    }
+                };
+                if let Some((_, reason)) = deny {
+                    eprintln!("dex: [extensions] '{id}' tool.before denied '{tool}': {reason}");
+                    return ControlFlow::Break(BeforeOutcome::Denied {
+                        by: id.to_string(),
+                        reason,
+                    });
                 }
-            };
-            if let Some((_, reason)) = deny {
-                eprintln!("dex: [extensions] '{id}' tool.before denied '{tool}': {reason}");
-                return BeforeOutcome::Denied { by: id, reason };
-            }
-            if next != current {
-                mutated_by.push(id.clone());
-            }
-            current = next;
-        }
-        BeforeOutcome::Proceed {
-            args: current,
-            mutated_by,
-        }
+                let mutated_by = if next != current {
+                    let mut by = mutated_by;
+                    by.push(id.to_string());
+                    by
+                } else {
+                    mutated_by
+                };
+                ControlFlow::Continue(BeforeOutcome::Proceed {
+                    args: next,
+                    mutated_by,
+                })
+            },
+        )
+        .await
     }
 
     /// `tool.after` chain (H2): post-execution middleware over the result.
@@ -663,58 +697,44 @@ impl ExtensionManager {
         ok: bool,
         host: &HostCtx<'_>,
     ) -> AfterOutcome {
-        let mut current_text = text.to_string();
-        let mut current_ok = ok;
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"tool.after".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "tool": tool,
-                "args": args,
-                "content": current_text,
-                "is_error": !current_ok,
-            });
-            let envelope = match self.run_event(&id, "tool.after", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool.after failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            (current_text, current_ok) = hooks::parse_after(&envelope, &current_text, current_ok);
-        }
-        AfterOutcome {
-            text: current_text,
-            ok: current_ok,
-        }
+        let (text, ok) = self
+            .run_chain(
+                "tool.after",
+                host,
+                (text.to_string(), ok),
+                |_| false,
+                |(content, is_error)| {
+                    serde_json::json!({
+                        "tool": tool,
+                        "args": args,
+                        "content": content,
+                        "is_error": !is_error,
+                    })
+                },
+                |_, _, envelope, (text, ok)| {
+                    let folded = envelope.ok().map_or((text.clone(), ok), |map| {
+                        hooks::parse_after(&map, &text, ok)
+                    });
+                    ControlFlow::Continue(folded)
+                },
+            )
+            .await;
+        AfterOutcome { text, ok }
     }
 
     /// Fire-and-forget lifecycle event (`turn.start`/`turn.end`): run every
     /// subscriber in load order, log failures, ignore directives — these
     /// events carry no decision the host acts on.
     pub async fn fire_event(&self, event: &str, payload: serde_json::Value, host: &HostCtx<'_>) {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&event.to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            if let Err(error) = self.run_event(&id, event, payload.clone(), host).await {
-                eprintln!("dex: [extensions] '{id}' {event} failed: {error}");
-            }
-        }
+        self.run_chain(
+            event,
+            host,
+            (),
+            |_| false,
+            |_| payload.clone(),
+            |_, _, _, _| ControlFlow::Continue(()),
+        )
+        .await;
     }
 
     /// `before_agent_start` chain: each handler may return `{ append = text }`
@@ -723,36 +743,15 @@ impl ExtensionManager {
     /// turn before it starts. Read-only influence: no gate interaction (the
     /// hook host still gets the turn's policy for nested `dex.tools.call`).
     pub async fn apply_before_agent_start(&self, host: &HostCtx<'_>) -> Vec<String> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"before_agent_start".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        let mut appends = Vec::new();
-        for id in subs {
-            let envelope = match self
-                .run_event(&id, "before_agent_start", serde_json::json!({}), host)
-                .await
-            {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' before_agent_start failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(append) = envelope.get("append").and_then(|v| v.as_str()) {
-                if !append.trim().is_empty() {
-                    appends.push(append.to_string());
-                }
-            }
-        }
-        appends
+        self.run_chain(
+            "before_agent_start",
+            host,
+            Vec::new(),
+            |_| false,
+            |_| serde_json::json!({}),
+            |_, _, envelope, appends| ControlFlow::Continue(fold_append(envelope, appends)),
+        )
+        .await
     }
 
     /// `supervisor.route` chain: merged across handlers in load order — the
@@ -764,36 +763,26 @@ impl ExtensionManager {
         task: Option<&str>,
         host: &HostCtx<'_>,
     ) -> SupervisorAction {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"supervisor.route".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        let mut action = SupervisorAction::default();
-        for id in subs {
-            let payload = serde_json::json!({ "agent": agent, "task": task });
-            let envelope = match self.run_event(&id, "supervisor.route", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' supervisor.route failed: {error}");
-                    continue;
+        self.run_chain(
+            "supervisor.route",
+            host,
+            SupervisorAction::default(),
+            |_| false,
+            |_| serde_json::json!({ "agent": agent, "task": task }),
+            |id, _, envelope, mut action| {
+                if let Ok(map) = envelope {
+                    let (redirect, deny) = hooks::parse_supervisor(&map);
+                    if action.agent.is_none() {
+                        action.agent = redirect;
+                    }
+                    if action.deny.is_none() {
+                        action.deny = deny.map(|reason| (id.to_string(), reason));
+                    }
                 }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            let parsed = hooks::parse_supervisor(&envelope);
-            if action.agent.is_none() {
-                action.agent = parsed.0;
-            }
-            if action.deny.is_none() {
-                action.deny = parsed.1.map(|reason| (id.clone(), reason));
-            }
-        }
-        action
+                ControlFlow::Continue(action)
+            },
+        )
+        .await
     }
 
     /// `permission.request` chain: first explicit `{decision = "allow"|"deny"}`
@@ -807,42 +796,27 @@ impl ExtensionManager {
         mode: &str,
         host: &HostCtx<'_>,
     ) -> Option<(hooks::PermissionDecision, String, String)> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"permission.request".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "tool": tool,
-                "args": args,
-                "requirement": requirement,
-                "mode": mode,
-            });
-            let envelope = match self
-                .run_event(&id, "permission.request", payload, host)
-                .await
-            {
-                Ok(json) => json,
-                Err(error) => {
-                    dex_runtime::log!(
-                        Warn,
-                        "extensions: '{id}' permission.request failed: {error}"
-                    );
-                    continue;
+        self.run_chain(
+            "permission.request",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "tool": tool,
+                    "args": args,
+                    "requirement": requirement,
+                    "mode": mode,
+                })
+            },
+            |id, _, envelope, _| match envelope.ok().and_then(|m| hooks::parse_permission(&m)) {
+                Some((decision, reason)) => {
+                    ControlFlow::Break(Some((decision, reason, id.to_string())))
                 }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some((decision, reason)) = hooks::parse_permission(&envelope) {
-                return Some((decision, reason, id));
-            }
-        }
-        None
+                None => ControlFlow::Continue(None),
+            },
+        )
+        .await
     }
 
     /// `llm.before` chain: each handler may return `{append = text}` (or set
@@ -854,66 +828,23 @@ impl ExtensionManager {
         host: &HostCtx<'_>,
         payload: serde_json::Value,
     ) -> Vec<String> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"llm.before".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        let mut appends = Vec::new();
-        for id in subs {
-            let envelope = match self
-                .run_event(&id, "llm.before", payload.clone(), host)
-                .await
-            {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' llm.before failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(append) = envelope.get("append").and_then(|v| v.as_str()) {
-                if !append.trim().is_empty() {
-                    appends.push(append.to_string());
-                }
-            }
-        }
-        appends
+        self.run_chain(
+            "llm.before",
+            host,
+            Vec::new(),
+            |_| false,
+            |_| payload.clone(),
+            |_, _, envelope, appends| ControlFlow::Continue(fold_append(envelope, appends)),
+        )
+        .await
     }
 
     /// `harness.overflow` chain: first non-`nil` `{overflow = bool}` wins in
     /// load order; errors/bad envelopes fail open to `None` (Rust default).
     pub async fn query_harness_overflow(&self, message: &str, host: &HostCtx<'_>) -> Option<bool> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.serves("harness.overflow"))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({ "message": message });
-            let envelope = match self.run_event(&id, "harness.overflow", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' harness.overflow failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(v) = hooks::parse_harness_bool(&envelope, "overflow") {
-                return Some(v);
-            }
-        }
-        None
+        let payload = serde_json::json!({ "message": message });
+        self.first_harness_bool("harness.overflow", "overflow", payload, host)
+            .await
     }
 
     /// `harness.conflict` chain: first non-`nil` `{conflicts = bool}` wins in
@@ -924,34 +855,9 @@ impl ExtensionManager {
         calls: &serde_json::Value,
         host: &HostCtx<'_>,
     ) -> Option<bool> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.serves("harness.conflict"))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({ "calls": calls });
-            let envelope = match self
-                .run_event(&id, "harness.conflict", payload.clone(), host)
-                .await
-            {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' harness.conflict failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(v) = hooks::parse_harness_bool(&envelope, "conflicts") {
-                return Some(v);
-            }
-        }
-        None
+        let payload = serde_json::json!({ "calls": calls });
+        self.first_harness_bool("harness.conflict", "conflicts", payload, host)
+            .await
     }
 
     /// `harness.compact` chain: first non-`nil` `{compact = bool}` wins in
@@ -965,35 +871,13 @@ impl ExtensionManager {
         message_count: usize,
         host: &HostCtx<'_>,
     ) -> Option<bool> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.serves("harness.compact"))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "stored_tokens": stored_tokens,
-                "ephemeral_overhead": ephemeral_overhead,
-                "message_count": message_count,
-            });
-            let envelope = match self.run_event(&id, "harness.compact", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' harness.compact failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(v) = hooks::parse_harness_bool(&envelope, "compact") {
-                return Some(v);
-            }
-        }
-        None
+        let payload = serde_json::json!({
+            "stored_tokens": stored_tokens,
+            "ephemeral_overhead": ephemeral_overhead,
+            "message_count": message_count,
+        });
+        self.first_harness_bool("harness.compact", "compact", payload, host)
+            .await
     }
 
     /// `harness.summarize` chain: first non-empty `{summary = "..."}` wins
@@ -1006,37 +890,26 @@ impl ExtensionManager {
         previous_summary: Option<&str>,
         host: &HostCtx<'_>,
     ) -> Option<String> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.serves("harness.summarize"))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "conversation": conversation,
-                "previous_summary": previous_summary,
-            });
-            let envelope = match self
-                .run_event(&id, "harness.summarize", payload, host)
-                .await
+        self.run_chain(
+            "harness.summarize",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "conversation": conversation,
+                    "previous_summary": previous_summary,
+                })
+            },
+            |_, _, envelope, _| match envelope
+                .ok()
+                .and_then(|m| hooks::parse_harness_string(&m, "summary"))
             {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' harness.summarize failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(v) = hooks::parse_harness_string(&envelope, "summary") {
-                return Some(v);
-            }
-        }
-        None
+                Some(summary) => ControlFlow::Break(Some(summary)),
+                None => ControlFlow::Continue(None),
+            },
+        )
+        .await
     }
 
     /// `model_selector` chain: first non-empty `{model = "..."}` (or a bare
@@ -1054,36 +927,29 @@ impl ExtensionManager {
         previous: Option<&str>,
         host: &HostCtx<'_>,
     ) -> Option<String> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.serves("model_selector"))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "current": current,
-                "previous": previous,
-            });
-            let envelope = match self.run_event(&id, "model_selector", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' model_selector failed: {error}");
-                    continue;
+        self.run_chain(
+            "model_selector",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "current": current,
+                    "previous": previous,
+                })
+            },
+            |_, _, envelope, _| {
+                let pick = envelope.ok().and_then(|m| {
+                    hooks::parse_harness_string(&m, "model")
+                        .or_else(|| hooks::parse_harness_string(&m, "content"))
+                });
+                match pick {
+                    Some(model) => ControlFlow::Break(Some(model)),
+                    None => ControlFlow::Continue(None),
                 }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(v) = hooks::parse_harness_string(&envelope, "model")
-                .or_else(|| hooks::parse_harness_string(&envelope, "content"))
-            {
-                return Some(v);
-            }
-        }
-        None
+            },
+        )
+        .await
     }
 
     /// `tool_catalog` chain (spec §7/§11): the first handler returning
@@ -1097,39 +963,28 @@ impl ExtensionManager {
         schemas: &[ToolDefinition],
         host: &HostCtx<'_>,
     ) -> Option<Vec<ToolDefinition>> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.serves("tool_catalog"))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "tools": schemas
-                    .iter()
-                    .map(|t| serde_json::json!({
-                        "name": t.function.name,
-                        "description": t.function.description,
-                    }))
-                    .collect::<Vec<_>>(),
-            });
-            let envelope = match self.run_event(&id, "tool_catalog", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool_catalog failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(filter) = hooks::parse_catalog_filter(&envelope) {
-                return Some(filter.apply(schemas));
-            }
-        }
-        None
+        self.run_chain(
+            "tool_catalog",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "tools": schemas
+                        .iter()
+                        .map(|t| serde_json::json!({
+                            "name": t.function.name,
+                            "description": t.function.description,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            },
+            |_, _, envelope, _| match envelope.ok().and_then(|m| hooks::parse_catalog_filter(&m)) {
+                Some(filter) => ControlFlow::Break(Some(filter.apply(schemas))),
+                None => ControlFlow::Continue(None),
+            },
+        )
+        .await
     }
 
     /// `session.before_compact` chain: merged across handlers — any cancel
@@ -1142,45 +997,137 @@ impl ExtensionManager {
         message_count: usize,
         host: &HostCtx<'_>,
     ) -> CompactAction {
-        let mut action = CompactAction {
-            cancel: false,
-            instructions: Vec::new(),
-            summary: None,
-        };
         let payload = serde_json::json!({ "emergency": emergency, "messages": message_count });
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"session.before_compact".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let envelope = match self
-                .run_event(&id, "session.before_compact", payload.clone(), host)
-                .await
-            {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' session.before_compact failed: {error}");
-                    continue;
+        self.run_chain(
+            "session.before_compact",
+            host,
+            CompactAction {
+                cancel: false,
+                instructions: Vec::new(),
+                summary: None,
+            },
+            |_| false,
+            |_| payload.clone(),
+            |_, _, envelope, mut action| {
+                if let Ok(map) = envelope {
+                    let parsed = hooks::parse_compact(&map);
+                    action.cancel |= parsed.cancel;
+                    action.instructions.extend(parsed.instructions);
+                    if action.summary.is_none() {
+                        action.summary = parsed.summary;
+                    }
                 }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            let parsed = hooks::parse_compact(&envelope);
-            action.cancel |= parsed.cancel;
-            action.instructions.extend(parsed.instructions);
-            if action.summary.is_none() {
-                action.summary = parsed.summary;
+                ControlFlow::Continue(action)
+            },
+        )
+        .await
+    }
+
+    /// Subscriber snapshot for `event`, in hook order (extensions are
+    /// id-sorted): `(extension id, strict)`. Every chain shares this one
+    /// selection — `serves` covers explicit handler subscriptions and
+    /// `dex.wrap`/`dex.fallback` middleware alike, matching what `run_event`
+    /// independently re-checks.
+    async fn subscribers(&self, event: &str) -> Vec<(String, bool)> {
+        self.engines
+            .read()
+            .await
+            .values()
+            .filter(|e| e.serves(event))
+            .map(|e| (e.manifest.id.clone(), e.manifest.strict))
+            .collect()
+    }
+
+    /// The one hook-chain engine.
+    ///
+    /// Every chain — before/after middleware, first-wins slots, merge
+    /// folds, fire-and-forget events — is this loop with a different fold.
+    /// The engine owns everything that used to be hand-rolled per chain:
+    /// subscriber selection, per-handler payload construction, the run +
+    /// envelope parse, error logging, and short-circuiting. The fold owns
+    /// only the event's own semantics: read the directive out of one
+    /// envelope and fold it into the running value.
+    ///
+    /// - `seed` — the chain's initial accumulator (`()`, `Vec`, `Option`, …).
+    /// - `done` — the accumulator is final: stop *before* running the next
+    ///   handler (first-wins chains pass `Option::is_some`).
+    /// - `payload` — one handler's request, built from the current
+    ///   accumulator (threaded middleware folds its state back in).
+    /// - `fold` — one handler's contribution: the extension id, its
+    ///   `strict` flag, the parsed directive envelope (or the run error,
+    ///   already logged), and the accumulator. `Continue` carries the
+    ///   folded value; `Break` ends the chain with that value (deny,
+    ///   strict failure, or the first explicit opinion).
+    ///
+    /// Errors fail open by contract: the engine logs and hands the error
+    /// to the fold, which decides — skip (`Continue`) everywhere except
+    /// `tool.before`, where `strict = true` denies. Chain failures surface
+    /// through the shared warning channel (`dex_runtime::log!`), not bare
+    /// stderr.
+    async fn run_chain<T>(
+        &self,
+        event: &str,
+        host: &HostCtx<'_>,
+        seed: T,
+        done: impl Fn(&T) -> bool,
+        mut payload: impl FnMut(&T) -> serde_json::Value,
+        mut fold: impl FnMut(
+            &str,
+            bool,
+            Result<serde_json::Map<String, serde_json::Value>, String>,
+            T,
+        ) -> ControlFlow<T, T>,
+    ) -> T {
+        let mut acc = seed;
+        for (id, strict) in self.subscribers(event).await {
+            if done(&acc) {
+                break;
             }
+            let envelope = match self.run_event(&id, event, payload(&acc), host).await {
+                Ok(json) => serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .ok_or_else(|| "returned bad envelope".to_string()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = &envelope {
+                dex_runtime::log!(Warn, "extensions: '{id}' {event} failed: {error}");
+            }
+            acc = match fold(&id, strict, envelope, acc) {
+                ControlFlow::Break(final_value) => return final_value,
+                ControlFlow::Continue(next) => next,
+            };
         }
-        action
+        acc
+    }
+
+    /// First-wins boolean slot (`harness.overflow` / `harness.conflict` /
+    /// `harness.compact`): the first handler naming `key` wins in load
+    /// order; errors and absent keys fail open to `None` (the Rust default).
+    async fn first_harness_bool(
+        &self,
+        event: &str,
+        key: &str,
+        payload: serde_json::Value,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        self.run_chain(
+            event,
+            host,
+            None,
+            Option::is_some,
+            |_| payload.clone(),
+            |_, _, envelope, _| match envelope
+                .ok()
+                .and_then(|m| hooks::parse_harness_bool(&m, key))
+            {
+                Some(v) => ControlFlow::Break(Some(v)),
+                None => ControlFlow::Continue(None),
+            },
+        )
+        .await
     }
 }
-
 impl ExtensionManager {
     /// `dex.tools.set_active` backing store (full names — the extension-facing
     /// `set_active_global` resolves short names first). Stored as-given:
