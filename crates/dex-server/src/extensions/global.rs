@@ -584,6 +584,65 @@ fn net_origin(url: &reqwest::Url) -> (String, String, Option<u16>) {
     )
 }
 
+/// `supervisor.route` for the spawn path: merged redirect/deny action, or
+/// the default (no opinion) when unsubscribed. Carries the turn's policy +
+/// filter so nested calls stay gated like model-issued ones.
+pub async fn query_supervisor_route(
+    agent: &str,
+    task: Option<&str>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+) -> super::SupervisorAction {
+    if !has_event_handlers("supervisor.route") {
+        return super::SupervisorAction::default();
+    }
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager()
+        .query_supervisor_route(agent, task, &host)
+        .await
+}
+
+/// Truncated text preview for observe-only lifecycle payloads: prompts and
+/// responses can be pastes large enough to wedge the 64 MiB Lua VM, so hooks
+/// get the head plus honest counts, never the whole body.
+pub fn text_preview(text: &str) -> (String, bool, usize) {
+    const MAX_CHARS: usize = 2000;
+    let chars = text.chars().count();
+    if chars <= MAX_CHARS {
+        (text.to_string(), false, chars)
+    } else {
+        (text.chars().take(MAX_CHARS).collect(), true, chars)
+    }
+}
+
+/// Observe-only lifecycle fire: `message.received`, `message.sent`,
+/// `session.created`, `session.loaded`. Zero-cost without subscribers;
+/// read-only nested policy; payloads carry truncated previews.
+pub async fn fire_lifecycle_event(
+    event: &'static str,
+    payload: serde_json::Value,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) {
+    if !has_event_handlers(event) {
+        return;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager().fire_event(event, payload, &host).await;
+}
+
 /// `permission.request` for the approval gate: first explicit
 /// `{decision = "allow"|"deny"}` wins, `None` (unsubscribed or no opinion)
 /// means the normal approval flow. Carries the turn's policy + filter so a

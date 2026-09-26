@@ -294,11 +294,13 @@ fn merge_directive(
                 "overflow",
                 "conflicts",
                 "decision",
+                "redirect",
             ] {
                 let value: Value = t.get(key).map_err(|e| e.to_string())?;
                 if !matches!(value, Value::Nil) {
                     let json = match key {
-                        "content" | "append" | "instructions" | "summary" | "reason" => {
+                        "content" | "append" | "instructions" | "summary" | "reason"
+                        | "agent" => {
                             match value {
                                 Value::String(s) => Json::String(
                                     s.to_str().map_err(|e| e.to_string())?.to_string(),

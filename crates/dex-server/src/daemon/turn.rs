@@ -302,12 +302,25 @@ pub(crate) async fn run_turn_inner(
 
     // Resume the session created via POST /api/sessions; fall back to a fresh
     // one if the file vanished.
+    let created = !entry.path.exists();
     let mut session = if entry.path.exists() {
         Session::from_path(&entry.path).map_err(|e| format!("failed to load session: {e}"))?
     } else {
         Session::new(entry.cwd.clone(), entry.name.clone())
             .map_err(|e| format!("failed to create session: {e}"))?
     };
+    // Runtime observation: session lifecycle for Lua (audit, metrics).
+    // Zero-cost without subscribers.
+    crate::extensions::fire_lifecycle_event(
+        if created {
+            "session.created"
+        } else {
+            "session.loaded"
+        },
+        serde_json::json!({ "session": session_id }),
+        cancel,
+    )
+    .await;
 
     // Persist plan forwarded by the client (remote TUI slash commands). Empty
     // string clears. Invalid JSON is rejected explicitly rather than silently
@@ -550,6 +563,22 @@ pub(crate) async fn run_turn_inner(
         .append_message(&user_message)
         .map_err(|e| format!("failed to persist prompt: {e}"))?;
     messages.push(user_message);
+    // Runtime observation: the prompt entering the turn (truncated preview —
+    // prompts can be pastes large enough to wedge the Lua VM).
+    {
+        let (preview, truncated, chars) = crate::extensions::text_preview(&req.prompt);
+        crate::extensions::fire_lifecycle_event(
+            "message.received",
+            serde_json::json!({
+                "session": session_id,
+                "preview": preview,
+                "truncated": truncated,
+                "chars": chars,
+            }),
+            cancel,
+        )
+        .await;
+    }
 
     // The agent loop reports through std channels; bridge them onto the
     // tokio sender with dedicated threads.

@@ -192,6 +192,26 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         let _ = session.append_message(&user);
     }
     messages.push(user);
+    // Runtime observation: the prompt entering the turn (truncated preview).
+    // Zero-cost without subscribers; skipped only when extensions never
+    // loaded (same fail-open contract as every lifecycle fire).
+    {
+        let sid = session
+            .as_ref()
+            .map(|s| s.id().to_string())
+            .unwrap_or_else(|| "headless".to_string());
+        let (preview, truncated, chars) = crate::extensions::text_preview(prompt);
+        crate::runtime::http::block_on(crate::extensions::fire_lifecycle_event(
+            "message.received",
+            serde_json::json!({
+                "session": sid,
+                "preview": preview,
+                "truncated": truncated,
+                "chars": chars,
+            }),
+            &crate::runtime::cancel::GlobalCancellation,
+        ));
+    }
     // The opencode gateway rejects requests without `x-opencode-session`;
     // explicit `--header` flags already baked into `extra_headers` still win.
     if let Some(session) = session.as_ref() {
