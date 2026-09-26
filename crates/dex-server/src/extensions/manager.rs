@@ -32,6 +32,8 @@ pub struct LoadedExtension {
     pub wraps: Vec<String>,
     /// Slots the extension backs with `dex.fallback`.
     pub fallbacks: Vec<String>,
+    /// Slots the extension implements with `dex.use` (spec §10).
+    pub uses: Vec<String>,
     /// `agent_loop` component id when the chunk registered one via
     /// `dex.replace("agent_loop", …)` (spec §9).
     pub agent_loop: Option<String>,
@@ -162,7 +164,41 @@ impl ExtensionManager {
             .map_err(|e| format!("extension '{}' has no extension.lua: {e}", m.id_for_error()))?;
         let engine = ExtensionEngine::new(m.clone(), dir.to_path_buf())
             .map_err(|e| format!("extension '{}': {e}", m.id_for_error()))?;
-        let exports = engine.load(source).await?;
+        let mut exports = engine.load(source).await?;
+
+        // Declarative component files (spec §31): each loads on the same
+        // worker with the same registration contract, after `extension.lua`.
+        // Manifest paths are validated (relative, .lua, unique) at parse
+        // time; a missing or failing file fails the whole extension.
+        for (slot, file) in &m.components {
+            let path = dir.join(file);
+            let comp_source = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "extension '{}' component '{slot}' ({}): {e}",
+                    m.id_for_error(),
+                    path.display()
+                )
+            })?;
+            let comp = engine
+                .load(comp_source)
+                .await
+                .map_err(|e| format!("extension '{}' component '{slot}': {e}", m.id_for_error()))?;
+            exports.tools.extend(comp.tools);
+            exports.events.extend(comp.events);
+            exports.wraps.extend(comp.wraps);
+            exports.fallbacks.extend(comp.fallbacks);
+            exports.uses.extend(comp.uses);
+            exports.shadows.extend(comp.shadows);
+            exports.commands.extend(comp.commands);
+            exports.agent_loop = exports.agent_loop.or(comp.agent_loop);
+        }
+        // Merged component chunks can unsort these; restore the invariants
+        // (sorted + deduped) the single-chunk load guarantees.
+        exports.commands.sort_by(|a, b| a.0.cmp(&b.0));
+        exports.uses.sort();
+        exports.uses.dedup();
+        exports.shadows.sort();
+        exports.shadows.dedup();
 
         // Shadows target real built-ins, claimed first-wins in load order.
         // A shadow colliding with an earlier shadow, or targeting a
@@ -215,6 +251,7 @@ impl ExtensionManager {
                 events,
                 wraps: exports.wraps,
                 fallbacks: exports.fallbacks,
+                uses: exports.uses,
                 shadows: exports.shadows,
                 commands,
                 agent_loop: exports.agent_loop,
@@ -1178,11 +1215,67 @@ impl ExtensionManager {
     }
 }
 
-/// `dex extensions install <dir>`: copy an extension directory into the
-/// user-scope dir. The manifest must parse — install validates before
-/// copying so a broken extension never lands.
+/// `dex extensions install <dir|git-url>`: install an extension into the
+/// user-scope dir. A local path is copied as-is; anything with a `://`
+/// scheme (https://, file://, …) is treated as a remote source and shallow
+/// git-cloned to a temp dir first. The manifest must parse — install
+/// validates before copying so a broken extension never lands.
 pub fn install(src: &str) -> Result<String, String> {
-    let src = PathBuf::from(src);
+    if src.contains("://") {
+        install_remote(src)
+    } else {
+        install_dir(PathBuf::from(src))
+    }
+}
+
+/// Remote sources (spec §32): `git clone --depth 1 <url>` into a private
+/// temp dir, then the same validate+copy path as a local install. The
+/// manifest must sit at the repo root (one extension per repo — a
+/// multi-extension repo is a packaging concern for the repo author). The
+/// temp dir is removed on every path out.
+fn install_remote(url: &str) -> Result<String, String> {
+    if !(url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("git@")
+        || url.starts_with("file://"))
+    {
+        return Err(format!(
+            "unsupported remote source {url:?}: use an https:// or git@ URL"
+        ));
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "dex-ext-install-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| {
+        let out = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", url])
+            .arg(&tmp)
+            .output()
+            .map_err(|e| format!("running git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        if !tmp.join("manifest.yaml").is_file() {
+            return Err(format!(
+                "{url} has no manifest.yaml at the repo root (one extension per repo)"
+            ));
+        }
+        install_dir(tmp.clone())
+    })();
+    std::fs::remove_dir_all(&tmp).ok();
+    result
+}
+
+/// Local-dir install: validate the manifest, copy into the user-scope dir.
+fn install_dir(src: PathBuf) -> Result<String, String> {
     let text = std::fs::read_to_string(src.join("manifest.yaml"))
         .map_err(|e| format!("{}: {e}", src.display()))?;
     let manifest = manifest::parse_manifest(&text)?;

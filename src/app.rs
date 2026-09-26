@@ -552,7 +552,7 @@ fn run_extensions(action: &str, name: Option<&str>) {
         }
         "install" => {
             let Some(src) = name else {
-                eprintln!("usage: dex extensions install <dir>");
+                eprintln!("usage: dex extensions install <dir|git-url>");
                 std::process::exit(2);
             };
             match crate::extensions::install(src) {
@@ -578,7 +578,7 @@ fn run_extensions(action: &str, name: Option<&str>) {
         }
         _ => {
             eprintln!(
-                "usage: dex extensions [list|enable <id>|disable <id>|install <dir>|remove <id>]"
+                "usage: dex extensions [list|enable <id>|disable <id>|install <dir|git-url>|remove <id>]"
             );
             std::process::exit(2);
         }

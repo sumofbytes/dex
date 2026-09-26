@@ -94,6 +94,22 @@ pub const WRAPPABLE_SLOTS: &[&str] = &[
     "tool_catalog",
 ];
 
+/// Current interface version per component slot (spec §28): `dex.use`
+/// validates an implementation's `interface` against this at registration
+/// time, so a component written for a renamed envelope fails at load instead
+/// of misreading payloads. Interfaces version independently of the slot
+/// name (`harness.summarize` serves the `summarizer.v1` interface); a
+/// breaking envelope change ships as `.v2` here with the old one still
+/// accepted during migration. `agent_loop` is negotiated by `dex.replace`.
+pub const SLOT_INTERFACES: &[(&str, &str)] = &[
+    ("model_selector", "model_selector.v1"),
+    ("harness.summarize", "summarizer.v1"),
+    ("harness.compact", "compactor.v1"),
+    ("harness.overflow", "overflow.v1"),
+    ("harness.conflict", "conflict.v1"),
+    ("tool_catalog", "catalog.v1"),
+];
+
 /// Host context a Lua call runs under: what cancellation, gates, and
 /// allowlists a nested `dex.tools.call` / `dex.tools.call_original` inherits
 /// from the outer call. Borrowed from the awaiting task — nothing here
@@ -204,6 +220,8 @@ pub struct ChunkExports {
     pub wraps: Vec<String>,
     /// Slots the extension backs via `dex.fallback`.
     pub fallbacks: Vec<String>,
+    /// Slots the extension implements via `dex.use` (spec §10).
+    pub uses: Vec<String>,
     pub shadows: Vec<String>,
     /// (name, description) pairs, sorted by name.
     pub commands: Vec<(String, String)>,
@@ -254,6 +272,10 @@ struct WorkerRegistrations {
     /// `dex.fallback(slot, fn)` backups: consulted when the slot's whole
     /// chain produced no opinion, before the Rust default.
     fallbacks: HashMap<String, Function>,
+    /// Slots the extension implements via `dex.use` (spec §10), in
+    /// registration order — export/surface only, the handlers live in
+    /// `events`.
+    uses: Vec<String>,
     /// `dex.commands.register({ name, description, execute })` handlers.
     commands: HashMap<String, (String, Function)>,
     /// `dex.replace("agent_loop", { id, interface, run })` (spec §9): the
@@ -697,6 +719,7 @@ fn run_load_inner(
         events: regs.events.keys().cloned().collect(),
         wraps: regs.wraps.keys().cloned().collect(),
         fallbacks: regs.fallbacks.keys().cloned().collect(),
+        uses: regs.uses.clone(),
         shadows: regs.shadows.clone(),
         commands,
         agent_loop: regs.agent_loop.as_ref().map(|(id, _)| id.clone()),
@@ -725,6 +748,8 @@ fn build_dex_table(
     dex.set("profile", current_profile).expect("dex.profile");
     dex.set("fallback", host_api::fallback_slot(lua, manifest, regs)?)
         .expect("dex.fallback");
+    dex.set("use", host_api::use_slot(lua, manifest, regs)?)
+        .expect("dex.use");
     dex.set("replace", host_api::replace_slot(lua, manifest, regs)?)
         .expect("dex.replace");
     dex.set("log", host_api::log_table(lua, manifest))

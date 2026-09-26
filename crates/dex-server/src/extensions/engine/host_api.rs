@@ -13,7 +13,8 @@ use serde_json::Value as Json;
 use super::super::Manifest;
 use super::{
     host_upcall, json_to_lua, lua_to_json, lua_type_name, lua_value_to_string, valid_segment,
-    worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS, WRAPPABLE_SLOTS,
+    worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS, SLOT_INTERFACES,
+    WRAPPABLE_SLOTS,
 };
 use crate::tools::resolve_workspace_path;
 
@@ -368,6 +369,86 @@ pub(super) fn replace_slot(
             )));
         }
         regs.agent_loop = Some((id, run));
+        Ok(())
+    })
+}
+
+/// `dex.use(slot, impl)` — component selection with registration-time
+/// validation (spec §10/§28): the slot must be a known component slot, and
+/// `impl` is either the implementation function directly or a
+/// `{ id?, interface?, run }` spec whose `interface` must name the slot's
+/// current version (`SLOT_INTERFACES`) — a component written against a
+/// different envelope fails at load instead of misreading payloads.
+/// Registered handlers join the slot's chain exactly like
+/// `dex.events.on(slot, …)` (fail-open contract unchanged, §33); the
+/// validated extra surface is the point. Requires the `harness`
+/// capability. `agent_loop` is not selectable here — `dex.replace` owns it.
+pub(super) fn use_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let manifest = manifest.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, component): (String, Value)| {
+        if !manifest.has_capability("harness") {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' uses slot '{slot}' without the harness capability"
+            )));
+        }
+        if slot == "agent_loop" {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}': use dex.replace(\"agent_loop\", …) for the agent loop"
+            )));
+        }
+        let Some((_, interface)) = SLOT_INTERFACES.iter().find(|(s, _)| *s == slot) else {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' uses unknown slot '{slot}' (usable: {})",
+                SLOT_INTERFACES
+                    .iter()
+                    .map(|(s, _)| *s)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        let run = match component {
+            // Bare function: current interface implied.
+            Value::Function(run) => run,
+            Value::Table(spec) => {
+                if let Some(id) = spec.get::<Option<String>>("id")? {
+                    if !valid_segment(&id) {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' {slot} component id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
+                        )));
+                    }
+                }
+                let declared: Option<String> = spec.get("interface")?;
+                if let Some(declared) = declared {
+                    if declared != *interface {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' {slot} interface {declared:?}: want {interface:?}"
+                        )));
+                    }
+                }
+                spec.get("run").map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "extension '{ext_id}' {slot} component needs a run function"
+                    ))
+                })?
+            }
+            other => {
+                return Err(LuaError::RuntimeError(format!(
+                    "extension '{ext_id}' dex.use('{slot}', …): expected a function or spec table, got {}",
+                    lua_type_name(&other)
+                )))
+            }
+        };
+        let mut regs = regs.borrow_mut();
+        regs.events.entry(slot.clone()).or_default().push(run);
+        if !regs.uses.contains(&slot) {
+            regs.uses.push(slot);
+        }
         Ok(())
     })
 }
