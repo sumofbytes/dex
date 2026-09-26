@@ -571,14 +571,29 @@ pub(crate) async fn compact_history(
         extract_file_ops_from_message(msg, &mut file_ops);
     }
 
+    // `harness.summarize` (spec §11): the first non-empty Lua summary
+    // replaces the LLM/deterministic summary outright, same precedence and
+    // fail-open contract as the `session.before_compact` replacement above —
+    // errors and empty replies fall through to the Rust path.
+    let hook_summary = hook
+        .summary
+        .clone()
+        .or(crate::extensions::query_harness_summarize(
+            &serialize_conversation(&messages_to_summarize),
+            previous_summary.as_deref(),
+            _cancel,
+        )
+        .await);
+
     // Jev verbatim prune: drop/truncate stale tool outputs in place, no
     // summary message, no LLM spend. Tried on a clone so an insufficient
     // prune discards cleanly and the summarizer below still sees the
-    // original span. An explicit hook summary always wins. With
-    // `TYPESAFE_API_KEY` + a config `jev:` table, the real Typesafe Jev
-    // scorer replaces the heuristic; any live failure falls back to the
-    // heuristic inside `prune_span`.
-    if hook.summary.is_none() && jev_prune {
+    // original span. An explicit `session.before_compact` replacement or a
+    // Lua `harness.summarize` summary always wins. With `TYPESAFE_API_KEY`
+    // + a config `jev:` table, the real Typesafe Jev scorer replaces the
+    // heuristic; any live failure falls back to the heuristic inside
+    // `prune_span`.
+    if hook_summary.is_none() && jev_prune {
         let creds = crate::agent::compaction::verbatim::live_credentials();
         let scorer = if creds.is_some() {
             crate::agent::compaction::verbatim::Scorer::Jev
@@ -623,8 +638,8 @@ pub(crate) async fn compact_history(
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
     let fallback = harness.summarizer.as_deref();
-    let summarized = if let Some(summary) = &hook.summary {
-        summary.clone()
+    let summarized = if let Some(summary) = hook_summary.as_deref() {
+        summary.to_string()
     } else if summarizer == crate::agent::compaction::verbatim::SummaryMode::Llm {
         llm_summary(
             _config,

@@ -367,6 +367,28 @@ fn shared_rows(
     // default. Values come from the same `from_env` the turn loop uses.
     let hc = crate::agent::composable::HarnessConfig::from_env();
     let harness_result = crate::agent::composable::DexHarness::from_env();
+    // Slot selections (`harness.slots:`): same resolver the turn loop calls.
+    let (_, slot_rows) = crate::agent::registry::resolve_snapshot_with_origins();
+    let applied: Vec<String> = slot_rows
+        .iter()
+        .filter(|r| r.applied && r.selection.is_some())
+        .map(|r| format!("{}={}", r.slot, r.resolved_id()))
+        .collect();
+    let profile_origin = slot_rows.iter().find_map(|r| r.profile.clone());
+    row(
+        out,
+        "harness slots",
+        &if applied.is_empty() {
+            "default".to_string()
+        } else {
+            applied.join(", ")
+        },
+        &match (&profile_origin, applied.is_empty()) {
+            (Some(profile), _) => format!("profile '{profile}'"),
+            (None, true) => "built-in default".to_string(),
+            (None, false) => "config harness.slots".to_string(),
+        },
+    );
     let file_has = |key: &str| super::load_harness_num(key).is_some();
     let iter_source = if std::env::var("DEX_MAX_TOOL_ITERATIONS")
         .ok()

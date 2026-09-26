@@ -2553,6 +2553,7 @@ fn doctor_output_is_byte_stable() {
             ),
             concat!(
                 "compaction              deterministic                                 built-in default\n",
+                "harness slots           default                                       built-in default\n",
                 "harness tools           200                                           built-in default\n",
                 "harness batch           10                                            built-in default\n",
                 "harness compact         3                                             built-in default\n",

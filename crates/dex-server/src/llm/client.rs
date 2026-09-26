@@ -15,6 +15,39 @@ use crate::protocol::{ChatCompletionsRequest, ChatMessage, ModelEvent, StreamOpt
 use crate::runtime::console::with_console;
 pub(crate) use dex_ai::ModelClient;
 
+// The `model_selector` slot's wire seam: a per-task override config that
+// every `LlmConfig` model call inside the scope serves instead of itself.
+// Set by `process_turn` when a Lua `model_selector` opinion resolves
+// against the provider catalog + credentials (`apply_model`); the scope
+// mirrors the drive context's per-turn scoping — nested child turns shadow
+// and restore, and only `LlmConfig` clients (production) consult it, so
+// test mocks are untouched. The override carries credentials, so it lives
+// only in the wire path — never in the extension-visible drive snapshot.
+tokio::task_local! {
+    static SERVED_MODEL: std::cell::RefCell<Option<std::sync::Arc<LlmConfig>>>;
+}
+
+/// Run `fut` with `config` as the served model: every `LlmConfig` model
+/// call in scope dispatches through it. Nesting shadows (a child turn with
+/// no opinion still shadows its parent's override — the child serves its
+/// own configured model).
+pub async fn with_served_model<Fut, T>(config: std::sync::Arc<LlmConfig>, fut: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    SERVED_MODEL
+        .scope(std::cell::RefCell::new(Some(config)), fut)
+        .await
+}
+
+/// The scope's override, if any. Cheap: an `Arc` clone per model round.
+fn current_served_model() -> Option<std::sync::Arc<LlmConfig>> {
+    SERVED_MODEL
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
 impl ModelClient for LlmConfig {
     async fn complete(
         &self,
@@ -23,6 +56,16 @@ impl ModelClient for LlmConfig {
         sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        // An active `model_selector` override wins over the config itself;
+        // dispatch directly (never `served.complete`, which would re-enter
+        // this check).
+        if let Some(served) = current_served_model() {
+            return crate::llm::dispatch::complete(&served, messages, tools, sink, cancel)
+                .await
+                .map_err(|e| {
+                    Box::<dyn std::error::Error + Send + Sync>::from(error_chain_message(&*e))
+                });
+        }
         crate::llm::dispatch::complete(self, messages, tools, sink, cancel)
             .await
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(error_chain_message(&*e)))

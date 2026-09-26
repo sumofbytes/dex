@@ -183,6 +183,80 @@ async fn turn_lifecycle_hooks_fire_around_the_turn() {
     crate::extensions::global_manager().reset_for_tests().await;
 }
 
+/// `model_selector` overrides the model this turn serves: the recorded
+/// snapshot (what `dex.model` and `model_select` see) follows the Lua
+/// opinion, and a failing selector fails open to the configured model.
+#[tokio::test]
+async fn model_selector_overrides_the_served_model_and_fails_open() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let mgr = crate::extensions::global_manager();
+    mgr.reset_for_tests().await;
+    let manifest = "manifest_version: 1\nid: msel\nversion: 0.1.0\ncapabilities: []\n";
+    let lua = "return function(dex)\n  dex.events.on(\"model_selector\", function(ctx, ev)\n    return { model = \"m-9\" }\n  end)\nend\n";
+    let root = crate::extensions::tests::fixture_exts(&[("msel", manifest, lua)]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &MockModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    // The served snapshot follows the Lua pick — `dex.model`'s view of the
+    // turn (`anthropic` = the test config's provider).
+    assert_eq!(
+        crate::extensions::served_model_snapshot().map(|s| s.id()),
+        Some("anthropic/m-9".to_string())
+    );
+    std::fs::remove_dir_all(&root).ok();
+    // Fail-open: a broken selector keeps the configured model served.
+    mgr.reset_for_tests().await;
+    let lua_bad = "return function(dex)\n  dex.events.on(\"model_selector\", function(ctx, ev)\n    error(\"boom\")\n  end)\nend\n";
+    let root = crate::extensions::tests::fixture_exts(&[("msel-bad", manifest, lua_bad)]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &MockModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        crate::extensions::served_model_snapshot().map(|s| s.id()),
+        Some("anthropic/mock".to_string())
+    );
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// `before_agent_start` appends to the System prompt for the turn's
 /// model requests and is restored when the turn ends (per-turn scope).
 #[tokio::test]

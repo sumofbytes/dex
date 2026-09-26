@@ -62,8 +62,11 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "session.before_compact",
     "before_agent_start",
     "model_select",
+    "model_selector",
     "harness.overflow",
     "harness.conflict",
+    "harness.compact",
+    "harness.summarize",
     "permission.request",
     "llm.before",
     "llm.after",
@@ -73,6 +76,22 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "message.sent",
     "session.created",
     "session.loaded",
+    "tool_catalog",
+    "runtime.start",
+    "runtime.stop",
+];
+
+/// Events (enveloped harness slots) `dex.wrap` middleware accepts — the
+/// slots whose whole handler chain is a JSON-envelope fold, so middleware
+/// is a plain function chain over it (spec §13). Everything else has no
+/// single envelope to wrap and is rejected at registration.
+pub const WRAPPABLE_SLOTS: &[&str] = &[
+    "model_selector",
+    "harness.summarize",
+    "harness.compact",
+    "harness.overflow",
+    "harness.conflict",
+    "tool_catalog",
 ];
 
 /// Host context a Lua call runs under: what cancellation, gates, and
@@ -163,6 +182,10 @@ pub enum HostOp {
 pub struct ChunkExports {
     pub tools: Vec<String>,
     pub events: Vec<String>,
+    /// Slot names the extension wraps via `dex.wrap` (middleware).
+    pub wraps: Vec<String>,
+    /// Slots the extension backs via `dex.fallback`.
+    pub fallbacks: Vec<String>,
     pub shadows: Vec<String>,
     /// (name, description) pairs, sorted by name.
     pub commands: Vec<(String, String)>,
@@ -194,6 +217,12 @@ enum Request {
 struct WorkerRegistrations {
     tools: HashMap<String, Function>,
     events: HashMap<String, Vec<Function>>,
+    /// `dex.wrap(slot, fn)` middleware, per slot, registration order
+    /// (outermost first). Only the enveloped harness slots accept it.
+    wraps: HashMap<String, Vec<Function>>,
+    /// `dex.fallback(slot, fn)` backups: consulted when the slot's whole
+    /// chain produced no opinion, before the Rust default.
+    fallbacks: HashMap<String, Function>,
     /// `dex.commands.register({ name, description, execute })` handlers.
     commands: HashMap<String, (String, Function)>,
     shadows: Vec<String>,
@@ -457,7 +486,8 @@ fn worker_loop(manifest: Manifest, dir: PathBuf, mut rx: mpsc::Receiver<Request>
         .expect("memory limit");
     strip_sandbox(&lua);
     let regs = Rc::new(RefCell::new(WorkerRegistrations::default()));
-    let dex = build_dex_table(&lua, &manifest, &regs);
+    let dex = build_dex_table(&lua, &manifest, &regs)
+        .expect("dex table builders are infallible at worker startup");
     // The worker exits when the last engine handle drops: `run()` returning
     // `None` is shutdown, never an error surface.
 
@@ -576,6 +606,8 @@ fn run_load_inner(
     Ok(ChunkExports {
         tools: regs.tools.keys().cloned().collect(),
         events: regs.events.keys().cloned().collect(),
+        wraps: regs.wraps.keys().cloned().collect(),
+        fallbacks: regs.fallbacks.keys().cloned().collect(),
         shadows: regs.shadows.clone(),
         commands,
     })
@@ -589,12 +621,20 @@ fn build_dex_table(
     lua: &Lua,
     manifest: &Manifest,
     regs: &Rc<RefCell<WorkerRegistrations>>,
-) -> Table {
+) -> Result<Table, LuaError> {
     let dex = lua.create_table().expect("dex table");
     dex.set("tools", host_api::tools_table(lua, manifest, regs))
         .expect("dex.tools");
     dex.set("events", host_api::events_table(lua, manifest, regs))
         .expect("dex.events");
+    dex.set("wrap", host_api::wrap_slot(lua, manifest, regs)?)
+        .expect("dex.wrap");
+    let (activate_profile, current_profile) = host_api::profile_api(lua).expect("dex profile api");
+    dex.set("activate_profile", activate_profile)
+        .expect("dex.activate_profile");
+    dex.set("profile", current_profile).expect("dex.profile");
+    dex.set("fallback", host_api::fallback_slot(lua, manifest, regs)?)
+        .expect("dex.fallback");
     dex.set("log", host_api::log_table(lua, manifest))
         .expect("dex.log");
     dex.set("workspace", host_api::workspace_table(lua, manifest))
@@ -611,7 +651,7 @@ fn build_dex_table(
         .expect("dex.net");
     dex.set("json", host_api::json_table(lua))
         .expect("dex.json");
-    dex
+    Ok(dex)
 }
 
 mod call;

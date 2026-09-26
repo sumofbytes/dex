@@ -753,7 +753,8 @@ Harness extensions in sandboxed Lua: drop a directory with `manifest.yaml` +
 `extension.lua` into a discovery dir and it can register tools, shadow
 built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
 `turn.start`/`turn.end`, `before_agent_start`, `model_select`,
-`session.before_compact`, plus `harness.overflow`/`harness.conflict` when
+`session.before_compact`, plus `harness.overflow`/`harness.compact`/
+`harness.conflict`/`harness.summarize`/`model_selector` when
 the `harness` capability is declared; observe-only `llm.before`/`llm.after`,
 `tool.error`, `permission.request` (also under `harness`),
 `supervisor.route`, and the read-only `message.received`/`message.sent`/
@@ -813,15 +814,35 @@ harness: # runtime harness numerics (env DEX_MAX_TOOL_ITERATIONS wins for iterat
   keep_below_chars: 500
   truncate_above_chars: 2000
   drop_above_chars: 10000
+  slots: # named registry impls; `dex runtime graph` prints the resolved graph
+    # catalog: native-only # default (native + MCP + extensions) | native-only
+    # trigger: never       # default (config budget) | never
 ```
+
+`harness.slots:` selects named registry implementations per harness slot
+(`dex runtime graph` prints every slot's resolved id and origin — the same
+resolver the turn loop calls, so the graph cannot drift from what a turn
+runs). Unknown slots or ids `warn_once` and keep the default; Rust code can
+add implementations with `crate::agent::registry::register`.
 
 A `harness`-capability extension can also override turn decisions at
 runtime (first non-nil opinion wins, otherwise the Rust default):
 `harness.overflow` (`{message} -> {overflow = bool}`),
+`harness.compact` (`{stored_tokens, ephemeral_overhead, message_count} ->
+{compact = bool}` — the compaction gate),
+`harness.summarize`
+(`{conversation, previous_summary} -> {summary = "..."}` — the first
+non-empty summary replaces the LLM/deterministic checkpoint; errors and
+empty replies fall back to the Rust summarizer),
 `harness.conflict` (`{calls} -> {conflicts = bool}`, one call per batch),
 and `permission.request` (`{tool, args, requirement, mode} ->
 {decision = "allow"|"deny"}`, consulted only when approval would otherwise
 be required — reads stay free; `read-only` mode is never overridable).
+`model_selector` (`{current, previous} -> {model = "provider/model"}` or a
+bare string) picks the model one turn serves: the first non-empty opinion is
+resolved like `/model` (provider switch, endpoint routing, wire protocol,
+context window — but nothing persisted), and errors, empty replies, and
+unresolvable selections fail open to the configured model.
 `supervisor.route` (`{agent, task} -> {redirect = "name"}` and/or
 `{deny = true, reason = "..."}`) gates every `delegate` spawn — first
 redirect wins, any deny fails attributed to the denying extension, and a

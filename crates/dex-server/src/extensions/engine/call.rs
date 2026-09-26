@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mlua::{Error as LuaError, Lua, MultiValue, Table, Value, VmState};
+use mlua::{Error as LuaError, Function, Lua, MultiValue, Table, Value, VmState};
 use serde_json::{Map, Value as Json};
 
 use super::{
@@ -194,7 +194,8 @@ fn run_event_handlers(
         .get(&event)
         .cloned()
         .unwrap_or_default();
-    let ev_id = manifest.id_for_error();
+    let wraps = regs.borrow().wraps.get(&event).cloned().unwrap_or_default();
+    let ev_id = manifest.id_for_error().to_string();
     let ev_table: Table = match json_to_lua(lua, &args).map_err(|e| e.to_string())? {
         Value::Table(t) => t,
         _ => {
@@ -203,21 +204,161 @@ fn run_event_handlers(
             ));
         }
     };
+    // A stable handle for the `dex.fallback` backup call: the main chain
+    // consumes the table (and middleware may hand it its own mutations —
+    // the fallback sees the original payload).
+    let ev_for_fallback = ev_table.clone();
+
+    // The chain bottom: run the handler fold over `ev`, returning the
+    // envelope as a Lua table so middleware can observe and rewrite it.
+    let run_fold = {
+        let ev_id = ev_id.clone();
+        let event = event.clone();
+        let ctx = ctx.clone();
+        let handlers = handlers.clone();
+        move |lua: &Lua, ev: Table| -> Result<Table, String> {
+            let mut envelope = fold_handlers(&ctx, &handlers, ev.clone(), &ev_id, &event)?;
+            envelope = fold_ev_mutations(ev, envelope, &ev_id, &event)?;
+            match json_to_lua(lua, &Json::Object(envelope)) {
+                Ok(Value::Table(t)) => Ok(t),
+                _ => Err(format!(
+                    "extension '{ev_id}' event '{event}': cannot build envelope"
+                )),
+            }
+        }
+    };
+
+    let envelope = if wraps.is_empty() {
+        let mut envelope = fold_handlers(ctx, &handlers, ev_table.clone(), &ev_id, &event)?;
+        envelope = fold_ev_mutations(ev_table, envelope, &ev_id, &event)?;
+        run_slot_fallback(lua, regs, &event, ctx, &ev_for_fallback, envelope, &ev_id)?
+    } else {
+        // Middleware chain, registration order outermost first: fold the
+        // layers around the handler fold in reverse. `next(ev)` is
+        // re-entrant (a retry middleware may call it repeatedly); a `nil`
+        // return is a pass-through. A string return is the convenient
+        // `{content = ...}` form.
+        let ev_id_mw = ev_id.clone();
+        let event_mw = event.clone();
+        let mut next: Function = lua
+            .create_function(move |lua, (ev,): (Table,)| {
+                run_fold(lua, ev).map_err(LuaError::RuntimeError)
+            })
+            .map_err(|e| e.to_string())?;
+        for mw in wraps.iter().rev() {
+            let inner = next.clone();
+            let mw = mw.clone();
+            next = lua
+                .create_function(move |lua, (ev,): (Table,)| -> Result<Value, mlua::Error> {
+                    let returned: Value = mw.call((inner.clone(), ev.clone()))?;
+                    match returned {
+                        Value::Nil => inner.call((ev,)),
+                        Value::String(s) => {
+                            let t = lua.create_table()?;
+                            t.set("content", s)?;
+                            Ok(Value::Table(t))
+                        }
+                        other => Ok(other),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        let returned: Value = next.call((ev_table,)).map_err(|e| {
+            format!("extension '{ev_id_mw}' event '{event_mw}' middleware failed: {e}")
+        })?;
+        let envelope: Map<String, Json> = match returned {
+            Value::Table(t) => match lua_to_json(Value::Table(t))
+                .map_err(|e| format!("extension '{ev_id}' event '{event}': {e}"))?
+            {
+                Json::Object(map) => map,
+                _ => {
+                    return Err(format!(
+                        "extension '{ev_id}' event '{event}': middleware must return an object"
+                    ));
+                }
+            },
+            Value::String(s) => {
+                let mut map = Map::new();
+                map.insert(
+                    "content".to_string(),
+                    Json::String(s.to_str().map_err(|e| e.to_string())?.to_string()),
+                );
+                map
+            }
+            Value::Nil => Map::new(),
+            other => {
+                return Err(format!(
+                    "extension '{ev_id}' event '{event}': middleware must return nil, a string, or a table, got {}",
+                    lua_type_name(&other)
+                ));
+            }
+        };
+        run_slot_fallback(lua, regs, &event, ctx, &ev_for_fallback, envelope, &ev_id)?
+    };
+    serde_json::to_string(&Json::Object(envelope)).map_err(|e| e.to_string())
+}
+
+/// `dex.fallback` (spec §34): when the slot's whole chain produced no
+/// opinion (no directive key set — every handler no-opped, errored, or
+/// there were none), run the registered backup before the Rust default. An
+/// opinion from the chain is never second-guessed.
+fn run_slot_fallback(
+    _lua: &Lua,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+    event: &str,
+    ctx: &Table,
+    ev_table: &Table,
+    mut envelope: Map<String, Json>,
+    ev_id: &str,
+) -> Result<Map<String, Json>, String> {
+    let fallback = regs.borrow().fallbacks.get(event).cloned();
+    let no_opinion = !envelope
+        .keys()
+        .any(|k| DIRECTIVE_KEYS.contains(&k.as_str()));
+    if no_opinion {
+        if let Some(backup) = fallback {
+            let returned: Value = backup
+                .call((ctx.clone(), ev_table.clone()))
+                .map_err(|e| format!("extension '{ev_id}' event '{event}' fallback failed: {e}"))?;
+            merge_directive(returned, &mut envelope, ev_id, event)?;
+        }
+    }
+    Ok(envelope)
+}
+
+/// Fold the handler chain over `ev` into a directive envelope: handlers run
+/// in registration order, each seeing the same event table; a deny
+/// short-circuits the rest.
+fn fold_handlers(
+    ctx: &Table,
+    handlers: &[Function],
+    ev_table: Table,
+    ev_id: &str,
+    event: &str,
+) -> Result<Map<String, Json>, String> {
     let mut envelope = Map::new();
-    for handler in &handlers {
+    for handler in handlers {
         let returned: Value = handler
             .call((ctx.clone(), ev_table.clone()))
             .map_err(|e| format!("extension '{ev_id}' event '{event}' failed: {e}"))?;
-        merge_directive(returned, &mut envelope, ev_id, &event)?;
+        merge_directive(returned, &mut envelope, ev_id, event)?;
         if envelope.get("deny").and_then(|v| v.as_bool()) == Some(true) {
             break;
         }
     }
-    // Mutations to the event table are directives too: fold every
-    // serializable ev key back into the envelope, with explicit handler
-    // returns taking precedence. This is what makes `ev.args.command = …`
-    // (tool.before) and `ev.content = …` / `ev.is_error = …` (tool.after)
-    // reach the host even when the handler returns nil.
+    Ok(envelope)
+}
+
+/// Fold every serializable `ev` mutation back into the envelope (explicit
+/// handler returns take precedence): this is what makes `ev.args.command = …`
+/// (tool.before) and `ev.content = …` / `ev.is_error = …` (tool.after) reach
+/// the host even when the handler returns nil.
+fn fold_ev_mutations(
+    ev_table: Table,
+    mut envelope: Map<String, Json>,
+    ev_id: &str,
+    event: &str,
+) -> Result<Map<String, Json>, String> {
     for pair in ev_table.pairs::<Value, Value>() {
         let (key, value) = match pair {
             Ok(kv) => kv,
@@ -233,7 +374,7 @@ fn run_event_handlers(
         })?;
         envelope.insert(key, json);
     }
-    serde_json::to_string(&Json::Object(envelope)).map_err(|e| e.to_string())
+    Ok(envelope)
 }
 
 /// Run one registered command handler with the rest-of-line payload.
@@ -262,6 +403,28 @@ fn run_command_handler(
     }
 }
 
+/// Directive-envelope keys the host reads from event handlers (the
+/// whitelist `merge_directive` folds; anything else on a handler's return
+/// is ignored). The ev-mutation fold uses the same set for precedence.
+const DIRECTIVE_KEYS: &[&str] = &[
+    "deny",
+    "reason",
+    "content",
+    "is_error",
+    "append",
+    "instructions",
+    "cancel",
+    "summary",
+    "overflow",
+    "conflicts",
+    "compact",
+    "decision",
+    "redirect",
+    "model",
+    "keep",
+    "drop",
+];
+
 /// Fold one handler's return into the directive envelope: nil continues the
 /// chain, a string is result content (the convenient `tool.after` form), a
 /// table sets directive keys. Anything else is a fail-open/fail-closed
@@ -282,25 +445,12 @@ fn merge_directive(
             Ok(())
         }
         Value::Table(t) => {
-            for key in [
-                "deny",
-                "reason",
-                "content",
-                "is_error",
-                "append",
-                "instructions",
-                "cancel",
-                "summary",
-                "overflow",
-                "conflicts",
-                "decision",
-                "redirect",
-            ] {
+            for &key in DIRECTIVE_KEYS {
                 let value: Value = t.get(key).map_err(|e| e.to_string())?;
                 if !matches!(value, Value::Nil) {
                     let json = match key {
                         "content" | "append" | "instructions" | "summary" | "reason"
-                        | "agent" => {
+                        | "agent" | "model" => {
                             match value {
                                 Value::String(s) => Json::String(
                                     s.to_str().map_err(|e| e.to_string())?.to_string(),
