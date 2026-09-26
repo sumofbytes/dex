@@ -2550,6 +2550,61 @@ end
 }
 
 #[tokio::test]
+async fn first_wins_chain_stops_before_running_later_handlers() {
+    let yes = hook_manifest("se-a", false);
+    let no = hook_manifest("se-b", false);
+    let root = fixture_exts(&[
+        (
+            "se-a",
+            yes.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.compact", function(ctx, ev)
+    return { compact = true }
+  end)
+end
+"#,
+        ),
+        (
+            "se-b",
+            no.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.compact", function(ctx, ev)
+    return { compact = false }
+  end)
+end
+"#,
+        ),
+    ]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    assert_eq!(
+        mgr.query_harness_compact(2000, 0, 5, &host).await,
+        Some(true)
+    );
+    // First-wins must stop the chain, not merely ignore later opinions:
+    // the trace ring records one entry per dispatch, and a merge fold
+    // would have flipped the decision to `false`.
+    let snapshot = super::trace::snapshot();
+    let dispatched: Vec<&str> = snapshot
+        .iter()
+        .filter(|r| r.event == "harness.compact")
+        .map(|r| r.component.as_str())
+        .collect();
+    assert!(dispatched.contains(&"se-a"), "first handler ran");
+    assert!(
+        !dispatched.contains(&"se-b"),
+        "chain stopped before the second handler"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn harness_summarize_first_nonempty_wins_and_empty_fails_open() {
     let yes = hook_manifest("h-yes", false);
     let nil = hook_manifest("h-nil", false);

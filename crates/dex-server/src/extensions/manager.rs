@@ -1,8 +1,14 @@
 //! The extension manager: load/reload, tool schema, dispatch.
 
 use crate::protocol::{FunctionDef, ToolDefinition};
+
+/// One fold step: `Next` carries the folded accumulator; `Stop` ends the
+/// chain with its value (deny, strict failure, or the first opinion).
+enum Chain<T> {
+    Next(T),
+    Stop(T),
+}
 use std::collections::{BTreeMap, HashSet};
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -603,87 +609,96 @@ impl ExtensionManager {
         args: &serde_json::Map<String, serde_json::Value>,
         host: &HostCtx<'_>,
     ) -> BeforeOutcome {
-        self.run_chain(
-            "tool.before",
-            host,
-            BeforeOutcome::Proceed {
-                args: args.clone(),
-                mutated_by: Vec::new(),
-            },
-            |_| false,
-            |acc| {
-                let current = match acc {
-                    BeforeOutcome::Proceed { args, .. } => args,
-                    BeforeOutcome::Denied { .. } => {
-                        unreachable!("a deny breaks the chain before the next payload")
+        // Fold state: the running args, who mutated them, and the deny (set
+        // only on the `Stop` that ends the chain — never on `Next`, so the
+        // payload is always built from the running args).
+        struct BeforeFold {
+            args: serde_json::Map<String, serde_json::Value>,
+            mutated_by: Vec<String>,
+            deny: Option<(String, String)>,
+        }
+        let state = self
+            .run_chain(
+                "tool.before",
+                host,
+                BeforeFold {
+                    args: args.clone(),
+                    mutated_by: Vec::new(),
+                    deny: None,
+                },
+                |state| state.deny.is_some(),
+                |state| serde_json::json!({ "tool": tool, "args": state.args }),
+                |id, strict, envelope, state| {
+                    let map = match envelope {
+                        Ok(map) => map,
+                        // The engine logged it; `strict` turns the failure
+                        // into a deny, fail-open keeps the current args.
+                        Err(error) => {
+                            return if strict {
+                                Chain::Stop(BeforeFold {
+                                    deny: Some((
+                                        id.to_string(),
+                                        format!("hook failed (strict): {error}"),
+                                    )),
+                                    ..state
+                                })
+                            } else {
+                                Chain::Next(state)
+                            };
+                        }
+                    };
+                    let (next, deny) = match hooks::parse_before(&map) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            dex_runtime::log!(
+                                Warn,
+                                "extensions: '{id}' tool.before failed: {error}"
+                            );
+                            return if strict {
+                                Chain::Stop(BeforeFold {
+                                    deny: Some((
+                                        id.to_string(),
+                                        format!("hook failed (strict): {error}"),
+                                    )),
+                                    ..state
+                                })
+                            } else {
+                                Chain::Next(state)
+                            };
+                        }
+                    };
+                    if let Some((_, reason)) = deny {
+                        dex_runtime::log!(
+                            Warn,
+                            "extensions: '{id}' tool.before denied '{tool}': {reason}"
+                        );
+                        return Chain::Stop(BeforeFold {
+                            deny: Some((id.to_string(), reason)),
+                            ..state
+                        });
                     }
-                };
-                serde_json::json!({ "tool": tool, "args": current })
+                    let mutated_by = if next != state.args {
+                        let mut by = state.mutated_by;
+                        by.push(id.to_string());
+                        by
+                    } else {
+                        state.mutated_by
+                    };
+                    Chain::Next(BeforeFold {
+                        args: next,
+                        mutated_by,
+                        deny: None,
+                    })
+                },
+            )
+            .await;
+        match state.deny {
+            Some((by, reason)) => BeforeOutcome::Denied { by, reason },
+            None => BeforeOutcome::Proceed {
+                args: state.args,
+                mutated_by: state.mutated_by,
             },
-            |id, strict, envelope, acc| {
-                let BeforeOutcome::Proceed {
-                    args: current,
-                    mutated_by,
-                } = acc
-                else {
-                    return ControlFlow::Break(acc);
-                };
-                let map = match envelope {
-                    Ok(map) => map,
-                    // The engine logged it; `strict` turns the failure into
-                    // a deny, fail-open keeps the current args.
-                    Err(error) => {
-                        return if strict {
-                            ControlFlow::Break(BeforeOutcome::Denied {
-                                by: id.to_string(),
-                                reason: format!("hook failed (strict): {error}"),
-                            })
-                        } else {
-                            ControlFlow::Continue(BeforeOutcome::Proceed {
-                                args: current,
-                                mutated_by,
-                            })
-                        };
-                    }
-                };
-                let (next, deny) = match hooks::parse_before(&map) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        eprintln!("dex: [extensions] '{id}' tool.before failed: {error}");
-                        return if strict {
-                            ControlFlow::Break(BeforeOutcome::Denied {
-                                by: id.to_string(),
-                                reason: format!("hook failed (strict): {error}"),
-                            })
-                        } else {
-                            ControlFlow::Continue(BeforeOutcome::Proceed {
-                                args: current,
-                                mutated_by,
-                            })
-                        };
-                    }
-                };
-                if let Some((_, reason)) = deny {
-                    eprintln!("dex: [extensions] '{id}' tool.before denied '{tool}': {reason}");
-                    return ControlFlow::Break(BeforeOutcome::Denied {
-                        by: id.to_string(),
-                        reason,
-                    });
-                }
-                let mutated_by = if next != current {
-                    let mut by = mutated_by;
-                    by.push(id.to_string());
-                    by
-                } else {
-                    mutated_by
-                };
-                ControlFlow::Continue(BeforeOutcome::Proceed {
-                    args: next,
-                    mutated_by,
-                })
-            },
-        )
-        .await
+        }
     }
 
     /// `tool.after` chain (H2): post-execution middleware over the result.
@@ -712,10 +727,13 @@ impl ExtensionManager {
                     })
                 },
                 |_, _, envelope, (text, ok)| {
-                    let folded = envelope.ok().map_or((text.clone(), ok), |map| {
-                        hooks::parse_after(&map, &text, ok)
-                    });
-                    ControlFlow::Continue(folded)
+                    // `map_or` would clone the full result text even when
+                    // the hook succeeded — only the error path needs it.
+                    let folded = envelope.ok().map_or_else(
+                        || (text.clone(), ok),
+                        |map| hooks::parse_after(&map, &text, ok),
+                    );
+                    Chain::Next(folded)
                 },
             )
             .await;
@@ -732,7 +750,7 @@ impl ExtensionManager {
             (),
             |_| false,
             |_| payload.clone(),
-            |_, _, _, _| ControlFlow::Continue(()),
+            |_, _, _, _| Chain::Next(()),
         )
         .await;
     }
@@ -749,7 +767,7 @@ impl ExtensionManager {
             Vec::new(),
             |_| false,
             |_| serde_json::json!({}),
-            |_, _, envelope, appends| ControlFlow::Continue(fold_append(envelope, appends)),
+            |_, _, envelope, appends| Chain::Next(fold_append(envelope, appends)),
         )
         .await
     }
@@ -779,7 +797,7 @@ impl ExtensionManager {
                         action.deny = deny.map(|reason| (id.to_string(), reason));
                     }
                 }
-                ControlFlow::Continue(action)
+                Chain::Next(action)
             },
         )
         .await
@@ -810,10 +828,8 @@ impl ExtensionManager {
                 })
             },
             |id, _, envelope, _| match envelope.ok().and_then(|m| hooks::parse_permission(&m)) {
-                Some((decision, reason)) => {
-                    ControlFlow::Break(Some((decision, reason, id.to_string())))
-                }
-                None => ControlFlow::Continue(None),
+                Some((decision, reason)) => Chain::Stop(Some((decision, reason, id.to_string()))),
+                None => Chain::Next(None),
             },
         )
         .await
@@ -834,7 +850,7 @@ impl ExtensionManager {
             Vec::new(),
             |_| false,
             |_| payload.clone(),
-            |_, _, envelope, appends| ControlFlow::Continue(fold_append(envelope, appends)),
+            |_, _, envelope, appends| Chain::Next(fold_append(envelope, appends)),
         )
         .await
     }
@@ -905,8 +921,8 @@ impl ExtensionManager {
                 .ok()
                 .and_then(|m| hooks::parse_harness_string(&m, "summary"))
             {
-                Some(summary) => ControlFlow::Break(Some(summary)),
-                None => ControlFlow::Continue(None),
+                Some(summary) => Chain::Stop(Some(summary)),
+                None => Chain::Next(None),
             },
         )
         .await
@@ -944,8 +960,8 @@ impl ExtensionManager {
                         .or_else(|| hooks::parse_harness_string(&m, "content"))
                 });
                 match pick {
-                    Some(model) => ControlFlow::Break(Some(model)),
-                    None => ControlFlow::Continue(None),
+                    Some(model) => Chain::Stop(Some(model)),
+                    None => Chain::Next(None),
                 }
             },
         )
@@ -980,8 +996,8 @@ impl ExtensionManager {
                 })
             },
             |_, _, envelope, _| match envelope.ok().and_then(|m| hooks::parse_catalog_filter(&m)) {
-                Some(filter) => ControlFlow::Break(Some(filter.apply(schemas))),
-                None => ControlFlow::Continue(None),
+                Some(filter) => Chain::Stop(Some(filter.apply(schemas))),
+                None => Chain::Next(None),
             },
         )
         .await
@@ -1017,7 +1033,7 @@ impl ExtensionManager {
                         action.summary = parsed.summary;
                     }
                 }
-                ControlFlow::Continue(action)
+                Chain::Next(action)
             },
         )
         .await
@@ -1027,7 +1043,11 @@ impl ExtensionManager {
     /// id-sorted): `(extension id, strict)`. Every chain shares this one
     /// selection — `serves` covers explicit handler subscriptions and
     /// `dex.wrap`/`dex.fallback` middleware alike, matching what `run_event`
-    /// independently re-checks.
+    /// independently re-checks. For event chains the selection is exactly
+    /// `events.contains`: wrap/fallback registration only accepts the
+    /// wrappable slots (`model_selector`, `harness.*`, `tool_catalog`),
+    /// none of which are event names — keep that pairing intact if the
+    /// wrappable set ever grows.
     async fn subscribers(&self, event: &str) -> Vec<(String, bool)> {
         self.engines
             .read()
@@ -1055,9 +1075,9 @@ impl ExtensionManager {
     ///   accumulator (threaded middleware folds its state back in).
     /// - `fold` — one handler's contribution: the extension id, its
     ///   `strict` flag, the parsed directive envelope (or the run error,
-    ///   already logged), and the accumulator. `Continue` carries the
-    ///   folded value; `Break` ends the chain with that value (deny,
-    ///   strict failure, or the first explicit opinion).
+    ///   already logged), and the accumulator. `Next` carries the folded
+    ///   value; `Stop` ends the chain with that value (deny, strict
+    ///   failure, or the first explicit opinion).
     ///
     /// Errors fail open by contract: the engine logs and hands the error
     /// to the fold, which decides — skip (`Continue`) everywhere except
@@ -1076,7 +1096,7 @@ impl ExtensionManager {
             bool,
             Result<serde_json::Map<String, serde_json::Value>, String>,
             T,
-        ) -> ControlFlow<T, T>,
+        ) -> Chain<T>,
     ) -> T {
         let mut acc = seed;
         for (id, strict) in self.subscribers(event).await {
@@ -1094,8 +1114,8 @@ impl ExtensionManager {
                 dex_runtime::log!(Warn, "extensions: '{id}' {event} failed: {error}");
             }
             acc = match fold(&id, strict, envelope, acc) {
-                ControlFlow::Break(final_value) => return final_value,
-                ControlFlow::Continue(next) => next,
+                Chain::Stop(final_value) => return final_value,
+                Chain::Next(next) => next,
             };
         }
         acc
@@ -1121,8 +1141,8 @@ impl ExtensionManager {
                 .ok()
                 .and_then(|m| hooks::parse_harness_bool(&m, key))
             {
-                Some(v) => ControlFlow::Break(Some(v)),
-                None => ControlFlow::Continue(None),
+                Some(v) => Chain::Stop(Some(v)),
+                None => Chain::Next(None),
             },
         )
         .await
