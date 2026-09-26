@@ -2,6 +2,7 @@
 //! net-fetch ceilings). Tests use the process-global manager — see
 //! `TEST_GLOBAL_MANAGER_LOCK` below.
 
+use super::discovery::is_disabled;
 use super::manager::ExtensionManager;
 use super::*;
 
@@ -491,6 +492,17 @@ async fn bad_hook_registration_skips_the_extension_whole() {
 end
 "#,
     );
+    // Permission arbitration without the `harness` capability fails at
+    // load: a `capabilities: []` extension must never see or decide an
+    // approval.
+    let perm_no_harness = (
+        "permcap",
+        "manifest_version: 1\nid: permcap\nversion: 0.1.0\ncapabilities: []\n",
+        r#"return function(dex)
+  dex.events.on("permission.request", function(ctx, ev) end)
+end
+"#,
+    );
     // Override without the capability.
     let no_cap = (
         "nocap",
@@ -516,6 +528,7 @@ end
     );
     let root = fixture_exts(&[
         (unknown_event.0, unknown_event.1, unknown_event.2),
+        (perm_no_harness.0, perm_no_harness.1, perm_no_harness.2),
         (no_cap.0, no_cap.1, no_cap.2),
         (no_target.0, no_target.1, no_target.2),
     ]);
@@ -2537,6 +2550,61 @@ end
 }
 
 #[tokio::test]
+async fn first_wins_chain_stops_before_running_later_handlers() {
+    let yes = hook_manifest("se-a", false);
+    let no = hook_manifest("se-b", false);
+    let root = fixture_exts(&[
+        (
+            "se-a",
+            yes.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.compact", function(ctx, ev)
+    return { compact = true }
+  end)
+end
+"#,
+        ),
+        (
+            "se-b",
+            no.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.compact", function(ctx, ev)
+    return { compact = false }
+  end)
+end
+"#,
+        ),
+    ]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    assert_eq!(
+        mgr.query_harness_compact(2000, 0, 5, &host).await,
+        Some(true)
+    );
+    // First-wins must stop the chain, not merely ignore later opinions:
+    // the trace ring records one entry per dispatch, and a merge fold
+    // would have flipped the decision to `false`.
+    let snapshot = super::trace::snapshot();
+    let dispatched: Vec<&str> = snapshot
+        .iter()
+        .filter(|r| r.event == "harness.compact")
+        .map(|r| r.component.as_str())
+        .collect();
+    assert!(dispatched.contains(&"se-a"), "first handler ran");
+    assert!(
+        !dispatched.contains(&"se-b"),
+        "chain stopped before the second handler"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn harness_summarize_first_nonempty_wins_and_empty_fails_open() {
     let yes = hook_manifest("h-yes", false);
     let nil = hook_manifest("h-nil", false);
@@ -2620,8 +2688,11 @@ end
 async fn supervisor_route_redirect_deny_and_fail_open() {
     // First redirect wins, any deny wins (attributed), garbage/no-opinion
     // fails open to the default (normal spawn flow).
-    let redir = hook_manifest("sup-redir", false);
-    let deny = hook_manifest("sup-deny", false);
+    // Routing is a harness-level power: the gate requires the capability.
+    let redir =
+        hook_manifest("sup-redir", false).replace("capabilities: []", "capabilities: [harness]");
+    let deny =
+        hook_manifest("sup-deny", false).replace("capabilities: []", "capabilities: [harness]");
     let root = fixture_exts(&[
         (
             "redir",
@@ -2842,8 +2913,10 @@ fn install_remote_git_url() {
         "ext",
     ]);
     let url = format!("file://{}", repo.display());
-    let id = install(&url).unwrap();
-    assert_eq!(id, "git-ext");
+    let msg = install(&url).unwrap();
+    assert!(msg.contains("git-ext") && msg.contains("enable"), "{msg}");
+    // Remote code needs explicit consent: the install lands disabled.
+    assert!(is_disabled("git-ext"));
     let installed = user_extensions_dir().join("git-ext");
     assert!(installed.join("manifest.yaml").is_file());
     assert!(installed.join("extension.lua").is_file());
@@ -2851,7 +2924,9 @@ fn install_remote_git_url() {
     let bad = root.join("bad");
     std::fs::create_dir_all(&bad).unwrap();
     assert!(install(&format!("file://{}", bad.display())).is_err());
-    // Unsupported scheme rejected before any git runs.
+    // Plaintext http:// is refused before any git runs (MITM would be
+    // remote code execution), like any other unsupported scheme.
+    assert!(install("http://example.com/x.git").is_err());
     assert!(install("ssh://example.com/x.git").is_err());
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(installed).ok();

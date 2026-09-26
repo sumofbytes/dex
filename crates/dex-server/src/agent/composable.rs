@@ -17,7 +17,6 @@
 //!   is passed per call, so the store can live on the harness).
 //! - [`UsageReporter`] — per-call usage accounting.
 //! - [`EventSink`] — transcript lines on every surface.
-//! - [`PromptContributor`] — system-prompt sections.
 //! - [`DynamicToolSource`] / [`ComposedCatalog`] — MCP / extension schema
 //!   slices merged behind the default [`ToolCatalog`].
 //! - [`RecoveryPolicy`] — overflow retry budget.
@@ -295,64 +294,6 @@ impl EventSink for DefaultEventSink {
         note: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(super::turn_loop::tools::system_note(console, note))
-    }
-}
-
-/// One system-prompt section. Chain contributors to replace the fixed
-/// base + project + extensions + skills assembly without forking `prompt.rs`;
-/// see `system_prompt_with_chain` for the assembly entry point.
-pub trait PromptContributor: Send + Sync {
-    fn append(&self, prompt: &mut String);
-}
-
-/// One static `header + body` section.
-pub struct StaticSection {
-    pub header: String,
-    pub body: String,
-}
-
-impl StaticSection {
-    pub fn new(header: impl Into<String>, body: impl Into<String>) -> Self {
-        Self {
-            header: header.into(),
-            body: body.into(),
-        }
-    }
-}
-
-impl PromptContributor for StaticSection {
-    fn append(&self, prompt: &mut String) {
-        prompt.push_str(&self.header);
-        prompt.push_str(&self.body);
-    }
-}
-
-/// Ordered chain; each contributor appends in registration order.
-#[derive(Default)]
-pub struct ChainContributor {
-    parts: Vec<Arc<dyn PromptContributor>>,
-}
-
-impl ChainContributor {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(mut self, part: impl PromptContributor + 'static) -> Self {
-        self.parts.push(Arc::new(part));
-        self
-    }
-
-    pub fn push_arc(mut self, part: Arc<dyn PromptContributor>) -> Self {
-        self.parts.push(part);
-        self
-    }
-
-    pub fn build(&self, mut base: String) -> String {
-        for part in &self.parts {
-            part.append(&mut base);
-        }
-        base
     }
 }
 

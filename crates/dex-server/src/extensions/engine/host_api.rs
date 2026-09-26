@@ -220,6 +220,7 @@ pub(super) fn events_table(
     regs: &Rc<RefCell<WorkerRegistrations>>,
 ) -> Table {
     let ext_id = manifest.id.clone();
+    let has_harness = manifest.has_capability("harness");
     let events = lua.create_table().expect("dex.events table");
 
     // dex.events.on(event, fn)
@@ -233,6 +234,18 @@ pub(super) fn events_table(
                     if !KNOWN_EVENTS.contains(&event.as_str()) {
                         return Err(LuaError::RuntimeError(format!(
                             "extension '{ext_id}' subscribes to unknown event '{event}'"
+                        )));
+                    }
+                    // Approval arbitration and turn routing are harness-level
+                    // powers: a plain `capabilities: [tools]` extension must
+                    // never see — let alone decide — a permission request.
+                    // Fail-closed at registration, like the unknown-event
+                    // check above.
+                    if (event == "permission.request" || event == "supervisor.route")
+                        && !has_harness
+                    {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' subscribes to '{event}' without the 'harness' capability (add it to the manifest capabilities:)"
                         )));
                     }
                     regs.borrow_mut()

@@ -2528,6 +2528,8 @@ fn doctor_output_is_byte_stable() {
         "XDG_CONFIG_HOME",
         "DEX_EXTENSIONS_PATHS",
     ]);
+    // EnvRestore::take only records for restore — it does not remove — so
+    // these must be actively cleared for the snapshot's origins.
     std::env::remove_var("DEX_MAX_TOOL_ITERATIONS");
     std::env::remove_var("DEX_EXTENSIONS_PATHS");
     std::env::remove_var("DEX_SYSTEM_PROMPT");

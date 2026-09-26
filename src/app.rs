@@ -556,7 +556,7 @@ fn run_extensions(action: &str, name: Option<&str>) {
                 std::process::exit(2);
             };
             match crate::extensions::install(src) {
-                Ok(id) => println!("installed '{id}' — run `dex extensions list`"),
+                Ok(msg) => println!("{msg}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
