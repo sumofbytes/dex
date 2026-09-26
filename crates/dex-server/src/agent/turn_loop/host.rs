@@ -63,12 +63,24 @@ async fn compaction_gate(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut compaction_attempts = 0;
     while compaction_attempts < harness.recovery_attempts() {
-        if !harness.should_compact(
-            config,
+        // `harness.compact` (spec §11): the first non-`nil` Lua opinion
+        // wins; `None` (unsubscribed, error, or no opinion) falls through
+        // to the Rust trigger — fail-open, per the hook contract.
+        let lua_compact = crate::extensions::query_harness_compact(
             ledger.stored_tokens(),
             budget_overhead,
             messages.len(),
-        ) {
+            cancel,
+        )
+        .await;
+        if !lua_compact.unwrap_or_else(|| {
+            harness.should_compact(
+                config,
+                ledger.stored_tokens(),
+                budget_overhead,
+                messages.len(),
+            )
+        }) {
             break;
         }
         // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
@@ -151,6 +163,27 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
 
         let ephemerals = [crate::mcp::ephemeral_line()];
         let overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
+        // Runtime prompt influence: `llm.before` appends land as one persisted
+        // user-role note before the compaction gate, so they count toward the
+        // window and appear in the journal like steering. Hooks must be
+        // idempotent (use `dex.state`) — an unconditional append grows history
+        // until compaction or the tool budget stops the turn.
+        let llm_appends = crate::extensions::apply_llm_before(
+            messages.len(),
+            ledger.stored_tokens(),
+            overhead,
+            self.cancel as &(dyn CancellationSource + Send + Sync),
+        )
+        .await;
+        if !llm_appends.is_empty() {
+            messages.push(ChatMessage::user_named(llm_appends.join("\n\n"), "note"));
+            *ledger = TokenLedger::rebuild(messages);
+            self.harness.transcript.append_pending(
+                &mut self.session,
+                messages,
+                &mut self.persisted_cursor,
+            )?;
+        }
         compaction_gate(
             self.config,
             self.console,
@@ -190,6 +223,22 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         stop_reason: Option<StopReason>,
         elapsed_ms: u64,
     ) -> Result<(), AgentTurnError> {
+        // Runtime observation: `llm.after` sees every request (usage, stop
+        // reason, timing). Fire-and-forget — no directive. Response text is
+        // engine-held; the final text surfaces via the transcript.
+        crate::extensions::fire_event_global(
+            "llm.after",
+            serde_json::json!({
+                "stop_reason": stop_reason.map(|s| format!("{s:?}")),
+                "prompt_tokens": usage.map(|u| u.prompt_tokens),
+                "completion_tokens": usage.map(|u| u.completion_tokens),
+                "elapsed_ms": elapsed_ms,
+            }),
+            self.cancel as &(dyn CancellationSource + Send + Sync),
+            &self.policy,
+            self.filter,
+        )
+        .await;
         if let Some(usage) = usage {
             self.last_usage = Some(usage.prompt_tokens);
             self.harness
@@ -229,7 +278,19 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         messages: &mut Vec<ChatMessage>,
         ledger: &mut TokenLedger,
     ) -> Result<bool, AgentTurnError> {
-        if !self.harness.is_overflow(error) {
+        // Runtime override: `harness.overflow` Lua hook wins when subscribed,
+        // else the Rust wording detector (zero-cost default).
+        let overflow = if crate::extensions::has_event_handlers("harness.overflow") {
+            crate::extensions::query_harness_overflow(
+                error,
+                self.cancel as &(dyn CancellationSource + Send + Sync),
+            )
+            .await
+            .unwrap_or_else(|| self.harness.is_overflow(error))
+        } else {
+            self.harness.is_overflow(error)
+        };
+        if !overflow {
             return Ok(false);
         }
         match emergency_compact(

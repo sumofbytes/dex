@@ -77,17 +77,23 @@ pub enum Mode {
         server: Option<String>,
     },
     /// Lua extensions (`dex extensions [list|enable <id>|disable <id>|
-    /// install <dir>|remove <id>]`).
+    /// install <dir|git-url>|remove <id>]`).
     Extensions {
         /// Subcommand (`list` when omitted).
         action: String,
-        /// Extension id (enable/disable/remove) or source dir (install).
+        /// Extension id (enable/disable/remove) or source dir/git URL (install).
         name: Option<String>,
     },
     /// Plot per-call token usage from a session (`dex usage <id|path>`).
     Usage {
         /// Session id or session/events file path.
         session: String,
+    },
+    /// Runtime slot graph (`dex runtime [graph]`): print the resolved
+    /// `DexHarness` snapshot — each slot's selected implementation and origin.
+    Runtime {
+        /// Subcommand (`graph` when omitted).
+        action: String,
     },
 }
 
@@ -256,6 +262,21 @@ pub fn resolve_mode(args: &Args) -> Mode {
                 session: args.rest[1].clone(),
             }
         }
+        Some("runtime") => {
+            // Strict like `usage`: extra args are an error, not a prompt.
+            if args.rest.len() > 2 {
+                return Mode::Runtime {
+                    action: "__invalid__".to_string(),
+                };
+            }
+            Mode::Runtime {
+                action: args
+                    .rest
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "graph".to_string()),
+            }
+        }
         None => Mode::Default,
         // The bare prompt and unknown flags (e.g. `-x`) both take the
         // one-shot path: unknown flags are treated as part of the prompt
@@ -274,7 +295,10 @@ pub(crate) fn check_reattach_mode(args: &Args, mode: &Mode) -> Result<(), String
         return Ok(());
     };
     // Informational modes win before any session is touched.
-    if matches!(mode, Mode::Help | Mode::Version | Mode::Usage { .. }) {
+    if matches!(
+        mode,
+        Mode::Help | Mode::Version | Mode::Usage { .. } | Mode::Runtime { .. }
+    ) {
         return Ok(());
     }
     // These pick or disable a session; `--reattach` already picked one, so
@@ -502,6 +526,29 @@ mod tests {
         match resolve_mode(&args_with_rest(&["mcp", "login", "a", "b"])) {
             Mode::Mcp { action, .. } => assert_eq!(action, "__invalid__"),
             other => panic!("expected invalid Mcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_resolves_to_runtime_mode() {
+        // Bare `runtime` and `runtime graph` both print the graph; extra args
+        // are invalid, never a one-shot prompt. `runtime trace` prints the
+        // extension-invocation audit ring.
+        match resolve_mode(&args_with_rest(&["runtime"])) {
+            Mode::Runtime { action } => assert_eq!(action, "graph"),
+            other => panic!("expected Mode::Runtime, got {other:?}"),
+        }
+        match resolve_mode(&args_with_rest(&["runtime", "graph"])) {
+            Mode::Runtime { action } => assert_eq!(action, "graph"),
+            other => panic!("expected Mode::Runtime, got {other:?}"),
+        }
+        match resolve_mode(&args_with_rest(&["runtime", "wat"])) {
+            Mode::Runtime { action } => assert_eq!(action, "wat"),
+            other => panic!("expected Mode::Runtime, got {other:?}"),
+        }
+        match resolve_mode(&args_with_rest(&["runtime", "a", "b"])) {
+            Mode::Runtime { action } => assert_eq!(action, "__invalid__"),
+            other => panic!("expected invalid Runtime, got {other:?}"),
         }
     }
 

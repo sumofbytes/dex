@@ -1792,3 +1792,141 @@ async fn unknown_tool_stays_unknown_under_filter() {
     .unwrap_err();
     assert!(err.to_string().contains("unknown tool"), "{err}");
 }
+
+/// `permission.request` allow skips the prompt; deny fails attributed; nil
+/// falls through to the normal flow; read-only is never overridable.
+#[tokio::test]
+async fn permission_request_hook_arbitrates_the_prompt() {
+    use crate::extensions::tests::{fixture_exts, TEST_GLOBAL_MANAGER_LOCK};
+    async fn gate_with(lua: &str) -> (Result<(), super::error::ToolError>, bool) {
+        let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+        let manifest =
+            "manifest_version: 1\nid: permhook\nversion: 0.1.0\ncapabilities: [harness]\n";
+        let root = fixture_exts(&[("permhook", manifest, lua)]);
+        crate::extensions::global_manager()
+            .refresh_with(std::slice::from_ref(&root))
+            .await;
+        let (console, approval_rx) = phase0_console();
+        let policy = Policy::turn(PermissionMode::Ask, &console);
+        let mut args = Map::new();
+        args.insert("path".into(), Value::String("target/permhook.txt".into()));
+        args.insert("content".into(), Value::String("x\n".into()));
+        let out = super::policy::enforce_policy(
+            "write",
+            &args,
+            super::policy::PermissionRequirement::Write,
+            &GlobalCancellation,
+            &policy,
+            None,
+        )
+        .await;
+        let prompted = !approval_rx.is_empty();
+        std::fs::remove_dir_all(&root).ok();
+        crate::extensions::global_manager().reset_for_tests().await;
+        (out, prompted)
+    }
+    // Allow: no prompt parked.
+    let allow = r#"return function(dex)
+  dex.events.on("permission.request", function(ctx, ev)
+    if ev.tool == "write" then return { decision = "allow" } end
+  end)
+end
+"#;
+    let (out, prompted) = gate_with(allow).await;
+    assert!(out.is_ok(), "{out:?}");
+    assert!(!prompted, "allow must skip the prompt");
+    // Deny: attributed, no prompt.
+    let deny = r#"return function(dex)
+  dex.events.on("permission.request", function(ctx, ev)
+    if ev.tool == "write" then return { decision = "deny", reason = "no writes today" } end
+  end)
+end
+"#;
+    let (out, prompted) = gate_with(deny).await;
+    let err = out.unwrap_err().to_string();
+    assert!(err.contains("permhook"), "{err}");
+    assert!(err.contains("no writes today"), "{err}");
+    assert!(!prompted, "deny must not park a prompt");
+    // Nil opinion: falls through to the normal prompt flow.
+    let nil = r#"return function(dex)
+  dex.events.on("permission.request", function(ctx, ev)
+  end)
+end
+"#;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let manifest = "manifest_version: 1\nid: permnil\nversion: 0.1.0\ncapabilities: [harness]\n";
+    let root = fixture_exts(&[("permnil", manifest, nil)]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    let (console, mut approval_rx) = phase0_console();
+    let policy = Policy::turn(PermissionMode::Ask, &console);
+    let mut args = Map::new();
+    args.insert("path".into(), Value::String("target/permhook.txt".into()));
+    args.insert("content".into(), Value::String("x\n".into()));
+    let handle = tokio::spawn(async move {
+        super::policy::enforce_policy(
+            "write",
+            &args,
+            super::policy::PermissionRequirement::Write,
+            &GlobalCancellation,
+            &policy,
+            None,
+        )
+        .await
+    });
+    // The hook declined, so exactly one prompt is parked…
+    let request = tokio::time::timeout(Duration::from_secs(5), approval_rx.recv())
+        .await
+        .expect("fall-through must park a prompt")
+        .expect("channel must stay open");
+    assert_eq!(request.name, "write");
+    request
+        .response
+        .send(crate::protocol::ApprovalDecision::Deny)
+        .await
+        .expect("agent must still be waiting");
+    let err = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("verdict must unblock the call")
+        .expect("worker panicked")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("denied by approver"), "{err}");
+    // Read-only ceiling: even an allow hook cannot override it.
+    let allow_manifest =
+        "manifest_version: 1\nid: permallow\nversion: 0.1.0\ncapabilities: [harness]\n";
+    let allow_lua = r#"return function(dex)
+  dex.events.on("permission.request", function(ctx, ev)
+    return { decision = "allow" }
+  end)
+end
+"#;
+    let root2 = fixture_exts(&[("permallow", allow_manifest, allow_lua)]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root2))
+        .await;
+    let policy = Policy {
+        mode: PermissionMode::ReadOnly,
+        console: None,
+        agent: None,
+        approval: None,
+    };
+    let mut args = Map::new();
+    args.insert("path".into(), Value::String("target/permhook.txt".into()));
+    let err = super::policy::enforce_policy(
+        "write",
+        &args,
+        super::policy::PermissionRequirement::Write,
+        &GlobalCancellation,
+        &policy,
+        None,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("read-only mode"), "{err}");
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&root2).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}

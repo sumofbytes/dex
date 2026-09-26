@@ -62,6 +62,52 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "session.before_compact",
     "before_agent_start",
     "model_select",
+    "model_selector",
+    "harness.overflow",
+    "harness.conflict",
+    "harness.compact",
+    "harness.summarize",
+    "permission.request",
+    "llm.before",
+    "llm.after",
+    "tool.error",
+    "supervisor.route",
+    "message.received",
+    "message.sent",
+    "session.created",
+    "session.loaded",
+    "tool_catalog",
+    "runtime.start",
+    "runtime.stop",
+];
+
+/// Events (enveloped harness slots) `dex.wrap` middleware accepts — the
+/// slots whose whole handler chain is a JSON-envelope fold, so middleware
+/// is a plain function chain over it (spec §13). Everything else has no
+/// single envelope to wrap and is rejected at registration.
+pub const WRAPPABLE_SLOTS: &[&str] = &[
+    "model_selector",
+    "harness.summarize",
+    "harness.compact",
+    "harness.overflow",
+    "harness.conflict",
+    "tool_catalog",
+];
+
+/// Current interface version per component slot (spec §28): `dex.use`
+/// validates an implementation's `interface` against this at registration
+/// time, so a component written for a renamed envelope fails at load instead
+/// of misreading payloads. Interfaces version independently of the slot
+/// name (`harness.summarize` serves the `summarizer.v1` interface); a
+/// breaking envelope change ships as `.v2` here with the old one still
+/// accepted during migration. `agent_loop` is negotiated by `dex.replace`.
+pub const SLOT_INTERFACES: &[(&str, &str)] = &[
+    ("model_selector", "model_selector.v1"),
+    ("harness.summarize", "summarizer.v1"),
+    ("harness.compact", "compactor.v1"),
+    ("harness.overflow", "overflow.v1"),
+    ("harness.conflict", "conflict.v1"),
+    ("tool_catalog", "catalog.v1"),
 ];
 
 /// Host context a Lua call runs under: what cancellation, gates, and
@@ -145,6 +191,24 @@ pub enum HostOp {
         timeout_ms: u64,
         allow_providers: bool,
     },
+    /// agent_loop.v1 (spec §9): one engine round on the turn's real state —
+    /// `before_model` + cancel check + model request (streaming forwarded,
+    /// cancellation honored) + `on_model_response` + normalized apply.
+    /// Answered by the turn driver, which owns the history/ledger/host.
+    LoopModel,
+    /// agent_loop.v1: execute the pending tool calls of the last applied
+    /// response through the host (hooks, gates, dispatch) and complete the
+    /// tool-round budget.
+    LoopTools,
+    /// agent_loop.v1: `finish_response` for a final response — steering
+    /// injection and persistence; the reply says whether the loop should
+    /// run another round.
+    LoopFinish { response: String },
+    /// agent_loop.v1: cheap read-only turn state (cancelled, budget rounds,
+    /// history length).
+    LoopState,
+    /// agent_loop.v1: is the turn cancelled? Cheap variant of `LoopState`.
+    LoopCancelled,
 }
 
 /// The chunk's exports: registered tool names, subscribed event names, and
@@ -152,9 +216,18 @@ pub enum HostOp {
 pub struct ChunkExports {
     pub tools: Vec<String>,
     pub events: Vec<String>,
+    /// Slot names the extension wraps via `dex.wrap` (middleware).
+    pub wraps: Vec<String>,
+    /// Slots the extension backs via `dex.fallback`.
+    pub fallbacks: Vec<String>,
+    /// Slots the extension implements via `dex.use` (spec §10).
+    pub uses: Vec<String>,
     pub shadows: Vec<String>,
     /// (name, description) pairs, sorted by name.
     pub commands: Vec<(String, String)>,
+    /// `agent_loop` component id when the chunk registered one via
+    /// `dex.replace("agent_loop", …)` (spec §9).
+    pub agent_loop: Option<String>,
 }
 
 enum Request {
@@ -174,6 +247,16 @@ enum Request {
         model: Option<super::DriveModel>,
         tx: mpsc::UnboundedSender<WorkerMsg>,
     },
+    /// Drive the registered agent loop (spec §9): no fixed deadline (model
+    /// rounds take minutes), so the task side owns an `abort` flag the
+    /// instruction hook checks — set on turn end/cancellation — and a
+    /// generous wall-clock backstop guards a wedged worker.
+    AgentLoop {
+        call_id: String,
+        model: Option<super::DriveModel>,
+        abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tx: mpsc::UnboundedSender<WorkerMsg>,
+    },
 }
 
 /// Mutable registration state shared by the `dex.*` closures. `Rc<RefCell>`
@@ -183,8 +266,22 @@ enum Request {
 struct WorkerRegistrations {
     tools: HashMap<String, Function>,
     events: HashMap<String, Vec<Function>>,
+    /// `dex.wrap(slot, fn)` middleware, per slot, registration order
+    /// (outermost first). Only the enveloped harness slots accept it.
+    wraps: HashMap<String, Vec<Function>>,
+    /// `dex.fallback(slot, fn)` backups: consulted when the slot's whole
+    /// chain produced no opinion, before the Rust default.
+    fallbacks: HashMap<String, Function>,
+    /// Slots the extension implements via `dex.use` (spec §10), in
+    /// registration order — export/surface only, the handlers live in
+    /// `events`.
+    uses: Vec<String>,
     /// `dex.commands.register({ name, description, execute })` handlers.
     commands: HashMap<String, (String, Function)>,
+    /// `dex.replace("agent_loop", { id, interface, run })` (spec §9): the
+    /// whole-loop replacement. One per extension; first loaded extension
+    /// with one wins at turn start.
+    agent_loop: Option<(String, Function)>,
     shadows: Vec<String>,
     /// Shadow target armed for the running call, if any: the only context in
     /// which `dex.tools.call_original` is legal.
@@ -243,6 +340,41 @@ impl ExtensionEngine {
             .map_err(|_| self.stopped())?;
 
         rx.await.map_err(|_| self.stopped())?
+    }
+
+    /// Start driving the registered agent loop (spec §9). The caller owns
+    /// the reply stream: it answers [`HostOp::Loop*`] upcalls with the
+    /// turn's real state (history, ledger, budget, host) and reaps the
+    /// terminal `Done`. No per-call deadline — the caller sets `abort` on
+    /// turn end/cancellation, and the worker's instruction hook enforces it
+    /// between instructions.
+    pub async fn agent_loop_request(
+        &self,
+        abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<mpsc::UnboundedReceiver<WorkerMsg>, String> {
+        let (tx, rx) = mpsc::unbounded_channel::<WorkerMsg>();
+        let call_id = uuid::Uuid::new_v4().to_string();
+        // Snapshot the turn's drive context now, exactly like `drive`:
+        // `dex.model.*` inside the loop serves this turn's model even when
+        // a concurrent turn records a newer snapshot mid-loop.
+        let model = {
+            let model = crate::extensions::current_drive_model();
+            if model.snapshot.is_some() {
+                Some(model)
+            } else {
+                None
+            }
+        };
+        self.tx
+            .send(Request::AgentLoop {
+                call_id,
+                model,
+                abort,
+                tx,
+            })
+            .await
+            .map_err(|_| self.stopped())?;
+        Ok(rx)
     }
 
     /// Run a registered tool, shadow, or event handler to completion,
@@ -368,7 +500,7 @@ impl ExtensionEngine {
 /// model-issued call. Boxed: this is the cycle's cut point
 /// (`execute` → dispatch → `call_global` → `drive` → here →
 /// `execute`), and unboxed it would recurse in type.
-async fn answer_hostcall(op: HostOp, host: &HostCtx<'_>) -> Result<String, String> {
+pub(crate) async fn answer_hostcall(op: HostOp, host: &HostCtx<'_>) -> Result<String, String> {
     match op {
         HostOp::ToolCall { name, args } => {
             let Some(args) = args.as_object() else {
@@ -418,6 +550,17 @@ async fn answer_hostcall(op: HostOp, host: &HostCtx<'_>) -> Result<String, Strin
             .await
             .map_err(|e| e.to_string())
         }
+        // agent_loop.v1 step upcalls are answered by the turn driver
+        // (`agent::turn_loop::lua_loop`), never by the generic host-call
+        // path — they need the turn's live state, which `HostCtx` has no
+        // handle on.
+        HostOp::LoopModel
+        | HostOp::LoopTools
+        | HostOp::LoopFinish { .. }
+        | HostOp::LoopState
+        | HostOp::LoopCancelled => {
+            Err("agent-loop step outside a turn loop is not answerable".to_string())
+        }
     }
 }
 
@@ -446,7 +589,8 @@ fn worker_loop(manifest: Manifest, dir: PathBuf, mut rx: mpsc::Receiver<Request>
         .expect("memory limit");
     strip_sandbox(&lua);
     let regs = Rc::new(RefCell::new(WorkerRegistrations::default()));
-    let dex = build_dex_table(&lua, &manifest, &regs);
+    let dex = build_dex_table(&lua, &manifest, &regs)
+        .expect("dex table builders are infallible at worker startup");
     // The worker exits when the last engine handle drops: `run()` returning
     // `None` is shutdown, never an error surface.
 
@@ -466,6 +610,14 @@ fn worker_loop(manifest: Manifest, dir: PathBuf, mut rx: mpsc::Receiver<Request>
                 run_call(
                     &lua, &manifest, &regs, &dir, kind, args, timeout, &call_id, model, &tx,
                 );
+            }
+            Request::AgentLoop {
+                call_id,
+                model,
+                abort,
+                tx,
+            } => {
+                run_agent_loop(&lua, &manifest, &regs, &dir, &call_id, abort, model, &tx);
             }
         }
     }
@@ -565,8 +717,12 @@ fn run_load_inner(
     Ok(ChunkExports {
         tools: regs.tools.keys().cloned().collect(),
         events: regs.events.keys().cloned().collect(),
+        wraps: regs.wraps.keys().cloned().collect(),
+        fallbacks: regs.fallbacks.keys().cloned().collect(),
+        uses: regs.uses.clone(),
         shadows: regs.shadows.clone(),
         commands,
+        agent_loop: regs.agent_loop.as_ref().map(|(id, _)| id.clone()),
     })
 }
 
@@ -578,12 +734,24 @@ fn build_dex_table(
     lua: &Lua,
     manifest: &Manifest,
     regs: &Rc<RefCell<WorkerRegistrations>>,
-) -> Table {
+) -> Result<Table, LuaError> {
     let dex = lua.create_table().expect("dex table");
     dex.set("tools", host_api::tools_table(lua, manifest, regs))
         .expect("dex.tools");
     dex.set("events", host_api::events_table(lua, manifest, regs))
         .expect("dex.events");
+    dex.set("wrap", host_api::wrap_slot(lua, manifest, regs)?)
+        .expect("dex.wrap");
+    let (activate_profile, current_profile) = host_api::profile_api(lua).expect("dex profile api");
+    dex.set("activate_profile", activate_profile)
+        .expect("dex.activate_profile");
+    dex.set("profile", current_profile).expect("dex.profile");
+    dex.set("fallback", host_api::fallback_slot(lua, manifest, regs)?)
+        .expect("dex.fallback");
+    dex.set("use", host_api::use_slot(lua, manifest, regs)?)
+        .expect("dex.use");
+    dex.set("replace", host_api::replace_slot(lua, manifest, regs)?)
+        .expect("dex.replace");
     dex.set("log", host_api::log_table(lua, manifest))
         .expect("dex.log");
     dex.set("workspace", host_api::workspace_table(lua, manifest))
@@ -600,7 +768,7 @@ fn build_dex_table(
         .expect("dex.net");
     dex.set("json", host_api::json_table(lua))
         .expect("dex.json");
-    dex
+    Ok(dex)
 }
 
 mod call;
@@ -625,7 +793,7 @@ pub(super) fn host_upcall(lua: &Lua, ext_id: &str, op: HostOp) -> Result<String,
         .map_err(LuaError::RuntimeError)
 }
 
-use call::{run_call, worker_drive_model};
+use call::{run_agent_loop, run_call, worker_drive_model};
 use lua_json::{
     json_to_lua, lua_to_json, lua_type_name, lua_value_to_string, stringify_json,
     stringify_tool_result,

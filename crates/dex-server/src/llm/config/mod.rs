@@ -228,6 +228,92 @@ pub fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<St
         .filter(|s| !s.is_empty())
 }
 
+/// Runtime-harness numeric knob (`harness:` table): file value only, positive
+/// integers — zero/garbage falls back to the caller's default. Env wins where
+/// a dedicated env var exists (`DEX_MAX_TOOL_ITERATIONS`); this is the file
+/// layer under it.
+pub fn load_harness_num(key: &str) -> Option<u64> {
+    let file = load_config_file()?;
+    let table = file.get("harness")?;
+    let v = table.get(key)?;
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// Named slot selections (`harness.slots:` table): slot name -> registry id.
+/// Used by `crate::agent::registry` at turn-start resolution; string values
+/// only, sorted for deterministic output. Non-string entries are dropped with
+/// a `warn_once`.
+pub fn load_harness_slots() -> Vec<(String, String)> {
+    let file = load_config_file();
+    let Some(table) = file
+        .as_ref()
+        .and_then(|f| f.get("harness"))
+        .and_then(|harness| harness.get("slots"))
+        .and_then(|slots| slots.as_mapping())
+    else {
+        return Vec::new();
+    };
+    let mut selected = BTreeMap::new();
+    for (key, value) in table {
+        let (Some(slot), Some(id)) = (key.as_str(), value.as_str()) else {
+            warn_once(
+                "config:harness-slots",
+                "config key 'harness.slots:' entries must be `slot: id` strings — ignoring the rest",
+            );
+            continue;
+        };
+        selected.insert(slot.to_string(), id.to_string());
+    }
+    selected.into_iter().collect()
+}
+
+/// The named profile selected via `harness_profile:`, plus every defined
+/// `harness_profiles:` map. A profile is a declarative slot map applied on
+/// top of `harness.slots:` at resolution time (validated transactionally
+/// there — an invalid profile applies nothing).
+pub fn load_harness_profiles() -> (
+    Option<String>,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) {
+    let file = load_config_file();
+    let selected = file
+        .as_ref()
+        .and_then(|f| f.get("harness_profile"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mut profiles = std::collections::BTreeMap::new();
+    if let Some(table) = file
+        .as_ref()
+        .and_then(|f| f.get("harness_profiles"))
+        .and_then(|p| p.as_mapping())
+    {
+        for (name, slots) in table {
+            let (Some(name), Some(slots)) = (name.as_str(), slots.as_mapping()) else {
+                warn_once(
+                    "config:harness-profiles",
+                    "config key 'harness_profiles:' entries must be `name: {slot: id}` tables — ignoring the rest",
+                );
+                continue;
+            };
+            let mut map = std::collections::BTreeMap::new();
+            for (slot, id) in slots {
+                if let (Some(slot), Some(id)) = (slot.as_str(), id.as_str()) {
+                    map.insert(slot.to_string(), id.to_string());
+                }
+            }
+            profiles.insert(name.to_string(), map);
+        }
+    }
+    (selected, profiles)
+}
+
 /// Every top-level config key dex reads (plus the deprecated ones it still
 /// honors). Used for typo hints: an unknown key is called out instead of
 /// silently doing nothing, and a parse error lists what is valid.
@@ -241,6 +327,9 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "mcp_servers",
     "agent_wake",
     "extensions",
+    "harness",
+    "harness_profile",
+    "harness_profiles",
     "jev",
     // Deprecated but still honored for old files:
     "base_url",
