@@ -18,7 +18,7 @@ async fn delegation_without_a_daemon_context_rejects_cleanly() {
     let mut args = Map::new();
     for action in DELEGATION_ACTIONS {
         args.insert("action".into(), json!(action));
-        let error = execute_delegation(DELEGATION_TOOL, &args, &GlobalCancellation, &policy)
+        let error = execute_delegation(DELEGATION_TOOL, &args, &GlobalCancellation, &policy, None)
             .await
             .unwrap_err();
         assert!(
@@ -131,7 +131,9 @@ async fn delegate_rejects_unresolvable_model_before_spawning() {
     args.insert("agent".into(), json!("explorer"));
     args.insert("task".into(), json!("look around"));
     args.insert("model".into(), json!("openai-codex/gpt-x"));
-    let error = delegate(&ctx, &args, &Policy::trusted()).await.unwrap_err();
+    let error = delegate(&ctx, &args, &GlobalCancellation, &Policy::trusted(), None)
+        .await
+        .unwrap_err();
     assert!(
         error.to_string().contains("openai-codex")
             || error.to_string().contains("credentials")
@@ -718,4 +720,54 @@ async fn delegate_list_reports_live_retained_and_disk() {
     assert_eq!(row("sess-9-explorer")["resumable"], true);
     manager.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn supervisor_route_deny_fails_attributed_before_spawn() {
+    // The wiring path: a denying `supervisor.route` hook makes the spawn
+    // fail attributed (extension id + reason) before any definition lookup
+    // or model resolution.
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    // Routing is a harness-level power: the subscription gate requires
+    // the capability.
+    let manifest = "manifest_version: 1\nid: gate\nversion: 0.1.0\ncapabilities: [harness]\n";
+    let root = crate::extensions::tests::fixture_exts(&[(
+        "gate",
+        manifest,
+        r#"return function(dex)
+  dex.events.on("supervisor.route", function(ctx, ev)
+    if ev.agent == "explorer" then return { deny = true, reason = "no children today" } end
+  end)
+end
+"#,
+    )]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    let manager = AgentManager::new("sess");
+    let ctx = Arc::new(AgentTurnContext {
+        depth: 0,
+        session_id: "sess".to_string(),
+        session_path: PathBuf::new(),
+        cwd: String::new(),
+        config: Arc::new(crate::llm::config::tests::test_cfg()),
+        manager: manager.clone(),
+        session_approvals: HashSet::new(),
+        child_approvals: None,
+        live_approvals: None,
+    });
+    let mut args = Map::new();
+    args.insert("agent".into(), json!("explorer"));
+    args.insert("task".into(), json!("look around"));
+    let error = delegate(&ctx, &args, &GlobalCancellation, &Policy::trusted(), None)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("gate"), "attributed: {text}");
+    assert!(text.contains("no children today"), "reason: {text}");
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
 }

@@ -2,15 +2,21 @@ use dex_coding_agent::{native_tool_metadata, needs_approval};
 
 pub use dex_coding_agent::{PermissionRequirement, ToolMetadata};
 
+/// Most-restrictive row for untrusted third-party tools (extension shadows,
+/// `ext__*`, `mcp__*`): `ask` unless trusted, same as shell.
+fn shell_row() -> ToolMetadata {
+    ToolMetadata {
+        read_only: false,
+        mutating: true,
+        idempotent: false,
+        requires_shell: true,
+        permission: PermissionRequirement::Shell,
+    }
+}
+
 pub fn metadata(name: &str) -> Option<ToolMetadata> {
     if crate::extensions::is_shadowed(name) {
-        return Some(ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        });
+        return Some(shell_row());
     }
     metadata_native(name)
 }
@@ -30,25 +36,48 @@ pub fn metadata_native(name: &str) -> Option<ToolMetadata> {
         // most restrictive gate (`ask` unless trusted), same as shell/MCP.
         // Resolved dynamically so loaded extensions don't need a static
         // entry each (`lua__` is the deprecated alias for `ext__`).
-        _ if crate::extensions::is_extension_tool(name) => ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        },
+        _ if crate::extensions::is_extension_tool(name) => shell_row(),
         // MCP tools are external processes: most restrictive gate (`ask`
         // unless trusted), same as shell. Resolved dynamically so cached
         // server tools don't need a static entry each.
-        _ if name.starts_with("mcp__") => ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        },
+        _ if name.starts_with("mcp__") => shell_row(),
         _ => return None,
     })
+}
+
+/// Metadata resolution honoring the turn's approval-policy override: the
+/// shadow row still wins (a shadow intercepts a built-in and may lie about
+/// it), then the override's rows, then the native + dynamic rows. `None`
+/// policy (or no row) falls back to [`metadata`] exactly.
+pub fn metadata_for(policy: &Policy, name: &str) -> Option<ToolMetadata> {
+    if crate::extensions::is_shadowed(name) {
+        return Some(shell_row());
+    }
+    metadata_native_for(policy, name)
+}
+
+/// Native + dynamic resolution honoring the override, without the shadow
+/// row (shadow re-dispatch path — see [`metadata_native`]).
+pub fn metadata_native_for(policy: &Policy, name: &str) -> Option<ToolMetadata> {
+    if let Some(override_policy) = policy.approval.as_ref() {
+        if let Some(meta) = override_policy.metadata(name) {
+            return Some(meta);
+        }
+    }
+    metadata_native(name)
+}
+
+/// Gate honoring the turn's approval-policy override; `None` keeps the
+/// default [`needs_approval`] gate.
+pub fn needs_approval_for(
+    policy: &Policy,
+    requirement: PermissionRequirement,
+    mode: PermissionMode,
+) -> bool {
+    if let Some(override_policy) = policy.approval.as_ref() {
+        return override_policy.needs_approval(requirement, mode);
+    }
+    needs_approval(requirement, mode)
 }
 
 use std::collections::BTreeSet;
@@ -68,6 +97,7 @@ impl Policy {
             mode: PermissionMode::Trusted,
             console: None,
             agent: None,
+            approval: None,
         }
     }
 
@@ -76,15 +106,18 @@ impl Policy {
             mode,
             console: Some(console.clone()),
             agent: None,
+            approval: None,
         }
     }
 }
 
 /// Approval gate: dispatch consults the turn's policy before any
 /// tool runs. Reads always pass; `trusted` passes everything; otherwise
-/// mutating tools park an `ApprovalRequest` on the console's approval
-/// channel and block for the verdict, with session approvals
-/// short-circuiting first. `read-only` rejects up front.
+/// mutating tools first honor session approvals, then the
+/// `permission.request` Lua hook (allow skips the prompt, deny fails
+/// attributed — nil/error falls through), and only then park an
+/// `ApprovalRequest` on the console's approval channel and block for the
+/// verdict. `read-only` rejects up front and is never hook-overridable.
 /// Denial, cancellation, and no-channel surface as `ToolError::Denied` —
 /// the loop records it as a failed tool result, and the post-fan-out
 /// cancellation check still unwinds a turn cancelled mid-prompt.
@@ -94,8 +127,9 @@ pub async fn enforce_policy(
     requirement: PermissionRequirement,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<(), ToolError> {
-    if !needs_approval(requirement, policy.mode) {
+    if !needs_approval_for(policy, requirement, policy.mode) {
         return Ok(());
     }
     if policy.mode == PermissionMode::ReadOnly {
@@ -115,6 +149,41 @@ pub async fn enforce_policy(
     let input = serde_json::Value::Object(args.clone()).to_string();
     if console.session_approved(name, &input) {
         return Ok(());
+    }
+    // Runtime policy override: one `permission.request` round-trip when a Lua
+    // extension subscribes, else the prompt below (zero-cost default). The
+    // hook sees the turn's gates so nested calls stay allowlisted.
+    if crate::extensions::has_event_handlers("permission.request") {
+        let requirement_name = match requirement {
+            PermissionRequirement::Read => "read",
+            PermissionRequirement::Write => "write",
+            PermissionRequirement::Shell => "shell",
+        };
+        if let Some((decision, reason, by)) = crate::extensions::query_permission_request(
+            name,
+            args,
+            requirement_name,
+            policy.mode.as_str(),
+            cancel,
+            policy,
+            filter,
+        )
+        .await
+        {
+            match decision {
+                crate::extensions::PermissionDecision::Allow => return Ok(()),
+                crate::extensions::PermissionDecision::Deny => {
+                    let why = if reason.trim().is_empty() {
+                        "denied by extension".to_string()
+                    } else {
+                        reason
+                    };
+                    return Err(ToolError::Denied(format!(
+                        "permission.request hook from extension '{by}' denied '{name}': {why}"
+                    )));
+                }
+            }
+        }
     }
     let Some(sender) = console.approval() else {
         return Err(ToolError::Denied(format!(

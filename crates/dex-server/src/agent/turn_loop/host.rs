@@ -4,12 +4,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::tool_results::prepare_tool_result;
-use super::tools::{
-    emergency_compact, inject_steering, is_context_overflow, note_sink, persist_pending,
-    record_usage, rewrite_session, run_tool_batch, system_note,
-};
+use super::tools::{emergency_compact, inject_steering, note_sink, run_tool_batch};
+use crate::agent::compaction::compact_history;
 use crate::agent::compaction::verbatim::summary_mode;
-use crate::agent::compaction::{compact_history, KEEP_RECENT_MESSAGES};
+use crate::agent::composable::DexHarness;
 use crate::agent::state::{CancellationSource, ToolState};
 use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
 use crate::llm::config::LlmConfig;
@@ -21,9 +19,7 @@ use crate::runtime::console::{Console, RESET, TOOL_OUTPUT_COLOR};
 use crate::session::changes::{track_end, track_start, TrackedCall};
 use crate::session::Session;
 use crate::tools::{Policy, ToolFilter};
-use dex_agent_core::{
-    tool_budget_exhausted_note, AgentHost, AgentTurnError, CompactionBudget, ToolRoundOutcome,
-};
+use dex_agent_core::{tool_budget_exhausted_note, AgentHost, AgentTurnError, ToolRoundOutcome};
 
 async fn forward_model_events(
     mut events: mpsc::Receiver<ModelEvent>,
@@ -63,16 +59,28 @@ async fn compaction_gate(
     persisted_cursor: &mut usize,
     state: &mut ToolState,
     ledger: &mut TokenLedger,
+    harness: &DexHarness,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut compaction_attempts = 0;
-    while compaction_attempts < 3 {
-        if !(CompactionBudget {
-            token_threshold: config.compaction_threshold(),
-            keep_recent_messages: KEEP_RECENT_MESSAGES,
-            prefix_messages: 1,
-        })
-        .should_compact(ledger.stored_tokens(), budget_overhead, messages.len())
-        {
+    while compaction_attempts < harness.recovery_attempts() {
+        // `harness.compact` (spec §11): the first non-`nil` Lua opinion
+        // wins; `None` (unsubscribed, error, or no opinion) falls through
+        // to the Rust trigger — fail-open, per the hook contract.
+        let lua_compact = crate::extensions::query_harness_compact(
+            ledger.stored_tokens(),
+            budget_overhead,
+            messages.len(),
+            cancel,
+        )
+        .await;
+        if !lua_compact.unwrap_or_else(|| {
+            harness.should_compact(
+                config,
+                ledger.stored_tokens(),
+                budget_overhead,
+                messages.len(),
+            )
+        }) {
             break;
         }
         // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
@@ -85,6 +93,7 @@ async fn compaction_gate(
             false,
             summarizer.prunes_jev(),
             summarizer,
+            harness,
         )
         .await
         {
@@ -95,9 +104,11 @@ async fn compaction_gate(
                 // Summarizer calls are billed like any other; account
                 // them so the status-bar spend includes compaction.
                 if let Some(u) = compacted {
-                    record_usage(config, state, console, u, None).await;
+                    harness.usage.record(config, state, console, u, None).await;
                 }
-                rewrite_session(session.as_deref_mut(), messages, persisted_cursor)?;
+                harness
+                    .transcript
+                    .rewrite(session.as_deref_mut(), messages, persisted_cursor)?;
                 continue;
             }
             Ok((false, _)) => break,
@@ -117,6 +128,7 @@ pub(super) struct DexTurnHost<'a, X> {
     pub(super) console: &'a Console,
     pub(super) filter: Option<&'a ToolFilter>,
     pub(super) policy: Policy,
+    pub(super) harness: Arc<DexHarness>,
     pub(super) last_tools: Vec<String>,
     pub(super) last_usage: Option<u64>,
     pub(super) persisted_cursor: usize,
@@ -129,7 +141,11 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         messages: &mut Vec<ChatMessage>,
         ledger: &mut TokenLedger,
     ) -> Result<(), AgentTurnError> {
-        persist_pending(&mut self.session, messages, &mut self.persisted_cursor)?;
+        self.harness.transcript.append_pending(
+            &mut self.session,
+            messages,
+            &mut self.persisted_cursor,
+        )?;
         if self.cancel.is_cancelled() {
             let _ = self.cancel.take_cancelled();
             return Err("cancelled by user".into());
@@ -137,12 +153,37 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         if let Some(rx) = self.steering_rx.as_mut() {
             if inject_steering(rx, self.steering_accepted_tx, messages).await {
                 *ledger = TokenLedger::rebuild(messages);
-                persist_pending(&mut self.session, messages, &mut self.persisted_cursor)?;
+                self.harness.transcript.append_pending(
+                    &mut self.session,
+                    messages,
+                    &mut self.persisted_cursor,
+                )?;
             }
         }
 
         let ephemerals = [crate::mcp::ephemeral_line()];
         let overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
+        // Runtime prompt influence: `llm.before` appends land as one persisted
+        // user-role note before the compaction gate, so they count toward the
+        // window and appear in the journal like steering. Hooks must be
+        // idempotent (use `dex.state`) — an unconditional append grows history
+        // until compaction or the tool budget stops the turn.
+        let llm_appends = crate::extensions::apply_llm_before(
+            messages.len(),
+            ledger.stored_tokens(),
+            overhead,
+            self.cancel as &(dyn CancellationSource + Send + Sync),
+        )
+        .await;
+        if !llm_appends.is_empty() {
+            messages.push(ChatMessage::user_named(llm_appends.join("\n\n"), "note"));
+            *ledger = TokenLedger::rebuild(messages);
+            self.harness.transcript.append_pending(
+                &mut self.session,
+                messages,
+                &mut self.persisted_cursor,
+            )?;
+        }
         compaction_gate(
             self.config,
             self.console,
@@ -153,13 +194,14 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             &mut self.persisted_cursor,
             self.state,
             ledger,
+            &self.harness,
         )
         .await?;
         Ok(())
     }
 
     fn tool_schemas(&self) -> Vec<dex_ai::ToolDefinition> {
-        crate::llm::tool_descriptions::tools_schema()
+        self.harness.tool_schemas()
     }
 
     fn start_model_events(&mut self) -> Option<mpsc::Sender<ModelEvent>> {
@@ -181,16 +223,34 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         stop_reason: Option<StopReason>,
         elapsed_ms: u64,
     ) -> Result<(), AgentTurnError> {
+        // Runtime observation: `llm.after` sees every request (usage, stop
+        // reason, timing). Fire-and-forget — no directive. Response text is
+        // engine-held; the final text surfaces via the transcript.
+        crate::extensions::fire_event_global(
+            "llm.after",
+            serde_json::json!({
+                "stop_reason": stop_reason.map(|s| format!("{s:?}")),
+                "prompt_tokens": usage.map(|u| u.prompt_tokens),
+                "completion_tokens": usage.map(|u| u.completion_tokens),
+                "elapsed_ms": elapsed_ms,
+            }),
+            self.cancel as &(dyn CancellationSource + Send + Sync),
+            &self.policy,
+            self.filter,
+        )
+        .await;
         if let Some(usage) = usage {
             self.last_usage = Some(usage.prompt_tokens);
-            record_usage(
-                self.config,
-                self.state,
-                self.console,
-                usage,
-                Some(elapsed_ms),
-            )
-            .await;
+            self.harness
+                .usage
+                .record(
+                    self.config,
+                    self.state,
+                    self.console,
+                    usage,
+                    Some(elapsed_ms),
+                )
+                .await;
         }
         let note = match stop_reason {
             Some(StopReason::Length) => {
@@ -218,7 +278,19 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         messages: &mut Vec<ChatMessage>,
         ledger: &mut TokenLedger,
     ) -> Result<bool, AgentTurnError> {
-        if !is_context_overflow(error) {
+        // Runtime override: `harness.overflow` Lua hook wins when subscribed,
+        // else the Rust wording detector (zero-cost default).
+        let overflow = if crate::extensions::has_event_handlers("harness.overflow") {
+            crate::extensions::query_harness_overflow(
+                error,
+                self.cancel as &(dyn CancellationSource + Send + Sync),
+            )
+            .await
+            .unwrap_or_else(|| self.harness.is_overflow(error))
+        } else {
+            self.harness.is_overflow(error)
+        };
+        if !overflow {
             return Ok(false);
         }
         match emergency_compact(
@@ -228,11 +300,12 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             self.cancel,
             self.console,
             ledger,
+            &self.harness,
         )
         .await
         {
             Ok(true) => {
-                rewrite_session(
+                self.harness.transcript.rewrite(
                     self.session.as_deref_mut(),
                     messages,
                     &mut self.persisted_cursor,
@@ -263,8 +336,15 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                 )
             })
             .collect();
-        let results =
-            run_tool_batch(calls, self.cancel, &self.policy, self.filter, self.console).await;
+        let results = run_tool_batch(
+            calls,
+            self.cancel,
+            &self.policy,
+            self.filter,
+            self.console,
+            &self.harness,
+        )
+        .await;
         if self.cancel.is_cancelled() {
             let _ = self.cancel.take_cancelled();
             for call in calls {
@@ -311,6 +391,7 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                 &name,
                 &input,
                 outcome,
+                &self.harness.result_policy,
             );
             let succeeded = result.ok;
             track_end(self.session.as_deref_mut(), tracked, succeeded);
@@ -354,7 +435,11 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             result_message.name = Some(name);
             messages.push(result_message);
             ledger.push(messages.last().expect("just pushed"));
-            persist_pending(&mut self.session, messages, &mut self.persisted_cursor)?;
+            self.harness.transcript.append_pending(
+                &mut self.session,
+                messages,
+                &mut self.persisted_cursor,
+            )?;
         }
         Ok(())
     }
@@ -370,15 +455,21 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                 let note = tool_budget_exhausted_note(completed);
                 messages.push(ChatMessage::user_named(&note, "budget"));
                 ledger.push(messages.last().expect("just pushed"));
-                let _ = persist_pending(&mut self.session, messages, &mut self.persisted_cursor);
+                let _ = self.harness.transcript.append_pending(
+                    &mut self.session,
+                    messages,
+                    &mut self.persisted_cursor,
+                );
                 return Ok(());
             }
             ToolRoundOutcome::Warn { completed, limit } => {
-                system_note(
-                    self.console,
-                    &format!("{completed}/{limit} tool rounds used this turn"),
-                )
-                .await;
+                self.harness
+                    .events
+                    .system_note(
+                        self.console,
+                        &format!("{completed}/{limit} tool rounds used this turn"),
+                    )
+                    .await;
             }
             ToolRoundOutcome::Continue { .. } => {}
         }
@@ -403,7 +494,11 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             }
         }
         self.state.last_usage = self.last_usage;
-        persist_pending(&mut self.session, messages, &mut self.persisted_cursor)?;
+        self.harness.transcript.append_pending(
+            &mut self.session,
+            messages,
+            &mut self.persisted_cursor,
+        )?;
         Ok(false)
     }
 }
@@ -420,9 +515,11 @@ pub(super) fn make_host<'a, X: CancellationSource + Clone + 'static>(
     filter: Option<&'a ToolFilter>,
     agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
     messages_len: usize,
+    harness: Arc<DexHarness>,
 ) -> DexTurnHost<'a, X> {
     let mut policy = Policy::turn(config.permission, console);
     policy.agent = agent_ctx;
+    policy.approval = harness.approval.clone();
     let last_usage = state.last_usage;
     DexTurnHost {
         config,
@@ -434,6 +531,7 @@ pub(super) fn make_host<'a, X: CancellationSource + Clone + 'static>(
         console,
         filter,
         policy,
+        harness,
         last_tools: Vec::new(),
         last_usage,
         persisted_cursor: messages_len,

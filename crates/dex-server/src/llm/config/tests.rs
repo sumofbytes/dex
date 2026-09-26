@@ -2524,9 +2524,13 @@ fn doctor_output_is_byte_stable() {
         "OPENCODE_API_KEY",
         "TYPESAFE_API_KEY",
         "TYPESAFE_JEV_URL",
+        "DEX_MAX_TOOL_ITERATIONS",
         "XDG_CONFIG_HOME",
         "DEX_EXTENSIONS_PATHS",
     ]);
+    // EnvRestore::take only records for restore — it does not remove — so
+    // these must be actively cleared for the snapshot's origins.
+    std::env::remove_var("DEX_MAX_TOOL_ITERATIONS");
     std::env::remove_var("DEX_EXTENSIONS_PATHS");
     std::env::remove_var("DEX_SYSTEM_PROMPT");
     std::env::remove_var("DEX_SYSTEM_PROMPT_FILE");
@@ -2551,6 +2555,13 @@ fn doctor_output_is_byte_stable() {
             ),
             concat!(
                 "compaction              deterministic                                 built-in default\n",
+                "harness slots           default                                       built-in default\n",
+                "harness tools           200                                           built-in default\n",
+                "harness batch           10                                            built-in default\n",
+                "harness compact         3                                             built-in default\n",
+                "harness repeat          3                                             built-in default\n",
+                "harness cut             keep 12 msgs / summarize >= 8                 built-in default\n",
+                "harness prune           keep <500/trunc >2000/drop >10000 chars       built-in default\n",
                 "jev scorer              heuristic scorer                              no TYPESAFE_API_KEY\n",
                 "thinking                (unset)                                       model default\n",
                 "permission              trusted                                       built-in default\n",
@@ -3007,5 +3018,29 @@ fn extension_configured_providers_lists_resolvable_endpoints() {
         !providers.contains(&"nokey".to_string()),
         "got: {providers:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn harness_table_reads_file_and_rejects_zero() {
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "XDG_CACHE_HOME"]);
+    let dir = std::env::temp_dir().join(format!("dex-harness-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.yaml"),
+        "harness:\n  batch_max_concurrent: 3\n  max_compaction_attempts: 0\n",
+    )
+    .unwrap();
+    std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+    std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+    super::invalidate_config_cache();
+    assert_eq!(super::load_harness_num("batch_max_concurrent"), Some(3));
+    assert_eq!(super::load_harness_num("max_compaction_attempts"), None);
+    assert_eq!(super::load_harness_num("missing_key"), None);
+    super::invalidate_config_cache();
     let _ = std::fs::remove_dir_all(&dir);
 }

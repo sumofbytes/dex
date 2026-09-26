@@ -55,15 +55,14 @@ pub(crate) const LEGACY_COMPACTION_ENV: &str = "DEX_COMPACTION_LLM";
 /// Characters of a truncated result kept as head context.
 pub(crate) const JEV_TRUNCATE_HEAD_CHARS: usize = 300;
 
-/// Minimum reduction for a prune to beat a summary (upstream
-/// `reductionRatio < 0.25` falls back to summary).
-pub(crate) const JEV_MIN_REDUCTION_RATIO: f64 = 0.25;
+// The minimum reduction for a prune to beat a summary (upstream
+// `reductionRatio < 0.25` falls back to summary) lives in one place:
+// `HarnessLimits::min_reduction_ratio` (default 25 = 0.25). The turn loop
+// passes the harness-configured ratio into `meets_reduction`, so there is
+// a single source of truth instead of a second constant here.
 
-/// Medium results are truncated; huge ones from re-runnable tools are dropped.
-const TRUNCATE_ABOVE_CHARS: usize = 2_000;
-const DROP_ABOVE_CHARS: usize = 10_000;
-/// Small results are cheap — keep verbatim.
-const KEEP_BELOW_CHARS: usize = 500;
+// Size gates live in `dex_agent_core::PruneThresholds`; `decide()` below
+// delegates to `DefaultPruneScorer` so there is one source of truth.
 
 /// How `compact_history` handles the archivable span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,9 +375,12 @@ pub(crate) fn reduction_ratio(stats: &JevStats) -> f64 {
     ratio.clamp(0.0, 1.0)
 }
 
-/// True when the prune freed enough to beat a summary.
-pub(crate) fn is_worthwhile(stats: &JevStats) -> bool {
-    stats.freed_chars > 0 && reduction_ratio(stats) >= JEV_MIN_REDUCTION_RATIO
+/// True when the prune freed at least `min_ratio` of the span.
+/// The default ratio is `HarnessLimits::default().reduction_ratio()`; the
+/// turn loop passes the harness-configured ratio so one override point
+/// covers the payoff check.
+pub(crate) fn meets_reduction(stats: &JevStats, min_ratio: f64) -> bool {
+    stats.freed_chars > 0 && reduction_ratio(stats) >= min_ratio
 }
 
 /// Tools whose output can be reproduced by re-running them — safe to drop
@@ -404,23 +406,12 @@ fn looks_like_error(text: &str) -> bool {
 
 /// Heuristic stand-in for Jev's two `noul` questions (call still matters?
 /// result still needed verbatim?): returns `(keep_call, keep_result)`.
-fn decide(tool: &str, result: &str) -> (bool, bool) {
-    // Chars, not bytes: the thresholds are named `_CHARS` and the truncate
-    // head is 300 chars, so a multibyte result must clear the same bar.
+/// The scorer is injected (default: [`dex_agent_core::DefaultPruneScorer`]);
+/// override it instead of forking this function.
+fn decide(scorer: &dyn dex_agent_core::PruneScorer, tool: &str, result: &str) -> (bool, bool) {
     let len = result.chars().count();
-    if len < KEEP_BELOW_CHARS {
-        return (true, true);
-    }
-    if len > DROP_ABOVE_CHARS {
-        if is_rerunnable(tool) && !looks_like_error(result) {
-            return (false, false);
-        }
-        return (true, false);
-    }
-    if len > TRUNCATE_ABOVE_CHARS {
-        return (true, false);
-    }
-    (true, true)
+    let verdict = scorer.decide(tool, len, is_rerunnable(tool), looks_like_error(result));
+    (verdict.keep_call, verdict.keep_result)
 }
 
 /// Context object threaded through a live prune: endpoint + key.
@@ -559,16 +550,18 @@ fn span_chars(messages: &[ChatMessage], start: usize, end: usize) -> usize {
 /// untouched. Returns per-reason counts plus char savings.
 ///
 /// `scorer` selects the asker: [`Scorer::Heuristic`] scores offline from
-/// size/re-runnability/error evidence; [`Scorer::Jev`] sends the span's
-/// pairs to the TypeSafe systemone endpoint (two noul questions per pair,
-/// batched) and falls back to the heuristic when the API fails or is not
-/// configured (`live` is `None`). A live failure degrades to the heuristic
-/// with a `warn_once`, never to a dropped prune.
+/// size/re-runnability/error evidence via `heuristic` (usually the
+/// harness's [`PruneScorer`](dex_agent_core::PruneScorer)); [`Scorer::Jev`]
+/// sends the span's pairs to the TypeSafe systemone endpoint (two noul
+/// questions per pair, batched) and falls back to the heuristic when the
+/// API fails or is not configured (`live` is `None`). A live failure
+/// degrades to the heuristic with a `warn_once`, never to a dropped prune.
 pub(crate) async fn prune_span(
     messages: &mut Vec<ChatMessage>,
     start: usize,
     end: usize,
     scorer: Scorer,
+    heuristic: &dyn dex_agent_core::PruneScorer,
     live: Option<&LiveScorer<'_>>,
 ) -> JevStats {
     // Callers pass the archivable span from `find_cut_point`; an inverted
@@ -631,7 +624,7 @@ pub(crate) async fn prune_span(
     let mut decisions: Vec<JevDecision> = pairs
         .iter()
         .map(|p| {
-            let (keep_call, keep_result) = decide(&p.tool, &p.result);
+            let (keep_call, keep_result) = decide(heuristic, &p.tool, &p.result);
             JevDecision {
                 keep_call,
                 keep_result,
@@ -770,10 +763,24 @@ mod tests {
     #[tokio::test]
     async fn drops_old_large_rerunnable_and_truncates_medium() {
         let mut msgs = history();
-        let stats = prune_span(&mut msgs, 1, 5, Scorer::Heuristic, None).await;
+        let stats = prune_span(
+            &mut msgs,
+            1,
+            5,
+            Scorer::Heuristic,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            None,
+        )
+        .await;
         assert_eq!(stats.dropped, 1);
         assert_eq!(stats.truncated, 1);
-        assert!(is_worthwhile(&stats), "{stats:?}");
+        assert!(
+            meets_reduction(
+                &stats,
+                dex_agent_core::HarnessLimits::default().reduction_ratio()
+            ),
+            "{stats:?}"
+        );
         // No orphaned result: c1's tool message is gone with its call.
         assert!(!msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("c1")));
         let c2 = msgs
@@ -793,7 +800,15 @@ mod tests {
         msgs.push(ChatMessage::assistant_calls(None, vec![call("b1", "bash")]));
         msgs.push(ChatMessage::tool_result("b1", "z".repeat(50_000)));
         msgs.push(ChatMessage::user("tail"));
-        let stats = prune_span(&mut msgs, 1, 3, Scorer::Heuristic, None).await;
+        let stats = prune_span(
+            &mut msgs,
+            1,
+            3,
+            Scorer::Heuristic,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            None,
+        )
+        .await;
         assert_eq!(stats.dropped, 0, "{stats:?}");
         assert_eq!(stats.truncated, 1, "{stats:?}");
         let kept = msgs
@@ -814,7 +829,15 @@ mod tests {
             format!("ERROR boom {}", "e".repeat(11_000)),
         ));
         msgs.push(ChatMessage::user("tail"));
-        let stats = prune_span(&mut msgs, 1, 3, Scorer::Heuristic, None).await;
+        let stats = prune_span(
+            &mut msgs,
+            1,
+            3,
+            Scorer::Heuristic,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            None,
+        )
+        .await;
         assert_eq!(stats.dropped, 0, "{stats:?}");
         assert!(msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("e1")));
     }
@@ -825,7 +848,15 @@ mod tests {
         msgs.push(ChatMessage::assistant_calls(None, vec![call("c1", "read")]));
         msgs.push(ChatMessage::tool_result("c1", "x".repeat(12_000)));
         // Prune only the result; the owning call sits before the span.
-        let stats = prune_span(&mut msgs, 2, 3, Scorer::Heuristic, None).await;
+        let stats = prune_span(
+            &mut msgs,
+            2,
+            3,
+            Scorer::Heuristic,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            None,
+        )
+        .await;
         assert_eq!(stats.dropped, 0, "{stats:?}");
         assert_eq!(stats.truncated, 1, "{stats:?}");
         // The call survives, so the (truncated) result is not orphaned.
@@ -838,8 +869,19 @@ mod tests {
     #[tokio::test]
     async fn tiny_span_is_not_worthwhile() {
         let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
-        let stats = prune_span(&mut msgs, 1, 2, Scorer::Heuristic, None).await;
-        assert!(!is_worthwhile(&stats));
+        let stats = prune_span(
+            &mut msgs,
+            1,
+            2,
+            Scorer::Heuristic,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            None,
+        )
+        .await;
+        assert!(!meets_reduction(
+            &stats,
+            dex_agent_core::HarnessLimits::default().reduction_ratio()
+        ));
         assert_eq!(msgs.len(), 2);
     }
 
@@ -1002,7 +1044,15 @@ mod tests {
             endpoint: &url,
             api_key: "k",
         };
-        let stats = prune_span(&mut msgs, 1, 3, Scorer::Jev, Some(&live)).await;
+        let stats = prune_span(
+            &mut msgs,
+            1,
+            3,
+            Scorer::Jev,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            Some(&live),
+        )
+        .await;
         // Heuristic fallback: huge re-runnable read drops.
         assert_eq!(stats.dropped, 1, "{stats:?}");
         assert!(!msgs.iter().any(|m| m.tool_call_id.as_deref() == Some("c1")));
@@ -1032,7 +1082,15 @@ mod tests {
             endpoint: &url,
             api_key: "k",
         };
-        let stats = prune_span(&mut msgs, 1, 5, Scorer::Jev, Some(&live)).await;
+        let stats = prune_span(
+            &mut msgs,
+            1,
+            5,
+            Scorer::Jev,
+            &dex_agent_core::DefaultPruneScorer::default(),
+            Some(&live),
+        )
+        .await;
         assert_eq!(stats.dropped, 1, "{stats:?}");
         assert_eq!(stats.truncated, 1, "{stats:?}");
         // Dropped pair is gone entirely; bash result survives truncated

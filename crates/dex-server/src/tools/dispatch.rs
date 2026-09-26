@@ -7,7 +7,9 @@ use super::edit::{change_diff_async, tool_edit};
 use super::error::ToolError;
 use super::meta::{tool_ls, Policy};
 use super::outcome::ToolOutcome;
-use super::policy::{enforce_policy, metadata, metadata_native, PermissionRequirement, ToolFilter};
+use super::policy::{
+    enforce_policy, metadata_for, metadata_native_for, PermissionRequirement, ToolFilter,
+};
 use super::read::tool_read;
 use super::search::{tool_fffind, tool_ffgrep};
 use super::shell::tool_bash;
@@ -153,14 +155,15 @@ async fn dispatch_tool(
                 )));
             }
         }
-        return crate::agent::delegate::execute_delegation(name, args, cancel, policy).await;
+        return crate::agent::delegate::execute_delegation(name, args, cancel, policy, filter)
+            .await;
     }
     // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
     // Shell row must not raise the gate again — use the native requirement.
     let requirement = match if resolve_shadow {
-        metadata(name)
+        metadata_for(policy, name)
     } else {
-        metadata_native(name)
+        metadata_native_for(policy, name)
     } {
         // MCP tools are external processes: their `metadata()` row already
         // carries the most restrictive gate (same as shell), so the separate
@@ -204,12 +207,20 @@ async fn dispatch_tool(
     if resolve_shadow && crate::extensions::is_shadowed(name) {
         // Same gates as the ext__ row in metadata(): a shadow intercepts a
         // built-in, so it can lie about what the built-in does.
-        enforce_policy(name, args, PermissionRequirement::Shell, cancel, policy).await?;
+        enforce_policy(
+            name,
+            args,
+            PermissionRequirement::Shell,
+            cancel,
+            policy,
+            filter,
+        )
+        .await?;
         return crate::extensions::call_shadow_global(name, args, cancel, policy, filter)
             .await
             .map_err(ToolError::Internal);
     }
-    enforce_policy(name, args, requirement, cancel, policy).await?;
+    enforce_policy(name, args, requirement, cancel, policy, filter).await?;
     if name.starts_with("mcp__") {
         // `ToolError::Internal` displays as the raw message, so the caller's
         // single audit row records exactly the string audited here before.
@@ -277,6 +288,18 @@ pub async fn execute_outcome(
         crate::extensions::apply_after_hooks(name, args, &text, ok, cancel, policy, filter).await;
     text = after.text;
     ok = after.ok;
+    // Runtime observation: `tool.error` fires on failures only (successes
+    // stay silent — subscribe to `tool.after` to observe everything).
+    if !ok {
+        crate::extensions::fire_event_global(
+            "tool.error",
+            serde_json::json!({"tool": name, "args": args, "error": text}),
+            cancel,
+            policy,
+            filter,
+        )
+        .await;
+    }
     ToolOutcome {
         text,
         ok,

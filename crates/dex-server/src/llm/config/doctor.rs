@@ -363,6 +363,115 @@ fn shared_rows(
     let (compaction, compaction_source) = crate::agent::compaction::verbatim::compaction_doctor();
     row(out, "compaction", &compaction, &compaction_source);
 
+    // Runtime-harness numerics: env > `harness:` file table > built-in
+    // default. Values come from the same `from_env` the turn loop uses.
+    let hc = crate::agent::composable::HarnessConfig::from_env();
+    let harness_result = crate::agent::composable::DexHarness::from_env();
+    // Slot selections (`harness.slots:`): same resolver the turn loop calls.
+    let (_, slot_rows) = crate::agent::registry::resolve_snapshot_with_origins();
+    let applied: Vec<String> = slot_rows
+        .iter()
+        .filter(|r| r.applied && r.selection.is_some())
+        .map(|r| format!("{}={}", r.slot, r.resolved_id()))
+        .collect();
+    let profile_origin = slot_rows.iter().find_map(|r| r.profile.clone());
+    row(
+        out,
+        "harness slots",
+        &if applied.is_empty() {
+            "default".to_string()
+        } else {
+            applied.join(", ")
+        },
+        &match (&profile_origin, applied.is_empty()) {
+            (Some(profile), _) => format!("profile '{profile}'"),
+            (None, true) => "built-in default".to_string(),
+            (None, false) => "config harness.slots".to_string(),
+        },
+    );
+    let file_has = |key: &str| super::load_harness_num(key).is_some();
+    let iter_source = if std::env::var("DEX_MAX_TOOL_ITERATIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .is_some()
+    {
+        "DEX_MAX_TOOL_ITERATIONS"
+    } else if file_has("max_tool_iterations") {
+        "config harness:"
+    } else {
+        "built-in default"
+    };
+    row(
+        out,
+        "harness tools",
+        &hc.limits.max_tool_iterations.to_string(),
+        iter_source,
+    );
+    row(
+        out,
+        "harness batch",
+        &hc.limits.batch_max_concurrent.to_string(),
+        if file_has("batch_max_concurrent") {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+    row(
+        out,
+        "harness compact",
+        &hc.limits.max_compaction_attempts.to_string(),
+        if file_has("max_compaction_attempts") {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+    row(
+        out,
+        "harness repeat",
+        &harness_result.result_policy.repeat_limit.to_string(),
+        if file_has("repeat_limit") {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+    // Cut window + prune thresholds: same `from_env`-family reads the turn
+    // loop uses, so the rows cannot drift from runtime behavior.
+    let cut_source = if file_has("keep_recent_messages") || file_has("min_to_summarize") {
+        "config harness:"
+    } else {
+        "built-in default"
+    };
+    row(
+        out,
+        "harness cut",
+        &format!(
+            "keep {} msgs / summarize >= {}",
+            hc.cut.min_keep_messages, hc.cut.min_to_summarize
+        ),
+        cut_source,
+    );
+    let prune = crate::agent::composable::prune_thresholds_from_env();
+    row(
+        out,
+        "harness prune",
+        &format!(
+            "keep <{}/trunc >{}/drop >{} chars",
+            prune.keep_below_chars, prune.truncate_above_chars, prune.drop_above_chars
+        ),
+        if file_has("keep_below_chars")
+            || file_has("truncate_above_chars")
+            || file_has("drop_above_chars")
+        {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+
     // Live Jev scorer: key comes only from the environment; the config
     // `jev:` table is the opt-in. Print the key masked, like `api key`.
     let jev_row = match (
@@ -546,6 +655,18 @@ fn tail_rows(
                 &format!("{scope}, {state}"),
             );
         }
+    }
+    // A Lua permission hook decides approvals *above* the permission mode,
+    // so it must never be invisible next to the `permission` row: surface
+    // every loaded extension with the `harness` capability (the enforced
+    // gate for `permission.request` / `supervisor.route` subscriptions).
+    for id in crate::extensions::permission_hook_ids() {
+        row(
+            out,
+            "permission hooks",
+            &id,
+            "harness capability — may arbitrate approvals",
+        );
     }
     // Extra dirs from config/env (origin per the precedence rules).
     let ext_paths = crate::extensions::config_extension_paths();
