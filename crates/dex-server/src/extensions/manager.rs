@@ -828,7 +828,10 @@ impl ExtensionManager {
             {
                 Ok(json) => json,
                 Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' permission.request failed: {error}");
+                    dex_runtime::log!(
+                        Warn,
+                        "extensions: '{id}' permission.request failed: {error}"
+                    );
                     continue;
                 }
             };
@@ -1219,12 +1222,16 @@ impl ExtensionManager {
 /// user-scope dir. A local path is copied as-is; anything with a `://`
 /// scheme (https://, file://, …) is treated as a remote source and shallow
 /// git-cloned to a temp dir first. The manifest must parse — install
-/// validates before copying so a broken extension never lands.
+/// validates before copying so a broken extension never lands. A local
+/// install returns the id; a remote install returns a ready-to-print
+/// message noting that the extension stays disabled until explicitly
+/// enabled (remote code is code the user has never audited).
 pub fn install(src: &str) -> Result<String, String> {
     if src.contains("://") {
         install_remote(src)
     } else {
         install_dir(PathBuf::from(src))
+            .map(|id| format!("installed '{id}' — run `dex extensions list`"))
     }
 }
 
@@ -1234,11 +1241,11 @@ pub fn install(src: &str) -> Result<String, String> {
 /// multi-extension repo is a packaging concern for the repo author). The
 /// temp dir is removed on every path out.
 fn install_remote(url: &str) -> Result<String, String> {
-    if !(url.starts_with("https://")
-        || url.starts_with("http://")
-        || url.starts_with("git@")
-        || url.starts_with("file://"))
-    {
+    // Plain `http://` is refused: a MITM'd clone is remote code execution
+    // by construction. `file://` stays allowed — it is a local repo, the
+    // same trust level as `install <dir>` (and it keeps the clone path
+    // testable offline).
+    if !(url.starts_with("https://") || url.starts_with("git@") || url.starts_with("file://")) {
         return Err(format!(
             "unsupported remote source {url:?}: use an https:// or git@ URL"
         ));
@@ -1268,7 +1275,17 @@ fn install_remote(url: &str) -> Result<String, String> {
                 "{url} has no manifest.yaml at the repo root (one extension per repo)"
             ));
         }
-        install_dir(tmp.clone())
+        let id = install_dir(tmp.clone())?;
+        // Remote code is code the user has not audited: it does not load
+        // until `dex extensions enable <id>` — the same explicit consent a
+        // project-scope extension needs. (User-scope loads unless disabled,
+        // so a bare install would arm it immediately.)
+        super::discovery::set_enabled(&id, false)
+            .map_err(|e| format!("marking '{id}' disabled: {e}"))?;
+        Ok(format!(
+            "installed '{id}' from {url} — it stays disabled until \
+`dex extensions enable {id}` (remote code needs explicit consent)"
+        ))
     })();
     std::fs::remove_dir_all(&tmp).ok();
     result

@@ -756,8 +756,10 @@ built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
 `session.before_compact`, plus `harness.overflow`/`harness.compact`/
 `harness.conflict`/`harness.summarize`/`model_selector` when
 the `harness` capability is declared; observe-only `llm.before`/`llm.after`,
-`tool.error`, `permission.request` (also under `harness`),
-`supervisor.route`, and the read-only `message.received`/`message.sent`/
+`tool.error`, `permission.request` and `supervisor.route` (both require the
+`harness` capability — enforced at registration, so a plain `tools` extension
+can never see or decide an approval), and the read-only
+`message.received`/`message.sent`/
 `session.created`/`session.loaded` lifecycle events). Extension code runs in a
 stripped VM — no io/os/require — and every effect flows through the same
 permission gates as a model-issued call.
@@ -901,8 +903,11 @@ only after `dex extensions enable <id>`, the trust consent), then
 `$XDG_CONFIG_HOME/dex/extensions`, config `extensions.paths:`, and
 `--extensions-dir` flags (user scope — loads unless `dex extensions disable
 <id>`). `dex extensions list|install|remove` manages them — `install` takes
-a local directory or a git URL (`https://…`, shallow-cloned, manifest
-validated at the repo root before anything lands); `/extensions` shows
+a local directory or a git URL (`https://…` or `git@…`; plaintext `http://`
+is refused, the clone is shallow, and the manifest is validated at the repo
+root before anything lands). A remote install lands **disabled** — remote
+code is code you have not audited — until `dex extensions enable <id>`;
+`/extensions` shows
 what is loaded and `/extensions reload` rescans. `dex doctor` lists every
 discovered extension with its consent state.
 

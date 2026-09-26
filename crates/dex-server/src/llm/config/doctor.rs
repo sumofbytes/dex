@@ -656,6 +656,18 @@ fn tail_rows(
             );
         }
     }
+    // A Lua permission hook decides approvals *above* the permission mode,
+    // so it must never be invisible next to the `permission` row: surface
+    // every loaded extension with the `harness` capability (the enforced
+    // gate for `permission.request` / `supervisor.route` subscriptions).
+    for id in crate::extensions::permission_hook_ids() {
+        row(
+            out,
+            "permission hooks",
+            &id,
+            "harness capability — may arbitrate approvals",
+        );
+    }
     // Extra dirs from config/env (origin per the precedence rules).
     let ext_paths = crate::extensions::config_extension_paths();
     if !ext_paths.is_empty() {
