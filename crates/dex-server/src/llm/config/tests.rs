@@ -2557,6 +2557,8 @@ fn doctor_output_is_byte_stable() {
                 "harness batch           10                                            built-in default\n",
                 "harness compact         3                                             built-in default\n",
                 "harness repeat          3                                             built-in default\n",
+                "harness cut             keep 12 msgs / summarize >= 8                 built-in default\n",
+                "harness prune           keep <500/trunc >2000/drop >10000 chars       built-in default\n",
                 "jev scorer              heuristic scorer                              no TYPESAFE_API_KEY\n",
                 "thinking                (unset)                                       model default\n",
                 "permission              trusted                                       built-in default\n",

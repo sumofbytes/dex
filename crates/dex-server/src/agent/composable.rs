@@ -478,6 +478,23 @@ impl Default for DexHarness {
     }
 }
 
+/// Effective prune thresholds: `harness:` file table over built-in defaults
+/// (`DexHarness::from_env` builds its scorer with these; `dex doctor` prints
+/// them so the row cannot drift from runtime behavior).
+pub fn prune_thresholds_from_env() -> PruneThresholds {
+    let mut prune = PruneThresholds::default();
+    if let Some(n) = file_usize("keep_below_chars") {
+        prune.keep_below_chars = n;
+    }
+    if let Some(n) = file_usize("truncate_above_chars") {
+        prune.truncate_above_chars = n;
+    }
+    if let Some(n) = file_usize("drop_above_chars") {
+        prune.drop_above_chars = n;
+    }
+    prune
+}
+
 impl DexHarness {
     /// Defaults with `DEX_MAX_TOOL_ITERATIONS` + the `harness:` file table
     /// read once. Turn setup calls this when the caller passes no harness,
@@ -498,17 +515,9 @@ impl DexHarness {
             result_policy = result_policy.with_repeat_limit(n);
         }
         harness.result_policy = result_policy;
-        let mut prune = PruneThresholds::default();
-        if let Some(n) = file_usize("keep_below_chars") {
-            prune.keep_below_chars = n;
-        }
-        if let Some(n) = file_usize("truncate_above_chars") {
-            prune.truncate_above_chars = n;
-        }
-        if let Some(n) = file_usize("drop_above_chars") {
-            prune.drop_above_chars = n;
-        }
-        harness.scorer = Arc::new(DefaultPruneScorer { thresholds: prune });
+        harness.scorer = Arc::new(DefaultPruneScorer {
+            thresholds: prune_thresholds_from_env(),
+        });
         harness
     }
 
