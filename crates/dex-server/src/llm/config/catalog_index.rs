@@ -1,6 +1,8 @@
 use super::context_index::dex_catalog_cache_path;
 use super::context_index::load_dex_catalog;
 use super::cost::cost_rates;
+use crate::workspace::unique_tmp_path;
+use crate::workspace::xdg_path;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -18,14 +20,14 @@ pub use crate::workspace::fnv_bytes;
 /// maps. Shape quirks are preserved per lookup via the `endpoint_only` /
 /// `from_flat` flags: each reader sees exactly the entries the old walk
 /// would have visited.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CostRates {
     pub input: f64,
     pub cache_read: Option<f64>,
     pub output: Option<f64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct IndexedModel {
     /// Catalog provider key (`""` for the flat `models` shape, which names none).
     pub provider: String,
@@ -223,6 +225,96 @@ fn build_catalog_index(
     index
 }
 
+/// Cross-process persisted catalog index (`models.idx.json`, next to the
+/// catalog): the derived lookup index serialized to disk so a fresh process
+/// skips the 4.5MB parse + index build and pays a ~2MB typed deserialize
+/// instead. Keyed by the catalog's content hash — a restored index is
+/// exactly as trustworthy as a rebuild, and a stale one fails the hash
+/// check and falls through to the parse (then re-persists).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedIndex {
+    hash: u64,
+    by_id: HashMap<String, Vec<IndexedModel>>,
+    provider_api: HashMap<String, String>,
+    provider_env: HashMap<String, Vec<String>>,
+    bare: Vec<(String, String)>,
+}
+
+pub fn persisted_index_path() -> Option<std::path::PathBuf> {
+    xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.idx.json")
+}
+
+/// Serialized persisted-index payload for one catalog generation. The
+/// identity fields (`path`/`mtime`/`len`) are runtime metadata, not part of
+/// the payload — a restore adopts whatever the catalog's `stat` says now.
+pub fn persisted_index_text(hash: u64, catalog: &serde_json::Value) -> Option<String> {
+    let built = build_catalog_index(
+        std::path::PathBuf::new(),
+        SystemTime::UNIX_EPOCH,
+        0,
+        hash,
+        catalog,
+    );
+    let persisted = PersistedIndex {
+        hash,
+        by_id: built.by_id,
+        provider_api: built.provider_api,
+        provider_env: built.provider_env,
+        bare: built.bare,
+    };
+    serde_json::to_string(&persisted).ok()
+}
+
+/// Restore a persisted index for catalog content `hash`. `None` on any
+/// parse failure or hash mismatch — the caller falls through to the full
+/// catalog parse, which re-persists a current copy in the background.
+pub fn restore_persisted_index(
+    path: &std::path::Path,
+    hash: u64,
+    mtime: SystemTime,
+    len: u64,
+) -> Option<CatalogIndex> {
+    let text = std::fs::read_to_string(persisted_index_path()?).ok()?;
+    let p: PersistedIndex = serde_json::from_str(&text).ok()?;
+    if p.hash != hash {
+        return None;
+    }
+    Some(CatalogIndex {
+        path: path.to_path_buf(),
+        mtime,
+        len,
+        hash,
+        by_id: p.by_id,
+        provider_api: p.provider_api,
+        provider_env: p.provider_env,
+        bare: p.bare,
+        expanded_for: HashMap::new(),
+    })
+}
+
+/// Serialize + write the persisted index on a background thread — a ~2MB
+/// serialize must not sit on the cold critical path. Runs at most once per
+/// catalog generation (only after a full rebuild; a successful restore
+/// means the file is already current). Atomic rename, like the ctx index,
+/// so a concurrent writer never leaves a torn file behind.
+fn spawn_persist_index(hash: u64, catalog: std::sync::Arc<serde_json::Value>) {
+    std::thread::spawn(move || {
+        let Some(text) = persisted_index_text(hash, &catalog) else {
+            return;
+        };
+        let Some(path) = persisted_index_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = unique_tmp_path(&path);
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    });
+}
+
 /// Run `f` against the current catalog index, rebuilding it when the catalog
 /// file changed since. `None` when no catalog is cached — every caller falls
 /// back exactly as before (config error, silent skip, or default).
@@ -270,8 +362,32 @@ pub fn with_catalog_index<T>(f: impl FnOnce(&CatalogIndex) -> T) -> Option<T> {
             return Some(f(index));
         }
     }
+    // Cold process: try the persisted index before the 4MB parse. Identity
+    // is the content hash already computed above, so a stale file (catalog
+    // rewritten by `dex update --models`) just fails the check.
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = (*guard)
+            .as_mut()
+            .filter(|index| index.path == path && index.hash == hash)
+        {
+            // Raced with a concurrent rebuild of the same generation —
+            // serve it, just refresh the identity metadata.
+            index.mtime = mtime;
+            index.len = len;
+            return Some(f(index));
+        }
+        if let Some(restored) = restore_persisted_index(&path, hash, mtime, len) {
+            *guard = Some(restored);
+            return Some(f(guard.as_ref()?));
+        }
+    }
     let catalog = load_dex_catalog()?;
     let fresh = build_catalog_index(path.clone(), mtime, len, hash, &catalog);
+    spawn_persist_index(hash, std::sync::Arc::clone(&catalog));
     let mut guard = CATALOG_INDEX
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -327,10 +443,31 @@ pub fn with_catalog_index_mut<T>(f: impl FnOnce(&mut CatalogIndex) -> T) -> Opti
             return Some(f(index));
         }
     }
+    // Cold process: try the persisted index before the 4MB parse (same
+    // contract as `with_catalog_index` above).
+    {
+        let mut guard = CATALOG_INDEX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = (*guard)
+            .as_mut()
+            .filter(|index| index.path == path && index.hash == hash)
+        {
+            index.mtime = mtime;
+            index.len = len;
+            return Some(f(index));
+        }
+        if let Some(restored) = restore_persisted_index(&path, hash, mtime, len) {
+            *guard = Some(restored);
+            return Some(f(guard.as_mut()?));
+        }
+    }
     // Parsed outside the lock (like `cached_parse`): the 4MB walk never
     // blocks concurrent readers serving the previous generation.
     let catalog = load_dex_catalog()?;
     let fresh_index = build_catalog_index(path.clone(), mtime, len, hash, &catalog);
+    spawn_persist_index(hash, std::sync::Arc::clone(&catalog));
     let mut guard = CATALOG_INDEX
         .get_or_init(|| Mutex::new(None))
         .lock()

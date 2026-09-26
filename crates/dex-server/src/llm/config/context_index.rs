@@ -31,15 +31,29 @@ fn dex_ctx_index_path() -> Option<std::path::PathBuf> {
     xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.ctx.json")
 }
 
+/// The parsed `models.ctx.json` map, cached process-wide and invalidated by
+/// file identity (path + content hash) via `cached_parse` — same contract as
+/// the catalog parse. Without this, every `ctx_from_index` call (i.e. every
+/// `LlmConfig::from_env`, so every daemon turn and `/api/config`) re-read and
+/// re-parsed the file even though it only ever changes via an atomic rewrite.
+type CtxMapCache = FileCache<std::sync::Arc<BTreeMap<String, u64>>>;
+static CTX_MAP_CACHE: OnceLock<Mutex<Option<CtxMapCache>>> = OnceLock::new();
+
 pub fn ctx_from_index(model: &str) -> Option<u64> {
     // KB-sized file: one small read + parse instead of the 4MB catalog.
     let path = dex_ctx_index_path()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
-    let from_index = map
-        .get(model.to_ascii_lowercase().as_str())
-        .and_then(|v| v.as_u64())
-        .filter(|ctx| *ctx > 0)?;
+    let map = cached_parse(&CTX_MAP_CACHE, &path, |text| {
+        let raw: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(text.as_deref()?).ok()?;
+        let mut map = BTreeMap::new();
+        for (id, value) in raw {
+            if let Some(ctx) = value.as_u64().filter(|ctx| *ctx > 0) {
+                map.insert(id, ctx);
+            }
+        }
+        Some(std::sync::Arc::new(map))
+    })?;
+    let from_index = map.get(model.to_ascii_lowercase().as_str()).copied()?;
     // Cross-check against a warm in-process catalog index (a lock + one
     // lookup, never a file read — `if_catalog_index_warm`): the KB file can
     // lag the catalog it was derived from (upstream re-sized a model; the
