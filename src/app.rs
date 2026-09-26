@@ -494,21 +494,42 @@ fn run_runtime(action: &str) {
     // whole `run_turn` orchestration. Refresh first — a bare
     // `global_manager()` only starts a background load, and this row must
     // not race it (same contract as `dex extensions list`).
-    let agent_loop = crate::runtime::http::block_on(async {
+    let (agent_loop, lua_opinions) = crate::runtime::http::block_on(async {
         let mgr = crate::extensions::global_manager();
         mgr.refresh().await;
-        mgr.agent_loop().await
+        let agent_loop = mgr.agent_loop().await;
+        let opinions = mgr.lua_opinion_holders().await;
+        (agent_loop, opinions)
     });
+    let mut lua_opinions = lua_opinions
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
     match agent_loop {
         Some((id, _)) => println!("  {:<11} {:<24} lua extension", "agent_loop", id),
         None => println!("  {:<11} {:<24} rust, builtin", "agent_loop", "run_turn"),
     }
     for row in rows {
+        // Lua opinions don't replace the slot: the first one wins, the
+        // Rust default decides otherwise — show who participates.
+        let lua = lua_opinions
+            .remove(row.slot)
+            .map(|holders| format!(" + lua opinion ({})", holders.join(", ")))
+            .unwrap_or_default();
         println!(
-            "  {:<11} {:<24} {}",
+            "  {:<11} {:<24} {}{}",
             row.slot,
             row.resolved_id(),
-            row.origin()
+            row.origin(),
+            lua
+        );
+    }
+    // Lua-only slots (no registry row): consulted once per turn.
+    for (slot, holders) in &lua_opinions {
+        println!(
+            "  {:<11} {:<24} lua opinion ({}); first one wins, Rust default otherwise",
+            slot,
+            "lua-only slot",
+            holders.join(", ")
         );
     }
     let config = &harness.config;
@@ -527,7 +548,6 @@ fn run_runtime(action: &str) {
         config.keep_recent_messages()
     );
     println!("  min_to_summarize        {}", config.min_to_summarize());
-    println!("  overflow/conflict lua hooks: see `dex doctor` (harness-capability extensions)");
 }
 
 /// `dex extensions <action>` — list, toggle, install, remove.

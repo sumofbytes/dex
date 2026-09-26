@@ -749,7 +749,10 @@ login retries once without it.
 
 ### Lua extensions
 
-Harness extensions in sandboxed Lua: drop a directory with `manifest.yaml` +
+The agent harness is runtime-composable: harness slots, profiles, and the
+agent loop itself can be replaced from config or Lua without recompiling —
+see [RUNTIME.md](RUNTIME.md) for the full guide. Harness extensions in
+sandboxed Lua: drop a directory with `manifest.yaml` +
 `extension.lua` into a discovery dir and it can register tools, shadow
 built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
 `turn.start`/`turn.end`, `before_agent_start`, `model_select`,
@@ -822,7 +825,9 @@ harness: # runtime harness numerics (env DEX_MAX_TOOL_ITERATIONS wins for iterat
 ```
 
 `harness.slots:` selects named registry implementations per harness slot
-(`dex runtime graph` prints every slot's resolved id and origin — the same
+(the slot map, profiles, and the rest of the composability surface are
+documented in [RUNTIME.md](RUNTIME.md); `dex runtime graph` prints every
+slot's resolved id and origin — the same
 resolver the turn loop calls, so the graph cannot drift from what a turn
 runs). Unknown slots or ids `warn_once` and keep the default; Rust code can
 add implementations with `crate::agent::registry::register`.
