@@ -5,10 +5,26 @@
 //! withholds `dex.*` subtrees that are not declared), and the tool schemas.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 /// Manifest-format version. Bumped only when the shape below changes; the
 /// extension's own `version:` is independent.
 pub const MANIFEST_VERSION: u32 = 1;
+
+/// Slots a manifest may declare under `components:` (spec §31): the
+/// middleware-wrappable harness slots plus `agent_loop` (which the Lua side
+/// registers via `dex.replace`, not `dex.use`). Kept here so manifest
+/// validation needs no engine types; a test pins this list against the
+/// engine's `WRAPPABLE_SLOTS` so the two cannot drift.
+pub const COMPONENT_SLOTS: &[&str] = &[
+    "model_selector",
+    "harness.summarize",
+    "harness.compact",
+    "harness.overflow",
+    "harness.conflict",
+    "tool_catalog",
+    "agent_loop",
+];
 
 /// Hard cap for per-tool `timeout:` (plan §6.3).
 pub const MAX_TOOL_TIMEOUT_SECS: u64 = 120;
@@ -31,6 +47,10 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     "model",
     "net",
     "net.providers",
+    "harness",
+    // agent_loop: replaces the turn loop via `dex.replace("agent_loop", …)`
+    // (spec §9) — the whole orchestration, so it is its own capability.
+    "agent_loop",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,11 +76,25 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub tools: Vec<ManifestTool>,
+    /// Harness compatibility: `dex = ">=0.15"` pins the minimum harness
+    /// that can serve this extension (new events/capabilities). Checked at
+    /// load against the harness crate version — a mismatch skips the whole
+    /// extension loudly instead of running it against events it never saw.
+    #[serde(default)]
+    pub dex: Option<String>,
     /// Fail-closed hooks: a `tool.before` error denies the call instead of
     /// being skipped (default fail-open, plan §8). Declared here so the
     /// enforcement posture is install-time consent, not runtime surprise.
     #[serde(default)]
     pub strict: bool,
+    /// Declarative component files (spec §31): slot name → `.lua` file
+    /// relative to the extension dir. Each file is loaded after
+    /// `extension.lua` with the same `return function(dex) … end` contract
+    /// and registers itself (`dex.use` / `dex.replace` / `dex.wrap`).
+    /// Validated at parse time: known slot, confined path, `harness`
+    /// capability required.
+    #[serde(default)]
+    pub components: BTreeMap<String, String>,
 }
 
 pub fn valid_segment(s: &str) -> bool {
@@ -140,7 +174,83 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if manifest.has_capability("net.providers") && !manifest.has_capability("net") {
         return Err("capability 'net.providers' requires the 'net' capability".to_string());
     }
+    if !manifest.components.is_empty() && !manifest.has_capability("harness") {
+        return Err("manifest declares components without the 'harness' capability".to_string());
+    }
+    let mut seen_files = std::collections::BTreeSet::new();
+    for (slot, file) in &manifest.components {
+        if !COMPONENT_SLOTS.contains(&slot.as_str()) {
+            return Err(format!(
+                "unknown component slot '{slot}' (known: {})",
+                COMPONENT_SLOTS.join(", ")
+            ));
+        }
+        // Confined relative path: the loader joins it onto the extension
+        // dir, so `..`, absolute paths, and empties are rejected here.
+        if file.is_empty()
+            || file.starts_with('/')
+            || file.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            return Err(format!(
+                "component '{slot}': path {file:?} must be relative to the extension dir"
+            ));
+        }
+        if !file.ends_with(".lua") {
+            return Err(format!("component '{slot}': {file:?} must be a .lua file"));
+        }
+        // The same file declared twice would load twice and double-register.
+        if !seen_files.insert(file.as_str()) {
+            return Err(format!("component '{slot}': {file:?} declared twice"));
+        }
+    }
+    if let Some(req) = manifest.dex.as_deref() {
+        check_dex_compat(req)?;
+    }
     Ok(manifest)
+}
+
+/// The harness version serving this extension (the `dex-server` crate
+/// version — the code that owns the event surface, not the CLI release).
+pub fn harness_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Check a manifest `dex = ">=a.b[.c]"` pin against the running harness.
+/// Only `>=` pins are accepted (an extension names the minimum it needs);
+/// anything else — or a newer harness requirement — is a loud load-time
+/// skip, never a silent run against unknown events.
+fn check_dex_compat(req: &str) -> Result<(), String> {
+    let min = req
+        .trim()
+        .strip_prefix(">=")
+        .ok_or_else(|| format!("unsupported dex pin {req:?}: use '>=<major>.<minor>[.<patch>]'"))?;
+    let mut need = min.split('.');
+    let parse_part = |part: Option<&str>| -> Result<u64, String> {
+        part.unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| format!("unsupported dex pin {req:?}: use '>=<major>.<minor>[.<patch>]'"))
+    };
+    let need = (
+        parse_part(need.next())?,
+        parse_part(need.next())?,
+        parse_part(need.next())?,
+    );
+    let mut have = harness_version().split('.');
+    let have = (
+        parse_part(have.next())?,
+        parse_part(have.next())?,
+        parse_part(have.next())?,
+    );
+    if have < need {
+        return Err(format!(
+            "extension needs dex harness >={}.{}.{} (running {})",
+            need.0,
+            need.1,
+            need.2,
+            harness_version()
+        ));
+    }
+    Ok(())
 }
 
 impl Manifest {
@@ -235,5 +345,58 @@ tools:
             "capabilities: [tools, model, net]",
         );
         assert!(parse_manifest(&both).is_ok());
+    }
+
+    #[test]
+    fn harness_capability_is_known() {
+        let m = parse_manifest(
+            "manifest_version: 1\nid: hook-ext\nversion: 0.1.0\ncapabilities: [harness]\n",
+        )
+        .unwrap();
+        assert!(m.has_capability("harness"));
+    }
+
+    #[test]
+    fn dex_pin_accepts_compatible_and_rejects_newer_or_garbage() {
+        let base = "manifest_version: 1\nid: pin-ext\nversion: 0.1.0\ncapabilities: []\n";
+        // Current or older floor: loads.
+        assert!(parse_manifest(&format!("{base}dex: \">={}\"\n", harness_version())).is_ok());
+        assert!(parse_manifest(&format!("{base}dex: \">=0.0\"\n")).is_ok());
+        // Newer floor than the running harness: loud skip.
+        let err = parse_manifest(&format!("{base}dex: \">=999.0\"\n")).unwrap_err();
+        assert!(err.contains("needs dex harness"), "got: {err}");
+        // Only `>=` pins exist.
+        assert!(parse_manifest(&format!("{base}dex: \"==1.0\"\n")).is_err());
+        assert!(parse_manifest(&format!("{base}dex: \"hello\"\n")).is_err());
+    }
+
+    #[test]
+    fn components_parse_and_validate() {
+        let base = "manifest_version: 1\nid: comp-ext\nversion: 0.1.0\ncapabilities: [harness]\n";
+        let with = |comp: &str| format!("{base}components:\n{comp}");
+        let ok = parse_manifest(&with("  model_selector: router.lua\n")).unwrap();
+        assert_eq!(ok.components.get("model_selector").unwrap(), "router.lua");
+        // Subdirectories are fine.
+        assert!(parse_manifest(&with("  harness.summarize: comp/sum.lua\n")).is_ok());
+        // Unknown slot.
+        let err = parse_manifest(&with("  summarizer: s.lua\n")).unwrap_err();
+        assert!(err.contains("unknown component slot"), "got: {err}");
+        // Escaping / absolute / non-lua paths.
+        for bad in [
+            "  model_selector: ../evil.lua\n",
+            "  model_selector: /etc/x.lua\n",
+            "  model_selector: router.txt\n",
+        ] {
+            assert!(parse_manifest(&with(bad)).is_err(), "{bad}");
+        }
+        // Same file twice: would load twice.
+        let err =
+            parse_manifest(&with("  model_selector: r.lua\n  tool_catalog: r.lua\n")).unwrap_err();
+        assert!(err.contains("declared twice"), "got: {err}");
+        // Components are harness surface: capability required.
+        let no_cap = base.replace("capabilities: [harness]", "capabilities: []");
+        assert!(
+            parse_manifest(&format!("{no_cap}components:\n  model_selector: r.lua\n")).is_err()
+        );
     }
 }

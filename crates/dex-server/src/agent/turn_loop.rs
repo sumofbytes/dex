@@ -21,7 +21,7 @@ use crate::tools::ToolFilter;
 #[cfg(test)]
 use tools::record_usage;
 #[cfg(test)]
-use tools::{is_context_overflow, run_tool_batch};
+use tools::run_tool_batch;
 
 /// The per-agent capability bundle for [`process_turn`]. One loop serves main agent and children — the
 /// bundle decides what each run gets: the main agent passes its steering
@@ -48,6 +48,12 @@ pub struct AgentRuntime<'a, C, X> {
     /// Turn budget override (a definition's `max_tool_iterations`
     /// feeds the existing budget knob; `None` = the default/env value).
     pub tool_budget: Option<usize>,
+    /// Overwritable harness decisions for this turn (`None` = defaults with
+    /// `DEX_MAX_TOOL_ITERATIONS` read once at turn setup). Pass a custom
+    /// [`DexHarness`](crate::agent::composable::DexHarness) to swap one
+    /// piece — catalog, trigger, overflow wording, conflict rule, scorer,
+    /// executor, transcript store — without forking the loop.
+    pub harness: Option<std::sync::Arc<crate::agent::composable::DexHarness>>,
 }
 
 /// Apply one drained queue message to the not-yet-injected `pending` list:
@@ -88,17 +94,89 @@ where
     C: ModelClient + 'static,
     X: CancellationSource + Clone + 'static,
 {
-    // Pin this turn's model drive context for the whole turn: extension
-    // drives read it instead of the process-wide fallback, so concurrent
-    // turns (daemon sessions) and nested child turns each serve their own
-    // model. The recorder below still updates the fallback for out-of-turn
-    // drives, and the `model_select` event still fires on change.
-    let drive = crate::extensions::drive_model_for(rt.config);
-    crate::extensions::with_drive_model(drive, process_turn_scoped(rt)).await
+    // `model_selector` slot (spec §11): the first Lua opinion picks the
+    // model this turn serves; no opinion — or an unresolvable one, which
+    // `apply_model` refuses rather than half-switching — keeps the
+    // configured model. Fail-open, like every hook. The resolved override
+    // drives three views at once: the wire (`with_served_model`, since the
+    // client IS the config in production), the host-side budget/compaction
+    // views (`process_turn_scoped`'s `config`), and the extension drive
+    // snapshot (`drive_model_for`) — so `dex.model`, `model_select` and
+    // compaction thresholds all agree on what was served.
+    let selection = {
+        let cancel = rt.cancel.clone();
+        crate::extensions::query_model_selector_global(rt.config, &cancel).await
+    };
+    let override_config: Option<std::sync::Arc<crate::llm::config::LlmConfig>> = selection
+        .and_then(|selection| {
+            let mut config = rt.config.clone();
+            match config.apply_model(&selection, false) {
+                Ok(_) => Some(std::sync::Arc::new(config)),
+                Err(e) => {
+                    crate::runtime::notice::warn_once(
+                        "ext.model-selector",
+                        &format!("model_selector: cannot serve '{selection}': {e}"),
+                    );
+                    None
+                }
+            }
+        });
+    let config = override_config
+        .as_ref()
+        .map(|a| a.as_ref())
+        .unwrap_or(rt.config);
+    // `tool_catalog` slot (spec §11): the first Lua opinion narrows the
+    // served schemas for this turn. Computed from the default composed
+    // assembly before the scope opens, so the filter never filters itself;
+    // no opinion — or an error, which fails open — serves the full catalog.
+    // Narrowing-only by construction (`CatalogFilter::apply` is a subset op).
+    let catalog_schemas = {
+        let cancel = rt.cancel.clone();
+        crate::extensions::query_tool_catalog_global(
+            &{
+                use dex_agent_core::ToolCatalog as _;
+                crate::agent::composable::ComposedCatalog::dex_default().tool_schemas()
+            },
+            &cancel,
+        )
+        .await
+    };
+    let drive = crate::extensions::drive_model_for(config);
+    let fut = process_turn_scoped(rt, config);
+    match (override_config.as_ref(), catalog_schemas) {
+        // The task-local scope is what the wire sees (`LlmConfig` clients);
+        // test mocks and other clients ignore it.
+        (Some(_), Some(schemas)) => {
+            crate::llm::client::with_served_model(
+                override_config.as_ref().expect("checked").clone(),
+                crate::agent::composable::with_tool_catalog_override(
+                    schemas,
+                    crate::extensions::with_drive_model(drive, fut),
+                ),
+            )
+            .await
+        }
+        (Some(_), None) => {
+            crate::llm::client::with_served_model(
+                override_config.as_ref().expect("checked").clone(),
+                crate::extensions::with_drive_model(drive, fut),
+            )
+            .await
+        }
+        (None, Some(schemas)) => {
+            crate::agent::composable::with_tool_catalog_override(
+                schemas,
+                crate::extensions::with_drive_model(drive, fut),
+            )
+            .await
+        }
+        (None, None) => crate::extensions::with_drive_model(drive, fut).await,
+    }
 }
 
 async fn process_turn_scoped<C, X>(
     rt: AgentRuntime<'_, C, X>,
+    config: &crate::llm::config::LlmConfig,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
 where
     C: ModelClient + 'static,
@@ -111,7 +189,7 @@ where
     // directive the host acts on. The hook host gets this turn's policy, so
     // a nested `dex.tools.call` from a hook is gated exactly like a
     // model-issued one.
-    let turn_policy = Policy::turn(rt.config.permission, rt.console);
+    let turn_policy = Policy::turn(config.permission, rt.console);
     let cancel = rt.cancel.clone();
     let filter = rt.filter;
     // Model-aware extensions (`dex.model`, provider-native tools) sync on
@@ -119,7 +197,7 @@ where
     // the last turn (always on the first), and records the snapshot
     // `dex.model` reads — including per-request daemon overrides the file
     // never sees. Same fail-open contract as the hooks below.
-    crate::extensions::fire_model_select_if_changed(rt.config, &cancel, &turn_policy, filter).await;
+    crate::extensions::fire_model_select_if_changed(config, &cancel, &turn_policy, filter).await;
     // `before_agent_start` system-prompt append (plan §7 P2): applied to the
     // leading System message for the duration of the turn, restored before
     // the result leaves — the journal never stores System role messages, so
@@ -155,7 +233,7 @@ where
     // needs it back, and inner's returns are many (a drop guard cannot hold a
     // second &mut).
     let AgentRuntime {
-        config,
+        config: _,
         messages,
         state,
         steering_rx,
@@ -167,6 +245,7 @@ where
         filter,
         agent_ctx,
         tool_budget,
+        harness,
     } = rt;
     let result = run_agent_engine(DexHostSetup {
         config,
@@ -181,8 +260,30 @@ where
         filter,
         agent_ctx,
         tool_budget,
+        harness,
     })
     .await;
+    // Runtime observation: `message.sent` fires for the turn's final text
+    // (uniform across daemon, children, one-shot, TUI-local — every path
+    // runs through here). Truncated preview; failures carry the error.
+    {
+        let (ok, body) = match &result {
+            Ok(text) => (true, text.clone()),
+            Err(e) => (false, e.to_string()),
+        };
+        let (preview, truncated, chars) = crate::extensions::text_preview(&body);
+        crate::extensions::fire_lifecycle_event(
+            "message.sent",
+            serde_json::json!({
+                "ok": ok,
+                "preview": preview,
+                "truncated": truncated,
+                "chars": chars,
+            }),
+            &cancel,
+        )
+        .await;
+    }
     // Restore the System message the appendix rode on: per-turn scope.
     if let Some(original) = saved_system {
         if let Some(first) = messages.first_mut() {
@@ -214,6 +315,7 @@ struct DexHostSetup<'a, C, X> {
     filter: Option<&'a ToolFilter>,
     agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
     tool_budget: Option<usize>,
+    harness: Option<Arc<crate::agent::composable::DexHarness>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,6 +333,7 @@ async fn run_agent_engine<C, X>(
         filter,
         agent_ctx,
         tool_budget,
+        harness,
     }: DexHostSetup<'_, C, X>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -238,6 +341,46 @@ where
     X: CancellationSource + Clone + 'static,
 {
     let _working = SpinnerGuard::start(console, "Working");
+    // Single env boundary for the turn: defaults read
+    // `DEX_MAX_TOOL_ITERATIONS` here, once — never per helper call. The
+    // resolver applies `harness.slots:` registry selections on top.
+    let harness = harness.unwrap_or_else(crate::agent::registry::resolve_snapshot);
+    let tool_round_limit = tool_budget.unwrap_or_else(|| harness.config.max_tool_iterations());
+    // `agent_loop` slot (spec §9 / Phase 5): a registered Lua loop replaces
+    // the whole `run_turn` orchestration — this driver keeps the host, the
+    // token ledger, the tool-round budget, and cancellation; the loop owns
+    // iteration. Queried at the same snapshot point as every other slot;
+    // `None` (no registered loop) keeps the Rust engine.
+    if let Some((ext_id, engine)) = crate::extensions::agent_loop_global().await {
+        let started = std::time::Instant::now();
+        let result = lua_loop::run_lua_agent_loop(
+            engine,
+            config,
+            messages,
+            state,
+            steering_rx,
+            steering_accepted_tx,
+            session,
+            client,
+            cancel,
+            console,
+            filter,
+            agent_ctx,
+            harness,
+            tool_round_limit,
+        )
+        .await;
+        // §35 invocation trace: the loop is one long invocation spanning the
+        // whole turn — one record, the turn's duration and outcome.
+        crate::extensions::trace::record(
+            &ext_id,
+            "agent_loop",
+            started.elapsed(),
+            if result.is_ok() { "ok" } else { "error" },
+            result.as_ref().err().map(|e| e.to_string()),
+        );
+        return result;
+    }
     let mut host = host::make_host(
         config,
         state,
@@ -249,22 +392,15 @@ where
         filter,
         agent_ctx,
         messages.len(),
+        harness,
     );
-    dex_agent_core::run_turn(
-        client,
-        cancel,
-        messages,
-        &mut host,
-        tool_budget.unwrap_or_else(max_tool_iterations),
-    )
-    .await
+    dex_agent_core::run_turn(client, cancel, messages, &mut host, tool_round_limit).await
 }
 
-mod host;
-mod tool_results;
-mod tools;
-
-use tools::max_tool_iterations;
+pub(crate) mod host;
+pub(crate) mod lua_loop;
+pub(crate) mod tool_results;
+pub(crate) mod tools;
 
 #[cfg(test)]
 pub mod tests;

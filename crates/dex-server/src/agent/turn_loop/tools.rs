@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use super::apply_queue_msg;
 use crate::agent::compaction::compact_history;
 use crate::agent::compaction::verbatim::summary_mode;
+use crate::agent::composable::{DexHarness, ToolExecutor};
 use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
@@ -17,11 +18,11 @@ use crate::render::format::short_arg;
 use crate::runtime::console::{with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK};
 use crate::runtime::unwind::CatchUnwind;
 use crate::session::Session;
-use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
+use crate::tools::{Policy, ToolFilter, ToolOutcome};
 
 /// Emit a system note on every surface: a transcript line when a sink is
 /// attached (TUI / daemon), `eprintln` headless.
-pub(super) async fn system_note(console: &Console, note: &str) {
+pub(crate) async fn system_note(console: &Console, note: &str) {
     note_sink(
         console,
         || SinkLine::System(note.to_string()),
@@ -96,7 +97,7 @@ pub(crate) fn persist_pending(
 /// after any compaction rewrites it (threshold gate, emergency, online
 /// boundary). Atomic (`Session::rewrite_messages`): readers never see a
 /// torn clear-plus-partial-tail.
-pub(super) fn rewrite_session(
+pub(crate) fn rewrite_session(
     session: Option<&mut Session>,
     messages: &[ChatMessage],
     persisted_cursor: &mut usize,
@@ -133,53 +134,6 @@ pub(super) async fn inject_steering(
     true
 }
 
-/// Per-turn cap on tool rounds (one round = one assistant batch with tool
-/// calls, regardless of how many calls the batch fans out). A model that
-/// loops (re-issuing the same failing call in new words, ping-ponging two
-/// files) burns unlimited tokens without one; the repeated-call detector
-/// only stops *identical* calls. Bounded, preserved partial progress; the
-/// user can continue with another prompt. `DEX_MAX_TOOL_ITERATIONS`
-/// overrides.
-pub(super) fn max_tool_iterations() -> usize {
-    std::env::var("DEX_MAX_TOOL_ITERATIONS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(200)
-}
-
-/// Phrases meaning "the input no longer fits the context window",
-/// matched on a lowercased message by `is_context_overflow`.
-const OVERFLOW_PHRASES: &[&str] = &[
-    "context length",
-    "context_length",
-    "maximum context",
-    "context window",
-    "context size",
-    "context too large",
-    "input length",
-    "input is too long",
-    "prompt is too long",
-    "prompt too long",
-    "too many tokens",
-    "token limit",
-];
-
-/// Provider wording for "the input no longer fits the context window".
-/// Matched on lowercase; providers phrase it many ways. The generic
-/// "reduce the length" only counts with a context/token/prompt/input
-/// anchor so unrelated length validations (filenames, etc.) don't trigger
-/// a wasteful emergency compaction.
-pub(super) fn is_context_overflow(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    OVERFLOW_PHRASES.iter().any(|p| message.contains(*p))
-        || (message.contains("reduce the length")
-            && (message.contains("context")
-                || message.contains("token")
-                || message.contains("prompt")
-                || message.contains("input")))
-}
-
 /// Shared per-call accounting: live context usage in `state`, the sink
 /// event the TUI accumulates spend from (carrying the daemon-priced USD
 /// cost, so the remote client never re-prices locally), and the
@@ -187,7 +141,7 @@ pub(super) fn is_context_overflow(message: &str) -> bool {
 /// which are billed too. `gen_ms` is the caller-measured wall-clock
 /// duration of the LLM call (`None` when untimed, e.g. compaction): it
 /// becomes the footer's tokens/s denominator on the client.
-pub(super) async fn record_usage(
+pub(crate) async fn record_usage(
     config: &LlmConfig,
     state: &mut ToolState,
     console: &Console,
@@ -230,6 +184,7 @@ pub(super) async fn execute_tool_call(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
     filter: Option<&ToolFilter>,
+    executor: &dyn ToolExecutor,
 ) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
@@ -261,7 +216,9 @@ pub(super) async fn execute_tool_call(
     let input = serde_json::to_string(args).unwrap_or_default();
     dex_runtime::log!(Debug, "tool {name} {input}");
     let started = Instant::now();
-    let outcome = execute_outcome(&name, args, cancel, policy, filter).await;
+    let outcome = executor
+        .execute_outcome(&name, args, cancel, policy, filter)
+        .await;
     dex_runtime::log!(
         Debug,
         "tool {name} ok={} in {:?}",
@@ -271,9 +228,10 @@ pub(super) async fn execute_tool_call(
     (name, input, outcome)
 }
 
-/// Force up to three compaction rounds regardless of the token threshold —
-/// the provider has already said the input is over the real limit, so the
-/// estimator's opinion no longer matters. Returns true when history shrank.
+/// Force up to the harness recovery budget of compaction rounds regardless
+/// of the token threshold — the provider has already said the input is over
+/// the real limit, so the estimator's opinion no longer matters. Returns
+/// true when history shrank.
 pub(super) async fn emergency_compact(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
@@ -281,9 +239,10 @@ pub(super) async fn emergency_compact(
     cancel: &(dyn CancellationSource + Send + Sync),
     console: &Console,
     ledger: &mut TokenLedger,
+    harness: &DexHarness,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
-    for _ in 0..3 {
+    for _ in 0..harness.recovery_attempts() {
         // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
         // one parse selects both the prune and the fallback summarizer.
         let summarizer = summary_mode();
@@ -294,13 +253,14 @@ pub(super) async fn emergency_compact(
             true,
             summarizer.prunes_jev(),
             summarizer,
+            harness,
         )
         .await
         {
             Ok((true, usage)) => {
                 compacted_any = true;
                 if let Some(u) = usage {
-                    record_usage(config, state, console, u, None).await;
+                    harness.usage.record(config, state, console, u, None).await;
                 }
             }
             _ => break,
@@ -314,7 +274,7 @@ pub(super) async fn emergency_compact(
     // Compaction may have rewritten history: re-measure once instead of
     // tracking per-round deltas on this rare path.
     *ledger = TokenLedger::rebuild(messages);
-    system_note(console, note).await;
+    harness.events.system_note(console, note).await;
     Ok(compacted_any)
 }
 
@@ -342,20 +302,33 @@ pub(super) async fn note_tool_start(console: &Console, call: &LlmToolCall) {
 }
 
 /// Execute one batch of tool calls: serialized under the mutation lock when
-/// the calls conflict, else fanned out on JoinSet tasks (bounded to
-/// `BATCH_MAX_CONCURRENT` permits, aborted promptly on cancel; input-ordered
-/// via indexed slots, panics surface as tool errors).
+/// the harness conflict detector fires, else fanned out on JoinSet tasks
+/// (bounded to the harness batch-concurrency permits, aborted promptly on
+/// cancel; input-ordered via indexed slots, panics surface as tool errors).
 pub(super) async fn run_tool_batch<X>(
     calls: &[LlmToolCall],
     cancel: &X,
     policy: &Policy,
     filter: Option<&ToolFilter>,
     console: &Console,
+    harness: &DexHarness,
 ) -> Vec<(String, String, ToolOutcome, Duration)>
 where
     X: CancellationSource + Clone + 'static,
 {
-    if tool_calls_conflict(calls) {
+    // Runtime override: one `harness.conflict` round-trip per batch when a Lua
+    // extension subscribes, else the Rust detector (zero-cost default).
+    let conflicts = if crate::extensions::has_event_handlers("harness.conflict") {
+        crate::extensions::query_harness_conflict(
+            calls,
+            cancel as &(dyn CancellationSource + Send + Sync),
+        )
+        .await
+        .unwrap_or_else(|| harness.conflicts(calls))
+    } else {
+        harness.conflicts(calls)
+    };
+    if conflicts {
         let _guard = TOOL_MUTATION_LOCK.lock().await;
         let mut out = Vec::new();
         for call in calls {
@@ -379,6 +352,7 @@ where
                 cancel as &(dyn CancellationSource + Send + Sync),
                 policy,
                 filter,
+                &*harness.executor,
             )
             .await;
             out.push((name, input, outcome, started.elapsed()));
@@ -390,9 +364,11 @@ where
         // stays in input order. A semaphore caps fd/thread pressure no matter
         // how many calls the model packed into one batch; `select!` on
         // `wait_cancelled` aborts the stragglers instead of waiting for the
-        // slowest tool after Ctrl+C.
-        const BATCH_MAX_CONCURRENT: usize = 10;
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(BATCH_MAX_CONCURRENT));
+        // slowest tool after Ctrl+C. The bound comes from the harness so the
+        // fan-out is overwritable without forking the scheduler.
+        let batch_max = harness.config.batch_max_concurrent();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_max));
+        let executor = harness.executor.clone();
         let mut set = tokio::task::JoinSet::new();
         for (idx, call) in calls.iter().enumerate() {
             let call = call.clone();
@@ -407,6 +383,7 @@ where
             // open at once, in permit order rather than input order.
             let task_console = console.clone();
             let sem = sem.clone();
+            let executor = executor.clone();
             set.spawn(async move {
                 // The semaphore is never closed, but fail closed with
                 // the index intact rather than run unpermitted.
@@ -431,7 +408,8 @@ where
                 // carries no task payload).
                 let work = async {
                     let (name, input, outcome) =
-                        execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
+                        execute_tool_call(&call, &cancel, &policy, filter.as_ref(), &*executor)
+                            .await;
                     (name, input, outcome, started.elapsed())
                 };
                 match CatchUnwind::new(Box::pin(work), "tool worker panicked").await {

@@ -192,6 +192,26 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         let _ = session.append_message(&user);
     }
     messages.push(user);
+    // Runtime observation: the prompt entering the turn (truncated preview).
+    // Zero-cost without subscribers; skipped only when extensions never
+    // loaded (same fail-open contract as every lifecycle fire).
+    {
+        let sid = session
+            .as_ref()
+            .map(|s| s.id().to_string())
+            .unwrap_or_else(|| "headless".to_string());
+        let (preview, truncated, chars) = crate::extensions::text_preview(prompt);
+        crate::runtime::http::block_on(crate::extensions::fire_lifecycle_event(
+            "message.received",
+            serde_json::json!({
+                "session": sid,
+                "preview": preview,
+                "truncated": truncated,
+                "chars": chars,
+            }),
+            &crate::runtime::cancel::GlobalCancellation,
+        ));
+    }
     // The opencode gateway rejects requests without `x-opencode-session`;
     // explicit `--header` flags already baked into `extra_headers` still win.
     if let Some(session) = session.as_ref() {
@@ -212,6 +232,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     }));
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {
@@ -320,6 +341,7 @@ fn print_help() {
         run <tool> k=v...         one-shot tool (read, ls, bash, write, edit, grep, find)\n  \
           doctor                    show resolved provider/model config + origins\n  \
           usage <id|path>           plot token usage per model call from a session's event journal\n  \
+          runtime [graph]           print the resolved runtime-slot graph (harness.slots)\n  \
           mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
         update [--models|--all]   update dex itself; --models refreshes the model catalog\n  \
         --tool                    raw JSON tool mode (stdin)\n\
@@ -436,6 +458,98 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
     }
 }
 
+/// `dex runtime [graph]` — print the resolved harness snapshot: every
+/// `DexHarness` slot's selected implementation (config `harness.slots:`) and
+/// origin, plus the numeric budgets. Same resolver the turn loop calls, so
+/// the printed graph cannot drift from what a turn would run.
+fn run_runtime(action: &str) {
+    if action == "trace" {
+        // Invocation audit (spec §35): one line per extension-event dispatch.
+        let rows = crate::extensions::trace::snapshot();
+        if rows.is_empty() {
+            println!("dex runtime trace: no extension invocations recorded");
+            return;
+        }
+        println!("dex runtime trace ({} invocations)", rows.len());
+        for r in rows {
+            print!(
+                "  {:<24} {:<22} {:>6}ms  {}",
+                r.component, r.event, r.duration_ms, r.status
+            );
+            if let Some(detail) = &r.detail {
+                print!(" — {detail}");
+            }
+            println!();
+        }
+        return;
+    }
+    if action != "graph" {
+        eprintln!("usage: dex runtime [graph|trace]");
+        std::process::exit(1);
+    }
+    let (harness, rows) = crate::agent::registry::resolve_snapshot_with_origins();
+    println!("dex runtime graph");
+    println!("slots:");
+    // The agent-loop slot (spec §9): a registered Lua loop replaces the
+    // whole `run_turn` orchestration. Refresh first — a bare
+    // `global_manager()` only starts a background load, and this row must
+    // not race it (same contract as `dex extensions list`).
+    let (agent_loop, lua_opinions) = crate::runtime::http::block_on(async {
+        let mgr = crate::extensions::global_manager();
+        mgr.refresh().await;
+        let agent_loop = mgr.agent_loop().await;
+        let opinions = mgr.lua_opinion_holders().await;
+        (agent_loop, opinions)
+    });
+    let mut lua_opinions = lua_opinions
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    match agent_loop {
+        Some((id, _)) => println!("  {:<11} {:<24} lua extension", "agent_loop", id),
+        None => println!("  {:<11} {:<24} rust, builtin", "agent_loop", "run_turn"),
+    }
+    for row in rows {
+        // Lua opinions don't replace the slot: the first one wins, the
+        // Rust default decides otherwise — show who participates.
+        let lua = lua_opinions
+            .remove(row.slot)
+            .map(|holders| format!(" + lua opinion ({})", holders.join(", ")))
+            .unwrap_or_default();
+        println!(
+            "  {:<11} {:<24} {}{}",
+            row.slot,
+            row.resolved_id(),
+            row.origin(),
+            lua
+        );
+    }
+    // Lua-only slots (no registry row): consulted once per turn.
+    for (slot, holders) in &lua_opinions {
+        println!(
+            "  {:<11} {:<24} lua opinion ({}); first one wins, Rust default otherwise",
+            slot,
+            "lua-only slot",
+            holders.join(", ")
+        );
+    }
+    let config = &harness.config;
+    println!("budgets:");
+    println!("  max_tool_iterations     {}", config.max_tool_iterations());
+    println!(
+        "  max_compaction_attempts {}",
+        config.max_compaction_attempts()
+    );
+    println!(
+        "  batch_max_concurrent    {}",
+        config.batch_max_concurrent()
+    );
+    println!(
+        "  keep_recent_messages    {}",
+        config.keep_recent_messages()
+    );
+    println!("  min_to_summarize        {}", config.min_to_summarize());
+}
+
 /// `dex extensions <action>` — list, toggle, install, remove.
 fn run_extensions(action: &str, name: Option<&str>) {
     match action {
@@ -458,11 +572,11 @@ fn run_extensions(action: &str, name: Option<&str>) {
         }
         "install" => {
             let Some(src) = name else {
-                eprintln!("usage: dex extensions install <dir>");
+                eprintln!("usage: dex extensions install <dir|git-url>");
                 std::process::exit(2);
             };
             match crate::extensions::install(src) {
-                Ok(id) => println!("installed '{id}' — run `dex extensions list`"),
+                Ok(msg) => println!("{msg}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -484,7 +598,7 @@ fn run_extensions(action: &str, name: Option<&str>) {
         }
         _ => {
             eprintln!(
-                "usage: dex extensions [list|enable <id>|disable <id>|install <dir>|remove <id>]"
+                "usage: dex extensions [list|enable <id>|disable <id>|install <dir|git-url>|remove <id>]"
             );
             std::process::exit(2);
         }
@@ -637,6 +751,7 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
+        Mode::Runtime { action } => run_runtime(&action),
         Mode::Default => {
             // Start server in background, then launch TUI connected to it.
             let addr = match start_daemon_background() {

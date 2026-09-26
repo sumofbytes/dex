@@ -1,6 +1,13 @@
 //! The extension manager: load/reload, tool schema, dispatch.
 
 use crate::protocol::{FunctionDef, ToolDefinition};
+
+/// One fold step: `Next` carries the folded accumulator; `Stop` ends the
+/// chain with its value (deny, strict failure, or the first opinion).
+enum Chain<T> {
+    Next(T),
+    Stop(T),
+}
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,8 +20,25 @@ use super::hooks;
 use super::manifest::{self, Manifest};
 use super::{
     AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx,
-    HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
+    SupervisorAction, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
 };
+
+/// Directive shared by `before_agent_start` and `llm.before`: an optional
+/// non-empty `append` string; appends concatenate in load order. Fail-open —
+/// a missing/bad envelope contributes nothing.
+fn fold_append(
+    envelope: Result<serde_json::Map<String, serde_json::Value>, String>,
+    mut appends: Vec<String>,
+) -> Vec<String> {
+    if let Some(append) = envelope
+        .ok()
+        .and_then(|m| m.get("append").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
+    {
+        appends.push(append);
+    }
+    appends
+}
 
 pub struct LoadedExtension {
     pub manifest: Manifest,
@@ -28,6 +52,25 @@ pub struct LoadedExtension {
     pub shadows: Vec<String>,
     /// Registered slash commands: (name, description), sorted by name.
     pub commands: Vec<(String, String)>,
+    /// Slot names this extension wraps with `dex.wrap` middleware.
+    pub wraps: Vec<String>,
+    /// Slots the extension backs with `dex.fallback`.
+    pub fallbacks: Vec<String>,
+    /// Slots the extension implements with `dex.use` (spec §10).
+    pub uses: Vec<String>,
+    /// `agent_loop` component id when the chunk registered one via
+    /// `dex.replace("agent_loop", …)` (spec §9).
+    pub agent_loop: Option<String>,
+}
+
+impl LoadedExtension {
+    /// Whether this extension participates in `event`: an explicit handler
+    /// subscription or middleware over a wrappable slot.
+    pub fn serves(&self, event: &str) -> bool {
+        self.events.iter().any(|e| e == event)
+            || self.wraps.iter().any(|e| e == event)
+            || self.fallbacks.iter().any(|e| e == event)
+    }
 }
 
 pub struct ExtensionManager {
@@ -56,6 +99,25 @@ pub struct ExtensionManager {
     /// extension, and log twice. The second refresh then no-ops on the
     /// already-present ids.
     pub refresh_lock: tokio::sync::Mutex<()>,
+}
+
+/// Fire `runtime.start` exactly once per process: the first completed
+/// bootstrap load (daemon background refresh, one-shot inline, or a racing
+/// `ensure_loaded`) announces the runtime to observers. Zero-cost without
+/// subscribers.
+async fn fire_runtime_start_once() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
+    crate::extensions::fire_lifecycle_event(
+        "runtime.start",
+        serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        &crate::runtime::cancel::GlobalCancellation,
+    )
+    .await;
 }
 
 impl ExtensionManager {
@@ -115,6 +177,7 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
     }
 
     /// Load one extension: spawn the worker, run its chunk, validate the
@@ -125,7 +188,41 @@ impl ExtensionManager {
             .map_err(|e| format!("extension '{}' has no extension.lua: {e}", m.id_for_error()))?;
         let engine = ExtensionEngine::new(m.clone(), dir.to_path_buf())
             .map_err(|e| format!("extension '{}': {e}", m.id_for_error()))?;
-        let exports = engine.load(source).await?;
+        let mut exports = engine.load(source).await?;
+
+        // Declarative component files (spec §31): each loads on the same
+        // worker with the same registration contract, after `extension.lua`.
+        // Manifest paths are validated (relative, .lua, unique) at parse
+        // time; a missing or failing file fails the whole extension.
+        for (slot, file) in &m.components {
+            let path = dir.join(file);
+            let comp_source = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "extension '{}' component '{slot}' ({}): {e}",
+                    m.id_for_error(),
+                    path.display()
+                )
+            })?;
+            let comp = engine
+                .load(comp_source)
+                .await
+                .map_err(|e| format!("extension '{}' component '{slot}': {e}", m.id_for_error()))?;
+            exports.tools.extend(comp.tools);
+            exports.events.extend(comp.events);
+            exports.wraps.extend(comp.wraps);
+            exports.fallbacks.extend(comp.fallbacks);
+            exports.uses.extend(comp.uses);
+            exports.shadows.extend(comp.shadows);
+            exports.commands.extend(comp.commands);
+            exports.agent_loop = exports.agent_loop.or(comp.agent_loop);
+        }
+        // Merged component chunks can unsort these; restore the invariants
+        // (sorted + deduped) the single-chunk load guarantees.
+        exports.commands.sort_by(|a, b| a.0.cmp(&b.0));
+        exports.uses.sort();
+        exports.uses.dedup();
+        exports.shadows.sort();
+        exports.shadows.dedup();
 
         // Shadows target real built-ins, claimed first-wins in load order.
         // A shadow colliding with an earlier shadow, or targeting a
@@ -176,8 +273,12 @@ impl ExtensionManager {
                 engine,
                 tools,
                 events,
+                wraps: exports.wraps,
+                fallbacks: exports.fallbacks,
+                uses: exports.uses,
                 shadows: exports.shadows,
                 commands,
+                agent_loop: exports.agent_loop,
             },
         );
         Ok(())
@@ -190,6 +291,64 @@ impl ExtensionManager {
     /// racing background refresh must not wipe a concurrent loader).
     pub async fn refresh(&self) {
         self.refresh_found(discover_scoped()).await;
+    }
+
+    /// The agent-loop slot (spec §9): first loaded extension that registered
+    /// one via `dex.replace("agent_loop", …)`. Load order is sorted by id,
+    /// so first-wins is deterministic; a collision warns once, naming every
+    /// claimant. `None` = the Rust `run_turn` default.
+    pub async fn agent_loop(&self) -> Option<(String, ExtensionEngine)> {
+        let engines = self.engines.read().await;
+        let mut claimants: Vec<&str> = Vec::new();
+        let mut picked: Option<(String, ExtensionEngine)> = None;
+        for (ext_id, e) in engines.iter() {
+            if let Some(id) = &e.agent_loop {
+                claimants.push(ext_id);
+                if picked.is_none() {
+                    picked = Some((id.clone(), e.engine.clone()));
+                }
+            }
+        }
+        if claimants.len() > 1 {
+            crate::runtime::notice::warn_once(
+                "ext.agent-loop.collision",
+                &format!(
+                    "{} extensions registered an agent_loop ({}); '{}' wins (first by extension id) — disable the rest to change this",
+                    claimants.len(),
+                    claimants.join(", "),
+                    claimants[0]
+                ),
+            );
+        }
+        picked
+    }
+
+    /// Harness decision points where Lua currently participates, for
+    /// `dex runtime graph`: registry slot name (or the Lua-only slot
+    /// name) → participating extension ids. Participation is a consulted
+    /// opinion, not a replacement — the first opinion wins, an absent or
+    /// failing one falls back to the Rust default (the hook contract).
+    pub async fn lua_opinion_holders(&self) -> Vec<(&'static str, Vec<String>)> {
+        const LUA_OPINIONS: &[(&str, &str)] = &[
+            ("trigger", "harness.compact"),
+            ("overflow", "harness.overflow"),
+            ("conflict", "harness.conflict"),
+            ("summarizer", "harness.summarize"),
+            ("model_selector", "model_selector"),
+            ("tool_catalog", "tool_catalog"),
+        ];
+        let engines = self.engines.read().await;
+        LUA_OPINIONS
+            .iter()
+            .filter_map(|(slot, event)| {
+                let holders: Vec<String> = engines
+                    .values()
+                    .filter(|e| e.serves(event))
+                    .map(|e| e.manifest.id.clone())
+                    .collect();
+                (!holders.is_empty()).then_some((*slot, holders))
+            })
+            .collect()
     }
 
     /// Ensure one extension is loaded, booting just it on first use (§26):
@@ -225,6 +384,7 @@ impl ExtensionManager {
         }
         self.load_one(&dir, m).await?;
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
         Ok(())
     }
 
@@ -256,6 +416,7 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
     }
 
     /// Unload engines whose id is not in `keep`, dropping their prompt
@@ -452,7 +613,7 @@ impl ExtensionManager {
             let Some(ext) = engines.get(ext_id) else {
                 return Err(format!("unknown extension '{ext_id}'"));
             };
-            if !ext.events.contains(&event.to_string()) {
+            if !ext.serves(event) {
                 return Err(format!("extension '{ext_id}' has no '{event}' handlers"));
             }
             ext.engine.clone()
@@ -470,6 +631,12 @@ impl ExtensionManager {
             )
             .await;
         let elapsed = started.elapsed();
+        match &out {
+            Ok(_) => super::trace::record(ext_id, event, elapsed, "ok", None),
+            Err(error) => {
+                super::trace::record(ext_id, event, elapsed, "error", Some(error.clone()))
+            }
+        }
         if elapsed >= SLOW_HOOK_WARN {
             eprintln!(
                 "dex: [extensions] '{ext_id}' {event} took {}ms (slow hook adds per-turn latency)",
@@ -489,70 +656,95 @@ impl ExtensionManager {
         args: &serde_json::Map<String, serde_json::Value>,
         host: &HostCtx<'_>,
     ) -> BeforeOutcome {
-        let mut current = args.clone();
-        let mut mutated_by = Vec::new();
-        let subs: Vec<(String, bool)> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"tool.before".to_string()))
-                .map(|e| (e.manifest.id.clone(), e.manifest.strict))
-                .collect()
-        };
-        for (id, strict) in subs {
-            let payload = serde_json::json!({"tool": tool, "args": current});
-            let envelope = match self.run_event(&id, "tool.before", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool.before failed: {error}");
-                    if strict {
-                        return BeforeOutcome::Denied {
-                            by: id,
-                            reason: format!("hook failed (strict): {error}"),
-                        };
-                    }
-                    continue;
-                }
-            };
-            let envelope: serde_json::Map<String, serde_json::Value> =
-                match serde_json::from_str(&envelope) {
-                    Ok(serde_json::Value::Object(map)) => map,
-                    _ => {
-                        eprintln!("dex: [extensions] '{id}' tool.before returned bad envelope");
-                        if strict {
-                            return BeforeOutcome::Denied {
-                                by: id,
-                                reason: "hook failed (strict): bad envelope".to_string(),
+        // Fold state: the running args, who mutated them, and the deny (set
+        // only on the `Stop` that ends the chain — never on `Next`, so the
+        // payload is always built from the running args).
+        struct BeforeFold {
+            args: serde_json::Map<String, serde_json::Value>,
+            mutated_by: Vec<String>,
+            deny: Option<(String, String)>,
+        }
+        let state = self
+            .run_chain(
+                "tool.before",
+                host,
+                BeforeFold {
+                    args: args.clone(),
+                    mutated_by: Vec::new(),
+                    deny: None,
+                },
+                |state| state.deny.is_some(),
+                |state| serde_json::json!({ "tool": tool, "args": state.args }),
+                |id, strict, envelope, state| {
+                    let map = match envelope {
+                        Ok(map) => map,
+                        // The engine logged it; `strict` turns the failure
+                        // into a deny, fail-open keeps the current args.
+                        Err(error) => {
+                            return if strict {
+                                Chain::Stop(BeforeFold {
+                                    deny: Some((
+                                        id.to_string(),
+                                        format!("hook failed (strict): {error}"),
+                                    )),
+                                    ..state
+                                })
+                            } else {
+                                Chain::Next(state)
                             };
                         }
-                        continue;
+                    };
+                    let (next, deny) = match hooks::parse_before(&map) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            dex_runtime::log!(
+                                Warn,
+                                "extensions: '{id}' tool.before failed: {error}"
+                            );
+                            return if strict {
+                                Chain::Stop(BeforeFold {
+                                    deny: Some((
+                                        id.to_string(),
+                                        format!("hook failed (strict): {error}"),
+                                    )),
+                                    ..state
+                                })
+                            } else {
+                                Chain::Next(state)
+                            };
+                        }
+                    };
+                    if let Some((_, reason)) = deny {
+                        dex_runtime::log!(
+                            Warn,
+                            "extensions: '{id}' tool.before denied '{tool}': {reason}"
+                        );
+                        return Chain::Stop(BeforeFold {
+                            deny: Some((id.to_string(), reason)),
+                            ..state
+                        });
                     }
-                };
-            let (next, deny) = match hooks::parse_before(&envelope) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool.before failed: {error}");
-                    if strict {
-                        return BeforeOutcome::Denied {
-                            by: id,
-                            reason: format!("hook failed (strict): {error}"),
-                        };
-                    }
-                    continue;
-                }
-            };
-            if let Some((_, reason)) = deny {
-                eprintln!("dex: [extensions] '{id}' tool.before denied '{tool}': {reason}");
-                return BeforeOutcome::Denied { by: id, reason };
-            }
-            if next != current {
-                mutated_by.push(id.clone());
-            }
-            current = next;
-        }
-        BeforeOutcome::Proceed {
-            args: current,
-            mutated_by,
+                    let mutated_by = if next != state.args {
+                        let mut by = state.mutated_by;
+                        by.push(id.to_string());
+                        by
+                    } else {
+                        state.mutated_by
+                    };
+                    Chain::Next(BeforeFold {
+                        args: next,
+                        mutated_by,
+                        deny: None,
+                    })
+                },
+            )
+            .await;
+        match state.deny {
+            Some((by, reason)) => BeforeOutcome::Denied { by, reason },
+            None => BeforeOutcome::Proceed {
+                args: state.args,
+                mutated_by: state.mutated_by,
+            },
         }
     }
 
@@ -567,58 +759,47 @@ impl ExtensionManager {
         ok: bool,
         host: &HostCtx<'_>,
     ) -> AfterOutcome {
-        let mut current_text = text.to_string();
-        let mut current_ok = ok;
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"tool.after".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let payload = serde_json::json!({
-                "tool": tool,
-                "args": args,
-                "content": current_text,
-                "is_error": !current_ok,
-            });
-            let envelope = match self.run_event(&id, "tool.after", payload, host).await {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' tool.after failed: {error}");
-                    continue;
-                }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            (current_text, current_ok) = hooks::parse_after(&envelope, &current_text, current_ok);
-        }
-        AfterOutcome {
-            text: current_text,
-            ok: current_ok,
-        }
+        let (text, ok) = self
+            .run_chain(
+                "tool.after",
+                host,
+                (text.to_string(), ok),
+                |_| false,
+                |(content, is_error)| {
+                    serde_json::json!({
+                        "tool": tool,
+                        "args": args,
+                        "content": content,
+                        "is_error": !is_error,
+                    })
+                },
+                |_, _, envelope, (text, ok)| {
+                    // `map_or` would clone the full result text even when
+                    // the hook succeeded — only the error path needs it.
+                    let folded = envelope.ok().map_or_else(
+                        || (text.clone(), ok),
+                        |map| hooks::parse_after(&map, &text, ok),
+                    );
+                    Chain::Next(folded)
+                },
+            )
+            .await;
+        AfterOutcome { text, ok }
     }
 
     /// Fire-and-forget lifecycle event (`turn.start`/`turn.end`): run every
     /// subscriber in load order, log failures, ignore directives — these
     /// events carry no decision the host acts on.
     pub async fn fire_event(&self, event: &str, payload: serde_json::Value, host: &HostCtx<'_>) {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&event.to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            if let Err(error) = self.run_event(&id, event, payload.clone(), host).await {
-                eprintln!("dex: [extensions] '{id}' {event} failed: {error}");
-            }
-        }
+        self.run_chain(
+            event,
+            host,
+            (),
+            |_| false,
+            |_| payload.clone(),
+            |_, _, _, _| Chain::Next(()),
+        )
+        .await;
     }
 
     /// `before_agent_start` chain: each handler may return `{ append = text }`
@@ -627,36 +808,246 @@ impl ExtensionManager {
     /// turn before it starts. Read-only influence: no gate interaction (the
     /// hook host still gets the turn's policy for nested `dex.tools.call`).
     pub async fn apply_before_agent_start(&self, host: &HostCtx<'_>) -> Vec<String> {
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"before_agent_start".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        let mut appends = Vec::new();
-        for id in subs {
-            let envelope = match self
-                .run_event(&id, "before_agent_start", serde_json::json!({}), host)
-                .await
+        self.run_chain(
+            "before_agent_start",
+            host,
+            Vec::new(),
+            |_| false,
+            |_| serde_json::json!({}),
+            |_, _, envelope, appends| Chain::Next(fold_append(envelope, appends)),
+        )
+        .await
+    }
+
+    /// `supervisor.route` chain: merged across handlers in load order — the
+    /// first redirect wins, any deny wins (attributed). Errors/bad envelopes
+    /// fail open to no opinion (normal spawn flow).
+    pub async fn query_supervisor_route(
+        &self,
+        agent: &str,
+        task: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> SupervisorAction {
+        self.run_chain(
+            "supervisor.route",
+            host,
+            SupervisorAction::default(),
+            |_| false,
+            |_| serde_json::json!({ "agent": agent, "task": task }),
+            |id, _, envelope, mut action| {
+                if let Ok(map) = envelope {
+                    let (redirect, deny) = hooks::parse_supervisor(&map);
+                    if action.agent.is_none() {
+                        action.agent = redirect;
+                    }
+                    if action.deny.is_none() {
+                        action.deny = deny.map(|reason| (id.to_string(), reason));
+                    }
+                }
+                Chain::Next(action)
+            },
+        )
+        .await
+    }
+
+    /// `permission.request` chain: first explicit `{decision = "allow"|"deny"}`
+    /// wins in load order; nil/garbage/errors fail open to `None` (the normal
+    /// approval flow). An explicit deny is honored downstream and attributed.
+    pub async fn query_permission(
+        &self,
+        tool: &str,
+        args: &serde_json::Map<String, serde_json::Value>,
+        requirement: &str,
+        mode: &str,
+        host: &HostCtx<'_>,
+    ) -> Option<(hooks::PermissionDecision, String, String)> {
+        self.run_chain(
+            "permission.request",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "tool": tool,
+                    "args": args,
+                    "requirement": requirement,
+                    "mode": mode,
+                })
+            },
+            |id, _, envelope, _| match envelope.ok().and_then(|m| hooks::parse_permission(&m)) {
+                Some((decision, reason)) => Chain::Stop(Some((decision, reason, id.to_string()))),
+                None => Chain::Next(None),
+            },
+        )
+        .await
+    }
+
+    /// `llm.before` chain: each handler may return `{append = text}` (or set
+    /// `ev.append`); strings concatenate in load order and the host persists
+    /// them as one user-role note before the compaction gate, so appends
+    /// count toward the window. Fail-open. Read-only influence otherwise.
+    pub async fn apply_llm_before(
+        &self,
+        host: &HostCtx<'_>,
+        payload: serde_json::Value,
+    ) -> Vec<String> {
+        self.run_chain(
+            "llm.before",
+            host,
+            Vec::new(),
+            |_| false,
+            |_| payload.clone(),
+            |_, _, envelope, appends| Chain::Next(fold_append(envelope, appends)),
+        )
+        .await
+    }
+
+    /// `harness.overflow` chain: first non-`nil` `{overflow = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (Rust default).
+    pub async fn query_harness_overflow(&self, message: &str, host: &HostCtx<'_>) -> Option<bool> {
+        let payload = serde_json::json!({ "message": message });
+        self.first_harness_bool("harness.overflow", "overflow", payload, host)
+            .await
+    }
+
+    /// `harness.conflict` chain: first non-`nil` `{conflicts = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (Rust default,
+    /// which is fail-closed to serialization).
+    pub async fn query_harness_conflict(
+        &self,
+        calls: &serde_json::Value,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        let payload = serde_json::json!({ "calls": calls });
+        self.first_harness_bool("harness.conflict", "conflicts", payload, host)
+            .await
+    }
+
+    /// `harness.compact` chain: first non-`nil` `{compact = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (the Rust
+    /// trigger decides). Decision inputs are counts only — no conversation
+    /// content crosses the boundary (spec §11).
+    pub async fn query_harness_compact(
+        &self,
+        stored_tokens: u64,
+        ephemeral_overhead: u64,
+        message_count: usize,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        let payload = serde_json::json!({
+            "stored_tokens": stored_tokens,
+            "ephemeral_overhead": ephemeral_overhead,
+            "message_count": message_count,
+        });
+        self.first_harness_bool("harness.compact", "compact", payload, host)
+            .await
+    }
+
+    /// `harness.summarize` chain: first non-empty `{summary = "..."}` wins
+    /// in load order; errors, non-strings, and empty strings fail open to
+    /// `None` (the Rust summarizer runs — compaction must not become
+    /// extension-hostage).
+    pub async fn query_harness_summarize(
+        &self,
+        conversation: &str,
+        previous_summary: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> Option<String> {
+        self.run_chain(
+            "harness.summarize",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "conversation": conversation,
+                    "previous_summary": previous_summary,
+                })
+            },
+            |_, _, envelope, _| match envelope
+                .ok()
+                .and_then(|m| hooks::parse_harness_string(&m, "summary"))
             {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' before_agent_start failed: {error}");
-                    continue;
+                Some(summary) => Chain::Stop(Some(summary)),
+                None => Chain::Next(None),
+            },
+        )
+        .await
+    }
+
+    /// `model_selector` chain: first non-empty `{model = "..."}` (or a bare
+    /// string return, which the envelope carries as `content`) wins in load
+    /// order. Errors, non-strings, and empty strings fail open to `None` —
+    /// the configured model is served, never a half-resolved one. The host
+    /// still resolves the selection against the catalog + credentials
+    /// (`apply_model`), so an unresolvable provider fails open there too.
+    /// The payload says `current`/`previous`, never `model`: the ev fold
+    /// merges payload keys into the directive envelope, and a payload key
+    /// must not shadow the directive key.
+    pub async fn query_model_selector(
+        &self,
+        current: &str,
+        previous: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> Option<String> {
+        self.run_chain(
+            "model_selector",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "current": current,
+                    "previous": previous,
+                })
+            },
+            |_, _, envelope, _| {
+                let pick = envelope.ok().and_then(|m| {
+                    hooks::parse_harness_string(&m, "model")
+                        .or_else(|| hooks::parse_harness_string(&m, "content"))
+                });
+                match pick {
+                    Some(model) => Chain::Stop(Some(model)),
+                    None => Chain::Next(None),
                 }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            if let Some(append) = envelope.get("append").and_then(|v| v.as_str()) {
-                if !append.trim().is_empty() {
-                    appends.push(append.to_string());
-                }
-            }
-        }
-        appends
+            },
+        )
+        .await
+    }
+
+    /// `tool_catalog` chain (spec §7/§11): the first handler returning
+    /// `{keep = [...]} / {drop = [...]}` narrows the schema list in load
+    /// order. Narrowing-only: the applied result is always a subset of the
+    /// input (unknown names in `keep` are ignored, `drop` removes). Errors
+    /// and empty envelopes fail open to `None` — the unfiltered catalog is
+    /// served, never a half-resolved one.
+    pub async fn query_tool_catalog(
+        &self,
+        schemas: &[ToolDefinition],
+        host: &HostCtx<'_>,
+    ) -> Option<Vec<ToolDefinition>> {
+        self.run_chain(
+            "tool_catalog",
+            host,
+            None,
+            Option::is_some,
+            |_| {
+                serde_json::json!({
+                    "tools": schemas
+                        .iter()
+                        .map(|t| serde_json::json!({
+                            "name": t.function.name,
+                            "description": t.function.description,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            },
+            |_, _, envelope, _| match envelope.ok().and_then(|m| hooks::parse_catalog_filter(&m)) {
+                Some(filter) => Chain::Stop(Some(filter.apply(schemas))),
+                None => Chain::Next(None),
+            },
+        )
+        .await
     }
 
     /// `session.before_compact` chain: merged across handlers — any cancel
@@ -669,45 +1060,141 @@ impl ExtensionManager {
         message_count: usize,
         host: &HostCtx<'_>,
     ) -> CompactAction {
-        let mut action = CompactAction {
-            cancel: false,
-            instructions: Vec::new(),
-            summary: None,
-        };
         let payload = serde_json::json!({ "emergency": emergency, "messages": message_count });
-        let subs: Vec<String> = {
-            let engines = self.engines.read().await;
-            engines
-                .values()
-                .filter(|e| e.events.contains(&"session.before_compact".to_string()))
-                .map(|e| e.manifest.id.clone())
-                .collect()
-        };
-        for id in subs {
-            let envelope = match self
-                .run_event(&id, "session.before_compact", payload.clone(), host)
-                .await
-            {
-                Ok(json) => json,
-                Err(error) => {
-                    eprintln!("dex: [extensions] '{id}' session.before_compact failed: {error}");
-                    continue;
+        self.run_chain(
+            "session.before_compact",
+            host,
+            CompactAction {
+                cancel: false,
+                instructions: Vec::new(),
+                summary: None,
+            },
+            |_| false,
+            |_| payload.clone(),
+            |_, _, envelope, mut action| {
+                if let Ok(map) = envelope {
+                    let parsed = hooks::parse_compact(&map);
+                    action.cancel |= parsed.cancel;
+                    action.instructions.extend(parsed.instructions);
+                    if action.summary.is_none() {
+                        action.summary = parsed.summary;
+                    }
                 }
-            };
-            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
-                continue;
-            };
-            let parsed = hooks::parse_compact(&envelope);
-            action.cancel |= parsed.cancel;
-            action.instructions.extend(parsed.instructions);
-            if action.summary.is_none() {
-                action.summary = parsed.summary;
+                Chain::Next(action)
+            },
+        )
+        .await
+    }
+
+    /// Subscriber snapshot for `event`, in hook order (extensions are
+    /// id-sorted): `(extension id, strict)`. Every chain shares this one
+    /// selection — `serves` covers explicit handler subscriptions and
+    /// `dex.wrap`/`dex.fallback` middleware alike, matching what `run_event`
+    /// independently re-checks. For event chains the selection is exactly
+    /// `events.contains`: wrap/fallback registration only accepts the
+    /// wrappable slots (`model_selector`, `harness.*`, `tool_catalog`),
+    /// none of which are event names — keep that pairing intact if the
+    /// wrappable set ever grows.
+    async fn subscribers(&self, event: &str) -> Vec<(String, bool)> {
+        self.engines
+            .read()
+            .await
+            .values()
+            .filter(|e| e.serves(event))
+            .map(|e| (e.manifest.id.clone(), e.manifest.strict))
+            .collect()
+    }
+
+    /// The one hook-chain engine.
+    ///
+    /// Every chain — before/after middleware, first-wins slots, merge
+    /// folds, fire-and-forget events — is this loop with a different fold.
+    /// The engine owns everything that used to be hand-rolled per chain:
+    /// subscriber selection, per-handler payload construction, the run +
+    /// envelope parse, error logging, and short-circuiting. The fold owns
+    /// only the event's own semantics: read the directive out of one
+    /// envelope and fold it into the running value.
+    ///
+    /// - `seed` — the chain's initial accumulator (`()`, `Vec`, `Option`, …).
+    /// - `done` — the accumulator is final: stop *before* running the next
+    ///   handler (first-wins chains pass `Option::is_some`).
+    /// - `payload` — one handler's request, built from the current
+    ///   accumulator (threaded middleware folds its state back in).
+    /// - `fold` — one handler's contribution: the extension id, its
+    ///   `strict` flag, the parsed directive envelope (or the run error,
+    ///   already logged), and the accumulator. `Next` carries the folded
+    ///   value; `Stop` ends the chain with that value (deny, strict
+    ///   failure, or the first explicit opinion).
+    ///
+    /// Errors fail open by contract: the engine logs and hands the error
+    /// to the fold, which decides — skip (`Continue`) everywhere except
+    /// `tool.before`, where `strict = true` denies. Chain failures surface
+    /// through the shared warning channel (`dex_runtime::log!`), not bare
+    /// stderr.
+    async fn run_chain<T>(
+        &self,
+        event: &str,
+        host: &HostCtx<'_>,
+        seed: T,
+        done: impl Fn(&T) -> bool,
+        mut payload: impl FnMut(&T) -> serde_json::Value,
+        mut fold: impl FnMut(
+            &str,
+            bool,
+            Result<serde_json::Map<String, serde_json::Value>, String>,
+            T,
+        ) -> Chain<T>,
+    ) -> T {
+        let mut acc = seed;
+        for (id, strict) in self.subscribers(event).await {
+            if done(&acc) {
+                break;
             }
+            let envelope = match self.run_event(&id, event, payload(&acc), host).await {
+                Ok(json) => serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .ok_or_else(|| "returned bad envelope".to_string()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = &envelope {
+                dex_runtime::log!(Warn, "extensions: '{id}' {event} failed: {error}");
+            }
+            acc = match fold(&id, strict, envelope, acc) {
+                Chain::Stop(final_value) => return final_value,
+                Chain::Next(next) => next,
+            };
         }
-        action
+        acc
+    }
+
+    /// First-wins boolean slot (`harness.overflow` / `harness.conflict` /
+    /// `harness.compact`): the first handler naming `key` wins in load
+    /// order; errors and absent keys fail open to `None` (the Rust default).
+    async fn first_harness_bool(
+        &self,
+        event: &str,
+        key: &str,
+        payload: serde_json::Value,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        self.run_chain(
+            event,
+            host,
+            None,
+            Option::is_some,
+            |_| payload.clone(),
+            |_, _, envelope, _| match envelope
+                .ok()
+                .and_then(|m| hooks::parse_harness_bool(&m, key))
+            {
+                Some(v) => Chain::Stop(Some(v)),
+                None => Chain::Next(None),
+            },
+        )
+        .await
     }
 }
-
 impl ExtensionManager {
     /// `dex.tools.set_active` backing store (full names — the extension-facing
     /// `set_active_global` resolves short names first). Stored as-given:
@@ -745,11 +1232,81 @@ impl ExtensionManager {
     }
 }
 
-/// `dex extensions install <dir>`: copy an extension directory into the
-/// user-scope dir. The manifest must parse — install validates before
-/// copying so a broken extension never lands.
+/// `dex extensions install <dir|git-url>`: install an extension into the
+/// user-scope dir. A local path is copied as-is; anything with a `://`
+/// scheme (https://, file://, …) is treated as a remote source and shallow
+/// git-cloned to a temp dir first. The manifest must parse — install
+/// validates before copying so a broken extension never lands. A local
+/// install returns the id; a remote install returns a ready-to-print
+/// message noting that the extension stays disabled until explicitly
+/// enabled (remote code is code the user has never audited).
 pub fn install(src: &str) -> Result<String, String> {
-    let src = PathBuf::from(src);
+    if src.contains("://") {
+        install_remote(src)
+    } else {
+        install_dir(PathBuf::from(src))
+            .map(|id| format!("installed '{id}' — run `dex extensions list`"))
+    }
+}
+
+/// Remote sources (spec §32): `git clone --depth 1 <url>` into a private
+/// temp dir, then the same validate+copy path as a local install. The
+/// manifest must sit at the repo root (one extension per repo — a
+/// multi-extension repo is a packaging concern for the repo author). The
+/// temp dir is removed on every path out.
+fn install_remote(url: &str) -> Result<String, String> {
+    // Plain `http://` is refused: a MITM'd clone is remote code execution
+    // by construction. `file://` stays allowed — it is a local repo, the
+    // same trust level as `install <dir>` (and it keeps the clone path
+    // testable offline).
+    if !(url.starts_with("https://") || url.starts_with("git@") || url.starts_with("file://")) {
+        return Err(format!(
+            "unsupported remote source {url:?}: use an https:// or git@ URL"
+        ));
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "dex-ext-install-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| {
+        let out = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", url])
+            .arg(&tmp)
+            .output()
+            .map_err(|e| format!("running git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        if !tmp.join("manifest.yaml").is_file() {
+            return Err(format!(
+                "{url} has no manifest.yaml at the repo root (one extension per repo)"
+            ));
+        }
+        let id = install_dir(tmp.clone())?;
+        // Remote code is code the user has not audited: it does not load
+        // until `dex extensions enable <id>` — the same explicit consent a
+        // project-scope extension needs. (User-scope loads unless disabled,
+        // so a bare install would arm it immediately.)
+        super::discovery::set_enabled(&id, false)
+            .map_err(|e| format!("marking '{id}' disabled: {e}"))?;
+        Ok(format!(
+            "installed '{id}' from {url} — it stays disabled until \
+`dex extensions enable {id}` (remote code needs explicit consent)"
+        ))
+    })();
+    std::fs::remove_dir_all(&tmp).ok();
+    result
+}
+
+/// Local-dir install: validate the manifest, copy into the user-scope dir.
+fn install_dir(src: PathBuf) -> Result<String, String> {
     let text = std::fs::read_to_string(src.join("manifest.yaml"))
         .map_err(|e| format!("{}: {e}", src.display()))?;
     let manifest = manifest::parse_manifest(&text)?;

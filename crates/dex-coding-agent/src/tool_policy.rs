@@ -51,10 +51,98 @@ pub fn native_tool_metadata(name: &str) -> Option<ToolMetadata> {
 
 /// Whether the tool's permission requirement needs human approval in a mode.
 pub fn needs_approval(requirement: PermissionRequirement, mode: PermissionMode) -> bool {
-    !matches!(
-        (requirement, mode),
-        (PermissionRequirement::Read, _) | (_, PermissionMode::Trusted)
-    )
+    DefaultApprovalPolicy.needs_approval(requirement, mode)
+}
+
+/// Overwritable approval metadata + gate.
+///
+/// The default answers native tools from [`native_tool_metadata`] and gates
+/// everything else as unknown (`None`); hosts extend it with MCP/extension
+/// rows. Override to auto-approve lists, per-tool modes, or custom UX
+/// without forking dispatch.
+pub trait ApprovalPolicy: Send + Sync {
+    fn metadata(&self, name: &str) -> Option<ToolMetadata>;
+    fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool;
+}
+
+/// Default policy: native metadata + [`needs_approval`] gate.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultApprovalPolicy;
+
+impl ApprovalPolicy for DefaultApprovalPolicy {
+    fn metadata(&self, name: &str) -> Option<ToolMetadata> {
+        native_tool_metadata(name)
+    }
+
+    fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool {
+        !matches!(
+            (requirement, mode),
+            (PermissionRequirement::Read, _) | (_, PermissionMode::Trusted)
+        )
+    }
+}
+
+/// Closure policy with an overridable gate.
+///
+/// `FnApprovalPolicy::new(f)` overrides metadata and keeps the default
+/// gate; `.with_gate(g)` (or `FnApprovalPolicy::with_gate(f, g)`) replaces
+/// the gate too — e.g. an auto-approve list — without forking dispatch.
+pub struct FnApprovalPolicy<F, G = fn(PermissionRequirement, PermissionMode) -> bool> {
+    metadata_fn: F,
+    gate_fn: G,
+}
+
+fn default_gate(requirement: PermissionRequirement, mode: PermissionMode) -> bool {
+    DefaultApprovalPolicy.needs_approval(requirement, mode)
+}
+
+impl<F> FnApprovalPolicy<F, fn(PermissionRequirement, PermissionMode) -> bool>
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
+{
+    pub fn new(f: F) -> Self {
+        Self {
+            metadata_fn: f,
+            gate_fn: default_gate,
+        }
+    }
+
+    pub fn with_gate<G>(self, g: G) -> FnApprovalPolicy<F, G>
+    where
+        G: Fn(PermissionRequirement, PermissionMode) -> bool + Send + Sync,
+    {
+        FnApprovalPolicy {
+            metadata_fn: self.metadata_fn,
+            gate_fn: g,
+        }
+    }
+}
+
+impl<F, G> FnApprovalPolicy<F, G>
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
+    G: Fn(PermissionRequirement, PermissionMode) -> bool + Send + Sync,
+{
+    pub fn with_parts(metadata_fn: F, gate_fn: G) -> Self {
+        Self {
+            metadata_fn,
+            gate_fn,
+        }
+    }
+}
+
+impl<F, G> ApprovalPolicy for FnApprovalPolicy<F, G>
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
+    G: Fn(PermissionRequirement, PermissionMode) -> bool + Send + Sync,
+{
+    fn metadata(&self, name: &str) -> Option<ToolMetadata> {
+        (self.metadata_fn)(name)
+    }
+
+    fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool {
+        (self.gate_fn)(requirement, mode)
+    }
 }
 
 #[cfg(test)]
@@ -88,5 +176,12 @@ mod tests {
             PermissionRequirement::Shell,
             PermissionMode::Trusted
         ));
+    }
+
+    #[test]
+    fn fn_policy_overrides_metadata_and_gate() {
+        let policy = FnApprovalPolicy::new(native_tool_metadata).with_gate(|_, _| false);
+        assert!(policy.metadata("read").is_some());
+        assert!(!policy.needs_approval(PermissionRequirement::Shell, PermissionMode::Ask));
     }
 }

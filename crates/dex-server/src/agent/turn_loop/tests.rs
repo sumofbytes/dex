@@ -167,6 +167,7 @@ async fn turn_lifecycle_hooks_fire_around_the_turn() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     assert!(result.is_ok(), "{result:?}");
@@ -180,6 +181,80 @@ async fn turn_lifecycle_hooks_fire_around_the_turn() {
     // the turn.end hook writing a marker file on every later turn in
     // this test process.
     crate::extensions::global_manager().reset_for_tests().await;
+}
+
+/// `model_selector` overrides the model this turn serves: the recorded
+/// snapshot (what `dex.model` and `model_select` see) follows the Lua
+/// opinion, and a failing selector fails open to the configured model.
+#[tokio::test]
+async fn model_selector_overrides_the_served_model_and_fails_open() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let mgr = crate::extensions::global_manager();
+    mgr.reset_for_tests().await;
+    let manifest = "manifest_version: 1\nid: msel\nversion: 0.1.0\ncapabilities: []\n";
+    let lua = "return function(dex)\n  dex.events.on(\"model_selector\", function(ctx, ev)\n    return { model = \"m-9\" }\n  end)\nend\n";
+    let root = crate::extensions::tests::fixture_exts(&[("msel", manifest, lua)]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &MockModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    // The served snapshot follows the Lua pick — `dex.model`'s view of the
+    // turn (`anthropic` = the test config's provider).
+    assert_eq!(
+        crate::extensions::served_model_snapshot().map(|s| s.id()),
+        Some("anthropic/m-9".to_string())
+    );
+    std::fs::remove_dir_all(&root).ok();
+    // Fail-open: a broken selector keeps the configured model served.
+    mgr.reset_for_tests().await;
+    let lua_bad = "return function(dex)\n  dex.events.on(\"model_selector\", function(ctx, ev)\n    error(\"boom\")\n  end)\nend\n";
+    let root = crate::extensions::tests::fixture_exts(&[("msel-bad", manifest, lua_bad)]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &MockModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        crate::extensions::served_model_snapshot().map(|s| s.id()),
+        Some("anthropic/mock".to_string())
+    );
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// `before_agent_start` appends to the System prompt for the turn's
@@ -240,6 +315,7 @@ async fn before_agent_start_appends_system_prompt_and_restores() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     assert!(result.is_ok(), "{result:?}");
@@ -278,6 +354,7 @@ async fn process_turn_completes_with_injected_client() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     assert!(result.is_ok());
@@ -357,6 +434,7 @@ async fn tool_result_streams_summary_preview_and_success() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     let mut events = Vec::new();
@@ -462,7 +540,15 @@ async fn parallel_batch_preserves_input_order() {
     let (sink_tx, mut sink_rx) = mpsc::channel(32);
     let (approval_tx, _approval_rx) = mpsc::channel(16);
     let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
-    let results = run_tool_batch(&calls, &NeverCancel, &Policy::trusted(), None, &console).await;
+    let results = run_tool_batch(
+        &calls,
+        &NeverCancel,
+        &Policy::trusted(),
+        None,
+        &console,
+        &crate::agent::composable::DexHarness::default(),
+    )
+    .await;
     assert_eq!(results.len(), 2);
     assert!(
         results[0].1.contains("definitely-not-here-a.rs"),
@@ -503,7 +589,15 @@ async fn serial_batch_cancel_fills_every_slot() {
     let (sink_tx, _sink_rx) = mpsc::channel(32);
     let (approval_tx, _approval_rx) = mpsc::channel(16);
     let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
-    let results = run_tool_batch(&calls, &AlwaysCancel, &Policy::trusted(), None, &console).await;
+    let results = run_tool_batch(
+        &calls,
+        &AlwaysCancel,
+        &Policy::trusted(),
+        None,
+        &console,
+        &crate::agent::composable::DexHarness::default(),
+    )
+    .await;
     assert_eq!(results.len(), calls.len());
     for (result, call) in results.iter().zip(calls.iter()) {
         assert_eq!(result.0, "edit");
@@ -535,7 +629,15 @@ async fn parallel_batch_cancel_keeps_order_and_count() {
     let (sink_tx, _sink_rx) = mpsc::channel(64);
     let (approval_tx, _approval_rx) = mpsc::channel(16);
     let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
-    let results = run_tool_batch(&calls, &AlwaysCancel, &Policy::trusted(), None, &console).await;
+    let results = run_tool_batch(
+        &calls,
+        &AlwaysCancel,
+        &Policy::trusted(),
+        None,
+        &console,
+        &crate::agent::composable::DexHarness::default(),
+    )
+    .await;
     assert_eq!(results.len(), calls.len());
     for (result, call) in results.iter().zip(calls.iter()) {
         assert_eq!(result.0, "read", "result keeps its own call's name");
@@ -578,6 +680,8 @@ fn then_run_forces_serialization() {
 
 #[test]
 fn overflow_wording_is_recognized() {
+    use crate::agent::composable::DexHarness;
+    let harness = DexHarness::default();
     for msg in [
         "API error: This model's maximum context length is 8192 tokens",
         "input length exceeds context window",
@@ -588,13 +692,13 @@ fn overflow_wording_is_recognized() {
         "token limit exceeded",
         "please reduce the length of the context",
     ] {
-        assert!(is_context_overflow(msg), "{msg}");
+        assert!(harness.is_overflow(msg), "{msg}");
     }
-    assert!(!is_context_overflow("API error: invalid api key"));
-    assert!(!is_context_overflow("stream idle for over 90s"));
+    assert!(!harness.is_overflow("API error: invalid api key"));
+    assert!(!harness.is_overflow("stream idle for over 90s"));
     // Generic length validation without a context anchor must not
     // trigger a wasteful emergency compaction.
-    assert!(!is_context_overflow("reduce the length of your filename"));
+    assert!(!harness.is_overflow("reduce the length of your filename"));
 }
 
 #[test]
@@ -672,6 +776,7 @@ async fn turn_budget_stops_an_endless_tool_loop() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await
     .unwrap_err()
@@ -756,6 +861,7 @@ async fn context_overflow_compacts_and_retries_once() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     assert!(
@@ -814,6 +920,7 @@ async fn cancel_during_llm_call_unwinds_promptly() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await
     .unwrap_err();
@@ -894,6 +1001,7 @@ async fn cancel_during_tool_io_suppresses_result_fanout() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await
     .unwrap_err();
@@ -994,6 +1102,7 @@ async fn repeated_tool_guard_counts_after_ring_eviction() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     let guard_hits = messages
@@ -1029,6 +1138,7 @@ async fn repeated_tool_guard_fires_on_third_consecutive_call() {
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     let guard_hits = messages
@@ -1134,6 +1244,7 @@ async fn filtered_child_run_enforces_allowlist_and_keeps_own_history() {
         filter: Some(&filter),
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     })
     .await;
     assert_eq!(result.unwrap(), "done");
@@ -1164,4 +1275,626 @@ async fn filtered_child_run_enforces_allowlist_and_keeps_own_history() {
             .is_some_and(|c| c.contains("parent transcript"))),
         "child must never see the parent transcript"
     );
+}
+
+/// Harness seams are load-bearing: each override below flows from
+/// `AgentRuntime.harness` through the turn loop to an observable outcome.
+/// A seam that cannot change behavior here is decorative — these tests pin
+/// the wiring, not just the trait definitions.
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StubExecutor;
+
+impl crate::agent::composable::ToolExecutor for StubExecutor {
+    fn execute_outcome<'a>(
+        &'a self,
+        name: &'a str,
+        _args: &'a serde_json::Map<String, serde_json::Value>,
+        _cancel: &'a (dyn CancellationSource + Send + Sync),
+        _policy: &'a crate::tools::Policy,
+        _filter: Option<&'a crate::tools::ToolFilter>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolOutcome> + Send + 'a>>
+    {
+        let text = format!("stubbed:{name}");
+        Box::pin(async move {
+            crate::tools::ToolOutcome {
+                text,
+                ok: true,
+                diff: None,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn harness_executor_stub_replaces_dispatch() {
+    use crate::agent::composable::DexHarness;
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let harness = DexHarness::default().with_executor(StubExecutor);
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &ToolThenAnswer::new(),
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: Some(Arc::new(harness)),
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        messages.iter().filter(|m| m.role == Role::Tool).any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("stubbed:bash"))),
+        "stubbed executor output must land in the transcript: {messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn harness_overflow_override_disables_recovery() {
+    use crate::agent::composable::DexHarness;
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    #[derive(Clone)]
+    struct AlwaysOverflow;
+    impl ModelClient for AlwaysOverflow {
+        async fn complete(
+            &self,
+            _m: &[ChatMessage],
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
+            _c: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            Err("API error: maximum context length exceeded".into())
+        }
+    }
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    // Default harness would compact + retry; this one never fires.
+    let harness = DexHarness::default().with_overflow_fn(|_| false);
+    let err = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &AlwaysOverflow,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: Some(Arc::new(harness)),
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("maximum context length"),
+        "unrecovered overflow must surface the provider error: {err}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.name.as_deref() == Some("summary")),
+        "no recovery means no compaction summary"
+    );
+}
+
+#[tokio::test]
+async fn harness_result_policy_without_guard_stops_tripping() {
+    use crate::agent::composable::DexHarness;
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let guard_err = "Error: repeated identical tool call; choose a different action or finish.";
+    let harness = DexHarness::default()
+        .with_result_policy(dex_coding_agent::ResultPolicy::default().without_repeat_guard());
+    let _ = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &RepeatedGuardScript::new(vec!["echo probe", "echo probe", "echo probe"]),
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: Some(Arc::new(harness)),
+    })
+    .await;
+    let guard_hits = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool && m.content.as_deref() == Some(guard_err))
+        .count();
+    assert_eq!(guard_hits, 0, "disabled guard must never fire");
+}
+
+#[tokio::test]
+async fn harness_catalog_controls_model_schemas() {
+    use crate::agent::composable::DexHarness;
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    #[derive(Clone)]
+    struct CaptureTools(Arc<std::sync::Mutex<Option<Vec<String>>>>);
+    impl ModelClient for CaptureTools {
+        async fn complete(
+            &self,
+            _m: &[ChatMessage],
+            tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
+            _c: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            *self.0.lock().unwrap() = Some(tools.iter().map(|t| t.function.name.clone()).collect());
+            Ok(Turn {
+                message: ChatMessage::assistant("done"),
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    cached_tokens: None,
+                }),
+                stop_reason: None,
+            })
+        }
+    }
+    let config = test_config();
+    // Empty catalog: the model sees no tools.
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let harness = DexHarness::default().with_catalog_fn(Vec::new);
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &CaptureTools(seen.clone()),
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: Some(Arc::new(harness)),
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(seen.lock().unwrap().clone().unwrap(), Vec::<String>::new());
+    // Default catalog: the model sees the native tools.
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &CaptureTools(seen.clone()),
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let names = seen.lock().unwrap().clone().unwrap();
+    assert!(names.contains(&"read".to_string()), "{names:?}");
+}
+
+/// `llm.before` appends land persisted in history; `llm.after` observes every
+/// request; `tool.error` fires on the failed call only.
+#[tokio::test]
+async fn llm_lifecycle_and_tool_error_hooks_fire() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let lua = r#"return function(dex)
+  dex.events.on("llm.before", function(ctx, ev)
+    return { append = "HOOK-NOTE" }
+  end)
+  dex.events.on("llm.after", function(ctx, ev)
+    dex.prompt.append("after-seen;")
+  end)
+  dex.events.on("tool.error", function(ctx, ev)
+    dex.prompt.append("error-seen:" .. ev.tool .. ";")
+  end)
+end
+"#;
+    let manifest = "manifest_version: 1\nid: llmhook\nversion: 0.1.0\ncapabilities: [harness]\n";
+    let root = crate::extensions::tests::fixture_exts(&[("llmhook", manifest, lua)]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    #[derive(Clone)]
+    struct FailOnce {
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ModelClient for FailOnce {
+        async fn complete(
+            &self,
+            _m: &[ChatMessage],
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
+            _c: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round == 0 {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![crate::protocol::LlmToolCall {
+                        id: "call-1".into(),
+                        call_type: "function".into(),
+                        function: crate::protocol::FunctionCall {
+                            name: "nope_bad_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                )
+            } else {
+                ChatMessage::assistant("done")
+            };
+            Ok(Turn {
+                message,
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    cached_tokens: None,
+                }),
+                stop_reason: None,
+            })
+        }
+    }
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &FailOnce {
+            round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        },
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    // The append rode the steering path: persisted user note in history.
+    let notes = messages
+        .iter()
+        .filter(|m| {
+            m.role == crate::protocol::Role::User
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("HOOK-NOTE"))
+        })
+        .count();
+    assert!(notes >= 1, "llm.before append must persist: {messages:?}");
+    let appendix = crate::extensions::prompt_appendix();
+    assert!(
+        appendix.contains("after-seen;"),
+        "llm.after must observe the requests: {appendix:?}"
+    );
+    assert!(
+        appendix.contains("error-seen:nope_bad_tool;"),
+        "tool.error must fire for the failed call: {appendix:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}
+
+/// `message.sent` fires once per turn with the final text (ok=true) — the
+/// uniform observe-only seam across daemon, children, one-shot, TUI-local.
+#[tokio::test]
+async fn message_sent_lifecycle_event_fires_with_final_text() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let manifest = "manifest_version: 1\nid: senthook\nversion: 0.1.0\ncapabilities: []\n";
+    let root = crate::extensions::tests::fixture_exts(&[(
+        "senthook",
+        manifest,
+        r#"return function(dex)
+  dex.events.on("message.sent", function(ctx, ev)
+    dex.prompt.append("sent:" .. tostring(ev.ok) .. ":" .. ev.preview .. ";")
+  end)
+end
+"#,
+    )]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &MockModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok());
+    let appendix = crate::extensions::prompt_appendix();
+    assert!(
+        appendix.contains("sent:true:hello from mock;"),
+        "message.sent must carry ok and the final text: {appendix:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}
+
+// --- agent_loop.v1: Lua loop replacement (spec §9 / Phase 5) ---
+
+/// A model the turn must never reach: if the default `run_turn` loop
+/// executed while a Lua agent loop is registered, the test fails loudly.
+#[derive(Clone)]
+struct PanicModel;
+
+impl ModelClient for PanicModel {
+    async fn complete(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[crate::protocol::ToolDefinition],
+        _sink: Option<mpsc::Sender<ModelEvent>>,
+        _cancel: &(dyn CancellationSource + Send + Sync),
+    ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        panic!("default loop ran — a registered Lua agent_loop must own the turn");
+    }
+}
+
+const AGENT_LOOP_MANIFEST: &str =
+    "manifest_version: 1\nid: looper\nversion: 0.1.0\ncapabilities: [agent_loop]\n";
+
+async fn load_looper(lua: &str) -> std::path::PathBuf {
+    crate::extensions::global_manager().reset_for_tests().await;
+    let root = crate::extensions::tests::fixture_exts(&[("looper", AGENT_LOOP_MANIFEST, lua)]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    root
+}
+
+/// Acceptance test 3 (spec §38): `dex.replace("agent_loop", ...)` — the
+/// default loop is not executed and the loop's text is the turn result.
+#[tokio::test]
+async fn lua_agent_loop_replaces_the_default_loop() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let lua = r#"return function(dex)
+  dex.replace("agent_loop", {
+    id = "fixed",
+    interface = "agent_loop.v1",
+    run = function(ctx)
+      local st = ctx.state()
+      assert(st.messages == 1, "loop sees the turn's history length")
+      return { text = "lua loop ran" }
+    end
+  })
+end
+"#;
+    let root = load_looper(lua).await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &PanicModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(
+        result.as_ref().is_ok_and(|text| text == "lua loop ran"),
+        "{result:?}"
+    );
+    // The loop never touched the model: history is unchanged.
+    assert_eq!(messages.len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}
+
+/// The loop drives real engine rounds: one tool batch through the host
+/// (hooks, gates, dispatch — the result lands in history) and a final
+/// model round whose content the turn returns.
+#[tokio::test]
+async fn lua_agent_loop_drives_model_rounds_and_tools() {
+    use crate::protocol::{FunctionCall, LlmToolCall};
+    #[derive(Clone)]
+    struct ToolThenText;
+    impl ModelClient for ToolThenText {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[crate::protocol::ToolDefinition],
+            _sink: Option<mpsc::Sender<ModelEvent>>,
+            _cancel: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            // The same queued Turn for every call: first round yields the
+            // tool call, after execute_tools the model returns the final
+            // text (the mock just always says both).
+            Ok(Turn {
+                message: ChatMessage::assistant_calls(
+                    None,
+                    vec![LlmToolCall {
+                        id: "call-1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "read".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                ),
+                usage: None,
+                stop_reason: None,
+            })
+        }
+    }
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let lua = r#"return function(dex)
+  dex.replace("agent_loop", {
+    id = "one-round",
+    run = function(ctx)
+      local r = ctx.model.call()
+      if r.tool_calls and #r.tool_calls > 0 then
+        local t = ctx.tools.execute()
+        assert(t.completed == 1, "one tool round completed")
+        r = ctx.model.call()
+      end
+      local s = ctx.finish(r.content or "")
+      assert(not s.steered, "no steering in this test")
+      return { text = r.content or "" }
+    end
+  })
+end
+"#;
+    let root = load_looper(lua).await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &ToolThenText,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    // History shows the full transition: system, assistant(tool_calls),
+    // tool result, and the second round's assistant reply (the mock always
+    // returns a tool turn, so round two appends its own assistant message).
+    assert_eq!(messages.len(), 4);
+    assert!(messages
+        .iter()
+        .any(|m| m.role == crate::protocol::Role::Tool));
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}
+
+/// Registration validation (spec §10): the capability gate, the interface
+/// pin, and the required `run` all fail the extension at load time —
+/// nothing half-registered ever reaches the slot.
+#[tokio::test]
+async fn agent_loop_registration_validates() {
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let mgr = crate::extensions::global_manager();
+    mgr.reset_for_tests().await;
+    let run_ok = r#"return function(dex)
+  dex.replace("agent_loop", { id = "x", run = function(ctx) return { text = "" } end })
+end
+"#;
+    let cases: &[(&str, String, &str, &str)] = &[
+        (
+            "no-cap",
+            "manifest_version: 1\nid: no-cap\nversion: 0.1.0\ncapabilities: []\n".to_string(),
+            run_ok,
+            "agent_loop capability",
+        ),
+        (
+            "bad-iface",
+            "manifest_version: 1\nid: bad-iface\nversion: 0.1.0\ncapabilities: [agent_loop]\n"
+                .to_string(),
+            r#"return function(dex)
+  dex.replace("agent_loop", { id = "x", interface = "agent_loop.v9", run = function() end })
+end
+"#,
+            "agent_loop.v1",
+        ),
+        (
+            "no-run",
+            "manifest_version: 1\nid: no-run\nversion: 0.1.0\ncapabilities: [agent_loop]\n"
+                .to_string(),
+            r#"return function(dex)
+  dex.replace("agent_loop", { id = "x" })
+end
+"#,
+            "run function",
+        ),
+        (
+            "bad-slot",
+            "manifest_version: 1\nid: bad-slot\nversion: 0.1.0\ncapabilities: [agent_loop]\n"
+                .to_string(),
+            r#"return function(dex)
+  dex.replace("summarizer", { id = "x", run = function() end })
+end
+"#,
+            "not a replaceable slot",
+        ),
+    ];
+    for (id, manifest, lua, needle) in cases {
+        let root = crate::extensions::tests::fixture_exts(&[(id, manifest.as_str(), lua)]);
+        let m = crate::extensions::parse_manifest(manifest.as_str()).unwrap();
+        let err = mgr
+            .ensure_loaded_found(id, vec![(root.join(id), m)])
+            .await
+            .expect_err("registration must fail at load time");
+        assert!(
+            err.contains(needle),
+            "case {id}: '{err}' must mention '{needle}'"
+        );
+        std::fs::remove_dir_all(&root).ok();
+        mgr.reset_for_tests().await;
+    }
 }

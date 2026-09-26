@@ -584,6 +584,292 @@ fn net_origin(url: &reqwest::Url) -> (String, String, Option<u16>) {
     )
 }
 
+/// `supervisor.route` for the spawn path: merged redirect/deny action, or
+/// the default (no opinion) when unsubscribed. Carries the turn's policy +
+/// filter so nested calls stay gated like model-issued ones.
+pub async fn query_supervisor_route(
+    agent: &str,
+    task: Option<&str>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+) -> super::SupervisorAction {
+    if !has_event_handlers("supervisor.route") {
+        return super::SupervisorAction::default();
+    }
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager()
+        .query_supervisor_route(agent, task, &host)
+        .await
+}
+
+/// Truncated text preview for observe-only lifecycle payloads: prompts and
+/// responses can be pastes large enough to wedge the 64 MiB Lua VM, so hooks
+/// get the head plus honest counts, never the whole body.
+pub fn text_preview(text: &str) -> (String, bool, usize) {
+    const MAX_CHARS: usize = 2000;
+    let chars = text.chars().count();
+    if chars <= MAX_CHARS {
+        (text.to_string(), false, chars)
+    } else {
+        (text.chars().take(MAX_CHARS).collect(), true, chars)
+    }
+}
+
+/// Observe-only lifecycle fire: `message.received`, `message.sent`,
+/// `session.created`, `session.loaded`. Zero-cost without subscribers;
+/// read-only nested policy; payloads carry truncated previews.
+pub async fn fire_lifecycle_event(
+    event: &'static str,
+    payload: serde_json::Value,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) {
+    if !has_event_handlers(event) {
+        return;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager().fire_event(event, payload, &host).await;
+}
+
+/// `permission.request` for the approval gate: first explicit
+/// `{decision = "allow"|"deny"}` wins, `None` (unsubscribed or no opinion)
+/// means the normal approval flow. Carries the turn's policy + filter so a
+/// nested `dex.tools.call` is gated exactly like a model-issued one.
+pub async fn query_permission_request(
+    tool: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    requirement: &str,
+    mode: &str,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+) -> Option<(super::PermissionDecision, String, String)> {
+    if !has_event_handlers("permission.request") {
+        return None;
+    }
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager()
+        .query_permission(tool, args, requirement, mode, &host)
+        .await
+}
+
+/// `llm.before` for `before_model`: appends persisted as a user-role note
+/// before the compaction gate (see the manager method). Zero-cost without
+/// subscribers. Read-only host: decision hooks cannot mutate.
+pub async fn apply_llm_before(
+    messages: usize,
+    stored_tokens: u64,
+    overhead: u64,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Vec<String> {
+    if !has_event_handlers("llm.before") {
+        return Vec::new();
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .apply_llm_before(
+            &host,
+            serde_json::json!({
+                "messages": messages,
+                "stored_tokens": stored_tokens,
+                "overhead": overhead,
+            }),
+        )
+        .await
+}
+
+/// `harness.overflow` for the recovery path: first non-nil `{overflow}`
+/// wins, `None` (unsubscribed or no opinion) means the Rust default.
+/// Read-only host: decision hooks cannot mutate.
+pub async fn query_harness_overflow(
+    message: &str,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<bool> {
+    if !has_event_handlers("harness.overflow") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_overflow(message, &host)
+        .await
+}
+
+/// `harness.conflict` for the batch scheduler: first non-nil `{conflicts}`
+/// wins for the whole batch (one Lua round-trip per batch, never per pair),
+/// `None` means the Rust conflict detector. Read-only host.
+pub async fn query_harness_conflict(
+    calls: &[crate::protocol::LlmToolCall],
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<bool> {
+    if !has_event_handlers("harness.conflict") {
+        return None;
+    }
+    let payload = calls
+        .iter()
+        .map(|c| serde_json::json!({"name": c.function.name, "args": c.function.arguments}))
+        .collect::<Vec<_>>();
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_conflict(&serde_json::Value::Array(payload), &host)
+        .await
+}
+
+/// `harness.compact` for the turn loop's compaction gate: first non-`nil`
+/// `{compact}` wins, `None` (unsubscribed, error, or no opinion) means the
+/// Rust trigger decides. Read-only host.
+pub async fn query_harness_compact(
+    stored_tokens: u64,
+    ephemeral_overhead: u64,
+    message_count: usize,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<bool> {
+    if !has_event_handlers("harness.compact") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_compact(stored_tokens, ephemeral_overhead, message_count, &host)
+        .await
+}
+
+/// `model_selector` for `process_turn`: first non-empty `{model = "..."}`
+/// (or a bare string return) picks the model this turn serves; `None`
+/// (unsubscribed, error, or no opinion) keeps the configured model.
+/// Read-only host — choosing a model must not require tool access. The
+/// payload names the configured and last served model ids, never secrets.
+pub async fn query_model_selector_global(
+    config: &crate::llm::config::LlmConfig,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<String> {
+    if !has_event_handlers("model_selector") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    let previous = LAST_MODEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|s| s.id());
+    global_manager()
+        .query_model_selector(
+            &served_snapshot_for(config).id(),
+            previous.as_deref(),
+            &host,
+        )
+        .await
+}
+
+/// The agent-loop slot (spec §9): first loaded extension that registered a
+/// loop via `dex.replace("agent_loop", …)`, or `None` for the Rust
+/// `run_turn` default. Queried once per turn at the snapshot point.
+pub async fn agent_loop_global() -> Option<(String, crate::extensions::ExtensionEngine)> {
+    global_manager().agent_loop().await
+}
+
+/// `tool_catalog` for the turn's schema assembly: the first `{keep}/{drop}`
+/// opinion narrows the served schemas; `None` (unsubscribed, error, no
+/// opinion) keeps the full catalog. Read-only host — filtering schemas must
+/// not require tool access.
+pub async fn query_tool_catalog_global(
+    schemas: &[crate::protocol::ToolDefinition],
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<Vec<crate::protocol::ToolDefinition>> {
+    if !has_event_handlers("tool_catalog") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager().query_tool_catalog(schemas, &host).await
+}
+
+/// `harness.summarize` for compaction: first non-empty `{summary}` wins;
+/// `None` (unsubscribed, error, or no opinion) means the Rust summarizer.
+/// Read-only host — a summarizer cannot mutate anything.
+pub async fn query_harness_summarize(
+    conversation: &str,
+    previous_summary: Option<&str>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<String> {
+    if !has_event_handlers("harness.summarize") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_summarize(conversation, previous_summary, &host)
+        .await
+}
+
 /// `session.before_compact` for `compact_history`. The host runs without a
 /// turn policy at this seam, so nested `dex.tools.call` upcalls inherit a
 /// read-only policy — a compaction hook cannot mutate anything.
