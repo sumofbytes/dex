@@ -12,7 +12,12 @@ mod engine;
 pub(crate) mod hooks;
 mod manifest;
 
-pub(crate) use engine::{CallKind, ExtensionEngine, HostCtx, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN};
+pub(crate) use engine::{
+    answer_hostcall, CallKind, ExtensionEngine, HostCtx, HostOp, WorkerMsg, HOOK_TIMEOUT_SECS,
+    SLOW_HOOK_WARN,
+};
+#[cfg(test)]
+pub(crate) use manifest::parse_manifest;
 pub(crate) use manifest::MAX_TOOL_TIMEOUT_SECS;
 /// `dex.net.fetch` ceilings: per-request timeout cap (matches the tool
 /// budget) and response-body cap (a runaway body fails the call, not the
@@ -61,9 +66,9 @@ use discovery::{data_extensions_dir, parse_config_paths};
 #[cfg(test)]
 pub(crate) use discovery::{scoped_extension_dirs, user_extensions_dir, Scope};
 pub use global::{
-    apply_after_hooks, apply_before_agent_start, apply_before_compact, apply_before_hooks,
-    apply_llm_before, cached_schema_tokens, cached_tools, call_global, command_list,
-    current_drive_model, drive_model_for, fire_event_global, fire_lifecycle_event,
+    agent_loop_global, apply_after_hooks, apply_before_agent_start, apply_before_compact,
+    apply_before_hooks, apply_llm_before, cached_schema_tokens, cached_tools, call_global,
+    command_list, current_drive_model, drive_model_for, fire_event_global, fire_lifecycle_event,
     fire_model_select_if_changed, global_manager, net_fetch, query_harness_compact,
     query_harness_conflict, query_harness_overflow, query_harness_summarize,
     query_model_selector_global, query_permission_request, query_supervisor_route,

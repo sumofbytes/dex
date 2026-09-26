@@ -32,6 +32,9 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     "net",
     "net.providers",
     "harness",
+    // agent_loop: replaces the turn loop via `dex.replace("agent_loop", …)`
+    // (spec §9) — the whole orchestration, so it is its own capability.
+    "agent_loop",
 ];
 
 #[derive(Debug, Clone, Deserialize)]

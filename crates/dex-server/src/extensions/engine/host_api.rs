@@ -316,6 +316,62 @@ pub(super) fn fallback_slot(
     })
 }
 
+/// `dex.replace(slot, spec)` — component replacement (spec §10/§12). The
+/// only replaceable slot is `agent_loop` (spec §9, the deliberately-last
+/// milestone): `spec = { id, interface? = "agent_loop.v1", run }` where
+/// `run(ctx)` owns the whole turn loop. Gated on the `agent_loop`
+/// capability — replacing the orchestration is the widest surface an
+/// extension can hold — and one loop per extension (re-running setup twice
+/// is a bug, not a re-register).
+pub(super) fn replace_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let manifest = manifest.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, spec): (String, Table)| {
+        if slot != "agent_loop" {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' replaces '{slot}': not a replaceable slot (replaceable: agent_loop)"
+            )));
+        }
+        if !manifest.has_capability("agent_loop") {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' replaces the agent loop without the agent_loop capability"
+            )));
+        }
+        let id: String = spec
+            .get("id")
+            .map_err(|_| LuaError::RuntimeError("replace needs an id".into()))?;
+        if !valid_segment(&id) {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' agent_loop id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
+            )));
+        }
+        let interface: Option<String> = spec.get("interface").unwrap_or(None);
+        if interface.as_deref().is_some_and(|i| i != "agent_loop.v1") {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' agent_loop interface {interface:?}: want \"agent_loop.v1\""
+            )));
+        }
+        let run: Function = spec.get("run").map_err(|_| {
+            LuaError::RuntimeError(format!(
+                "extension '{ext_id}' agent_loop '{id}' needs a run function"
+            ))
+        })?;
+        let mut regs = regs.borrow_mut();
+        if regs.agent_loop.is_some() {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' registers agent_loop twice"
+            )));
+        }
+        regs.agent_loop = Some((id, run));
+        Ok(())
+    })
+}
+
 /// `dex.log.*` — daemon log + journal lines, prefixed `lua[<ext>]`.
 pub(super) fn log_table(lua: &Lua, manifest: &Manifest) -> Table {
     let ext_id = manifest.id.clone();

@@ -490,6 +490,19 @@ fn run_runtime(action: &str) {
     let (harness, rows) = crate::agent::registry::resolve_snapshot_with_origins();
     println!("dex runtime graph");
     println!("slots:");
+    // The agent-loop slot (spec §9): a registered Lua loop replaces the
+    // whole `run_turn` orchestration. Refresh first — a bare
+    // `global_manager()` only starts a background load, and this row must
+    // not race it (same contract as `dex extensions list`).
+    let agent_loop = crate::runtime::http::block_on(async {
+        let mgr = crate::extensions::global_manager();
+        mgr.refresh().await;
+        mgr.agent_loop().await
+    });
+    match agent_loop {
+        Some((id, _)) => println!("  {:<11} {:<24} lua extension", "agent_loop", id),
+        None => println!("  {:<11} {:<24} rust, builtin", "agent_loop", "run_turn"),
+    }
     for row in rows {
         println!(
             "  {:<11} {:<24} {}",

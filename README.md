@@ -857,6 +857,24 @@ the compaction gate; `llm.after` (`{stop_reason, usage, elapsed_ms}`) and
 previews, never whole prompts. Unsubscribed turns
 pay no Lua cost.
 
+The `agent_loop` capability unlocks the deepest slot: `dex.replace(
+"agent_loop", { id, interface? = "agent_loop.v1", run })` replaces the whole
+turn loop — `run(ctx)` owns iteration while Rust keeps every invariant. The
+step surface on `ctx` blocks until the host finishes each step: `model.call()`
+(one engine round: persistence + streaming + cancellation + normalized
+history apply; returns `{content, tool_calls = [{id, name, args}]}`),
+`tools.execute()` (runs the last response's tool calls through the same
+hooks/gates/dispatch a model-issued batch gets; returns `{completed, limit}`
+or `{exhausted, note}`), `finish(response)` (steering injection;
+`{steered = bool}` says whether to run another round), `cancelled()`, and
+`state()` (`{cancelled, rounds, round_limit, messages}`). The default loop in
+this surface is `while true` + `model.call` → (`tools.execute` | `finish` →
+`return content`). `dex.tools.call`/`dex.net.fetch` and friends work inside
+the loop under the turn's policy; a loop error fails the turn with the Lua
+error (there is no default left to fail open to), and cancellation always
+aborts between Lua instructions. First registered loop wins (load order);
+`dex runtime graph` shows `agent_loop = <id>` when one is active.
+
 A manifest may pin the harness it needs with `dex: ">=0.15"` — a running
 harness older than the floor skips the whole extension loudly at load
 instead of running it against events it never saw (only `>=` pins exist).
