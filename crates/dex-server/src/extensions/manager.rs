@@ -13,7 +13,7 @@ use super::hooks;
 use super::manifest::{self, Manifest};
 use super::{
     AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx,
-    HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
+    SupervisorAction, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
 };
 
 pub struct LoadedExtension {
@@ -657,6 +657,47 @@ impl ExtensionManager {
             }
         }
         appends
+    }
+
+    /// `supervisor.route` chain: merged across handlers in load order — the
+    /// first redirect wins, any deny wins (attributed). Errors/bad envelopes
+    /// fail open to no opinion (normal spawn flow).
+    pub async fn query_supervisor_route(
+        &self,
+        agent: &str,
+        task: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> SupervisorAction {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"supervisor.route".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        let mut action = SupervisorAction::default();
+        for id in subs {
+            let payload = serde_json::json!({ "agent": agent, "task": task });
+            let envelope = match self.run_event(&id, "supervisor.route", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' supervisor.route failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            let parsed = hooks::parse_supervisor(&envelope);
+            if action.agent.is_none() {
+                action.agent = parsed.0;
+            }
+            if action.deny.is_none() {
+                action.deny = parsed.1.map(|reason| (id.clone(), reason));
+            }
+        }
+        action
     }
 
     /// `permission.request` chain: first explicit `{decision = "allow"|"deny"}`

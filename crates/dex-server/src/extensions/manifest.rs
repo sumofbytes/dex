@@ -57,6 +57,12 @@ pub struct Manifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub tools: Vec<ManifestTool>,
+    /// Harness compatibility: `dex = ">=0.15"` pins the minimum harness
+    /// that can serve this extension (new events/capabilities). Checked at
+    /// load against the harness crate version — a mismatch skips the whole
+    /// extension loudly instead of running it against events it never saw.
+    #[serde(default)]
+    pub dex: Option<String>,
     /// Fail-closed hooks: a `tool.before` error denies the call instead of
     /// being skipped (default fail-open, plan §8). Declared here so the
     /// enforcement posture is install-time consent, not runtime surprise.
@@ -141,7 +147,54 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if manifest.has_capability("net.providers") && !manifest.has_capability("net") {
         return Err("capability 'net.providers' requires the 'net' capability".to_string());
     }
+    if let Some(req) = manifest.dex.as_deref() {
+        check_dex_compat(req)?;
+    }
     Ok(manifest)
+}
+
+/// The harness version serving this extension (the `dex-server` crate
+/// version — the code that owns the event surface, not the CLI release).
+pub fn harness_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Check a manifest `dex = ">=a.b[.c]"` pin against the running harness.
+/// Only `>=` pins are accepted (an extension names the minimum it needs);
+/// anything else — or a newer harness requirement — is a loud load-time
+/// skip, never a silent run against unknown events.
+fn check_dex_compat(req: &str) -> Result<(), String> {
+    let min = req
+        .trim()
+        .strip_prefix(">=")
+        .ok_or_else(|| format!("unsupported dex pin {req:?}: use '>=<major>.<minor>[.<patch>]'"))?;
+    let mut need = min.split('.');
+    let parse_part = |part: Option<&str>| -> Result<u64, String> {
+        part.unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| format!("unsupported dex pin {req:?}: use '>=<major>.<minor>[.<patch>]'"))
+    };
+    let need = (
+        parse_part(need.next())?,
+        parse_part(need.next())?,
+        parse_part(need.next())?,
+    );
+    let mut have = harness_version().split('.');
+    let have = (
+        parse_part(have.next())?,
+        parse_part(have.next())?,
+        parse_part(have.next())?,
+    );
+    if have < need {
+        return Err(format!(
+            "extension needs dex harness >={}.{}.{} (running {})",
+            need.0,
+            need.1,
+            need.2,
+            harness_version()
+        ));
+    }
+    Ok(())
 }
 
 impl Manifest {
@@ -245,5 +298,19 @@ tools:
         )
         .unwrap();
         assert!(m.has_capability("harness"));
+    }
+
+    #[test]
+    fn dex_pin_accepts_compatible_and_rejects_newer_or_garbage() {
+        let base = "manifest_version: 1\nid: pin-ext\nversion: 0.1.0\ncapabilities: []\n";
+        // Current or older floor: loads.
+        assert!(parse_manifest(&format!("{base}dex: \">={}\"\n", harness_version())).is_ok());
+        assert!(parse_manifest(&format!("{base}dex: \">=0.0\"\n")).is_ok());
+        // Newer floor than the running harness: loud skip.
+        let err = parse_manifest(&format!("{base}dex: \">=999.0\"\n")).unwrap_err();
+        assert!(err.contains("needs dex harness"), "got: {err}");
+        // Only `>=` pins exist.
+        assert!(parse_manifest(&format!("{base}dex: \"==1.0\"\n")).is_err());
+        assert!(parse_manifest(&format!("{base}dex: \"hello\"\n")).is_err());
     }
 }

@@ -68,6 +68,11 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "llm.before",
     "llm.after",
     "tool.error",
+    "supervisor.route",
+    "message.received",
+    "message.sent",
+    "session.created",
+    "session.loaded",
 ];
 
 /// Host context a Lua call runs under: what cancellation, gates, and

@@ -2115,3 +2115,73 @@ end
     assert_eq!(mgr.query_harness_conflict(&one, &host).await, None);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[tokio::test]
+async fn supervisor_route_redirect_deny_and_fail_open() {
+    // First redirect wins, any deny wins (attributed), garbage/no-opinion
+    // fails open to the default (normal spawn flow).
+    let redir = hook_manifest("sup-redir", false);
+    let deny = hook_manifest("sup-deny", false);
+    let root = fixture_exts(&[
+        (
+            "redir",
+            redir.as_str(),
+            r#"return function(dex)
+  dex.events.on("supervisor.route", function(ctx, ev)
+    if ev.agent == "explorer" then return { redirect = "researcher" } end
+  end)
+end
+"#,
+        ),
+        (
+            "deny",
+            deny.as_str(),
+            r#"return function(dex)
+  dex.events.on("supervisor.route", function(ctx, ev)
+    if ev.agent == "ghost" then return { deny = true, reason = "blocked" } end
+    return {}
+  end)
+end
+"#,
+        ),
+    ]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    // Redirect wins over the deny extension's no-opinion.
+    let action = mgr
+        .query_supervisor_route("explorer", Some("t"), &host)
+        .await;
+    assert_eq!(action.agent.as_deref(), Some("researcher"));
+    assert_eq!(action.deny, None);
+    // Deny is attributed to the denying extension.
+    let action = mgr.query_supervisor_route("ghost", None, &host).await;
+    assert_eq!(action.agent, None);
+    assert_eq!(
+        action.deny,
+        Some(("sup-deny".to_string(), "blocked".to_string()))
+    );
+    // No opinion from any handler: default.
+    let action = mgr.query_supervisor_route("unlisted", None, &host).await;
+    assert_eq!(action, super::SupervisorAction::default());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn text_preview_truncates_with_honest_counts() {
+    let (preview, truncated, chars) = super::text_preview("hello");
+    assert_eq!(preview, "hello");
+    assert!(!truncated);
+    assert_eq!(chars, 5);
+    let long = "é".repeat(3000); // multibyte: counts chars, not bytes
+    let (preview, truncated, chars) = super::text_preview(&long);
+    assert!(truncated);
+    assert_eq!(chars, 3000);
+    assert_eq!(preview.chars().count(), 2000);
+    assert!(preview.starts_with("é"));
+}

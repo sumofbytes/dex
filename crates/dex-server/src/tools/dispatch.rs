@@ -155,7 +155,8 @@ async fn dispatch_tool(
                 )));
             }
         }
-        return crate::agent::delegate::execute_delegation(name, args, cancel, policy).await;
+        return crate::agent::delegate::execute_delegation(name, args, cancel, policy, filter)
+            .await;
     }
     // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
     // Shell row must not raise the gate again — use the native requirement.

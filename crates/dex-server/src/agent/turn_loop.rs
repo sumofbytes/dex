@@ -191,6 +191,27 @@ where
         harness,
     })
     .await;
+    // Runtime observation: `message.sent` fires for the turn's final text
+    // (uniform across daemon, children, one-shot, TUI-local — every path
+    // runs through here). Truncated preview; failures carry the error.
+    {
+        let (ok, body) = match &result {
+            Ok(text) => (true, text.clone()),
+            Err(e) => (false, e.to_string()),
+        };
+        let (preview, truncated, chars) = crate::extensions::text_preview(&body);
+        crate::extensions::fire_lifecycle_event(
+            "message.sent",
+            serde_json::json!({
+                "ok": ok,
+                "preview": preview,
+                "truncated": truncated,
+                "chars": chars,
+            }),
+            &cancel,
+        )
+        .await;
+    }
     // Restore the System message the appendix rode on: per-turn scope.
     if let Some(original) = saved_system {
         if let Some(first) = messages.first_mut() {

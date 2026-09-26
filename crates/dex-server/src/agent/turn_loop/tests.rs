@@ -1535,3 +1535,54 @@ end
     std::fs::remove_dir_all(&root).ok();
     crate::extensions::global_manager().reset_for_tests().await;
 }
+
+/// `message.sent` fires once per turn with the final text (ok=true) — the
+/// uniform observe-only seam across daemon, children, one-shot, TUI-local.
+#[tokio::test]
+async fn message_sent_lifecycle_event_fires_with_final_text() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let manifest = "manifest_version: 1\nid: senthook\nversion: 0.1.0\ncapabilities: []\n";
+    let root = crate::extensions::tests::fixture_exts(&[(
+        "senthook",
+        manifest,
+        r#"return function(dex)
+  dex.events.on("message.sent", function(ctx, ev)
+    dex.prompt.append("sent:" .. tostring(ev.ok) .. ":" .. ev.preview .. ";")
+  end)
+end
+"#,
+    )]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &MockModel,
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok());
+    let appendix = crate::extensions::prompt_appendix();
+    assert!(
+        appendix.contains("sent:true:hello from mock;"),
+        "message.sent must carry ok and the final text: {appendix:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}

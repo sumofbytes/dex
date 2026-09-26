@@ -81,6 +81,42 @@ pub fn parse_after(envelope: &Map<String, Json>, text: &str, ok: bool) -> (Strin
     (content, ok)
 }
 
+/// `supervisor.route` action: redirect a spawn to another definition,
+/// deny it, or no opinion (normal flow). The deny carries the denying
+/// extension id plus its reason for attribution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SupervisorAction {
+    /// Redirect target: must name a known definition, else the host keeps
+    /// the requested agent and logs the miss.
+    pub agent: Option<String>,
+    /// `(by, reason)` when a handler denied the spawn.
+    pub deny: Option<(String, String)>,
+}
+
+/// Read one extension's `supervisor.route` envelope: `{redirect = "name"}`
+/// and/or `{deny = true, reason = "..."}`. The directive key is `redirect`
+/// (not `agent`) so it can't collide with the request's `agent` field, which
+/// the envelope echoes back. Returns the redirect target and the deny reason
+/// (empty/garbage = no opinion on that half).
+pub fn parse_supervisor(envelope: &Map<String, Json>) -> (Option<String>, Option<String>) {
+    let agent = envelope
+        .get("redirect")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let deny = match envelope.get("deny").and_then(|v| v.as_bool()) {
+        Some(true) => Some(
+            envelope
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ => None,
+    };
+    (agent, deny)
+}
+
 /// `permission.request` verdict: the hook arbitrates one approval prompt.
 /// First explicit decision wins; absent/garbage = no opinion (normal flow).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,5 +261,30 @@ mod tests {
         assert!(action.cancel);
         assert_eq!(action.instructions, vec!["keep X".to_string()]);
         assert_eq!(action.summary, None);
+    }
+
+    #[test]
+    fn supervisor_parses_redirect_deny_and_no_opinion() {
+        let env = json!({"redirect": "researcher"});
+        assert_eq!(
+            parse_supervisor(env.as_object().unwrap()),
+            (Some("researcher".to_string()), None)
+        );
+        let env = json!({"deny": true, "reason": "nope"});
+        assert_eq!(
+            parse_supervisor(env.as_object().unwrap()),
+            (None, Some("nope".to_string()))
+        );
+        // Both halves at once.
+        let env = json!({"redirect": "coder", "deny": true});
+        assert_eq!(
+            parse_supervisor(env.as_object().unwrap()),
+            (Some("coder".to_string()), Some(String::new()))
+        );
+        // Empty/garbage = no opinion on that half.
+        let env = json!({});
+        assert_eq!(parse_supervisor(env.as_object().unwrap()), (None, None));
+        let env = json!({"redirect": "  ", "deny": false});
+        assert_eq!(parse_supervisor(env.as_object().unwrap()), (None, None));
     }
 }

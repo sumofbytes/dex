@@ -55,6 +55,7 @@ pub async fn execute_delegation(
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
     let Some(ctx) = policy.agent.clone() else {
         return Err(ToolError::Denied(format!(
@@ -67,7 +68,7 @@ pub async fn execute_delegation(
         .and_then(Value::as_str)
         .unwrap_or("spawn");
     match action {
-        "spawn" => delegate(&ctx, args, policy).await,
+        "spawn" => delegate(&ctx, args, cancel, policy, filter).await,
         "wait" => delegate_output(&ctx, args, cancel).await,
         "stop" => delegate_stop(&ctx, args).await,
         "list" => delegate_list(&ctx).await,
@@ -130,7 +131,9 @@ pub fn resolve_child_config(parent: &LlmConfig, model: Option<&str>) -> Result<L
 pub async fn delegate(
     ctx: &Arc<AgentTurnContext>,
     args: &Map<String, Value>,
+    cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<String, ToolError> {
     if ctx.depth >= MAX_AGENT_DEPTH {
         return Err(ToolError::Denied(format!(
@@ -138,13 +141,50 @@ pub async fn delegate(
             ctx.depth
         )));
     }
-    let agent_name = string_arg(args, "agent").ok_or(ToolError::Missing("agent"))?;
-    let mut def = super::super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
-    let resume_from = string_arg(args, "resume_from");
+    let requested = string_arg(args, "agent").ok_or(ToolError::Missing("agent"))?;
     let task = string_arg(args, "task");
+    let resume_from = string_arg(args, "resume_from");
     if resume_from.is_none() && task.is_none() {
         return Err(ToolError::Missing("task"));
     }
+    // Supervisor routing: one `supervisor.route` round-trip when a Lua
+    // extension subscribes, else the requested definition (zero-cost
+    // default). A deny fails attributed; a redirect to an unknown
+    // definition falls back to the requested agent with a loud log — a
+    // hook typo must not brick delegation.
+    let agent_name = if crate::extensions::has_event_handlers("supervisor.route") {
+        let action = crate::extensions::query_supervisor_route(
+            &requested,
+            task.as_deref(),
+            cancel,
+            policy,
+            filter,
+        )
+        .await;
+        if let Some((by, reason)) = action.deny {
+            let why = if reason.trim().is_empty() {
+                "denied by extension".to_string()
+            } else {
+                reason
+            };
+            return Err(ToolError::Denied(format!(
+                "supervisor.route hook from extension '{by}' denied spawn of '{requested}': {why}"
+            )));
+        }
+        match action.agent {
+            Some(target) if super::super::find_definition(&target).is_ok() => target,
+            Some(target) => {
+                eprintln!(
+                    "dex: [extensions] supervisor.route redirected to unknown agent '{target}' — spawning '{requested}' instead"
+                );
+                requested
+            }
+            None => requested,
+        }
+    } else {
+        requested
+    };
+    let mut def = super::super::find_definition(&agent_name).map_err(ToolError::InvalidArgument)?;
     // Resolve the handle before the model so a resume without its own
     // `model` can inherit the finished generation's pick. On-disk handles
     // predate model tracking (`None`) and fall back to the definition.

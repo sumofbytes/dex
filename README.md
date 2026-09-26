@@ -754,7 +754,10 @@ Harness extensions in sandboxed Lua: drop a directory with `manifest.yaml` +
 built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
 `turn.start`/`turn.end`, `before_agent_start`, `model_select`,
 `session.before_compact`, plus `harness.overflow`/`harness.conflict` when
-the `harness` capability is declared). Extension code runs in a
+the `harness` capability is declared; observe-only `llm.before`/`llm.after`,
+`tool.error`, `permission.request` (also under `harness`),
+`supervisor.route`, and the read-only `message.received`/`message.sent`/
+`session.created`/`session.loaded` lifecycle events). Extension code runs in a
 stripped VM — no io/os/require — and every effect flows through the same
 permission gates as a model-issued call.
 
@@ -819,10 +822,23 @@ runtime (first non-nil opinion wins, otherwise the Rust default):
 and `permission.request` (`{tool, args, requirement, mode} ->
 {decision = "allow"|"deny"}`, consulted only when approval would otherwise
 be required — reads stay free; `read-only` mode is never overridable).
+`supervisor.route` (`{agent, task} -> {redirect = "name"}` and/or
+`{deny = true, reason = "..."}`) gates every `delegate` spawn — first
+redirect wins, any deny fails attributed to the denying extension, and a
+redirect to an unknown definition falls back to the requested agent with a
+loud log (fail-open).
 `llm.before` may return `{append}` text persisted as a user-role note before
 the compaction gate; `llm.after` (`{stop_reason, usage, elapsed_ms}`) and
-`tool.error` (`{tool, args, error}`) are observe-only. Unsubscribed turns
+`tool.error` (`{tool, args, error}`) are observe-only.
+`message.received`/`message.sent` (`{session, preview, truncated, chars}` /
+`{ok, preview, truncated, chars}`) and `session.created`/`session.loaded`
+(`{session}`) are observe-only audit hooks — payloads carry truncated
+previews, never whole prompts. Unsubscribed turns
 pay no Lua cost.
+
+A manifest may pin the harness it needs with `dex: ">=0.15"` — a running
+harness older than the floor skips the whole extension loudly at load
+instead of running it against events it never saw (only `>=` pins exist).
 
 Discovery: cwd `.dex/extensions` + `.agents/extensions` (project scope — loads
 only after `dex extensions enable <id>`, the trust consent), then
