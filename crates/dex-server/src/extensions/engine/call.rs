@@ -291,6 +291,8 @@ fn merge_directive(
                 "instructions",
                 "cancel",
                 "summary",
+                "overflow",
+                "conflicts",
             ] {
                 let value: Value = t.get(key).map_err(|e| e.to_string())?;
                 if !matches!(value, Value::Nil) {

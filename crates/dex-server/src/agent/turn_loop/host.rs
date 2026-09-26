@@ -229,7 +229,19 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         messages: &mut Vec<ChatMessage>,
         ledger: &mut TokenLedger,
     ) -> Result<bool, AgentTurnError> {
-        if !self.harness.is_overflow(error) {
+        // Runtime override: `harness.overflow` Lua hook wins when subscribed,
+        // else the Rust wording detector (zero-cost default).
+        let overflow = if crate::extensions::has_event_handlers("harness.overflow") {
+            crate::extensions::query_harness_overflow(
+                error,
+                self.cancel as &(dyn CancellationSource + Send + Sync),
+            )
+            .await
+            .unwrap_or_else(|| self.harness.is_overflow(error))
+        } else {
+            self.harness.is_overflow(error)
+        };
+        if !overflow {
             return Ok(false);
         }
         match emergency_compact(

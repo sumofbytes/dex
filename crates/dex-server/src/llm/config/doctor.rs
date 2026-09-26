@@ -363,6 +363,60 @@ fn shared_rows(
     let (compaction, compaction_source) = crate::agent::compaction::verbatim::compaction_doctor();
     row(out, "compaction", &compaction, &compaction_source);
 
+    // Runtime-harness numerics: env > `harness:` file table > built-in
+    // default. Values come from the same `from_env` the turn loop uses.
+    let hc = crate::agent::composable::HarnessConfig::from_env();
+    let harness_result = crate::agent::composable::DexHarness::from_env();
+    let file_has = |key: &str| super::load_harness_num(key).is_some();
+    let iter_source = if std::env::var("DEX_MAX_TOOL_ITERATIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .is_some()
+    {
+        "DEX_MAX_TOOL_ITERATIONS"
+    } else if file_has("max_tool_iterations") {
+        "config harness:"
+    } else {
+        "built-in default"
+    };
+    row(
+        out,
+        "harness tools",
+        &hc.limits.max_tool_iterations.to_string(),
+        iter_source,
+    );
+    row(
+        out,
+        "harness batch",
+        &hc.limits.batch_max_concurrent.to_string(),
+        if file_has("batch_max_concurrent") {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+    row(
+        out,
+        "harness compact",
+        &hc.limits.max_compaction_attempts.to_string(),
+        if file_has("max_compaction_attempts") {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+    row(
+        out,
+        "harness repeat",
+        &harness_result.result_policy.repeat_limit.to_string(),
+        if file_has("repeat_limit") {
+            "config harness:"
+        } else {
+            "built-in default"
+        },
+    );
+
     // Live Jev scorer: key comes only from the environment; the config
     // `jev:` table is the opt-in. Print the key masked, like `api key`.
     let jev_row = match (

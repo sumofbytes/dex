@@ -316,7 +316,19 @@ pub(super) async fn run_tool_batch<X>(
 where
     X: CancellationSource + Clone + 'static,
 {
-    if harness.conflicts(calls) {
+    // Runtime override: one `harness.conflict` round-trip per batch when a Lua
+    // extension subscribes, else the Rust detector (zero-cost default).
+    let conflicts = if crate::extensions::has_event_handlers("harness.conflict") {
+        crate::extensions::query_harness_conflict(
+            calls,
+            cancel as &(dyn CancellationSource + Send + Sync),
+        )
+        .await
+        .unwrap_or_else(|| harness.conflicts(calls))
+    } else {
+        harness.conflicts(calls)
+    };
+    if conflicts {
         let _guard = TOOL_MUTATION_LOCK.lock().await;
         let mut out = Vec::new();
         for call in calls {

@@ -584,6 +584,58 @@ fn net_origin(url: &reqwest::Url) -> (String, String, Option<u16>) {
     )
 }
 
+/// `harness.overflow` for the recovery path: first non-nil `{overflow}`
+/// wins, `None` (unsubscribed or no opinion) means the Rust default.
+/// Read-only host: decision hooks cannot mutate.
+pub async fn query_harness_overflow(
+    message: &str,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<bool> {
+    if !has_event_handlers("harness.overflow") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_overflow(message, &host)
+        .await
+}
+
+/// `harness.conflict` for the batch scheduler: first non-nil `{conflicts}`
+/// wins for the whole batch (one Lua round-trip per batch, never per pair),
+/// `None` means the Rust conflict detector. Read-only host.
+pub async fn query_harness_conflict(
+    calls: &[crate::protocol::LlmToolCall],
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<bool> {
+    if !has_event_handlers("harness.conflict") {
+        return None;
+    }
+    let payload = calls
+        .iter()
+        .map(|c| serde_json::json!({"name": c.function.name, "args": c.function.arguments}))
+        .collect::<Vec<_>>();
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_conflict(&serde_json::Value::Array(payload), &host)
+        .await
+}
+
 /// `session.before_compact` for `compact_history`. The host runs without a
 /// turn policy at this seam, so nested `dex.tools.call` upcalls inherit a
 /// read-only policy — a compaction hook cannot mutate anything.

@@ -31,6 +31,7 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     "model",
     "net",
     "net.providers",
+    "harness",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
