@@ -753,7 +753,8 @@ Harness extensions in sandboxed Lua: drop a directory with `manifest.yaml` +
 `extension.lua` into a discovery dir and it can register tools, shadow
 built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
 `turn.start`/`turn.end`, `before_agent_start`, `model_select`,
-`session.before_compact`). Extension code runs in a
+`session.before_compact`, plus `harness.overflow`/`harness.conflict` when
+the `harness` capability is declared). Extension code runs in a
 stripped VM — no io/os/require — and every effect flows through the same
 permission gates as a model-issued call.
 
@@ -797,7 +798,25 @@ use it.
 extensions:
   paths: # extra extension dirs (user scope)
     - ~/work/dex-extensions
+
+harness: # runtime harness numerics (env DEX_MAX_TOOL_ITERATIONS wins for iterations)
+  max_tool_iterations: 200
+  max_compaction_attempts: 3
+  batch_max_concurrent: 10
+  keep_recent_messages: 12
+  min_to_summarize: 8
+  recent_window: 6
+  repeat_limit: 3
+  keep_below_chars: 500
+  truncate_above_chars: 2000
+  drop_above_chars: 10000
 ```
+
+A `harness`-capability extension can also override two turn decisions at
+runtime (first non-nil opinion wins, otherwise the Rust default):
+`harness.overflow` (`{message} -> {overflow = bool}`) and
+`harness.conflict` (`{calls} -> {conflicts = bool}`, one call per batch).
+Unsubscribed turns pay no Lua cost.
 
 Discovery: cwd `.dex/extensions` + `.agents/extensions` (project scope — loads
 only after `dex extensions enable <id>`, the trust consent), then

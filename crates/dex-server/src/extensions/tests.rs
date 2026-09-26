@@ -2042,3 +2042,76 @@ async fn web_example_falls_back_to_override_model() {
     global_manager().reset_for_tests().await;
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[tokio::test]
+async fn harness_overflow_first_opinion_wins_and_nil_falls_through() {
+    let yes = hook_manifest("h-yes", false);
+    let nil = hook_manifest("h-nil", false);
+    let root = fixture_exts(&[
+        (
+            "hov",
+            yes.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.overflow", function(ctx, ev)
+    if ev.message:find("boom") then return { overflow = true } end
+  end)
+end
+"#,
+        ),
+        (
+            "hnil",
+            nil.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.overflow", function(ctx, ev)
+  end)
+end
+"#,
+        ),
+    ]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    assert_eq!(
+        mgr.query_harness_overflow("boom goes the context", &host)
+            .await,
+        Some(true)
+    );
+    assert_eq!(mgr.query_harness_overflow("all quiet", &host).await, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn harness_conflict_override_decides_the_batch() {
+    let m = hook_manifest("h-conf", false);
+    let root = fixture_exts(&[(
+        "hconf",
+        m.as_str(),
+        r#"return function(dex)
+  dex.events.on("harness.conflict", function(ctx, ev)
+    if #ev.calls > 1 then return { conflicts = false } end
+  end)
+end
+"#,
+    )]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    let two = serde_json::json!([
+        {"name": "read", "args": "{}"},
+        {"name": "read", "args": "{}"},
+    ]);
+    assert_eq!(mgr.query_harness_conflict(&two, &host).await, Some(false));
+    let one = serde_json::json!([{"name": "read", "args": "{}"}]);
+    assert_eq!(mgr.query_harness_conflict(&one, &host).await, None);
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -81,6 +81,13 @@ pub fn parse_after(envelope: &Map<String, Json>, text: &str, ok: bool) -> (Strin
     (content, ok)
 }
 
+/// Read one extension's `harness.overflow` / `harness.conflict` envelope:
+/// `{overflow = bool}` or `{conflicts = bool}`. Absent/non-bool = no opinion
+/// (`None`), so the host falls back to the Rust default.
+pub fn parse_harness_bool(envelope: &Map<String, Json>, key: &str) -> Option<bool> {
+    envelope.get(key).and_then(|v| v.as_bool())
+}
+
 /// Read one extension's `session.before_compact` envelope.
 pub fn parse_compact(envelope: &Map<String, Json>) -> CompactAction {
     CompactAction {
@@ -135,6 +142,31 @@ mod tests {
         assert_eq!(
             parse_after(env.as_object().unwrap(), "old", false),
             ("old".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn harness_bool_reads_named_key() {
+        let env = json!({"overflow": true});
+        assert_eq!(
+            parse_harness_bool(env.as_object().unwrap(), "overflow"),
+            Some(true)
+        );
+        let env = json!({"conflicts": false});
+        assert_eq!(
+            parse_harness_bool(env.as_object().unwrap(), "conflicts"),
+            Some(false)
+        );
+        // Absent/non-bool = no opinion, host keeps the Rust default.
+        let env = json!({});
+        assert_eq!(
+            parse_harness_bool(env.as_object().unwrap(), "overflow"),
+            None
+        );
+        let env = json!({"overflow": "yes"});
+        assert_eq!(
+            parse_harness_bool(env.as_object().unwrap(), "overflow"),
+            None
         );
     }
 

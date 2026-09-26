@@ -62,6 +62,8 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "session.before_compact",
     "before_agent_start",
     "model_select",
+    "harness.overflow",
+    "harness.conflict",
 ];
 
 /// Host context a Lua call runs under: what cancellation, gates, and

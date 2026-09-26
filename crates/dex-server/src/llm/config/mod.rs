@@ -228,6 +228,24 @@ pub fn load_config_str(file: &Option<serde_yaml::Value>, key: &str) -> Option<St
         .filter(|s| !s.is_empty())
 }
 
+/// Runtime-harness numeric knob (`harness:` table): file value only, positive
+/// integers — zero/garbage falls back to the caller's default. Env wins where
+/// a dedicated env var exists (`DEX_MAX_TOOL_ITERATIONS`); this is the file
+/// layer under it.
+pub fn load_harness_num(key: &str) -> Option<u64> {
+    let file = load_config_file()?;
+    let table = file.get("harness")?;
+    let v = table.get(key)?;
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
 /// Every top-level config key dex reads (plus the deprecated ones it still
 /// honors). Used for typo hints: an unknown key is called out instead of
 /// silently doing nothing, and a parse error lists what is valid.
@@ -241,6 +259,7 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "mcp_servers",
     "agent_wake",
     "extensions",
+    "harness",
     "jev",
     // Deprecated but still honored for old files:
     "base_url",

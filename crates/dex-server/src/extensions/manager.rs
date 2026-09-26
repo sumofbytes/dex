@@ -659,6 +659,74 @@ impl ExtensionManager {
         appends
     }
 
+    /// `harness.overflow` chain: first non-`nil` `{overflow = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (Rust default).
+    pub async fn query_harness_overflow(&self, message: &str, host: &HostCtx<'_>) -> Option<bool> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"harness.overflow".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({ "message": message });
+            let envelope = match self.run_event(&id, "harness.overflow", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.overflow failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_bool(&envelope, "overflow") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `harness.conflict` chain: first non-`nil` `{conflicts = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (Rust default,
+    /// which is fail-closed to serialization).
+    pub async fn query_harness_conflict(
+        &self,
+        calls: &serde_json::Value,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"harness.conflict".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({ "calls": calls });
+            let envelope = match self
+                .run_event(&id, "harness.conflict", payload.clone(), host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.conflict failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_bool(&envelope, "conflicts") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// `session.before_compact` chain: merged across handlers — any cancel
     /// wins, instruction strings concatenate in load order, the first
     /// summary replacement wins. Fail-open: a handler error is logged and

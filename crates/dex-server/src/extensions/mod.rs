@@ -59,7 +59,8 @@ pub use global::{
     apply_after_hooks, apply_before_agent_start, apply_before_compact, apply_before_hooks,
     cached_schema_tokens, cached_tools, call_global, command_list, current_drive_model,
     drive_model_for, fire_event_global, fire_model_select_if_changed, global_manager, net_fetch,
-    run_command_global, served_model_snapshot, with_drive_model, DriveModel,
+    query_harness_conflict, query_harness_overflow, run_command_global, served_model_snapshot,
+    with_drive_model, DriveModel,
 };
 #[cfg(test)]
 use global::{current_routing_headers, harvest_routing_headers, with_routing_headers};
