@@ -212,6 +212,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
         filter: None,
         agent_ctx: None,
         tool_budget: None,
+        harness: None,
     }));
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event(if result.is_ok() {

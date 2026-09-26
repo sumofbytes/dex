@@ -12,11 +12,15 @@
 //! - [`PruneScorer`] — which compacted tool pairs survive verbatim.
 //! - [`HarnessLimits`] — numeric budgets (tool rounds, compaction attempts,
 //!   batch fan-out) in one struct instead of scattered env reads.
+//! - [`CutConfig`] — cut-point window (keep-recent tokens + message-count
+//!   fallback) replacing scattered `KEEP_RECENT_*` consts.
 //!
 //! Each trait ships with closure adapters (`FnCatalog`, `FnTrigger`,
-//! `FnSummarizer`), static test doubles (`StaticCatalog`,
-//! `NeverCompact`, `AlwaysCompact`, `StaticSummarizer`), and a
-//! [`Harness`] builder that bundles the three plus the tool-round limit.
+//! `FnSummarizer`, `FnOverflowDetector`, `FnConflictDetector`,
+//! `FnPruneScorer`), static test doubles (`StaticCatalog`,
+//! `NeverCompact`, `AlwaysCompact`, `StaticSummarizer`, `SerializeAll`,
+//! `NeverConflict`), and a [`Harness`] builder that bundles every piece so
+//! hosts hold one value and delegate their decision points to it.
 //! Overriding one piece is one `with_*` call:
 //!
 //! ```rust
@@ -44,7 +48,7 @@ use crate::{deterministic_summary, CompactionBudget, FileOps};
 ///
 /// Implement this to add, remove, or rewrite tools without touching the
 /// turn engine. See `dex-coding-agent::ToolRegistry` for a ready-made
-/// catalog with `register` / `override_tool` / `remove` helpers.
+/// catalog with `register` / `override_native` / `remove` helpers.
 pub trait ToolCatalog: Send + Sync {
     fn tool_schemas(&self) -> Vec<ToolDefinition>;
 }
@@ -222,13 +226,19 @@ where
 
 /// Bundled, overwritable harness decisions.
 ///
-/// Hosts can hold a `Harness` and delegate their `AgentHost` methods to
-/// it, so users override behavior by swapping one field instead of
-/// reimplementing the host.
+/// Hosts hold one `Harness` and delegate their decision points to it, so
+/// users override behavior by swapping one field instead of reimplementing
+/// the host. Every field has a `with_*` builder plus an `_arc` variant for
+/// shared handles and a `_fn` closure shortcut where it pays.
 pub struct Harness {
     catalog: Arc<dyn ToolCatalog>,
     trigger: Arc<dyn CompactionTrigger>,
     summarizer: Arc<dyn Summarizer>,
+    overflow: Arc<dyn OverflowDetector>,
+    conflict: Arc<dyn ConflictDetector>,
+    scorer: Arc<dyn PruneScorer>,
+    limits: HarnessLimits,
+    cut: CutConfig,
     tool_round_limit: usize,
 }
 
@@ -242,22 +252,38 @@ impl Default for Harness {
                 prefix_messages: 1,
             }),
             summarizer: Arc::new(DeterministicSummarizer),
-            tool_round_limit: 200,
+            overflow: Arc::new(DefaultOverflowDetector),
+            conflict: Arc::new(SerializeAll),
+            scorer: Arc::new(DefaultPruneScorer::default()),
+            limits: HarnessLimits::default(),
+            cut: CutConfig::default(),
+            tool_round_limit: HarnessLimits::default().max_tool_iterations,
         }
     }
 }
 
 impl Harness {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<dyn ToolCatalog>,
         trigger: Arc<dyn CompactionTrigger>,
         summarizer: Arc<dyn Summarizer>,
-        tool_round_limit: usize,
+        overflow: Arc<dyn OverflowDetector>,
+        conflict: Arc<dyn ConflictDetector>,
+        scorer: Arc<dyn PruneScorer>,
+        limits: HarnessLimits,
+        cut: CutConfig,
     ) -> Self {
+        let tool_round_limit = limits.max_tool_iterations;
         Self {
             catalog,
             trigger,
             summarizer,
+            overflow,
+            conflict,
+            scorer,
+            limits,
+            cut,
             tool_round_limit,
         }
     }
@@ -334,6 +360,59 @@ impl Harness {
         self
     }
 
+    pub fn with_overflow(mut self, overflow: impl OverflowDetector + 'static) -> Self {
+        self.overflow = Arc::new(overflow);
+        self
+    }
+
+    pub fn with_overflow_arc(mut self, overflow: Arc<dyn OverflowDetector>) -> Self {
+        self.overflow = overflow;
+        self
+    }
+
+    /// Closure shortcut: `.with_overflow_fn(|message| …)`.
+    pub fn with_overflow_fn(self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.with_overflow(FnOverflowDetector(f))
+    }
+
+    pub fn with_conflict(mut self, conflict: impl ConflictDetector + 'static) -> Self {
+        self.conflict = Arc::new(conflict);
+        self
+    }
+
+    pub fn with_conflict_arc(mut self, conflict: Arc<dyn ConflictDetector>) -> Self {
+        self.conflict = conflict;
+        self
+    }
+
+    /// Closure shortcut: `.with_conflict_fn(|calls| …)`.
+    pub fn with_conflict_fn(
+        self,
+        f: impl Fn(&[LlmToolCall]) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.with_conflict(FnConflictDetector(f))
+    }
+
+    pub fn with_scorer(mut self, scorer: impl PruneScorer + 'static) -> Self {
+        self.scorer = Arc::new(scorer);
+        self
+    }
+
+    pub fn with_scorer_arc(mut self, scorer: Arc<dyn PruneScorer>) -> Self {
+        self.scorer = scorer;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: HarnessLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn with_cut(mut self, cut: CutConfig) -> Self {
+        self.cut = cut;
+        self
+    }
+
     pub fn tool_schemas(&self) -> Vec<ToolDefinition> {
         self.catalog.tool_schemas()
     }
@@ -354,6 +433,32 @@ impl Harness {
 
     pub fn tool_round_limit(&self) -> usize {
         self.tool_round_limit
+    }
+
+    pub fn is_overflow(&self, message: &str) -> bool {
+        self.overflow.is_overflow(message)
+    }
+
+    pub fn conflicts(&self, calls: &[LlmToolCall]) -> bool {
+        self.conflict.conflicts(calls)
+    }
+
+    pub fn decide(
+        &self,
+        tool: &str,
+        result_chars: usize,
+        rerunnable: bool,
+        is_error: bool,
+    ) -> PairVerdict {
+        self.scorer.decide(tool, result_chars, rerunnable, is_error)
+    }
+
+    pub fn limits(&self) -> HarnessLimits {
+        self.limits
+    }
+
+    pub fn cut(&self) -> CutConfig {
+        self.cut
     }
 }
 
@@ -672,5 +777,33 @@ mod tests {
             Harness::default().with_summarizer_fn(|old, _, _, _| format!("{} messages", old.len()));
         let old = vec![ChatMessage::user("a"), ChatMessage::user("b")];
         assert_eq!(harness.summarize(&old, &[], None, &ops), "2 messages");
+    }
+
+    #[test]
+    fn full_harness_delegates_every_piece() {
+        let harness = Harness::default()
+            .with_overflow_fn(|m| m.contains("boom"))
+            .with_conflict(NeverConflict)
+            .with_limits(HarnessLimits {
+                max_tool_iterations: 7,
+                ..HarnessLimits::default()
+            })
+            .with_cut(CutConfig {
+                min_keep_messages: 4,
+                ..CutConfig::default()
+            });
+        assert!(harness.is_overflow("boom goes the context"));
+        assert!(!harness.is_overflow("context length exceeded"));
+        assert!(!harness.conflicts(&[]));
+        assert_eq!(harness.limits().max_tool_iterations, 7);
+        assert_eq!(harness.cut().min_keep_messages, 4);
+        let verdict = harness.decide("read", 11_000, true, false);
+        assert_eq!(
+            verdict,
+            PairVerdict {
+                keep_call: false,
+                keep_result: false,
+            }
+        );
     }
 }

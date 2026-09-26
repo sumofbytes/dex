@@ -82,21 +82,66 @@ impl ApprovalPolicy for DefaultApprovalPolicy {
     }
 }
 
-/// Closure metadata override; approval gate stays default.
-pub struct FnApprovalPolicy<F>(pub F)
-where
-    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync;
+/// Closure policy with an overridable gate.
+///
+/// `FnApprovalPolicy::new(f)` overrides metadata and keeps the default
+/// gate; `.with_gate(g)` (or `FnApprovalPolicy::with_gate(f, g)`) replaces
+/// the gate too — e.g. an auto-approve list — without forking dispatch.
+pub struct FnApprovalPolicy<F, G = fn(PermissionRequirement, PermissionMode) -> bool> {
+    metadata_fn: F,
+    gate_fn: G,
+}
 
-impl<F> ApprovalPolicy for FnApprovalPolicy<F>
+fn default_gate(requirement: PermissionRequirement, mode: PermissionMode) -> bool {
+    DefaultApprovalPolicy.needs_approval(requirement, mode)
+}
+
+impl<F> FnApprovalPolicy<F, fn(PermissionRequirement, PermissionMode) -> bool>
 where
     F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
 {
+    pub fn new(f: F) -> Self {
+        Self {
+            metadata_fn: f,
+            gate_fn: default_gate,
+        }
+    }
+
+    pub fn with_gate<G>(self, g: G) -> FnApprovalPolicy<F, G>
+    where
+        G: Fn(PermissionRequirement, PermissionMode) -> bool + Send + Sync,
+    {
+        FnApprovalPolicy {
+            metadata_fn: self.metadata_fn,
+            gate_fn: g,
+        }
+    }
+}
+
+impl<F, G> FnApprovalPolicy<F, G>
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
+    G: Fn(PermissionRequirement, PermissionMode) -> bool + Send + Sync,
+{
+    pub fn with_parts(metadata_fn: F, gate_fn: G) -> Self {
+        Self {
+            metadata_fn,
+            gate_fn,
+        }
+    }
+}
+
+impl<F, G> ApprovalPolicy for FnApprovalPolicy<F, G>
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
+    G: Fn(PermissionRequirement, PermissionMode) -> bool + Send + Sync,
+{
     fn metadata(&self, name: &str) -> Option<ToolMetadata> {
-        (self.0)(name)
+        (self.metadata_fn)(name)
     }
 
     fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool {
-        DefaultApprovalPolicy.needs_approval(requirement, mode)
+        (self.gate_fn)(requirement, mode)
     }
 }
 
@@ -131,5 +176,12 @@ mod tests {
             PermissionRequirement::Shell,
             PermissionMode::Trusted
         ));
+    }
+
+    #[test]
+    fn fn_policy_overrides_metadata_and_gate() {
+        let policy = FnApprovalPolicy::new(native_tool_metadata).with_gate(|_, _| false);
+        assert!(policy.metadata("read").is_some());
+        assert!(!policy.needs_approval(PermissionRequirement::Shell, PermissionMode::Ask));
     }
 }

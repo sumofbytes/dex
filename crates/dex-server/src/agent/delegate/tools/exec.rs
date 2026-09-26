@@ -883,6 +883,7 @@ async fn child_run(
                 .as_ref()
                 .and_then(|request| request.handle.remaining_budget)
                 .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
+            harness: None,
         })
         .await;
         let payload = match &result {

@@ -54,6 +54,11 @@ pub async fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
 /// `Policy::trusted()` (no console) preserves the old behavior for explicit
 /// user-invoked paths (`dex run`, `--tool`, the `!` escape): the `!` itself
 /// is the approval there.
+///
+/// `approval` carries an optional [`ApprovalPolicy`](dex_coding_agent::ApprovalPolicy)
+/// override for the turn: `None` keeps the default native rows + gate.
+/// Hosts set it from the harness so embedders can extend metadata rows or
+/// replace the gate without forking dispatch.
 #[derive(Clone)]
 pub struct Policy {
     pub mode: PermissionMode,
@@ -64,4 +69,16 @@ pub struct Policy {
     /// `delegate` call from either is rejected at dispatch (no recursion
     /// — the depth cap in code, not in the prompt).
     pub agent: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
+    pub approval: Option<std::sync::Arc<dyn dex_coding_agent::ApprovalPolicy>>,
+}
+
+impl Policy {
+    /// Attach an approval-policy override for this turn.
+    pub fn with_approval(
+        mut self,
+        approval: impl dex_coding_agent::ApprovalPolicy + 'static,
+    ) -> Self {
+        self.approval = Some(std::sync::Arc::new(approval));
+        self
+    }
 }

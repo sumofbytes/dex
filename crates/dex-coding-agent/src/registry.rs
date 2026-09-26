@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 
+use dex_agent_core::ToolCatalog;
 use dex_ai::ToolDefinition;
 
 use crate::{native_tool_metadata, sort_tool_defs_by_name, ToolMetadata};
@@ -139,6 +140,12 @@ impl ToolRegistry {
             self.native.iter().map(|e| e.definition.clone()).collect();
         out.extend(tail);
         out
+    }
+}
+
+impl ToolCatalog for ToolRegistry {
+    fn tool_schemas(&self) -> Vec<ToolDefinition> {
+        self.schemas()
     }
 }
 

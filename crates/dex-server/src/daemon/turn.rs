@@ -10,7 +10,7 @@ use crate::agent::delegate::{AgentTurnContext, WaitOutcome};
 use crate::agent::state::ToolState;
 use crate::agent::turn_loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::llm::config::LlmConfig;
-use crate::llm::prompt::system_prompt_with_override_for;
+use crate::llm::prompt::system_prompt_with_chain;
 use crate::protocol::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
 use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
 use crate::runtime::console::{CancellationToken, Console};
@@ -517,11 +517,15 @@ pub(crate) async fn run_turn_inner(
     // The model-bound load drops `!!` shell runs (saved + shown, never sent
     // to the LLM); the transcript rebuild keeps them.
     let mut messages: Vec<ChatMessage> = Vec::new();
-    messages.push(ChatMessage::system(system_prompt_with_override_for(
+    // Prompt assembly runs through the contributor chain (empty here, so
+    // bytes match `system_prompt_with_override_for` exactly): embedders
+    // pass a `DexHarness`-held `ChainContributor` to add sections.
+    messages.push(ChatMessage::system(system_prompt_with_chain(
         &skills,
         req.system_prompt.as_deref(),
         Some(std::path::Path::new(&entry.cwd)),
         agent_mode.is_some_and(crate::protocol::AgentMode::is_plan),
+        &crate::agent::composable::ChainContributor::new(),
     )));
     // The history above is the exact message list the turn sends.
     messages.extend(history);
@@ -746,6 +750,7 @@ pub(crate) async fn run_turn_inner(
             filter: None,
             agent_ctx: Some(agent_ctx.clone()),
             tool_budget: None,
+            harness: None,
         })
         .await;
         match result {

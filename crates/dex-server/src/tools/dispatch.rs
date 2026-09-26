@@ -7,7 +7,9 @@ use super::edit::{change_diff_async, tool_edit};
 use super::error::ToolError;
 use super::meta::{tool_ls, Policy};
 use super::outcome::ToolOutcome;
-use super::policy::{enforce_policy, metadata, metadata_native, PermissionRequirement, ToolFilter};
+use super::policy::{
+    enforce_policy, metadata_for, metadata_native_for, PermissionRequirement, ToolFilter,
+};
 use super::read::tool_read;
 use super::search::{tool_fffind, tool_ffgrep};
 use super::shell::tool_bash;
@@ -158,9 +160,9 @@ async fn dispatch_tool(
     // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
     // Shell row must not raise the gate again — use the native requirement.
     let requirement = match if resolve_shadow {
-        metadata(name)
+        metadata_for(policy, name)
     } else {
-        metadata_native(name)
+        metadata_native_for(policy, name)
     } {
         // MCP tools are external processes: their `metadata()` row already
         // carries the most restrictive gate (same as shell), so the separate

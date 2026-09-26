@@ -36,7 +36,27 @@ pub fn normalize_tool_result(
     tool_name: &str,
     outcome: ToolExecutionResult,
 ) -> NormalizedToolResult {
-    ResultPolicy::default().normalize(cache, recent_calls, cache_key, tool_name, outcome)
+    normalize_tool_result_with(
+        &ResultPolicy::default(),
+        cache,
+        recent_calls,
+        cache_key,
+        tool_name,
+        outcome,
+    )
+}
+
+/// Same as [`normalize_tool_result`] with an explicit policy, so hosts can
+/// inject their configured [`ResultPolicy`] instead of the default.
+pub fn normalize_tool_result_with(
+    policy: &ResultPolicy,
+    cache: &mut HashMap<String, String>,
+    recent_calls: &mut Vec<String>,
+    cache_key: String,
+    tool_name: &str,
+    outcome: ToolExecutionResult,
+) -> NormalizedToolResult {
+    policy.normalize(cache, recent_calls, cache_key, tool_name, outcome)
 }
 
 /// Overwritable cache + repeat-call policy.
