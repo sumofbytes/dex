@@ -291,6 +291,21 @@ pub(crate) async fn summarize_old_messages(
     Ok((turn.message.content.unwrap_or_default(), turn.usage))
 }
 
+/// Offline fallback summary: the harness override when set, otherwise the
+/// deterministic structured checkpoint.
+fn summarize_fallback(
+    fallback: Option<&dyn dex_agent_core::Summarizer>,
+    old: &[ChatMessage],
+    turn_prefix: &[ChatMessage],
+    previous_summary: Option<&str>,
+    file_ops: &FileOps,
+) -> String {
+    if let Some(summarizer) = fallback {
+        return summarizer.summarize(old, turn_prefix, previous_summary, file_ops);
+    }
+    deterministic_summary(old, turn_prefix, previous_summary, file_ops)
+}
+
 /// Fold one call's usage into an accumulator (summing prompt, completion,
 /// and cached counts; cache detail is dropped when any call omits it).
 fn merge_usage(acc: &mut Option<Usage>, u: Option<Usage>) {
@@ -374,6 +389,7 @@ async fn llm_summary(
     file_ops: &FileOps,
     usage_total: &mut Option<Usage>,
     hook_instructions: &[String],
+    fallback: Option<&dyn dex_agent_core::Summarizer>,
 ) -> Result<String, String> {
     let history_summary = if !messages_to_summarize.is_empty() {
         match summarize_old_messages(config, messages_to_summarize, cancel, hook_instructions).await
@@ -384,14 +400,26 @@ async fn llm_summary(
             }
             Ok((_, u)) => {
                 merge_usage(usage_total, u);
-                deterministic_summary(messages_to_summarize, &[], previous_summary, file_ops)
+                summarize_fallback(
+                    fallback,
+                    messages_to_summarize,
+                    &[],
+                    previous_summary,
+                    file_ops,
+                )
             }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("cancelled") || msg.contains("cancellation") {
                     return Err(format!("history compaction cancelled: {msg}"));
                 }
-                deterministic_summary(messages_to_summarize, &[], previous_summary, file_ops)
+                summarize_fallback(
+                    fallback,
+                    messages_to_summarize,
+                    &[],
+                    previous_summary,
+                    file_ops,
+                )
             }
         }
     } else {
@@ -448,6 +476,9 @@ pub(crate) async fn compact_history(
     // skipped or does not pay — always the threshold knob's choice, parsed
     // once by the caller instead of re-read here.
     summarizer: crate::agent::compaction::verbatim::SummaryMode,
+    // Overwritable harness decisions: cut window, prune scorer, fallback
+    // summarizer override, and the prune-payoff ratio.
+    harness: &crate::agent::composable::DexHarness,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
     if total <= 1 {
@@ -471,18 +502,20 @@ pub(crate) async fn compact_history(
     // Emergency cut: the provider has already declared the input over its
     // real limit, so the comfort floors that normally protect recency are
     // what stop the retry. Shrink the keep window and the minimum-summarize
-    // guard to a floor that still leaves a coherent transcript.
-    let keep_recent_tokens = if emergency {
-        _config.keep_recent_tokens().saturating_div(4)
-    } else {
-        _config.keep_recent_tokens()
+    // guard to a floor that still leaves a coherent transcript. The window
+    // comes from the harness cut config (tokens from `LlmConfig`), so one
+    // override point covers both paths.
+    let cut = {
+        let base = harness.config.cut_for(_config);
+        if emergency {
+            base.emergency()
+        } else {
+            base
+        }
     };
-    let min_keep_messages = if emergency { 4 } else { KEEP_RECENT_MESSAGES };
-    let min_to_summarize = if emergency {
-        1
-    } else {
-        MIN_MESSAGES_TO_SUMMARIZE
-    };
+    let keep_recent_tokens = cut.keep_recent_tokens;
+    let min_keep_messages = cut.min_keep_messages;
+    let min_to_summarize = cut.min_to_summarize;
     let cp = match find_cut_point(
         messages,
         boundary_start,
@@ -565,10 +598,14 @@ pub(crate) async fn compact_history(
             boundary_start,
             first_kept,
             scorer,
+            &*harness.scorer,
             live.as_ref(),
         )
         .await;
-        if crate::agent::compaction::verbatim::is_worthwhile(&stats) {
+        if crate::agent::compaction::verbatim::meets_reduction(
+            &stats,
+            harness.config.limits.reduction_ratio(),
+        ) {
             dex_runtime::log!(
                 Info,
                 "jev compaction: dropped {} truncated {} kept {} (freed {} chars, ratio {:.2})",
@@ -585,6 +622,7 @@ pub(crate) async fn compact_history(
 
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
+    let fallback = harness.summarizer.as_deref();
     let summarized = if let Some(summary) = &hook.summary {
         summary.clone()
     } else if summarizer == crate::agent::compaction::verbatim::SummaryMode::Llm {
@@ -598,10 +636,12 @@ pub(crate) async fn compact_history(
             &file_ops,
             &mut usage_total,
             &hook.instructions,
+            fallback,
         )
         .await?
     } else {
-        deterministic_summary(
+        summarize_fallback(
+            fallback,
             &messages_to_summarize,
             &turn_prefix_messages,
             previous_summary.as_deref(),
@@ -880,6 +920,7 @@ mod tests {
             false,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -896,6 +937,7 @@ mod tests {
             false,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -940,6 +982,7 @@ mod tests {
             false,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1010,6 +1053,7 @@ mod tests {
             true,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap_err();
@@ -1023,6 +1067,7 @@ mod tests {
             false,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1066,6 +1111,7 @@ mod tests {
             false,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1077,6 +1123,7 @@ mod tests {
             true,
             false,
             crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1137,6 +1184,7 @@ mod tests {
             false,
             summarizer.prunes_jev(),
             summarizer,
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1188,6 +1236,7 @@ mod tests {
             false,
             summarizer.prunes_jev(),
             summarizer,
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1236,6 +1285,7 @@ mod tests {
             false,
             summarizer.prunes_jev(),
             summarizer,
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();
@@ -1343,6 +1393,7 @@ mod tests {
             false,
             summarizer.prunes_jev(),
             summarizer,
+            &crate::agent::composable::DexHarness::default(),
         )
         .await
         .unwrap();

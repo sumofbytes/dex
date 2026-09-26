@@ -191,6 +191,27 @@ pub(crate) fn system_prompt_with_override_for(
     prompt
 }
 
+/// Same as [`system_prompt_with_override_for`] with extra prompt
+/// contributors applied after skills (before the plan directive): the
+/// [`ChainContributor`](crate::agent::composable::ChainContributor) seam for
+/// embedders composing custom sections without forking this assembly. An
+/// empty chain reproduces the historic bytes exactly.
+pub(crate) fn system_prompt_with_chain(
+    skills: &[Skill],
+    explicit: Option<&str>,
+    cwd: Option<&Path>,
+    plan_mode: bool,
+    chain: &crate::agent::composable::ChainContributor,
+) -> String {
+    let base = system_prompt_with_override_for(skills, explicit, cwd, false);
+    let composed = chain.build(base);
+    if plan_mode {
+        format!("{composed}{PLAN_MODE_DIRECTIVE}")
+    } else {
+        composed
+    }
+}
+
 /// Appended to the system prompt when the client selected `plan` mode. The
 /// gate (read-only) blocks the mutations; this directive is what makes the
 /// model *plan* instead of merely failing. Prose, not a tool or a struct —
@@ -361,5 +382,31 @@ mod tests {
         assert!(on.contains("--- Plan mode ---"), "{on}");
         assert!(on.contains("make no changes"), "{on}");
         assert_eq!(on, format!("{off}{PLAN_MODE_DIRECTIVE}"));
+    }
+
+    #[test]
+    fn prompt_chain_is_byte_stable_empty_and_ordered_otherwise() {
+        use crate::agent::composable::{ChainContributor, StaticSection};
+        let empty = ChainContributor::new();
+        // Empty chain reproduces the historic bytes, with and without plan.
+        assert_eq!(
+            system_prompt_with_chain(&[], Some("base"), None, false, &empty),
+            system_prompt_with_override_for(&[], Some("base"), None, false)
+        );
+        assert_eq!(
+            system_prompt_with_chain(&[], Some("base"), None, true, &empty),
+            system_prompt_with_override_for(&[], Some("base"), None, true)
+        );
+        // Sections append in registration order, before the plan directive.
+        let chain = ChainContributor::new()
+            .push(StaticSection::new("\n\n--- A ---\n", "aaa"))
+            .push(StaticSection::new("\n\n--- B ---\n", "bbb"));
+        let out = system_prompt_with_chain(&[], Some("base"), None, true, &chain);
+        let (a, b, plan) = (
+            out.find("aaa").unwrap(),
+            out.find("bbb").unwrap(),
+            out.find("--- Plan mode ---").unwrap(),
+        );
+        assert!(a < b && b < plan, "{out}");
     }
 }

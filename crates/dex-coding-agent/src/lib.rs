@@ -16,6 +16,7 @@ pub use tool_policy::{
     PermissionRequirement, ToolMetadata,
 };
 pub use tool_results::{
-    normalize_tool_result, NormalizedToolResult, ResultPolicy, ToolExecutionResult,
+    normalize_tool_result, normalize_tool_result_with, NormalizedToolResult, ResultPolicy,
+    ToolExecutionResult,
 };
 pub use tools::{builtin_tools, merge_tool_schemas, sort_tool_defs_by_name};

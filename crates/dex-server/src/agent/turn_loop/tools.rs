@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use super::apply_queue_msg;
 use crate::agent::compaction::compact_history;
 use crate::agent::compaction::verbatim::summary_mode;
+use crate::agent::composable::{DexHarness, ToolExecutor};
 use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
 use crate::llm::config::LlmConfig;
@@ -17,7 +18,7 @@ use crate::render::format::short_arg;
 use crate::runtime::console::{with_console, Console, RESET, TOOL_INPUT_COLOR, TOOL_MUTATION_LOCK};
 use crate::runtime::unwind::CatchUnwind;
 use crate::session::Session;
-use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
+use crate::tools::{Policy, ToolFilter, ToolOutcome};
 
 /// Emit a system note on every surface: a transcript line when a sink is
 /// attached (TUI / daemon), `eprintln` headless.
@@ -133,27 +134,6 @@ pub(super) async fn inject_steering(
     true
 }
 
-/// Per-turn cap on tool rounds (one round = one assistant batch with tool
-/// calls, regardless of how many calls the batch fans out). A model that
-/// loops (re-issuing the same failing call in new words, ping-ponging two
-/// files) burns unlimited tokens without one; the repeated-call detector
-/// only stops *identical* calls. Bounded, preserved partial progress; the
-/// user can continue with another prompt. `DEX_MAX_TOOL_ITERATIONS`
-/// overrides.
-///
-/// Single env boundary: [`crate::agent::composable::HarnessConfig::from_env`].
-pub(super) fn max_tool_iterations() -> usize {
-    crate::agent::composable::HarnessConfig::from_env().max_tool_iterations
-}
-
-/// Provider wording for "the input no longer fits the context window".
-/// Delegates to the overwritable [`dex_agent_core::DefaultOverflowDetector`];
-/// override that trait instead of forking this function.
-pub(super) fn is_context_overflow(message: &str) -> bool {
-    use dex_agent_core::{DefaultOverflowDetector, OverflowDetector};
-    DefaultOverflowDetector.is_overflow(message)
-}
-
 /// Shared per-call accounting: live context usage in `state`, the sink
 /// event the TUI accumulates spend from (carrying the daemon-priced USD
 /// cost, so the remote client never re-prices locally), and the
@@ -204,6 +184,7 @@ pub(super) async fn execute_tool_call(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
     filter: Option<&ToolFilter>,
+    executor: &dyn ToolExecutor,
 ) -> (String, String, ToolOutcome) {
     let name = call.function.name.clone();
     let raw_args = call.function.arguments.clone();
@@ -235,7 +216,9 @@ pub(super) async fn execute_tool_call(
     let input = serde_json::to_string(args).unwrap_or_default();
     dex_runtime::log!(Debug, "tool {name} {input}");
     let started = Instant::now();
-    let outcome = execute_outcome(&name, args, cancel, policy, filter).await;
+    let outcome = executor
+        .execute_outcome(&name, args, cancel, policy, filter)
+        .await;
     dex_runtime::log!(
         Debug,
         "tool {name} ok={} in {:?}",
@@ -245,10 +228,10 @@ pub(super) async fn execute_tool_call(
     (name, input, outcome)
 }
 
-/// Force up to `HarnessConfig::max_compaction_attempts` rounds regardless of
-/// the token threshold — the provider has already said the input is over the
-/// real limit, so the estimator's opinion no longer matters. Returns true
-/// when history shrank.
+/// Force up to the harness recovery budget of compaction rounds regardless
+/// of the token threshold — the provider has already said the input is over
+/// the real limit, so the estimator's opinion no longer matters. Returns
+/// true when history shrank.
 pub(super) async fn emergency_compact(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
@@ -256,10 +239,10 @@ pub(super) async fn emergency_compact(
     cancel: &(dyn CancellationSource + Send + Sync),
     console: &Console,
     ledger: &mut TokenLedger,
+    harness: &DexHarness,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
-    let max_attempts = crate::agent::composable::HarnessConfig::default().max_compaction_attempts;
-    for _ in 0..max_attempts {
+    for _ in 0..harness.recovery_attempts() {
         // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
         // one parse selects both the prune and the fallback summarizer.
         let summarizer = summary_mode();
@@ -270,13 +253,14 @@ pub(super) async fn emergency_compact(
             true,
             summarizer.prunes_jev(),
             summarizer,
+            harness,
         )
         .await
         {
             Ok((true, usage)) => {
                 compacted_any = true;
                 if let Some(u) = usage {
-                    record_usage(config, state, console, u, None).await;
+                    harness.usage.record(config, state, console, u, None).await;
                 }
             }
             _ => break,
@@ -290,7 +274,7 @@ pub(super) async fn emergency_compact(
     // Compaction may have rewritten history: re-measure once instead of
     // tracking per-round deltas on this rare path.
     *ledger = TokenLedger::rebuild(messages);
-    system_note(console, note).await;
+    harness.events.system_note(console, note).await;
     Ok(compacted_any)
 }
 
@@ -318,20 +302,21 @@ pub(super) async fn note_tool_start(console: &Console, call: &LlmToolCall) {
 }
 
 /// Execute one batch of tool calls: serialized under the mutation lock when
-/// the calls conflict, else fanned out on JoinSet tasks (bounded to
-/// `BATCH_MAX_CONCURRENT` permits, aborted promptly on cancel; input-ordered
-/// via indexed slots, panics surface as tool errors).
+/// the harness conflict detector fires, else fanned out on JoinSet tasks
+/// (bounded to the harness batch-concurrency permits, aborted promptly on
+/// cancel; input-ordered via indexed slots, panics surface as tool errors).
 pub(super) async fn run_tool_batch<X>(
     calls: &[LlmToolCall],
     cancel: &X,
     policy: &Policy,
     filter: Option<&ToolFilter>,
     console: &Console,
+    harness: &DexHarness,
 ) -> Vec<(String, String, ToolOutcome, Duration)>
 where
     X: CancellationSource + Clone + 'static,
 {
-    if tool_calls_conflict(calls) {
+    if harness.conflicts(calls) {
         let _guard = TOOL_MUTATION_LOCK.lock().await;
         let mut out = Vec::new();
         for call in calls {
@@ -355,6 +340,7 @@ where
                 cancel as &(dyn CancellationSource + Send + Sync),
                 policy,
                 filter,
+                &*harness.executor,
             )
             .await;
             out.push((name, input, outcome, started.elapsed()));
@@ -366,10 +352,11 @@ where
         // stays in input order. A semaphore caps fd/thread pressure no matter
         // how many calls the model packed into one batch; `select!` on
         // `wait_cancelled` aborts the stragglers instead of waiting for the
-        // slowest tool after Ctrl+C. Bound from `HarnessConfig` so the
+        // slowest tool after Ctrl+C. The bound comes from the harness so the
         // fan-out is overwritable without forking the scheduler.
-        let batch_max = crate::agent::composable::HarnessConfig::default().batch_max_concurrent;
+        let batch_max = harness.config.batch_max_concurrent();
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_max));
+        let executor = harness.executor.clone();
         let mut set = tokio::task::JoinSet::new();
         for (idx, call) in calls.iter().enumerate() {
             let call = call.clone();
@@ -384,6 +371,7 @@ where
             // open at once, in permit order rather than input order.
             let task_console = console.clone();
             let sem = sem.clone();
+            let executor = executor.clone();
             set.spawn(async move {
                 // The semaphore is never closed, but fail closed with
                 // the index intact rather than run unpermitted.
@@ -408,7 +396,8 @@ where
                 // carries no task payload).
                 let work = async {
                     let (name, input, outcome) =
-                        execute_tool_call(&call, &cancel, &policy, filter.as_ref()).await;
+                        execute_tool_call(&call, &cancel, &policy, filter.as_ref(), &*executor)
+                            .await;
                     (name, input, outcome, started.elapsed())
                 };
                 match CatchUnwind::new(Box::pin(work), "tool worker panicked").await {

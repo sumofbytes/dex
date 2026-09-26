@@ -2,15 +2,21 @@ use dex_coding_agent::{native_tool_metadata, needs_approval};
 
 pub use dex_coding_agent::{PermissionRequirement, ToolMetadata};
 
+/// Most-restrictive row for untrusted third-party tools (extension shadows,
+/// `ext__*`, `mcp__*`): `ask` unless trusted, same as shell.
+fn shell_row() -> ToolMetadata {
+    ToolMetadata {
+        read_only: false,
+        mutating: true,
+        idempotent: false,
+        requires_shell: true,
+        permission: PermissionRequirement::Shell,
+    }
+}
+
 pub fn metadata(name: &str) -> Option<ToolMetadata> {
     if crate::extensions::is_shadowed(name) {
-        return Some(ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        });
+        return Some(shell_row());
     }
     metadata_native(name)
 }
@@ -30,25 +36,48 @@ pub fn metadata_native(name: &str) -> Option<ToolMetadata> {
         // most restrictive gate (`ask` unless trusted), same as shell/MCP.
         // Resolved dynamically so loaded extensions don't need a static
         // entry each (`lua__` is the deprecated alias for `ext__`).
-        _ if crate::extensions::is_extension_tool(name) => ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        },
+        _ if crate::extensions::is_extension_tool(name) => shell_row(),
         // MCP tools are external processes: most restrictive gate (`ask`
         // unless trusted), same as shell. Resolved dynamically so cached
         // server tools don't need a static entry each.
-        _ if name.starts_with("mcp__") => ToolMetadata {
-            read_only: false,
-            mutating: true,
-            idempotent: false,
-            requires_shell: true,
-            permission: PermissionRequirement::Shell,
-        },
+        _ if name.starts_with("mcp__") => shell_row(),
         _ => return None,
     })
+}
+
+/// Metadata resolution honoring the turn's approval-policy override: the
+/// shadow row still wins (a shadow intercepts a built-in and may lie about
+/// it), then the override's rows, then the native + dynamic rows. `None`
+/// policy (or no row) falls back to [`metadata`] exactly.
+pub fn metadata_for(policy: &Policy, name: &str) -> Option<ToolMetadata> {
+    if crate::extensions::is_shadowed(name) {
+        return Some(shell_row());
+    }
+    metadata_native_for(policy, name)
+}
+
+/// Native + dynamic resolution honoring the override, without the shadow
+/// row (shadow re-dispatch path — see [`metadata_native`]).
+pub fn metadata_native_for(policy: &Policy, name: &str) -> Option<ToolMetadata> {
+    if let Some(override_policy) = policy.approval.as_ref() {
+        if let Some(meta) = override_policy.metadata(name) {
+            return Some(meta);
+        }
+    }
+    metadata_native(name)
+}
+
+/// Gate honoring the turn's approval-policy override; `None` keeps the
+/// default [`needs_approval`] gate.
+pub fn needs_approval_for(
+    policy: &Policy,
+    requirement: PermissionRequirement,
+    mode: PermissionMode,
+) -> bool {
+    if let Some(override_policy) = policy.approval.as_ref() {
+        return override_policy.needs_approval(requirement, mode);
+    }
+    needs_approval(requirement, mode)
 }
 
 use std::collections::BTreeSet;
@@ -68,6 +97,7 @@ impl Policy {
             mode: PermissionMode::Trusted,
             console: None,
             agent: None,
+            approval: None,
         }
     }
 
@@ -76,6 +106,7 @@ impl Policy {
             mode,
             console: Some(console.clone()),
             agent: None,
+            approval: None,
         }
     }
 }
@@ -95,7 +126,7 @@ pub async fn enforce_policy(
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
 ) -> Result<(), ToolError> {
-    if !needs_approval(requirement, policy.mode) {
+    if !needs_approval_for(policy, requirement, policy.mode) {
         return Ok(());
     }
     if policy.mode == PermissionMode::ReadOnly {

@@ -352,6 +352,7 @@ async fn then_run_needs_the_shell_gate() {
         mode: PermissionMode::Ask,
         console: None,
         agent: None,
+        approval: None,
     };
     let mut args = Map::new();
     args.insert("path".into(), Value::String(rel.into()));

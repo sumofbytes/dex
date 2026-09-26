@@ -21,7 +21,7 @@ use crate::tools::ToolFilter;
 #[cfg(test)]
 use tools::record_usage;
 #[cfg(test)]
-use tools::{is_context_overflow, run_tool_batch};
+use tools::run_tool_batch;
 
 /// The per-agent capability bundle for [`process_turn`]. One loop serves main agent and children — the
 /// bundle decides what each run gets: the main agent passes its steering
@@ -48,6 +48,12 @@ pub struct AgentRuntime<'a, C, X> {
     /// Turn budget override (a definition's `max_tool_iterations`
     /// feeds the existing budget knob; `None` = the default/env value).
     pub tool_budget: Option<usize>,
+    /// Overwritable harness decisions for this turn (`None` = defaults with
+    /// `DEX_MAX_TOOL_ITERATIONS` read once at turn setup). Pass a custom
+    /// [`DexHarness`](crate::agent::composable::DexHarness) to swap one
+    /// piece — catalog, trigger, overflow wording, conflict rule, scorer,
+    /// executor, transcript store — without forking the loop.
+    pub harness: Option<std::sync::Arc<crate::agent::composable::DexHarness>>,
 }
 
 /// Apply one drained queue message to the not-yet-injected `pending` list:
@@ -167,6 +173,7 @@ where
         filter,
         agent_ctx,
         tool_budget,
+        harness,
     } = rt;
     let result = run_agent_engine(DexHostSetup {
         config,
@@ -181,6 +188,7 @@ where
         filter,
         agent_ctx,
         tool_budget,
+        harness,
     })
     .await;
     // Restore the System message the appendix rode on: per-turn scope.
@@ -214,6 +222,7 @@ struct DexHostSetup<'a, C, X> {
     filter: Option<&'a ToolFilter>,
     agent_ctx: Option<Arc<crate::agent::delegate::AgentTurnContext>>,
     tool_budget: Option<usize>,
+    harness: Option<Arc<crate::agent::composable::DexHarness>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,6 +240,7 @@ async fn run_agent_engine<C, X>(
         filter,
         agent_ctx,
         tool_budget,
+        harness,
     }: DexHostSetup<'_, C, X>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -238,6 +248,11 @@ where
     X: CancellationSource + Clone + 'static,
 {
     let _working = SpinnerGuard::start(console, "Working");
+    // Single env boundary for the turn: defaults read
+    // `DEX_MAX_TOOL_ITERATIONS` here, once — never per helper call.
+    let harness =
+        harness.unwrap_or_else(|| Arc::new(crate::agent::composable::DexHarness::from_env()));
+    let tool_round_limit = tool_budget.unwrap_or_else(|| harness.config.max_tool_iterations());
     let mut host = host::make_host(
         config,
         state,
@@ -249,22 +264,14 @@ where
         filter,
         agent_ctx,
         messages.len(),
+        harness,
     );
-    dex_agent_core::run_turn(
-        client,
-        cancel,
-        messages,
-        &mut host,
-        tool_budget.unwrap_or_else(max_tool_iterations),
-    )
-    .await
+    dex_agent_core::run_turn(client, cancel, messages, &mut host, tool_round_limit).await
 }
 
 pub(crate) mod host;
 pub(crate) mod tool_results;
 pub(crate) mod tools;
-
-use tools::max_tool_iterations;
 
 #[cfg(test)]
 pub mod tests;
