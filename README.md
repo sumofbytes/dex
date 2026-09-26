@@ -878,12 +878,31 @@ aborts between Lua instructions. First registered loop wins (load order);
 A manifest may pin the harness it needs with `dex: ">=0.15"` — a running
 harness older than the floor skips the whole extension loudly at load
 instead of running it against events it never saw (only `>=` pins exist).
+Components can be declared in the manifest instead of (or alongside)
+`extension.lua`:
+
+```yaml
+capabilities: [harness]
+components:
+  model_selector: router.lua   # loaded after extension.lua, same setup contract
+```
+
+Each component file is `return function(dex) … end` and registers itself:
+`dex.use(slot, impl)` selects an implementation for a harness slot —
+`impl` is the handler function or `{ id, interface = "<slot>.v1", run }`;
+an `interface` that doesn't match the slot's current version fails the
+extension at load (`dex.replace("agent_loop", …)` owns the agent loop;
+`dex.wrap` adds middleware, `dex.fallback` a backup). Components require
+the `harness` capability, and a missing or failing component file fails
+the whole extension.
 
 Discovery: cwd `.dex/extensions` + `.agents/extensions` (project scope — loads
 only after `dex extensions enable <id>`, the trust consent), then
 `$XDG_CONFIG_HOME/dex/extensions`, config `extensions.paths:`, and
 `--extensions-dir` flags (user scope — loads unless `dex extensions disable
-<id>`). `dex extensions list|install|remove` manages them; `/extensions` shows
+<id>`). `dex extensions list|install|remove` manages them — `install` takes
+a local directory or a git URL (`https://…`, shallow-cloned, manifest
+validated at the repo root before anything lands); `/extensions` shows
 what is loaded and `/extensions reload` rescans. `dex doctor` lists every
 discovered extension with its consent state.
 

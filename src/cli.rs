@@ -77,11 +77,11 @@ pub enum Mode {
         server: Option<String>,
     },
     /// Lua extensions (`dex extensions [list|enable <id>|disable <id>|
-    /// install <dir>|remove <id>]`).
+    /// install <dir|git-url>|remove <id>]`).
     Extensions {
         /// Subcommand (`list` when omitted).
         action: String,
-        /// Extension id (enable/disable/remove) or source dir (install).
+        /// Extension id (enable/disable/remove) or source dir/git URL (install).
         name: Option<String>,
     },
     /// Plot per-call token usage from a session (`dex usage <id|path>`).

@@ -17,6 +17,8 @@ pub(crate) use engine::{
     SLOW_HOOK_WARN,
 };
 #[cfg(test)]
+pub(crate) use engine::{SLOT_INTERFACES, WRAPPABLE_SLOTS};
+#[cfg(test)]
 pub(crate) use manifest::parse_manifest;
 pub(crate) use manifest::MAX_TOOL_TIMEOUT_SECS;
 /// `dex.net.fetch` ceilings: per-request timeout cap (matches the tool

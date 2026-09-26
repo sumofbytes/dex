@@ -2685,3 +2685,174 @@ fn text_preview_truncates_with_honest_counts() {
     assert_eq!(preview.chars().count(), 2000);
     assert!(preview.starts_with("é"));
 }
+
+// --- Phase 6 (runtime composability spec): packaging polish ---
+
+/// The manifest's `components:` slot list and the engine's wrappable-slot
+/// list must never drift: everything `dex.wrap` accepts is declareable,
+/// and the manifest additionally knows `agent_loop` (via `dex.replace`).
+#[test]
+fn wrappable_slots_are_declareable_components() {
+    for slot in WRAPPABLE_SLOTS {
+        assert!(
+            SLOT_INTERFACES.iter().any(|(s, _)| s == slot),
+            "wrappable slot '{slot}' has no interface version"
+        );
+        assert!(
+            super::manifest::COMPONENT_SLOTS.contains(slot),
+            "wrappable slot '{slot}' missing from manifest COMPONENT_SLOTS"
+        );
+    }
+    assert!(super::manifest::COMPONENT_SLOTS.contains(&"agent_loop"));
+}
+
+/// Spec §31: `components:` files load after `extension.lua` on the same
+/// worker and register via `dex.use` — the slot chain sees them like any
+/// handler, with the interface validated at load (spec §28).
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn manifest_components_load_and_register() {
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+        .lock()
+        .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    let manifest = r#"
+manifest_version: 1
+id: comp-ext
+version: 0.1.0
+capabilities: [harness]
+components:
+  model_selector: comp/router.lua
+"#;
+    let root = fixture_ext(manifest, "return function(dex) end\n");
+    let dir = root.join("ext/comp");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("router.lua"),
+        r#"return function(dex)
+  dex.use("model_selector", {
+    id = "cost-router",
+    interface = "model_selector.v1",
+    run = function(ctx, ev) return { model = "myprov/m-9" } end,
+  })
+end
+"#,
+    )
+    .unwrap();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let cfg = model_select_config("myprov", "m-7", "https://myprov.example/v1");
+    let picked = query_model_selector_global(&cfg, &crate::agent::state::GlobalCancellation).await;
+    assert_eq!(picked.as_deref(), Some("myprov/m-9"));
+    let uses = mgr
+        .engines
+        .read()
+        .await
+        .get("comp-ext")
+        .map(|e| e.uses.clone())
+        .unwrap_or_default();
+    assert_eq!(uses, vec!["model_selector".to_string()]);
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Spec §10: registration validates slot, interface, and capability — a
+/// bad `dex.use` fails the whole extension at load, never half-registers.
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn dex_use_fails_the_extension_on_bad_registration() {
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let harness = "manifest_version: 1\nid: use-ext\nversion: 0.1.0\ncapabilities: [harness]\n";
+    let cases: Vec<(&str, &str, &str)> = vec![
+        (
+            "unknown slot",
+            harness,
+            r#"return function(dex) dex.use("summarizer", function() end) end"#,
+        ),
+        (
+            "interface mismatch",
+            harness,
+            r#"return function(dex) dex.use("model_selector", { interface = "model_selector.v9", run = function() end }) end"#,
+        ),
+        (
+            "agent_loop goes through dex.replace",
+            harness,
+            r#"return function(dex) dex.use("agent_loop", function() end) end"#,
+        ),
+        (
+            "harness capability required",
+            "manifest_version: 1\nid: use-ext\nversion: 0.1.0\ncapabilities: []\n",
+            r#"return function(dex) dex.use("model_selector", function() end) end"#,
+        ),
+    ];
+    for (name, manifest, lua) in cases {
+        let root = fixture_ext(manifest, lua);
+        let mgr = ExtensionManager::fresh();
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        assert!(
+            mgr.engines.read().await.is_empty(),
+            "{name}: extension must fail whole"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+/// Spec §32: remote sources — `dex extensions install <git-url>` clones,
+/// validates the manifest, and lands the extension in the user dir.
+#[test]
+fn install_remote_git_url() {
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::take(&["XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
+    let root = fixture_root("dex-ext-git");
+    std::env::set_var("XDG_DATA_HOME", &root);
+    std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("manifest.yaml"),
+        "manifest_version: 1\nid: git-ext\nversion: 0.1.0\ncapabilities: []\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("extension.lua"), "return function(dex) end\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "."]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "ext",
+    ]);
+    let url = format!("file://{}", repo.display());
+    let id = install(&url).unwrap();
+    assert_eq!(id, "git-ext");
+    let installed = user_extensions_dir().join("git-ext");
+    assert!(installed.join("manifest.yaml").is_file());
+    assert!(installed.join("extension.lua").is_file());
+    // A remote URL with no manifest at the root fails and cleans up.
+    let bad = root.join("bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    assert!(install(&format!("file://{}", bad.display())).is_err());
+    // Unsupported scheme rejected before any git runs.
+    assert!(install("ssh://example.com/x.git").is_err());
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(installed).ok();
+}
