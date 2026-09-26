@@ -754,6 +754,115 @@ pub async fn query_harness_conflict(
         .await
 }
 
+/// `harness.compact` for the turn loop's compaction gate: first non-`nil`
+/// `{compact}` wins, `None` (unsubscribed, error, or no opinion) means the
+/// Rust trigger decides. Read-only host.
+pub async fn query_harness_compact(
+    stored_tokens: u64,
+    ephemeral_overhead: u64,
+    message_count: usize,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<bool> {
+    if !has_event_handlers("harness.compact") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_compact(stored_tokens, ephemeral_overhead, message_count, &host)
+        .await
+}
+
+/// `model_selector` for `process_turn`: first non-empty `{model = "..."}`
+/// (or a bare string return) picks the model this turn serves; `None`
+/// (unsubscribed, error, or no opinion) keeps the configured model.
+/// Read-only host — choosing a model must not require tool access. The
+/// payload names the configured and last served model ids, never secrets.
+pub async fn query_model_selector_global(
+    config: &crate::llm::config::LlmConfig,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<String> {
+    if !has_event_handlers("model_selector") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    let previous = LAST_MODEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|s| s.id());
+    global_manager()
+        .query_model_selector(
+            &served_snapshot_for(config).id(),
+            previous.as_deref(),
+            &host,
+        )
+        .await
+}
+
+/// `tool_catalog` for the turn's schema assembly: the first `{keep}/{drop}`
+/// opinion narrows the served schemas; `None` (unsubscribed, error, no
+/// opinion) keeps the full catalog. Read-only host — filtering schemas must
+/// not require tool access.
+pub async fn query_tool_catalog_global(
+    schemas: &[crate::protocol::ToolDefinition],
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<Vec<crate::protocol::ToolDefinition>> {
+    if !has_event_handlers("tool_catalog") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager().query_tool_catalog(schemas, &host).await
+}
+
+/// `harness.summarize` for compaction: first non-empty `{summary}` wins;
+/// `None` (unsubscribed, error, or no opinion) means the Rust summarizer.
+/// Read-only host — a summarizer cannot mutate anything.
+pub async fn query_harness_summarize(
+    conversation: &str,
+    previous_summary: Option<&str>,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Option<String> {
+    if !has_event_handlers("harness.summarize") {
+        return None;
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .query_harness_summarize(conversation, previous_summary, &host)
+        .await
+}
+
 /// `session.before_compact` for `compact_history`. The host runs without a
 /// turn policy at this seam, so nested `dex.tools.call` upcalls inherit a
 /// read-only policy — a compaction hook cannot mutate anything.

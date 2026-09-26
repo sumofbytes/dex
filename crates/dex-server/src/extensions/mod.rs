@@ -34,6 +34,8 @@ mod discovery;
 mod global;
 mod manager;
 mod state;
+/// Invocation audit ring, printed by `dex runtime trace` (spec §35).
+pub mod trace;
 // `summary_line` is the `/extensions` sheet (TUI) consumer only.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use discovery::{discovered_extensions, list_command, summary_line};
@@ -62,9 +64,11 @@ pub use global::{
     apply_after_hooks, apply_before_agent_start, apply_before_compact, apply_before_hooks,
     apply_llm_before, cached_schema_tokens, cached_tools, call_global, command_list,
     current_drive_model, drive_model_for, fire_event_global, fire_lifecycle_event,
-    fire_model_select_if_changed, global_manager, net_fetch, query_harness_conflict,
-    query_harness_overflow, query_permission_request, query_supervisor_route, run_command_global,
-    served_model_snapshot, with_drive_model, DriveModel,
+    fire_model_select_if_changed, global_manager, net_fetch, query_harness_compact,
+    query_harness_conflict, query_harness_overflow, query_harness_summarize,
+    query_model_selector_global, query_permission_request, query_supervisor_route,
+    query_tool_catalog_global, run_command_global, served_model_snapshot, with_drive_model,
+    DriveModel,
 };
 #[cfg(test)]
 use global::{current_routing_headers, harvest_routing_headers, with_routing_headers};

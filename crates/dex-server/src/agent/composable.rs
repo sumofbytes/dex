@@ -382,6 +382,34 @@ impl DynamicToolSource for ExtensionToolSource {
     }
 }
 
+// The `tool_catalog` slot's turn seam (spec §11): a per-task schema list a
+// Lua filter opinion narrowed. Set by `process_turn` when an opinion
+// resolves; `ComposedCatalog` serves it verbatim for the scope's duration.
+// Nesting shadows (a child turn resolves its own filter), mirroring
+// `SERVED_MODEL`; only the default composed catalog consults it, so
+// registry-selected custom catalogs are untouched.
+tokio::task_local! {
+    static TOOL_CATALOG_OVERRIDE: std::cell::RefCell<Option<std::sync::Arc<[ToolDefinition]>>>;
+}
+
+/// Run `fut` with `schemas` as the served tool catalog. Nesting shadows.
+pub async fn with_tool_catalog_override<Fut, T>(schemas: Vec<ToolDefinition>, fut: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    TOOL_CATALOG_OVERRIDE
+        .scope(std::cell::RefCell::new(Some(schemas.into())), fut)
+        .await
+}
+
+/// The scope's narrowed catalog, if any. Cheap: an `Arc` clone per round.
+fn tool_catalog_override() -> Option<std::sync::Arc<[ToolDefinition]>> {
+    TOOL_CATALOG_OVERRIDE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
 /// Default [`ToolCatalog`]: native schemas first (fixed order), dynamic
 /// sources merged into a name-sorted tail so provider request bytes stay
 /// deterministic. Byte-identical to `tools_schema()` with the default
@@ -406,6 +434,11 @@ impl ComposedCatalog {
 
 impl ToolCatalog for ComposedCatalog {
     fn tool_schemas(&self) -> Vec<ToolDefinition> {
+        // A `tool_catalog` Lua opinion (turn-scoped) is served verbatim: it
+        // was computed from this same assembly, already narrowed.
+        if let Some(override_) = tool_catalog_override() {
+            return override_.to_vec();
+        }
         let (native, _, _) = crate::llm::tool_descriptions::tools_schema_parts();
         let mut tail = Vec::new();
         for source in &self.sources {

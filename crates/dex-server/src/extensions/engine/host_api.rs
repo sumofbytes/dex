@@ -13,7 +13,7 @@ use serde_json::Value as Json;
 use super::super::Manifest;
 use super::{
     host_upcall, json_to_lua, lua_to_json, lua_type_name, lua_value_to_string, valid_segment,
-    worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS,
+    worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS, WRAPPABLE_SLOTS,
 };
 use crate::tools::resolve_workspace_path;
 
@@ -247,6 +247,73 @@ pub(super) fn events_table(
     }
 
     events
+}
+
+/// `dex.wrap(slot, fn)` — middleware over an enveloped slot's handler chain
+/// (spec §13). `fn(next, ctx)` receives the rest of the chain as `next(ev)`
+/// and the event payload as `ctx`; its return becomes the envelope the host
+/// reads. Registration order is composition order, outermost first.
+/// Wrapping an unknown or non-wrappable slot fails legibly at load.
+pub(super) fn wrap_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, mw): (String, Function)| {
+        if !WRAPPABLE_SLOTS.contains(&slot.as_str()) {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' wraps '{slot}': not a middleware-wrappable slot (wrappable: {})",
+                WRAPPABLE_SLOTS.join(", ")
+            )));
+        }
+        regs.borrow_mut().wraps.entry(slot).or_default().push(mw);
+        Ok(())
+    })
+}
+
+/// `dex.activate_profile(name)` / `dex.profile()` — harness-profile
+/// activation and inspection (spec §30). Activation is transactional at
+/// resolution time: the name is stored now; when the next turn snapshot
+/// resolves, an unknown name warns and applies nothing. `nil` deactivates.
+/// Returns the previously active name.
+pub(super) fn profile_api(lua: &Lua) -> Result<(Function, Function), LuaError> {
+    let activate = lua.create_function(|_, name: Option<String>| {
+        let previous = crate::agent::registry::active_profile();
+        match name {
+            Some(n) if !n.trim().is_empty() => {
+                crate::agent::registry::set_active_profile(Some(n));
+            }
+            _ => crate::agent::registry::set_active_profile(None),
+        }
+        Ok(previous)
+    })?;
+    let current = lua.create_function(|_, ()| Ok(crate::agent::registry::active_profile()))?;
+    Ok((activate, current))
+}
+
+/// `dex.fallback(slot, fn)` — backup opinion for an enveloped slot (spec
+/// §34): consulted when the slot's whole chain (handlers + middleware)
+/// produced no opinion, before the Rust default. Same slot family as
+/// `dex.wrap`; unknown slots fail legibly at load.
+pub(super) fn fallback_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, backup): (String, Function)| {
+        if !WRAPPABLE_SLOTS.contains(&slot.as_str()) {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' sets a fallback for '{slot}': not a wrappable slot (wrappable: {})",
+                WRAPPABLE_SLOTS.join(", ")
+            )));
+        }
+        regs.borrow_mut().fallbacks.insert(slot, backup);
+        Ok(())
+    })
 }
 
 /// `dex.log.*` — daemon log + journal lines, prefixed `lua[<ext>]`.

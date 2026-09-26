@@ -33,6 +33,8 @@ impl ExtensionManager {
         // extension state (e.g. the web example's override_model) must
         // not leak into the next test's Lua.
         STATE.lock().expect("state lock").clear();
+        // A previous test's `dex.activate_profile` must not leak either.
+        crate::agent::registry::set_active_profile(None);
     }
 }
 
@@ -1097,6 +1099,426 @@ async fn model_select_is_zero_cost_without_subscribers() {
     mgr.reset_for_tests().await;
 }
 
+/// `model_selector`: the first non-empty opinion wins in load order;
+/// errors, empty strings, and non-strings fail open to `None` (the
+/// configured model is served). Holds the global locks: `LAST_MODEL`
+/// feeds the payload and every `process_turn` records into it.
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn model_selector_first_opinion_wins_and_fails_open() {
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+        .lock()
+        .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    let manifest =
+        |id: &str| format!("manifest_version: 1\nid: {id}\nversion: 0.1.0\ncapabilities: []\n");
+    // Run 1: two opinions — load order decides.
+    let root = fixture_exts(&[
+        (
+            "ms-a",
+            &manifest("ms-a"),
+            r#"return function(dex)
+  dex.events.on("model_selector", function(ctx, ev)
+    return { model = "myprov/m-9" }
+  end)
+end
+"#,
+        ),
+        (
+            "ms-b",
+            &manifest("ms-b"),
+            r#"return function(dex)
+  dex.events.on("model_selector", function(ctx, ev)
+    return { model = "myprov/m-0" }
+  end)
+end
+"#,
+        ),
+    ]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let cfg = model_select_config("myprov", "m-7", "https://myprov.example/v1");
+    let picked = query_model_selector_global(&cfg, &crate::agent::state::GlobalCancellation).await;
+    assert_eq!(picked.as_deref(), Some("myprov/m-9"));
+    std::fs::remove_dir_all(&root).ok();
+    // Run 2: a bare string return is accepted (envelope `content`); a
+    // failing handler is skipped and the chain continues; an empty string
+    // is no opinion. reset_for_tests first: refresh_with only adds.
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[
+        (
+            "ms-err",
+            &manifest("ms-err"),
+            r#"return function(dex)
+  dex.events.on("model_selector", function(ctx, ev)
+    error("boom")
+  end)
+end
+"#,
+        ),
+        (
+            "ms-str",
+            &manifest("ms-str"),
+            r#"return function(dex)
+  dex.events.on("model_selector", function(ctx, ev)
+    return "myprov/m-8"
+  end)
+end
+"#,
+        ),
+    ]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let picked = query_model_selector_global(&cfg, &crate::agent::state::GlobalCancellation).await;
+    assert_eq!(
+        picked.as_deref(),
+        Some("myprov/m-8"),
+        "error skips to next handler"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    // Run 3: empty string = no opinion; unsubscribed = None. Both fail
+    // open — nothing to serve.
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[(
+        "ms-empty",
+        &manifest("ms-empty"),
+        r#"return function(dex)
+  dex.events.on("model_selector", function(ctx, ev)
+    return { model = "" }
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let picked = query_model_selector_global(&cfg, &crate::agent::state::GlobalCancellation).await;
+    assert_eq!(picked, None, "empty string is no opinion");
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
+    let picked = query_model_selector_global(&cfg, &crate::agent::state::GlobalCancellation).await;
+    assert_eq!(picked, None, "zero cost without subscribers");
+}
+
+/// `tool_catalog`: the first `{keep}/{drop}` opinion narrows the served
+/// schemas in load order; errors and no-opinion envelopes fail open to the
+/// full catalog. Narrowing-only by construction: unknown `keep` names are
+/// ignored, and the result is always a subset of the input.
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn tool_catalog_first_opinion_wins_and_fails_open() {
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+        .lock()
+        .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    let manifest =
+        |id: &str| format!("manifest_version: 1\nid: {id}\nversion: 0.1.0\ncapabilities: []\n");
+    let schemas = || {
+        let def = |name: &str, description: &str| crate::protocol::ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::protocol::FunctionDef {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        };
+        vec![
+            def("grep", "search files"),
+            def("find", "locate files"),
+            def("bash", "run commands"),
+        ]
+    };
+    // Run 1: keep + drop combine; unknown keep names ignored.
+    let root = fixture_exts(&[(
+        "tc-a",
+        &manifest("tc-a"),
+        r#"return function(dex)
+  dex.events.on("tool_catalog", function(ctx, ev)
+    return { keep = { "grep", "bash", "nope" }, drop = { "bash" } }
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let served =
+        query_tool_catalog_global(&schemas(), &crate::agent::state::GlobalCancellation).await;
+    let names: Vec<&str> = served
+        .as_ref()
+        .expect("opinion applied")
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["grep"]);
+    std::fs::remove_dir_all(&root).ok();
+    // Run 2: an erroring handler fails open to the next, which drops one
+    // tool; drop-only keeps the rest.
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[
+        (
+            "tc-err",
+            &manifest("tc-err"),
+            r#"return function(dex)
+  dex.events.on("tool_catalog", function(ctx, ev) error("boom") end)
+end
+"#,
+        ),
+        (
+            "tc-b",
+            &manifest("tc-b"),
+            r#"return function(dex)
+  dex.events.on("tool_catalog", function(ctx, ev)
+    return { drop = { "find" } }
+  end)
+end
+"#,
+        ),
+    ]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let served =
+        query_tool_catalog_global(&schemas(), &crate::agent::state::GlobalCancellation).await;
+    let names: Vec<&str> = served
+        .as_ref()
+        .expect("opinion applied")
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["grep", "bash"]);
+    std::fs::remove_dir_all(&root).ok();
+    // Run 3: no opinion (handler returns a table without keep/drop) and no
+    // subscribers both serve the full catalog.
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[(
+        "tc-empty",
+        &manifest("tc-empty"),
+        r#"return function(dex)
+  dex.events.on("tool_catalog", function(ctx, ev)
+    return { other = true }
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let served =
+        query_tool_catalog_global(&schemas(), &crate::agent::state::GlobalCancellation).await;
+    assert!(served.is_none(), "empty envelope is no opinion");
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
+    let served =
+        query_tool_catalog_global(&schemas(), &crate::agent::state::GlobalCancellation).await;
+    assert!(served.is_none(), "zero cost without subscribers");
+}
+
+/// `dex.wrap`: middleware wraps the slot's handler chain in registration
+/// order, outermost first; every call passes through it. A `nil` return is
+/// a pass-through, and middleware works with or without local handlers.
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn wrap_middleware_wraps_handler_chain_outermost_first() {
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+        .lock()
+        .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    let manifest =
+        |id: &str| format!("manifest_version: 1\nid: {id}\nversion: 0.1.0\ncapabilities: []\n");
+    let root = fixture_exts(&[(
+        "mw-a",
+        &manifest("mw-a"),
+        r#"return function(dex)
+  dex.events.on("model_selector", function(ctx, ev)
+    return { model = "prov/handler" }
+  end)
+  -- registered first: outermost. Passes through, then decorates.
+  dex.wrap("model_selector", function(next, ev)
+    local r = next(ev)
+    if r and r.model then r.model = r.model .. "-outer" end
+    return r
+  end)
+  -- registered second: innermost relative to the first.
+  dex.wrap("model_selector", function(next, ev)
+    return next(ev)
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let policy = crate::tools::Policy::trusted();
+    let host = HostCtx {
+        cancel: &crate::agent::state::GlobalCancellation,
+        policy: &policy,
+        filter: None,
+    };
+    let picked = mgr.query_model_selector("prov/base", None, &host).await;
+    assert_eq!(
+        picked.as_deref(),
+        Some("prov/handler-outer"),
+        "outer middleware decorates last"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    // Middleware without local handlers still serves the slot: it can
+    // provide the opinion itself (next(ev) is the empty envelope).
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[(
+        "mw-b",
+        &manifest("mw-b"),
+        r#"return function(dex)
+  dex.wrap("harness.summarize", function(next, ev)
+    if ev.conversation:len() > 10 then
+      return { summary = "long conversation" }
+    end
+    return next(ev)
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let summary = mgr
+        .query_harness_summarize("a reasonably long conversation", None, &host)
+        .await;
+    assert_eq!(summary.as_deref(), Some("long conversation"));
+    // Fail-open: a middleware error skips to the Rust default (None).
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[(
+        "mw-err",
+        &manifest("mw-err"),
+        r#"return function(dex)
+  dex.wrap("harness.summarize", function(next, ev)
+    error("boom")
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let summary = mgr.query_harness_summarize("anything", None, &host).await;
+    assert_eq!(summary, None, "middleware error fails open");
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `dex.wrap` on a non-wrappable slot fails legibly at load.
+#[test]
+fn wrap_rejects_non_wrappable_slots() {
+    let manifest = "manifest_version: 1\nid: mw-bad\nversion: 0.1.0\ncapabilities: []\n";
+    let root = fixture_exts(&[(
+        "mw-bad",
+        manifest,
+        r#"return function(dex)
+  dex.wrap("tool.before", function(next, ev) return next(ev) end)
+end
+"#,
+    )]);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mgr = global_manager();
+        mgr.reset_for_tests().await;
+        mgr.refresh_with(std::slice::from_ref(&root)).await;
+        // A rejected extension never enters the engine map: its middleware
+        // would otherwise run against a slot it never consented to.
+        assert!(
+            !mgr.engines.read().await.contains_key("mw-bad"),
+            "non-wrappable slot must fail at load"
+        );
+        mgr.reset_for_tests().await;
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `dex.fallback`: the backup runs only when the slot's chain produced no
+/// opinion — chain success and Rust-default failures both keep their path.
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn fallback_runs_only_on_no_opinion() {
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+        .lock()
+        .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    let manifest =
+        |id: &str| format!("manifest_version: 1\nid: {id}\nversion: 0.1.0\ncapabilities: []\n");
+    // Chain that never opines + a fallback: fallback's opinion is served.
+    let root = fixture_exts(&[(
+        "fb-a",
+        &manifest("fb-a"),
+        r#"return function(dex)
+  dex.events.on("harness.summarize", function(ctx, ev)
+    return {}
+  end)
+  dex.fallback("harness.summarize", function(ctx, ev)
+    return { summary = "backup summary" }
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let policy = crate::tools::Policy::trusted();
+    let host = HostCtx {
+        cancel: &crate::agent::state::GlobalCancellation,
+        policy: &policy,
+        filter: None,
+    };
+    let summary = mgr
+        .query_harness_summarize("some conversation", None, &host)
+        .await;
+    assert_eq!(summary.as_deref(), Some("backup summary"));
+    std::fs::remove_dir_all(&root).ok();
+    // Chain that DOES opine: fallback never runs.
+    mgr.reset_for_tests().await;
+    let root = fixture_exts(&[(
+        "fb-b",
+        &manifest("fb-b"),
+        r#"return function(dex)
+  dex.events.on("harness.summarize", function(ctx, ev)
+    return { summary = "primary summary" }
+  end)
+  dex.fallback("harness.summarize", function(ctx, ev)
+    return { summary = "backup summary" }
+  end)
+end
+"#,
+    )]);
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let summary = mgr
+        .query_harness_summarize("some conversation", None, &host)
+        .await;
+    assert_eq!(summary.as_deref(), Some("primary summary"));
+    mgr.reset_for_tests().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `dex.activate_profile`: stored at activation, validated at resolution.
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn dex_activate_profile_swaps_resolution() {
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
+    let manifest = "manifest_version: 1\nid: prof-a\nversion: 0.1.0\ncapabilities: []\n";
+    let root = fixture_exts(&[(
+        "prof-a",
+        manifest,
+        r#"return function(dex)
+  local previous = dex.activate_profile("lean")
+  dex.state.set("prev", previous)
+end
+"#,
+    )]);
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    assert_eq!(
+        crate::agent::registry::active_profile(),
+        Some("lean".to_string())
+    );
+    mgr.reset_for_tests().await;
+    assert_eq!(crate::agent::registry::active_profile(), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The turn records dex's own routing-affinity headers for `dex.net.fetch`:
 /// only the `x-opencode-*` pair (canonical lowercase), never user headers.
 #[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
@@ -2082,6 +2504,84 @@ end
         Some(true)
     );
     assert_eq!(mgr.query_harness_overflow("all quiet", &host).await, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn harness_compact_first_opinion_wins_and_nil_falls_through() {
+    let m = hook_manifest("h-cmp", false);
+    let root = fixture_exts(&[(
+        "hcmp",
+        m.as_str(),
+        r#"return function(dex)
+  dex.events.on("harness.compact", function(ctx, ev)
+    if ev.stored_tokens > 1000 then return { compact = true } end
+  end)
+end
+"#,
+    )]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    assert_eq!(
+        mgr.query_harness_compact(2000, 0, 5, &host).await,
+        Some(true)
+    );
+    assert_eq!(mgr.query_harness_compact(10, 0, 5, &host).await, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn harness_summarize_first_nonempty_wins_and_empty_fails_open() {
+    let yes = hook_manifest("h-yes", false);
+    let nil = hook_manifest("h-nil", false);
+    let root = fixture_exts(&[
+        (
+            "hsum",
+            yes.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.summarize", function(ctx, ev)
+    if ev.conversation:find("needle") then return { summary = "LUA CHECKPOINT" } end
+  end)
+end
+"#,
+        ),
+        (
+            "hsumnil",
+            nil.as_str(),
+            r#"return function(dex)
+  dex.events.on("harness.summarize", function(ctx, ev)
+    return { summary = "" }
+  end)
+end
+"#,
+        ),
+    ]);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let (cancel, policy) = test_host();
+    let host = HostCtx {
+        cancel: &cancel,
+        policy: &policy,
+        filter: None,
+    };
+    assert_eq!(
+        mgr.query_harness_summarize("find the needle here", None, &host)
+            .await,
+        Some("LUA CHECKPOINT".to_string())
+    );
+    // Empty summary from the first handler in load order fails open — the
+    // empty string never becomes the summary of record.
+    assert_eq!(
+        mgr.query_harness_summarize("nothing to see", Some("prev"), &host)
+            .await,
+        None
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

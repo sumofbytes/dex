@@ -63,12 +63,24 @@ async fn compaction_gate(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut compaction_attempts = 0;
     while compaction_attempts < harness.recovery_attempts() {
-        if !harness.should_compact(
-            config,
+        // `harness.compact` (spec §11): the first non-`nil` Lua opinion
+        // wins; `None` (unsubscribed, error, or no opinion) falls through
+        // to the Rust trigger — fail-open, per the hook contract.
+        let lua_compact = crate::extensions::query_harness_compact(
             ledger.stored_tokens(),
             budget_overhead,
             messages.len(),
-        ) {
+            cancel,
+        )
+        .await;
+        if !lua_compact.unwrap_or_else(|| {
+            harness.should_compact(
+                config,
+                ledger.stored_tokens(),
+                budget_overhead,
+                messages.len(),
+            )
+        }) {
             break;
         }
         // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):

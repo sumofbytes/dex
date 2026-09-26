@@ -341,6 +341,7 @@ fn print_help() {
         run <tool> k=v...         one-shot tool (read, ls, bash, write, edit, grep, find)\n  \
           doctor                    show resolved provider/model config + origins\n  \
           usage <id|path>           plot token usage per model call from a session's event journal\n  \
+          runtime [graph]           print the resolved runtime-slot graph (harness.slots)\n  \
           mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
         update [--models|--all]   update dex itself; --models refreshes the model catalog\n  \
         --tool                    raw JSON tool mode (stdin)\n\
@@ -455,6 +456,65 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+/// `dex runtime [graph]` — print the resolved harness snapshot: every
+/// `DexHarness` slot's selected implementation (config `harness.slots:`) and
+/// origin, plus the numeric budgets. Same resolver the turn loop calls, so
+/// the printed graph cannot drift from what a turn would run.
+fn run_runtime(action: &str) {
+    if action == "trace" {
+        // Invocation audit (spec §35): one line per extension-event dispatch.
+        let rows = crate::extensions::trace::snapshot();
+        if rows.is_empty() {
+            println!("dex runtime trace: no extension invocations recorded");
+            return;
+        }
+        println!("dex runtime trace ({} invocations)", rows.len());
+        for r in rows {
+            print!(
+                "  {:<24} {:<22} {:>6}ms  {}",
+                r.component, r.event, r.duration_ms, r.status
+            );
+            if let Some(detail) = &r.detail {
+                print!(" — {detail}");
+            }
+            println!();
+        }
+        return;
+    }
+    if action != "graph" {
+        eprintln!("usage: dex runtime [graph|trace]");
+        std::process::exit(1);
+    }
+    let (harness, rows) = crate::agent::registry::resolve_snapshot_with_origins();
+    println!("dex runtime graph");
+    println!("slots:");
+    for row in rows {
+        println!(
+            "  {:<11} {:<24} {}",
+            row.slot,
+            row.resolved_id(),
+            row.origin()
+        );
+    }
+    let config = &harness.config;
+    println!("budgets:");
+    println!("  max_tool_iterations     {}", config.max_tool_iterations());
+    println!(
+        "  max_compaction_attempts {}",
+        config.max_compaction_attempts()
+    );
+    println!(
+        "  batch_max_concurrent    {}",
+        config.batch_max_concurrent()
+    );
+    println!(
+        "  keep_recent_messages    {}",
+        config.keep_recent_messages()
+    );
+    println!("  min_to_summarize        {}", config.min_to_summarize());
+    println!("  overflow/conflict lua hooks: see `dex doctor` (harness-capability extensions)");
 }
 
 /// `dex extensions <action>` — list, toggle, install, remove.
@@ -658,6 +718,7 @@ pub fn run() {
                 std::process::exit(1);
             }
         }
+        Mode::Runtime { action } => run_runtime(&action),
         Mode::Default => {
             // Start server in background, then launch TUI connected to it.
             let addr = match start_daemon_background() {

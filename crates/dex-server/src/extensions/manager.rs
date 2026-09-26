@@ -28,6 +28,20 @@ pub struct LoadedExtension {
     pub shadows: Vec<String>,
     /// Registered slash commands: (name, description), sorted by name.
     pub commands: Vec<(String, String)>,
+    /// Slot names this extension wraps with `dex.wrap` middleware.
+    pub wraps: Vec<String>,
+    /// Slots the extension backs with `dex.fallback`.
+    pub fallbacks: Vec<String>,
+}
+
+impl LoadedExtension {
+    /// Whether this extension participates in `event`: an explicit handler
+    /// subscription or middleware over a wrappable slot.
+    pub fn serves(&self, event: &str) -> bool {
+        self.events.iter().any(|e| e == event)
+            || self.wraps.iter().any(|e| e == event)
+            || self.fallbacks.iter().any(|e| e == event)
+    }
 }
 
 pub struct ExtensionManager {
@@ -56,6 +70,25 @@ pub struct ExtensionManager {
     /// extension, and log twice. The second refresh then no-ops on the
     /// already-present ids.
     pub refresh_lock: tokio::sync::Mutex<()>,
+}
+
+/// Fire `runtime.start` exactly once per process: the first completed
+/// bootstrap load (daemon background refresh, one-shot inline, or a racing
+/// `ensure_loaded`) announces the runtime to observers. Zero-cost without
+/// subscribers.
+async fn fire_runtime_start_once() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
+    crate::extensions::fire_lifecycle_event(
+        "runtime.start",
+        serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        &crate::runtime::cancel::GlobalCancellation,
+    )
+    .await;
 }
 
 impl ExtensionManager {
@@ -115,6 +148,7 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
     }
 
     /// Load one extension: spawn the worker, run its chunk, validate the
@@ -176,6 +210,8 @@ impl ExtensionManager {
                 engine,
                 tools,
                 events,
+                wraps: exports.wraps,
+                fallbacks: exports.fallbacks,
                 shadows: exports.shadows,
                 commands,
             },
@@ -225,6 +261,7 @@ impl ExtensionManager {
         }
         self.load_one(&dir, m).await?;
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
         Ok(())
     }
 
@@ -256,6 +293,7 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
     }
 
     /// Unload engines whose id is not in `keep`, dropping their prompt
@@ -452,7 +490,7 @@ impl ExtensionManager {
             let Some(ext) = engines.get(ext_id) else {
                 return Err(format!("unknown extension '{ext_id}'"));
             };
-            if !ext.events.contains(&event.to_string()) {
+            if !ext.serves(event) {
                 return Err(format!("extension '{ext_id}' has no '{event}' handlers"));
             }
             ext.engine.clone()
@@ -470,6 +508,12 @@ impl ExtensionManager {
             )
             .await;
         let elapsed = started.elapsed();
+        match &out {
+            Ok(_) => super::trace::record(ext_id, event, elapsed, "ok", None),
+            Err(error) => {
+                super::trace::record(ext_id, event, elapsed, "error", Some(error.clone()))
+            }
+        }
         if elapsed >= SLOW_HOOK_WARN {
             eprintln!(
                 "dex: [extensions] '{ext_id}' {event} took {}ms (slow hook adds per-turn latency)",
@@ -794,7 +838,7 @@ impl ExtensionManager {
             let engines = self.engines.read().await;
             engines
                 .values()
-                .filter(|e| e.events.contains(&"harness.overflow".to_string()))
+                .filter(|e| e.serves("harness.overflow"))
                 .map(|e| e.manifest.id.clone())
                 .collect()
         };
@@ -829,7 +873,7 @@ impl ExtensionManager {
             let engines = self.engines.read().await;
             engines
                 .values()
-                .filter(|e| e.events.contains(&"harness.conflict".to_string()))
+                .filter(|e| e.serves("harness.conflict"))
                 .map(|e| e.manifest.id.clone())
                 .collect()
         };
@@ -850,6 +894,184 @@ impl ExtensionManager {
             };
             if let Some(v) = hooks::parse_harness_bool(&envelope, "conflicts") {
                 return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `harness.compact` chain: first non-`nil` `{compact = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (the Rust
+    /// trigger decides). Decision inputs are counts only — no conversation
+    /// content crosses the boundary (spec §11).
+    pub async fn query_harness_compact(
+        &self,
+        stored_tokens: u64,
+        ephemeral_overhead: u64,
+        message_count: usize,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("harness.compact"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "stored_tokens": stored_tokens,
+                "ephemeral_overhead": ephemeral_overhead,
+                "message_count": message_count,
+            });
+            let envelope = match self.run_event(&id, "harness.compact", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.compact failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_bool(&envelope, "compact") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `harness.summarize` chain: first non-empty `{summary = "..."}` wins
+    /// in load order; errors, non-strings, and empty strings fail open to
+    /// `None` (the Rust summarizer runs — compaction must not become
+    /// extension-hostage).
+    pub async fn query_harness_summarize(
+        &self,
+        conversation: &str,
+        previous_summary: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> Option<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("harness.summarize"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "conversation": conversation,
+                "previous_summary": previous_summary,
+            });
+            let envelope = match self
+                .run_event(&id, "harness.summarize", payload, host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.summarize failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_string(&envelope, "summary") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `model_selector` chain: first non-empty `{model = "..."}` (or a bare
+    /// string return, which the envelope carries as `content`) wins in load
+    /// order. Errors, non-strings, and empty strings fail open to `None` —
+    /// the configured model is served, never a half-resolved one. The host
+    /// still resolves the selection against the catalog + credentials
+    /// (`apply_model`), so an unresolvable provider fails open there too.
+    /// The payload says `current`/`previous`, never `model`: the ev fold
+    /// merges payload keys into the directive envelope, and a payload key
+    /// must not shadow the directive key.
+    pub async fn query_model_selector(
+        &self,
+        current: &str,
+        previous: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> Option<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("model_selector"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "current": current,
+                "previous": previous,
+            });
+            let envelope = match self.run_event(&id, "model_selector", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' model_selector failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_string(&envelope, "model")
+                .or_else(|| hooks::parse_harness_string(&envelope, "content"))
+            {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `tool_catalog` chain (spec §7/§11): the first handler returning
+    /// `{keep = [...]} / {drop = [...]}` narrows the schema list in load
+    /// order. Narrowing-only: the applied result is always a subset of the
+    /// input (unknown names in `keep` are ignored, `drop` removes). Errors
+    /// and empty envelopes fail open to `None` — the unfiltered catalog is
+    /// served, never a half-resolved one.
+    pub async fn query_tool_catalog(
+        &self,
+        schemas: &[ToolDefinition],
+        host: &HostCtx<'_>,
+    ) -> Option<Vec<ToolDefinition>> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("tool_catalog"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "tools": schemas
+                    .iter()
+                    .map(|t| serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            let envelope = match self.run_event(&id, "tool_catalog", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' tool_catalog failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(filter) = hooks::parse_catalog_filter(&envelope) {
+                return Some(filter.apply(schemas));
             }
         }
         None

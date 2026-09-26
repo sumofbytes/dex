@@ -150,6 +150,73 @@ pub fn parse_harness_bool(envelope: &Map<String, Json>, key: &str) -> Option<boo
     envelope.get(key).and_then(|v| v.as_bool())
 }
 
+/// Read one extension's `harness.summarize` envelope: `{summary = "..."}`.
+/// Absent/non-string/empty = no opinion (`None`), so the host falls back to
+/// the Rust summarizer (same fail-open contract as `parse_harness_bool`).
+pub fn parse_harness_string(envelope: &Map<String, Json>, key: &str) -> Option<String> {
+    match envelope.get(key) {
+        Some(Json::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// A `tool_catalog` opinion: narrowing-only name lists (spec §23 — a policy
+/// slot may remove tools, never add). Empty `keep` means "keep everything
+/// not dropped"; unknown names in either list are ignored at apply time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CatalogFilter {
+    pub keep: Vec<String>,
+    pub drop: Vec<String>,
+}
+
+impl CatalogFilter {
+    /// Apply to a schema list in name order: intersect with `keep` (when
+    /// non-empty), then remove `drop`. The result is always a subset of the
+    /// input — the narrowing invariant is enforced here, not in Lua.
+    pub fn apply(
+        &self,
+        schemas: &[crate::protocol::ToolDefinition],
+    ) -> Vec<crate::protocol::ToolDefinition> {
+        schemas
+            .iter()
+            .filter(|t| {
+                let name = &t.function.name;
+                (self.keep.is_empty() || self.keep.iter().any(|k| k == name))
+                    && !self.drop.iter().any(|d| d == name)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// `true` when the envelope narrows nothing (no opinion).
+    fn is_noop(&self) -> bool {
+        self.keep.is_empty() && self.drop.is_empty()
+    }
+}
+
+/// Read one extension's `tool_catalog` envelope: `{keep = {...}}` and/or
+/// `{drop = {...}}` name lists. `None` = no opinion (fail-open: the full
+/// catalog is served). Non-string entries are ignored, not errors.
+pub fn parse_catalog_filter(envelope: &Map<String, Json>) -> Option<CatalogFilter> {
+    let names = |key: &str| -> Vec<String> {
+        match envelope.get(key) {
+            Some(Json::Array(list)) => list
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    if !envelope.contains_key("keep") && !envelope.contains_key("drop") {
+        return None;
+    }
+    let filter = CatalogFilter {
+        keep: names("keep"),
+        drop: names("drop"),
+    };
+    (!filter.is_noop()).then_some(filter)
+}
+
 /// Read one extension's `session.before_compact` envelope.
 pub fn parse_compact(envelope: &Map<String, Json>) -> CompactAction {
     CompactAction {
@@ -169,10 +236,45 @@ pub fn parse_compact(envelope: &Map<String, Json>) -> CompactAction {
     }
 }
 
+/// Shared tool schemas for the `tool_catalog` envelope tests.
+#[cfg(test)]
+pub(crate) fn tool_catalog_schemas() -> Vec<crate::protocol::ToolDefinition> {
+    let def = |name: &str| crate::protocol::ToolDefinition {
+        tool_type: "function".to_string(),
+        function: crate::protocol::FunctionDef {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+    };
+    vec![def("grep"), def("find"), def("bash")]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn catalog_filter_narrows_only_and_ignores_non_strings() {
+        let env = json!({"keep": ["grep", 1, "nope"], "drop": ["bash"]});
+        let filter = parse_catalog_filter(env.as_object().unwrap()).unwrap();
+        assert_eq!(filter.keep, vec!["grep".to_string(), "nope".to_string()]);
+        let served = filter.apply(&super::tool_catalog_schemas());
+        let names: Vec<&str> = served.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names, vec!["grep"]);
+        // No keep/drop keys: no opinion.
+        assert!(parse_catalog_filter(json!({"other": true}).as_object().unwrap()).is_none());
+        // Both lists empty: no opinion.
+        assert!(
+            parse_catalog_filter(json!({"keep": [], "drop": []}).as_object().unwrap()).is_none()
+        );
+        // Drop-only keeps the rest.
+        let filter = parse_catalog_filter(json!({"drop": ["find"]}).as_object().unwrap()).unwrap();
+        let served = filter.apply(&super::tool_catalog_schemas());
+        let names: Vec<&str> = served.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names, vec!["grep", "bash"]);
+    }
 
     #[test]
     fn before_parses_deny_and_args() {
@@ -230,6 +332,22 @@ mod tests {
             parse_harness_bool(env.as_object().unwrap(), "overflow"),
             None
         );
+    }
+
+    #[test]
+    fn harness_string_reads_named_key_and_fails_open_on_empty() {
+        let env = json!({"summary": "checkpoint text"});
+        assert_eq!(
+            parse_harness_string(env.as_object().unwrap(), "summary"),
+            Some("checkpoint text".to_string())
+        );
+        // Absent/non-string/empty = no opinion, host keeps the Rust default.
+        for env in [json!({}), json!({"summary": 3}), json!({"summary": ""})] {
+            assert_eq!(
+                parse_harness_string(env.as_object().unwrap(), "summary"),
+                None
+            );
+        }
     }
 
     #[test]
