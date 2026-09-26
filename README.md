@@ -812,11 +812,17 @@ harness: # runtime harness numerics (env DEX_MAX_TOOL_ITERATIONS wins for iterat
   drop_above_chars: 10000
 ```
 
-A `harness`-capability extension can also override two turn decisions at
+A `harness`-capability extension can also override turn decisions at
 runtime (first non-nil opinion wins, otherwise the Rust default):
-`harness.overflow` (`{message} -> {overflow = bool}`) and
-`harness.conflict` (`{calls} -> {conflicts = bool}`, one call per batch).
-Unsubscribed turns pay no Lua cost.
+`harness.overflow` (`{message} -> {overflow = bool}`),
+`harness.conflict` (`{calls} -> {conflicts = bool}`, one call per batch),
+and `permission.request` (`{tool, args, requirement, mode} ->
+{decision = "allow"|"deny"}`, consulted only when approval would otherwise
+be required — reads stay free; `read-only` mode is never overridable).
+`llm.before` may return `{append}` text persisted as a user-role note before
+the compaction gate; `llm.after` (`{stop_reason, usage, elapsed_ms}`) and
+`tool.error` (`{tool, args, error}`) are observe-only. Unsubscribed turns
+pay no Lua cost.
 
 Discovery: cwd `.dex/extensions` + `.agents/extensions` (project scope — loads
 only after `dex extensions enable <id>`, the trust consent), then

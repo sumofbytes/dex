@@ -1425,3 +1425,113 @@ async fn harness_catalog_controls_model_schemas() {
     let names = seen.lock().unwrap().clone().unwrap();
     assert!(names.contains(&"read".to_string()), "{names:?}");
 }
+
+/// `llm.before` appends land persisted in history; `llm.after` observes every
+/// request; `tool.error` fires on the failed call only.
+#[tokio::test]
+async fn llm_lifecycle_and_tool_error_hooks_fire() {
+    let _lock = TEST_TURN_ENV_LOCK.lock().await;
+    let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+        .lock()
+        .await;
+    let lua = r#"return function(dex)
+  dex.events.on("llm.before", function(ctx, ev)
+    return { append = "HOOK-NOTE" }
+  end)
+  dex.events.on("llm.after", function(ctx, ev)
+    dex.prompt.append("after-seen;")
+  end)
+  dex.events.on("tool.error", function(ctx, ev)
+    dex.prompt.append("error-seen:" .. ev.tool .. ";")
+  end)
+end
+"#;
+    let manifest = "manifest_version: 1\nid: llmhook\nversion: 0.1.0\ncapabilities: [harness]\n";
+    let root = crate::extensions::tests::fixture_exts(&[("llmhook", manifest, lua)]);
+    crate::extensions::global_manager()
+        .refresh_with(std::slice::from_ref(&root))
+        .await;
+    #[derive(Clone)]
+    struct FailOnce {
+        round: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ModelClient for FailOnce {
+        async fn complete(
+            &self,
+            _m: &[ChatMessage],
+            _tools: &[crate::protocol::ToolDefinition],
+            _s: Option<mpsc::Sender<ModelEvent>>,
+            _c: &(dyn CancellationSource + Send + Sync),
+        ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+            let round = self.round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if round == 0 {
+                ChatMessage::assistant_calls(
+                    None,
+                    vec![crate::protocol::LlmToolCall {
+                        id: "call-1".into(),
+                        call_type: "function".into(),
+                        function: crate::protocol::FunctionCall {
+                            name: "nope_bad_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    }],
+                )
+            } else {
+                ChatMessage::assistant("done")
+            };
+            Ok(Turn {
+                message,
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    cached_tokens: None,
+                }),
+                stop_reason: None,
+            })
+        }
+    }
+    let config = test_config();
+    let mut messages = vec![ChatMessage::system("sys")];
+    let mut state = ToolState::default();
+    let result = process_turn(AgentRuntime {
+        config: &config,
+        messages: &mut messages,
+        state: &mut state,
+        steering_rx: None,
+        steering_accepted_tx: None,
+        session: None,
+        client: &FailOnce {
+            round: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        },
+        cancel: &NeverCancel,
+        console: &crate::runtime::console::Console::none(),
+        filter: None,
+        agent_ctx: None,
+        tool_budget: None,
+        harness: None,
+    })
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    // The append rode the steering path: persisted user note in history.
+    let notes = messages
+        .iter()
+        .filter(|m| {
+            m.role == crate::protocol::Role::User
+                && m.content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("HOOK-NOTE"))
+        })
+        .count();
+    assert!(notes >= 1, "llm.before append must persist: {messages:?}");
+    let appendix = crate::extensions::prompt_appendix();
+    assert!(
+        appendix.contains("after-seen;"),
+        "llm.after must observe the requests: {appendix:?}"
+    );
+    assert!(
+        appendix.contains("error-seen:nope_bad_tool;"),
+        "tool.error must fire for the failed call: {appendix:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    crate::extensions::global_manager().reset_for_tests().await;
+}

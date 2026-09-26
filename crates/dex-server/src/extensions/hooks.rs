@@ -81,6 +81,32 @@ pub fn parse_after(envelope: &Map<String, Json>, text: &str, ok: bool) -> (Strin
     (content, ok)
 }
 
+/// `permission.request` verdict: the hook arbitrates one approval prompt.
+/// First explicit decision wins; absent/garbage = no opinion (normal flow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+/// Read one extension's `permission.request` envelope: `{decision =
+/// "allow"|"deny"}` plus an optional `reason` string. Anything else is no
+/// opinion — a broken hook fails open to the normal approval flow, never to
+/// a silent allow or a surprise deny.
+pub fn parse_permission(envelope: &Map<String, Json>) -> Option<(PermissionDecision, String)> {
+    let decision = match envelope.get("decision").and_then(|v| v.as_str()) {
+        Some("allow") => PermissionDecision::Allow,
+        Some("deny") => PermissionDecision::Deny,
+        _ => return None,
+    };
+    let reason = envelope
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((decision, reason))
+}
+
 /// Read one extension's `harness.overflow` / `harness.conflict` envelope:
 /// `{overflow = bool}` or `{conflicts = bool}`. Absent/non-bool = no opinion
 /// (`None`), so the host falls back to the Rust default.
@@ -168,6 +194,28 @@ mod tests {
             parse_harness_bool(env.as_object().unwrap(), "overflow"),
             None
         );
+    }
+
+    #[test]
+    fn permission_parses_allow_deny_and_rejects_garbage() {
+        let env = json!({"decision": "allow"});
+        assert_eq!(
+            parse_permission(env.as_object().unwrap()),
+            Some((PermissionDecision::Allow, String::new()))
+        );
+        let env = json!({"decision": "deny", "reason": "nope"});
+        assert_eq!(
+            parse_permission(env.as_object().unwrap()),
+            Some((PermissionDecision::Deny, "nope".to_string()))
+        );
+        // Absent/garbage = no opinion, host keeps the normal approval flow.
+        for env in [
+            json!({}),
+            json!({"decision": "maybe"}),
+            json!({"decision": true}),
+        ] {
+            assert_eq!(parse_permission(env.as_object().unwrap()), None);
+        }
     }
 
     #[test]

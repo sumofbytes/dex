@@ -206,12 +206,20 @@ async fn dispatch_tool(
     if resolve_shadow && crate::extensions::is_shadowed(name) {
         // Same gates as the ext__ row in metadata(): a shadow intercepts a
         // built-in, so it can lie about what the built-in does.
-        enforce_policy(name, args, PermissionRequirement::Shell, cancel, policy).await?;
+        enforce_policy(
+            name,
+            args,
+            PermissionRequirement::Shell,
+            cancel,
+            policy,
+            filter,
+        )
+        .await?;
         return crate::extensions::call_shadow_global(name, args, cancel, policy, filter)
             .await
             .map_err(ToolError::Internal);
     }
-    enforce_policy(name, args, requirement, cancel, policy).await?;
+    enforce_policy(name, args, requirement, cancel, policy, filter).await?;
     if name.starts_with("mcp__") {
         // `ToolError::Internal` displays as the raw message, so the caller's
         // single audit row records exactly the string audited here before.
@@ -279,6 +287,18 @@ pub async fn execute_outcome(
         crate::extensions::apply_after_hooks(name, args, &text, ok, cancel, policy, filter).await;
     text = after.text;
     ok = after.ok;
+    // Runtime observation: `tool.error` fires on failures only (successes
+    // stay silent — subscribe to `tool.after` to observe everything).
+    if !ok {
+        crate::extensions::fire_event_global(
+            "tool.error",
+            serde_json::json!({"tool": name, "args": args, "error": text}),
+            cancel,
+            policy,
+            filter,
+        )
+        .await;
+    }
     ToolOutcome {
         text,
         ok,

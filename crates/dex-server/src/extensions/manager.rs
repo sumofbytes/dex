@@ -659,6 +659,93 @@ impl ExtensionManager {
         appends
     }
 
+    /// `permission.request` chain: first explicit `{decision = "allow"|"deny"}`
+    /// wins in load order; nil/garbage/errors fail open to `None` (the normal
+    /// approval flow). An explicit deny is honored downstream and attributed.
+    pub async fn query_permission(
+        &self,
+        tool: &str,
+        args: &serde_json::Map<String, serde_json::Value>,
+        requirement: &str,
+        mode: &str,
+        host: &HostCtx<'_>,
+    ) -> Option<(hooks::PermissionDecision, String, String)> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"permission.request".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "tool": tool,
+                "args": args,
+                "requirement": requirement,
+                "mode": mode,
+            });
+            let envelope = match self
+                .run_event(&id, "permission.request", payload, host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' permission.request failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some((decision, reason)) = hooks::parse_permission(&envelope) {
+                return Some((decision, reason, id));
+            }
+        }
+        None
+    }
+
+    /// `llm.before` chain: each handler may return `{append = text}` (or set
+    /// `ev.append`); strings concatenate in load order and the host persists
+    /// them as one user-role note before the compaction gate, so appends
+    /// count toward the window. Fail-open. Read-only influence otherwise.
+    pub async fn apply_llm_before(
+        &self,
+        host: &HostCtx<'_>,
+        payload: serde_json::Value,
+    ) -> Vec<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"llm.before".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        let mut appends = Vec::new();
+        for id in subs {
+            let envelope = match self
+                .run_event(&id, "llm.before", payload.clone(), host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' llm.before failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(append) = envelope.get("append").and_then(|v| v.as_str()) {
+                if !append.trim().is_empty() {
+                    appends.push(append.to_string());
+                }
+            }
+        }
+        appends
+    }
+
     /// `harness.overflow` chain: first non-`nil` `{overflow = bool}` wins in
     /// load order; errors/bad envelopes fail open to `None` (Rust default).
     pub async fn query_harness_overflow(&self, message: &str, host: &HostCtx<'_>) -> Option<bool> {
