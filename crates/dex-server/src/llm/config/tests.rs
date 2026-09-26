@@ -3044,3 +3044,127 @@ fn harness_table_reads_file_and_rejects_zero() {
     super::invalidate_config_cache();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn persisted_index_restores_and_rejects_stale_hash() {
+    // Serializes process-env redirection against other tests.
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("dex-persist-idx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+    env::set_var("XDG_CACHE_HOME", &dir);
+
+    let catalog = serde_json::json!({
+        "openai": {"models": {"gpt-x": {"limit": {"context": 128000, "output": 4096}}}}
+    });
+    let hash = 0xDEADBEEF;
+    let text = super::catalog_index::persisted_index_text(hash, &catalog).unwrap();
+    let path = super::catalog_index::persisted_index_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &text).unwrap();
+
+    // Matching hash restores the maps; runtime identity comes from the caller.
+    let restored = super::catalog_index::restore_persisted_index(
+        std::path::Path::new("/catalog"),
+        hash,
+        std::time::SystemTime::UNIX_EPOCH,
+        42,
+    )
+    .expect("restore");
+    assert_eq!(restored.path, std::path::Path::new("/catalog"));
+    assert_eq!(restored.len, 42);
+    let entry = restored
+        .by_id
+        .get("gpt-x")
+        .and_then(|entries| entries.first())
+        .expect("indexed model");
+    assert_eq!(entry.context, Some(128000));
+    assert!(restored.expanded_for.is_empty());
+
+    // Stale generation: the persisted file must never be served.
+    assert!(super::catalog_index::restore_persisted_index(
+        std::path::Path::new("/catalog"),
+        hash + 1,
+        std::time::SystemTime::UNIX_EPOCH,
+        42
+    )
+    .is_none());
+
+    // Corrupt file: falls back (None) instead of failing the caller.
+    std::fs::write(&path, "{not json").unwrap();
+    assert!(super::catalog_index::restore_persisted_index(
+        std::path::Path::new("/catalog"),
+        hash,
+        std::time::SystemTime::UNIX_EPOCH,
+        42
+    )
+    .is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ctx_from_index_maps_nonpositive_and_nonnumeric_to_none() {
+    // The slim index is machine-written, but a hand-edited or torn file must
+    // degrade to per-entry skips, not poison the whole lookup.
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("dex-ctx-map-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+    env::set_var("XDG_CACHE_HOME", &dir);
+
+    let map = serde_json::json!({"gpt-x": 128000, "gpt-zero": 0, "gpt-bad": "oops"});
+    let ctx_path =
+        super::context_index::xdg_path("XDG_CACHE_HOME", ".cache", "dex/models.ctx.json").unwrap();
+    std::fs::create_dir_all(ctx_path.parent().unwrap()).unwrap();
+    std::fs::write(&ctx_path, map.to_string()).unwrap();
+
+    let ctx = super::context_index::ctx_from_index("GPT-X");
+    assert_eq!(ctx, Some(128000));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn with_catalog_index_persists_index_for_the_next_process() {
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("dex-persist-spawn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+    env::set_var("XDG_CACHE_HOME", &dir);
+    let cache = dir.join("dex");
+    std::fs::create_dir_all(&cache).unwrap();
+    let catalog = serde_json::json!({
+        "prov": {"api": "https://x", "models": {"m1": {"limit": {"context": 8000}}}}
+    });
+    std::fs::write(cache.join("models.dev.json"), catalog.to_string()).unwrap();
+
+    // A cold rebuild must schedule the background persist: the next process
+    // restores this instead of re-parsing the catalog.
+    let got = super::catalog_index::with_catalog_index(|i| i.by_id.len());
+    assert_eq!(got, Some(1));
+    let path = super::catalog_index::persisted_index_path().unwrap();
+    for _ in 0..100 {
+        if path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(path.exists(), "background persist never wrote {path:?}");
+    let restored = super::catalog_index::restore_persisted_index(
+        &cache.join("models.dev.json"),
+        super::catalog_index::fnv_bytes(&catalog.to_string()),
+        std::time::SystemTime::UNIX_EPOCH,
+        0,
+    )
+    .expect("persisted index must match the catalog it was built from");
+    assert!(restored.by_id.contains_key("m1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
