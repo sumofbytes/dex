@@ -64,6 +64,10 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "model_select",
     "harness.overflow",
     "harness.conflict",
+    "permission.request",
+    "llm.before",
+    "llm.after",
+    "tool.error",
 ];
 
 /// Host context a Lua call runs under: what cancellation, gates, and

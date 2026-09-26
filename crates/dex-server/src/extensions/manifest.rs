@@ -237,4 +237,13 @@ tools:
         );
         assert!(parse_manifest(&both).is_ok());
     }
+
+    #[test]
+    fn harness_capability_is_known() {
+        let m = parse_manifest(
+            "manifest_version: 1\nid: hook-ext\nversion: 0.1.0\ncapabilities: [harness]\n",
+        )
+        .unwrap();
+        assert!(m.has_capability("harness"));
+    }
 }

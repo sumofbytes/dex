@@ -584,6 +584,65 @@ fn net_origin(url: &reqwest::Url) -> (String, String, Option<u16>) {
     )
 }
 
+/// `permission.request` for the approval gate: first explicit
+/// `{decision = "allow"|"deny"}` wins, `None` (unsubscribed or no opinion)
+/// means the normal approval flow. Carries the turn's policy + filter so a
+/// nested `dex.tools.call` is gated exactly like a model-issued one.
+pub async fn query_permission_request(
+    tool: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    requirement: &str,
+    mode: &str,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    policy: &crate::tools::Policy,
+    filter: Option<&crate::tools::ToolFilter>,
+) -> Option<(super::PermissionDecision, String, String)> {
+    if !has_event_handlers("permission.request") {
+        return None;
+    }
+    let host = HostCtx {
+        cancel,
+        policy,
+        filter,
+    };
+    global_manager()
+        .query_permission(tool, args, requirement, mode, &host)
+        .await
+}
+
+/// `llm.before` for `before_model`: appends persisted as a user-role note
+/// before the compaction gate (see the manager method). Zero-cost without
+/// subscribers. Read-only host: decision hooks cannot mutate.
+pub async fn apply_llm_before(
+    messages: usize,
+    stored_tokens: u64,
+    overhead: u64,
+    cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+) -> Vec<String> {
+    if !has_event_handlers("llm.before") {
+        return Vec::new();
+    }
+    let policy = crate::tools::Policy::turn(
+        crate::protocol::PermissionMode::ReadOnly,
+        &crate::runtime::console::Console::none(),
+    );
+    let host = HostCtx {
+        cancel,
+        policy: &policy,
+        filter: None,
+    };
+    global_manager()
+        .apply_llm_before(
+            &host,
+            serde_json::json!({
+                "messages": messages,
+                "stored_tokens": stored_tokens,
+                "overhead": overhead,
+            }),
+        )
+        .await
+}
+
 /// `harness.overflow` for the recovery path: first non-nil `{overflow}`
 /// wins, `None` (unsubscribed or no opinion) means the Rust default.
 /// Read-only host: decision hooks cannot mutate.

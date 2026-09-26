@@ -151,6 +151,27 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
 
         let ephemerals = [crate::mcp::ephemeral_line()];
         let overhead = estimate_ephemeral_tokens(&ephemerals) + schema_budget_tokens();
+        // Runtime prompt influence: `llm.before` appends land as one persisted
+        // user-role note before the compaction gate, so they count toward the
+        // window and appear in the journal like steering. Hooks must be
+        // idempotent (use `dex.state`) — an unconditional append grows history
+        // until compaction or the tool budget stops the turn.
+        let llm_appends = crate::extensions::apply_llm_before(
+            messages.len(),
+            ledger.stored_tokens(),
+            overhead,
+            self.cancel as &(dyn CancellationSource + Send + Sync),
+        )
+        .await;
+        if !llm_appends.is_empty() {
+            messages.push(ChatMessage::user_named(llm_appends.join("\n\n"), "note"));
+            *ledger = TokenLedger::rebuild(messages);
+            self.harness.transcript.append_pending(
+                &mut self.session,
+                messages,
+                &mut self.persisted_cursor,
+            )?;
+        }
         compaction_gate(
             self.config,
             self.console,
@@ -190,6 +211,22 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         stop_reason: Option<StopReason>,
         elapsed_ms: u64,
     ) -> Result<(), AgentTurnError> {
+        // Runtime observation: `llm.after` sees every request (usage, stop
+        // reason, timing). Fire-and-forget — no directive. Response text is
+        // engine-held; the final text surfaces via the transcript.
+        crate::extensions::fire_event_global(
+            "llm.after",
+            serde_json::json!({
+                "stop_reason": stop_reason.map(|s| format!("{s:?}")),
+                "prompt_tokens": usage.map(|u| u.prompt_tokens),
+                "completion_tokens": usage.map(|u| u.completion_tokens),
+                "elapsed_ms": elapsed_ms,
+            }),
+            self.cancel as &(dyn CancellationSource + Send + Sync),
+            &self.policy,
+            self.filter,
+        )
+        .await;
         if let Some(usage) = usage {
             self.last_usage = Some(usage.prompt_tokens);
             self.harness
