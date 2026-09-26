@@ -346,6 +346,41 @@ where
     // resolver applies `harness.slots:` registry selections on top.
     let harness = harness.unwrap_or_else(crate::agent::registry::resolve_snapshot);
     let tool_round_limit = tool_budget.unwrap_or_else(|| harness.config.max_tool_iterations());
+    // `agent_loop` slot (spec §9 / Phase 5): a registered Lua loop replaces
+    // the whole `run_turn` orchestration — this driver keeps the host, the
+    // token ledger, the tool-round budget, and cancellation; the loop owns
+    // iteration. Queried at the same snapshot point as every other slot;
+    // `None` (no registered loop) keeps the Rust engine.
+    if let Some((ext_id, engine)) = crate::extensions::agent_loop_global().await {
+        let started = std::time::Instant::now();
+        let result = lua_loop::run_lua_agent_loop(
+            engine,
+            config,
+            messages,
+            state,
+            steering_rx,
+            steering_accepted_tx,
+            session,
+            client,
+            cancel,
+            console,
+            filter,
+            agent_ctx,
+            harness,
+            tool_round_limit,
+        )
+        .await;
+        // §35 invocation trace: the loop is one long invocation spanning the
+        // whole turn — one record, the turn's duration and outcome.
+        crate::extensions::trace::record(
+            &ext_id,
+            "agent_loop",
+            started.elapsed(),
+            if result.is_ok() { "ok" } else { "error" },
+            result.as_ref().err().map(|e| e.to_string()),
+        );
+        return result;
+    }
     let mut host = host::make_host(
         config,
         state,
@@ -363,6 +398,7 @@ where
 }
 
 pub(crate) mod host;
+pub(crate) mod lua_loop;
 pub(crate) mod tool_results;
 pub(crate) mod tools;
 

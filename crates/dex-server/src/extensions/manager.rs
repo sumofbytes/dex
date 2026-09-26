@@ -32,6 +32,9 @@ pub struct LoadedExtension {
     pub wraps: Vec<String>,
     /// Slots the extension backs with `dex.fallback`.
     pub fallbacks: Vec<String>,
+    /// `agent_loop` component id when the chunk registered one via
+    /// `dex.replace("agent_loop", …)` (spec §9).
+    pub agent_loop: Option<String>,
 }
 
 impl LoadedExtension {
@@ -214,6 +217,7 @@ impl ExtensionManager {
                 fallbacks: exports.fallbacks,
                 shadows: exports.shadows,
                 commands,
+                agent_loop: exports.agent_loop,
             },
         );
         Ok(())
@@ -226,6 +230,17 @@ impl ExtensionManager {
     /// racing background refresh must not wipe a concurrent loader).
     pub async fn refresh(&self) {
         self.refresh_found(discover_scoped()).await;
+    }
+
+    /// The agent-loop slot (spec §9): first loaded extension that registered
+    /// one via `dex.replace("agent_loop", …)`. Load order is sorted by id,
+    /// so first-wins is deterministic. `None` = the Rust `run_turn` default.
+    pub async fn agent_loop(&self) -> Option<(String, ExtensionEngine)> {
+        self.engines.read().await.values().find_map(|e| {
+            e.agent_loop
+                .as_ref()
+                .map(|id| (id.clone(), e.engine.clone()))
+        })
     }
 
     /// Ensure one extension is loaded, booting just it on first use (§26):

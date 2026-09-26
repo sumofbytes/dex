@@ -19,6 +19,12 @@ use super::{
 use crate::extensions::Manifest;
 use tokio::sync::mpsc;
 
+/// Wall-clock backstop for an agent loop (spec §9): model rounds legitimately
+/// take minutes, so there is no per-call deadline — the task side sets the
+/// abort flag on turn end/cancellation. This backstop only catches a worker
+/// nobody is waiting on or cancelled, e.g. a loop that never surfaces.
+const LOOP_BACKSTOP: Duration = Duration::from_secs(3600);
+
 // The drive's model context on the worker thread: set by `run_call` for
 // the drive's duration, read by the sync `dex.model.*` closures (which
 // cannot reach the task-local — the worker is a plain OS thread). Drives
@@ -108,6 +114,221 @@ pub(super) fn run_call(
     };
     abort.store(true, Ordering::Relaxed);
     done(result);
+}
+
+/// Drive the registered agent loop on the worker (spec §9, agent_loop.v1).
+/// The loop owns iteration; every engine step is a blocking host upcall the
+/// turn driver answers on the task side with the turn's real state. The
+/// instruction hook enforces the caller's `abort` flag (no fixed deadline —
+/// model rounds take minutes) plus a generous wall-clock backstop. The
+/// return value is the loop's result envelope: a string is `{text}`, a
+/// table may carry `{text}` and/or `{error}`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_agent_loop(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+    dir: &Path,
+    call_id: &str,
+    abort: Arc<AtomicBool>,
+    model: Option<super::super::DriveModel>,
+    tx: &mpsc::UnboundedSender<WorkerMsg>,
+) {
+    // Same drive-model pin as `run_call`: `dex.model.*` serves this turn.
+    let _drive_guard = DRIVE_WORKER.with(|slot| {
+        let prev = slot.borrow().clone();
+        *slot.borrow_mut() = model;
+        WorkerDriveGuard { prev }
+    });
+    let started = Instant::now();
+    let hook_abort = Arc::clone(&abort);
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(10_000),
+        move |_, _| {
+            if hook_abort.load(Ordering::Relaxed) {
+                return Err(LuaError::RuntimeError("agent loop aborted".into()));
+            }
+            if started.elapsed() > LOOP_BACKSTOP {
+                return Err(LuaError::RuntimeError(
+                    "agent loop exceeded its wall-clock backstop".into(),
+                ));
+            }
+            Ok(VmState::Continue)
+        },
+    )
+    .expect("hook arm");
+    let _ = lua.set_app_data(tx.clone());
+    let done = |result: Result<String, String>| {
+        lua.remove_app_data::<mpsc::UnboundedSender<WorkerMsg>>();
+        lua.remove_hook();
+        let _ = tx.send(WorkerMsg::Done(result));
+    };
+    let (loop_id, run) = match regs.borrow().agent_loop.clone() {
+        Some(pair) => pair,
+        None => {
+            done(Err(
+                "agent loop requested but none is registered".to_string()
+            ));
+            return;
+        }
+    };
+    let ctx = match loop_context(lua, manifest, dir, &loop_id, call_id) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            done(Err(e));
+            return;
+        }
+    };
+    let ev_id = manifest.id_for_error();
+    let returned: Value = match run.call((ctx,)) {
+        Ok(v) => v,
+        Err(e) => {
+            done(Err(format!(
+                "extension '{ev_id}' agent loop '{loop_id}' failed: {e}"
+            )));
+            return;
+        }
+    };
+    abort.store(true, Ordering::Relaxed);
+    let envelope: Result<Json, String> = match returned {
+        Value::String(s) => s
+            .to_str()
+            .map(|text| {
+                Json::Object(
+                    [("text".to_string(), Json::String(text.to_string()))]
+                        .into_iter()
+                        .collect(),
+                )
+            })
+            .map_err(|e| e.to_string()),
+        Value::Table(t) => lua_to_json(Value::Table(t)).and_then(|json| {
+            let mut out = Map::new();
+            match json {
+                Json::Object(map) => {
+                    if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
+                        out.insert("text".to_string(), Json::String(text.to_string()));
+                    }
+                    if let Some(error) = map.get("error").and_then(|v| v.as_str()) {
+                        out.insert("error".to_string(), Json::String(error.to_string()));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "extension '{ev_id}' agent loop '{loop_id}' must return a string or a table"
+                    ));
+                }
+            }
+            if out.is_empty() {
+                return Err(format!(
+                    "extension '{ev_id}' agent loop '{loop_id}' returned no text/error"
+                ));
+            }
+            Ok(Json::Object(out))
+        }),
+        other => Err(format!(
+            "extension '{ev_id}' agent loop '{loop_id}' must return a string or a table, got {}",
+            lua_type_name(&other)
+        )),
+    };
+    done(envelope.map(|envelope| envelope.to_string()));
+}
+
+/// The `ctx` handed to an agent loop's `run(ctx)`: identity fields plus the
+/// agent_loop.v1 step surface. Every step is a blocking host upcall (the
+/// worker never touches async code); JSON in, JSON out.
+fn loop_context(
+    lua: &Lua,
+    manifest: &Manifest,
+    dir: &Path,
+    loop_id: &str,
+    call_id: &str,
+) -> Result<Table, String> {
+    let ext_id = manifest.id.clone();
+    let ctx = lua.create_table().map_err(|e| e.to_string())?;
+    ctx.set("extension", ext_id.clone())
+        .map_err(|e| e.to_string())?;
+    ctx.set("workspace", dir.display().to_string())
+        .map_err(|e| e.to_string())?;
+    ctx.set("call_id", call_id).map_err(|e| e.to_string())?;
+    ctx.set("loop", loop_id).map_err(|e| e.to_string())?;
+    ctx.set("interface", "agent_loop.v1")
+        .map_err(|e| e.to_string())?;
+
+    let upcall_table = |name: &str, member: &str, f: mlua::Function| -> Result<(), String> {
+        let t = lua.create_table().map_err(|e| e.to_string())?;
+        t.set(member, f).map_err(|e| e.to_string())?;
+        ctx.set(name, t).map_err(|e| e.to_string())
+    };
+
+    // ctx.model.call(): one engine round. Reply is the envelope table
+    // `{content?, tool_calls? = [{id,name,args}], retry?}` or a Lua error.
+    {
+        let ext_id = ext_id.clone();
+        let f = lua
+            .create_function(move |lua, _: ()| {
+                let json = super::host_upcall(lua, &ext_id, super::HostOp::LoopModel)?;
+                let value: Json = serde_json::from_str(&json)
+                    .map_err(|e| LuaError::RuntimeError(format!("bad model reply: {e}")))?;
+                json_to_lua(lua, &value).map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
+            .map_err(|e| e.to_string())?;
+        upcall_table("model", "call", f)?;
+    }
+    // ctx.tools.execute(): run the last response's pending tool calls
+    // through the host (hooks, gates, dispatch) + budget. Reply
+    // `{completed, limit}` or `{exhausted, note}`.
+    {
+        let ext_id = ext_id.clone();
+        let f = lua
+            .create_function(move |lua, _: ()| {
+                let json = super::host_upcall(lua, &ext_id, super::HostOp::LoopTools)?;
+                let value: Json = serde_json::from_str(&json)
+                    .map_err(|e| LuaError::RuntimeError(format!("bad tools reply: {e}")))?;
+                json_to_lua(lua, &value).map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
+            .map_err(|e| e.to_string())?;
+        upcall_table("tools", "execute", f)?;
+    }
+    // ctx.finish(response): finish_response — steering + persistence.
+    // Reply `{steered = bool}`: true means run another round.
+    {
+        let ext_id = ext_id.clone();
+        let f = lua
+            .create_function(move |lua, response: String| {
+                let json =
+                    super::host_upcall(lua, &ext_id, super::HostOp::LoopFinish { response })?;
+                let value: Json = serde_json::from_str(&json)
+                    .map_err(|e| LuaError::RuntimeError(format!("bad finish reply: {e}")))?;
+                json_to_lua(lua, &value).map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
+            .map_err(|e| e.to_string())?;
+        ctx.set("finish", f).map_err(|e| e.to_string())?;
+    }
+    // ctx.cancelled(): is the turn cancelled?
+    {
+        let ext_id = ext_id.clone();
+        let f = lua
+            .create_function(move |lua, _: ()| {
+                let json = super::host_upcall(lua, &ext_id, super::HostOp::LoopCancelled)?;
+                Ok(json == "true")
+            })
+            .map_err(|e| e.to_string())?;
+        ctx.set("cancelled", f).map_err(|e| e.to_string())?;
+    }
+    // ctx.state(): `{cancelled, rounds, round_limit, messages}`.
+    {
+        let ext_id = ext_id.clone();
+        let f = lua
+            .create_function(move |lua, _: ()| {
+                let json = super::host_upcall(lua, &ext_id, super::HostOp::LoopState)?;
+                let value: Json = serde_json::from_str(&json)
+                    .map_err(|e| LuaError::RuntimeError(format!("bad state reply: {e}")))?;
+                json_to_lua(lua, &value).map_err(|e| LuaError::RuntimeError(e.to_string()))
+            })
+            .map_err(|e| e.to_string())?;
+        ctx.set("state", f).map_err(|e| e.to_string())?;
+    }
+    Ok(ctx)
 }
 
 fn call_context(

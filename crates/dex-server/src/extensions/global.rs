@@ -815,6 +815,13 @@ pub async fn query_model_selector_global(
         .await
 }
 
+/// The agent-loop slot (spec §9): first loaded extension that registered a
+/// loop via `dex.replace("agent_loop", …)`, or `None` for the Rust
+/// `run_turn` default. Queried once per turn at the snapshot point.
+pub async fn agent_loop_global() -> Option<(String, crate::extensions::ExtensionEngine)> {
+    global_manager().agent_loop().await
+}
+
 /// `tool_catalog` for the turn's schema assembly: the first `{keep}/{drop}`
 /// opinion narrows the served schemas; `None` (unsubscribed, error, no
 /// opinion) keeps the full catalog. Read-only host — filtering schemas must
