@@ -65,7 +65,8 @@ async fn compaction_gate(
     ledger: &mut TokenLedger,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut compaction_attempts = 0;
-    while compaction_attempts < 3 {
+    let max_attempts = crate::agent::composable::HarnessConfig::default().max_compaction_attempts;
+    while compaction_attempts < max_attempts {
         if !(CompactionBudget {
             token_threshold: config.compaction_threshold(),
             keep_recent_messages: KEEP_RECENT_MESSAGES,

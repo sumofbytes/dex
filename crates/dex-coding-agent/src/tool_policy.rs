@@ -51,10 +51,53 @@ pub fn native_tool_metadata(name: &str) -> Option<ToolMetadata> {
 
 /// Whether the tool's permission requirement needs human approval in a mode.
 pub fn needs_approval(requirement: PermissionRequirement, mode: PermissionMode) -> bool {
-    !matches!(
-        (requirement, mode),
-        (PermissionRequirement::Read, _) | (_, PermissionMode::Trusted)
-    )
+    DefaultApprovalPolicy.needs_approval(requirement, mode)
+}
+
+/// Overwritable approval metadata + gate.
+///
+/// The default answers native tools from [`native_tool_metadata`] and gates
+/// everything else as unknown (`None`); hosts extend it with MCP/extension
+/// rows. Override to auto-approve lists, per-tool modes, or custom UX
+/// without forking dispatch.
+pub trait ApprovalPolicy: Send + Sync {
+    fn metadata(&self, name: &str) -> Option<ToolMetadata>;
+    fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool;
+}
+
+/// Default policy: native metadata + [`needs_approval`] gate.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DefaultApprovalPolicy;
+
+impl ApprovalPolicy for DefaultApprovalPolicy {
+    fn metadata(&self, name: &str) -> Option<ToolMetadata> {
+        native_tool_metadata(name)
+    }
+
+    fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool {
+        !matches!(
+            (requirement, mode),
+            (PermissionRequirement::Read, _) | (_, PermissionMode::Trusted)
+        )
+    }
+}
+
+/// Closure metadata override; approval gate stays default.
+pub struct FnApprovalPolicy<F>(pub F)
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync;
+
+impl<F> ApprovalPolicy for FnApprovalPolicy<F>
+where
+    F: Fn(&str) -> Option<ToolMetadata> + Send + Sync,
+{
+    fn metadata(&self, name: &str) -> Option<ToolMetadata> {
+        (self.0)(name)
+    }
+
+    fn needs_approval(&self, requirement: PermissionRequirement, mode: PermissionMode) -> bool {
+        DefaultApprovalPolicy.needs_approval(requirement, mode)
+    }
 }
 
 #[cfg(test)]

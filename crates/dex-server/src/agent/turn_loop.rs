@@ -260,9 +260,9 @@ where
     .await
 }
 
-mod host;
-mod tool_results;
-mod tools;
+pub(crate) mod host;
+pub(crate) mod tool_results;
+pub(crate) mod tools;
 
 use tools::max_tool_iterations;
 

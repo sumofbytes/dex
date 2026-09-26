@@ -36,47 +36,104 @@ pub fn normalize_tool_result(
     tool_name: &str,
     outcome: ToolExecutionResult,
 ) -> NormalizedToolResult {
-    let succeeded = outcome.ok;
-    if succeeded {
-        if recent_calls.len() >= 6 {
-            recent_calls.remove(0);
-        }
-        recent_calls.push(cache_key.clone());
-    }
-    let repeated_count = recent_calls.iter().filter(|key| **key == cache_key).count();
-    let cacheable = matches!(
-        tool_name,
-        "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls"
-    );
-    let mut cache_hit = false;
-    let mut cache_changed = false;
-    let mut ok = succeeded;
-    let text = if repeated_count >= 3 {
-        ok = false;
-        "Error: repeated identical tool call; choose a different action or finish.".to_string()
-    } else if cacheable && succeeded {
-        if let Some(cached) = cache.get(&cache_key) {
-            cache_hit = true;
-            cached.clone()
-        } else {
-            cache_changed = true;
-            cache.insert(cache_key, outcome.text.clone());
-            outcome.text
-        }
-    } else {
-        if matches!(tool_name, "write" | "edit") {
-            cache_changed = !cache.is_empty();
-            cache.clear();
-        }
-        outcome.text
-    };
+    ResultPolicy::default().normalize(cache, recent_calls, cache_key, tool_name, outcome)
+}
 
-    NormalizedToolResult {
-        text,
-        ok,
-        diff: outcome.diff,
-        cache_hit,
-        cache_changed,
+/// Overwritable cache + repeat-call policy.
+///
+/// Defaults match the historic behavior (cacheable reads, `write`/`edit`
+/// invalidate, 6-deep recent window, ≥3 repeats rejected). Override to
+/// cache more tools, disable the repeat guard, or scope keys per workspace.
+#[derive(Clone, Copy, Debug)]
+pub struct ResultPolicy {
+    pub recent_window: usize,
+    pub repeat_limit: usize,
+}
+
+impl Default for ResultPolicy {
+    fn default() -> Self {
+        Self {
+            recent_window: 6,
+            repeat_limit: 3,
+        }
+    }
+}
+
+impl ResultPolicy {
+    pub fn with_recent_window(mut self, window: usize) -> Self {
+        self.recent_window = window;
+        self
+    }
+
+    pub fn with_repeat_limit(mut self, limit: usize) -> Self {
+        self.repeat_limit = limit;
+        self
+    }
+
+    /// Without the repeat guard (repeat_limit = usize::MAX).
+    pub fn without_repeat_guard(mut self) -> Self {
+        self.repeat_limit = usize::MAX;
+        self
+    }
+
+    pub fn is_cacheable(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls"
+        )
+    }
+
+    pub fn is_mutating(tool_name: &str) -> bool {
+        matches!(tool_name, "write" | "edit")
+    }
+
+    pub fn normalize(
+        &self,
+        cache: &mut HashMap<String, String>,
+        recent_calls: &mut Vec<String>,
+        cache_key: String,
+        tool_name: &str,
+        outcome: ToolExecutionResult,
+    ) -> NormalizedToolResult {
+        let succeeded = outcome.ok;
+        if succeeded {
+            while recent_calls.len() >= self.recent_window.max(1) {
+                recent_calls.remove(0);
+            }
+            recent_calls.push(cache_key.clone());
+        }
+        let repeated_count = recent_calls.iter().filter(|key| **key == cache_key).count();
+        let cacheable = Self::is_cacheable(tool_name);
+        let mut cache_hit = false;
+        let mut cache_changed = false;
+        let mut ok = succeeded;
+        let text = if repeated_count >= self.repeat_limit {
+            ok = false;
+            "Error: repeated identical tool call; choose a different action or finish.".to_string()
+        } else if cacheable && succeeded {
+            if let Some(cached) = cache.get(&cache_key) {
+                cache_hit = true;
+                cached.clone()
+            } else {
+                cache_changed = true;
+                cache.insert(cache_key, outcome.text.clone());
+                outcome.text
+            }
+        } else {
+            if Self::is_mutating(tool_name) {
+                cache_changed = !cache.is_empty();
+                cache.clear();
+            }
+            outcome.text
+        };
+
+        NormalizedToolResult {
+            text,
+            ok,
+            diff: outcome.diff,
+            cache_hit,
+            cache_changed,
+        }
     }
 }
 
