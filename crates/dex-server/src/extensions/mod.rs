@@ -45,7 +45,7 @@ mod state;
 pub mod trace;
 // `summary_line` is the `/extensions` sheet (TUI) consumer only.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
-pub use discovery::{discovered_extensions, list_command, summary_line};
+pub use discovery::{discovered_extensions, list_command, permission_hook_ids, summary_line};
 #[cfg(test)]
 pub(crate) use global::resolve_active_name;
 pub use global::text_preview;

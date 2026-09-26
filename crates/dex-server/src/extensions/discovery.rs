@@ -224,6 +224,47 @@ pub fn discovered_extensions() -> Vec<(String, String, &'static str, String)> {
     found
 }
 
+/// Extensions that may arbitrate approvals: loaded (user scope not
+/// disabled / project scope explicitly enabled) and declaring the
+/// `harness` capability — the enforced gate for `permission.request` and
+/// `supervisor.route` subscriptions. Subscriptions live in the Lua, not
+/// the manifest, so the capability is the proxy `dex doctor` can read
+/// without booting a worker — a Lua permission hook must never be
+/// invisible next to the configured permission mode.
+pub fn permission_hook_ids() -> Vec<String> {
+    let mut ids = Vec::new();
+    for (dir, scope) in scoped_extension_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let ext_dir = entry.path();
+            if !ext_dir.is_dir() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(ext_dir.join("manifest.yaml")) else {
+                continue;
+            };
+            let Ok(m) = manifest::parse_manifest(&text) else {
+                continue;
+            };
+            if !m.has_capability("harness") {
+                continue;
+            }
+            let live = match scope {
+                Scope::User => !is_disabled(&m.id),
+                Scope::Project => is_enabled(&m.id),
+            };
+            if live {
+                ids.push(m.id);
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// One-line summary for `dex extensions list` / `/extensions` (shared so
 /// the two surfaces never drift).
 pub fn summary_line(id: &str, version: &str, tools: &[String], events: &[String]) -> String {

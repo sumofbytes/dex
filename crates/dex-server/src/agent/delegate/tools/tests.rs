@@ -731,7 +731,9 @@ async fn supervisor_route_deny_fails_attributed_before_spawn() {
     let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
         .lock()
         .await;
-    let manifest = "manifest_version: 1\nid: gate\nversion: 0.1.0\ncapabilities: []\n";
+    // Routing is a harness-level power: the subscription gate requires
+    // the capability.
+    let manifest = "manifest_version: 1\nid: gate\nversion: 0.1.0\ncapabilities: [harness]\n";
     let root = crate::extensions::tests::fixture_exts(&[(
         "gate",
         manifest,
