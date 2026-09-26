@@ -21,7 +21,7 @@ use crate::tools::{execute_outcome, Policy, ToolFilter, ToolOutcome};
 
 /// Emit a system note on every surface: a transcript line when a sink is
 /// attached (TUI / daemon), `eprintln` headless.
-pub(super) async fn system_note(console: &Console, note: &str) {
+pub(crate) async fn system_note(console: &Console, note: &str) {
     note_sink(
         console,
         || SinkLine::System(note.to_string()),
@@ -96,7 +96,7 @@ pub(crate) fn persist_pending(
 /// after any compaction rewrites it (threshold gate, emergency, online
 /// boundary). Atomic (`Session::rewrite_messages`): readers never see a
 /// torn clear-plus-partial-tail.
-pub(super) fn rewrite_session(
+pub(crate) fn rewrite_session(
     session: Option<&mut Session>,
     messages: &[ChatMessage],
     persisted_cursor: &mut usize,
@@ -140,44 +140,18 @@ pub(super) async fn inject_steering(
 /// only stops *identical* calls. Bounded, preserved partial progress; the
 /// user can continue with another prompt. `DEX_MAX_TOOL_ITERATIONS`
 /// overrides.
+///
+/// Single env boundary: [`crate::agent::composable::HarnessConfig::from_env`].
 pub(super) fn max_tool_iterations() -> usize {
-    std::env::var("DEX_MAX_TOOL_ITERATIONS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(200)
+    crate::agent::composable::HarnessConfig::from_env().max_tool_iterations
 }
 
-/// Phrases meaning "the input no longer fits the context window",
-/// matched on a lowercased message by `is_context_overflow`.
-const OVERFLOW_PHRASES: &[&str] = &[
-    "context length",
-    "context_length",
-    "maximum context",
-    "context window",
-    "context size",
-    "context too large",
-    "input length",
-    "input is too long",
-    "prompt is too long",
-    "prompt too long",
-    "too many tokens",
-    "token limit",
-];
-
 /// Provider wording for "the input no longer fits the context window".
-/// Matched on lowercase; providers phrase it many ways. The generic
-/// "reduce the length" only counts with a context/token/prompt/input
-/// anchor so unrelated length validations (filenames, etc.) don't trigger
-/// a wasteful emergency compaction.
+/// Delegates to the overwritable [`dex_agent_core::DefaultOverflowDetector`];
+/// override that trait instead of forking this function.
 pub(super) fn is_context_overflow(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    OVERFLOW_PHRASES.iter().any(|p| message.contains(*p))
-        || (message.contains("reduce the length")
-            && (message.contains("context")
-                || message.contains("token")
-                || message.contains("prompt")
-                || message.contains("input")))
+    use dex_agent_core::{DefaultOverflowDetector, OverflowDetector};
+    DefaultOverflowDetector.is_overflow(message)
 }
 
 /// Shared per-call accounting: live context usage in `state`, the sink
@@ -187,7 +161,7 @@ pub(super) fn is_context_overflow(message: &str) -> bool {
 /// which are billed too. `gen_ms` is the caller-measured wall-clock
 /// duration of the LLM call (`None` when untimed, e.g. compaction): it
 /// becomes the footer's tokens/s denominator on the client.
-pub(super) async fn record_usage(
+pub(crate) async fn record_usage(
     config: &LlmConfig,
     state: &mut ToolState,
     console: &Console,
@@ -271,9 +245,10 @@ pub(super) async fn execute_tool_call(
     (name, input, outcome)
 }
 
-/// Force up to three compaction rounds regardless of the token threshold —
-/// the provider has already said the input is over the real limit, so the
-/// estimator's opinion no longer matters. Returns true when history shrank.
+/// Force up to `HarnessConfig::max_compaction_attempts` rounds regardless of
+/// the token threshold — the provider has already said the input is over the
+/// real limit, so the estimator's opinion no longer matters. Returns true
+/// when history shrank.
 pub(super) async fn emergency_compact(
     config: &LlmConfig,
     messages: &mut Vec<ChatMessage>,
@@ -283,7 +258,8 @@ pub(super) async fn emergency_compact(
     ledger: &mut TokenLedger,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
-    for _ in 0..3 {
+    let max_attempts = crate::agent::composable::HarnessConfig::default().max_compaction_attempts;
+    for _ in 0..max_attempts {
         // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
         // one parse selects both the prune and the fallback summarizer.
         let summarizer = summary_mode();
@@ -390,9 +366,10 @@ where
         // stays in input order. A semaphore caps fd/thread pressure no matter
         // how many calls the model packed into one batch; `select!` on
         // `wait_cancelled` aborts the stragglers instead of waiting for the
-        // slowest tool after Ctrl+C.
-        const BATCH_MAX_CONCURRENT: usize = 10;
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(BATCH_MAX_CONCURRENT));
+        // slowest tool after Ctrl+C. Bound from `HarnessConfig` so the
+        // fan-out is overwritable without forking the scheduler.
+        let batch_max = crate::agent::composable::HarnessConfig::default().batch_max_concurrent;
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_max));
         let mut set = tokio::task::JoinSet::new();
         for (idx, call) in calls.iter().enumerate() {
             let call = call.clone();

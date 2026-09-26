@@ -59,11 +59,8 @@ pub(crate) const JEV_TRUNCATE_HEAD_CHARS: usize = 300;
 /// `reductionRatio < 0.25` falls back to summary).
 pub(crate) const JEV_MIN_REDUCTION_RATIO: f64 = 0.25;
 
-/// Medium results are truncated; huge ones from re-runnable tools are dropped.
-const TRUNCATE_ABOVE_CHARS: usize = 2_000;
-const DROP_ABOVE_CHARS: usize = 10_000;
-/// Small results are cheap — keep verbatim.
-const KEEP_BELOW_CHARS: usize = 500;
+// Size gates live in `dex_agent_core::PruneThresholds`; `decide()` below
+// delegates to `DefaultPruneScorer` so there is one source of truth.
 
 /// How `compact_history` handles the archivable span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,23 +401,18 @@ fn looks_like_error(text: &str) -> bool {
 
 /// Heuristic stand-in for Jev's two `noul` questions (call still matters?
 /// result still needed verbatim?): returns `(keep_call, keep_result)`.
+/// Delegates to the overwritable [`dex_agent_core::DefaultPruneScorer`];
+/// override that trait instead of forking this function.
 fn decide(tool: &str, result: &str) -> (bool, bool) {
-    // Chars, not bytes: the thresholds are named `_CHARS` and the truncate
-    // head is 300 chars, so a multibyte result must clear the same bar.
+    use dex_agent_core::{DefaultPruneScorer, PruneScorer};
     let len = result.chars().count();
-    if len < KEEP_BELOW_CHARS {
-        return (true, true);
-    }
-    if len > DROP_ABOVE_CHARS {
-        if is_rerunnable(tool) && !looks_like_error(result) {
-            return (false, false);
-        }
-        return (true, false);
-    }
-    if len > TRUNCATE_ABOVE_CHARS {
-        return (true, false);
-    }
-    (true, true)
+    let verdict = DefaultPruneScorer::default().decide(
+        tool,
+        len,
+        is_rerunnable(tool),
+        looks_like_error(result),
+    );
+    (verdict.keep_call, verdict.keep_result)
 }
 
 /// Context object threaded through a live prune: endpoint + key.
