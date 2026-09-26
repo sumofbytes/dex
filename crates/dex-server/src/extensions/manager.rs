@@ -13,7 +13,7 @@ use super::hooks;
 use super::manifest::{self, Manifest};
 use super::{
     AfterOutcome, BeforeOutcome, CallKind, CompactAction, ExtensionEngine, HostCtx,
-    HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
+    SupervisorAction, HOOK_TIMEOUT_SECS, SLOW_HOOK_WARN,
 };
 
 pub struct LoadedExtension {
@@ -28,6 +28,25 @@ pub struct LoadedExtension {
     pub shadows: Vec<String>,
     /// Registered slash commands: (name, description), sorted by name.
     pub commands: Vec<(String, String)>,
+    /// Slot names this extension wraps with `dex.wrap` middleware.
+    pub wraps: Vec<String>,
+    /// Slots the extension backs with `dex.fallback`.
+    pub fallbacks: Vec<String>,
+    /// Slots the extension implements with `dex.use` (spec §10).
+    pub uses: Vec<String>,
+    /// `agent_loop` component id when the chunk registered one via
+    /// `dex.replace("agent_loop", …)` (spec §9).
+    pub agent_loop: Option<String>,
+}
+
+impl LoadedExtension {
+    /// Whether this extension participates in `event`: an explicit handler
+    /// subscription or middleware over a wrappable slot.
+    pub fn serves(&self, event: &str) -> bool {
+        self.events.iter().any(|e| e == event)
+            || self.wraps.iter().any(|e| e == event)
+            || self.fallbacks.iter().any(|e| e == event)
+    }
 }
 
 pub struct ExtensionManager {
@@ -56,6 +75,25 @@ pub struct ExtensionManager {
     /// extension, and log twice. The second refresh then no-ops on the
     /// already-present ids.
     pub refresh_lock: tokio::sync::Mutex<()>,
+}
+
+/// Fire `runtime.start` exactly once per process: the first completed
+/// bootstrap load (daemon background refresh, one-shot inline, or a racing
+/// `ensure_loaded`) announces the runtime to observers. Zero-cost without
+/// subscribers.
+async fn fire_runtime_start_once() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
+    crate::extensions::fire_lifecycle_event(
+        "runtime.start",
+        serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        &crate::runtime::cancel::GlobalCancellation,
+    )
+    .await;
 }
 
 impl ExtensionManager {
@@ -115,6 +153,7 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
     }
 
     /// Load one extension: spawn the worker, run its chunk, validate the
@@ -125,7 +164,41 @@ impl ExtensionManager {
             .map_err(|e| format!("extension '{}' has no extension.lua: {e}", m.id_for_error()))?;
         let engine = ExtensionEngine::new(m.clone(), dir.to_path_buf())
             .map_err(|e| format!("extension '{}': {e}", m.id_for_error()))?;
-        let exports = engine.load(source).await?;
+        let mut exports = engine.load(source).await?;
+
+        // Declarative component files (spec §31): each loads on the same
+        // worker with the same registration contract, after `extension.lua`.
+        // Manifest paths are validated (relative, .lua, unique) at parse
+        // time; a missing or failing file fails the whole extension.
+        for (slot, file) in &m.components {
+            let path = dir.join(file);
+            let comp_source = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "extension '{}' component '{slot}' ({}): {e}",
+                    m.id_for_error(),
+                    path.display()
+                )
+            })?;
+            let comp = engine
+                .load(comp_source)
+                .await
+                .map_err(|e| format!("extension '{}' component '{slot}': {e}", m.id_for_error()))?;
+            exports.tools.extend(comp.tools);
+            exports.events.extend(comp.events);
+            exports.wraps.extend(comp.wraps);
+            exports.fallbacks.extend(comp.fallbacks);
+            exports.uses.extend(comp.uses);
+            exports.shadows.extend(comp.shadows);
+            exports.commands.extend(comp.commands);
+            exports.agent_loop = exports.agent_loop.or(comp.agent_loop);
+        }
+        // Merged component chunks can unsort these; restore the invariants
+        // (sorted + deduped) the single-chunk load guarantees.
+        exports.commands.sort_by(|a, b| a.0.cmp(&b.0));
+        exports.uses.sort();
+        exports.uses.dedup();
+        exports.shadows.sort();
+        exports.shadows.dedup();
 
         // Shadows target real built-ins, claimed first-wins in load order.
         // A shadow colliding with an earlier shadow, or targeting a
@@ -176,8 +249,12 @@ impl ExtensionManager {
                 engine,
                 tools,
                 events,
+                wraps: exports.wraps,
+                fallbacks: exports.fallbacks,
+                uses: exports.uses,
                 shadows: exports.shadows,
                 commands,
+                agent_loop: exports.agent_loop,
             },
         );
         Ok(())
@@ -190,6 +267,17 @@ impl ExtensionManager {
     /// racing background refresh must not wipe a concurrent loader).
     pub async fn refresh(&self) {
         self.refresh_found(discover_scoped()).await;
+    }
+
+    /// The agent-loop slot (spec §9): first loaded extension that registered
+    /// one via `dex.replace("agent_loop", …)`. Load order is sorted by id,
+    /// so first-wins is deterministic. `None` = the Rust `run_turn` default.
+    pub async fn agent_loop(&self) -> Option<(String, ExtensionEngine)> {
+        self.engines.read().await.values().find_map(|e| {
+            e.agent_loop
+                .as_ref()
+                .map(|id| (id.clone(), e.engine.clone()))
+        })
     }
 
     /// Ensure one extension is loaded, booting just it on first use (§26):
@@ -225,6 +313,7 @@ impl ExtensionManager {
         }
         self.load_one(&dir, m).await?;
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
         Ok(())
     }
 
@@ -256,6 +345,7 @@ impl ExtensionManager {
             }
         }
         self.rebuild_cache().await;
+        fire_runtime_start_once().await;
     }
 
     /// Unload engines whose id is not in `keep`, dropping their prompt
@@ -452,7 +542,7 @@ impl ExtensionManager {
             let Some(ext) = engines.get(ext_id) else {
                 return Err(format!("unknown extension '{ext_id}'"));
             };
-            if !ext.events.contains(&event.to_string()) {
+            if !ext.serves(event) {
                 return Err(format!("extension '{ext_id}' has no '{event}' handlers"));
             }
             ext.engine.clone()
@@ -470,6 +560,12 @@ impl ExtensionManager {
             )
             .await;
         let elapsed = started.elapsed();
+        match &out {
+            Ok(_) => super::trace::record(ext_id, event, elapsed, "ok", None),
+            Err(error) => {
+                super::trace::record(ext_id, event, elapsed, "error", Some(error.clone()))
+            }
+        }
         if elapsed >= SLOW_HOOK_WARN {
             eprintln!(
                 "dex: [extensions] '{ext_id}' {event} took {}ms (slow hook adds per-turn latency)",
@@ -659,6 +755,380 @@ impl ExtensionManager {
         appends
     }
 
+    /// `supervisor.route` chain: merged across handlers in load order — the
+    /// first redirect wins, any deny wins (attributed). Errors/bad envelopes
+    /// fail open to no opinion (normal spawn flow).
+    pub async fn query_supervisor_route(
+        &self,
+        agent: &str,
+        task: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> SupervisorAction {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"supervisor.route".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        let mut action = SupervisorAction::default();
+        for id in subs {
+            let payload = serde_json::json!({ "agent": agent, "task": task });
+            let envelope = match self.run_event(&id, "supervisor.route", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' supervisor.route failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            let parsed = hooks::parse_supervisor(&envelope);
+            if action.agent.is_none() {
+                action.agent = parsed.0;
+            }
+            if action.deny.is_none() {
+                action.deny = parsed.1.map(|reason| (id.clone(), reason));
+            }
+        }
+        action
+    }
+
+    /// `permission.request` chain: first explicit `{decision = "allow"|"deny"}`
+    /// wins in load order; nil/garbage/errors fail open to `None` (the normal
+    /// approval flow). An explicit deny is honored downstream and attributed.
+    pub async fn query_permission(
+        &self,
+        tool: &str,
+        args: &serde_json::Map<String, serde_json::Value>,
+        requirement: &str,
+        mode: &str,
+        host: &HostCtx<'_>,
+    ) -> Option<(hooks::PermissionDecision, String, String)> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"permission.request".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "tool": tool,
+                "args": args,
+                "requirement": requirement,
+                "mode": mode,
+            });
+            let envelope = match self
+                .run_event(&id, "permission.request", payload, host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' permission.request failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some((decision, reason)) = hooks::parse_permission(&envelope) {
+                return Some((decision, reason, id));
+            }
+        }
+        None
+    }
+
+    /// `llm.before` chain: each handler may return `{append = text}` (or set
+    /// `ev.append`); strings concatenate in load order and the host persists
+    /// them as one user-role note before the compaction gate, so appends
+    /// count toward the window. Fail-open. Read-only influence otherwise.
+    pub async fn apply_llm_before(
+        &self,
+        host: &HostCtx<'_>,
+        payload: serde_json::Value,
+    ) -> Vec<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.events.contains(&"llm.before".to_string()))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        let mut appends = Vec::new();
+        for id in subs {
+            let envelope = match self
+                .run_event(&id, "llm.before", payload.clone(), host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' llm.before failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(append) = envelope.get("append").and_then(|v| v.as_str()) {
+                if !append.trim().is_empty() {
+                    appends.push(append.to_string());
+                }
+            }
+        }
+        appends
+    }
+
+    /// `harness.overflow` chain: first non-`nil` `{overflow = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (Rust default).
+    pub async fn query_harness_overflow(&self, message: &str, host: &HostCtx<'_>) -> Option<bool> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("harness.overflow"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({ "message": message });
+            let envelope = match self.run_event(&id, "harness.overflow", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.overflow failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_bool(&envelope, "overflow") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `harness.conflict` chain: first non-`nil` `{conflicts = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (Rust default,
+    /// which is fail-closed to serialization).
+    pub async fn query_harness_conflict(
+        &self,
+        calls: &serde_json::Value,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("harness.conflict"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({ "calls": calls });
+            let envelope = match self
+                .run_event(&id, "harness.conflict", payload.clone(), host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.conflict failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_bool(&envelope, "conflicts") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `harness.compact` chain: first non-`nil` `{compact = bool}` wins in
+    /// load order; errors/bad envelopes fail open to `None` (the Rust
+    /// trigger decides). Decision inputs are counts only — no conversation
+    /// content crosses the boundary (spec §11).
+    pub async fn query_harness_compact(
+        &self,
+        stored_tokens: u64,
+        ephemeral_overhead: u64,
+        message_count: usize,
+        host: &HostCtx<'_>,
+    ) -> Option<bool> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("harness.compact"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "stored_tokens": stored_tokens,
+                "ephemeral_overhead": ephemeral_overhead,
+                "message_count": message_count,
+            });
+            let envelope = match self.run_event(&id, "harness.compact", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.compact failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_bool(&envelope, "compact") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `harness.summarize` chain: first non-empty `{summary = "..."}` wins
+    /// in load order; errors, non-strings, and empty strings fail open to
+    /// `None` (the Rust summarizer runs — compaction must not become
+    /// extension-hostage).
+    pub async fn query_harness_summarize(
+        &self,
+        conversation: &str,
+        previous_summary: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> Option<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("harness.summarize"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "conversation": conversation,
+                "previous_summary": previous_summary,
+            });
+            let envelope = match self
+                .run_event(&id, "harness.summarize", payload, host)
+                .await
+            {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' harness.summarize failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_string(&envelope, "summary") {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `model_selector` chain: first non-empty `{model = "..."}` (or a bare
+    /// string return, which the envelope carries as `content`) wins in load
+    /// order. Errors, non-strings, and empty strings fail open to `None` —
+    /// the configured model is served, never a half-resolved one. The host
+    /// still resolves the selection against the catalog + credentials
+    /// (`apply_model`), so an unresolvable provider fails open there too.
+    /// The payload says `current`/`previous`, never `model`: the ev fold
+    /// merges payload keys into the directive envelope, and a payload key
+    /// must not shadow the directive key.
+    pub async fn query_model_selector(
+        &self,
+        current: &str,
+        previous: Option<&str>,
+        host: &HostCtx<'_>,
+    ) -> Option<String> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("model_selector"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "current": current,
+                "previous": previous,
+            });
+            let envelope = match self.run_event(&id, "model_selector", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' model_selector failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(v) = hooks::parse_harness_string(&envelope, "model")
+                .or_else(|| hooks::parse_harness_string(&envelope, "content"))
+            {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `tool_catalog` chain (spec §7/§11): the first handler returning
+    /// `{keep = [...]} / {drop = [...]}` narrows the schema list in load
+    /// order. Narrowing-only: the applied result is always a subset of the
+    /// input (unknown names in `keep` are ignored, `drop` removes). Errors
+    /// and empty envelopes fail open to `None` — the unfiltered catalog is
+    /// served, never a half-resolved one.
+    pub async fn query_tool_catalog(
+        &self,
+        schemas: &[ToolDefinition],
+        host: &HostCtx<'_>,
+    ) -> Option<Vec<ToolDefinition>> {
+        let subs: Vec<String> = {
+            let engines = self.engines.read().await;
+            engines
+                .values()
+                .filter(|e| e.serves("tool_catalog"))
+                .map(|e| e.manifest.id.clone())
+                .collect()
+        };
+        for id in subs {
+            let payload = serde_json::json!({
+                "tools": schemas
+                    .iter()
+                    .map(|t| serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            let envelope = match self.run_event(&id, "tool_catalog", payload, host).await {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("dex: [extensions] '{id}' tool_catalog failed: {error}");
+                    continue;
+                }
+            };
+            let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(&envelope) else {
+                continue;
+            };
+            if let Some(filter) = hooks::parse_catalog_filter(&envelope) {
+                return Some(filter.apply(schemas));
+            }
+        }
+        None
+    }
+
     /// `session.before_compact` chain: merged across handlers — any cancel
     /// wins, instruction strings concatenate in load order, the first
     /// summary replacement wins. Fail-open: a handler error is logged and
@@ -745,11 +1215,67 @@ impl ExtensionManager {
     }
 }
 
-/// `dex extensions install <dir>`: copy an extension directory into the
-/// user-scope dir. The manifest must parse — install validates before
-/// copying so a broken extension never lands.
+/// `dex extensions install <dir|git-url>`: install an extension into the
+/// user-scope dir. A local path is copied as-is; anything with a `://`
+/// scheme (https://, file://, …) is treated as a remote source and shallow
+/// git-cloned to a temp dir first. The manifest must parse — install
+/// validates before copying so a broken extension never lands.
 pub fn install(src: &str) -> Result<String, String> {
-    let src = PathBuf::from(src);
+    if src.contains("://") {
+        install_remote(src)
+    } else {
+        install_dir(PathBuf::from(src))
+    }
+}
+
+/// Remote sources (spec §32): `git clone --depth 1 <url>` into a private
+/// temp dir, then the same validate+copy path as a local install. The
+/// manifest must sit at the repo root (one extension per repo — a
+/// multi-extension repo is a packaging concern for the repo author). The
+/// temp dir is removed on every path out.
+fn install_remote(url: &str) -> Result<String, String> {
+    if !(url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("git@")
+        || url.starts_with("file://"))
+    {
+        return Err(format!(
+            "unsupported remote source {url:?}: use an https:// or git@ URL"
+        ));
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "dex-ext-install-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| {
+        let out = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", url])
+            .arg(&tmp)
+            .output()
+            .map_err(|e| format!("running git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        if !tmp.join("manifest.yaml").is_file() {
+            return Err(format!(
+                "{url} has no manifest.yaml at the repo root (one extension per repo)"
+            ));
+        }
+        install_dir(tmp.clone())
+    })();
+    std::fs::remove_dir_all(&tmp).ok();
+    result
+}
+
+/// Local-dir install: validate the manifest, copy into the user-scope dir.
+fn install_dir(src: PathBuf) -> Result<String, String> {
     let text = std::fs::read_to_string(src.join("manifest.yaml"))
         .map_err(|e| format!("{}: {e}", src.display()))?;
     let manifest = manifest::parse_manifest(&text)?;

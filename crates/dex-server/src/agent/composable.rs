@@ -31,7 +31,8 @@ use std::sync::Arc;
 
 use dex_agent_core::{
     CompactionBudget, CompactionTrigger, ConflictDetector, CutConfig, DefaultOverflowDetector,
-    DefaultPruneScorer, HarnessLimits, OverflowDetector, PruneScorer, Summarizer, ToolCatalog,
+    DefaultPruneScorer, HarnessLimits, OverflowDetector, PruneScorer, PruneThresholds, Summarizer,
+    ToolCatalog,
 };
 use dex_coding_agent::{ApprovalPolicy, ResultPolicy};
 use serde_json::{Map, Value};
@@ -55,12 +56,39 @@ pub struct HarnessConfig {
     pub cut: CutConfig,
 }
 
+/// Positive `harness:` file knob, if set.
+fn file_usize(key: &str) -> Option<usize> {
+    crate::llm::config::load_harness_num(key).and_then(|n| usize::try_from(n).ok())
+}
+
 impl HarnessConfig {
     pub fn from_env() -> Self {
-        Self {
-            limits: HarnessLimits::from_env(),
-            cut: CutConfig::default(),
+        // Env wins for the iterations knob (`HarnessLimits::from_env`); the
+        // file fills every other numeric while env stays the top layer.
+        let mut limits = HarnessLimits::from_env();
+        let env_iterations = std::env::var("DEX_MAX_TOOL_ITERATIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0);
+        if env_iterations.is_none() {
+            if let Some(n) = file_usize("max_tool_iterations") {
+                limits.max_tool_iterations = n;
+            }
         }
+        if let Some(n) = file_usize("max_compaction_attempts") {
+            limits.max_compaction_attempts = n;
+        }
+        if let Some(n) = file_usize("batch_max_concurrent") {
+            limits.batch_max_concurrent = n.max(1);
+        }
+        let mut cut = CutConfig::default();
+        if let Some(n) = file_usize("keep_recent_messages") {
+            cut.min_keep_messages = n;
+        }
+        if let Some(n) = file_usize("min_to_summarize") {
+            cut.min_to_summarize = n;
+        }
+        Self { limits, cut }
     }
 
     pub fn with_limits(mut self, limits: HarnessLimits) -> Self {
@@ -354,6 +382,34 @@ impl DynamicToolSource for ExtensionToolSource {
     }
 }
 
+// The `tool_catalog` slot's turn seam (spec §11): a per-task schema list a
+// Lua filter opinion narrowed. Set by `process_turn` when an opinion
+// resolves; `ComposedCatalog` serves it verbatim for the scope's duration.
+// Nesting shadows (a child turn resolves its own filter), mirroring
+// `SERVED_MODEL`; only the default composed catalog consults it, so
+// registry-selected custom catalogs are untouched.
+tokio::task_local! {
+    static TOOL_CATALOG_OVERRIDE: std::cell::RefCell<Option<std::sync::Arc<[ToolDefinition]>>>;
+}
+
+/// Run `fut` with `schemas` as the served tool catalog. Nesting shadows.
+pub async fn with_tool_catalog_override<Fut, T>(schemas: Vec<ToolDefinition>, fut: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    TOOL_CATALOG_OVERRIDE
+        .scope(std::cell::RefCell::new(Some(schemas.into())), fut)
+        .await
+}
+
+/// The scope's narrowed catalog, if any. Cheap: an `Arc` clone per round.
+fn tool_catalog_override() -> Option<std::sync::Arc<[ToolDefinition]>> {
+    TOOL_CATALOG_OVERRIDE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
 /// Default [`ToolCatalog`]: native schemas first (fixed order), dynamic
 /// sources merged into a name-sorted tail so provider request bytes stay
 /// deterministic. Byte-identical to `tools_schema()` with the default
@@ -378,6 +434,11 @@ impl ComposedCatalog {
 
 impl ToolCatalog for ComposedCatalog {
     fn tool_schemas(&self) -> Vec<ToolDefinition> {
+        // A `tool_catalog` Lua opinion (turn-scoped) is served verbatim: it
+        // was computed from this same assembly, already narrowed.
+        if let Some(override_) = tool_catalog_override() {
+            return override_.to_vec();
+        }
         let (native, _, _) = crate::llm::tool_descriptions::tools_schema_parts();
         let mut tail = Vec::new();
         for source in &self.sources {
@@ -450,15 +511,47 @@ impl Default for DexHarness {
     }
 }
 
+/// Effective prune thresholds: `harness:` file table over built-in defaults
+/// (`DexHarness::from_env` builds its scorer with these; `dex doctor` prints
+/// them so the row cannot drift from runtime behavior).
+pub fn prune_thresholds_from_env() -> PruneThresholds {
+    let mut prune = PruneThresholds::default();
+    if let Some(n) = file_usize("keep_below_chars") {
+        prune.keep_below_chars = n;
+    }
+    if let Some(n) = file_usize("truncate_above_chars") {
+        prune.truncate_above_chars = n;
+    }
+    if let Some(n) = file_usize("drop_above_chars") {
+        prune.drop_above_chars = n;
+    }
+    prune
+}
+
 impl DexHarness {
-    /// Defaults with `DEX_MAX_TOOL_ITERATIONS` read once. Turn setup calls
-    /// this when the caller passes no harness, so the env knob keeps its
-    /// historic read-at-entry timing.
+    /// Defaults with `DEX_MAX_TOOL_ITERATIONS` + the `harness:` file table
+    /// read once. Turn setup calls this when the caller passes no harness,
+    /// so the env/file knobs keep their historic read-at-entry timing.
+    /// `harness.overflow` / `harness.conflict` Lua hooks (when subscribed)
+    /// override the wording/conflict decision per call at the async call
+    /// sites; everything else here is the Rust default.
     pub fn from_env() -> Self {
-        Self {
+        let mut harness = Self {
             config: HarnessConfig::from_env(),
             ..Self::default()
+        };
+        let mut result_policy = ResultPolicy::default();
+        if let Some(n) = file_usize("recent_window") {
+            result_policy = result_policy.with_recent_window(n);
         }
+        if let Some(n) = file_usize("repeat_limit") {
+            result_policy = result_policy.with_repeat_limit(n);
+        }
+        harness.result_policy = result_policy;
+        harness.scorer = Arc::new(DefaultPruneScorer {
+            thresholds: prune_thresholds_from_env(),
+        });
+        harness
     }
 
     pub fn with_config(mut self, config: HarnessConfig) -> Self {
@@ -699,6 +792,44 @@ mod tests {
         // Defaults still fire: overflow wording and path conflicts.
         assert!(harness.is_overflow("maximum context length exceeded"));
         assert!(!harness.is_overflow("invalid api key"));
+    }
+
+    #[test]
+    fn from_env_reads_harness_table_and_env_wins() {
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_config = std::env::var_os("DEX_CONFIG");
+        let prev_iter = std::env::var_os("DEX_MAX_TOOL_ITERATIONS");
+        let dir = std::env::temp_dir().join(format!("dex-harness-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "harness:\n  max_tool_iterations: 33\n  batch_max_concurrent: 2\n  repeat_limit: 9\n",
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+        std::env::remove_var("DEX_MAX_TOOL_ITERATIONS");
+        crate::llm::config::invalidate_config_cache();
+        let cfg = HarnessConfig::from_env();
+        assert_eq!(cfg.max_tool_iterations(), 33);
+        assert_eq!(cfg.batch_max_concurrent(), 2);
+        assert_eq!(DexHarness::from_env().result_policy.repeat_limit, 9);
+        // Env beats the file for the iterations knob.
+        std::env::set_var("DEX_MAX_TOOL_ITERATIONS", "7");
+        let cfg = HarnessConfig::from_env();
+        assert_eq!(cfg.max_tool_iterations(), 7);
+        match prev_config {
+            Some(v) => std::env::set_var("DEX_CONFIG", v),
+            None => std::env::remove_var("DEX_CONFIG"),
+        }
+        match prev_iter {
+            Some(v) => std::env::set_var("DEX_MAX_TOOL_ITERATIONS", v),
+            None => std::env::remove_var("DEX_MAX_TOOL_ITERATIONS"),
+        }
+        crate::llm::config::invalidate_config_cache();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -82,6 +82,17 @@ impl ToolRoundBudget {
             limit: self.limit,
         }
     }
+
+    /// Completed tool batches — read-only view for a loop driver that
+    /// reports state to a Lua agent loop instead of owning the loop.
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+
+    /// Configured round limit — read-only view, as [`completed`](Self::completed).
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 #[cfg(test)]

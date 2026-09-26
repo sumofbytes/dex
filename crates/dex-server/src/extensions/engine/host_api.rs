@@ -13,7 +13,8 @@ use serde_json::Value as Json;
 use super::super::Manifest;
 use super::{
     host_upcall, json_to_lua, lua_to_json, lua_type_name, lua_value_to_string, valid_segment,
-    worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS,
+    worker_drive_model, HostOp, WorkerRegistrations, KNOWN_EVENTS, SLOT_INTERFACES,
+    WRAPPABLE_SLOTS,
 };
 use crate::tools::resolve_workspace_path;
 
@@ -247,6 +248,209 @@ pub(super) fn events_table(
     }
 
     events
+}
+
+/// `dex.wrap(slot, fn)` — middleware over an enveloped slot's handler chain
+/// (spec §13). `fn(next, ctx)` receives the rest of the chain as `next(ev)`
+/// and the event payload as `ctx`; its return becomes the envelope the host
+/// reads. Registration order is composition order, outermost first.
+/// Wrapping an unknown or non-wrappable slot fails legibly at load.
+pub(super) fn wrap_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, mw): (String, Function)| {
+        if !WRAPPABLE_SLOTS.contains(&slot.as_str()) {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' wraps '{slot}': not a middleware-wrappable slot (wrappable: {})",
+                WRAPPABLE_SLOTS.join(", ")
+            )));
+        }
+        regs.borrow_mut().wraps.entry(slot).or_default().push(mw);
+        Ok(())
+    })
+}
+
+/// `dex.activate_profile(name)` / `dex.profile()` — harness-profile
+/// activation and inspection (spec §30). Activation is transactional at
+/// resolution time: the name is stored now; when the next turn snapshot
+/// resolves, an unknown name warns and applies nothing. `nil` deactivates.
+/// Returns the previously active name.
+pub(super) fn profile_api(lua: &Lua) -> Result<(Function, Function), LuaError> {
+    let activate = lua.create_function(|_, name: Option<String>| {
+        let previous = crate::agent::registry::active_profile();
+        match name {
+            Some(n) if !n.trim().is_empty() => {
+                crate::agent::registry::set_active_profile(Some(n));
+            }
+            _ => crate::agent::registry::set_active_profile(None),
+        }
+        Ok(previous)
+    })?;
+    let current = lua.create_function(|_, ()| Ok(crate::agent::registry::active_profile()))?;
+    Ok((activate, current))
+}
+
+/// `dex.fallback(slot, fn)` — backup opinion for an enveloped slot (spec
+/// §34): consulted when the slot's whole chain (handlers + middleware)
+/// produced no opinion, before the Rust default. Same slot family as
+/// `dex.wrap`; unknown slots fail legibly at load.
+pub(super) fn fallback_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, backup): (String, Function)| {
+        if !WRAPPABLE_SLOTS.contains(&slot.as_str()) {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' sets a fallback for '{slot}': not a wrappable slot (wrappable: {})",
+                WRAPPABLE_SLOTS.join(", ")
+            )));
+        }
+        regs.borrow_mut().fallbacks.insert(slot, backup);
+        Ok(())
+    })
+}
+
+/// `dex.replace(slot, spec)` — component replacement (spec §10/§12). The
+/// only replaceable slot is `agent_loop` (spec §9, the deliberately-last
+/// milestone): `spec = { id, interface? = "agent_loop.v1", run }` where
+/// `run(ctx)` owns the whole turn loop. Gated on the `agent_loop`
+/// capability — replacing the orchestration is the widest surface an
+/// extension can hold — and one loop per extension (re-running setup twice
+/// is a bug, not a re-register).
+pub(super) fn replace_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let manifest = manifest.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, spec): (String, Table)| {
+        if slot != "agent_loop" {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' replaces '{slot}': not a replaceable slot (replaceable: agent_loop)"
+            )));
+        }
+        if !manifest.has_capability("agent_loop") {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' replaces the agent loop without the agent_loop capability"
+            )));
+        }
+        let id: String = spec
+            .get("id")
+            .map_err(|_| LuaError::RuntimeError("replace needs an id".into()))?;
+        if !valid_segment(&id) {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' agent_loop id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
+            )));
+        }
+        let interface: Option<String> = spec.get("interface").unwrap_or(None);
+        if interface.as_deref().is_some_and(|i| i != "agent_loop.v1") {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' agent_loop interface {interface:?}: want \"agent_loop.v1\""
+            )));
+        }
+        let run: Function = spec.get("run").map_err(|_| {
+            LuaError::RuntimeError(format!(
+                "extension '{ext_id}' agent_loop '{id}' needs a run function"
+            ))
+        })?;
+        let mut regs = regs.borrow_mut();
+        if regs.agent_loop.is_some() {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' registers agent_loop twice"
+            )));
+        }
+        regs.agent_loop = Some((id, run));
+        Ok(())
+    })
+}
+
+/// `dex.use(slot, impl)` — component selection with registration-time
+/// validation (spec §10/§28): the slot must be a known component slot, and
+/// `impl` is either the implementation function directly or a
+/// `{ id?, interface?, run }` spec whose `interface` must name the slot's
+/// current version (`SLOT_INTERFACES`) — a component written against a
+/// different envelope fails at load instead of misreading payloads.
+/// Registered handlers join the slot's chain exactly like
+/// `dex.events.on(slot, …)` (fail-open contract unchanged, §33); the
+/// validated extra surface is the point. Requires the `harness`
+/// capability. `agent_loop` is not selectable here — `dex.replace` owns it.
+pub(super) fn use_slot(
+    lua: &Lua,
+    manifest: &Manifest,
+    regs: &Rc<RefCell<WorkerRegistrations>>,
+) -> Result<Function, LuaError> {
+    let ext_id = manifest.id.clone();
+    let manifest = manifest.clone();
+    let regs = Rc::clone(regs);
+    lua.create_function(move |_, (slot, component): (String, Value)| {
+        if !manifest.has_capability("harness") {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' uses slot '{slot}' without the harness capability"
+            )));
+        }
+        if slot == "agent_loop" {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}': use dex.replace(\"agent_loop\", …) for the agent loop"
+            )));
+        }
+        let Some((_, interface)) = SLOT_INTERFACES.iter().find(|(s, _)| *s == slot) else {
+            return Err(LuaError::RuntimeError(format!(
+                "extension '{ext_id}' uses unknown slot '{slot}' (usable: {})",
+                SLOT_INTERFACES
+                    .iter()
+                    .map(|(s, _)| *s)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        let run = match component {
+            // Bare function: current interface implied.
+            Value::Function(run) => run,
+            Value::Table(spec) => {
+                if let Some(id) = spec.get::<Option<String>>("id")? {
+                    if !valid_segment(&id) {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' {slot} component id '{id}': use [a-z0-9_-]+, max 64 chars, no `__`"
+                        )));
+                    }
+                }
+                let declared: Option<String> = spec.get("interface")?;
+                if let Some(declared) = declared {
+                    if declared != *interface {
+                        return Err(LuaError::RuntimeError(format!(
+                            "extension '{ext_id}' {slot} interface {declared:?}: want {interface:?}"
+                        )));
+                    }
+                }
+                spec.get("run").map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "extension '{ext_id}' {slot} component needs a run function"
+                    ))
+                })?
+            }
+            other => {
+                return Err(LuaError::RuntimeError(format!(
+                    "extension '{ext_id}' dex.use('{slot}', …): expected a function or spec table, got {}",
+                    lua_type_name(&other)
+                )))
+            }
+        };
+        let mut regs = regs.borrow_mut();
+        regs.events.entry(slot.clone()).or_default().push(run);
+        if !regs.uses.contains(&slot) {
+            regs.uses.push(slot);
+        }
+        Ok(())
+    })
 }
 
 /// `dex.log.*` — daemon log + journal lines, prefixed `lua[<ext>]`.

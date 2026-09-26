@@ -77,6 +77,12 @@ pub async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error:
         let state_for_exit = state.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
+                crate::extensions::fire_lifecycle_event(
+                    "runtime.stop",
+                    serde_json::json!({}),
+                    &crate::runtime::cancel::GlobalCancellation,
+                )
+                .await;
                 state_for_exit.shutdown_agents().await;
                 std::process::exit(0);
             }

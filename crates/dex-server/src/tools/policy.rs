@@ -113,9 +113,11 @@ impl Policy {
 
 /// Approval gate: dispatch consults the turn's policy before any
 /// tool runs. Reads always pass; `trusted` passes everything; otherwise
-/// mutating tools park an `ApprovalRequest` on the console's approval
-/// channel and block for the verdict, with session approvals
-/// short-circuiting first. `read-only` rejects up front.
+/// mutating tools first honor session approvals, then the
+/// `permission.request` Lua hook (allow skips the prompt, deny fails
+/// attributed — nil/error falls through), and only then park an
+/// `ApprovalRequest` on the console's approval channel and block for the
+/// verdict. `read-only` rejects up front and is never hook-overridable.
 /// Denial, cancellation, and no-channel surface as `ToolError::Denied` —
 /// the loop records it as a failed tool result, and the post-fan-out
 /// cancellation check still unwinds a turn cancelled mid-prompt.
@@ -125,6 +127,7 @@ pub async fn enforce_policy(
     requirement: PermissionRequirement,
     cancel: &(dyn CancellationSource + Send + Sync),
     policy: &Policy,
+    filter: Option<&ToolFilter>,
 ) -> Result<(), ToolError> {
     if !needs_approval_for(policy, requirement, policy.mode) {
         return Ok(());
@@ -146,6 +149,41 @@ pub async fn enforce_policy(
     let input = serde_json::Value::Object(args.clone()).to_string();
     if console.session_approved(name, &input) {
         return Ok(());
+    }
+    // Runtime policy override: one `permission.request` round-trip when a Lua
+    // extension subscribes, else the prompt below (zero-cost default). The
+    // hook sees the turn's gates so nested calls stay allowlisted.
+    if crate::extensions::has_event_handlers("permission.request") {
+        let requirement_name = match requirement {
+            PermissionRequirement::Read => "read",
+            PermissionRequirement::Write => "write",
+            PermissionRequirement::Shell => "shell",
+        };
+        if let Some((decision, reason, by)) = crate::extensions::query_permission_request(
+            name,
+            args,
+            requirement_name,
+            policy.mode.as_str(),
+            cancel,
+            policy,
+            filter,
+        )
+        .await
+        {
+            match decision {
+                crate::extensions::PermissionDecision::Allow => return Ok(()),
+                crate::extensions::PermissionDecision::Deny => {
+                    let why = if reason.trim().is_empty() {
+                        "denied by extension".to_string()
+                    } else {
+                        reason
+                    };
+                    return Err(ToolError::Denied(format!(
+                        "permission.request hook from extension '{by}' denied '{name}': {why}"
+                    )));
+                }
+            }
+        }
     }
     let Some(sender) = console.approval() else {
         return Err(ToolError::Denied(format!(
