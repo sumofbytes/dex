@@ -9,4 +9,4 @@ pub struct ServerStatus {
     pub error: Option<String>,
 }
 
-pub use dex_runtime::lines::ApprovalRequest;
+pub use dex_agent_core::lines::ApprovalRequest;

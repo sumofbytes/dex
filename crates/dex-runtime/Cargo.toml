@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 dex-agent-core = { version = "0.1.0", path = "../dex-agent-core" }
-dex-protocol = { version = "0.1.0", path = "../dex-protocol" }
 dex-ai = { version = "0.1.0", path = "../dex-ai" }
 chrono = "0.4"
 serde_json = "1"

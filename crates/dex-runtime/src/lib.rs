@@ -4,9 +4,11 @@
 //!
 //! This crate sits at the base of the dependency graph, so both the server
 //! (`dex-server`) and the thin client (`dex`) can link it. It is small, but
-//! not dependency-free: it pulls `dex-ai` (model/message types),
-//! `dex-protocol` (wire vocabulary), `dex-agent-core` (agent vocabulary),
-//! `reqwest`, and full-feature `tokio`.
+//! not dependency-free: it pulls `dex-ai` (the `CancellationSource` contract
+//! the console and agent loop share) and `dex-agent-core` (the
+//! transcript/approval vocabulary the console emits, from its `lines`
+//! module), plus `reqwest` and full-feature `tokio`. The vocabulary's data
+//! lives in `dex-agent-core`; this crate no longer depends on `dex-protocol`.
 
 pub mod runtime;
 pub use runtime::*;
