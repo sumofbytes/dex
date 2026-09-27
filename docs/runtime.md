@@ -8,7 +8,8 @@ in config or in Lua, without recompiling dex.
 
 This document is the user-facing guide. The design background lives in the
 repository's internal spec; the config surface below is authoritative for
-usage. See also the [README](README.md) (§ Lua extensions) for the full hook
+usage. See also the [README](../README.md) and
+[Lua extensions](extensions.md) for the full hook
 payload reference.
 
 ## The harness snapshot
@@ -176,7 +177,7 @@ default): `harness.overflow`, `harness.compact`, `harness.summarize`,
 `supervisor.route`. Observe-only hooks (`llm.before`/`llm.after`,
 `tool.error`, `message.received`/`message.sent`,
 `session.created`/`session.loaded`) never decide anything. Full payload
-shapes: [README](README.md#lua-extensions).
+shapes: [extensions](extensions.md).
 
 ## Security model
 

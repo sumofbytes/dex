@@ -40,7 +40,7 @@ build, test, and submit changes. Please follow the
   demand via `/skill:<name>`.
 - **History compaction** — when the context window is exceeded, older turns are
   summarized deterministically (no LLM call) to keep requests bounded. Set
-  `DEX_COMPACTION=llm` for model summarization (`1` also accepted), or `=jev` to prune stale
+  `DEX_COMPACTION=llm` for model summarization, or `=jev` to prune stale
   tool outputs verbatim instead (drops/truncates old results, keeps text;
   falls back to the deterministic summary when pruning doesn't pay). With `=jev` plus a
   `jev:` table in the config file and `TYPESAFE_API_KEY` set, the Typesafe Jev API
@@ -57,41 +57,20 @@ build, test, and submit changes. Please follow the
 - **No telemetry** — dex makes network calls only to the LLM providers you
   configure (plus `models.dev` for the model catalog). Nothing else.
 
-## Workspace crates
+## Documentation
 
-The Cargo workspace contains the `dex` application and five reusable crates.
-They have no dependency on dex's TUI, daemon implementation, session store, or
-workspace tool implementations. The app continues to re-export existing types
-from `dex::protocol` and `dex::client` for source compatibility.
-
-- `dex-protocol` owns serializable HTTP/SSE wire types shared by clients and
-  daemons.
-- `dex-ai` owns provider-neutral message and tool types, provider wire mapping,
-  SSE parsers, HTTP auth/retry policy, and the model-client API. Dex still owns
-  model discovery, configuration resolution, credential refresh, UI streaming,
-  and CLI behavior.
-- `dex-agent-core` owns permission/agent modes, plans, token accounting,
-  deterministic compaction, text limits, context compaction and tool-round
-  budget policies, the model-response-to-history transition, and the generic
-  model/tool turn engine. Dex implements the engine's host interface for its
-  compaction backends, tools, sessions, steering, extensions, and UI.
-- `dex-coding-agent` owns the built-in coding tool catalog, stable composition
-  with host-provided tool schemas, built-in permission metadata, and
-  host-independent cache/repeated-call result policy. Dex supplies delegation
-  availability, MCP/extension tools, tool execution, output rendering, and
-  cache persistence.
-- `dex-client` is a standalone HTTP/SSE daemon client over `dex-protocol`.
-  It can be embedded without pulling in the daemon, TUI, session store, or
-  workspace tools; callers can provide credentials with `with_token`.
-
-```toml
-[dependencies]
-dex-protocol = { git = "https://github.com/sumofbytes/dex" }
-dex-ai = { git = "https://github.com/sumofbytes/dex" }
-dex-agent-core = { git = "https://github.com/sumofbytes/dex" }
-dex-coding-agent = { git = "https://github.com/sumofbytes/dex" }
-dex-client = { git = "https://github.com/sumofbytes/dex" }
-```
+| Document | Contents |
+| --- | --- |
+| [docs/getting-started.md](docs/getting-started.md) | Install → configure → verify → first run, everyday usage, troubleshooting |
+| [docs/configuration.md](docs/configuration.md) | Config file, precedence, `model:` knob, provider examples, legacy keys, system prompt |
+| [docs/tui.md](docs/tui.md) | Slash commands, `!` shell escape, agent modes, keyboard controls, steering queue |
+| [docs/tools.md](docs/tools.md) | Built-in tools, `then_run`, sub-agents (`delegate`), MCP servers |
+| [docs/sessions-and-skills.md](docs/sessions-and-skills.md) | JSONL session storage, skill discovery and `SKILL.md` format |
+| [docs/extensions.md](docs/extensions.md) | Lua extensions: tools, hooks, harness slots, `agent_loop` |
+| [docs/environment.md](docs/environment.md) | Every `DEX_*` and provider environment variable |
+| [docs/architecture.md](docs/architecture.md) | Workspace crates, project structure, how a turn works |
+| [docs/releasing.md](docs/releasing.md) | Release/tag process and CI |
+| [docs/runtime.md](docs/runtime.md) | Runtime composability: slots, profiles, replaceable agent loop |
 
 ## Install
 
@@ -109,11 +88,13 @@ curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/sumofbytes/dex/releases).
 
-First run needs one thing: a model. Copy a sample from
-`examples/config.yaml`, set `model: <provider>/<model>` in the config, and
-run `dex doctor` to verify (exit 1 means setup is still incomplete). The
-daemon fetches the models.dev catalog in the background on first start
-(`dex update --models` for a manual refresh).
+First run needs one thing: a model — the
+[Getting started guide](docs/getting-started.md) walks through it. Copy a
+sample from `examples/config.yaml`, set `model: <provider>/<model>` in the
+config (see [Configuration](docs/configuration.md)), and run `dex doctor` to
+verify (exit 1 means setup is still incomplete). The daemon fetches the
+models.dev catalog in the background on first start (`dex update --models` for
+a manual refresh).
 
 ## Building
 
@@ -124,206 +105,8 @@ cargo build --release
 # binary: target/release/dex
 ```
 
-## Releasing
-
-Creating the `v*` tag is the only manual step; CI does the rest:
-
-```sh
-scripts/release.sh patch    # tag the next version — also major, minor, or 1.2.3
-# or by hand:
-git tag v0.1.1 && git push origin v0.1.1
-```
-
-`.github/workflows/release.yml` then: bumps `Cargo.toml`/`Cargo.lock` on the
-default branch (`develop`) to the tag's version (github-actions bot commit) →
-builds all targets from that commit → smoke tests → attaches tarballs +
-`SHA256SUMS` to the GitHub release. The install script resolves the latest
-release and picks the right asset for the running machine. `git pull` afterwards
-to pick up the version bump.
-
-If the default branch is protected, let GitHub Actions push to it (Settings →
-Branches → add the Actions bot as bypass), since the bump commit is written by
-CI.
-
-## Configuration
-
-One config file, one precedence order, one selection knob. `dex doctor` prints
-every resolved value with where it came from.
-
-| Layer (wins first)    | Example                                               |
-| --------------------- | ----------------------------------------------------- |
-| CLI flags             | `--model`, `--base-url`                               |
-| Environment variables | `DEX_MODEL`, provider key vars, `DEX_HEADERS`          |
-| Config file           | `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) |
-
-Nothing hardcodes a model *or* a provider: if no layer selects one, `dex`
-refuses to start and prints a setup guide instead of guessing. (`dex doctor`
-shows the same.) Built-in providers are `anthropic` (native Messages wire) and
-`openai-codex` (ChatGPT OAuth); every other provider — including the opencode
-gateway — is an ordinary `providers:` entry resolved through the models.dev
-catalog.
-
-`model:` is the only selection knob and names provider _and_ model:
-`<provider>/<model>` — the stored key always carries a model id (an
-in-session `/model anthropic` may switch just the provider; the key stays
-qualified). Write-back keeps that form: a `/model` or `/provider` pick updates
-`model:` in the file, so the switch becomes the default for later runs. Session
-state still re-applies the exact provider/model on `/resume`.
-
-A minimal `~/.config/dex/config.yaml` (the endpoint comes from the
-models.dev catalog, so no `base_url:` is needed here):
-
-```yaml
-providers:
-  opencode:
-    api_key: sk-... # the deposit place for this provider's key
-model: opencode/gpt-5-nano # provider / model
-```
-
-### Provider examples
-
-Copy-paste samples for popular providers live in `examples/config.yaml`
-(copy ONE block into your config file — the checked-in file keeps exactly
-one active block, so uncommenting in place would leave duplicate keys).
-The short version:
-
-| Provider | `model:` | Key | `base_url:` needed? |
-|---|---|---|---|
-| opencode (Zen gateway) | `opencode/gpt-5-nano` | `providers.opencode.api_key` or `OPENCODE_API_KEY` | no (catalog) |
-| anthropic (built in) | `anthropic/claude-sonnet-4-5` | `providers.anthropic.api_key` or `ANTHROPIC_API_KEY` | no (built in) |
-| openai-codex (built in) | `openai-codex/gpt-5.6-luna` | none — run `codex --login` first | no (built in) |
-| gemini | `google/gemini-3.1-pro-preview` | `providers.google.api_key` or `GEMINI_API_KEY` | yes — `https://generativelanguage.googleapis.com/v1beta/openai/` |
-| openai | `openai/gpt-5-nano` | `providers.openai.api_key` or `OPENAI_API_KEY` | yes — `https://api.openai.com/v1` |
-| deepseek | `deepseek/deepseek-v4-flash` | `providers.deepseek.api_key` or `DEEPSEEK_API_KEY` | no (catalog) |
-| moonshot / Kimi | `moonshotai/kimi-k2.6` | `providers.moonshotai.api_key` or `MOONSHOT_API_KEY` | no (catalog) |
-| openrouter | `openrouter/qwen/qwen3-coder-flash` | `providers.openrouter.api_key` or `OPENROUTER_API_KEY` | no (catalog) |
-| xai (Grok) | `xai/grok-4.6` | `providers.xai.api_key` or `XAI_API_KEY` | yes — `https://api.x.ai/v1` |
-| groq | `groq/openai/gpt-oss-120b` | `providers.groq.api_key` or `GROQ_API_KEY` | yes — `https://api.groq.com/openai/v1` |
-| mistral | `mistral/devstral-2512` | `providers.mistral.api_key` or `MISTRAL_API_KEY` | yes — `https://api.mistral.ai/v1` |
-| cerebras | `cerebras/gpt-oss-120b` | `providers.cerebras.api_key` or `CEREBRAS_API_KEY` | yes — `https://api.cerebras.ai/v1` |
-| zai (Zhipu / GLM) | `zai/glm-5.3-flash` | `providers.zai.api_key` or `ZHIPU_API_KEY` | no (catalog) |
-| commandcode / custom gateway | `commandcode/<model-id>` | `providers.commandcode.api_key` | yes — the gateway URL (no catalog entry) |
-
-Notes: the provider name must match the catalog key (`moonshotai`, not
-`moonshot`; gemini lives under `google`). Model ids rotate — run
-`dex update --models`, then `/model` lists current ids. A gateway outside
-the catalog additionally needs `context_window:` (or `DEX_CONTEXT_WINDOW`)
-since nothing sizes its models.
-
-The stored selection always carries a model id: a provider-only selection
-(`model: anthropic`) fails with a "names a provider but no model" error —
-export the provider's key and pass an id instead:
-`DEX_MODEL=anthropic/<model-id> dex`. The daemon bootstraps the models.dev
-catalog in the background, so a fresh install needs no manual
-`dex update --models`.
-
-Run `dex update --models` once to cache the models.dev catalog. After that a
-bare `/model <id>` stays on the current provider (`provider/<id>` switches to
-another), and the wire protocol follows the same way: a first `/responses`
-failure falls back to chat-completions once and is remembered, so per-model
-knowledge never needs
-configuring. An explicit `--base-url` pins the endpoint — prefixes become naming
-only and are stripped. Manual overrides are escape hatches only:
-`DEX_MODEL_APIS="id=openai-completions,..."` seeds a model's protocol (full
-`endpoint/id` key beats bare id). Do NOT set a global `api:` to fix one model —
-it pins every model and disables the automatic fallback.
-
-Deprecated file keys are still honored with a one-time warning — move them to
-the canonical spots:
-
-| Deprecated                                        | Replacement                                                                       |
-| ------------------------------------------------- | --------------------------------------------------------------------------------- |
-| top-level `base_url:`                             | `base_url:` under the provider's entry in `providers:`                            |
-| top-level `api:`                                  | `api:` under the provider's entry in `providers:`                                 |
-| top-level `headers:` / `http_headers:`            | `headers:` under the provider's entry (provider-scoped) or `DEX_HEADERS` (global) |
-| `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` env | `DEX_HEADERS` (same syntax)                                                       |
-
-`active_provider:` / `provider:` (file) and `DEX_PROVIDER` (env) are no longer
-read at all: the provider lives in `model:` as `provider/model`.
-
-Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
-parse error lists the valid keys: `model`, `providers`, `context_window`,
-`thinking_effort`, `system_prompt`, `system_prompt_file`, `mcp_servers`,
-`agent_wake`, `extensions` (+ the deprecated
-ones above). Other keys are preserved untouched.
-
-### System prompt
-
-  `system_prompt:` (inline text) or `system_prompt_file:` (path to a file)
-  replaces the built-in base prompt (identity + working rules). Project
-  instructions (`AGENTS.md`/`CLAUDE.md`), extension appendix and skills are
-  still appended. Subagent children keep their own persona/rules (unaffected).
-  `dex serve` ignores CLI flags — the daemon falls back to its own env/file
-  layers unless the client forwards per-request text. Empty/whitespace-only
-  values count as unset at every layer and fall through. Precedence:
-  `--system-prompt` > `--system-prompt-file` >
-  `DEX_SYSTEM_PROMPT` > `DEX_SYSTEM_PROMPT_FILE` > file `system_prompt:` >
-  file `system_prompt_file:` > built-in default. `dex doctor` shows the
-  resolved source as `system prompt`.
-
-### Other OpenAI-compatible providers
-
-Any models.dev provider with an OpenAI-style endpoint works without dedicated
-integration. Deposit its key under `providers:` and pick it by name:
-
-```yaml
-model: zai/glm-5.3-flash
-providers:
-  zai:
-    api_key: zsk-... # the deposit place; or export ZHIPU_API_KEY
-    # base_url: ...        # optional; defaults to the catalog endpoint
-    # api: openai-completions  # optional protocol pin; learned otherwise
-    # headers: {X-Custom: ...} # optional; sent only to this provider
-```
-
-Anthropic is built in as its own provider — `model: anthropic/claude-sonnet-4-5`
-(or `--model anthropic`) with `ANTHROPIC_API_KEY`. It speaks the native Messages
-wire (`anthropic-messages`: `x-api-key` auth, `anthropic-version` header,
-block-shaped tool calls and thinking blocks replayed with their signatures). Any
-other provider entry can also pin that wire with `api: anthropic-messages` when
-its endpoint speaks the Messages API:
-
-```yaml
-providers:
-  gateway:
-    api_key: ...
-    base_url: https://gateway.example/v1
-    api: anthropic-messages
-```
-
-`/provider zai` and `/model zai/<id>` switch to it (the completion list shows
-`zai/<id>` once configured). The endpoint, model list, pricing, context windows
-and reasoning options come from the cached models.dev catalog — run
-`dex update --models` once. The key resolves per provider: config
-`providers.<name>.api_key` > the provider's own documented env var (from the
-catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY`). There
-is no per-provider default key var outside the catalog
-— one provider's key never leaks into another. A model's advertised thinking
-options (e.g. `low/high/max`) are shown in the `/model` confirmation;
-`/thinking <level>` pins one per model (remembered per endpoint+model and
-validated against the advertised list — unknown models accept anything, a stale
-catalog never blocks). `DEX_THINKING_EFFORT` is the fallback when nothing is
-pinned, and an effort no model advertises warns once instead of failing opaquely
-at the API. A file `thinking_effort:` default sits under both (stored choice >
-env > file). Wire protocol resolves like any OpenAI-compatible provider:
-responses first, one fallback
-to completions, remembered per endpoint+model. Native-protocol-only providers
-(no OpenAI-compatible endpoint in the catalog, e.g. anthropic) are not
-selectable this way.
-
-For ChatGPT-backed Codex, first run `codex --login`, then:
-
-```sh
-DEX_MODEL=openai-codex/gpt-5.6-luna dex
-```
-
-Replace `gpt-5.6-luna` with the model id you want to use. A bare provider
-name such as `DEX_MODEL=openai-codex` does not select a model and will fail
-with a “provider but no model” error.
-
-`dex` reads the current access token and account ID from
-`CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID` or `$CODEX_HOME/auth.json` (default
-`~/.codex/auth.json`). Run `codex --login` again when the local token expires.
+Releases are tagged with `scripts/release.sh` — see
+[docs/releasing.md](docs/releasing.md).
 
 ## Usage
 
@@ -454,8 +237,8 @@ in-flight turn (a third Ctrl+C force-quits a stuck turn). API keys, the model,
 and the permission mode are resolved by the daemon's own environment; client
 flags like `--model` and `--permission` are forwarded as per-request overrides.
 
-Note that tools execute on the machine where the daemon runs, confined to the
-daemon's working directory.
+Tools execute on the machine where the daemon runs, confined to its working
+directory.
 
 ## Command-line flags
 
@@ -469,7 +252,7 @@ daemon's working directory.
 | `-s`, `--session <path>`         | Open/continue a specific session file.                                                                            |
 | `--no-session`                   | Disable session persistence for this run.                                                                         |
 | `-n`, `--new`                    | Start a new session (the default).                                                                                |
-| `--permission <mode>`            | Tool permission ceiling: `read-only`, `ask`, or `trusted` (default `trusted`). Deprecated `ask-writes`/`ask-shell` still parse and map to `ask`. |
+| `--permission <mode>`            | Tool permission ceiling: `read-only`, `ask`, or `trusted` (default `trusted`). |
 | `--mode <plan\|manual\|auto>`    | Agent mode for this run (`plan` = read-only + planning directive); clamped to the permission ceiling.               |
 | `--name <name>`                  | Name the session (default `<workspace>-<7 chars>`, e.g. `dex-k3m9x2q`).                                           |
 | `--reattach <id>`                | Attach to an existing daemon session and replay its event journal (bare `dex` or `dex connect <url>`, no prompt). |
@@ -480,7 +263,7 @@ Tool safety defaults to `trusted` (no approval popups; the TUI seeds the
 `auto` agent mode from it). Set
 `DEX_PERMISSION=ask` or pass `--permission` to approve writes and shell
 commands and seed `manual` instead. The ceiling also seeds the TUI's agent mode (`plan`/`manual`/`auto`,
-see [Agent modes](#agent-modes)): a client can only go stricter than the
+see [Agent modes](docs/tui.md#agent-modes)): a client can only go stricter than the
 daemon's ceiling. Paths are confined to the current workspace; `bash` can execute
 arbitrary commands in that workspace and should only be enabled in trusted
 environments. Shell commands default to 120 seconds and 1 MiB per output stream.
@@ -488,538 +271,18 @@ HTTP requests default to 10 seconds to connect and 300 seconds overall. Sessions
 journal to `$XDG_DATA_HOME/dex/sessions/*.jsonl` with `fsync` only on
 `turn_*`/`effect_*` (set `DEX_DURABLE=1` for per-line). Audit to `audit.jsonl`
 is off by default (`DEX_AUDIT=1` to enable). Configure limits with `DEX_TOOL_*`
-and `DEX_HTTP_*` environment variables (see table below).
+and `DEX_HTTP_*` environment variables (see
+[Environment variables](docs/environment.md)).
 
 In the interactive TUI, actions requiring approval open a dedicated overlay. Use
 the arrow keys and Enter to choose `Allow once`, `Allow for this session`, or
 `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,
-`connect`, `run`, `usage`, `update`, `mcp`, `doctor`) are covered under Usage / MCP
-servers above; `--help`/`-h` and `--version`/`-V` print help and version without
+`connect`, `run`, `usage`, `update`, `mcp`, `doctor`) are covered under
+[Usage](#usage) above and [MCP servers](docs/tools.md#mcp-servers);
+`--help`/`-h` and `--version`/`-V` print help and version without
 touching config or network.
-
-## TUI slash commands
-
-| Command                      | Description                                               |
-| ---------------------------- | --------------------------------------------------------- |
-| `/quit`                      | Exit the REPL.                                            |
-| `/permissions`               | Deprecated alias for `/mode`.                             |
-| `/mode [plan\|manual\|auto]` | Show or set the agent mode (also Shift+Tab).              |
-| `/mcp`                       | Show MCP servers, tools, and connection errors.           |
-| `/extensions [reload]`       | Show loaded Lua extensions (`reload` rescans).            |
-| `/clear`                     | Clear the conversation history (keeps the system prompt). |
-| `/new`                       | Start a new session and clear history.                    |
-| `/session`                   | Show the current session id, path, and turn count.        |
-| `/resume [index\|path]`      | List sessions, or resume one by index/path.               |
-| `/name <name>`               | Rename the current session.                               |
-| `/skill:<name>`              | Load a skill's full content into the conversation.        |
-| `/model`                     | Show the current model and wire protocol.                 |
-| `/model <name>`              | Switch the model for the rest of the session.             |
-| `/thinking [<level>\|clear]` | Show or set reasoning effort.                             |
-| `/waive <reason>`            | Waive verification with a reason.                         |
-| `/undo`                      | Undo the last recorded file change.                       |
-| `/provider`                  | Show the current and available providers.                 |
-| `/provider <name>`           | Switch provider for the rest of the session.              |
-| `/help` (unknown)            | Unknown commands print a hint.                            |
-
-### Shell escape
-
-Prefix any TUI input with `!` to run it as a shell command directly, without
-involving the agent:
-
-```text
-> !ls -la
-> !!cargo test -- --nocapture
-```
-
-The command runs in the daemon workspace via the `bash` tool and renders as a
-tool block. It needs no approval — the `!` itself is the approval, even in
-`read-only` mode (that mode constrains the model, not your own typing) — and the
-run is saved to session history: `!` output feeds the model's context on the
-next turn, while `!!` stays visible in the transcript but is never sent to the
-model. A shell run may overlap an agent turn; only one `!` runs at a time per
-session — a second is refused until the first finishes, and `Esc`/`Ctrl+C`
-cancels it. `dex "!<command>"` and `dex connect <url> "!<command>"` do the same
-without the TUI.
-
-### Agent modes
-
-The TUI has one autonomy selector, cycled with **Shift+Tab** or set with
-`/mode [plan|manual|auto]`:
-
-| Mode | Intent | Tool gate | Model directive |
-| ------- | ---------------------------------------- | --------------------------------- | -------------------------------------- |
-| `plan` | Research and produce a plan; make **no** changes | `read-only` — every mutation/shell call denied | explore first, then present a plan; do not edit |
-| `manual` | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the approval overlay | none |
-| `auto` (default) | Hands-off execution | `trusted` — no prompts | none |
-
-The default is `auto`: a stock launch seeds the mode from the permission
-default (`trusted` → `auto`; a stricter `--permission`/`DEX_PERMISSION` ceiling
-seeds the matching mode). Prefer a human in the loop? Set
-`DEX_PERMISSION=ask` or pass `--permission ask` — that seeds `manual` and caps
-the Shift+Tab cycle. The mode is journaled with
-each turn, so `--reattach` and `/resume` restore the last selector instead of
-reseeding from the ceiling.
-
-The mode is a client-side selector that *derives* the per-turn permission; it
-is not a second wire concept. The daemon's `--permission`/`DEX_PERMISSION` is a
-**ceiling**: a client may only go stricter (`plan` ≤ `manual` ≤ `auto`), so the
-cycle clamps and reports `ceiling …` rather than letting an `auto` client bypass
-an `ask` daemon. Switching takes effect on the next submit. A `plan` turn also
-appends a plan directive to the system prompt; already-sent turns are
-unaffected.
-
-### Keyboard controls
-
-- **Enter** — submit the current input.
-- **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓**
-  navigate suggestions; **Esc** — discard the draft and close the popup.
-- **Shift+Enter** — insert a newline (multi-line input). Needs a terminal with
-  Kitty keyboard-protocol support (e.g. Ghostty, Kitty, WezTerm, foot);
-  otherwise use **Ctrl+J**, which works everywhere.
-- **Enter while working** — queue a steering message for the next model
-  boundary.
-- **Alt+Enter while working** — queue a follow-up for after the current task.
-- **Alt+Up while working** — recall queued steers (newest first), then
-  follow-ups, back into the composer to edit them before delivery; press again
-  for the next one.
-- **Esc** or **Ctrl+C** — cancel the active turn and restore queued messages (a
-  third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt
-  clears it first, and **Ctrl+D** on an empty line quits.
-- **Ctrl+T** — expand/collapse the full thinking block.
-- **Shift+Tab** — cycle the agent mode: `plan` → `manual` → `auto` → `plan`
-  (clamped to the daemon's `--permission`/`DEX_PERMISSION` ceiling, which it
-  cannot exceed). See [Agent modes](#agent-modes).
-- **Alt+V** — cycle your voice color (plain by default; magenta → sky → peach →
-  violet → rose → amber → coral → plain); the composer and new prompts use it,
-  already-sent rows keep theirs.
-- **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the
-  transcript.
-- **Paste** — pasted text is inserted at the cursor.
-- **Mouse wheel** — scrolls the transcript. **Drag** — selects transcript text
-  with a visible highlight and copies it to the clipboard on release (OSC 52; a
-  click just clears). **Shift+drag** (Option+drag in iTerm2) still bypasses
-  mouse reporting for native selection; tmux users may need
-  `set -g set-clipboard on`.
-
-### Steering and follow-ups
-
-While `dex` is working, the input remains available. Submitted steering and
-follow-up messages stay visible in the queue directly above the input box until
-the worker accepts them. Steering is delivered before the next model call;
-follow-ups wait until the current task has finished. The queue is kept separate
-from the transcript so pending messages do not scroll away. **Alt+Up** recalls
-queued steers (newest first), then follow-ups, back into the composer for
-editing (the daemon drops its queued copy); a message already accepted at a
-model boundary has been injected and can no longer be recalled.
-
-## Sessions
-
-Sessions are stored as JSONL files under:
-
-- `$XDG_DATA_HOME/dex/sessions` (or `~/.local/share/dex/sessions`),
-- organized in subdirectories by a slug of the current working directory.
-- new sessions are named `<workspace>-<7 chars>` (workspace directory plus a
-  k8s-style suffix, e.g. `dex-k3m9x2q`); override with `--name` or `/name`.
-
-Each file starts with a `session` header line followed by `message` entries and
-optional `session_info` (rename) entries. Entries are appended after every turn,
-so a crash or Ctrl+C loses at most the in-progress turn. Starting `dex` in a
-directory creates a fresh session; use `--session <path>` to continue a saved
-one.
-
-## Skills
-
-Skills are discovered from these directories (first match wins per directory):
-
-- `<cwd>/.dex/skills`
-- `<cwd>/.agents/skills`
-- `$XDG_CONFIG_HOME/dex/skills` (or `~/.config/dex/skills`)
-
-A skill is a directory containing a `SKILL.md` file with YAML frontmatter:
-
-```markdown
----
-name: my-skill
-description: Short description surfaced to the model.
----
-
-Detailed instructions / reference content...
-```
-
-Only the `name` and `description` are included in the system prompt; the full
-body is loaded on demand via `/skill:<name>` or when the conversation references
-it.
-
-## Tools
-
-The agent can call the following tools (each maps to a function in the API
-schema):
-
-| Tool               | Purpose                                                                                                                                                                                                                                                                  |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `read`             | Read a file (`path`, `paths`, `glob`). Line-numbered, tab-expanded.                                                                                                                                                                                                      |
-| `bash`             | Run a shell command via `sh -c` (`command`).                                                                                                                                                                                                                             |
-| `write`            | Write/overwrite a file (`path`, `content`, optional `then_run`).                                                                                                                                                                                                         |
-| `edit`             | Replace text (`path`, one `oldText`/`newText` pair or a batch of disjoint `edits[]`, optional `replaceAll`, `then_run`). Matching tolerates indentation, trailing whitespace, and quote/dash variants. |
-| `grep`             | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
-| `find`             | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
-| `ls`               | List files and directories (`path`, default `.`).                                                                                                                                                                                                                        |
-| `delegate`*        | Sub-agents via `action`: `spawn` a background child (`explorer`/`reviewer`/`tester`; `resume_from` continues one, `model` overrides — else inherits; resume keeps prior pick), `wait` (bounded, ≤120 s) fetches its result, `stop` cancels it, `list` shows this session's children (live, finished, interrupted on-disk). Daemon sessions only. |
-
-The model-facing schema registers `grep` and `find`; both are also dispatched
-under their fff-engine names, `ffgrep`/`fffind` (`dex run ffgrep …` and older
-transcripts keep working).
-
-`*` daemon sessions only (sub-agents); the default native schema is 7 tools.
-Tool results are truncated before being
-sent back to the model, and a result cache (`dex-tool-cache.json`) is kept only
-when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same
-`path`, any `bash`, or any call carrying `then_run` (which runs a shell command)
-serializes the batch.
-
-`write`/`edit` take an optional `then_run` shell command that runs in the same
-call _after_ a successful change, so a build, formatter or test result arrives
-with the mutation instead of costing another round trip. It is skipped when the
-change fails, and the observation reports `[then_run:succeeded]` /
-`[then_run:failed (exit N)]` followed by the command's clamped output; a command
-that times out, is cancelled, or fails to spawn reports plain
-`[then_run:failed]` with the reason as its output (no phantom exit code).
-Because it executes shell, a call carrying `then_run` clears the _shell_
-permission gate (not the write gate), requires `bash` in a child agent's tool
-allowlist, and is logged to the audit trail as its own `bash` record.
-
-### Sub-agents
-
-`delegate` hands a self-contained task to a background child (three built-ins:
-`explorer`, `reviewer`, `tester`) that runs the same turn loop with its own
-context, tool allowlist, and JSONL transcript
-(`$XDG_DATA_HOME/dex/sessions/<slug>/agents/*.jsonl`). Completions are announced
-at the next turn boundary and, while the session is idle with a client attached,
-a wake turn surfaces them immediately (off with `agent_wake: false` /
-`DEX_AGENT_WAKE=0`). The same `delegate` tool's `wait` action fetches a result on
-demand. Children may delegate
-further up to a nesting depth of 3. A recoverable ending — interrupted, timed
-out, or budget-exhausted with progress on disk — is marked `resumable` in its
-result: `delegate(resume_from: …)` continues that child from its transcript as
-a new generation (re-entry is always manual — there is no automatic recovery,
-no spawn queue, and no idle reaper; over-cap spawns reject so the model waits
-for or cancels a child and retries). Under `ask-*` modes a mutating call
-parks a labeled
-prompt in the session's approval queue — "explorer wants to run bash: …" —
-unanswered for five minutes it denies; session-level "allow" approvals apply to
-children too. The `list` action shows live, finished, and interrupted children.
-Set `DEX_SUBAGENTS=0` to unregister the tool.
-
-### MCP servers
-
-External tools via [Model Context Protocol](https://modelcontextprotocol.io)
-(stdio command or HTTP/SSE URL), declared under `mcp_servers:` in `config.yaml`
-(`DEX_MCP_SERVERS_JSON` wins when set — same shape as JSON):
-
-```yaml
-mcp_servers:
-  github: "npx -y github-mcp-server" # shorthand: command + args
-  docs:
-    url: "https://docs.example.com/mcp" # HTTP/SSE server
-    headers: { authorization: "Bearer ${DOCS_TOKEN}" } # $VAR expands, fail-closed
-    timeout_secs: 30
-    allow: ["search"] # optional tool filter (deny wins)
-```
-
-Each server's tools appear in the schema as `mcp__<server>__<tool>` (description
-prefixed with `[<server>]`), plus one `mcp__<server>_read_resource` reader when
-the server hosts resources. The merged schema is capped at `DEX_MCP_MAX_TOOLS`
-(default 200, sorted by name, dropped count reported); servers connect in the
-background at startup and a 60s liveness sweeper marks dead ones `down` before
-the next turn uses them. `GET /api/mcp` shows per-server state/tool counts plus
-the truncated total; `POST /api/mcp/{server}/reconnect` redials a fixed server
-without restarting the daemon.
-
-HTTP servers with OAuth (RFC9728 protected-resource + RFC8414 discovery +
-RFC7591 registration + PKCE S256) log in via `dex mcp login <server>` (browser +
-loopback callback), `dex mcp logout <server>`, `dex mcp status`; `/mcp` shows
-the same auth lines. Tokens live in `$XDG_DATA_HOME/dex/mcp/<server>.json`
-(0600, never logged), refresh once per 401 with a 60s backoff on failure
-(`invalid_grant` drops the file). Discovery/token URLs must be https (loopback
-http allowed); optional `oauth_client_id`/`oauth_client_secret`/`oauth_scope` in
-config skip registration. When an AS rejects `resource` with `invalid_target`,
-login retries once without it.
-
-### Lua extensions
-
-The agent harness is runtime-composable: harness slots, profiles, and the
-agent loop itself can be replaced from config or Lua without recompiling —
-see [RUNTIME.md](RUNTIME.md) for the full guide. Harness extensions in
-sandboxed Lua: drop a directory with `manifest.yaml` +
-`extension.lua` into a discovery dir and it can register tools, shadow
-built-ins, and subscribe to lifecycle hooks (`tool.before`/`tool.after`,
-`turn.start`/`turn.end`, `before_agent_start`, `model_select`,
-`session.before_compact`, plus `harness.overflow`/`harness.compact`/
-`harness.conflict`/`harness.summarize`/`model_selector` when
-the `harness` capability is declared; observe-only `llm.before`/`llm.after`,
-`tool.error`, `permission.request` and `supervisor.route` (both require the
-`harness` capability — enforced at registration, so a plain `tools` extension
-can never see or decide an approval), and the read-only
-`message.received`/`message.sent`/
-`session.created`/`session.loaded` lifecycle events). Extension code runs in a
-stripped VM — no io/os/require — and every effect flows through the same
-permission gates as a model-issued call.
-
-Model-aware extensions declare the `model` capability
-(`dex.model.current()` for the served `{provider, model, id, api, base_url}`,
-`dex.model.auth()` for its key + endpoint + merged extra headers — or
-`dex.model.auth("<provider>")` for another configured provider's deposits
-(needs `net.providers`: cross-provider keys are gated like the fetches
-they enable),
-and `dex.model.providers()` for the configured list with resolvable keys)
-and the `net` capability (`dex.net.fetch({url, method, headers, body,
-timeout_ms})`, HTTP confined to that model's own endpoint —
-scheme+host+port must match; `net` requires `model`). Declaring
-`net.providers` additionally allows calls to any *configured provider
-endpoint* — every allowed origin comes from the user's own config, never an
-arbitrary host — which is how a model-independent extension (search, …)
-falls back to another provider. `dex.json` encodes/decodes request
-bodies. Non-2xx
-is a `{status, headers, body}` value, not an error; redirects are never
-followed (a 3xx surfaces as a value instead of escaping the endpoint
-check); per-call `timeout_ms`
-defaults to 30 s and caps at 120 s, and must sit under the tool's manifest
-`timeout:` (default 30 s, cap 120 s) — provider-side search rounds run ~40 s
-non-streamed, so the reference uses `timeout: 120` with `timeout_ms = 100000`.
-The host re-attaches the turn's routing-affinity headers
-(`x-opencode-session`/`x-opencode-client`) under Lua-explicit ones, so calls
-to a gateway endpoint route like dex's own. The host fires `model_select`
-(first turn always, then on `provider/model` change; fail-open) so extensions
-can hide tools the model cannot serve (`dex.tools.set_active` accepts short
-own-tool names). The served model is scoped to the turn — concurrent sessions
-and nested subagent turns each see their own. See `examples/extensions/web` —
-provider-native web search (gemini / openai-responses / anthropic) + URL fetch
-(Gemini only) that reuses the current model's credentials, hides tools no
-target can serve, and falls back to a `/search-model` override provider (per
-extension `dex.state`) when the served model has no search API — never
-switching the model silently. Copy it to
-`$XDG_CONFIG_HOME/dex/extensions/web` (or `dex extensions install <dir>`) to
-use it.
-
-```yaml
-extensions:
-  paths: # extra extension dirs (user scope)
-    - ~/work/dex-extensions
-
-harness: # runtime harness numerics (env DEX_MAX_TOOL_ITERATIONS wins for iterations)
-  max_tool_iterations: 200
-  max_compaction_attempts: 3
-  batch_max_concurrent: 10
-  keep_recent_messages: 12
-  min_to_summarize: 8
-  recent_window: 6
-  repeat_limit: 3
-  keep_below_chars: 500
-  truncate_above_chars: 2000
-  drop_above_chars: 10000
-  slots: # named registry impls; `dex runtime graph` prints the resolved graph
-    # catalog: native-only # default (native + MCP + extensions) | native-only
-    # trigger: never       # default (config budget) | never
-```
-
-`harness.slots:` selects named registry implementations per harness slot
-(the slot map, profiles, and the rest of the composability surface are
-documented in [RUNTIME.md](RUNTIME.md); `dex runtime graph` prints every
-slot's resolved id and origin — the same
-resolver the turn loop calls, so the graph cannot drift from what a turn
-runs). Unknown slots or ids `warn_once` and keep the default; Rust code can
-add implementations with `crate::agent::registry::register`.
-
-A `harness`-capability extension can also override turn decisions at
-runtime (first non-nil opinion wins, otherwise the Rust default):
-`harness.overflow` (`{message} -> {overflow = bool}`),
-`harness.compact` (`{stored_tokens, ephemeral_overhead, message_count} ->
-{compact = bool}` — the compaction gate),
-`harness.summarize`
-(`{conversation, previous_summary} -> {summary = "..."}` — the first
-non-empty summary replaces the LLM/deterministic checkpoint; errors and
-empty replies fall back to the Rust summarizer),
-`harness.conflict` (`{calls} -> {conflicts = bool}`, one call per batch),
-and `permission.request` (`{tool, args, requirement, mode} ->
-{decision = "allow"|"deny"}`, consulted only when approval would otherwise
-be required — reads stay free; `read-only` mode is never overridable).
-`model_selector` (`{current, previous} -> {model = "provider/model"}` or a
-bare string) picks the model one turn serves: the first non-empty opinion is
-resolved like `/model` (provider switch, endpoint routing, wire protocol,
-context window — but nothing persisted), and errors, empty replies, and
-unresolvable selections fail open to the configured model.
-`supervisor.route` (`{agent, task} -> {redirect = "name"}` and/or
-`{deny = true, reason = "..."}`) gates every `delegate` spawn — first
-redirect wins, any deny fails attributed to the denying extension, and a
-redirect to an unknown definition falls back to the requested agent with a
-loud log (fail-open).
-`llm.before` may return `{append}` text persisted as a user-role note before
-the compaction gate; `llm.after` (`{stop_reason, usage, elapsed_ms}`) and
-`tool.error` (`{tool, args, error}`) are observe-only.
-`message.received`/`message.sent` (`{session, preview, truncated, chars}` /
-`{ok, preview, truncated, chars}`) and `session.created`/`session.loaded`
-(`{session}`) are observe-only audit hooks — payloads carry truncated
-previews, never whole prompts. Unsubscribed turns
-pay no Lua cost.
-
-The `agent_loop` capability unlocks the deepest slot: `dex.replace(
-"agent_loop", { id, interface? = "agent_loop.v1", run })` replaces the whole
-turn loop — `run(ctx)` owns iteration while Rust keeps every invariant. The
-step surface on `ctx` blocks until the host finishes each step: `model.call()`
-(one engine round: persistence + streaming + cancellation + normalized
-history apply; returns `{content, tool_calls = [{id, name, args}]}`),
-`tools.execute()` (runs the last response's tool calls through the same
-hooks/gates/dispatch a model-issued batch gets; returns `{completed, limit}`
-or `{exhausted, note}`), `finish(response)` (steering injection;
-`{steered = bool}` says whether to run another round), `cancelled()`, and
-`state()` (`{cancelled, rounds, round_limit, messages}`). The default loop in
-this surface is `while true` + `model.call` → (`tools.execute` | `finish` →
-`return content`). `dex.tools.call`/`dex.net.fetch` and friends work inside
-the loop under the turn's policy; a loop error fails the turn with the Lua
-error (there is no default left to fail open to), and cancellation always
-aborts between Lua instructions. First registered loop wins (load order);
-`dex runtime graph` shows `agent_loop = <id>` when one is active.
-
-A manifest may pin the harness it needs with `dex: ">=0.15"` — a running
-harness older than the floor skips the whole extension loudly at load
-instead of running it against events it never saw (only `>=` pins exist).
-Components can be declared in the manifest instead of (or alongside)
-`extension.lua`:
-
-```yaml
-capabilities: [harness]
-components:
-  model_selector: router.lua   # loaded after extension.lua, same setup contract
-```
-
-Each component file is `return function(dex) … end` and registers itself:
-`dex.use(slot, impl)` selects an implementation for a harness slot —
-`impl` is the handler function or `{ id, interface = "<slot>.v1", run }`;
-an `interface` that doesn't match the slot's current version fails the
-extension at load (`dex.replace("agent_loop", …)` owns the agent loop;
-`dex.wrap` adds middleware, `dex.fallback` a backup). Components require
-the `harness` capability, and a missing or failing component file fails
-the whole extension.
-
-Discovery: cwd `.dex/extensions` + `.agents/extensions` (project scope — loads
-only after `dex extensions enable <id>`, the trust consent), then
-`$XDG_CONFIG_HOME/dex/extensions`, config `extensions.paths:`, and
-`--extensions-dir` flags (user scope — loads unless `dex extensions disable
-<id>`). `dex extensions list|install|remove` manages them — `install` takes
-a local directory or a git URL (`https://…` or `git@…`; plaintext `http://`
-is refused, the clone is shallow, and the manifest is validated at the repo
-root before anything lands). A remote install lands **disabled** — remote
-code is code you have not audited — until `dex extensions enable <id>`;
-`/extensions` shows
-what is loaded and `/extensions reload` rescans. `dex doctor` lists every
-discovered extension with its consent state.
-
-## Environment variables
-
-| Variable                                                      | Description                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OPENCODE_API_KEY`                                            | API key env var of the `opencode` provider, learned from its models.dev catalog entry (set `providers.opencode.api_key` instead, or use whatever the catalog documents).                                                                                                                                                                                                                                          |
-| `ANTHROPIC_API_KEY`                                           | API key for the built-in `anthropic` provider (`model: anthropic/<model>`); resolves cache-less.                                                                                                                                                                                                                                                                                                                |
-| `DEX_HEADERS` / `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` | Extra provider headers (JSON object or `Name: Value` pairs, comma/newline separated; later var wins: `ANTHROPIC_*` < `OPENAI_*` < `DEX_*`). File `headers:`/`http_headers:` < env < `--header`. `authorization` can't be overridden. `OPENAI_HEADERS`/`ANTHROPIC_CUSTOM_HEADERS` are deprecated aliases — use `DEX_HEADERS`.                                                                                    |
-| `DEX_MODEL`                                                   | Model selection, `provider/model` — the same knob as the file's `model:` key. A bare provider name has no model and is rejected.                                                                                                                                                                                                                                                                               |
-| `DEX_PROVIDER`                                                | No longer read — use `DEX_MODEL=<provider>/<model>`.                                                                                                                                                                                                                                                                                             |
-| `CODEX_ACCESS_TOKEN`                                          | Optional Codex OAuth access-token override.                                                                                                                                                                                                                                                                                                                                                                     |
-| `CODEX_ACCOUNT_ID`                                            | Account ID paired with `CODEX_ACCESS_TOKEN`.                                                                                                                                                                                                                                                                                                                                                                    |
-| `DEX_MODELS`                                                  | Comma-separated models for `/model` autocomplete (default: catalog cache).                                                                                                                                                                                                                                                                                                                                      |
-| `DEX_HTTP_CONNECT_TIMEOUT_SECS`                               | HTTP connect timeout (default 10).                                                                                                                                                                                                                                                                                                                                                                              |
-| `DEX_HTTP_REQUEST_TIMEOUT_SECS`                               | Total request bound, applied only when explicitly set — streaming LLM/chat paths default to no total timeout so long turns aren't killed.                                                                                                                                                                                                                                                                       |
-| `DEX_TOOL_TIMEOUT_SECS`                                       | Shell command timeout in seconds (default 120).                                                                                                                                                                                                                                                                                                                                                                 |
-| `DEX_TOOL_OUTPUT_BYTES`                                       | Maximum captured stdout/stderr bytes per stream (default 1 MiB).                                                                                                                                                                                                                                                                                                                                                |
-| `DEX_STREAM_IDLE_TIMEOUT_SECS`                                | SSE idle watchdog: no chunk (or keep-alive) for this long counts as a stall (default 90, 300 for reasoning-capable models; `0` disables). Pre-output stalls and dropped connections retry automatically same-protocol (2 retries) before failing the turn. Also scales the socket-level per-read backstop (default 330s, override +30s) so the watchdog always fires first; `0` disables the backstop too.                                                      |
-| `DEX_MAX_TOOL_ITERATIONS`                                     | Per-turn cap on tool rounds — one round per assistant batch with calls, not per call (default 200). A looping model is stopped with partial progress preserved and a transcript marker.                                                                                                                                                                                                                         |
-| `DEX_DAEMON_TOKEN`                                            | Bearer token for the daemon API. Required by clients when `dex serve` binds a non-loopback address (auto-generated and written to `$XDG_DATA_HOME/dex/daemon.token`, 0600) or when the operator sets one. Loopback-only daemons need no token.                                                                                                                                                                  |
-| `DEX_MODEL_APIS`                                              | Per-model wire protocol table (`id=api,...`; full `endpoint/id` key beats bare id).                                                                                                                                                                                                                                                                                                                             |
-| `DEX_THINKING_EFFORT`                                         | Default reasoning effort (a stored `/thinking` choice wins; file `thinking_effort:` is the fallback).                                                                                                                                                                                                                                                                                                           |
-| `DEX_SYSTEM_PROMPT`                                           | Replace the built-in base system prompt (same knob as file `system_prompt:`; project/extensions/skills still append).                                                                                                                                                                                                                                                                                           |
-| `DEX_SYSTEM_PROMPT_FILE`                                      | Read the replacement base system prompt from a file (same knob as file `system_prompt_file:`).                                                                                                                                                                                                                                                                                                                  |
-| `DEX_PERMISSION`                                              | Tool permission ceiling (`read-only`, `ask`, or `trusted`; default `trusted`). Deprecated `ask-writes`/`ask-shell` map to `ask`.                                                                                                                         |
-| `DEX_LOG`                                                     | Runtime log level: `off`, `error`, `warn` (default), `info`, `debug`, `trace` — works on release builds. Logs go to stderr, or to `$XDG_DATA_HOME/dex/dex.log` while the TUI runs. `debug` covers provider requests/responses and tool runs; `trace` adds raw provider SSE lines.                                                                                                                               |
-| `DEX_VERIFY`                                                  | Verification hook: `1` auto-detects `cargo test`/`go test`/`npm test`; or set to a command. Off by default.                                                                                                                                                                                                                                                                                                     |
-| `DEX_COMPACTION`                                              | `llm` for LLM summarization (`1` accepted), `jev` for verbatim tool-output pruning (default deterministic; `jev` falls back to deterministic when pruning doesn't pay). With `TYPESAFE_API_KEY` + a config `jev:` table, the Typesafe Jev API scores the prune.                                                                                                                |
-| `TYPESAFE_API_KEY`                                            | Enables the Typesafe Jev scorer for `DEX_COMPACTION=jev` (needs the config `jev:` opt-in table).                                                                                                                                                                                                                                                                              |
-| `TYPESAFE_JEV_URL`                                            | Override the Jev evaluation endpoint (default `https://api.typesafe.ai/v1/systemone`); tests and gateways.                                                                                                                                                                                                                                                                    |
-| `DEX_DURABLE`                                                 | `1` to `fsync` every session line (default only `turn_*`/`effect_*`).                                                                                                                                                                                                                                                                |
-| `DEX_AUDIT`                                                   | `1` to write `audit.jsonl` per tool call (default off; session already journals).                                                                                                                                                                                                                                                                                                                               |
-| `DEX_SUBAGENTS`                                               | `0` to unregister the `delegate` tool (default on in daemon sessions).                                                                                                                                                                                                                                                                                                                                                          |
-| `DEX_AGENT_WAKE`                                              | `0` to disable idle wake turns (default on): when a child agent completes while the session is idle and a client is listening, the daemon runs one wake turn to surface the notice.                                                                                                                                                                                                                             |
-| `DEX_MCP_SERVERS_JSON`                                        | MCP servers as JSON (same shape as `mcp_servers:` in config; wins over the file, handy for tests).                                                                                                                                                                                                                                                                                                              |
-| `DEX_MCP` / `DEX_NO_MCP`                                      | `0`/`off`/`false`/`no` (or `DEX_NO_MCP=1`) disables all MCP servers.                                                                                                                                                                                                                                                                                                                                            |
-| `DEX_MCP_MAX_TOOLS`                                           | Cap on merged MCP schema tools (default 200; head kept sorted by name).                                                                                                                                                                                                                                                                                                                                         |
-| `DEX_EXTENSIONS_PATHS`                                        | Extra Lua-extension dirs (`:`-separated; user scope). Wins over `extensions.paths:` in config.                                                                                                                                                                                                                                                                                                                  |
-| `DEX_COST_PER_1K`                                             | Fallback token cost per 1k tok (prompt + completion) for the status-bar spend figure when the pricing catalog has no entry (default `0.002`).                                                                                                                                                                                                                                                                   |
-| `DEX_CONTEXT_WINDOW`                                          | Override model context window (file `context_window:` > catalog when unset; unknown models with neither are a startup error).                                                                                                                                                                                                                                                                                   |
-| `DEX_RESERVE_TOKENS`                                          | Tokens reserved for reply (default 16384).                                                                                                                                                                                                                                                                                                                                                                      |
-| `DEX_KEEP_RECENT_TOKENS`                                      | Recent tokens kept on compaction (default 20000).                                                                                                                                                                                                                                                                                                                                                               |
-| `DEX_TOOL_CACHE`                                              | `1` to cache tool results across runs (`dex-tool-cache.json`; default off).                                                                                                                                                                                                                                                                                                                                     |
-| `DEX_CONFIG`                                                  | Override the config file path (default `$XDG_CONFIG_HOME/dex/config.yaml`).                                                                                                                                                                                                                                                                                                                                     |
-| `DEX_REPO`                                                    | GitHub repo `dex update` downloads releases from, `owner/name` (default `sumofbytes/dex`).                                                                                                                                                                                                                                                                                                                         |
-| `DEX_VERSION`                                                 | Version pin for `dex update`: `vX.Y.Z` (bare or `V`-prefixed also accepted) installs that exact release, enabling downgrades; `latest` (default) follows the newest release. Both also honored by `scripts/install.sh`.                                                                                                                                                                                         |
-| `CODEX_HOME`                                                  | Directory holding Codex `auth.json` (default `~/.codex`).                                                                                                                                                                                                                                                                                                                                                       |
-| `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME`        | XDG base dirs for config/data/cache.                                                                                                                                                                                                                                                                                                                                                                            |
-| `HOME`                                                        | Fallback when XDG vars are unset.                                                                                                                                                                                                                                                                                                                                                                               |
-
-Restore strict harness:
-`DEX_DURABLE=1 DEX_AUDIT=1 DEX_VERIFY=1 DEX_COMPACTION=llm dex`
-
-## Project structure
-
-```text
-dex/
-├── crates/
-│   ├── dex-protocol/     # reusable HTTP + SSE wire types
-│   ├── dex-ai/           # model API, provider wiring, shared AI types
-│   ├── dex-agent-core/   # reusable agent engine and policies
-│   ├── dex-coding-agent/ # tool catalog, tool policies, schema composition
-│   └── dex-client/       # standalone HTTP/SSE daemon client
-├── .dex/
-│   └── skills/           # (optional) project-level agent skills
-├── target/
-├── Cargo.lock
-├── Cargo.toml
-├── README.md
-└── src/
-    ├── main.rs           # entry point: mode resolution, daemon bootstrap
-    ├── cli.rs            # argument parsing / invocation mode
-    ├── app/              # client/oneshot entry orchestration
-    ├── protocol/         # compatibility exports + app-specific protocol glue
-    ├── client/           # HTTP client: SSE turn streaming, approvals, REPL
-    ├── daemon/           # axum daemon: sessions, chat SSE, approve, cancel
-    ├── agent/            # lifecycle wrapper, AgentHost adapter, app integrations
-    ├── runtime/          # console sinks, cancellation, logging
-    ├── llm/              # model config, provider resolution, app transport glue
-    ├── session/          # JSONL session persistence and journal
-    ├── tools/            # workspace tools: read, bash, write, edit, grep, find, ls
-    ├── mcp/              # MCP client: stdio/HTTP/SSE servers, OAuth login
-    ├── skills/           # skill discovery and parsing
-    ├── extensions/       # Lua extension engine and host APIs
-    ├── workspace/        # workspace paths and repository context
-    └── ui/               # ratatui local/remote TUI
-```
-
-## How it works
-
-A turn enters through dex's `process_turn` lifecycle wrapper and runs the
-model/tool state machine in `dex-agent-core::run_turn`. Dex implements the
-`AgentHost` callbacks for compaction, steering, session writes, tool execution,
-usage accounting, and transcript events. Tool calls may run in parallel
-(`write`/`edit` on distinct files); `bash`, `then_run`, or conflicting paths
-serialize. The host compacts history to keep model requests within the
-configured context budget. Progress is reported through a dex `Console`
-(streamed lines + approval requests).
-
-In client–server mode the daemon runs `process_turn` on a blocking thread and
-translates console output into `StreamEvent`s over SSE (`crates/dex-server/src/daemon/server/`).
-The TUI (`src/ui/remote/`) consumes those events from a worker thread and
-renders them live; approvals and cancellation are round-tripped over
-`POST .../approve` and `POST .../cancel`. The local TUI (`src/ui/app.rs`) runs
-the same loop in-process with direct channels.
 
 ## Acknowledgments
 
@@ -1046,7 +309,9 @@ labeled
 [`good first issue` or `help wanted`](https://github.com/sumofbytes/dex/issues).
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) first and follow the
 [Code of Conduct](CODE_OF_CONDUCT.md). By contributing you agree your work is
-dual-licensed MIT/Apache-2.0 like the rest of the project.
+dual-licensed MIT/Apache-2.0 like the rest of the project. New to `dex`? The
+[Getting started guide](docs/getting-started.md) is the fastest way to see it
+work.
 
 Status: pre-`1.0` (`0.x`) — usable daily but expect breaking changes until a
 `1.0` release.
