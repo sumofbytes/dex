@@ -149,3 +149,94 @@ mod tests {
         assert_eq!(incremental.stored_tokens(), estimate_tokens(&messages));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use dex_ai::{FunctionCall, LlmToolCall, Role};
+    use proptest::prelude::*;
+
+    /// Arbitrary `ChatMessage`: every field the estimator walks is varied.
+    fn arb_message() -> impl proptest::strategy::Strategy<Value = ChatMessage> {
+        (
+            proptest::sample::select(vec![Role::System, Role::User, Role::Assistant, Role::Tool]),
+            proptest::option::of("[ -~]{0,80}"),  // content
+            proptest::option::of("[ -~]{0,20}"),  // tool_call_id
+            proptest::option::of("[a-z-]{0,16}"), // name
+            proptest::option::of("[ -~]{0,80}"),  // reasoning_content
+            proptest::option::of(proptest::collection::vec(
+                ("[ -~]{0,8}", "[ -~]{0,8}", "[ -~]{0,40}"),
+                0..=4,
+            )), // tool_calls: (id, name, arguments)
+            proptest::option::of(proptest::collection::vec("[ -~]{0,40}", 0..=5)), // reasoning_items
+        )
+            .prop_map(
+                |(
+                    role,
+                    content,
+                    tool_call_id,
+                    name,
+                    reasoning_content,
+                    tool_calls,
+                    reasoning_items,
+                )| {
+                    ChatMessage {
+                        role,
+                        content,
+                        tool_call_id,
+                        name,
+                        reasoning_content,
+                        tool_calls: tool_calls.map(|calls| {
+                            calls
+                                .into_iter()
+                                .map(|(id, fname, args)| LlmToolCall {
+                                    id,
+                                    call_type: "function".to_string(),
+                                    function: FunctionCall {
+                                        name: fname,
+                                        arguments: args,
+                                    },
+                                })
+                                .collect()
+                        }),
+                        reasoning_items: reasoning_items.map(|items| {
+                            items
+                                .into_iter()
+                                .map(|s| serde_json::json!({"type": "thinking", "thinking": s}))
+                                .collect()
+                        }),
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        /// The incremental ledger agrees with both a fresh rebuild and the
+        /// full walk for any history, and pushing strictly grows the total.
+        #[test]
+        fn ledger_matches_rebuild_and_walk(
+            messages in proptest::collection::vec(arb_message(), 0..=30),
+        ) {
+            let ledger = TokenLedger::rebuild(&messages);
+            prop_assert_eq!(ledger.stored_tokens(), estimate_tokens(&messages));
+
+            let mut incremental = TokenLedger::default();
+            for message in &messages {
+                incremental.push(message);
+            }
+            prop_assert_eq!(incremental.stored_tokens(), ledger.stored_tokens());
+
+            if let Some(last) = messages.last() {
+                let mut extended = ledger;
+                extended.push(last);
+                prop_assert!(extended.stored_tokens() > incremental.stored_tokens());
+            }
+        }
+
+        /// The human formatter passes small counts through unchanged.
+        #[test]
+        fn format_tokens_small_counts(t in 0u64..=999) {
+            prop_assert_eq!(format_tokens(t), t.to_string());
+        }
+    }
+}

@@ -84,3 +84,55 @@ pub fn clamp_lines_checked(text: &str, max_lines: usize, max_bytes: usize) -> (S
 pub fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
     clamp_lines(text, max_lines, max_bytes)
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Any string over the full Unicode range, so char-boundary handling
+    /// (multibyte, emoji, combining marks) is exercised.
+    fn any_text(max: usize) -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::collection::vec(proptest::char::any(), 0..=max)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest! {
+        /// Below the budget the clip is the identity.
+        #[test]
+        fn clip_chars_identity_below_budget(s in any_text(80), max in 0usize..=200) {
+            if s.chars().count() <= max {
+                prop_assert_eq!(&clip_chars(&s, max), &s);
+            }
+        }
+
+        /// Clipping is idempotent: re-clipping changes nothing.
+        #[test]
+        fn clip_chars_is_idempotent(s in any_text(120), max in 0usize..=80) {
+            let once = clip_chars(&s, max);
+            prop_assert_eq!(clip_chars(&once, max), once);
+        }
+
+        /// A cut output carries at most `max` chars plus the `…` marker.
+        #[test]
+        fn clip_chars_char_budget(s in any_text(120), max in 1usize..=80) {
+            let out = clip_chars(&s, max);
+            prop_assert!(out.chars().count() <= max + 1);
+            prop_assert!(out.ends_with('…') || out == s);
+        }
+
+        /// Clamped output never exceeds max_lines + 1 (marker) lines and
+        /// carries at most one truncation marker.
+        #[test]
+        fn clamp_lines_bounds(
+            lines in proptest::collection::vec("[^\n\r]{0,40}", 0..=60),
+            max_lines in 1usize..=12,
+            max_bytes in 1usize..=300,
+        ) {
+            let text = lines.join("\n");
+            let out = clamp_lines(&text, max_lines, max_bytes);
+            prop_assert!(out.lines().count() <= max_lines + 1);
+            prop_assert!(out.matches(" lines truncated ").count() <= 1);
+        }
+    }
+}
