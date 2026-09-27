@@ -427,6 +427,13 @@ fn error_chain_message_walks_sources() {
 #[test]
 fn default_constructor_resolves_token_and_sync_wrappers() {
     const TOKEN: &str = "crate-e2e-token";
+    let _lock = dex_runtime::test_env::TEST_SESSIONS_ENV_LOCK.lock();
+    // Records the PREVIOUS values, restored on drop — never the test's own
+    // (that would leak `DEX_DAEMON_TOKEN`/`XDG_DATA_HOME` into later tests).
+    let _env = dex_runtime::test_env::EnvGuard(vec![
+        ("DEX_DAEMON_TOKEN", std::env::var_os("DEX_DAEMON_TOKEN")),
+        ("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
+    ]);
     std::env::set_var("DEX_DAEMON_TOKEN", TOKEN);
     let require_bearer = axum::routing::get(|headers: axum::http::HeaderMap| async move {
         if headers.get("authorization").and_then(|v| v.to_str().ok())
@@ -460,22 +467,17 @@ fn default_constructor_resolves_token_and_sync_wrappers() {
     let info = client.get_config().unwrap();
     assert_eq!(info.model, "stub-model");
     assert_eq!(info.provider, "stub");
-    std::env::remove_var("DEX_DAEMON_TOKEN");
+    std::env::remove_var("DEX_DAEMON_TOKEN"); // file fallback below needs no env shadowing
 
     // File fallback: `$XDG_DATA_HOME/dex/daemon.token` trims whitespace.
     let data = std::env::temp_dir().join(format!("dex-client-e2e-{}", std::process::id()));
     std::fs::create_dir_all(data.join("dex")).unwrap();
     std::fs::write(data.join("dex/daemon.token"), "file-token\n").unwrap();
-    let saved_xdg = std::env::var_os("XDG_DATA_HOME");
     std::env::set_var("XDG_DATA_HOME", &data);
     assert_eq!(
         crate::auth::client_daemon_token().as_deref(),
         Some("file-token")
     );
-    match saved_xdg {
-        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-        None => std::env::remove_var("XDG_DATA_HOME"),
-    }
     assert!(std::fs::remove_dir_all(&data).is_ok());
 }
 

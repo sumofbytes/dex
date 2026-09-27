@@ -520,6 +520,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dex-protocol",
+ "dex-runtime",
  "reqwest",
  "serde",
  "serde_json",

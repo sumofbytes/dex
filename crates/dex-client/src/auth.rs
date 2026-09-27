@@ -32,18 +32,19 @@ mod tests {
     fn empty_env_var_falls_through_to_token_file() {
         // Empty/whitespace `DEX_DAEMON_TOKEN` must not shadow a real token
         // file; the env check trims and rejects empties before the file read.
+        let _lock = dex_runtime::test_env::TEST_SESSIONS_ENV_LOCK.lock();
+        // Records the PREVIOUS values, restored on drop — never the test's
+        // own (that would leak `XDG_DATA_HOME` into later tests).
+        let _env = dex_runtime::test_env::EnvGuard(vec![
+            ("DEX_DAEMON_TOKEN", std::env::var_os("DEX_DAEMON_TOKEN")),
+            ("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
+        ]);
         let data = std::env::temp_dir().join(format!("dex-client-auth-{}", std::process::id()));
         std::fs::create_dir_all(data.join("dex")).unwrap();
         std::fs::write(data.join("dex/daemon.token"), "  file-token \n").unwrap();
-        let saved_xdg = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("DEX_DAEMON_TOKEN", "   ");
         std::env::set_var("XDG_DATA_HOME", &data);
         assert_eq!(client_daemon_token().as_deref(), Some("file-token"));
-        std::env::remove_var("DEX_DAEMON_TOKEN");
-        match saved_xdg {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
         assert!(std::fs::remove_dir_all(&data).is_ok());
     }
 }
