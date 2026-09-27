@@ -497,6 +497,7 @@ name = "dex-agent-core"
 version = "0.1.0"
 dependencies = [
  "dex-ai",
+ "dex-protocol",
  "serde",
  "serde_json",
  "tokio",
@@ -519,6 +520,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dex-protocol",
+ "dex-runtime",
  "reqwest",
  "serde",
  "serde_json",
@@ -549,7 +551,6 @@ dependencies = [
  "chrono",
  "dex-agent-core",
  "dex-ai",
- "dex-protocol",
  "reqwest",
  "serde_json",
  "tokio",
