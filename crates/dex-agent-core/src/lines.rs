@@ -2,13 +2,11 @@
 //! daemon and every UI. Plain data (no ANSI, no serde): UIs apply their own
 //! styling; wire serialization happens in `dex-protocol`.
 //!
-//! These types live in `dex-runtime` (not the server crate) because
-//! `runtime::console::Console` carries them, and the console is shared by
-//! the server and the thin client. The server's `protocol` module
-//! re-exports them so historical `protocol::SinkLine` /
-//! `protocol::ApprovalRequest` paths keep working.
+//! These types live here (not `dex-protocol`, which stays wire-only) because
+//! they are the host-boundary event stream the turn engine drives, and they
+//! share `Plan` with the rest of the agent vocabulary.
 
-use dex_agent_core::Plan;
+use crate::Plan;
 use dex_protocol::ApprovalDecision;
 
 /// A single streamed line destined for the UI transcript. Plain text (no

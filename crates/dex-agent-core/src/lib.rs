@@ -1,11 +1,13 @@
 //! Reusable agent turn engine, policies, and context accounting.
 //!
 //! The dex application supplies tools, persistence, and UI behavior around
-//! these types; this crate depends only on the shared AI model API.
+//! these types; this crate depends only on the shared AI model API and the
+//! wire vocabulary (`dex-protocol`).
 
 mod budgets;
 mod compaction;
 mod components;
+pub mod lines;
 mod modes;
 mod plan;
 mod runtime;
@@ -26,6 +28,7 @@ pub use components::{
     OverflowDetector, PairVerdict, PruneScorer, PruneThresholds, SerializeAll, StaticCatalog,
     StaticSummarizer, Summarizer, ToolCatalog, OVERFLOW_PHRASES,
 };
+pub use lines::{ApprovalRequest, SinkLine};
 pub use modes::{AgentMode, PermissionMode};
 pub use plan::Plan;
 pub use runtime::{run_turn, AgentHost, AgentTurnError};
