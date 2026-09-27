@@ -1,59 +1,49 @@
 # dex
 
-A terminal coding agent written in Rust. `dex` talks to OpenAI-compatible Chat
-Completions or Responses APIs and Anthropic's native Messages wire, calls tools
-(`read`, `bash`, `write`, `edit`, `grep`, `find`, `ls`, plus MCP servers) to
-operate on your local files, and offers an interactive TUI, a one-shot prompt
-mode, and a raw JSON tool mode. All agent work can run in a daemon over
-HTTP+SSE, and conversations persist as resumable JSONL sessions.
+A terminal coding agent written in Rust. It calls tools (`read`, `bash`,
+`write`, `edit`, `grep`, `find`, `ls`, plus MCP servers) to work on your local
+files, talks to OpenAI-compatible, Anthropic, and Codex providers, and saves
+every conversation as a resumable JSONL session.
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to
-build, test, and submit changes. Please follow the
-[Code of Conduct](CODE_OF_CONDUCT.md), and file bugs or ideas in
-[GitHub issues](https://github.com/sumofbytes/dex/issues).
+The TUI is a pure HTTP client — a daemon does the LLM calls, tools, and
+sessions over HTTP+SSE — and that engine is a workspace of reusable crates
+(`dex-ai`, `dex-agent-core`, `dex-session`, …), so the harness pieces can be
+reused to build your own agent.
 
 ## Features
 
-- **Multi-provider backends** — OpenAI-compatible Chat Completions and Responses
-  endpoints (OpenAI, OpenCode Zen, Moonshot/Kimi, …), Anthropic's native
-  Messages wire, and ChatGPT-backed Codex OAuth. Streaming responses,
-  stalled-stream retries with idle watchdogs, automatic protocol fallback
-  (responses → completions, remembered per endpoint+model), and configurable
-  reasoning effort.
-- **Agentic tool use** — the model can read files, run shell commands, write and
-  edit files, and search the filesystem. External tools arrive via MCP servers
-  (stdio or HTTP/SSE, with OAuth). Tool output caching is off by default; set
-  `DEX_TOOL_CACHE=1` to opt in.
-- **Client–daemon architecture** — the TUI is a pure HTTP client; a daemon does
-  the LLM calls, tools, and sessions. Attach from anywhere, reconnect with
-  journal replay, and approve tool calls remotely.
+- **Multi-provider backends** — OpenAI-compatible Chat Completions/Responses
+  endpoints, Anthropic's Messages API, and ChatGPT-backed Codex OAuth, with
+  streaming, retries, and automatic protocol fallback. See
+  [Configuration](docs/configuration.md).
+- **Agentic tool use** — the model reads, runs, writes, edits, and searches
+  your files. Bring your own tools via MCP servers (stdio or HTTP/SSE, with
+  OAuth); `DEX_TOOL_CACHE=1` opts into result caching.
+- **Client–daemon architecture** — the TUI is a pure HTTP client; the daemon
+  does the LLM calls, tools, and sessions. Attach from anywhere, reconnect
+  with journal replay, and approve tool calls remotely.
 - **Interactive TUI** — a `ratatui` REPL with a streaming markdown transcript,
-  multi-line input, autoscroll, a status bar, and a visible steering/follow-up
-  queue while the agent is working. `!` shell escape for direct commands without
-  the agent.
-- **Session persistence** — each conversation is saved as a crash-safe JSONL
-  journal. A fresh session starts by default; use `--session` to explicitly
-  continue one, or `--reattach <id>` to reattach to a daemon session. Quitting
-  the TUI prints the exact resume command for that session.
-- **Skills** — lightweight, discoverable agent skills (directories with a
-  `SKILL.md` frontmatter) can be injected into the system prompt or loaded on
-  demand via `/skill:<name>`.
-- **History compaction** — when the context window is exceeded, older turns are
-  summarized deterministically (no LLM call) to keep requests bounded. Set
-  `DEX_COMPACTION=llm` for model summarization, or `=jev` to prune stale
-  tool outputs verbatim instead (drops/truncates old results, keeps text;
-  falls back to the deterministic summary when pruning doesn't pay). With `=jev` plus a
-  `jev:` table in the config file and `TYPESAFE_API_KEY` set, the Typesafe Jev API
-  (System One noul questions) scores each tool result instead of the built-in heuristic;
-  any API failure falls back to the heuristic, never to a lost compaction.
-
-- **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended to
-  the system prompt automatically.
+  multi-line input, autoscroll, a status bar, and a follow-up queue while the
+  agent works. `!` runs shell commands without the agent.
+- **Session persistence** — each conversation is a crash-safe JSONL journal.
+  Use `--session` to continue one, or `--reattach <id>` to reattach to a
+  daemon session (quitting the TUI prints the exact resume command).
+- **Skills** — teach the agent something by dropping a directory with a
+  `SKILL.md` frontmatter; inject into the system prompt or load on demand via
+  `/skill:<name>`. See [Sessions and skills](docs/sessions-and-skills.md).
+- **History compaction** — when the context window fills, older turns are
+  summarized deterministically (no LLM call). `DEX_COMPACTION=llm` or `=jev`
+  switch strategies — see [Environment variables](docs/environment.md).
+- **Modular by design** — providers, the agent engine, sessions, protocol, and
+  server live in separate crates; see [Architecture](docs/architecture.md) and
+  [Runtime composability](docs/runtime.md).
+- **Project instructions** — a repo-level `AGENTS.md`/`CLAUDE.md` is appended
+  to the system prompt automatically.
 - **Runtime logging** — `DEX_LOG=off|error|warn|info|debug|trace` with a
-  TUI-safe sink (stderr outside the TUI, `dex.log` inside); no new dependencies.
+  TUI-safe sink (stderr outside the TUI, `dex.log` inside).
 - **Herdr-aware** — running inside a [Herdr](https://herdr.dev) pane
-  (`HERDR_ENV=1`), dex reports `working`/`blocked`/`idle` to the Herdr sidebar
-  via `pane report-agent`; no-op everywhere else.
+  (`HERDR_ENV=1`), dex reports `working`/`blocked`/`idle` to the Herdr
+  sidebar; no-op everywhere else.
 - **No telemetry** — dex makes network calls only to the LLM providers you
   configure (plus `models.dev` for the model catalog). Nothing else.
 
@@ -224,21 +214,16 @@ prints it, clients present `DEX_DAEMON_TOKEN=<token>` (or the token file at
 file: two daemons share it (second overwrites), so multi-daemon clients must
 pass per-host `DEX_DAEMON_TOKEN` explicitly.
 
-Reconnects: a dropped TUI replays the journal from its cursor and re-POSTs with
-the same idempotency key. Completed turns replay their terminal event;
-still-running turns answer 409 (reattach with `--reattach`); turns that died
-with no terminal re-execute (idempotency can't dedup what never finished). One
-reconnect per turn, then an honest error.
-
-The TUI behaves exactly like the local one: assistant text streams live, tool
-calls and results appear as they happen, tool approvals pop up as an overlay
-(the daemon parks the turn until you decide), and Ctrl+C/Esc cancels the
-in-flight turn (a third Ctrl+C force-quits a stuck turn). API keys, the model,
-and the permission mode are resolved by the daemon's own environment; client
-flags like `--model` and `--permission` are forwarded as per-request overrides.
-
-Tools execute on the machine where the daemon runs, confined to its working
-directory.
+If the connection drops, the TUI replays the session journal and re-POSTs with
+the same idempotency key: finished turns replay their result, still-running
+turns answer 409 — use `--reattach <id>` to take over — and turns that died
+with the daemon re-execute from their last journal event. Everything looks
+local: text streams live, tool calls and results appear as they happen, tool
+approvals pop up as an overlay (the daemon parks the turn until you decide),
+and Ctrl+C cancels the in-flight turn. API keys and permissions resolve in the
+daemon's environment; client flags like `--model` are forwarded as
+per-request overrides. Tools execute on the daemon's machine, confined to its
+working directory.
 
 ## Command-line flags
 
@@ -259,20 +244,20 @@ directory.
 | `--skill <dir>`                  | Add an extra skill directory to discover skills from.                                                             |
 | `--tool`                         | Run raw JSON tool mode (read JSON lines from stdin).                                                              |
 
-Tool safety defaults to `trusted` (no approval popups; the TUI seeds the
-`auto` agent mode from it). Set
-`DEX_PERMISSION=ask` or pass `--permission` to approve writes and shell
-commands and seed `manual` instead. The ceiling also seeds the TUI's agent mode (`plan`/`manual`/`auto`,
-see [Agent modes](docs/tui.md#agent-modes)): a client can only go stricter than the
-daemon's ceiling. Paths are confined to the current workspace; `bash` can execute
-arbitrary commands in that workspace and should only be enabled in trusted
-environments. Shell commands default to 120 seconds and 1 MiB per output stream.
-HTTP requests default to 10 seconds to connect and 300 seconds overall. Sessions
-journal to `$XDG_DATA_HOME/dex/sessions/*.jsonl` with `fsync` only on
-`turn_*`/`effect_*` (set `DEX_DURABLE=1` for per-line). Audit to `audit.jsonl`
-is off by default (`DEX_AUDIT=1` to enable). Configure limits with `DEX_TOOL_*`
-and `DEX_HTTP_*` environment variables (see
-[Environment variables](docs/environment.md)).
+Defaults, all overridable via `DEX_*` env vars — see
+[Environment variables](docs/environment.md):
+
+- Permission ceiling: `trusted` (no approvals); set `DEX_PERMISSION=ask` or
+  `--permission` to approve writes and shell commands. A client can only go
+  stricter than the daemon's ceiling; the ceiling seeds the TUI's agent mode
+  ([Agent modes](docs/tui.md#agent-modes)).
+- Shell commands: 120 s timeout, 1 MiB per output stream (`DEX_TOOL_*`).
+- HTTP: 10 s to connect, 300 s overall (`DEX_HTTP_*`).
+- Sessions: journals live in `$XDG_DATA_HOME/dex/sessions/*.jsonl`, `fsync`
+  on turn/effect events only (`DEX_DURABLE=1` for every line).
+- Audit: off; `DEX_AUDIT=1` writes `audit.jsonl` per tool call.
+- Paths: tools are confined to the current workspace (`bash` can still run
+  arbitrary commands there — use `trusted` only in environments you trust).
 
 In the interactive TUI, actions requiring approval open a dedicated overlay. Use
 the arrow keys and Enter to choose `Allow once`, `Allow for this session`, or
