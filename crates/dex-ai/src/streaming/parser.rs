@@ -591,3 +591,140 @@ impl StreamParser for AnthropicParser {
         }
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// SSE keep-alive noise: comments, blank lines, and event-type fields
+    /// must be transparent to every parser.
+    const NOISE: [&str; 3] = [": keep-alive", "", "event: message"];
+
+    fn with_noise(lines: &[String], inject: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in lines {
+            if inject {
+                out.extend(NOISE.iter().map(|s| s.to_string()));
+            }
+            out.push(line.clone());
+        }
+        out
+    }
+
+    fn run<P: StreamParser>(mut parser: P, lines: &[String]) -> (String, String, ParsedMessage) {
+        let mut text = String::new();
+        let mut thinking = String::new();
+        for line in lines {
+            for event in parser.feed(line) {
+                match event {
+                    StreamEvent::Text(t) => text.push_str(&t),
+                    StreamEvent::Thinking(t) => thinking.push_str(&t),
+                    _ => {}
+                }
+            }
+        }
+        (text, thinking, parser.finish())
+    }
+
+    proptest! {
+        /// Chat-completions: keep-alive noise never perturbs the text
+        /// stream or the parsed message.
+        #[test]
+        fn chat_completions_ignores_noise(
+            texts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            inject in proptest::bool::ANY,
+        ) {
+            let data: Vec<String> = texts
+                .iter()
+                .map(|t| {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}",
+                        serde_json::to_string(t).unwrap()
+                    )
+                })
+                .chain(std::iter::once("data: [DONE]".to_string()))
+                .collect();
+            let (text, thinking, parsed) =
+                run(ChatCompletionsParser::default(), &with_noise(&data, inject));
+            prop_assert_eq!(text, texts.concat());
+            prop_assert!(thinking.is_empty());
+            prop_assert!(parsed.tool_calls.is_empty());
+            prop_assert!(parsed.reasoning_content.is_none());
+            prop_assert!(parsed.reasoning_items.is_none());
+        }
+
+        /// Responses API: same transparency for the text-delta protocol.
+        #[test]
+        fn responses_ignores_noise(
+            texts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            inject in proptest::bool::ANY,
+        ) {
+            let data: Vec<String> = texts
+                .iter()
+                .map(|t| {
+                    format!(
+                        "data: {{\"type\":\"response.output_text.delta\",\"delta\":{}}}",
+                        serde_json::to_string(t).unwrap()
+                    )
+                })
+                .collect();
+            let (text, _, parsed) =
+                run(ResponsesParser::default(), &with_noise(&data, inject));
+            prop_assert_eq!(text, texts.concat());
+            prop_assert!(parsed.tool_calls.is_empty());
+            prop_assert!(parsed.reasoning_items.is_none());
+            prop_assert!(parsed.reasoning_content.is_none());
+        }
+
+        /// Anthropic Messages: usage stays split-accurate (prompt from
+        /// `message_start`, output from `message_delta`) and the text
+        /// stream survives interleaved keep-alives across blocks.
+        #[test]
+        fn anthropic_ignores_noise(
+            texts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            inject in proptest::bool::ANY,
+        ) {
+            let mut data: Vec<String> = vec![
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}"
+                    .to_string(),
+            ];
+            for (i, t) in texts.iter().enumerate() {
+                data.push(format!(
+                    "data: {{\"type\":\"content_block_start\",\"index\":{i},\"content_block\":{{\"type\":\"text\"}}}}"
+                ));
+                data.push(format!(
+                    "data: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}",
+                    serde_json::to_string(t).unwrap()
+                ));
+                data.push(format!(
+                    "data: {{\"type\":\"content_block_stop\",\"index\":{i}}}"
+                ));
+            }
+            data.push(
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}"
+                    .to_string(),
+            );
+            data.push("data: {\"type\":\"message_stop\"}".to_string());
+
+            let mut parser = AnthropicParser::default();
+            let mut text = String::new();
+            let mut stop = None;
+            let mut usage = None;
+            for line in &with_noise(&data, inject) {
+                for event in parser.feed(line) {
+                    match event {
+                        StreamEvent::Text(t) => text.push_str(&t),
+                        StreamEvent::Stop(s) => stop = Some(s),
+                        StreamEvent::Usage(u) => usage = Some(u),
+                        _ => {}
+                    }
+                }
+            }
+            prop_assert_eq!(text, texts.concat());
+            prop_assert_eq!(stop, Some(StopReason::Stop));
+            prop_assert_eq!(usage.map(|u| (u.prompt_tokens, u.completion_tokens)), Some((10, 7)));
+            prop_assert!(parser.finish().tool_calls.is_empty());
+        }
+    }
+}
