@@ -3061,7 +3061,7 @@ fn persisted_index_restores_and_rejects_stale_hash() {
         "openai": {"models": {"gpt-x": {"limit": {"context": 128000, "output": 4096}}}}
     });
     let hash = 0xDEADBEEF;
-    let text = super::catalog_index::persisted_index_text(hash, &catalog).unwrap();
+    let text = super::catalog_index::persisted_index_text(hash, &catalog, None, 0).unwrap();
     let path = super::catalog_index::persisted_index_path().unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &text).unwrap();
@@ -3100,6 +3100,49 @@ fn persisted_index_restores_and_rejects_stale_hash() {
         hash,
         std::time::SystemTime::UNIX_EPOCH,
         42
+    )
+    .is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn persisted_index_meta_restore_skips_catalog_read() {
+    // Serializes process-env redirection against other tests.
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("dex-persist-meta-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+    env::set_var("XDG_CACHE_HOME", &dir);
+
+    let catalog = serde_json::json!({
+        "openai": {"models": {"gpt-x": {"limit": {"context": 128000}}}}
+    });
+    let mtime = std::time::SystemTime::now();
+    let len = 42u64;
+    let text =
+        super::catalog_index::persisted_index_text(0xDEADBEEF, &catalog, Some(mtime), len).unwrap();
+    let path = super::catalog_index::persisted_index_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &text).unwrap();
+
+    // Matching (mtime, len) restores without needing the catalog at all.
+    let restored = super::catalog_index::restore_persisted_index_meta(
+        std::path::Path::new("/catalog"),
+        mtime,
+        len,
+    )
+    .expect("meta restore");
+    assert!(restored.by_id.contains_key("gpt-x"));
+    assert_eq!(restored.len, 42);
+
+    // A changed catalog (new mtime/len) must not be served stale.
+    assert!(super::catalog_index::restore_persisted_index_meta(
+        std::path::Path::new("/catalog"),
+        mtime,
+        len + 1
     )
     .is_none());
     let _ = std::fs::remove_dir_all(&dir);
