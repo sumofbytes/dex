@@ -11,7 +11,7 @@ cargo test --all-targets       # must pass
 cargo clippy --all-targets -- -D warnings  # must pass
 ```
 
-Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `README.md` § Configuration and `dex doctor`.
+Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `docs/configuration.md` and `dex doctor`.
 
 ## Structure
 
@@ -38,7 +38,7 @@ All of this lives in `crates/dex-server/src/llm/config/` — don't add a second 
 - Endpoints, model lists, pricing, context windows come from the models.dev catalog (cache via `dex update --models`); wire protocol is learned per endpoint+model (`learned-apis.json`), with `providers.<name>.api:` as the pin.
 - Per-provider keys live in `providers.<name>.api_key` or the provider's own catalog env var (opencode: `OPENCODE_API_KEY`). Never add per-provider default key env vars.
 - Extra headers precedence: file (provider-scoped `headers:` > global, per-key) < env (`ANTHROPIC_CUSTOM_HEADERS` < `OPENAI_HEADERS` < `DEX_HEADERS`) < `--header`; `authorization` can't be overridden.
-- Deprecated keys/env stay honored with `warn_once` + a pointer at the replacement; new knobs must do the same, add themselves to the unknown-key list in `load_config_file` (`config/mod.rs`), add a `dex doctor` origin row, and appear in the README env table.
+- Deprecated keys/env stay honored with `warn_once` + a pointer at the replacement; new knobs must do the same, add themselves to the unknown-key list in `load_config_file` (`config/mod.rs`), add a `dex doctor` origin row, and appear in the env table (`docs/environment.md`).
 - `dex doctor` prints every resolved value with its origin — keep it in sync with `from_env` when resolution changes. Config tests use `EnvRestore` + `TEST_SESSIONS_ENV_LOCK` (in `dex-runtime::test_env`) and hermetic `XDG_CACHE_HOME`/`DEX_CONFIG` paths.
 - Lua extensions (`dex extensions`, `Mode::Extensions`) are the scripting surface; don't add parallel knob types elsewhere.
 
