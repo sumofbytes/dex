@@ -2,9 +2,10 @@
 //! daemon and every UI. Plain data (no ANSI, no serde): UIs apply their own
 //! styling; wire serialization happens in `dex-protocol`.
 //!
-//! These types live here (not `dex-protocol`, which stays wire-only) because
-//! they are the host-boundary event stream the turn engine drives, and they
-//! share `Plan` with the rest of the agent vocabulary.
+//! These types live here (not `dex-protocol`, which stays wire-only)
+//! because they are the in-process vocabulary that flows across the host
+//! boundary (emitted by the server-side host adapter, carried by the
+//! console), and they share `Plan` with the rest of the agent vocabulary.
 
 use crate::Plan;
 use dex_protocol::ApprovalDecision;
