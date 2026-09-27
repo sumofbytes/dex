@@ -6,7 +6,6 @@ description = "Terminal coding agent in Rust: OpenAI-compatible LLMs with tool u
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/sumofbytes/dex"
-authors = ["Arpit Kumar <4772479+arpitsr@users.noreply.github.com>"]
 keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
 categories = ["command-line-utilities", "development-tools"]
 
