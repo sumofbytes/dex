@@ -183,18 +183,18 @@ mod proptests {
             threshold in 0u64..=10_000,
             keep in 0usize..=200,
             prefix in 0usize..=100,
-            tokens in 0u64..=10_000,
-            overhead in 0u64..=10_000,
+            tokens in proptest::num::u64::ANY,
+            overhead in proptest::num::u64::ANY,
             count in 0usize..=400,
-            d_tokens in 0u64..=10_000,
-            d_overhead in 0u64..=10_000,
+            d_tokens in proptest::num::u64::ANY,
+            d_overhead in proptest::num::u64::ANY,
             d_count in 0usize..=400,
         ) {
             let b = budget(threshold, keep, prefix);
             let lower = b.should_compact(tokens, overhead, count);
             let higher = b.should_compact(
-                tokens + d_tokens,
-                overhead + d_overhead,
+                tokens.saturating_add(d_tokens),
+                overhead.saturating_add(d_overhead),
                 count + d_count,
             );
             prop_assert!(higher || !lower);

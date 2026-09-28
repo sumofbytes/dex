@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 85171c5b8444675fb440bb10816ab02e8fff3dc4080fa8d5565f974f352d2e77 # shrinks to lines = ["Aa¡ ¡\u{e}\0a𐀀AaAa\u{b}a0\u{b}𐀀 A0𐀀"], max_lines = 2, max_bytes = 1
+cc 28b4982319017c403732b22de75afa4e0319818772942e203fc7d828005e8051 # shrinks to lines = ["", "", "\u{e}"], max_lines = 3, max_bytes = 1

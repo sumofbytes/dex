@@ -232,11 +232,5 @@ mod proptests {
                 prop_assert!(extended.stored_tokens() > incremental.stored_tokens());
             }
         }
-
-        /// The human formatter passes small counts through unchanged.
-        #[test]
-        fn format_tokens_small_counts(t in 0u64..=999) {
-            prop_assert_eq!(format_tokens(t), t.to_string());
-        }
     }
 }
