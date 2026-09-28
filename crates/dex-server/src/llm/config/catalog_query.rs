@@ -228,7 +228,7 @@ pub fn load_dex_models_cache() -> Option<Vec<String>> {
 /// Fetches `https://models.dev/api.json` (no auth) and caches to
 /// XDG_CACHE_HOME/dex/models.dev.json. Next startup uses it for contextWindow
 /// and autocomplete without network.
-pub async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn refresh_models_cache_async(quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Shared client (pool reuse): the 30s total rides per-request — api.json
     // is a ~4MB body, and the old 10s cap failed on normal slow links while
     // curl (no timeout) succeeded.
@@ -273,7 +273,9 @@ pub async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Erro
             tokio::fs::rename(&tmp, &path)
                 .await
                 .map_err(|e| crate::llm::http::error_chain_message(&e))?;
-            println!("cached models.dev {} to {}", url, path.display());
+            if !quiet {
+                println!("cached models.dev {} to {}", url, path.display());
+            }
             Ok(())
         }
         .await;
@@ -299,5 +301,5 @@ pub async fn refresh_models_cache_async() -> Result<(), Box<dyn std::error::Erro
 /// Sync wrapper for CLI paths that stay sync (`dex update --models`):
 /// blocks on the shared runtime handle.
 pub fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
-    crate::runtime::http::block_on(refresh_models_cache_async())
+    crate::runtime::http::block_on(refresh_models_cache_async(false))
 }
