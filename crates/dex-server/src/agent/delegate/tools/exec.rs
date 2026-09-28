@@ -27,6 +27,7 @@ use crate::llm::config::LlmConfig;
 use crate::protocol::ApprovalRequest;
 use crate::protocol::ChatMessage;
 use crate::protocol::SinkLine;
+use crate::protocol::StreamEvent;
 use crate::runtime::console::CancellationToken;
 use crate::runtime::console::Console;
 use crate::session::load_llm_messages_from_session;
@@ -646,6 +647,43 @@ pub fn child_system_prompt(def: &AgentDefinition) -> String {
     prompt
 }
 
+/// Route one child console line onto the wire (plan §20 child view),
+/// coalescing the token-voluminous delta kinds exactly like the parent
+/// turn's sink pump (`daemon/turn.rs`): providers emit one sink line per
+/// thinking token, and each event costs a seq bump, a journal append, and
+/// an SSE write. Thinking deltas join verbatim; Assistant events are
+/// complete markdown lines and join with `'\n'`. A non-coalescing event
+/// flushes the held tail first, so line order never changes.
+fn forward_coalesced(
+    event: StreamEvent,
+    coalescing: bool,
+    pending: &mut Option<StreamEvent>,
+    emit: &mut dyn FnMut(StreamEvent),
+) {
+    if !coalescing {
+        if let Some(held) = pending.take() {
+            emit(held);
+        }
+        emit(event);
+        return;
+    }
+    match (pending, event) {
+        (Some(StreamEvent::Thinking(buf)), StreamEvent::Thinking(text)) => {
+            buf.push_str(&text);
+        }
+        (Some(StreamEvent::AssistantText(buf)), StreamEvent::AssistantText(text)) => {
+            buf.push('\n');
+            buf.push_str(&text);
+        }
+        (held, event) => {
+            if let Some(held) = held.take() {
+                emit(held);
+            }
+            *held = Some(event);
+        }
+    }
+}
+
 /// The child body handed to [`AgentManager::spawn`]: one standard
 /// `process_turn` run with an isolated bundle — no parent transcript, no
 /// steering, no parent session, no parent cancel token (§8). Concrete
@@ -809,25 +847,78 @@ async fn child_run(
     // capture (last assistant text), the §15 progress label (the tool the
     // child is currently running, read by the `wait` action), and the §18
     // usage tally (each `record_usage` emission folds into the result).
+    // Under the daemon they also stream the live child transcript (plan §20
+    // child view): each console line maps onto the same `StreamEvent` shape
+    // the parent turn streams (turn.rs's sink pump), with the same Thinking
+    // coalescing — providers emit one sink line per token, and each event
+    // costs a seq bump, a journal append, and an SSE write. `Usage` and
+    // `Plan` stay local: the usage folds into the result (§18) and the
+    // child never owns a plan.
+    let child_name = def.name.clone();
     let consumer = tokio::spawn(async move {
+        let mut pending: Option<StreamEvent> = None;
+        let emit = |event: StreamEvent| progress.emit_line(&child_name, event);
+        let mut emit = emit;
         while let Some(line) = sink_rx.recv().await {
             match line {
                 SinkLine::Assistant(text) => {
-                    *capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+                    *capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
+                    forward_coalesced(
+                        StreamEvent::AssistantText(text),
+                        true,
+                        &mut pending,
+                        &mut emit,
+                    );
                 }
-                SinkLine::ToolInput { input, .. } => {
+                SinkLine::Thinking(text) => {
+                    forward_coalesced(StreamEvent::Thinking(text), true, &mut pending, &mut emit)
+                }
+                SinkLine::ToolInput { id, input } => {
                     // Preview is "<name> <short-args>" (loop.rs emit shape).
                     let name = input.split(' ').next().unwrap_or_default();
                     progress.set(name);
                     *open_in.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     *tally_calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    let mut parts = input.splitn(2, ' ');
+                    let tool = parts.next().unwrap_or_default().to_string();
+                    let args = parts.next().unwrap_or_default().to_string();
+                    forward_coalesced(
+                        StreamEvent::ToolCall {
+                            name: tool,
+                            args: serde_json::Value::String(args),
+                            id,
+                        },
+                        false,
+                        &mut pending,
+                        &mut emit,
+                    );
                 }
-                SinkLine::ToolOutput { .. } => {
+                SinkLine::ToolOutput {
+                    id,
+                    name,
+                    summary,
+                    success,
+                    preview,
+                    duration,
+                } => {
                     let mut open = open_out.lock().unwrap_or_else(|e| e.into_inner());
                     *open = open.saturating_sub(1);
                     if *open == 0 {
                         progress.clear();
                     }
+                    forward_coalesced(
+                        StreamEvent::ToolResult {
+                            name,
+                            summary,
+                            success,
+                            preview,
+                            duration,
+                            id,
+                        },
+                        false,
+                        &mut pending,
+                        &mut emit,
+                    );
                 }
                 SinkLine::Usage {
                     tokens,
@@ -840,8 +931,18 @@ async fn child_run(
                         .unwrap_or_else(|e| e.into_inner())
                         .absorb(tokens, output, cost);
                 }
+                SinkLine::System(text) => {
+                    forward_coalesced(StreamEvent::System(text), false, &mut pending, &mut emit)
+                }
+                SinkLine::Error(text) => {
+                    forward_coalesced(StreamEvent::Error(text), false, &mut pending, &mut emit)
+                }
                 _ => {}
             }
+        }
+        // Channel closed: flush the coalesced tail.
+        if let Some(event) = pending.take() {
+            emit(event);
         }
     });
 

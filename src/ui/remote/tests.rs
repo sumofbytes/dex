@@ -341,6 +341,8 @@ fn test_remote() -> RemoteApp {
         approval_rx: None,
         pending_approvals: Vec::new(),
         agents: Vec::new(),
+        child_logs: Vec::new(),
+        child_view: None,
         busy: false,
         autoscroll: true,
         scroll: 0,
@@ -1033,4 +1035,77 @@ fn plain_tab_still_completes_in_the_slash_popup() {
     handle_key(&mut remote, key(KeyCode::Tab, KeyModifiers::empty()));
     assert_eq!(remote.mode, AgentMode::Plan, "Tab must not cycle the mode");
     assert_eq!(remote.app.input.text(), "/clear ");
+}
+
+#[test]
+fn agent_lines_buffer_into_child_log_and_leave_parent_alone() {
+    let mut remote = test_remote();
+    let before = remote.app.transcript.len();
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::AgentLine {
+            agent_id: "a1".into(),
+            name: "explorer".into(),
+            event: Box::new(crate::protocol::StreamEvent::AssistantText(
+                "hello from child".into(),
+            )),
+        },
+    );
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::AgentLine {
+            agent_id: "a1".into(),
+            name: "explorer".into(),
+            event: Box::new(crate::protocol::StreamEvent::ToolResult {
+                name: "bash".into(),
+                summary: "ls".into(),
+                success: true,
+                preview: vec![],
+                duration: 0.0,
+                id: "t1".into(),
+            }),
+        },
+    );
+    assert_eq!(remote.app.transcript.len(), before, "parent untouched");
+    assert_eq!(remote.app.child_logs.len(), 1);
+    let log = &remote.app.child_logs[0];
+    assert_eq!(log.name, "explorer");
+    assert_eq!(log.app.transcript.len(), 2, "assistant + tool blocks");
+    assert!(
+        matches!(
+            log.app.transcript[0],
+            crate::ui::TranscriptBlock::Assistant { .. }
+        ),
+        "same block semantics as the parent transcript"
+    );
+}
+
+#[test]
+fn child_view_toggles_and_cycles_with_keys() {
+    let mut remote = test_remote();
+    for id in ["a1", "a2"] {
+        input::handle_stream_event(
+            &mut remote,
+            crate::protocol::StreamEvent::AgentLine {
+                agent_id: id.into(),
+                name: "explorer".into(),
+                event: Box::new(crate::protocol::StreamEvent::System("working".into())),
+            },
+        );
+    }
+    assert!(remote.app.child_view.is_none());
+    // Ctrl+A opens the first log.
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a1"));
+    // Ctrl+A cycles to the second; Esc closes; Ctrl+A opens again.
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a2"));
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(remote.app.child_view.is_none());
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a1"));
+    // Scrolling drives the child log's own scroll state, not the parent's.
+    handle_key(&mut remote, key(KeyCode::PageUp, KeyModifiers::empty()));
+    assert!(!remote.app.child_logs[0].app.autoscroll);
+    assert_eq!(remote.app.scroll, 0);
 }

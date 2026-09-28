@@ -593,6 +593,18 @@ pub(crate) fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, ev
             },
             Some(notice.text()),
         ),
+        AgentEvent::Line {
+            agent_id,
+            name,
+            event,
+        } => (
+            StreamEvent::AgentLine {
+                agent_id: agent_id.to_string(),
+                name: name.clone(),
+                event: Box::new(event.clone()),
+            },
+            None,
+        ),
     };
     // The V1a line first, so a replay renders the transcript line before it
     // consumes the typed variant.

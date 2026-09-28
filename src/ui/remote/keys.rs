@@ -90,6 +90,12 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
     if handle_approval_key(remote, key) {
         return;
     }
+    // Child transcript view (plan §20): modal while open — the fullscreen
+    // child log owns every key (scroll/close/cycle); Ctrl+C is passed
+    // through so a running turn can still be cancelled from inside it.
+    if remote.app.child_view.is_some() && handle_child_view_key(remote, key) {
+        return;
+    }
     let app = &mut remote.app;
 
     // Idle double Ctrl+C guard: any non-Ctrl+C key cancels the pending quit.
@@ -119,6 +125,11 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
             app.show_thinking = !app.show_thinking;
             bump_thinking_stamps(app);
+        }
+        // Ctrl+A: toggle the child transcript view (plan §20). With no log
+        // yet there is nothing to show — say so instead of staying silent.
+        KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+            toggle_child_view(remote);
         }
         // Alt+V: cycle the user voice color. Global chrome like Ctrl+T
         // above, so it sits before the slash-popup arm and works with the
@@ -166,6 +177,68 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         KeyCode::Up => handle_up_key(app, key),
         KeyCode::Down => handle_down_key(app, key),
         _ => handle_composer_key(app, key),
+    }
+}
+
+/// Ctrl+A (plan §20 child view): open the first child log, or close the
+/// open one. With no log there is nothing to show — a notice explains it.
+fn toggle_child_view(remote: &mut RemoteApp) {
+    if remote.app.child_view.take().is_some() {
+        return;
+    }
+    match remote.app.child_logs.first() {
+        Some(log) => remote.app.child_view = Some(log.id.clone()),
+        None => {
+            remote.app.notice = Some((
+                "no child transcripts — spawn one with delegate".to_string(),
+                Instant::now(),
+            ));
+        }
+    }
+}
+
+/// Keys while the fullscreen child transcript view is open (plan §20):
+/// Esc closes, Ctrl+A cycles among logs (closing when only one), the
+/// scroll keys drive the child log's own scrollback, and everything else
+/// is swallowed — the view is modal, the parent stays hidden beneath it.
+/// Returns false only for Ctrl+C so the main match still cancels a turn.
+fn handle_child_view_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            remote.app.child_view = None;
+        }
+        KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+            cycle_child_view(remote);
+        }
+        KeyCode::PageUp => scroll_child_view(remote, -20),
+        KeyCode::PageDown => scroll_child_view(remote, 20),
+        KeyCode::Up => scroll_child_view(remote, -1),
+        KeyCode::Down => scroll_child_view(remote, 1),
+        _ => {}
+    }
+    true
+}
+
+/// Ctrl+A inside the view: move to the next log in arrival order; with a
+/// single log this is the toggle close.
+fn cycle_child_view(remote: &mut RemoteApp) {
+    let logs = &remote.app.child_logs;
+    let current = remote.app.child_view.as_ref();
+    let idx = current
+        .and_then(|id| logs.iter().position(|log| &log.id == id))
+        .map_or(0, |idx| (idx + 1) % logs.len());
+    remote.app.child_view = Some(logs[idx].id.clone());
+}
+
+fn scroll_child_view(remote: &mut RemoteApp, delta: i32) {
+    let Some(id) = remote.app.child_view.clone() else {
+        return;
+    };
+    if let Some(log) = remote.app.child_logs.iter_mut().find(|log| log.id == id) {
+        scroll_transcript(&mut log.app, delta);
     }
 }
 

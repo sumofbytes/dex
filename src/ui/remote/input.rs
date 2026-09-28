@@ -273,6 +273,15 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 remote.live_children.store(false, Ordering::SeqCst);
             }
         }
+        // Plan §20 child view: one child transcript line, already in the
+        // same shapes the parent turn streams. Routed into the per-child
+        // log (a scratch `App`), never into the parent transcript — the
+        // child view renders it with the identical block semantics.
+        StreamEvent::AgentLine {
+            agent_id,
+            name,
+            event,
+        } => append_child_log(remote, &agent_id, &name, *event),
         StreamEvent::TurnComplete { usage, cached, .. } => {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
@@ -511,4 +520,74 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     // background poll. Async so the UI thread never blocks on HTTP (the
     // daemon's 5s git cache keeps it cheap).
     refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
+}
+
+/// Plan §20 child view: route one child transcript line into its per-agent
+/// log — a scratch [`App`](crate::ui::App) reused purely for its transcript
+/// machinery, so child blocks build exactly like the parent's (streaming
+/// assistant merges, tool call/result pairing, thinking collapse). The
+/// parent transcript is never touched. The log survives the child's
+/// completion so the view can be reopened; the block cap bounds memory.
+fn append_child_log(remote: &mut RemoteApp, agent_id: &str, name: &str, event: StreamEvent) {
+    let Some(line) = child_sink_line(event) else {
+        return;
+    };
+    let log = match remote
+        .app
+        .child_logs
+        .iter_mut()
+        .find(|log| log.id == agent_id)
+    {
+        Some(log) => log,
+        None => {
+            remote.app.child_logs.push(crate::ui::ChildLog {
+                id: agent_id.to_string(),
+                name: name.to_string(),
+                app: crate::ui::App::scratch(),
+            });
+            remote.app.child_logs.last_mut().expect("just pushed")
+        }
+    };
+    append_sink_line(&mut log.app, line);
+    // Cap: past the limit drop the oldest quarter and clear the wrap caches
+    // (recomputed lazily on the next render of the child view).
+    if log.app.transcript.len() > crate::ui::CHILD_LOG_MAX_BLOCKS {
+        let keep = crate::ui::CHILD_LOG_MAX_BLOCKS - crate::ui::CHILD_LOG_MAX_BLOCKS / 4;
+        log.app.transcript.drain(..log.app.transcript.len() - keep);
+        log.app.wrapped_cache.clear();
+        log.app.display_cache.clear();
+    }
+}
+
+/// Map the subset of wire events the child view streams onto the in-process
+/// [`SinkLine`] vocabulary, the mirror image of the daemon's child sink
+/// pump (`delegate/tools/exec.rs:forward_coalesced`). `Usage`/`Plan` and
+/// lifecycle events never arrive here — the daemon filters them out.
+fn child_sink_line(event: StreamEvent) -> Option<SinkLine> {
+    match event {
+        StreamEvent::AssistantText(text) => Some(SinkLine::Assistant(text)),
+        StreamEvent::Thinking(text) => Some(SinkLine::Thinking(text)),
+        StreamEvent::ToolCall { name, args, id } => Some(SinkLine::ToolInput {
+            id,
+            input: format!("{name} {}", args.as_str().unwrap_or_default()),
+        }),
+        StreamEvent::ToolResult {
+            id,
+            name,
+            summary,
+            success,
+            preview,
+            duration,
+        } => Some(SinkLine::ToolOutput {
+            id,
+            name,
+            summary,
+            success,
+            preview,
+            duration,
+        }),
+        StreamEvent::System(text) => Some(SinkLine::System(text)),
+        StreamEvent::Error(text) => Some(SinkLine::Error(text)),
+        _ => None,
+    }
 }

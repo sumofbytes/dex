@@ -51,8 +51,8 @@ pub(crate) mod app;
 pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
-    AgentChip, App, EnableMouseScroll, PendingApproval, TranscriptBlock, WrappedBlock,
-    NOTICE_LIFETIME,
+    AgentChip, App, ChildLog, EnableMouseScroll, PendingApproval, TranscriptBlock, WrappedBlock,
+    CHILD_LOG_MAX_BLOCKS, NOTICE_LIFETIME,
 };
 #[cfg(test)]
 pub(crate) use selection::{b64, line_width};
