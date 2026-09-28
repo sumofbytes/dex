@@ -273,9 +273,7 @@ pub async fn refresh_models_cache_async(quiet: bool) -> Result<(), Box<dyn std::
             tokio::fs::rename(&tmp, &path)
                 .await
                 .map_err(|e| crate::llm::http::error_chain_message(&e))?;
-            if !quiet {
-                println!("cached models.dev {} to {}", url, path.display());
-            }
+            emit_cached(quiet, url, &path);
             Ok(())
         }
         .await;
@@ -298,8 +296,84 @@ pub async fn refresh_models_cache_async(quiet: bool) -> Result<(), Box<dyn std::
     Err(format!("could not fetch models.dev catalog: {last_err}").into())
 }
 
+/// Where a successful fetch is reported: interactive CLI paths print to
+/// stdout; headless daemons (`quiet`) log at Info instead, so `DEX_LOG=info`
+/// still surfaces the line while nothing paints on a shared terminal.
+fn emit_cached(quiet: bool, url: &str, path: &std::path::Path) {
+    let line = format!("cached models.dev {url} to {}", path.display());
+    if quiet {
+        dex_runtime::log!(Info, "{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
 /// Sync wrapper for CLI paths that stay sync (`dex update --models`):
 /// blocks on the shared runtime handle.
 pub fn refresh_models_cache() -> Result<(), Box<dyn std::error::Error>> {
     crate::runtime::http::block_on(refresh_models_cache_async(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Save/restore process env around tests that redirect dex env vars
+    /// (same pattern as the sibling `config/tests.rs` helper).
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn take(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, prev) in self.0.drain(..) {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Quiet (headless) refresh must not print to stdout: the success line
+    /// goes through the log sink at Info, so `DEX_LOG=info` surfaces it
+    /// while an embedded daemon sharing the TUI's terminal stays clean.
+    #[test]
+    fn quiet_refresh_reports_via_log_not_stdout() {
+        let _lock = dex_runtime::test_env::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let guard = EnvRestore::take(&["XDG_DATA_HOME", "DEX_LOG"]);
+        let base = std::env::temp_dir().join(format!("dex-catalog-quiet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("XDG_DATA_HOME", &base);
+        std::env::set_var("DEX_LOG", "info");
+        dex_runtime::logging::init();
+        // Same sink move the TUI does before alt-screen; the notice is None
+        // because the temp log file opens fine.
+        assert!(dex_runtime::logging::redirect_to_file().is_none());
+
+        emit_cached(
+            true,
+            "https://models.dev/api.json",
+            std::path::Path::new("/cache/models.dev.json"),
+        );
+
+        let log = std::fs::read_to_string(base.join("dex/dex.log")).expect("log file exists");
+        assert!(log.contains("INFO"), "{log}");
+        assert!(
+            log.contains("cached models.dev https://models.dev/api.json to /cache/models.dev.json"),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        // Restore the ceiling from the (reverted) DEX_LOG. The file sink
+        // survives into the deleted temp dir — writes land nowhere — because
+        // the logger has no public sink reset; no other test asserts stderr.
+        drop(guard);
+        dex_runtime::logging::init();
+    }
 }
