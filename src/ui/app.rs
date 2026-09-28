@@ -228,6 +228,15 @@ pub(crate) struct App {
     pub(crate) pending_approvals: Vec<PendingApproval>,
     /// Live child agents (V1b typed events, §15).
     pub(crate) agents: Vec<AgentChip>,
+    /// Per-child transcript logs (plan §20 child view): scratch `App`s keyed
+    /// by agent id, reused purely for their transcript machinery (block
+    /// building + wrap caches), so child lines render with the identical
+    /// block semantics as the parent transcript. Logs survive the child's
+    /// completion; the block cap bounds memory for runaway children.
+    pub(crate) child_logs: Vec<ChildLog>,
+    /// The open child transcript view: the agent id being shown fullscreen
+    /// in place of the parent screen, `None` while the parent is showing.
+    pub(crate) child_view: Option<String>,
     pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
@@ -351,6 +360,8 @@ impl App {
             approval_rx: None,
             pending_approvals: Vec::new(),
             agents: Vec::new(),
+            child_logs: Vec::new(),
+            child_view: None,
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -383,6 +394,86 @@ impl App {
 }
 
 impl App {
+    /// A bare scratch `App` used only as transcript machinery for a child
+    /// log (plan §20 child view): nothing renders from it but its
+    /// transcript, so every non-transcript field stays at its default.
+    pub(crate) fn scratch() -> App {
+        App {
+            remote_mode: false,
+            transcript: Vec::new(),
+            input: crate::ui::input::InputField::new(),
+            config: crate::llm::config::LlmConfig {
+                provider: crate::protocol::Provider::Anthropic,
+                api_key: String::new(),
+                base_url: String::new(),
+                model: String::new(),
+                available_models: Vec::new(),
+                endpoints: Default::default(),
+                api: crate::protocol::ApiProtocol::Responses,
+                account_id: None,
+                thinking_effort: None,
+                context_window: 128_000,
+                reserve_tokens: 16_384,
+                keep_recent_tokens: 20_000,
+                permission: crate::protocol::PermissionMode::Trusted,
+                verify_command: None,
+                extra_headers: Default::default(),
+                global_headers: Default::default(),
+                provider_entries: Default::default(),
+                provider_headers: Default::default(),
+                api_pinned: false,
+                connect_timeout_secs: 10,
+                request_timeout_secs: 300,
+            },
+            messages: Vec::new(),
+            tool_state: crate::ui::UsageState::default(),
+            session: crate::session::Session::in_memory("/tmp".into()),
+            skills: Vec::new(),
+            turn_start: 0,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            git_dirty: false,
+            steering_rx: None,
+            followup_rx: None,
+            pending_steering: Vec::new(),
+            pending_followups: Vec::new(),
+            cancel_requested: false,
+            cancel_presses: 0,
+            approval_rx: None,
+            pending_approvals: Vec::new(),
+            agents: Vec::new(),
+            child_logs: Vec::new(),
+            child_view: None,
+            busy: false,
+            autoscroll: true,
+            scroll: 0,
+            tick: 0,
+            quit: false,
+            last_ctrl_c: None,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            slash_selected: 0,
+            connection: None,
+            daemon_url: None,
+            assistant_open: false,
+            show_thinking: false,
+            thinking_open: false,
+            plan: crate::protocol::Plan::default(),
+            assistant_pending: String::new(),
+            assistant_gap: crate::render::theme::markdown::GapState::new(),
+            stream_last_flush: Instant::now(),
+            wrapped_cache: Vec::new(),
+            wrapped_width: 0,
+            display_cache: Vec::new(),
+            transcript_area: None,
+            selection: None,
+            notice: None,
+            status_tokens_cache: Cell::new((0, 0, 0)),
+            slash_cache: std::cell::RefCell::new(None),
+        }
+    }
+
     pub(crate) fn history_up(&mut self) {
         if self.history.is_empty() {
             return;
@@ -515,6 +606,21 @@ pub(crate) struct AgentChip {
     pub(crate) name: String,
     pub(crate) tool: Option<String>,
 }
+
+/// One child agent's transcript log (plan §20 child view): the definition
+/// name for the view title plus a scratch [`App`] carrying the transcript
+/// blocks and their wrap caches. `App::new`-free — the scratch is built by
+/// [`App::child_scratch`] so every field stays initialized exactly once.
+pub(crate) struct ChildLog {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) app: App,
+}
+
+/// Block cap per child log: a runaway child must not grow the client's
+/// memory without bound. Past the cap the oldest quarter is dropped and the
+/// wrap caches cleared (recomputed lazily on the next render).
+pub(crate) const CHILD_LOG_MAX_BLOCKS: usize = 2000;
 
 pub(crate) struct TerminalCleanup;
 

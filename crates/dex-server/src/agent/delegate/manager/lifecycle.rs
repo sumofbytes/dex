@@ -96,6 +96,26 @@ impl ProgressReporter {
             child.instance.progress = None;
         }
     }
+
+    /// Fire one child transcript line (plan §20 child view) through the
+    /// lifecycle hook. A no-op when no hook is attached (test-built
+    /// managers, non-daemon callers): the lines are a UI surface, never
+    /// agent state.
+    pub fn emit_line(&self, name: &str, event: crate::protocol::StreamEvent) {
+        let hook = self
+            .manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .events
+            .clone();
+        if let Some(hook) = hook {
+            hook(AgentEvent::Line {
+                agent_id: self.id.clone(),
+                name: name.to_string(),
+                event,
+            });
+        }
+    }
 }
 
 /// Per-session child-agent registry. Cheap to clone; all clones share one
@@ -121,6 +141,15 @@ pub enum AgentEvent {
         current_tool: Option<String>,
     },
     Completed(AgentNotice),
+    /// One child transcript line (plan §20 child view): already mapped onto
+    /// the wire shapes the parent turn streams, fired from the child body's
+    /// sink consumer through [`ProgressReporter::emit_line`]. Journaled and
+    /// broadcast through the same hook as the other variants.
+    Line {
+        agent_id: AgentId,
+        name: String,
+        event: crate::protocol::StreamEvent,
+    },
 }
 
 /// The daemon-supplied lifecycle hook: typed events (§15 V1b) journaled and

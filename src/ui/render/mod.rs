@@ -178,12 +178,57 @@ pub(super) fn compute_layout(
     })
 }
 
+/// Plan §20 child view: one title row (definition name + id + key hints),
+/// then the child log's transcript filling the rest of the screen. Rendered
+/// through [`TranscriptView::render`] so child blocks wrap, style, scroll,
+/// and autoscroll exactly like the parent transcript's.
+fn render_child_view(f: &mut ratatui::Frame, area: Rect, app: &mut App, idx: usize) {
+    let (title, live) = {
+        let log = &app.child_logs[idx];
+        let live = app.agents.iter().any(|chip| chip.id == log.id);
+        (format!("\u{27e1} {} \u{b7} {}", log.name, log.id), live)
+    };
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let title_line = ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled(title, fg(theme::accent_fg())),
+        ratatui::text::Span::styled(
+            if live {
+                "  \u{25cf} running"
+            } else {
+                "  \u{25cb} done"
+            },
+            fg(if live {
+                theme::success_fg()
+            } else {
+                theme::muted_fg()
+            }),
+        ),
+        ratatui::text::Span::styled(
+            "   Esc close \u{b7} Ctrl+A next \u{b7} PgUp/PgDn scroll",
+            fg(theme::muted_fg()),
+        ),
+    ]);
+    f.render_widget(ratatui::widgets::Paragraph::new(title_line), chunks[0]);
+    TranscriptView::render(f, chunks[1], &mut app.child_logs[idx].app);
+}
+
 pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     // Ratatui only repaints cells the widget touches; without a full clear,
     // a shorter line (e.g. fewer queued-steer badges, or a shrunken input)
     // would leave trailing chars from the previous frame.
     f.render_widget(Clear, area);
+    // Plan §20 child view: the open child transcript replaces the whole
+    // parent screen — a title bar, then the child log rendered by the very
+    // same view (and block semantics) as the parent transcript.
+    if let Some(idx) = app
+        .child_view
+        .as_ref()
+        .and_then(|id| app.child_logs.iter().position(|log| &log.id == id))
+    {
+        render_child_view(f, area, app, idx);
+        return;
+    }
     // ponytail: wrap the composer once — the rows size the layout and
     // render it, so don't pay `render_input` twice per frame.
     let (input_lines, input_cursor) = render_input(

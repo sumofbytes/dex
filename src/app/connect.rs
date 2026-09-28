@@ -143,6 +143,9 @@ fn handle_event_with(
         StreamEvent::AgentCompleted { agent_id, status } => {
             eprintln!("[agent …:{agent_id}] {status}");
         }
+        // Child transcript lines (plan §20 child view): a TUI-only surface;
+        // headless clients render the parent transcript's lifecycle lines.
+        StreamEvent::AgentLine { .. } => {}
     }
     None
 }
