@@ -162,3 +162,104 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn budget(threshold: u64, keep: usize, prefix: usize) -> CompactionBudget {
+        CompactionBudget {
+            token_threshold: threshold,
+            keep_recent_messages: keep,
+            prefix_messages: prefix,
+        }
+    }
+
+    proptest! {
+        /// Raising any input can never un-trigger compaction.
+        #[test]
+        fn should_compact_is_monotone(
+            threshold in 0u64..=10_000,
+            keep in 0usize..=200,
+            prefix in 0usize..=100,
+            tokens in proptest::num::u64::ANY,
+            overhead in proptest::num::u64::ANY,
+            count in 0usize..=400,
+            d_tokens in proptest::num::u64::ANY,
+            d_overhead in proptest::num::u64::ANY,
+            d_count in 0usize..=400,
+        ) {
+            let b = budget(threshold, keep, prefix);
+            let lower = b.should_compact(tokens, overhead, count);
+            let higher = b.should_compact(
+                tokens.saturating_add(d_tokens),
+                overhead.saturating_add(d_overhead),
+                count + d_count,
+            );
+            prop_assert!(higher || !lower);
+        }
+
+        /// Exact token boundary: triggers one token past the threshold,
+        /// never at it.
+        #[test]
+        fn should_compact_token_boundary(
+            threshold in 0u64..=10_000,
+            tokens in 0u64..=10_000,
+        ) {
+            prop_assert_eq!(
+                budget(threshold, 0, 0).should_compact(tokens, 0, 0),
+                tokens > threshold
+            );
+        }
+
+        /// Exact message boundary against the count-based fallback.
+        #[test]
+        fn should_compact_message_boundary(
+            threshold in 1u64..=10_000,
+            keep in 0usize..=200,
+            prefix in 0usize..=100,
+            count in 0usize..=400,
+        ) {
+            prop_assert_eq!(
+                budget(threshold, keep, prefix).should_compact(0, 0, count),
+                count > prefix + keep
+            );
+        }
+
+        /// ToolRoundBudget invariants over any run: completed tracks the
+        /// round count, at most one warning fires (only below the limit),
+        /// and exhaustion is terminal.
+        #[test]
+        fn tool_round_budget_invariants(limit in 0usize..=60, rounds in 1usize..=120) {
+            let mut budget = ToolRoundBudget::new(limit);
+            let mut warned = 0usize;
+            let mut exhausted = false;
+            for round in 1..=rounds {
+                match budget.complete_round() {
+                    ToolRoundOutcome::Continue { completed, .. } => {
+                        prop_assert!(!exhausted);
+                        prop_assert_eq!(completed, round);
+                        prop_assert!(completed < limit);
+                        prop_assert!(completed * 5 < limit * 4 || warned == 1);
+                    }
+                    ToolRoundOutcome::Warn { completed, .. } => {
+                        prop_assert!(!exhausted);
+                        prop_assert_eq!(completed, round);
+                        warned += 1;
+                        prop_assert_eq!(warned, 1);
+                        prop_assert!(completed < limit);
+                        prop_assert!(completed * 5 >= limit * 4);
+                    }
+                    ToolRoundOutcome::Exhausted { completed, .. } => {
+                        prop_assert_eq!(completed, round);
+                        prop_assert!(completed >= limit);
+                        exhausted = true;
+                    }
+                }
+                prop_assert_eq!(budget.completed(), round);
+            }
+            prop_assert!(exhausted || rounds < limit.max(1));
+        }
+    }
+}

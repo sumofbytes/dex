@@ -51,8 +51,11 @@ pub fn clamp_lines_checked(text: &str, max_lines: usize, max_bytes: usize) -> (S
         return (clipped.join("\n"), clipped_any);
     }
 
-    let head_budget = max_lines / 2;
-    let tail_budget = max_lines - head_budget;
+    // Clamp each window to what the line count actually leaves, so head
+    // and tail can never overlap (or double-count) when `total <
+    // max_lines` but the byte budget still forces the clamp path.
+    let head_budget = (max_lines / 2).min(total);
+    let tail_budget = (max_lines - head_budget).min(total - head_budget);
     let mut head: Vec<String> = Vec::new();
     let mut used = 0usize;
     for line in clipped.iter().take(head_budget) {
@@ -76,6 +79,11 @@ pub fn clamp_lines_checked(text: &str, max_lines: usize, max_bytes: usize) -> (S
     let shown = head.len() + tail.len();
     let omitted = total - shown;
     let mut out = head;
+    if omitted == 0 {
+        // Every line survived the byte budget — keep them all, no marker.
+        out.extend(tail);
+        return (out.join("\n"), clipped_any);
+    }
     out.push(format!("[... {omitted} of {total} lines truncated ...]"));
     out.extend(tail);
     (out.join("\n"), true)
@@ -83,4 +91,58 @@ pub fn clamp_lines_checked(text: &str, max_lines: usize, max_bytes: usize) -> (S
 
 pub fn truncate_text(text: &str, max_bytes: usize, max_lines: usize) -> String {
     clamp_lines(text, max_lines, max_bytes)
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Any string over the full Unicode range, so char-boundary handling
+    /// (multibyte, emoji, combining marks) is exercised.
+    fn any_text(max: usize) -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::collection::vec(proptest::char::any(), 0..=max)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest! {
+        /// Below the budget the clip is the identity.
+        #[test]
+        fn clip_chars_identity_below_budget(s in any_text(80), max in 0usize..=200) {
+            if s.chars().count() <= max {
+                prop_assert_eq!(&clip_chars(&s, max), &s);
+            }
+        }
+
+        /// Clipping is idempotent: re-clipping changes nothing.
+        #[test]
+        fn clip_chars_is_idempotent(s in any_text(120), max in 0usize..=80) {
+            let once = clip_chars(&s, max);
+            prop_assert_eq!(clip_chars(&once, max), once);
+        }
+
+        /// A cut output carries at most `max` chars plus the `…` marker.
+        #[test]
+        fn clip_chars_char_budget(s in any_text(120), max in 1usize..=80) {
+            let out = clip_chars(&s, max);
+            prop_assert!(out.chars().count() <= max + 1);
+            prop_assert!(out.ends_with('…') || out == s);
+        }
+
+        /// Clamped output never exceeds max_lines + 1 (marker) lines and
+        /// carries at most one truncation marker.
+        #[test]
+        fn clamp_lines_bounds(
+            lines in proptest::collection::vec("[^\n\r]{0,40}", 0..=60),
+            max_lines in 1usize..=12,
+            max_bytes in 1usize..=300,
+        ) {
+            let text = lines.join("\n");
+            let out = clamp_lines(&text, max_lines, max_bytes);
+            prop_assert!(out.lines().count() <= max_lines + 1);
+            prop_assert!(out.matches(" lines truncated ").count() <= 1);
+            // A marker is only emitted when lines were actually dropped.
+            prop_assert!(!out.contains("[... 0 of "));
+        }
+    }
 }
