@@ -540,6 +540,17 @@ fn append_child_log(remote: &mut RemoteApp, agent_id: &str, name: &str, event: S
     {
         Some(log) => log,
         None => {
+            // Log-count cap (`CHILD_LOG_MAX_LOGS`): drop the oldest log
+            // before pushing a new one — each carries a scratch `App` with
+            // wrap caches, so an unbounded session must not accumulate
+            // them. A still-streaming dropped child just starts a fresh
+            // log; the view closes if it was showing the dropped one.
+            if remote.app.child_logs.len() >= crate::ui::CHILD_LOG_MAX_LOGS {
+                let dropped = remote.app.child_logs.remove(0);
+                if remote.app.child_view.as_deref() == Some(dropped.id.as_str()) {
+                    remote.app.child_view = None;
+                }
+            }
             remote.app.child_logs.push(crate::ui::ChildLog {
                 id: agent_id.to_string(),
                 name: name.to_string(),

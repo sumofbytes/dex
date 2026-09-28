@@ -178,10 +178,13 @@ pub(super) fn compute_layout(
     })
 }
 
-/// Plan §20 child view: one title row (definition name + id + key hints),
-/// then the child log's transcript filling the rest of the screen. Rendered
-/// through [`TranscriptView::render`] so child blocks wrap, style, scroll,
-/// and autoscroll exactly like the parent transcript's.
+/// Plan §20 child view: the child log rendered inside the parent's
+/// transcript window — a one-row title (definition name + id + key hints)
+/// on top, the child log below. Rendered through [`TranscriptView::render`]
+/// so child blocks wrap, style, scroll, and autoscroll exactly like the
+/// parent transcript's. The composer, queue strip, and footer stay visible
+/// (the session stays controllable), and the approval overlay draws over
+/// this in [`view`].
 fn render_child_view(f: &mut ratatui::Frame, area: Rect, app: &mut App, idx: usize) {
     let (title, live) = {
         let log = &app.child_logs[idx];
@@ -218,17 +221,6 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // a shorter line (e.g. fewer queued-steer badges, or a shrunken input)
     // would leave trailing chars from the previous frame.
     f.render_widget(Clear, area);
-    // Plan §20 child view: the open child transcript replaces the whole
-    // parent screen — a title bar, then the child log rendered by the very
-    // same view (and block semantics) as the parent transcript.
-    if let Some(idx) = app
-        .child_view
-        .as_ref()
-        .and_then(|id| app.child_logs.iter().position(|log| &log.id == id))
-    {
-        render_child_view(f, area, app, idx);
-        return;
-    }
     // ponytail: wrap the composer once — the rows size the layout and
     // render it, so don't pay `render_input` twice per frame.
     let (input_lines, input_cursor) = render_input(
@@ -247,8 +239,19 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
     // no reason and push the composer up.
     let layout = compute_layout(area, input_rows, queue, false).expect("layout always exists");
-
-    TranscriptView::render(f, layout.transcript, app);
+    // Plan §20 child view: the open child transcript replaces only the
+    // parent's transcript window (title bar + child log); the composer and
+    // footer stay so the session remains controllable. The approval
+    // overlay below renders on top of it.
+    if let Some(idx) = app
+        .child_view
+        .as_ref()
+        .and_then(|id| app.child_logs.iter().position(|log| &log.id == id))
+    {
+        render_child_view(f, layout.transcript, app, idx);
+    } else {
+        TranscriptView::render(f, layout.transcript, app);
+    }
     BottomPane::render(f, &layout, app, input_lines, input_cursor, &groups);
     if !app.pending_approvals.is_empty() {
         ApprovalOverlay::render(f, area, app);
