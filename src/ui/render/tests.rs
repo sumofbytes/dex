@@ -2,7 +2,7 @@
 
 use super::super::status::{cell_safe, footer_text, status_pieces, ui_status};
 use super::*;
-use crate::protocol::{ApiProtocol, PermissionMode, Provider};
+use crate::protocol::PermissionMode;
 use crate::ui::style::{composer_band, content_width as input_content_width, BLOCK_GAP_ROWS};
 use ratatui::backend::TestBackend;
 use std::time::Instant;
@@ -209,86 +209,23 @@ fn apply_selection_full_width_end_row_matches_whole_line() {
 }
 
 fn test_app() -> super::super::App {
+    // Derived from the canonical all-defaults `App::scratch()` literal, so
+    // a new App field never needs a second initializer here.
+    let mut app = super::super::App::scratch();
+    app.transcript = vec![super::super::TranscriptBlock::Assistant {
+        stamp: 0,
+        lines: vec![super::super::indent_transcript_line(Line::from(
+            "hello from the transcript — this line is intentionally long enough to wrap",
+        ))],
+    }];
+    app.config.api_key = "test".to_string();
+    app.config.base_url = "http://localhost".to_string();
+    app.config.model = "test-model".to_string();
+    app.config.available_models = vec!["test-model".to_string()];
     let cwd = "/tmp/dex-ui-test".to_string();
-    super::super::App {
-        remote_mode: false,
-        transcript: vec![super::super::TranscriptBlock::Assistant {
-            stamp: 0,
-            lines: vec![super::super::indent_transcript_line(Line::from(
-                "hello from the transcript — this line is intentionally long enough to wrap",
-            ))],
-        }],
-        input: InputField::new(),
-        config: super::super::LlmConfig {
-            provider: Provider::Anthropic,
-            api_key: "test".to_string(),
-            base_url: "http://localhost".to_string(),
-            model: "test-model".to_string(),
-            available_models: vec!["test-model".to_string()],
-            endpoints: Default::default(),
-            api: ApiProtocol::Responses,
-            account_id: None,
-            thinking_effort: None,
-            context_window: 128_000,
-            reserve_tokens: 16_384,
-            keep_recent_tokens: 20_000,
-            permission: PermissionMode::Trusted,
-            verify_command: None,
-            extra_headers: Default::default(),
-            global_headers: Default::default(),
-            provider_entries: Default::default(),
-            provider_headers: Default::default(),
-            api_pinned: false,
-            connect_timeout_secs: 10,
-            request_timeout_secs: 300,
-        },
-        messages: Vec::new(),
-        tool_state: super::super::UsageState::default(),
-        session: super::super::Session::in_memory(cwd.clone()),
-        skills: Vec::new(),
-        turn_start: 0,
-        cwd,
-        git_branch: None,
-        git_dirty: false,
-        steering_rx: None,
-        followup_rx: None,
-        pending_steering: Vec::new(),
-        pending_followups: Vec::new(),
-        cancel_requested: false,
-        cancel_presses: 0,
-        approval_rx: None,
-        pending_approvals: Vec::new(),
-        agents: Vec::new(),
-        child_logs: Vec::new(),
-        child_view: None,
-        busy: false,
-        autoscroll: true,
-        scroll: 0,
-        tick: 0,
-        quit: false,
-        last_ctrl_c: None,
-        history: Vec::new(),
-        history_index: None,
-        history_draft: String::new(),
-        slash_selected: 0,
-        connection: None,
-        daemon_url: None,
-        assistant_open: false,
-        show_thinking: false,
-        thinking_open: false,
-        plan: crate::protocol::Plan::default(),
-        assistant_pending: String::new(),
-        assistant_gap: crate::render::theme::markdown::GapState::new(),
-        stream_last_flush: std::time::Instant::now(),
-        wrapped_cache: Vec::new(),
-        wrapped_width: 0,
-        display_cache: Vec::new(),
-        transcript_area: None,
-        selection: None,
-        notice: None,
-        status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
-        slash_cache: std::cell::RefCell::new(None),
-    }
+    app.session = super::super::Session::in_memory(cwd.clone());
+    app.cwd = cwd;
+    app
 }
 
 #[test]
@@ -3020,5 +2957,93 @@ fn tool_input_wraps_under_the_glyph_column() {
     assert!(
         !cont.starts_with(' '),
         "over-cap marker must not hang: {cont:?}"
+    );
+}
+
+fn rendered_rows(terminal: &ratatui::Terminal<TestBackend>) -> Vec<String> {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn child_view_takes_only_the_transcript_window() {
+    // Plan §20: the child log replaces the parent's transcript window —
+    // the composer and status footer stay visible beneath it, so the
+    // session stays controllable while reading a child transcript.
+    let mut app = test_app();
+    app.child_logs.push(super::super::ChildLog {
+        id: "a1".into(),
+        name: "explorer".into(),
+        app: super::super::App::scratch(),
+    });
+    app.child_view = Some("a1".into());
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let rendered = rendered_rows(&terminal);
+    assert!(
+        rendered.iter().any(|row| row.contains("explorer · a1")),
+        "child title missing: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|row| row.contains('❯')),
+        "composer must stay visible under the child view: {rendered:?}"
+    );
+    // The parent transcript block is hidden while the view is open.
+    assert!(
+        !rendered
+            .iter()
+            .any(|row| row.contains("hello from the transcript")),
+        "parent transcript leaked through the child view: {rendered:?}"
+    );
+}
+
+#[test]
+fn approval_overlay_draws_over_open_child_view() {
+    // An approval pending while the child view is open must be visible —
+    // the pre-fix rendering hid the overlay entirely behind the early
+    // return, so y/n/s resolved it invisibly.
+    let mut app = test_app();
+    app.child_logs.push(super::super::ChildLog {
+        id: "a1".into(),
+        name: "explorer".into(),
+        app: super::super::App::scratch(),
+    });
+    app.child_view = Some("a1".into());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    app.pending_approvals
+        .push(super::super::PendingApproval::new(
+            "bash".into(),
+            "{}".into(),
+            tx,
+            None,
+        ));
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let rendered = rendered_rows(&terminal);
+    assert!(
+        rendered.iter().any(|row| row.contains("explorer · a1")),
+        "child view missing: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|row| row.contains("bash") && row.contains("—")),
+        "approval overlay must draw over the child view: {rendered:?}"
     );
 }

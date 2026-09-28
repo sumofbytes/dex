@@ -86,13 +86,16 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
     let shell_cancel_requested = remote.shell_cancel_requested;
 
     // Approval overlay takes precedence: the worker is blocked until a
-    // decision arrives.
+    // decision arrives. The overlay draws on top of the child view too
+    // (render/mod.rs), so `y`/`n`/`s`/arrows resolve it from inside the
+    // view; only Esc differs — it closes the view instead of denying.
     if handle_approval_key(remote, key) {
         return;
     }
-    // Child transcript view (plan §20): modal while open — the fullscreen
-    // child log owns every key (scroll/close/cycle); Ctrl+C is passed
-    // through so a running turn can still be cancelled from inside it.
+    // Child transcript view (plan §20): modal while open — the child log
+    // owns the parent transcript window (scroll/close/cycle); Ctrl+C is
+    // passed through so a running turn can still be cancelled from inside
+    // it.
     if remote.app.child_view.is_some() && handle_child_view_key(remote, key) {
         return;
     }
@@ -197,11 +200,13 @@ fn toggle_child_view(remote: &mut RemoteApp) {
     }
 }
 
-/// Keys while the fullscreen child transcript view is open (plan §20):
-/// Esc closes, Ctrl+A cycles among logs (closing when only one), the
-/// scroll keys drive the child log's own scrollback, and everything else
-/// is swallowed — the view is modal, the parent stays hidden beneath it.
-/// Returns false only for Ctrl+C so the main match still cancels a turn.
+/// Keys while the child transcript view is open (plan §20): Esc closes,
+/// Ctrl+A cycles among logs (closing when only one), the scroll keys drive
+/// the child log's own scrollback, and everything else is swallowed — the
+/// view is modal over the parent transcript. Returns false only for Ctrl+C
+/// so the main match still cancels a turn. While an approval is pending the
+/// overlay handles keys first (see `handle_key`), with Esc closing this
+/// view rather than denying.
 fn handle_child_view_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
     if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
@@ -276,7 +281,8 @@ fn apply_mode(remote: &mut RemoteApp, mode: AgentMode) {
 }
 
 /// Approval overlay: the worker is blocked until a decision arrives, so this
-/// owns every key while an approval is pending. Returns true when one was
+/// owns every key while an approval is pending — including over the open
+/// child view, which renders beneath the overlay. Returns true when one was
 /// showing (the caller then returns without touching the composer).
 fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
     if remote.app.pending_approvals.is_empty() {
@@ -306,7 +312,17 @@ fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
         KeyCode::Char('s') | KeyCode::Char('S') => {
             resolve_approval(app, ApprovalDecision::AllowSession);
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            resolve_approval(app, ApprovalDecision::Deny);
+        }
+        // Esc over an open child view closes the view, not the approval:
+        // a user reading a transcript presses Esc to leave, and a silent
+        // deny from the pre-overlay ordering was the bug this guard fixes.
+        // The approval stays parked, the overlay still shows.
+        KeyCode::Esc if app.child_view.is_some() => {
+            app.child_view = None;
+        }
+        KeyCode::Esc => {
             resolve_approval(app, ApprovalDecision::Deny);
         }
         KeyCode::Enter => {

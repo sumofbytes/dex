@@ -857,8 +857,7 @@ async fn child_run(
     let child_name = def.name.clone();
     let consumer = tokio::spawn(async move {
         let mut pending: Option<StreamEvent> = None;
-        let emit = |event: StreamEvent| progress.emit_line(&child_name, event);
-        let mut emit = emit;
+        let mut emit = |event: StreamEvent| progress.emit_line(&child_name, event);
         while let Some(line) = sink_rx.recv().await {
             match line {
                 SinkLine::Assistant(text) => {

@@ -53,6 +53,11 @@ const WAIT_POLL: Duration = Duration::from_millis(25);
 pub struct ProgressReporter {
     pub manager: Arc<Mutex<Inner>>,
     pub id: AgentId,
+    /// Lifecycle hook snapshotted at spawn (see [`AgentManager::launch`]):
+    /// per-line emission is the hot path (one sink line per streamed
+    /// token), so it must not take the manager lock per event. The hook is
+    /// attached when the manager is built, always before any spawn.
+    events: Option<EventHook>,
 }
 
 impl ProgressReporter {
@@ -98,17 +103,11 @@ impl ProgressReporter {
     }
 
     /// Fire one child transcript line (plan §20 child view) through the
-    /// lifecycle hook. A no-op when no hook is attached (test-built
-    /// managers, non-daemon callers): the lines are a UI surface, never
-    /// agent state.
+    /// lifecycle hook snapshotted at spawn. A no-op when no hook was
+    /// attached (test-built managers, non-daemon callers): the lines are a
+    /// UI surface, never agent state.
     pub fn emit_line(&self, name: &str, event: crate::protocol::StreamEvent) {
-        let hook = self
-            .manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .events
-            .clone();
-        if let Some(hook) = hook {
+        if let Some(hook) = &self.events {
             hook(AgentEvent::Line {
                 agent_id: self.id.clone(),
                 name: name.to_string(),
@@ -347,6 +346,10 @@ impl AgentManager {
     ) {
         let manager = self.clone();
         let task_id = id.clone();
+        // Snapshot the hook before the task spawns: the child body's
+        // per-line emissions (`ProgressReporter::emit_line`) then never
+        // touch the manager lock (see `ProgressReporter::events`).
+        let events = manager.lock().events.clone();
         let handle = tokio::spawn(async move {
             // Cancel wins over a body that ignores its token, and the body
             // gets the definition's `timeout` to finish (plan §14): a run
@@ -361,6 +364,7 @@ impl AgentManager {
                             ProgressReporter {
                                 manager: manager.inner.clone(),
                                 id: task_id.clone(),
+                                events,
                             },
                             task_id.clone(),
                         )),
