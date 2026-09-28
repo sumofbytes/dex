@@ -35,20 +35,33 @@ pub async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error:
     // a daemon can outlive the outage; `dex update --models` always works too.
     if crate::llm::config::catalog_cache_missing() {
         tokio::spawn(async {
+            // Small initial delay: an embedded TUI moves logs to the file sink
+            // only after daemon health passes, so a near-instant fetch failure
+            // (e.g. offline DNS) could otherwise paint one Warn line on the
+            // terminal pre-alt-screen. The fetch is best-effort background on
+            // first start, so the delay is invisible.
+            tokio::time::sleep(Duration::from_secs(2)).await;
             // The error type is Box<dyn Error>, which is not Send: report it
             // and drop it before any further await so the future stays Send.
-            let failed = match crate::llm::config::refresh_models_cache_async().await {
+            let failed = match crate::llm::config::refresh_models_cache_async(true).await {
                 Ok(()) => false,
                 Err(e) => {
-                    eprintln!("note: models.dev catalog fetch failed ({e}); retrying in 5 minutes");
+                    // log, not stderr: the embedded daemon shares the TUI's
+                    // terminal and any stdout/stderr write here paints raw
+                    // text over the alt-screen (see the note below).
+                    dex_runtime::log!(
+                        Warn,
+                        "models.dev catalog fetch failed ({e}); retrying in 5 minutes"
+                    );
                     true
                 }
             };
             if failed {
                 tokio::time::sleep(Duration::from_secs(5 * 60)).await;
-                if let Err(e) = crate::llm::config::refresh_models_cache_async().await {
-                    eprintln!(
-                        "note: models.dev catalog still missing ({e}); run `dex update --models`"
+                if let Err(e) = crate::llm::config::refresh_models_cache_async(true).await {
+                    dex_runtime::log!(
+                        Warn,
+                        "models.dev catalog still missing ({e}); run `dex update --models`"
                     );
                 }
             }
