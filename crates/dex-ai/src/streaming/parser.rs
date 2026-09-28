@@ -629,92 +629,128 @@ mod proptests {
 
     proptest! {
         /// Chat-completions: keep-alive noise never perturbs the text
-        /// stream or the parsed message.
+        /// or thinking streams or the parsed message (including replayed
+        /// `reasoning_content`).
         #[test]
         fn chat_completions_ignores_noise(
             texts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            thoughts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
             inject in proptest::bool::ANY,
         ) {
-            let data: Vec<String> = texts
+            let data: Vec<String> = thoughts
                 .iter()
                 .map(|t| {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{}}}}}]}}",
+                        serde_json::to_string(t).unwrap()
+                    )
+                })
+                .chain(texts.iter().map(|t| {
                     format!(
                         "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}",
                         serde_json::to_string(t).unwrap()
                     )
-                })
+                }))
                 .chain(std::iter::once("data: [DONE]".to_string()))
                 .collect();
             let (text, thinking, parsed) =
                 run(ChatCompletionsParser::default(), &with_noise(&data, inject));
+            let expected = thoughts.concat();
             prop_assert_eq!(text, texts.concat());
-            prop_assert!(thinking.is_empty());
+            prop_assert_eq!(thinking, expected.clone());
+            prop_assert_eq!(parsed.reasoning_content.as_deref(), Some(expected.as_str()));
             prop_assert!(parsed.tool_calls.is_empty());
-            prop_assert!(parsed.reasoning_content.is_none());
             prop_assert!(parsed.reasoning_items.is_none());
         }
 
-        /// Responses API: same transparency for the text-delta protocol.
+        /// Responses API: same transparency for the text-delta and
+        /// thinking-delta protocols.
         #[test]
         fn responses_ignores_noise(
             texts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            thoughts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
             inject in proptest::bool::ANY,
         ) {
-            let data: Vec<String> = texts
+            let data: Vec<String> = thoughts
                 .iter()
                 .map(|t| {
+                    format!(
+                        "data: {{\"type\":\"response.reasoning_text.delta\",\"delta\":{}}}",
+                        serde_json::to_string(t).unwrap()
+                    )
+                })
+                .chain(texts.iter().map(|t| {
                     format!(
                         "data: {{\"type\":\"response.output_text.delta\",\"delta\":{}}}",
                         serde_json::to_string(t).unwrap()
                     )
-                })
+                }))
                 .collect();
-            let (text, _, parsed) =
+            let (text, thinking, parsed) =
                 run(ResponsesParser::default(), &with_noise(&data, inject));
             prop_assert_eq!(text, texts.concat());
+            prop_assert_eq!(thinking, thoughts.concat());
             prop_assert!(parsed.tool_calls.is_empty());
             prop_assert!(parsed.reasoning_items.is_none());
             prop_assert!(parsed.reasoning_content.is_none());
         }
 
         /// Anthropic Messages: usage stays split-accurate (prompt from
-        /// `message_start`, output from `message_delta`) and the text
-        /// stream survives interleaved keep-alives across blocks.
+        /// `message_start`, output from `message_delta`) with varied
+        /// token counts, and text + thinking streams survive interleaved
+        /// keep-alives across blocks.
         #[test]
         fn anthropic_ignores_noise(
             texts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            thoughts in proptest::collection::vec("[^\n\r]{1,40}", 1..=8),
+            prompt_tokens in 0u64..=1_000_000,
+            output_tokens in 0u64..=1_000_000,
             inject in proptest::bool::ANY,
         ) {
             let mut data: Vec<String> = vec![
-                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}"
+                format!(
+                    "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":{prompt_tokens}}}}}}}"
+                ),
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}"
                     .to_string(),
             ];
+            for t in &thoughts {
+                data.push(format!(
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":{}}}}}",
+                    serde_json::to_string(t).unwrap()
+                ));
+            }
+            data.push("data: {\"type\":\"content_block_stop\",\"index\":0}".to_string());
             for (i, t) in texts.iter().enumerate() {
                 data.push(format!(
-                    "data: {{\"type\":\"content_block_start\",\"index\":{i},\"content_block\":{{\"type\":\"text\"}}}}"
+                    "data: {{\"type\":\"content_block_start\",\"index\":{},\"content_block\":{{\"type\":\"text\"}}}}",
+                    i + 1
                 ));
                 data.push(format!(
-                    "data: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}",
+                    "data: {{\"type\":\"content_block_delta\",\"index\":{},\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}",
+                    i + 1,
                     serde_json::to_string(t).unwrap()
                 ));
                 data.push(format!(
-                    "data: {{\"type\":\"content_block_stop\",\"index\":{i}}}"
+                    "data: {{\"type\":\"content_block_stop\",\"index\":{}}}",
+                    i + 1
                 ));
             }
-            data.push(
-                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}"
-                    .to_string(),
-            );
+            data.push(format!(
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}"
+            ));
             data.push("data: {\"type\":\"message_stop\"}".to_string());
 
             let mut parser = AnthropicParser::default();
             let mut text = String::new();
+            let mut thinking = String::new();
             let mut stop = None;
             let mut usage = None;
             for line in &with_noise(&data, inject) {
                 for event in parser.feed(line) {
                     match event {
                         StreamEvent::Text(t) => text.push_str(&t),
+                        StreamEvent::Thinking(t) => thinking.push_str(&t),
                         StreamEvent::Stop(s) => stop = Some(s),
                         StreamEvent::Usage(u) => usage = Some(u),
                         _ => {}
@@ -722,8 +758,12 @@ mod proptests {
                 }
             }
             prop_assert_eq!(text, texts.concat());
+            prop_assert_eq!(thinking, thoughts.concat());
             prop_assert_eq!(stop, Some(StopReason::Stop));
-            prop_assert_eq!(usage.map(|u| (u.prompt_tokens, u.completion_tokens)), Some((10, 7)));
+            prop_assert_eq!(
+                usage.map(|u| (u.prompt_tokens, u.completion_tokens)),
+                Some((prompt_tokens, output_tokens))
+            );
             prop_assert!(parser.finish().tool_calls.is_empty());
         }
     }

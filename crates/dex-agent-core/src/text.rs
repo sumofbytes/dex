@@ -51,8 +51,11 @@ pub fn clamp_lines_checked(text: &str, max_lines: usize, max_bytes: usize) -> (S
         return (clipped.join("\n"), clipped_any);
     }
 
-    let head_budget = max_lines / 2;
-    let tail_budget = max_lines - head_budget;
+    // Clamp each window to what the line count actually leaves, so head
+    // and tail can never overlap (or double-count) when `total <
+    // max_lines` but the byte budget still forces the clamp path.
+    let head_budget = (max_lines / 2).min(total);
+    let tail_budget = (max_lines - head_budget).min(total - head_budget);
     let mut head: Vec<String> = Vec::new();
     let mut used = 0usize;
     for line in clipped.iter().take(head_budget) {
@@ -76,6 +79,11 @@ pub fn clamp_lines_checked(text: &str, max_lines: usize, max_bytes: usize) -> (S
     let shown = head.len() + tail.len();
     let omitted = total - shown;
     let mut out = head;
+    if omitted == 0 {
+        // Every line survived the byte budget — keep them all, no marker.
+        out.extend(tail);
+        return (out.join("\n"), clipped_any);
+    }
     out.push(format!("[... {omitted} of {total} lines truncated ...]"));
     out.extend(tail);
     (out.join("\n"), true)
@@ -133,6 +141,8 @@ mod proptests {
             let out = clamp_lines(&text, max_lines, max_bytes);
             prop_assert!(out.lines().count() <= max_lines + 1);
             prop_assert!(out.matches(" lines truncated ").count() <= 1);
+            // A marker is only emitted when lines were actually dropped.
+            prop_assert!(!out.contains("[... 0 of "));
         }
     }
 }
