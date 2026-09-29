@@ -714,7 +714,10 @@ pub fn doctor(
     system_prompt_override: Option<(String, &'static str)>,
 ) -> (String, bool) {
     let mut out = String::new();
-    out.push_str(&format!("dex {}\n\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!(
+        "dex {}\n\n",
+        crate::runtime::runtime::http::VERSION
+    ));
 
     match config_file_path() {
         Some(path) => {

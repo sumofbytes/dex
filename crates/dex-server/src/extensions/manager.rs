@@ -114,7 +114,7 @@ async fn fire_runtime_start_once() {
     }
     crate::extensions::fire_lifecycle_event(
         "runtime.start",
-        serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        serde_json::json!({ "version": crate::runtime::runtime::http::VERSION }),
         &crate::runtime::cancel::GlobalCancellation,
     )
     .await;

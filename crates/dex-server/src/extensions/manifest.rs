@@ -209,10 +209,11 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
-/// The harness version serving this extension (the `dex-server` crate
-/// version — the code that owns the event surface, not the CLI release).
+/// The harness version serving this extension: the dex release version
+/// (workspace root `Cargo.toml`, via `dex-runtime`'s `VERSION`) — the
+/// surface the extension hosts, not this internal crate's version.
 pub fn harness_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    crate::runtime::runtime::http::VERSION
 }
 
 /// Check a manifest `dex = ">=a.b[.c]"` pin against the running harness.
