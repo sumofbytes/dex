@@ -27,8 +27,6 @@ pub(crate) mod status;
 pub(crate) mod wrapping;
 
 pub(crate) use self::input::InputField;
-#[cfg(test)]
-pub(crate) use crate::llm::config::LlmConfig;
 pub(crate) use app::TerminalCleanup;
 #[cfg(test)]
 pub(crate) use app::{STREAM_FLUSH_INTERVAL, THINKING_TEXT_CAP, THINKING_TEXT_SLACK};
@@ -51,8 +49,8 @@ pub(crate) mod app;
 pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
-    AgentChip, App, EnableMouseScroll, PendingApproval, TranscriptBlock, WrappedBlock,
-    NOTICE_LIFETIME,
+    AgentChip, App, ChildLog, EnableMouseScroll, PendingApproval, TranscriptBlock, WrappedBlock,
+    CHILD_LOG_MAX_BLOCKS, CHILD_LOG_MAX_LOGS, NOTICE_LIFETIME,
 };
 #[cfg(test)]
 pub(crate) use selection::{b64, line_width};

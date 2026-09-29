@@ -321,6 +321,22 @@ pub enum StreamEvent {
     /// V1a lifecycle line uses ("completed"/"failed"/"cancelled"/"timed out").
     #[serde(rename = "agent_completed")]
     AgentCompleted { agent_id: String, status: String },
+
+    /// One live child-agent transcript line (plan §20 child view): the
+    /// child's own console output, wrapped in the same `StreamEvent` shapes
+    /// the parent turn streams (`AssistantText`/`Thinking`/`ToolCall`/
+    /// `ToolResult`/`System`/`Error`), so a client renders the child
+    /// transcript with the identical block semantics as the parent's. The
+    /// event rides the same journal + SSE path as the other typed variants;
+    /// older clients skip the unknown type without stalling replay.
+    #[serde(rename = "agent_line")]
+    AgentLine {
+        agent_id: String,
+        /// The child's definition name (view title); repeated so a client
+        /// keying the log by id never needs the spawn event first.
+        name: String,
+        event: Box<StreamEvent>,
+    },
 }
 
 /// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session
@@ -412,6 +428,37 @@ pub struct GitInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_line_round_trips_with_nested_event() {
+        let event = StreamEvent::AgentLine {
+            agent_id: "a1".into(),
+            name: "explorer".into(),
+            event: Box::new(StreamEvent::ToolResult {
+                name: "bash".into(),
+                summary: "ls".into(),
+                success: true,
+                preview: vec!["file.rs".into()],
+                duration: 0.1,
+                id: "t1".into(),
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"agent_line\""));
+        let back: StreamEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            StreamEvent::AgentLine {
+                agent_id,
+                name,
+                event,
+            } => {
+                assert_eq!(agent_id, "a1");
+                assert_eq!(name, "explorer");
+                assert!(matches!(*event, StreamEvent::ToolResult { .. }));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 
     #[test]
     fn git_info_round_trips_and_defaults_dirty() {

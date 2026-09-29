@@ -9,20 +9,14 @@ use crate::client::http::DaemonClient;
 #[cfg(test)]
 use crate::protocol::AgentMode;
 #[cfg(test)]
-use crate::protocol::ApiProtocol;
-#[cfg(test)]
 use crate::protocol::ApprovalDecision;
 #[cfg(test)]
 use crate::protocol::PermissionMode;
-#[cfg(test)]
-use crate::protocol::Provider;
 #[cfg(test)]
 #[cfg(test)]
 use crate::runtime::console::DIM;
 #[cfg(test)]
 use crate::runtime::console::RESET;
-#[cfg(test)]
-use crate::session::Session;
 #[cfg(test)]
 use crossterm::event::KeyCode;
 #[cfg(test)]
@@ -34,8 +28,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use std::time::Instant;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
