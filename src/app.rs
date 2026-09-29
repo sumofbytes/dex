@@ -798,7 +798,9 @@ mod tests {
     fn schema_surface_matches_docs() {
         let schema = crate::llm::tool_descriptions::tools_schema();
         let names: Vec<&str> = schema.iter().map(|t| t.function.name.as_str()).collect();
-        for expected in ["read", "bash", "write", "edit", "grep", "find", "ls"] {
+        for expected in [
+            "read", "bash", "write", "edit", "grep", "find", "ls", "ask_user",
+        ] {
             assert!(
                 names.contains(&expected),
                 "{expected} missing from {names:?}"

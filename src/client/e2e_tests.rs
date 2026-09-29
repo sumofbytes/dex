@@ -1,4 +1,4 @@
-use crate::client::{ChatOptions, DaemonClient};
+use crate::client::{ChatOptions, DaemonClient, EventReply};
 use crate::protocol::{ApprovalDecision, StreamEvent};
 use std::time::Duration;
 
@@ -165,7 +165,7 @@ fn client_end_to_end_hits_every_endpoint() {
         &session_id,
         "again",
         ChatOptions::default(),
-        &mut |_| None,
+        &mut |_| EventReply::None,
     ))
     .unwrap();
 

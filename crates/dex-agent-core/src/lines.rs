@@ -61,6 +61,26 @@ pub enum SinkLine {
     Plan(Plan),
 }
 
+/// A pending `ask_user` batch, routed to whichever surface can answer it —
+/// the in-process counterpart of [`ApprovalRequest`] with a variable
+/// option list instead of a fixed decision enum. Like approvals it rides
+/// a dedicated channel on the `Console` (not the transcript sink), and
+/// the daemon-side bridge parks it, journals it, and broadcasts the wire
+/// event. One sender resolves the whole batch — partial answers never
+/// cross the host boundary; UIs buffer per-question state and submit
+/// once. Teardown semantics match approvals: `agent_id` set means the
+/// requester is a background child that outlives the parent turn, so
+/// turn-end teardown must not dismiss its question.
+#[derive(Clone, Debug)]
+pub struct QuestionRequest {
+    pub questions: Vec<dex_protocol::Question>,
+    pub agent_id: Option<String>,
+    /// The child's definition name for the labeled prompt ("explorer
+    /// asks: …"). `None` for the parent turn's own questions.
+    pub agent: Option<String>,
+    pub response: tokio::sync::mpsc::Sender<Vec<dex_protocol::QuestionAnswer>>,
+}
+
 /// One tool/permission approval, routed to whichever surface can answer it
 /// (headless console prompt, TUI modal, remote client).
 #[derive(Clone, Debug)]

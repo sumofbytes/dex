@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::protocol::{
     ApprovalDecision, ApprovalResponse, ChatRequest, CreateSessionRequest, CreateSessionResponse,
     DaemonInfo, EventsResponse, FollowupRequest, GitInfo, LoadSkillRequest, LoadSkillResponse,
-    ReattachResponse, RecallRequest, SessionInfo, ShellRequest, ShellResponse, SkillInfo,
-    SteerRequest, StreamEnvelope, StreamEvent,
+    QuestionAnswer, QuestionResponse, ReattachResponse, RecallRequest, SessionInfo, ShellRequest,
+    ShellResponse, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
 };
 
 use super::runtime::{block_on, shared_async_client, shared_streaming_client};
@@ -25,7 +25,16 @@ fn error_chain_message(err: &dyn std::error::Error) -> String {
     message
 }
 
-/// Per-request overrides forwarded to the daemon with a chat turn.
+/// What a synchronous event callback wants done after it handled an event:
+/// an approval decision, a question batch's answers, or nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventReply {
+    Decision(ApprovalDecision),
+    Answers(Vec<QuestionAnswer>),
+    None,
+}
+
+/// Per-request overrides forwarded to the daemon with a chat request.
 #[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
     pub skill_dirs: Vec<String>,
@@ -403,14 +412,14 @@ impl DaemonClient {
     }
 
     /// Async SSE chat: drives `chat_async` stream, invoking `on_event`
-    /// synchronously per event. Approval decisions `await` the daemon
-    /// confirm POST instead of blocking a thread (S6).
+    /// synchronously per event. Approval decisions and question answers
+    /// `await` the daemon confirm POST instead of blocking a thread (S6).
     pub async fn chat_async(
         &self,
         session_id: &str,
         prompt: &str,
         options: ChatOptions,
-        on_event: &mut dyn FnMut(StreamEvent) -> Option<ApprovalDecision>,
+        on_event: &mut dyn FnMut(StreamEvent) -> EventReply,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Sync-callback path (one-shot CLI, repl, e2e tests): the callback
         // never touches the runtime, so driving the shared `ChatStream`
@@ -432,18 +441,48 @@ impl DaemonClient {
             ) {
                 saw_terminal = true;
             }
-            if let StreamEvent::ApprovalRequired { ref request_id, .. } = &event {
-                let request_id = request_id.clone();
-                let decision = on_event(event).unwrap_or(ApprovalDecision::Deny);
-                if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
-                    (self.warning)(&format!(
-                        "daemon approval delivery failed: {}",
-                        error_chain_message(e.as_ref())
-                    ));
+            match &event {
+                StreamEvent::ApprovalRequired { ref request_id, .. } => {
+                    let request_id = request_id.clone();
+                    let reply = on_event(event);
+                    let decision = match reply {
+                        EventReply::Decision(decision) => decision,
+                        // A callback that ignores the event denies: fail closed.
+                        _ => ApprovalDecision::Deny,
+                    };
+                    if let Err(e) = self.approve_async(session_id, &request_id, decision).await {
+                        (self.warning)(&format!(
+                            "daemon approval delivery failed: {}",
+                            error_chain_message(e.as_ref())
+                        ));
+                    }
                 }
-                continue;
+                StreamEvent::QuestionRequired {
+                    ref request_id,
+                    ref questions,
+                    ..
+                } => {
+                    let request_id = request_id.clone();
+                    let questions_len = questions.len();
+                    let reply = on_event(event);
+                    let answers = match reply {
+                        EventReply::Answers(answers) => answers,
+                        // Ignored or malformed replies dismiss every slot:
+                        // a piped stdin or a headless caller must never hang
+                        // the turn on a question nobody will answer.
+                        _ => vec![QuestionAnswer::Dismiss; questions_len],
+                    };
+                    if let Err(e) = self.answer_async(session_id, &request_id, answers).await {
+                        (self.warning)(&format!(
+                            "daemon answer delivery failed: {}",
+                            error_chain_message(e.as_ref())
+                        ));
+                    }
+                }
+                _ => {
+                    on_event(event);
+                }
             }
-            on_event(event);
         }
         if saw_terminal {
             Ok(())
@@ -464,7 +503,7 @@ impl DaemonClient {
         session_id: &str,
         prompt: &str,
         options: ChatOptions,
-        on_event: &mut dyn FnMut(StreamEvent) -> Option<ApprovalDecision>,
+        on_event: &mut dyn FnMut(StreamEvent) -> EventReply,
     ) -> Result<(), Box<dyn std::error::Error>> {
         block_on(self.chat_async(session_id, prompt, options, on_event))
     }
@@ -482,6 +521,27 @@ impl DaemonClient {
             .json(&ApprovalResponse {
                 request_id: request_id.to_string(),
                 decision,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Send the answers to a pending `ask_user` batch. One response
+    /// resolves the whole batch (`answers[i]` ↔ `questions[i]`).
+    pub async fn answer_async(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.http
+            .post(self.session_url(session_id, "answer"))
+            .headers(self.api_headers())
+            .json(&QuestionResponse {
+                request_id: request_id.to_string(),
+                answers,
             })
             .send()
             .await?

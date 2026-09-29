@@ -11,7 +11,10 @@ use crate::agent::state::ToolState;
 use crate::agent::turn_loop::{apply_queue_msg, process_turn, AgentRuntime};
 use crate::llm::config::LlmConfig;
 use crate::llm::prompt::system_prompt_with_override_for;
-use crate::protocol::{ApprovalDecision, ApprovalRequest, ChatMessage, QueueMsg, SinkLine};
+use crate::protocol::{
+    ApprovalDecision, ApprovalRequest, ChatMessage, QuestionAnswer, QuestionRequest, QueueMsg,
+    SinkLine,
+};
 use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
 use crate::runtime::console::{CancellationToken, Console};
 use crate::runtime::unwind::CatchUnwind;
@@ -20,6 +23,7 @@ use dex_skills::{discover_skills_async, skill_dirs};
 
 use super::approvals::child_approval_bridge;
 use super::lookup::persisted_current;
+use super::questions::{child_question_bridge, parent_question_bridge};
 use super::server::create_queue_pair;
 use super::{journal_event, lock_map, DaemonState, PendingApproval};
 
@@ -114,6 +118,12 @@ pub(crate) async fn run_agent_turn(
             // parent turn and must stay answerable.
             for sender in self.state.take_session_pendings(&self.session_id) {
                 let _ = sender.try_send(ApprovalDecision::Deny);
+            }
+            // Same for the parent turn's still-pending `ask_user` batches:
+            // a blocked tool call must never outlive its surface. Child
+            // questions are skipped (same rule as child approvals).
+            for (sender, count) in self.state.take_session_question_pendings(&self.session_id) {
+                let _ = sender.try_send(vec![QuestionAnswer::Dismiss; count]);
             }
             // Tear down only the entries THIS turn registered: an idle wake
             // stolen by a user chat POST must not remove the user turn's
@@ -492,6 +502,20 @@ pub(crate) async fn run_turn_inner(
             child_approval_rx,
         ));
     }
+    // `ask_user` counterpart (§ ask-user spec): children's question batches
+    // park labeled and dismiss after the five-minute silence.
+    let (child_question_tx, child_question_rx) = mpsc::channel::<QuestionRequest>(8);
+    {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        let manager = state.manager_for(&session_id);
+        tokio::spawn(child_question_bridge(
+            state,
+            session_id.clone(),
+            manager,
+            child_question_rx,
+        ));
+    }
     let live_approvals = {
         let state = state.clone();
         let sid = session_id.to_string();
@@ -517,6 +541,7 @@ pub(crate) async fn run_turn_inner(
             .cloned()
             .unwrap_or_default(),
         child_approvals: Some(child_approval_tx),
+        child_questions: Some(child_question_tx),
         live_approvals: Some(live_approvals),
     });
 
@@ -580,7 +605,8 @@ pub(crate) async fn run_turn_inner(
     // tokio sender with dedicated threads.
     let (sink_tx, sink_rx) = mpsc::channel::<SinkLine>(256);
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(16);
-    let console = Console::daemon(sink_tx, approval_tx);
+    let (question_tx, question_rx) = mpsc::channel::<QuestionRequest>(16);
+    let console = Console::daemon(sink_tx, approval_tx).with_questions(Some(question_tx.clone()));
     // Restore “allow for session” approvals that survived from prior turns
     // (previously the per-turn Console dropped them).
     if let Some(set) = lock_map(&state.session_approvals).get(session_id).cloned() {
@@ -752,6 +778,25 @@ pub(crate) async fn run_turn_inner(
             // Channel closed: run_agent_turn may now emit the terminal event.
             let _ = approval_done.send(());
         });
+    }
+
+    // Question bridge (`ask_user`): each batch gets a fresh request_id;
+    // the response sender is parked in the shared state so POST /answer
+    // can resolve it. Events ride the turn's SSE pump like every other
+    // parent-turn event.
+    {
+        let state = state.clone();
+        let session_id = session_id.to_string();
+        let stream_tx = tx.clone();
+        let cancel = cancel.clone();
+        let question_rx = question_rx;
+        tokio::spawn(parent_question_bridge(
+            state,
+            session_id,
+            stream_tx,
+            question_rx,
+            cancel,
+        ));
     }
 
     let mut tool_state = ToolState::load_async().await;

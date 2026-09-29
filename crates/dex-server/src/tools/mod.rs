@@ -1,5 +1,6 @@
 #![allow(clippy::doc_lazy_continuation)]
 mod args;
+mod ask_user;
 mod audit;
 mod dispatch;
 mod edit;

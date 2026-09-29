@@ -11,10 +11,10 @@ use super::super::selection_text;
 use super::super::settle_activity;
 use super::super::word_bounds;
 use super::super::AgentChip;
-use super::super::PendingApproval;
 use super::super::Selection;
+use super::super::{PendingApproval, PendingQuestionUi};
 use super::pollers::refresh_git_async;
-use super::pollers::spawn_approval_poster;
+use super::pollers::{spawn_approval_poster, spawn_question_poster};
 use super::state::RemoteApp;
 use crate::protocol::ApprovalDecision;
 use crate::protocol::SinkLine;
@@ -153,6 +153,26 @@ pub(crate) fn output_rate(output: u64, gen_ms: Option<u64>) -> Option<f64> {
 
 pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
     match event {
+        StreamEvent::QuestionRequired {
+            request_id,
+            questions,
+            agent,
+        } => {
+            // Queue like approvals (V1b): child agents can park several
+            // batches; the wizard resolves the front, each entry POSTs
+            // its own answer set.
+            let (response, answers_rx) = mpsc::channel::<Vec<crate::protocol::QuestionAnswer>>(1);
+            remote
+                .app
+                .pending_questions
+                .push(PendingQuestionUi::new(questions, agent, response));
+            spawn_question_poster(
+                remote.client.clone(),
+                remote.session_id.clone(),
+                request_id,
+                answers_rx,
+            );
+        }
         StreamEvent::AssistantText(text) => {
             append_sink_line(&mut remote.app, SinkLine::Assistant(text));
         }

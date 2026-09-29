@@ -297,6 +297,7 @@ pub(crate) fn bootstrap(
         cancel_presses: 0,
         approval_rx: None,
         pending_approvals: Vec::new(),
+        pending_questions: Vec::new(),
         agents: Vec::new(),
         child_logs: Vec::new(),
         child_view: None,

@@ -825,6 +825,7 @@ async fn child_run(
         }
     };
     let console = Console::new(sink_tx, approval_tx)
+        .with_questions(ctx.child_questions.clone())
         .with_live_approvals(ctx.live_approvals.clone())
         .with_agent(id.0.clone(), def.name.clone());
     console.seed_session_approvals(ctx.session_approvals.clone());
@@ -959,6 +960,10 @@ async fn child_run(
         .filter(|tool| !is_delegation(tool))
         .cloned()
         .collect();
+    // `ask_user` is always available to children (like `ls`, it never
+    // prompts): a child blocked on a decision must be able to ask, and its
+    // question rides the same labeled prompt path as its approvals.
+    allowed.insert("ask_user".to_string());
     if may_delegate {
         allowed.insert(DELEGATION_TOOL.to_string());
     }
@@ -982,6 +987,7 @@ async fn child_run(
             manager: ctx.manager.clone(),
             session_approvals: ctx.session_approvals.clone(),
             child_approvals: ctx.child_approvals.clone(),
+            child_questions: ctx.child_questions.clone(),
             live_approvals: ctx.live_approvals.clone(),
         }))
     } else {

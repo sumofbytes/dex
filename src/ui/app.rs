@@ -226,6 +226,9 @@ pub(crate) struct App {
     /// single-slot overwrite-deny invariant is a queue now. The overlay
     /// renders the front; a decision pops it and reveals the next.
     pub(crate) pending_approvals: Vec<PendingApproval>,
+    /// Waiting `ask_user` batches, oldest first. The overlay resolves the
+    /// front; each entry POSTs its own answer set.
+    pub(crate) pending_questions: Vec<PendingQuestionUi>,
     /// Live child agents (V1b typed events, §15).
     pub(crate) agents: Vec<AgentChip>,
     /// Per-child transcript logs (plan §20 child view): scratch `App`s keyed
@@ -375,6 +378,7 @@ impl App {
             cancel_presses: 0,
             approval_rx: None,
             pending_approvals: Vec::new(),
+            pending_questions: Vec::new(),
             agents: Vec::new(),
             child_logs: Vec::new(),
             child_view: None,
@@ -528,6 +532,99 @@ impl PendingApproval {
             risk_label,
             risk_color,
         }
+    }
+}
+
+/// One pending `ask_user` batch with its wizard state. The overlay owns
+/// every key while pending; one sender resolves the whole batch
+/// (`answers[i]` ↔ `questions[i]`, unfilled slots submit as `Dismiss`).
+pub(crate) struct PendingQuestionUi {
+    pub(crate) questions: Vec<crate::protocol::Question>,
+    /// Answers recorded so far, filled positionally by the wizard.
+    pub(crate) answers: Vec<Option<crate::protocol::QuestionAnswer>>,
+    /// Wizard index: which question is showing.
+    pub(crate) current: usize,
+    /// Selected row of the visible question's menu: the options, then the
+    /// implicit "Other" row, then (multiSelect only) the Submit row.
+    pub(crate) selected: usize,
+    /// Toggle state for the visible question when `multi_select`.
+    pub(crate) toggled: Vec<bool>,
+    /// Free-text buffer while the "Other" row is being answered.
+    pub(crate) text_entry: Option<String>,
+    /// True when the summary screen (all questions answered) is showing.
+    pub(crate) summary: bool,
+    /// The child agent's definition name ("explorer asks: …").
+    pub(crate) agent: Option<String>,
+    pub(crate) response: tokio::sync::mpsc::Sender<Vec<crate::protocol::QuestionAnswer>>,
+}
+
+impl PendingQuestionUi {
+    pub(crate) fn new(
+        questions: Vec<crate::protocol::Question>,
+        agent: Option<String>,
+        response: tokio::sync::mpsc::Sender<Vec<crate::protocol::QuestionAnswer>>,
+    ) -> Self {
+        let toggled = questions
+            .first()
+            .map(|q| vec![false; q.options.len()])
+            .unwrap_or_default();
+        Self {
+            answers: vec![None; questions.len()],
+            current: 0,
+            selected: 0,
+            toggled,
+            text_entry: None,
+            summary: false,
+            agent,
+            questions,
+            response,
+        }
+    }
+
+    /// Row count of the visible question's menu (options + Other [+ Submit]).
+    pub(crate) fn menu_rows(&self) -> usize {
+        self.questions
+            .get(self.current)
+            .map(|q| q.options.len() + 1 + usize::from(q.multi_select))
+            .unwrap_or(0)
+    }
+
+    /// Reset the per-question selection state for the question now showing.
+    pub(crate) fn reset_selection(&mut self) {
+        self.selected = 0;
+        self.text_entry = None;
+        self.toggled = self
+            .questions
+            .get(self.current)
+            .map(|q| vec![false; q.options.len()])
+            .unwrap_or_default();
+    }
+
+    /// Record the current question's answer and advance; on the last
+    /// question this shows the summary screen instead of submitting —
+    /// Enter there sends the whole batch.
+    pub(crate) fn record_and_advance(&mut self, answer: crate::protocol::QuestionAnswer) {
+        if let Some(slot) = self.answers.get_mut(self.current) {
+            *slot = Some(answer);
+        }
+        self.text_entry = None;
+        if self.current + 1 < self.questions.len() {
+            self.current += 1;
+            self.reset_selection();
+        } else {
+            self.summary = true;
+        }
+    }
+
+    /// The batch's answers, unfilled slots as `Dismiss`.
+    pub(crate) fn collected(&self) -> Vec<crate::protocol::QuestionAnswer> {
+        self.answers
+            .iter()
+            .map(|slot| {
+                slot.clone()
+                    .unwrap_or(crate::protocol::QuestionAnswer::Dismiss)
+            })
+            .collect()
     }
 }
 

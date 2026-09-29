@@ -11,7 +11,9 @@ mod routes_chat;
 mod routes_misc;
 mod routes_sessions;
 
-pub(crate) use routes_chat::{approve, cancel, chat, create_queue_pair, followup, recall, steer};
+pub(crate) use routes_chat::{
+    answer, approve, cancel, chat, create_queue_pair, followup, recall, steer,
+};
 pub(crate) use routes_misc::{
     extensions_reload, extensions_run, get_config, get_extensions, get_git, get_mcp, health,
     list_skills, load_skill, log_requests, mcp_reconnect, require_bearer,
@@ -37,6 +39,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))
+        .route("/api/sessions/{id}/answer", post(answer))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/steer", post(steer))
         .route("/api/sessions/{id}/followup", post(followup))

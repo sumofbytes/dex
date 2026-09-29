@@ -13,4 +13,4 @@ pub mod runtime;
 pub mod sse;
 
 pub use auth::client_daemon_token;
-pub use http::{ChatOptions, DaemonClient};
+pub use http::{ChatOptions, DaemonClient, EventReply};
