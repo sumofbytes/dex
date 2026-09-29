@@ -1,6 +1,7 @@
 use super::super::approvals::write_approval_audit;
 use super::super::lock_map;
 use super::super::lookup::lookup_entry_async;
+use super::super::questions::sanitize_answers;
 use super::super::turn::run_agent_turn;
 use super::super::DaemonState;
 use super::routes_sessions::steal_wake_and_claim;
@@ -21,6 +22,7 @@ use axum::http::StatusCode;
 use axum::response::sse::Event;
 use axum::response::sse::Sse;
 use axum::Json;
+use dex_protocol::Question;
 use futures_core::Stream;
 use serde_json::json;
 use std::convert::Infallible;
@@ -229,10 +231,22 @@ pub(crate) async fn answer(
     let pending = lock_map(&state.pending_questions).remove(&req.request_id);
     match pending {
         Some(pending) if pending.session_id == session_id => {
+            // Clamp the client's batch against the parked questions before
+            // anything touches the audit trail or the executor (see
+            // `sanitize_answers`): slot count enforced, out-of-range
+            // `Choice`/`Multi` indices collapse to `Dismiss`.
+            let answers = match serde_json::from_str::<Vec<Question>>(&pending.questions_json) {
+                Ok(questions) => sanitize_answers(&questions, req.answers),
+                Err(_) => {
+                    let mut answers = req.answers;
+                    answers.truncate(pending.question_count);
+                    answers
+                }
+            };
             // Audit: answer kinds come from the single-source `as_str`, so
             // the trail never drifts from the wire spellings. Labels live
             // in the executor's own row.
-            let kinds: Vec<&'static str> = req.answers.iter().map(|a| a.clone().as_str()).collect();
+            let kinds: Vec<&'static str> = answers.iter().map(|a| a.as_str()).collect();
             write_approval_audit(
                 &session_id,
                 &req.request_id,
@@ -242,7 +256,7 @@ pub(crate) async fn answer(
                 &format!("remote; {}", kinds.join(",")),
                 pending.agent.as_deref(),
             );
-            let _ = pending.response.send(req.answers).await;
+            let _ = pending.response.send(answers).await;
             Ok(Json(json!({ "status": "ok" })))
         }
         Some(pending) => {

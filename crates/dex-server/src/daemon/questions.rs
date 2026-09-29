@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use dex_protocol::QuestionAnswer;
+use dex_protocol::{Question, QuestionAnswer};
 
 use crate::agent::delegate::{AgentId, AgentManager};
 use crate::protocol::QuestionRequest;
@@ -30,8 +30,11 @@ pub(crate) fn dismissed(count: usize) -> Vec<QuestionAnswer> {
 
 /// Parent-turn bridge: park each batch under a fresh `request_id` and
 /// surface it through the turn's SSE pump (the same channel that journals
-/// and forwards every other event, so ordering stays intact). No timer —
-/// the turn's `TurnGuard` dismisses parent questions on teardown.
+/// and forwards every other event, so ordering stays intact). Journal +
+/// direct-send ONLY — the turn's stream is registered in `active_streams`,
+/// so a broadcast here would deliver the event twice (mirrors the parent
+/// approval bridge in `turn.rs`). No timer — the turn's `TurnGuard`
+/// dismisses parent questions on teardown.
 pub(crate) async fn parent_question_bridge(
     state: Arc<DaemonState>,
     session_id: String,
@@ -77,7 +80,7 @@ pub(crate) async fn child_question_bridge(
             .agent
             .clone()
             .or_else(|| manager.definition_name(&AgentId(request.agent_id.clone()?)));
-        park(
+        let env = park(
             &state,
             &session_id,
             request_id.clone(),
@@ -88,6 +91,9 @@ pub(crate) async fn child_question_bridge(
                 response: request.response,
             },
         );
+        // With no turn streaming for children, the client's event poll is
+        // the delivery path (§15: child events ride ?since=).
+        state.broadcast_event(&session_id, &env);
         // The five-minute dismissal timer. Resolution removes the entry
         // first, so an answered prompt never double-dismisses.
         let timer_state = state.clone();
@@ -124,9 +130,9 @@ pub(crate) async fn child_question_bridge(
     }
 }
 
-/// Park one batch, then journal + broadcast the wire event (with no turn
-/// streaming for children, the client's event poll is the delivery path).
-/// Returns the envelope so the parent bridge can ride the turn's pump.
+/// Park one batch and journal the wire event. Returns the envelope; the
+/// caller owns the delivery path — parent: direct-send on the turn's
+/// stream, child: `broadcast_event` (children have no turn stream).
 fn park(
     state: &Arc<DaemonState>,
     session_id: &str,
@@ -158,6 +164,43 @@ fn park(
         },
     };
     journal_event(state, session_id, env.seq, &env.event);
-    state.broadcast_event(session_id, &env);
     env
+}
+
+/// Clamp a client-supplied answer batch server-side, mirroring the
+/// executor's `parse_questions` clamping (a mismatched client must not be
+/// able to mis-align `answers[i]` with `questions[i]`): the slot count is
+/// truncated/padded to the parked batch size, and out-of-range
+/// `Choice`/`Multi` indices collapse to `Dismiss` (the executor renders
+/// those rows as "no answer"). Selection order is preserved.
+pub(crate) fn sanitize_answers(
+    questions: &[Question],
+    answers: Vec<QuestionAnswer>,
+) -> Vec<QuestionAnswer> {
+    let mut answers = clamp_len(answers, questions.len());
+    for (answer, question) in answers.iter_mut().zip(questions) {
+        match answer {
+            QuestionAnswer::Choice(idx) if *idx >= question.options.len() => {
+                *answer = QuestionAnswer::Dismiss;
+            }
+            QuestionAnswer::Multi(idxs) => {
+                idxs.retain(|idx| *idx < question.options.len());
+                if idxs.is_empty() {
+                    *answer = QuestionAnswer::Dismiss;
+                }
+            }
+            _ => {}
+        }
+    }
+    answers
+}
+
+/// Truncate/pad an answer batch to exactly `count` slots (`Dismiss` fills
+/// the tail, matching the executor's missing-slot rendering).
+fn clamp_len(mut answers: Vec<QuestionAnswer>, count: usize) -> Vec<QuestionAnswer> {
+    answers.truncate(count);
+    while answers.len() < count {
+        answers.push(QuestionAnswer::Dismiss);
+    }
+    answers
 }
