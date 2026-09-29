@@ -147,6 +147,74 @@ pub struct ApprovalResponse {
     pub decision: ApprovalDecision,
 }
 
+/// One labeled option inside a [`Question`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// One structured question the model asks via the `ask_user` tool. Bounds
+/// (option count, label lengths) are enforced in the schema AND clamped
+/// server-side by the executor — schema constraints are advisory for some
+/// models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    /// Checkbox vs radio behavior on the picker surfaces.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// 0-based index into `options`, used by the headless empty-line
+    /// shortcut. `None` re-prompts instead.
+    #[serde(default)]
+    pub default: Option<usize>,
+}
+
+/// One answer slot in a [`QuestionResponse`]; `answers[i]` corresponds to
+/// `questions[i]` of the `QuestionRequired` event (unanswered slots are
+/// [`QuestionAnswer::Dismiss`]). `Choice`/`Multi` index into
+/// `Question.options` only — the implicit "Other" row is UI-only and never
+/// shifts those indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum QuestionAnswer {
+    #[serde(rename = "choice")]
+    Choice(usize),
+    #[serde(rename = "multi")]
+    Multi(Vec<usize>),
+    #[serde(rename = "text")]
+    Text(String),
+    #[serde(rename = "dismiss")]
+    Dismiss,
+}
+
+impl QuestionAnswer {
+    /// Audit spelling for the answer kind ("choice"/"multi"/"text"/
+    /// "dismiss"). Single source so audit rows never drift from the wire,
+    /// mirroring [`ApprovalDecision::as_str`]; the option labels for
+    /// `choice`/`multi` are joined by the caller, which owns the question.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Choice(_) => "choice",
+            Self::Multi(_) => "multi",
+            Self::Text(_) => "text",
+            Self::Dismiss => "dismiss",
+        }
+    }
+}
+
+/// POST body answering a `QuestionRequired` stream event, mirroring
+/// [`ApprovalResponse`]. One response resolves the whole batch: partial
+/// answers never cross the wire; UIs buffer per-question state and submit
+/// once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionResponse {
+    pub request_id: String,
+    pub answers: Vec<QuestionAnswer>,
+}
+
 // Single enum for the wire AND the agent loop. Serde spellings are the wire contract ("allow_once" /
 // "allow_session" / "deny"); `as_str` is the audit spelling ("once" /
 // "session" / "deny") — single source so audit rows never drift from the
@@ -223,6 +291,20 @@ pub enum StreamEvent {
         request_id: String,
         name: String,
         input: String,
+        #[serde(default)]
+        agent: Option<String>,
+    },
+
+    /// The model asked a structured question via the `ask_user` tool:
+    /// 1–4 questions, each with 2–4 labeled options plus an implicit
+    /// UI-only free-text row. `agent` is set when the requester is a
+    /// background child agent (same labeling as `ApprovalRequired`).
+    /// Optional with a serde default so older clients/datasets parse
+    /// unchanged.
+    #[serde(rename = "question_required")]
+    QuestionRequired {
+        request_id: String,
+        questions: Vec<Question>,
         #[serde(default)]
         agent: Option<String>,
     },
@@ -603,6 +685,89 @@ mod tests {
             serde_json::to_string(&ApprovalDecision::Deny).unwrap(),
             "\"deny\""
         );
+    }
+
+    #[test]
+    fn question_required_round_trips_and_defaults_agent() {
+        let event = StreamEvent::QuestionRequired {
+            request_id: "q-1".into(),
+            questions: vec![Question {
+                question: "Which database?".into(),
+                header: "Database".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "postgres".into(),
+                        description: "default".into(),
+                    },
+                    QuestionOption {
+                        label: "sqlite".into(),
+                        description: "embedded".into(),
+                    },
+                ],
+                multi_select: false,
+                default: Some(0),
+            }],
+            agent: Some("explorer".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"question_required\""));
+        assert!(json.contains("multi_select"));
+        let back: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // Old-client parse path: a journal/event without `agent` still parses.
+        let bare: StreamEvent = serde_json::from_str(
+            r#"{"type":"question_required","data":{"request_id":"q-1","questions":[]}}"#,
+        )
+        .unwrap();
+        match bare {
+            StreamEvent::QuestionRequired {
+                agent, questions, ..
+            } => {
+                assert_eq!(agent, None);
+                assert!(questions.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn question_answer_round_trips_all_variants() {
+        for answer in [
+            QuestionAnswer::Choice(1),
+            QuestionAnswer::Multi(vec![0, 2]),
+            QuestionAnswer::Text("sqlite, actually".into()),
+            QuestionAnswer::Dismiss,
+        ] {
+            let json = serde_json::to_string(&answer).unwrap();
+            let back: QuestionAnswer = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, answer);
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+        assert_eq!(
+            serde_json::to_string(&QuestionAnswer::Choice(0)).unwrap(),
+            r#"{"type":"choice","data":0}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&QuestionAnswer::Dismiss).unwrap(),
+            r#"{"type":"dismiss"}"#
+        );
+        // Audit spellings share one source with the wire kinds.
+        assert_eq!(QuestionAnswer::Choice(3).as_str(), "choice");
+        assert_eq!(QuestionAnswer::Multi(vec![]).as_str(), "multi");
+        assert_eq!(QuestionAnswer::Text("t".into()).as_str(), "text");
+        assert_eq!(QuestionAnswer::Dismiss.as_str(), "dismiss");
+    }
+
+    #[test]
+    fn question_response_round_trips() {
+        let req = QuestionResponse {
+            request_id: "q-1".into(),
+            answers: vec![QuestionAnswer::Choice(1), QuestionAnswer::Dismiss],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: QuestionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.request_id, "q-1");
+        assert_eq!(back.answers.len(), 2);
     }
 
     #[test]

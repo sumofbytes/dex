@@ -18,7 +18,7 @@ use super::super::turn::run_turn_inner;
 use super::super::turn::TurnChannels;
 #[cfg(test)]
 use crate::daemon::server::{
-    approve, cancel, chat, create_session, extensions_reload, extensions_run, followup,
+    answer, approve, cancel, chat, create_session, extensions_reload, extensions_run, followup,
     get_extensions, get_git, get_mcp, health, list_skills, load_skill, mcp_reconnect, reattach,
     recall, router, session_events, session_name, session_trace, session_undo, session_waive,
     steal_wake_and_claim, steer,
@@ -26,9 +26,10 @@ use crate::daemon::server::{
 #[cfg(test)]
 use crate::daemon::server::{list_sessions, DaemonState};
 #[cfg(test)]
-use crate::daemon::state::{lock_map, PendingApproval, SessionEntry};
+use crate::daemon::state::{lock_map, PendingApproval, PendingQuestion, SessionEntry};
 #[cfg(test)]
 use crate::llm::config::LlmConfig;
+use crate::protocol::QuestionAnswer;
 #[cfg(test)]
 use crate::protocol::{
     ApprovalDecision, ChatRequest, CreateSessionRequest, ExtensionRunRequest, FollowupRequest,
@@ -623,6 +624,126 @@ mod handler_tests {
             rx.try_recv().ok(),
             Some(crate::protocol::ApprovalDecision::Deny)
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
+    async fn answer_resolves_parked_question_and_404s_cross_session() {
+        let _lock = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+        let state = Arc::new(DaemonState::new());
+        let questions = vec![crate::protocol::Question {
+            question: "Which database?".into(),
+            header: "Database".into(),
+            options: vec![
+                crate::protocol::QuestionOption {
+                    label: "postgres".into(),
+                    description: String::new(),
+                },
+                crate::protocol::QuestionOption {
+                    label: "sqlite".into(),
+                    description: String::new(),
+                },
+            ],
+            multi_select: false,
+            default: None,
+        }];
+        let (tx, mut rx) = mpsc::channel(1);
+        state.pending_questions.lock().unwrap().insert(
+            "q-1".into(),
+            PendingQuestion {
+                session_id: "sess-a".into(),
+                response: tx,
+                question_count: 1,
+                questions_json: serde_json::to_string(&questions).unwrap(),
+                agent_id: None,
+                agent: None,
+            },
+        );
+
+        // Unknown request_id -> 404; cross-session -> 404 and restored.
+        for (session, request_id) in [("sess-a", "missing"), ("sess-b", "q-1")] {
+            let r = answer(
+                State(state.clone()),
+                Path(session.into()),
+                Json(crate::protocol::QuestionResponse {
+                    request_id: request_id.into(),
+                    answers: vec![crate::protocol::QuestionAnswer::Choice(1)],
+                }),
+            )
+            .await;
+            assert!(
+                matches!(r, Err(StatusCode::NOT_FOUND)),
+                "{session}/{request_id}"
+            );
+        }
+        assert!(state.pending_questions.lock().unwrap().contains_key("q-1"));
+        assert!(
+            rx.try_recv().is_err(),
+            "restored batch must not be resolved"
+        );
+
+        // The right session resolves the whole batch with the posted answers.
+        let r = answer(
+            State(state.clone()),
+            Path("sess-a".into()),
+            Json(crate::protocol::QuestionResponse {
+                request_id: "q-1".into(),
+                answers: vec![crate::protocol::QuestionAnswer::Choice(1)],
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert!(state.pending_questions.lock().unwrap().is_empty());
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(vec![crate::protocol::QuestionAnswer::Choice(1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_dismisses_parent_questions_but_not_child_ones() {
+        let state = Arc::new(DaemonState::new());
+        let (tx_parent, mut rx_parent) = mpsc::channel(1);
+        let (tx_child, mut rx_child) = mpsc::channel(1);
+        let questions_json = "[]".to_string();
+        {
+            let mut pending = state.pending_questions.lock().unwrap();
+            pending.insert(
+                "q-parent".into(),
+                PendingQuestion {
+                    session_id: "s-a".into(),
+                    response: tx_parent,
+                    question_count: 2,
+                    questions_json: questions_json.clone(),
+                    agent_id: None,
+                    agent: None,
+                },
+            );
+            pending.insert(
+                "q-child".into(),
+                PendingQuestion {
+                    session_id: "s-a".into(),
+                    response: tx_child,
+                    question_count: 1,
+                    questions_json,
+                    agent_id: Some("a-1".into()),
+                    agent: Some("explorer".into()),
+                },
+            );
+        }
+        let _ = cancel(State(state.clone()), Path("s-a".into())).await;
+        // Parent batch dismissed with the right slot count; child batch
+        // stays parked and answerable (the child outlives the turn).
+        assert_eq!(
+            rx_parent.try_recv().ok(),
+            Some(vec![QuestionAnswer::Dismiss, QuestionAnswer::Dismiss])
+        );
+        assert!(state
+            .pending_questions
+            .lock()
+            .unwrap()
+            .contains_key("q-child"));
+        assert!(rx_child.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1683,7 +1804,7 @@ mod e2e_tests {
     use axum::extract::State as AxumState;
     use axum::routing::post;
     use axum::Router;
-    use dex_client::http::{ChatOptions, DaemonClient};
+    use dex_client::http::{ChatOptions, DaemonClient, EventReply};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn spawn_app(app: Router) -> String {
@@ -1797,14 +1918,14 @@ mod e2e_tests {
                     "write a file please",
                     ChatOptions::default(),
                     &mut |event| {
-                        let decision = match &event {
+                        let reply = match &event {
                             crate::protocol::StreamEvent::ApprovalRequired { .. } => {
-                                Some(crate::protocol::ApprovalDecision::Deny)
+                                EventReply::Decision(crate::protocol::ApprovalDecision::Deny)
                             }
-                            _ => None,
+                            _ => EventReply::None,
                         };
                         events.push(event);
-                        decision
+                        reply
                     },
                 )
                 .map_err(|e| e.to_string());
@@ -1987,7 +2108,7 @@ mod e2e_tests {
                     &session_id,
                     "go explore",
                     ChatOptions::default(),
-                    &mut |_event| None,
+                    &mut |_event| EventReply::None,
                 )
                 .map_err(|e| e.to_string());
             (session_id, r)
@@ -2141,7 +2262,7 @@ mod e2e_tests {
                     ChatOptions::default(),
                     &mut |event| {
                         events.push(event);
-                        None
+                        EventReply::None
                     },
                 )
                 .map_err(|e| e.to_string());
@@ -2207,7 +2328,7 @@ mod e2e_tests {
                     ChatOptions::default(),
                     &mut |event| {
                         events.push(event);
-                        None
+                        EventReply::None
                     },
                 )
                 .map_err(|e| e.to_string());
@@ -2507,7 +2628,7 @@ mod e2e_tests {
                     },
                     &mut |event| {
                         first.push(event);
-                        None
+                        EventReply::None
                     },
                 )
                 .unwrap();
@@ -2524,7 +2645,7 @@ mod e2e_tests {
                     },
                     &mut |event| {
                         second.push(event);
-                        None
+                        EventReply::None
                     },
                 )
                 .unwrap();

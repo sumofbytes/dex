@@ -51,6 +51,18 @@ All of this lives in `crates/dex-server/src/llm/config/` — don't add a second 
 - Tool output is truncated for the model: bash ~400 lines/32 KiB, read 2000 lines/256 KiB, fan-out caps 10 files. Use `$DEX_BIN run <tool>` inside `bash` to stitch pipelines without flooding context.
 - Sessions journal incrementally (`crates/dex-session/src/store.rs`); `turn_start`/`turn_complete`/`turn_failed` markers — crash loses at most the in-flight event.
 
+## Testing philosophy — property-based first
+
+Prefer property-based tests (`proptest`) over example-based unit tests wherever the code takes structured input. The codebase already follows this (`crates/dex-agent-core/src/{text,tokens,budgets}.rs`, `crates/dex-ai/src/streaming/parser.rs`); new logic should too.
+
+- State the invariant, not the example. Ask "what must always hold?" (idempotence, roundtrip, monotonicity, parse(render(x)) == x, output size bounds, no panic) and assert that over generated input, instead of hand-picking cases.
+- Generate realistic domain values: build strategies from the real data shapes (roles, tool calls, chunk sequences), not just `any::<String>()`. Use small bounded strings/vecs so failures shrink readably.
+- Always mix in edge cases: empty input, max-size input, unicode/surrogates, `\r\n`, adversarial sequences. Proptest strategies make these first-class — don't leave them to luck.
+- When a property fails, proptest writes a shrinking case to `proptest-regressions/` — commit that file. Don't hand-translate the failure into a unit test and drop the property.
+- Keep example-based tests for exact-output contracts (snapshot-style: rendering, serialization, doctor output) where a specific expected string is the spec, and for reproducing a fixed bug when the shrinking case is unclear. Everything else leans on properties.
+- Wire-format and parser code (SSE parsing, JSONL journal, config resolution) is the highest-value target: roundtrip and "parse never panics on arbitrary bytes" properties belong there.
+- Pure, deterministic, seedless-by-default: property tests must not depend on wall-clock, network, or cwd, and must pass under `cargo test --all-targets` alongside everything else.
+
 ## Conventions
 
 - No new dependencies without clear need — check `Cargo.toml` first, prefer stdlib/native.

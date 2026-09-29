@@ -125,6 +125,7 @@ async fn delegate_rejects_unresolvable_model_before_spawning() {
         manager: manager.clone(),
         session_approvals: HashSet::new(),
         child_approvals: None,
+        child_questions: None,
         live_approvals: None,
     });
     let mut args = Map::new();
@@ -225,6 +226,7 @@ async fn parent_cancel_ends_delegate_output_without_touching_children() {
         manager: manager.clone(),
         session_approvals: HashSet::new(),
         child_approvals: None,
+        child_questions: None,
         live_approvals: None,
     });
     let id = manager
@@ -500,6 +502,7 @@ fn resume_test_ctx(manager: AgentManager, session_path: PathBuf) -> Arc<AgentTur
         manager,
         session_approvals: HashSet::new(),
         child_approvals: None,
+        child_questions: None,
         live_approvals: None,
     })
 }
@@ -757,6 +760,7 @@ end
         manager: manager.clone(),
         session_approvals: HashSet::new(),
         child_approvals: None,
+        child_questions: None,
         live_approvals: None,
     });
     let mut args = Map::new();

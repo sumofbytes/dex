@@ -116,11 +116,54 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                     "properties": {
                         "path": { "type": "string", "description": "directory to list (default '.')" }
                     },
-                    "required": []
+          "required": []
+              }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "ask_user".to_string(),
+                description: "Ask the user a structured question when a decision has 2-4 well-defined options; prefer this over guessing. Ask in plain text for anything open-ended. One call may batch related questions (each gets its own picker screen). If the user dismisses a question, proceed on your own judgment instead of re-asking the same question.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 4,
+                            "description": "1-4 related questions, each rendered as its own picker screen",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "question": { "type": "string", "description": "one line, the actual ask" },
+                                    "header": { "type": "string", "maxLength": 12, "description": "short picker tab label, e.g. 'Database'" },
+                                    "options": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": 4,
+                                        "description": "2-4 labeled choices; a free-text 'Other' row is added implicitly",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": { "type": "string", "maxLength": 20, "description": "what the user selects" },
+                                                "description": { "type": "string", "description": "one line shown under the label" }
+                                            },
+                                            "required": ["label", "description"]
+                                        }
+                                    },
+                                    "multiSelect": { "type": "boolean", "description": "checkbox behavior allowing several options (default false)" },
+                                    "default": { "type": "integer", "description": "0-based index into options; preselected in pickers and used by the headless empty-line shortcut" }
+                                },
+                                "required": ["question", "header", "options"]
+                            }
+                        }
+                    },
+                    "required": ["questions"]
                 }),
-              },
-          },
-      ];
+            },
+        },
+    ];
     // Sub-agent delegation (§10): background spawn + bounded wait + stop.
     // Registered only in daemon-linked processes with the kill switch unset;
     // OneShot/direct runs reject it at dispatch (no manager to spawn into).
@@ -194,7 +237,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["read", "bash", "write", "edit", "grep", "find", "ls"]
+            ["read", "bash", "write", "edit", "grep", "find", "ls", "ask_user"]
         );
 
         let with_delegation = builtin_tools(true);

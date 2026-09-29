@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::runtime::cancel::CancellationSource;
 
-use dex_agent_core::lines::{ApprovalRequest, SinkLine};
+use dex_agent_core::lines::{ApprovalRequest, QuestionRequest, SinkLine};
 
 /// Live "allow for session" lookup (V1b): the daemon hands children a
 /// closure over its approval map so decisions granted after a child
@@ -192,6 +192,11 @@ pub struct Console {
     /// Stamped onto its `ApprovalRequest`s so the daemon parks and labels
     /// them as the child's; `None` for the parent turn's own tools.
     pub agent: Option<(String, String)>,
+    /// `ask_user` channel: the tool executor sends a [`QuestionRequest`];
+    /// the daemon-side bridge parks it and routes it to the active surface.
+    /// `None` where no interactive surface exists (explicit CLI runs), in
+    /// which case `ask_user` fails closed.
+    questions: Option<mpsc::Sender<QuestionRequest>>,
 }
 
 impl Clone for Console {
@@ -205,6 +210,7 @@ impl Clone for Console {
             remote_approval: self.remote_approval,
             live_approvals: self.live_approvals.clone(),
             agent: self.agent.clone(),
+            questions: self.questions.clone(),
         }
     }
 }
@@ -219,6 +225,7 @@ impl Console {
             remote_approval: false,
             live_approvals: None,
             agent: None,
+            questions: None,
         }
     }
 
@@ -232,6 +239,7 @@ impl Console {
             remote_approval: false,
             live_approvals: None,
             agent: None,
+            questions: None,
         }
     }
 
@@ -244,6 +252,7 @@ impl Console {
             remote_approval: true,
             live_approvals: None,
             agent: None,
+            questions: None,
         }
     }
 
@@ -279,6 +288,17 @@ impl Console {
 
     pub fn approval(&self) -> Option<&mpsc::Sender<ApprovalRequest>> {
         self.approval.as_ref()
+    }
+
+    /// Attach the `ask_user` channel (daemon turns): the executor sends a
+    /// [`QuestionRequest`], the bridge parks + routes it.
+    pub fn with_questions(mut self, questions: Option<mpsc::Sender<QuestionRequest>>) -> Self {
+        self.questions = questions;
+        self
+    }
+
+    pub fn questions(&self) -> Option<&mpsc::Sender<QuestionRequest>> {
+        self.questions.as_ref()
     }
 
     /// Async emit for async turn/SSE/tool paths: back-pressured `send().await`.

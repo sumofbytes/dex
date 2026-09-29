@@ -31,6 +31,16 @@ const READ_ONLY: ToolMetadata = ToolMetadata {
 pub fn native_tool_metadata(name: &str) -> Option<ToolMetadata> {
     Some(match name {
         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => READ_ONLY,
+        // `ask_user` parks state per call (a pending question), so it cannot
+        // share the `READ_ONLY` constant's `idempotent: true`. It still never
+        // prompts: `Read` passes in every session mode.
+        "ask_user" => ToolMetadata {
+            read_only: true,
+            mutating: false,
+            idempotent: false,
+            requires_shell: false,
+            permission: PermissionRequirement::Read,
+        },
         "bash" => ToolMetadata {
             read_only: false,
             mutating: true,

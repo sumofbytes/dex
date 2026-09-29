@@ -142,6 +142,31 @@ pub(crate) fn spawn_approval_poster(
     });
 }
 
+/// One answer courier per queued `ask_user` batch (the question counterpart
+/// of [`spawn_approval_poster`]): the overlay resolves the front entry
+/// through its own sender and this task POSTs the answers for that
+/// request_id. A closed channel (the TUI went away) skips the POST — the
+/// daemon's turn teardown dismisses the parked batch instead.
+pub(crate) fn spawn_question_poster(
+    client: DaemonClient,
+    session_id: String,
+    request_id: String,
+    answers_rx: mpsc::Receiver<Vec<crate::protocol::QuestionAnswer>>,
+) {
+    crate::runtime::http::spawn_task(async move {
+        let mut answers_rx = answers_rx;
+        if let Some(answers) = answers_rx.recv().await {
+            if let Err(e) = client.answer_async(&session_id, &request_id, answers).await {
+                dex_runtime::log!(
+                    Warn,
+                    "daemon answer delivery failed: {}",
+                    crate::runtime::error::chain_message(&*e)
+                );
+            }
+        }
+    });
+}
+
 /// Terminal-close classification for the worker task. The daemon always ends
 /// a turn with `TurnComplete` / `TurnFailed`; closing without one is a
 /// transport failure and must surface as an error, not silent success.

@@ -2,7 +2,7 @@
 
 use std::ops::Deref;
 
-pub use dex_client::http::{mcp_auth_lines, ChatOptions, ChatStream};
+pub use dex_client::http::{mcp_auth_lines, ChatOptions, ChatStream, EventReply};
 
 /// Application-configured client retaining Dex's shared runtime, HTTP pools,
 /// credential lookup, and structured warning logger.

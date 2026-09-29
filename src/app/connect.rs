@@ -1,10 +1,9 @@
 use std::io::{self, IsTerminal, Write};
 
-use crate::protocol::{ApprovalDecision, StreamEvent};
+use crate::client::http::{ChatOptions, DaemonClient, EventReply};
+use crate::protocol::{ApprovalDecision, Question, QuestionAnswer, StreamEvent};
 use crate::runtime::console::{AGENT_COLOR, RESET};
 use crate::runtime::format_runtime::agent_lifecycle;
-
-use crate::client::http::{ChatOptions, DaemonClient};
 
 fn prompt_for_approval(name: &str, input: &str) -> ApprovalDecision {
     use crate::render::format::{approval_details, approval_summary, approval_title};
@@ -41,7 +40,7 @@ fn approval_answer(answer: &str) -> ApprovalDecision {
     }
 }
 
-fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
+fn handle_event(event: StreamEvent) -> EventReply {
     handle_event_with(event, &mut prompt_for_approval)
 }
 
@@ -50,7 +49,7 @@ fn handle_event(event: StreamEvent) -> Option<ApprovalDecision> {
 fn handle_event_with(
     event: StreamEvent,
     decide: &mut dyn FnMut(&str, &str) -> ApprovalDecision,
-) -> Option<ApprovalDecision> {
+) -> EventReply {
     match event {
         StreamEvent::AssistantText(text) => {
             print!("{text}");
@@ -94,7 +93,15 @@ fn handle_event_with(
             if let Some(agent) = agent {
                 eprintln!("  [{agent}] requests {name}");
             }
-            return Some(decide(&name, &input));
+            return EventReply::Decision(decide(&name, &input));
+        }
+        StreamEvent::QuestionRequired {
+            questions, agent, ..
+        } => {
+            if let Some(agent) = agent {
+                eprintln!("{AGENT_COLOR}  [{agent}] asks:{RESET}");
+            }
+            return EventReply::Answers(prompt_questions(&questions));
         }
         StreamEvent::TurnFailed { error } => {
             eprintln!("\nerror: {error}");
@@ -147,7 +154,147 @@ fn handle_event_with(
         // headless clients render the parent transcript's lifecycle lines.
         StreamEvent::AgentLine { .. } => {}
     }
-    None
+    EventReply::None
+}
+
+/// The whole batch dismissed: a piped/closed stdin or a Ctrl-C must never
+/// hang the turn on a question nobody will answer.
+fn dismissed(count: usize) -> Vec<QuestionAnswer> {
+    vec![QuestionAnswer::Dismiss; count]
+}
+
+/// Numbered-prompt fallback for `ask_user` (the stdin equivalent of the
+/// approval y/n prompt). One question at a time; a recorded answer advances
+/// (the last question's submit sends the whole batch). `.` alone dismisses
+/// the current question; an empty line picks `default` when the model set
+/// one, else re-prompts. Ctrl-C / EOF / non-TTY stdin dismiss the batch.
+fn prompt_questions(questions: &[Question]) -> Vec<QuestionAnswer> {
+    // A piped or closed stdin can never answer: dismiss immediately
+    // instead of reading a junk line or hanging.
+    if !io::stdin().is_terminal() {
+        return dismissed(questions.len());
+    }
+    prompt_questions_with(questions, &mut read_answer_line)
+}
+
+/// One stdin line for the question prompt; `None` = EOF or Ctrl-C.
+fn read_answer_line() -> Option<String> {
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) if crate::runtime::console::is_interrupted() => None,
+        Ok(_) => Some(line),
+        Err(_) => None,
+    }
+}
+
+/// The prompt loop with the line source injected (tests use a script).
+fn prompt_questions_with(
+    questions: &[Question],
+    read: &mut dyn FnMut() -> Option<String>,
+) -> Vec<QuestionAnswer> {
+    let mut answers: Vec<Option<QuestionAnswer>> = vec![None; questions.len()];
+    let mut idx = 0;
+    while idx < questions.len() {
+        let question = &questions[idx];
+        eprintln!();
+        eprintln!(
+            "[{}/{}] {}? ({}: {})",
+            idx + 1,
+            questions.len(),
+            question.header,
+            if question.multi_select {
+                "numbers"
+            } else {
+                "number"
+            },
+            if question.default.is_some() {
+                "empty line: default, '.': skip"
+            } else {
+                "'.': skip"
+            }
+        );
+        for (i, option) in question.options.iter().enumerate() {
+            let marker = if question.default == Some(i) {
+                "  — default"
+            } else {
+                ""
+            };
+            eprintln!("  {}) {}{marker}", i + 1, option.label);
+        }
+        eprintln!("  {}) other", question.options.len() + 1);
+        eprint!("> ");
+        io::stderr().flush().ok();
+        let Some(line) = read() else {
+            return dismissed(questions.len());
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            if let Some(default) = question.default {
+                answers[idx] = Some(QuestionAnswer::Choice(default));
+                idx += 1;
+            }
+            // No default: re-prompt the same question.
+            continue;
+        }
+        if line == "." {
+            answers[idx] = Some(QuestionAnswer::Dismiss);
+            idx += 1;
+            continue;
+        }
+        if question.multi_select {
+            match parse_multi_select(line, question.options.len()) {
+                Some(idxs) => {
+                    answers[idx] = Some(QuestionAnswer::Multi(idxs));
+                    idx += 1;
+                }
+                None => eprintln!("  pick comma-separated numbers, e.g. 1,3 ('.' to skip)"),
+            }
+            continue;
+        }
+        match line.parse::<usize>() {
+            Ok(n) if (1..=question.options.len()).contains(&n) => {
+                answers[idx] = Some(QuestionAnswer::Choice(n - 1));
+                idx += 1;
+            }
+            // The implicit "other" row is display-only: it never shifts the
+            // option indices.
+            Ok(n) if n == question.options.len() + 1 => {
+                eprint!("  your answer: ");
+                io::stderr().flush().ok();
+                match read() {
+                    Some(text) => {
+                        answers[idx] = Some(QuestionAnswer::Text(text));
+                        idx += 1;
+                    }
+                    None => return dismissed(questions.len()),
+                }
+            }
+            _ => eprintln!("  pick 1..{} ('.' to skip)", question.options.len() + 1),
+        }
+    }
+    answers
+        .into_iter()
+        .map(|answer| answer.unwrap_or(QuestionAnswer::Dismiss))
+        .collect()
+}
+
+/// Parse `1,3` (or a single `2`) into option indices; anything invalid
+/// (out of range, junk, duplicates) returns `None` so the prompt can
+/// re-ask instead of recording a half-answer.
+fn parse_multi_select(line: &str, option_count: usize) -> Option<Vec<usize>> {
+    let mut idxs = Vec::new();
+    for part in line.split(',') {
+        let n: usize = part.trim().parse().ok()?;
+        if !(1..=option_count).contains(&n) || idxs.contains(&(n - 1)) {
+            return None;
+        }
+        idxs.push(n - 1);
+    }
+    if idxs.is_empty() {
+        return None;
+    }
+    Some(idxs)
 }
 
 /// One-shot mode: `!<command>` runs a shell command directly on the daemon

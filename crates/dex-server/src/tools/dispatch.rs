@@ -221,6 +221,13 @@ async fn dispatch_tool(
             .map_err(ToolError::Internal);
     }
     enforce_policy(name, args, requirement, cancel, policy, filter).await?;
+    if name == "ask_user" {
+        // Not a workspace tool: it parks a question on the active surface
+        // and returns the formatted answer as the tool result. Reached only
+        // past the gate (a `Read` requirement never prompts) and the
+        // allowlist (children always carry `ask_user`).
+        return super::ask_user::tool_ask_user(args, cancel, policy).await;
+    }
     if name.starts_with("mcp__") {
         // `ToolError::Internal` displays as the raw message, so the caller's
         // single audit row records exactly the string audited here before.
@@ -253,6 +260,7 @@ async fn dispatch_tool(
         "edit" => tool_edit(args).await,
         "grep" | "ffgrep" | "find" | "fffind" => unreachable!("handled above"),
         "ls" => tool_ls(args).await,
+        "ask_user" => unreachable!("handled before the workspace dispatch"),
         _ => unreachable!("metadata and dispatch must stay in sync"),
     }
 }
