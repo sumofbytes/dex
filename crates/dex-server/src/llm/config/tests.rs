@@ -2542,18 +2542,16 @@ fn doctor_output_is_byte_stable() {
     // XDG config dir, which must not see the developer's real installs.
     std::env::set_var("XDG_CONFIG_HOME", "/tmp/dex-doctor-snapshot/config");
     let out = doctor(None, None, None, &[], None).0;
+    let version_line = format!("dex {}\n\n", crate::runtime::runtime::http::VERSION);
     let expected = format!(
             "{}{}",
+            version_line,
             concat!(
-                concat!("dex ", env!("CARGO_PKG_VERSION"), "\n"),
-                "\n",
                 "config                  /tmp/dex-doctor-snapshot/missing.yaml         missing or invalid — ignored (env/defaults still apply)\n",
                 "catalog                 /tmp/dex-doctor-snapshot/cache/dex/models.dev.json\n",
                 "                                                                      missing — run `dex update --models`\n",
                 "\n",
                 "provider                (unset)                                       UNCONFIGURED — set 'model: <provider>/<model>'\n",
-            ),
-            concat!(
                 "compaction              deterministic                                 built-in default\n",
                 "harness slots           default                                       built-in default\n",
                 "harness tools           200                                           built-in default\n",

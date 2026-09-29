@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::runtime::runtime::http::VERSION;
+
 pub(crate) const DEFAULT_REPO: &str = "sumofbytes/dex";
 
 /// Sync entry point for `dex update`: blocks on the shared runtime.
@@ -79,11 +81,10 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         }
     };
 
-    let current = parse_version(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is semver");
+    let current = parse_version(VERSION).expect("dex release version is semver");
     if pinned.is_none() && latest <= current {
         return Ok(format!(
-            "dex {} is up to date (latest release {tag})",
-            env!("CARGO_PKG_VERSION")
+            "dex {VERSION} is up to date (latest release {tag})"
         ));
     }
 
@@ -128,12 +129,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
     }
     .await;
     let _ = fs::remove_dir_all(&dir);
-    outcome.map(|installed| {
-        format!(
-            "dex {} -> {tag} — updated at {installed}",
-            env!("CARGO_PKG_VERSION")
-        )
-    })
+    outcome.map(|installed| format!("dex {VERSION} -> {tag} — updated at {installed}"))
 }
 
 /// Download a URL into bytes; the message names the URL like install.sh does.
