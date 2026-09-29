@@ -77,7 +77,7 @@ fn handle_event_prints_and_only_asks_on_approvals() {
         },
     ];
     for event in events {
-        assert_eq!(handle_event_with(event, &mut decide), None);
+        assert_eq!(handle_event_with(event, &mut decide), EventReply::None);
     }
     assert!(
         calls.borrow().is_empty(),
@@ -94,10 +94,130 @@ fn handle_event_prints_and_only_asks_on_approvals() {
         },
         &mut decide,
     );
-    assert_eq!(decision, Some(ApprovalDecision::AllowSession));
+    assert_eq!(
+        decision,
+        EventReply::Decision(ApprovalDecision::AllowSession)
+    );
     assert_eq!(
         calls.borrow().as_slice(),
         vec![("write".to_string(), r#"{"path":"x"}"#.to_string())]
+    );
+}
+
+fn sample_questions() -> Vec<crate::protocol::Question> {
+    use crate::protocol::{Question, QuestionOption};
+    vec![
+        Question {
+            question: "Which database?".into(),
+            header: "Database".into(),
+            options: vec![
+                QuestionOption {
+                    label: "postgres".into(),
+                    description: "default".into(),
+                },
+                QuestionOption {
+                    label: "sqlite".into(),
+                    description: "embedded".into(),
+                },
+            ],
+            multi_select: false,
+            default: Some(0),
+        },
+        Question {
+            question: "Pick extras".into(),
+            header: "Extras".into(),
+            options: vec![
+                QuestionOption {
+                    label: "auth".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "telemetry".into(),
+                    description: String::new(),
+                },
+            ],
+            multi_select: true,
+            default: None,
+        },
+    ]
+}
+
+/// Scripted stdin for `prompt_questions_with`; `None` entries are EOF and
+/// an exhausted script is EOF too (the caller only scripts what it needs).
+fn script(lines: &[Option<&str>]) -> impl FnMut() -> Option<String> {
+    let owned: Vec<Option<String>> = lines
+        .iter()
+        .map(|l| l.as_ref().map(|s| s.to_string()))
+        .collect();
+    let mut it = owned.into_iter();
+    move || it.next().unwrap_or(None)
+}
+
+#[test]
+fn headless_questions_eof_dismisses_the_whole_batch() {
+    let answers = prompt_questions_with(&sample_questions(), &mut script(&[Some("2")]));
+    // The first answer was recorded, but EOF on the second dismisses
+    // everything — a half-batch must never be submitted.
+    assert_eq!(
+        answers,
+        vec![QuestionAnswer::Dismiss, QuestionAnswer::Dismiss]
+    );
+}
+
+#[test]
+fn headless_questions_empty_line_honors_default_and_rereprompts() {
+    // Empty line on q1 picks the model-set default; empty on q2 (no
+    // default) re-prompts, then "1" answers it; the last Enter submits.
+    let answers = prompt_questions_with(
+        &sample_questions(),
+        &mut script(&[Some(""), Some(""), Some("1")]),
+    );
+    assert_eq!(
+        answers,
+        vec![QuestionAnswer::Choice(0), QuestionAnswer::Multi(vec![0]),]
+    );
+}
+
+#[test]
+fn headless_questions_dot_skips_and_multi_parses() {
+    let answers =
+        prompt_questions_with(&sample_questions(), &mut script(&[Some("."), Some("2,1")]));
+    assert_eq!(
+        answers,
+        vec![QuestionAnswer::Dismiss, QuestionAnswer::Multi(vec![1, 0]),]
+    );
+    // Junk multi answers re-prompt until a valid line arrives.
+    let answers = prompt_questions_with(
+        &sample_questions(),
+        &mut script(&[Some("1"), Some("9"), Some("auth"), Some("1,1"), Some("2")]),
+    );
+    assert_eq!(
+        answers,
+        vec![QuestionAnswer::Choice(0), QuestionAnswer::Multi(vec![1])]
+    );
+}
+
+#[test]
+fn headless_questions_other_row_takes_free_text() {
+    let answers = prompt_questions_with(
+        &sample_questions(),
+        &mut script(&[Some("3"), Some("sqlite, on a stick\n"), Some("1")]),
+    );
+    assert_eq!(
+        answers[0],
+        QuestionAnswer::Text("sqlite, on a stick\n".to_string())
+    );
+}
+
+#[test]
+fn headless_questions_out_of_range_rereprompts() {
+    let answers = prompt_questions_with(
+        &sample_questions(),
+        &mut script(&[Some("7"), Some("0"), Some("2"), Some("1")]),
+    );
+    assert_eq!(
+        answers,
+        vec![QuestionAnswer::Choice(1), QuestionAnswer::Multi(vec![0])]
     );
 }
 

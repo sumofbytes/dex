@@ -284,10 +284,14 @@ async fn chat_async_callback_path_still_forwards_and_approves() {
     let mut seen = Vec::new();
     client
         .chat_async("s1", "hi", ChatOptions::default(), &mut |event| {
-            let decision = matches!(event, StreamEvent::ApprovalRequired { .. })
-                .then_some(ApprovalDecision::Deny);
-            seen.push(matches!(event, StreamEvent::ApprovalRequired { .. }));
-            decision
+            let approval = matches!(event, StreamEvent::ApprovalRequired { .. });
+            let reply = if approval {
+                EventReply::Decision(ApprovalDecision::Deny)
+            } else {
+                EventReply::None
+            };
+            seen.push(approval);
+            reply
         })
         .await
         .expect("chat must succeed");
@@ -304,7 +308,9 @@ async fn chat_async_reports_premature_close_without_terminal() {
     let base = mock_chat_server(body, 200, approvals).await;
     let client = DaemonClient::new(&base).unwrap();
     let err = client
-        .chat_async("s1", "hi", ChatOptions::default(), &mut |_| None)
+        .chat_async("s1", "hi", ChatOptions::default(), &mut |_| {
+            EventReply::None
+        })
         .await;
     assert!(
         err.is_err(),
@@ -512,8 +518,10 @@ fn approval_delivery_failure_warns_through_warning_handler() {
         .with_warning_handler(move |message| sink.lock().unwrap().push(message.to_string()));
 
     let mut on_event = |event: StreamEvent| match &event {
-        StreamEvent::ApprovalRequired { .. } => Some(crate::protocol::ApprovalDecision::AllowOnce),
-        _ => None,
+        StreamEvent::ApprovalRequired { .. } => {
+            EventReply::Decision(crate::protocol::ApprovalDecision::AllowOnce)
+        }
+        _ => EventReply::None,
     };
     client
         .chat("s1", "hi", ChatOptions::default(), &mut on_event)

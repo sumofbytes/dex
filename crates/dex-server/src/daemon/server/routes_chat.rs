@@ -1,6 +1,7 @@
 use super::super::approvals::write_approval_audit;
 use super::super::lock_map;
 use super::super::lookup::lookup_entry_async;
+use super::super::questions::sanitize_answers;
 use super::super::turn::run_agent_turn;
 use super::super::DaemonState;
 use super::routes_sessions::steal_wake_and_claim;
@@ -8,6 +9,8 @@ use crate::protocol::ApprovalDecision;
 use crate::protocol::ApprovalResponse;
 use crate::protocol::ChatRequest;
 use crate::protocol::FollowupRequest;
+use crate::protocol::QuestionAnswer;
+use crate::protocol::QuestionResponse;
 use crate::protocol::QueueMsg;
 use crate::protocol::RecallRequest;
 use crate::protocol::SteerRequest;
@@ -19,6 +22,7 @@ use axum::http::StatusCode;
 use axum::response::sse::Event;
 use axum::response::sse::Sse;
 use axum::Json;
+use dex_protocol::Question;
 use futures_core::Stream;
 use serde_json::json;
 use std::convert::Infallible;
@@ -214,6 +218,55 @@ pub(crate) async fn approve(
     }
 }
 
+/// Resolve a parked `ask_user` batch: one `QuestionResponse` carries every
+/// slot's answer (`answers[i]` ↔ `questions[i]`). Mirrors `approve` — no
+/// "allow for session" semantics (there is nothing to remember), and a
+/// cross-session attempt restores the entry so the legitimate session can
+/// still resolve it.
+pub(crate) async fn answer(
+    State(state): State<Arc<DaemonState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<QuestionResponse>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let pending = lock_map(&state.pending_questions).remove(&req.request_id);
+    match pending {
+        Some(pending) if pending.session_id == session_id => {
+            // Clamp the client's batch against the parked questions before
+            // anything touches the audit trail or the executor (see
+            // `sanitize_answers`): slot count enforced, out-of-range
+            // `Choice`/`Multi` indices collapse to `Dismiss`.
+            let answers = match serde_json::from_str::<Vec<Question>>(&pending.questions_json) {
+                Ok(questions) => sanitize_answers(&questions, req.answers),
+                Err(_) => {
+                    let mut answers = req.answers;
+                    answers.truncate(pending.question_count);
+                    answers
+                }
+            };
+            // Audit: answer kinds come from the single-source `as_str`, so
+            // the trail never drifts from the wire spellings. Labels live
+            // in the executor's own row.
+            let kinds: Vec<&'static str> = answers.iter().map(|a| a.as_str()).collect();
+            write_approval_audit(
+                &session_id,
+                &req.request_id,
+                "ask_user",
+                &pending.questions_json,
+                "ask",
+                &format!("remote; {}", kinds.join(",")),
+                pending.agent.as_deref(),
+            );
+            let _ = pending.response.send(answers).await;
+            Ok(Json(json!({ "status": "ok" })))
+        }
+        Some(pending) => {
+            lock_map(&state.pending_questions).insert(req.request_id, pending);
+            Err(StatusCode::NOT_FOUND)
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
 pub(crate) async fn cancel(
     State(state): State<Arc<DaemonState>>,
     Path(session_id): Path<String>,
@@ -237,6 +290,12 @@ pub(crate) async fn cancel(
     // are skipped — see `take_session_pendings` (§12 V1b).
     for sender in state.take_session_pendings(&session_id) {
         let _ = sender.send(ApprovalDecision::Deny).await;
+    }
+    // Same for the parent turn's parked `ask_user` batches: a blocked
+    // tool call must never outlive its surface. Child questions are
+    // skipped (same rule as child approvals).
+    for (sender, count) in state.take_session_question_pendings(&session_id) {
+        let _ = sender.send(vec![QuestionAnswer::Dismiss; count]).await;
     }
 
     Json(json!({ "status": "ok" }))

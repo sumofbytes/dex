@@ -43,7 +43,7 @@ mod preview;
 mod thinking;
 mod transcript;
 pub(super) use activity::{queue_groups, queue_metrics_of};
-pub(crate) use bottom::{ApprovalOverlay, BottomPane, SlashSuggestionsView};
+pub(crate) use bottom::{ApprovalOverlay, BottomPane, QuestionOverlay, SlashSuggestionsView};
 pub(super) use composer::render_input;
 pub(super) use markdown::markdown_lines;
 #[cfg(test)]
@@ -253,6 +253,9 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
         TranscriptView::render(f, layout.transcript, app);
     }
     BottomPane::render(f, &layout, app, input_lines, input_cursor, &groups);
+    if !app.pending_questions.is_empty() {
+        QuestionOverlay::render(f, area, app);
+    }
     if !app.pending_approvals.is_empty() {
         ApprovalOverlay::render(f, area, app);
     }

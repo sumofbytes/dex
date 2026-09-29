@@ -232,6 +232,192 @@ impl BottomPane {
     }
 }
 
+/// The `ask_user` wizard overlay: one question at a time (`[n/N]`),
+/// options with a cursor, the implicit "Other" row, a Submit row on
+/// multiSelect questions, and the summary screen after the last question.
+pub(crate) struct QuestionOverlay;
+
+impl QuestionOverlay {
+    pub(super) fn render(f: &mut ratatui::Frame, area: Rect, app: &App) {
+        let Some(question) = app.pending_questions.first() else {
+            return;
+        };
+        let extra = app.pending_questions.len().saturating_sub(1);
+        let agent_prefix = question
+            .agent
+            .as_deref()
+            .map(|agent| format!("{agent} asks: "))
+            .unwrap_or_default();
+        let width = area
+            .width
+            .saturating_sub(6)
+            .clamp(52, 76)
+            .min(area.width.saturating_sub(2));
+        let rows: Vec<Line> = if question.summary {
+            summary_lines(question)
+        } else {
+            let Some(current) = question.questions.get(question.current) else {
+                return;
+            };
+            question_lines(question, current)
+        };
+        let counter = if question.summary {
+            "summary".to_string()
+        } else {
+            format!("[{}/{}]", question.current + 1, question.questions.len())
+        };
+        let height = (rows.len() as u16 + 6).clamp(9, area.height.saturating_sub(4));
+        let popup = centered(area, width, height);
+        f.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(format!(" {}Question {} ", agent_prefix, counter))
+            .title_style(fg(theme::accent_fg()))
+            .borders(Borders::ALL)
+            .border_style(fg(theme::accent_fg()))
+            .padding(Padding::new(1, 1, 1, 1))
+            .style(Style::default().bg(theme::popup_bg()));
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        f.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), inner);
+        if extra > 0 {
+            // Queued batches behind this one.
+            let note = Rect {
+                y: popup.y + popup.height.saturating_sub(1),
+                ..popup
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("+{extra} more question batch(es) waiting"),
+                    fg(theme::muted_fg()),
+                ))),
+                note,
+            );
+        }
+    }
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn question_lines(
+    question: &super::super::PendingQuestionUi,
+    current: &crate::protocol::Question,
+) -> Vec<Line<'static>> {
+    let mut rows = vec![
+        Line::from(Span::styled(
+            current.question.clone(),
+            fg(theme::accent_fg()),
+        )),
+        Line::from(Span::raw(String::new())),
+    ];
+    for (i, option) in current.options.iter().enumerate() {
+        let marker = if current.multi_select && question.toggled[i] {
+            "[x] "
+        } else if current.multi_select {
+            "[ ] "
+        } else if question.selected == i {
+            "› "
+        } else {
+            "  "
+        };
+        let default = if current.default == Some(i) {
+            "  — default"
+        } else {
+            ""
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("{marker}{}", i + 1), fg(theme::muted_fg())),
+            Span::raw(" "),
+            Span::styled(option.label.clone(), fg(theme::surface_fg())),
+            Span::styled(default.to_string(), fg(theme::warn_fg())),
+        ]));
+        rows.push(Line::from(Span::styled(
+            format!("     {}", option.description),
+            fg(theme::muted_fg()),
+        )));
+    }
+    // The implicit "Other" row (display-only index: never shifts options).
+    let other_selected = question.selected == current.options.len();
+    if let Some(buffer) = &question.text_entry {
+        rows.push(Line::from(Span::styled(
+            format!("  other › {buffer}▏"),
+            fg(theme::surface_fg()),
+        )));
+        rows.push(Line::from(Span::styled(
+            "  type your answer, Enter to record, Esc to cancel",
+            fg(theme::muted_fg()),
+        )));
+    } else {
+        let marker = if other_selected { "› " } else { "  " };
+        rows.push(Line::from(Span::styled(
+            format!("{marker}{}) other", current.options.len() + 1),
+            if other_selected {
+                fg(theme::surface_fg())
+            } else {
+                fg(theme::muted_fg())
+            },
+        )));
+    }
+    if current.multi_select {
+        let submit_selected = question.selected == current.options.len() + 1;
+        let marker = if submit_selected { "› " } else { "  " };
+        rows.push(Line::from(Span::styled(
+            format!("{marker}submit  [Space: toggle]"),
+            if submit_selected {
+                fg(theme::surface_fg())
+            } else {
+                fg(theme::muted_fg())
+            },
+        )));
+    }
+    rows.push(Line::from(Span::raw(String::new())));
+    rows.push(Line::from(Span::styled(
+        "↑/↓ move · number pick · Enter record · Esc back",
+        fg(theme::muted_fg()),
+    )));
+    rows
+}
+
+fn summary_lines(question: &super::super::PendingQuestionUi) -> Vec<Line<'static>> {
+    let mut rows = vec![
+        Line::from(Span::styled("Your answers", fg(theme::accent_fg()))),
+        Line::from(Span::raw(String::new())),
+    ];
+    for (i, q) in question.questions.iter().enumerate() {
+        let answer = match &question.answers[i] {
+            Some(crate::protocol::QuestionAnswer::Choice(idx)) => q
+                .options
+                .get(*idx)
+                .map(|o| o.label.clone())
+                .unwrap_or_else(|| "—".to_string()),
+            Some(crate::protocol::QuestionAnswer::Multi(idxs)) => idxs
+                .iter()
+                .filter_map(|idx| q.options.get(*idx))
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(crate::protocol::QuestionAnswer::Text(text)) => text.clone(),
+            _ => "—".to_string(),
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("{}: ", q.header), fg(theme::muted_fg())),
+            Span::styled(answer, fg(theme::surface_fg())),
+        ]));
+    }
+    rows.push(Line::from(Span::raw(String::new())));
+    rows.push(Line::from(Span::styled(
+        "Enter submit · Esc back",
+        fg(theme::muted_fg()),
+    )));
+    rows
+}
+
 pub(crate) struct ApprovalOverlay;
 
 impl ApprovalOverlay {

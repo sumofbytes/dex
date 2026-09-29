@@ -12,7 +12,7 @@ pub const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(600);
 /// and bare `mcp__*` are accepted without further checks — the policy layer
 /// must not assume a closed enum (§11); MCP servers arrive dynamically.
 const KNOWN_TOOLS: &[&str] = &[
-    "read", "bash", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls",
+    "read", "bash", "write", "edit", "grep", "ffgrep", "find", "fffind", "ls", "ask_user",
 ];
 
 /// Safe default when a definition names no tools: the explorer trio.

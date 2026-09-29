@@ -85,6 +85,11 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
     let shell_running = remote.shell_running;
     let shell_cancel_requested = remote.shell_cancel_requested;
 
+    // `ask_user` wizard takes top precedence: a question is a direct ask
+    // to the user, and the worker is blocked on it.
+    if handle_question_key(remote, key) {
+        return;
+    }
     // Approval overlay takes precedence: the worker is blocked until a
     // decision arrives. The overlay draws on top of the child view too
     // (render/mod.rs), so `y`/`n`/`s`/arrows resolve it from inside the
@@ -278,6 +283,223 @@ fn apply_mode(remote: &mut RemoteApp, mode: AgentMode) {
     remote.app.config.permission = mode.permission();
     remote.options.mode = Some(mode.as_str().to_string());
     remote.options.permission = Some(mode.permission().as_str().to_string());
+}
+
+/// `ask_user` wizard: one question at a time, `[n/N]` counter. Enter on an
+/// option (or on the multiSelect Submit row) records that question's answer
+/// and advances — it never submits the batch. After the last question the
+/// summary screen shows the collected answers; Enter there is the single
+/// batch submit. Esc backs out one question; on the first it dismisses that
+/// question and advances (only past the first does Esc navigate back).
+/// Ctrl+C dismisses every parked batch and cancels the turn, mirroring the
+/// approval overlay.
+fn handle_question_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
+    if remote.app.pending_questions.is_empty() {
+        return false;
+    }
+    let app = &mut remote.app;
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Dismiss every parked batch and cancel the turn; another Ctrl+C
+            // once idle quits.
+            resolve_all_questions(app);
+            request_cancel(remote);
+        }
+        _ if front_question(app)
+            .map(|q| q.text_entry.is_some())
+            .unwrap_or(false) =>
+        {
+            // Free-text entry for the "Other" row: printable keys append,
+            // Backspace pops, Enter records, Esc cancels the entry.
+            let Some(question) = front_question_mut(app) else {
+                return true;
+            };
+            match key.code {
+                KeyCode::Enter => {
+                    let text = question
+                        .text_entry
+                        .take()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let answer = if text.is_empty() {
+                        crate::protocol::QuestionAnswer::Dismiss
+                    } else {
+                        crate::protocol::QuestionAnswer::Text(text)
+                    };
+                    finish_entry_and_record(question, answer);
+                }
+                KeyCode::Esc => {
+                    let question = front_question_mut(app).expect("front checked");
+                    question.text_entry = None;
+                }
+                KeyCode::Backspace => {
+                    let question = front_question_mut(app).expect("front checked");
+                    question.text_entry.as_mut().map(|t| t.pop());
+                }
+                KeyCode::Char(c) => {
+                    let question = front_question_mut(app).expect("front checked");
+                    if let Some(t) = question.text_entry.as_mut() {
+                        t.push(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Up | KeyCode::Left => {
+            if let Some(question) = front_question_mut(app) {
+                question.selected = question.selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+            if let Some(question) = front_question_mut(app) {
+                if question.summary {
+                    return true;
+                }
+                question.selected = (question.selected + 1).min(question.menu_rows() - 1);
+            }
+        }
+        KeyCode::Char(' ') => {
+            // Space toggles an option on multiSelect questions.
+            let Some(question) = front_question_mut(app) else {
+                return true;
+            };
+            let option_count = question
+                .questions
+                .get(question.current)
+                .map(|q| q.options.len())
+                .unwrap_or(0);
+            let multi = question
+                .questions
+                .get(question.current)
+                .map(|q| q.multi_select)
+                .unwrap_or(false);
+            if multi && question.selected < option_count {
+                question.toggled[question.selected] = !question.toggled[question.selected];
+            }
+        }
+        KeyCode::Char(c @ '1'..='9') => {
+            let Some(question) = front_question_mut(app) else {
+                return true;
+            };
+            if question.summary {
+                return true;
+            }
+            let index = c as usize - '1' as usize;
+            let Some(current) = question.questions.get(question.current) else {
+                return true;
+            };
+            if index >= current.options.len() {
+                return true;
+            }
+            if current.multi_select {
+                question.toggled[index] = !question.toggled[index];
+            } else {
+                let answer = crate::protocol::QuestionAnswer::Choice(index);
+                question.record_and_advance(answer);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(question) = front_question_mut(app) else {
+                return true;
+            };
+            if question.summary {
+                // The single batch submit.
+                let batch = front_question(app).expect("front checked").collected();
+                resolve_front_question(app, batch);
+                return true;
+            }
+            let Some(current) = question.questions.get(question.current) else {
+                return true;
+            };
+            let option_count = current.options.len();
+            let multi = current.multi_select;
+            if multi && question.selected == option_count + 1 {
+                // The Submit row: collect the toggles (empty → dismissed).
+                let picked: Vec<usize> = question
+                    .toggled
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, on)| on.then_some(i))
+                    .collect();
+                let answer = if picked.is_empty() {
+                    crate::protocol::QuestionAnswer::Dismiss
+                } else {
+                    crate::protocol::QuestionAnswer::Multi(picked)
+                };
+                question.record_and_advance(answer);
+            } else if multi && question.selected < option_count {
+                // Enter toggles too (Space's neighbor).
+                question.toggled[question.selected] = !question.toggled[question.selected];
+            } else if question.selected == option_count {
+                // The implicit "Other" row: open free-text entry.
+                question.text_entry = Some(String::new());
+            } else {
+                let answer = crate::protocol::QuestionAnswer::Choice(question.selected);
+                question.record_and_advance(answer);
+            }
+        }
+        // Esc over an open child view closes the view, not the question.
+        KeyCode::Esc if app.child_view.is_some() => {
+            app.child_view = None;
+        }
+        KeyCode::Esc => {
+            let Some(question) = front_question_mut(app) else {
+                return true;
+            };
+            if question.summary {
+                // Back to the last question to re-answer it.
+                question.summary = false;
+            } else if question.current > 0 {
+                // Back out one question; the backed-out question stays
+                // unanswered (submits as Dismiss).
+                question.current -= 1;
+                question.reset_selection();
+            } else {
+                // On the first question Esc dismisses it and advances.
+                question.record_and_advance(crate::protocol::QuestionAnswer::Dismiss);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn front_question(app: &App) -> Option<&super::super::PendingQuestionUi> {
+    app.pending_questions.first()
+}
+
+fn front_question_mut(app: &mut App) -> Option<&mut super::super::PendingQuestionUi> {
+    app.pending_questions.first_mut()
+}
+
+/// Carry a finished free-text answer into the wizard (keeps the borrow
+/// checker happy without nested borrows of the same entry).
+fn finish_entry_and_record(
+    question: &mut super::super::PendingQuestionUi,
+    answer: crate::protocol::QuestionAnswer,
+) {
+    question.record_and_advance(answer);
+}
+
+/// Submit the front batch through its sender, then reveal the next queued
+/// one (child agents can park several).
+pub(crate) fn resolve_front_question(app: &mut App, answers: Vec<crate::protocol::QuestionAnswer>) {
+    if !app.pending_questions.is_empty() {
+        let question = app.pending_questions.remove(0);
+        let _ = question.response.try_send(answers);
+    }
+}
+
+/// Dismiss every parked batch (cancel/quit path): the blocked tool calls
+/// unwind instead of waiting on a prompt nobody will answer.
+pub(crate) fn resolve_all_questions(app: &mut App) {
+    for question in app.pending_questions.drain(..) {
+        let _ = question.response.try_send(vec![
+            crate::protocol::QuestionAnswer::Dismiss;
+            question.questions.len()
+        ]);
+    }
 }
 
 /// Approval overlay: the worker is blocked until a decision arrives, so this
@@ -512,8 +734,10 @@ fn request_cancel(remote: &mut RemoteApp) {
         remote.app.cancel_requested = true;
         remote.cancel_flag.store(true, Ordering::SeqCst);
         // Deny every queued approval so the blocked agent threads unwind
-        // (child agents may have parked several).
+        // (child agents may have parked several). Same for parked
+        // `ask_user` batches.
         deny_all_approvals(&mut remote.app);
+        resolve_all_questions(&mut remote.app);
     }
     if remote.shell_running && !remote.shell_cancel_requested {
         remote.shell_cancel_requested = true;

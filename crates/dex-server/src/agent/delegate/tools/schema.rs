@@ -1,7 +1,7 @@
 use super::super::manager::AgentManager;
 use super::super::model::AgentState;
 use crate::llm::config::LlmConfig;
-use crate::protocol::ApprovalRequest;
+use crate::protocol::{ApprovalRequest, QuestionRequest};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -92,6 +92,10 @@ pub struct AgentTurnContext {
     /// `None` outside the daemon: the child console then carries a closed
     /// channel and `enforce_policy` fails closed (V1a detached auto-deny).
     pub child_approvals: Option<tokio::sync::mpsc::Sender<ApprovalRequest>>,
+    /// `ask_user` counterpart: routes a child's question batches into the
+    /// daemon's `pending_questions` (labeled, five-minute dismissal).
+    /// `None` outside the daemon: `tool_ask_user` then fails closed.
+    pub child_questions: Option<tokio::sync::mpsc::Sender<QuestionRequest>>,
     /// §12 V1b: live "allow for session" lookup against the daemon's map,
     /// so a decision granted after a child spawned still applies to it.
     /// `None` outside the daemon.

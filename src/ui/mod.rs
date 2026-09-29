@@ -27,7 +27,7 @@ pub(crate) mod status;
 pub(crate) mod wrapping;
 
 pub(crate) use self::input::InputField;
-pub(crate) use app::TerminalCleanup;
+pub(crate) use app::{PendingQuestionUi, TerminalCleanup};
 #[cfg(test)]
 pub(crate) use app::{STREAM_FLUSH_INTERVAL, THINKING_TEXT_CAP, THINKING_TEXT_SLACK};
 pub(crate) use metrics::UsageState;

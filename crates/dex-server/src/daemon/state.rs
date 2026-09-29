@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::agent::delegate::{AgentEvent, AgentManager};
-use crate::protocol::{ApprovalDecision, PermissionMode, QueueMsg};
+use crate::protocol::{ApprovalDecision, PermissionMode, QuestionAnswer, QueueMsg};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 use crate::runtime::console::CancellationToken;
 
@@ -32,6 +32,24 @@ pub struct PendingApproval {
     /// The child's definition name for the labeled prompt (V1b, §12):
     /// rendered "explorer wants to run bash: …". `None` for the parent
     /// turn's own tools.
+    pub(crate) agent: Option<String>,
+}
+
+/// A pending `ask_user` batch awaiting the user's answers. The counterpart
+/// of [`PendingApproval`]: one response resolves the whole batch, so the
+/// sender carries every slot's answer at once.
+pub struct PendingQuestion {
+    pub session_id: String,
+    pub response: tokio::sync::mpsc::Sender<Vec<QuestionAnswer>>,
+    /// Slot count, for building the all-`Dismiss` teardown response
+    /// without retaining the questions themselves.
+    pub(crate) question_count: usize,
+    /// Serialized questions — the audit row's redacted input.
+    pub(crate) questions_json: String,
+    /// Set when the requester is a background child agent: teardown
+    /// semantics match [`PendingApproval::agent_id`] — the child outlives
+    /// the parent turn, so turn-end teardown must not dismiss its question.
+    pub(crate) agent_id: Option<String>,
     pub(crate) agent: Option<String>,
 }
 
@@ -62,6 +80,10 @@ pub struct DaemonState {
     /// in the `ApprovalRequired` stream event). The sender resolves the
     /// blocking `approve_tool` call inside the agent loop.
     pub pending_approvals: Mutex<HashMap<String, PendingApproval>>,
+    /// Pending `ask_user` batches keyed by request ID (as sent to the
+    /// client in the `QuestionRequired` stream event). The sender resolves
+    /// the blocking `tool_ask_user` call inside the agent loop.
+    pub pending_questions: Mutex<HashMap<String, PendingQuestion>>,
     /// Sessions with a turn currently in flight; one turn at a time per
     /// session keeps the append-only session log consistent.
     pub active_turns: Mutex<HashSet<String>>,
@@ -171,6 +193,7 @@ impl DaemonState {
             // resolution, but the ceiling itself stays conservative).
             ceiling: crate::llm::config::permission_from_env().unwrap_or(PermissionMode::Ask),
             pending_approvals: Mutex::new(HashMap::new()),
+            pending_questions: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(HashSet::new()),
             cancel_tokens: Mutex::new(HashMap::new()),
             shell_tokens: Mutex::new(HashMap::new()),
@@ -300,6 +323,46 @@ impl DaemonState {
         out
     }
 
+    /// Collect (and remove) still-pending child-agent questions for a
+    /// session so cancel/shutdown paths can dismiss them. The counterpart
+    /// of [`Self::take_session_question_pendings`], which skips these.
+    pub(crate) fn take_agent_question_pendings(
+        &self,
+        session_id: Option<&str>,
+    ) -> Vec<(tokio::sync::mpsc::Sender<Vec<QuestionAnswer>>, usize)> {
+        let mut out = Vec::new();
+        lock_map(&self.pending_questions).retain(|_, q| {
+            if q.agent_id.is_some() && session_id.is_none_or(|sid| q.session_id == sid) {
+                out.push((q.response.clone(), q.question_count));
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
+    /// Collect (and remove) the parent turn's still-pending questions for a
+    /// session so the caller can dismiss them without holding the lock
+    /// across an await. Child-agent questions are skipped: a background
+    /// child outlives the parent turn, and dismissing its question would
+    /// strand a still-running child with no way to proceed.
+    pub(crate) fn take_session_question_pendings(
+        &self,
+        session_id: &str,
+    ) -> Vec<(tokio::sync::mpsc::Sender<Vec<QuestionAnswer>>, usize)> {
+        let mut out = Vec::new();
+        lock_map(&self.pending_questions).retain(|_, q| {
+            if q.agent_id.is_none() && q.session_id == session_id {
+                out.push((q.response.clone(), q.question_count));
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+
     /// Lazily create (or return) the child-agent manager for a session.
     /// Clones share one registry, so any handle sees every child. The
     /// terminal-path journal hook (§15 V1a) closes over this state, making
@@ -333,6 +396,9 @@ impl DaemonState {
         for sender in self.take_agent_pendings(Some(session_id)) {
             let _ = sender.send(ApprovalDecision::Deny).await;
         }
+        for (sender, count) in self.take_agent_question_pendings(Some(session_id)) {
+            let _ = sender.send(vec![QuestionAnswer::Dismiss; count]).await;
+        }
         let manager = lock_map(&self.agents).remove(session_id);
         if let Some(manager) = manager {
             manager.shutdown().await;
@@ -352,6 +418,9 @@ impl DaemonState {
         }
         for sender in self.take_agent_pendings(None) {
             let _ = sender.send(ApprovalDecision::Deny).await;
+        }
+        for (sender, count) in self.take_agent_question_pendings(None) {
+            let _ = sender.send(vec![QuestionAnswer::Dismiss; count]).await;
         }
     }
 

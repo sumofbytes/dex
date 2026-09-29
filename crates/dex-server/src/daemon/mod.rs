@@ -6,6 +6,7 @@
 pub(crate) mod approvals;
 pub(crate) mod auth;
 pub(crate) mod lookup;
+pub(crate) mod questions;
 pub mod server;
 pub(crate) mod shell;
 pub(crate) mod turn;
@@ -23,4 +24,4 @@ pub(crate) mod state;
 mod tests;
 pub use serve::run_daemon;
 pub(crate) use state::{journal_event, lock_map, SessionEntry, NEGATIVE_TTL};
-pub use state::{DaemonState, PendingApproval};
+pub use state::{DaemonState, PendingApproval, PendingQuestion};

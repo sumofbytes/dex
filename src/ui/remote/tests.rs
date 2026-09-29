@@ -922,6 +922,171 @@ fn back_tab_clamps_at_the_daemon_ceiling() {
     assert!(text.contains("ask"), "{text}");
 }
 
+fn one_question() -> crate::protocol::Question {
+    crate::protocol::Question {
+        question: "Which database?".into(),
+        header: "Database".into(),
+        options: vec![
+            crate::protocol::QuestionOption {
+                label: "postgres".into(),
+                description: "default".into(),
+            },
+            crate::protocol::QuestionOption {
+                label: "sqlite".into(),
+                description: "embedded".into(),
+            },
+        ],
+        multi_select: false,
+        default: None,
+    }
+}
+
+fn park_question(
+    remote: &mut RemoteApp,
+    questions: Vec<crate::protocol::Question>,
+) -> tokio::sync::mpsc::Receiver<Vec<crate::protocol::QuestionAnswer>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    remote
+        .app
+        .pending_questions
+        .push(crate::ui::PendingQuestionUi::new(questions, None, tx));
+    rx
+}
+
+#[test]
+fn question_wizard_number_and_enter_record_then_advance() {
+    let questions = vec![one_question(), one_question()];
+    let mut remote = test_remote();
+    let mut rx = park_question(&mut remote, questions);
+    // Number 2 picks sqlite; the wizard advances to question 2, never
+    // submitting the batch.
+    handle_key(&mut remote, key(KeyCode::Char('2'), KeyModifiers::empty()));
+    assert_eq!(remote.app.pending_questions.len(), 1);
+    let front = &remote.app.pending_questions[0];
+    assert_eq!(front.current, 1, "advanced to the second question");
+    assert_eq!(
+        front.answers[0],
+        Some(crate::protocol::QuestionAnswer::Choice(1))
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "recording an answer must not submit the batch"
+    );
+    // Enter on question 2 records it (selected row 0) and shows the
+    // summary; Enter there submits the whole batch.
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(remote.app.pending_questions[0].summary, "summary shows");
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(remote.app.pending_questions.is_empty(), "submitted");
+    assert_eq!(
+        rx.try_recv().expect("batch sent"),
+        vec![
+            crate::protocol::QuestionAnswer::Choice(1),
+            crate::protocol::QuestionAnswer::Choice(0),
+        ]
+    );
+}
+
+#[test]
+fn question_wizard_multi_toggle_submit_and_esc_backout() {
+    let mut q = one_question();
+    q.multi_select = true;
+    q.options.push(crate::protocol::QuestionOption {
+        label: "cache".into(),
+        description: String::new(),
+    });
+    let mut remote = test_remote();
+    let mut rx = park_question(&mut remote, vec![q, one_question()]);
+    // Toggle option 1 twice via Space: net off. Then toggle via Enter.
+    handle_key(&mut remote, key(KeyCode::Char(' '), KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Char(' '), KeyModifiers::empty()));
+    assert!(!remote.app.pending_questions[0].toggled[0]);
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(remote.app.pending_questions[0].toggled[0]);
+    // Move to the Submit row: 3 options + Other + Submit → index 4.
+    handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    let front = &remote.app.pending_questions[0];
+    assert_eq!(
+        front.answers[0],
+        Some(crate::protocol::QuestionAnswer::Multi(vec![0])),
+        "submit collects the toggles"
+    );
+    // Esc backs out one question: from the second back to the first; the
+    // backed-out (second) question stays unanswered.
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    let front = &remote.app.pending_questions[0];
+    assert_eq!(front.current, 0);
+    assert_eq!(
+        front.answers[1], None,
+        "backed-out question stays unanswered"
+    );
+    // Re-answer the first via its Submit row (backing out cleared the
+    // toggles, so it submits as Dismiss), record the second, and submit
+    // from the summary.
+    for _ in 0..4 {
+        handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    }
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert_eq!(
+        rx.try_recv().expect("batch sent"),
+        vec![
+            crate::protocol::QuestionAnswer::Dismiss,
+            crate::protocol::QuestionAnswer::Choice(0)
+        ]
+    );
+}
+
+#[test]
+fn question_wizard_esc_on_first_dismisses_and_other_takes_text() {
+    let mut remote = test_remote();
+    let mut rx = park_question(&mut remote, vec![one_question()]);
+    // Select the Other row (index = options.len() = 2) and press Enter:
+    // free-text entry opens, Esc cancels it, Enter records the text.
+    handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Down, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(remote.app.pending_questions[0].text_entry.is_some());
+    handle_key(&mut remote, key(KeyCode::Char('s'), KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Char('q'), KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(remote.app.pending_questions[0].summary, "summary shows");
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert!(
+        remote.app.pending_questions.is_empty(),
+        "single question submitted"
+    );
+    assert_eq!(
+        rx.try_recv().expect("batch sent"),
+        vec![crate::protocol::QuestionAnswer::Text("sq".into())]
+    );
+
+    // Esc on the first question dismisses it and advances (never strands).
+    let mut remote = test_remote();
+    let mut rx = park_question(&mut remote, vec![one_question(), one_question()]);
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    let front = &remote.app.pending_questions[0];
+    assert_eq!(front.current, 1);
+    assert_eq!(
+        front.answers[0],
+        Some(crate::protocol::QuestionAnswer::Dismiss)
+    );
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert_eq!(
+        rx.try_recv().expect("batch sent"),
+        vec![
+            crate::protocol::QuestionAnswer::Dismiss,
+            crate::protocol::QuestionAnswer::Choice(0)
+        ]
+    );
+}
+
 #[test]
 fn back_tab_is_inert_while_an_approval_is_parked() {
     let mut remote = test_remote();

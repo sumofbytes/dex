@@ -7,7 +7,7 @@
 
 pub mod http;
 pub use dex_client::{protocol, runtime, sse};
-pub use http::{ChatOptions, DaemonClient};
+pub use http::{ChatOptions, DaemonClient, EventReply};
 
 #[cfg(test)]
 pub(crate) mod e2e_tests;
