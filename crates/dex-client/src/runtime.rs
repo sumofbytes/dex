@@ -3,6 +3,12 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Release version (workspace root, via `build.rs`'s `DEX_VERSION`), not
+/// this crate's own version.
+fn user_agent() -> String {
+    format!("dex-client/{}", env!("DEX_VERSION"))
+}
+
 static SHARED_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn shared_rt() -> &'static tokio::runtime::Runtime {
@@ -25,7 +31,7 @@ pub fn shared_async_client() -> reqwest::Client {
     SHARED_CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
-                .user_agent(concat!("dex-client/", env!("CARGO_PKG_VERSION")))
+                .user_agent(user_agent())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(300))
                 .build()
@@ -53,7 +59,7 @@ pub fn shared_streaming_client() -> reqwest::Client {
     STREAMING_CLIENT
         .get_or_init(|| {
             let mut builder = reqwest::Client::builder()
-                .user_agent(concat!("dex-client/", env!("CARGO_PKG_VERSION")))
+                .user_agent(user_agent())
                 .connect_timeout(Duration::from_secs(10));
             if let Some(timeout) = stream_read_timeout() {
                 builder = builder.read_timeout(timeout);

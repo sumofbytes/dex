@@ -15,11 +15,18 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// The dex release version: the workspace root `[package]` version (what
+/// `Cargo.toml` at the repo root says, via `build.rs`), not this crate's
+/// own `CARGO_PKG_VERSION`. Every user-visible version string — `dex
+/// doctor`, `dex update`, banners, User-Agents, MCP `clientInfo` — reads
+/// this, so sub-crates never report their internal crate versions.
+pub const VERSION: &str = env!("DEX_VERSION");
+
 /// `User-Agent` sent on every outbound HTTP request (provider generations,
 /// catalog fetches, daemon/TUI traffic). Both reference agents identify
 /// themselves on the wire; a missing UA reads as bot traffic to some
 /// gateways. A per-request `User-Agent` header still overrides this default.
-pub const USER_AGENT: &str = concat!("dex/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("dex/", env!("DEX_VERSION"));
 
 /// Socket keepalive interval for long-lived SSE streams. One place so the
 /// shared streaming client and the explicit-timeout client stay in sync.

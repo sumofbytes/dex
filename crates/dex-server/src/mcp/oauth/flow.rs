@@ -738,7 +738,7 @@ pub async fn probe_challenge(
         "jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": {
             "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "dex", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {"name": "dex", "version": crate::runtime::runtime::http::VERSION},
         },
     });
     let Ok(resp) = req.json(&body).send().await else {
