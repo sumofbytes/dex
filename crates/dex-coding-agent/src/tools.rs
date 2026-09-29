@@ -116,8 +116,8 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                     "properties": {
                         "path": { "type": "string", "description": "directory to list (default '.')" }
                     },
-          "required": []
-              }),
+                    "required": []
+                }),
             },
         },
         ToolDefinition {

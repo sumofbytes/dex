@@ -195,7 +195,7 @@ impl QuestionAnswer {
     /// "dismiss"). Single source so audit rows never drift from the wire,
     /// mirroring [`ApprovalDecision::as_str`]; the option labels for
     /// `choice`/`multi` are joined by the caller, which owns the question.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Choice(_) => "choice",
             Self::Multi(_) => "multi",

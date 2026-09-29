@@ -189,7 +189,7 @@ fn audit_answer(question: &Question, answer: &QuestionAnswer) -> String {
                 format!("multi {}", labels.join(","))
             }
         }
-        other => other.clone().as_str().to_string(),
+        other => other.as_str().to_string(),
     }
 }
 
@@ -428,49 +428,68 @@ mod tests {
 
     #[test]
     fn proptest_parse_never_panics_and_always_bounded() {
-        // Deterministic soak over malformed shapes: the executor clamps
-        // server-side, so no model-supplied shape may panic or breach bounds.
-        let mut gen_state = 0x2545F4914F6CDD1D_u64;
-        let mut next = move || {
-            // xorshift64*
-            gen_state ^= gen_state >> 12;
-            gen_state ^= gen_state << 25;
-            gen_state ^= gen_state >> 27;
-            gen_state.wrapping_mul(0x2545F4914F6CDD1D)
-        };
-        for _ in 0..2000 {
-            let n_questions = (next() % 8) as usize;
-            let n_options = (next() % 8) as usize;
-            let with_header = next() % 2 == 0;
-            let question = json!({
-                "question": if next() % 4 == 0 { Value::Null } else { json!("q".repeat((next() % 700) as usize)) },
-                "header": if with_header { json!("h".repeat((next() % 40) as usize)) } else { Value::Null },
-                "multiSelect": if next() % 3 == 0 { json!("junk") } else { json!(next() % 2 == 0) },
-                "default": if next() % 2 == 0 { json!((next() % 20)) } else { Value::Null },
-                "options": (0..n_options).map(|i| json!({
-                    "label": if i == 0 && next() % 4 == 0 { Value::Null } else { json!("l".repeat((next() % 60) as usize)) },
-                    "description": "d"
-                })).collect::<Vec<_>>()
-            });
-            let list = (0..n_questions)
+        use proptest::prelude::*;
+
+        // Property: for ANY model-supplied shape the executor clamps
+        // server-side — parsing never panics, and every parsed batch
+        // respects the hard bounds (`MAX_QUESTIONS`, `MAX_OPTIONS`,
+        // `MIN_OPTIONS`, header length, in-range `default`).
+        fn opt_string(max: usize) -> impl proptest::strategy::Strategy<Value = Value> {
+            use proptest::prelude::*;
+            proptest::option::of(proptest::collection::vec(any::<char>(), 0..max)).prop_map(|opt| {
+                opt.map(|chars| json!(chars.into_iter().collect::<String>()))
+                    .unwrap_or(Value::Null)
+            })
+        }
+
+        fn question_strategy() -> impl proptest::strategy::Strategy<Value = Value> {
+            use proptest::prelude::*;
+            (
+                opt_string(700),
+                opt_string(40),
+                proptest::prop_oneof![Just(json!("junk")), Just(json!(true)), Just(Value::Null),],
+                proptest::option::of(0u64..20),
+                0usize..8,
+                opt_string(60),
+            )
+                .prop_map(
+                    |(question, header, multi_select, default, n_options, first_label)| {
+                        json!({
+                            "question": question,
+                            "header": header,
+                            "multiSelect": multi_select,
+                            "default": default,
+                            "options": (0..n_options)
+                                .map(|i| if i == 0 {
+                                    json!({"label": first_label, "description": "d"})
+                                } else {
+                                    json!({"label": format!("o{i}"), "description": "d"})
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    },
+                )
+        }
+
+        proptest!(|(n_questions in 0usize..8, question in question_strategy())| {
+            let list: Vec<Value> = (0..n_questions)
                 .map(|i| {
                     if i == 0 {
                         question.clone()
                     } else {
+                        // Later slots exercise the too-few-options rejection.
                         json!({"question": "x", "header": "H", "options": []})
                     }
                 })
-                .collect::<Vec<_>>();
-            let parsed = parse_questions(&args(json!({"questions": list})));
-            if let Ok(parsed) = parsed {
-                assert!(parsed.len() <= MAX_QUESTIONS);
+                .collect();
+            if let Ok(parsed) = parse_questions(&args(json!({"questions": list}))) {
+                prop_assert!(parsed.len() <= MAX_QUESTIONS);
                 for q in &parsed {
-                    assert!(q.options.len() <= MAX_OPTIONS);
-                    assert!(q.options.len() >= MIN_OPTIONS);
-                    assert!(q.header.chars().count() <= HEADER_MAX_CHARS);
-                    assert!(q.default.is_none_or(|d| d < q.options.len()));
+                    prop_assert!((MIN_OPTIONS..=MAX_OPTIONS).contains(&q.options.len()));
+                    prop_assert!(q.header.chars().count() <= HEADER_MAX_CHARS);
+                    prop_assert!(q.default.is_none_or(|d| d < q.options.len()));
                 }
             }
-        }
+        });
     }
 }

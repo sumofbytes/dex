@@ -701,6 +701,152 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // single-threaded test runtime; guard is intentional
+    async fn parent_question_bridge_delivers_question_required_exactly_once() {
+        use crate::protocol::QuestionOption;
+        use crate::protocol::QuestionRequest;
+        use crate::protocol::StreamEnvelope;
+
+        let _lock = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+        let state = Arc::new(DaemonState::new());
+        // The turn's stream, registered exactly like `run_agent_turn` does —
+        // so a broadcast in the parent path would double-deliver.
+        let (tx, mut rx) = mpsc::channel::<StreamEnvelope>(8);
+        state.register_stream("s-q", &tx);
+        let (question_tx, question_rx) = mpsc::channel(1);
+        tokio::spawn(crate::daemon::questions::parent_question_bridge(
+            state.clone(),
+            "s-q".into(),
+            tx,
+            question_rx,
+            CancellationToken::new(),
+        ));
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        question_tx
+            .send(QuestionRequest {
+                questions: vec![crate::protocol::Question {
+                    question: "Which database?".into(),
+                    header: "Database".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "postgres".into(),
+                            description: String::new(),
+                        },
+                        QuestionOption {
+                            label: "sqlite".into(),
+                            description: String::new(),
+                        },
+                    ],
+                    multi_select: false,
+                    default: None,
+                }],
+                agent_id: None,
+                agent: None,
+                response: response_tx,
+            })
+            .await
+            .unwrap();
+
+        // Exactly ONE `QuestionRequired` on the turn stream, then silence:
+        // journal + direct-send only, never a broadcast on top.
+        let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event delivered")
+            .expect("stream open");
+        let request_id = match env.event {
+            StreamEvent::QuestionRequired { request_id, .. } => request_id,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(
+            rx.try_recv().is_err(),
+            "QuestionRequired must be delivered exactly once on the turn stream"
+        );
+        // The batch is parked under that request_id and resolvable via the
+        // route, closing the parent loop end to end.
+        assert_eq!(state.pending_questions.lock().unwrap().len(), 1);
+        let r = answer(
+            State(state.clone()),
+            Path("s-q".into()),
+            Json(crate::protocol::QuestionResponse {
+                request_id,
+                answers: vec![QuestionAnswer::Choice(1)],
+            }),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(
+            response_rx.try_recv().ok(),
+            Some(vec![QuestionAnswer::Choice(1)])
+        );
+    }
+
+    #[test]
+    fn sanitize_answers_clamps_mismatched_client_batches() {
+        use crate::daemon::questions::sanitize_answers;
+        use crate::protocol::QuestionOption;
+
+        let option = |label: &str| QuestionOption {
+            label: label.into(),
+            description: String::new(),
+        };
+        let questions = vec![
+            crate::protocol::Question {
+                question: "q1".into(),
+                header: "H1".into(),
+                options: vec![option("a"), option("b")],
+                multi_select: false,
+                default: None,
+            },
+            crate::protocol::Question {
+                question: "q2".into(),
+                header: "H2".into(),
+                options: vec![option("c"), option("d")],
+                multi_select: false,
+                default: None,
+            },
+        ];
+        // Out-of-range Choice collapses to Dismiss; in-range Text passes.
+        assert_eq!(
+            sanitize_answers(
+                &questions,
+                vec![QuestionAnswer::Choice(9), QuestionAnswer::Text("t".into())]
+            ),
+            vec![QuestionAnswer::Dismiss, QuestionAnswer::Text("t".into())]
+        );
+        // Empty Multi collapses; extra slots beyond the batch size truncate.
+        assert_eq!(
+            sanitize_answers(
+                &questions,
+                vec![
+                    QuestionAnswer::Multi(vec![]),
+                    QuestionAnswer::Dismiss,
+                    QuestionAnswer::Text("extra".into())
+                ]
+            ),
+            vec![QuestionAnswer::Dismiss, QuestionAnswer::Dismiss]
+        );
+        // Missing slots pad with Dismiss.
+        assert_eq!(
+            sanitize_answers(&questions, vec![QuestionAnswer::Choice(1)]),
+            vec![QuestionAnswer::Choice(1), QuestionAnswer::Dismiss]
+        );
+        // In-range answers pass through untouched, order preserved.
+        assert_eq!(
+            sanitize_answers(
+                &questions,
+                vec![
+                    QuestionAnswer::Multi(vec![1, 0]),
+                    QuestionAnswer::Text("t".into())
+                ]
+            ),
+            vec![
+                QuestionAnswer::Multi(vec![1, 0]),
+                QuestionAnswer::Text("t".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_dismisses_parent_questions_but_not_child_ones() {
         let state = Arc::new(DaemonState::new());
         let (tx_parent, mut rx_parent) = mpsc::channel(1);
