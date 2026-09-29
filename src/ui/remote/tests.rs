@@ -297,78 +297,10 @@ fn esc_key() -> crossterm::event::KeyEvent {
 /// dead port so `request_cancel`'s POST fails fast (connection refused)
 /// instead of hanging.
 fn test_remote() -> RemoteApp {
-    let app = App {
-        remote_mode: true,
-        transcript: Vec::new(),
-        input: crate::ui::input::InputField::new(),
-        config: crate::llm::config::LlmConfig {
-            provider: Provider::Anthropic,
-            api_key: String::new(),
-            base_url: String::new(),
-            model: "test".into(),
-            available_models: vec!["test".into()],
-            endpoints: Default::default(),
-            api: ApiProtocol::Responses,
-            account_id: None,
-            thinking_effort: None,
-            context_window: 128_000,
-            reserve_tokens: 16_384,
-            keep_recent_tokens: 20_000,
-            permission: PermissionMode::Trusted,
-            verify_command: None,
-            extra_headers: Default::default(),
-            global_headers: Default::default(),
-            provider_entries: Default::default(),
-            provider_headers: Default::default(),
-            api_pinned: false,
-            connect_timeout_secs: 10,
-            request_timeout_secs: 300,
-        },
-        messages: Vec::new(),
-        tool_state: crate::ui::UsageState::default(),
-        session: Session::in_memory("/tmp".into()),
-        skills: Vec::new(),
-        turn_start: 0,
-        cwd: "/tmp".into(),
-        git_branch: None,
-        git_dirty: false,
-        steering_rx: None,
-        followup_rx: None,
-        pending_steering: Vec::new(),
-        pending_followups: Vec::new(),
-        cancel_requested: false,
-        cancel_presses: 0,
-        approval_rx: None,
-        pending_approvals: Vec::new(),
-        agents: Vec::new(),
-        busy: false,
-        autoscroll: true,
-        scroll: 0,
-        tick: 0,
-        quit: false,
-        last_ctrl_c: None,
-        history: Vec::new(),
-        history_index: None,
-        history_draft: String::new(),
-        slash_selected: 0,
-        connection: None,
-        daemon_url: None,
-        assistant_open: false,
-        show_thinking: false,
-        thinking_open: false,
-        plan: crate::protocol::Plan::default(),
-        assistant_pending: String::new(),
-        assistant_gap: crate::render::theme::markdown::GapState::new(),
-        stream_last_flush: Instant::now(),
-        wrapped_cache: Vec::new(),
-        wrapped_width: 0,
-        display_cache: Vec::new(),
-        transcript_area: None,
-        selection: None,
-        notice: None,
-        status_tokens_cache: std::cell::Cell::new((0, 0, 0)),
-        slash_cache: std::cell::RefCell::new(None),
-    };
+    let mut app = App::scratch();
+    app.remote_mode = true;
+    app.config.model = "test".into();
+    app.config.available_models = vec!["test".into()];
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(16);
     RemoteApp {
         app,
@@ -1033,4 +965,136 @@ fn plain_tab_still_completes_in_the_slash_popup() {
     handle_key(&mut remote, key(KeyCode::Tab, KeyModifiers::empty()));
     assert_eq!(remote.mode, AgentMode::Plan, "Tab must not cycle the mode");
     assert_eq!(remote.app.input.text(), "/clear ");
+}
+
+#[test]
+fn agent_lines_buffer_into_child_log_and_leave_parent_alone() {
+    let mut remote = test_remote();
+    let before = remote.app.transcript.len();
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::AgentLine {
+            agent_id: "a1".into(),
+            name: "explorer".into(),
+            event: Box::new(crate::protocol::StreamEvent::AssistantText(
+                "hello from child".into(),
+            )),
+        },
+    );
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::AgentLine {
+            agent_id: "a1".into(),
+            name: "explorer".into(),
+            event: Box::new(crate::protocol::StreamEvent::ToolResult {
+                name: "bash".into(),
+                summary: "ls".into(),
+                success: true,
+                preview: vec![],
+                duration: 0.0,
+                id: "t1".into(),
+            }),
+        },
+    );
+    assert_eq!(remote.app.transcript.len(), before, "parent untouched");
+    assert_eq!(remote.app.child_logs.len(), 1);
+    let log = &remote.app.child_logs[0];
+    assert_eq!(log.name, "explorer");
+    assert_eq!(log.app.transcript.len(), 2, "assistant + tool blocks");
+    assert!(
+        matches!(
+            log.app.transcript[0],
+            crate::ui::TranscriptBlock::Assistant { .. }
+        ),
+        "same block semantics as the parent transcript"
+    );
+}
+
+#[test]
+fn child_view_toggles_and_cycles_with_keys() {
+    let mut remote = test_remote();
+    for id in ["a1", "a2"] {
+        input::handle_stream_event(
+            &mut remote,
+            crate::protocol::StreamEvent::AgentLine {
+                agent_id: id.into(),
+                name: "explorer".into(),
+                event: Box::new(crate::protocol::StreamEvent::System("working".into())),
+            },
+        );
+    }
+    assert!(remote.app.child_view.is_none());
+    // Ctrl+A opens the first log.
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a1"));
+    // Ctrl+A cycles to the second; Esc closes; Ctrl+A opens again.
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a2"));
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(remote.app.child_view.is_none());
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a1"));
+    // Scrolling drives the child log's own scroll state, not the parent's.
+    handle_key(&mut remote, key(KeyCode::PageUp, KeyModifiers::empty()));
+    assert!(!remote.app.child_logs[0].app.autoscroll);
+    assert_eq!(remote.app.scroll, 0);
+}
+
+fn child_line(id: &str) -> crate::protocol::StreamEvent {
+    crate::protocol::StreamEvent::AgentLine {
+        agent_id: id.into(),
+        name: "explorer".into(),
+        event: Box::new(crate::protocol::StreamEvent::System("working".into())),
+    }
+}
+
+#[test]
+fn esc_closes_child_view_without_denying_a_parked_approval() {
+    // Regression: the approval handler ran before the child-view modal, so
+    // with an approval pending and the view open, Esc denied the approval
+    // instead of closing the view (and y/n/s resolved it invisibly). Now
+    // the overlay draws over the view and Esc only closes it.
+    let mut remote = test_remote();
+    input::handle_stream_event(&mut remote, child_line("a1"));
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a1"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    remote
+        .app
+        .pending_approvals
+        .push(crate::ui::PendingApproval::new(
+            "bash".into(),
+            "{}".into(),
+            tx,
+            None,
+        ));
+
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(remote.app.child_view.is_none(), "Esc closes the view");
+    assert_eq!(remote.app.pending_approvals.len(), 1, "approval survives");
+
+    // And with the view closed, Esc denies again as before.
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(remote.app.pending_approvals.is_empty());
+    assert_eq!(
+        rx.try_recv().expect("decision sent"),
+        crate::protocol::ApprovalDecision::Deny
+    );
+}
+
+#[test]
+fn child_log_count_is_capped_and_view_closes_on_dropped_log() {
+    // Each log is a scratch `App` with caches, so a many-spawn session
+    // must not accumulate them unbounded: past the cap the oldest log
+    // drops, and an open view onto it closes instead of dangling.
+    let mut remote = test_remote();
+    for i in 0..crate::ui::CHILD_LOG_MAX_LOGS {
+        input::handle_stream_event(&mut remote, child_line(&format!("a{i}")));
+    }
+    assert_eq!(remote.app.child_logs.len(), crate::ui::CHILD_LOG_MAX_LOGS);
+    remote.app.child_view = Some("a0".into());
+    input::handle_stream_event(&mut remote, child_line("new"));
+    assert_eq!(remote.app.child_logs.len(), crate::ui::CHILD_LOG_MAX_LOGS);
+    assert_eq!(remote.app.child_logs[0].id, "a1", "oldest dropped");
+    assert!(remote.app.child_view.is_none(), "view closed");
 }

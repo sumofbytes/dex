@@ -53,6 +53,11 @@ const WAIT_POLL: Duration = Duration::from_millis(25);
 pub struct ProgressReporter {
     pub manager: Arc<Mutex<Inner>>,
     pub id: AgentId,
+    /// Lifecycle hook snapshotted at spawn (see [`AgentManager::launch`]):
+    /// per-line emission is the hot path (one sink line per streamed
+    /// token), so it must not take the manager lock per event. The hook is
+    /// attached when the manager is built, always before any spawn.
+    events: Option<EventHook>,
 }
 
 impl ProgressReporter {
@@ -96,6 +101,20 @@ impl ProgressReporter {
             child.instance.progress = None;
         }
     }
+
+    /// Fire one child transcript line (plan §20 child view) through the
+    /// lifecycle hook snapshotted at spawn. A no-op when no hook was
+    /// attached (test-built managers, non-daemon callers): the lines are a
+    /// UI surface, never agent state.
+    pub fn emit_line(&self, name: &str, event: crate::protocol::StreamEvent) {
+        if let Some(hook) = &self.events {
+            hook(AgentEvent::Line {
+                agent_id: self.id.clone(),
+                name: name.to_string(),
+                event,
+            });
+        }
+    }
 }
 
 /// Per-session child-agent registry. Cheap to clone; all clones share one
@@ -121,6 +140,15 @@ pub enum AgentEvent {
         current_tool: Option<String>,
     },
     Completed(AgentNotice),
+    /// One child transcript line (plan §20 child view): already mapped onto
+    /// the wire shapes the parent turn streams, fired from the child body's
+    /// sink consumer through [`ProgressReporter::emit_line`]. Journaled and
+    /// broadcast through the same hook as the other variants.
+    Line {
+        agent_id: AgentId,
+        name: String,
+        event: crate::protocol::StreamEvent,
+    },
 }
 
 /// The daemon-supplied lifecycle hook: typed events (§15 V1b) journaled and
@@ -318,6 +346,10 @@ impl AgentManager {
     ) {
         let manager = self.clone();
         let task_id = id.clone();
+        // Snapshot the hook before the task spawns: the child body's
+        // per-line emissions (`ProgressReporter::emit_line`) then never
+        // touch the manager lock (see `ProgressReporter::events`).
+        let events = manager.lock().events.clone();
         let handle = tokio::spawn(async move {
             // Cancel wins over a body that ignores its token, and the body
             // gets the definition's `timeout` to finish (plan §14): a run
@@ -332,6 +364,7 @@ impl AgentManager {
                             ProgressReporter {
                                 manager: manager.inner.clone(),
                                 id: task_id.clone(),
+                                events,
                             },
                             task_id.clone(),
                         )),

@@ -77,6 +77,8 @@ async fn journal_hook_fires_on_every_terminal_path() {
                     super::super::status_word(notice.status)
                 )
             }
+            // Child transcript lines never fire from these test bodies.
+            AgentEvent::Line { .. } => return,
         };
         capture.lock().unwrap_or_else(|e| e.into_inner()).push(text);
     }));

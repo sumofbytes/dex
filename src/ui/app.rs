@@ -228,6 +228,16 @@ pub(crate) struct App {
     pub(crate) pending_approvals: Vec<PendingApproval>,
     /// Live child agents (V1b typed events, §15).
     pub(crate) agents: Vec<AgentChip>,
+    /// Per-child transcript logs (plan §20 child view): scratch `App`s keyed
+    /// by agent id, reused purely for their transcript machinery (block
+    /// building + wrap caches), so child lines render with the identical
+    /// block semantics as the parent transcript. Logs survive the child's
+    /// completion; the block cap bounds memory for runaway children.
+    pub(crate) child_logs: Vec<ChildLog>,
+    /// The open child transcript view: the agent id being shown in the
+    /// parent's transcript window (composer and footer stay visible),
+    /// `None` while the parent transcript is showing.
+    pub(crate) child_view: Option<String>,
     pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
@@ -306,7 +316,22 @@ pub(crate) struct App {
 impl App {
     /// Shared test constructor: a hermetic in-memory session, no connection,
     /// no skills, model "test". ui.rs and ui/slash.rs tests both build on it.
+    /// Derived from [`App::scratch`] — the one canonical all-defaults `App`
+    /// literal — so a new field is initialized in exactly one place.
     pub(crate) fn test_app() -> App {
+        let mut app = App::scratch();
+        app.config.model = "test".into();
+        app.config.available_models = vec!["test".into()];
+        app
+    }
+}
+
+impl App {
+    /// The canonical all-defaults `App` literal: a bare scratch `App` used
+    /// only as transcript machinery for a child log (plan §20 child view;
+    /// tests derive [`App::test_app`] from it), so every non-transcript
+    /// field stays at its default and new fields initialize in one place.
+    pub(crate) fn scratch() -> App {
         App {
             remote_mode: false,
             transcript: Vec::new(),
@@ -315,8 +340,8 @@ impl App {
                 provider: crate::protocol::Provider::Anthropic,
                 api_key: String::new(),
                 base_url: String::new(),
-                model: "test".into(),
-                available_models: vec!["test".into()],
+                model: String::new(),
+                available_models: Vec::new(),
                 endpoints: Default::default(),
                 api: crate::protocol::ApiProtocol::Responses,
                 account_id: None,
@@ -335,7 +360,7 @@ impl App {
                 request_timeout_secs: 300,
             },
             messages: Vec::new(),
-            tool_state: super::UsageState::default(),
+            tool_state: crate::ui::UsageState::default(),
             session: crate::session::Session::in_memory("/tmp".into()),
             skills: Vec::new(),
             turn_start: 0,
@@ -351,6 +376,8 @@ impl App {
             approval_rx: None,
             pending_approvals: Vec::new(),
             agents: Vec::new(),
+            child_logs: Vec::new(),
+            child_view: None,
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -380,9 +407,7 @@ impl App {
             slash_cache: std::cell::RefCell::new(None),
         }
     }
-}
 
-impl App {
     pub(crate) fn history_up(&mut self) {
         if self.history.is_empty() {
             return;
@@ -515,6 +540,27 @@ pub(crate) struct AgentChip {
     pub(crate) name: String,
     pub(crate) tool: Option<String>,
 }
+
+/// One child agent's transcript log (plan §20 child view): the definition
+/// name for the view title plus a scratch [`App`] carrying the transcript
+/// blocks and their wrap caches. `App::new`-free — the scratch is built by
+/// [`App::scratch`] so every field stays initialized exactly once.
+pub(crate) struct ChildLog {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) app: App,
+}
+
+/// Block cap per child log: a runaway child must not grow the client's
+/// memory without bound. Past the cap the oldest quarter is dropped and the
+/// wrap caches cleared (recomputed lazily on the next render).
+pub(crate) const CHILD_LOG_MAX_BLOCKS: usize = 2000;
+
+/// Cap on the number of retained child logs: each is a full scratch `App`
+/// with caches, so a long session spawning many children must not grow
+/// without bound either. Past the cap the oldest log is dropped (recreated
+/// empty if that child is still streaming).
+pub(crate) const CHILD_LOG_MAX_LOGS: usize = 16;
 
 pub(crate) struct TerminalCleanup;
 

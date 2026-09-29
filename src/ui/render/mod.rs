@@ -178,6 +178,43 @@ pub(super) fn compute_layout(
     })
 }
 
+/// Plan §20 child view: the child log rendered inside the parent's
+/// transcript window — a one-row title (definition name + id + key hints)
+/// on top, the child log below. Rendered through [`TranscriptView::render`]
+/// so child blocks wrap, style, scroll, and autoscroll exactly like the
+/// parent transcript's. The composer, queue strip, and footer stay visible
+/// (the session stays controllable), and the approval overlay draws over
+/// this in [`view`].
+fn render_child_view(f: &mut ratatui::Frame, area: Rect, app: &mut App, idx: usize) {
+    let (title, live) = {
+        let log = &app.child_logs[idx];
+        let live = app.agents.iter().any(|chip| chip.id == log.id);
+        (format!("\u{27e1} {} \u{b7} {}", log.name, log.id), live)
+    };
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let title_line = ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled(title, fg(theme::accent_fg())),
+        ratatui::text::Span::styled(
+            if live {
+                "  \u{25cf} running"
+            } else {
+                "  \u{25cb} done"
+            },
+            fg(if live {
+                theme::success_fg()
+            } else {
+                theme::muted_fg()
+            }),
+        ),
+        ratatui::text::Span::styled(
+            "   Esc close \u{b7} Ctrl+A next \u{b7} PgUp/PgDn scroll",
+            fg(theme::muted_fg()),
+        ),
+    ]);
+    f.render_widget(ratatui::widgets::Paragraph::new(title_line), chunks[0]);
+    TranscriptView::render(f, chunks[1], &mut app.child_logs[idx].app);
+}
+
 pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     // Ratatui only repaints cells the widget touches; without a full clear,
@@ -202,8 +239,19 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
     // no reason and push the composer up.
     let layout = compute_layout(area, input_rows, queue, false).expect("layout always exists");
-
-    TranscriptView::render(f, layout.transcript, app);
+    // Plan §20 child view: the open child transcript replaces only the
+    // parent's transcript window (title bar + child log); the composer and
+    // footer stay so the session remains controllable. The approval
+    // overlay below renders on top of it.
+    if let Some(idx) = app
+        .child_view
+        .as_ref()
+        .and_then(|id| app.child_logs.iter().position(|log| &log.id == id))
+    {
+        render_child_view(f, layout.transcript, app, idx);
+    } else {
+        TranscriptView::render(f, layout.transcript, app);
+    }
     BottomPane::render(f, &layout, app, input_lines, input_cursor, &groups);
     if !app.pending_approvals.is_empty() {
         ApprovalOverlay::render(f, area, app);
