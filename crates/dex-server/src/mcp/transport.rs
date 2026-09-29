@@ -25,7 +25,7 @@ pub(crate) fn initialize_params() -> Value {
     serde_json::json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {},
-        "clientInfo": {"name": "dex", "version": env!("CARGO_PKG_VERSION")},
+        "clientInfo": {"name": "dex", "version": crate::runtime::runtime::http::VERSION},
     })
 }
 
