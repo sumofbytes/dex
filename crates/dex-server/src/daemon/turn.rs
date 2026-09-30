@@ -885,8 +885,9 @@ async fn drain_agent_notices(
 ) -> Result<bool, String> {
     let manager = state.manager_for(session_id);
     let notices = manager.drain_notices();
+    let task_notices = manager.drain_task_notices();
     let overflow = manager.take_overflow();
-    if notices.is_empty() && overflow == 0 {
+    if notices.is_empty() && task_notices.is_empty() && overflow == 0 {
         return Ok(false);
     }
     let mut text = String::new();
@@ -911,6 +912,12 @@ async fn drain_agent_notices(
             "\n\n{overflow} more children finished earlier than this notice could \
              carry; their results are retained — use delegate action=wait with their ids."
         ));
+    }
+    for notice in task_notices {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&notice.text());
     }
     let message = ChatMessage::user_named(text, "agent-notifications");
     session

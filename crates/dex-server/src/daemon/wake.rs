@@ -23,7 +23,7 @@ const WAKE_PRESENCE_WINDOW: Duration = Duration::from_secs(30);
 /// The idle wake turn's prompt: the drained notices themselves ride the
 /// agent-notifications user message (the same seam a user turn uses), so
 /// the wake only needs to point the main agent at them.
-const WAKE_PROMPT: &str = "A background agent finished while this session was idle. Review the agent-notifications below and continue the work they point at; if nothing needs doing, reply with one short line and stop.";
+const WAKE_PROMPT: &str = "A background task or agent finished while this session was idle. Review the agent-notifications below and continue the work they point at; if nothing needs doing, reply with one short line and stop.";
 
 /// §10b V1b: idle wake. Fired when a completion notice is queued while no
 /// turn is live and a client is plausibly listening (presence = a recent
@@ -54,7 +54,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 continue;
             }
             let manager = state.manager_for(&session_id);
-            if !manager.has_notices() {
+            if !manager.has_any_notices() {
                 return;
             }
             let Some(wake_cancel) = state.claim_wake(&session_id) else {
@@ -138,7 +138,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             .await;
             // More completions may have landed while the wake ran; re-arm
             // (bounded) instead of dropping them.
-            if !state.manager_for(&session_id).has_notices() {
+            if !state.manager_for(&session_id).has_any_notices() {
                 return;
             }
             tokio::time::sleep(WAKE_DEBOUNCE).await;

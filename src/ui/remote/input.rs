@@ -302,6 +302,37 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             name,
             event,
         } => append_child_log(remote, &agent_id, &name, *event),
+        // Background shell tasks (spec Rev 3): chips + capped output logs.
+        // The V1a System lines ([task …] started/finished) already render
+        // into the parent transcript via the System arm below.
+        StreamEvent::TaskStarted { id, command } => {
+            if !remote.app.tasks.iter().any(|t| t.id == id) {
+                remote.app.tasks.push(crate::ui::TaskChip {
+                    id: id.clone(),
+                    command: command.clone(),
+                    done: false,
+                });
+            }
+            if !remote.app.task_logs.iter().any(|l| l.id == id) {
+                if remote.app.task_logs.len() >= crate::ui::TASK_LOG_MAX_LOGS {
+                    let dropped = remote.app.task_logs.remove(0);
+                    if remote.app.task_view.as_deref() == Some(dropped.id.as_str()) {
+                        remote.app.task_view = None;
+                    }
+                }
+                remote.app.task_logs.push(crate::ui::TaskLog {
+                    id,
+                    command,
+                    lines: Vec::new(),
+                });
+            }
+        }
+        StreamEvent::TaskFinished { id, .. } => {
+            if let Some(chip) = remote.app.tasks.iter_mut().find(|t| t.id == id) {
+                chip.done = true;
+            }
+        }
+        StreamEvent::TaskOutput { id, chunk } => append_task_log(remote, &id, &chunk),
         StreamEvent::TurnComplete { usage, cached, .. } => {
             if let Some(usage) = usage {
                 remote.app.tool_state.last_usage = Some(usage);
@@ -587,6 +618,36 @@ fn append_child_log(remote: &mut RemoteApp, agent_id: &str, name: &str, event: S
         log.app.transcript.drain(..log.app.transcript.len() - keep);
         log.app.wrapped_cache.clear();
         log.app.display_cache.clear();
+    }
+}
+
+/// Background task output: append chunk lines to the per-task log with the
+/// line-cap discipline. Unknown ids (reconnect race) start a fresh
+/// command-less log rather than dropping output.
+fn append_task_log(remote: &mut RemoteApp, id: &str, chunk: &str) {
+    let log = match remote.app.task_logs.iter_mut().find(|l| l.id == id) {
+        Some(log) => log,
+        None => {
+            if remote.app.task_logs.len() >= crate::ui::TASK_LOG_MAX_LOGS {
+                let dropped = remote.app.task_logs.remove(0);
+                if remote.app.task_view.as_deref() == Some(dropped.id.as_str()) {
+                    remote.app.task_view = None;
+                }
+            }
+            remote.app.task_logs.push(crate::ui::TaskLog {
+                id: id.to_string(),
+                command: String::new(),
+                lines: Vec::new(),
+            });
+            remote.app.task_logs.last_mut().expect("just pushed")
+        }
+    };
+    for line in chunk.split('\n') {
+        log.lines.push(line.to_string());
+    }
+    if log.lines.len() > crate::ui::TASK_LOG_MAX_LINES {
+        let excess = log.lines.len() - crate::ui::TASK_LOG_MAX_LINES;
+        log.lines.drain(..excess);
     }
 }
 

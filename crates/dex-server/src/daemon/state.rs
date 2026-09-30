@@ -368,7 +368,9 @@ impl DaemonState {
     /// terminal-path journal hook (§15 V1a) closes over this state, making
     /// a state → manager → hook cycle; `shutdown_agents` and
     /// `remove_session_agents` take the managers out of the map, which
-    /// drops the hooks and breaks it — nothing leaks.
+    /// drops the hooks and breaks it — nothing leaks. Background shell
+    /// tasks ride the same per-session manager (their registry lives in
+    /// `Inner`), with a sibling task hook for journal + broadcast + wake.
     pub(crate) fn manager_for(self: &Arc<Self>, session_id: &str) -> AgentManager {
         let mut agents = lock_map(&self.agents);
         agents
@@ -376,9 +378,15 @@ impl DaemonState {
             .or_insert_with(|| {
                 let state = Arc::clone(self);
                 let sid = session_id.to_string();
-                AgentManager::new(session_id).with_events(Arc::new(move |event| {
-                    journal_agent_event(&state, &sid, event);
-                }))
+                let state_task = Arc::clone(self);
+                let sid_task = session_id.to_string();
+                AgentManager::new(session_id)
+                    .with_events(Arc::new(move |event| {
+                        journal_agent_event(&state, &sid, event);
+                    }))
+                    .with_task_events(Arc::new(move |event| {
+                        journal_task_event(&state_task, &sid_task, event);
+                    }))
             })
             .clone()
     }
@@ -692,5 +700,95 @@ pub(crate) fn journal_agent_event(state: &Arc<DaemonState>, session_id: &str, ev
     state.broadcast_event(session_id, &env);
     if matches!(&event, AgentEvent::Completed(_)) {
         crate::daemon::wake::schedule_idle_wake(state.clone(), session_id.to_string());
+    }
+}
+
+/// Journal one background-task lifecycle event (spec Rev 3): a `System`
+/// line with the stable `[task <id>]` prefix (old clients render it) plus
+/// the typed variant (new clients read fields). `TaskOutput` is
+/// broadcast-only: it allocates a seq and hits live streams without a
+/// journal append (intentional seq gaps; `?since=` replay skips them).
+/// Completion schedules the idle wake; the notice itself was already queued
+/// by `bg_finish` before the hook fired.
+pub(crate) fn journal_task_event(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    event: crate::agent::delegate::TaskEvent,
+) {
+    use crate::agent::delegate::TaskEvent as TE;
+    match event {
+        TE::Output { id, chunk } => {
+            let seq = state.next_seq(session_id);
+            state.broadcast_event(
+                session_id,
+                &StreamEnvelope {
+                    seq,
+                    event: StreamEvent::TaskOutput { id, chunk },
+                },
+            );
+        }
+        TE::Started { id, command } => {
+            let path = lock_map(&state.sessions)
+                .get(session_id)
+                .map(|e| e.path.clone());
+            let Some(path) = path else { return };
+            let Ok(mut journal) = crate::session::Session::from_path_for_events(&path) else {
+                return;
+            };
+            let line = format!("[task {id}] started: {command}");
+            let seq = state.next_seq(session_id);
+            let env = StreamEnvelope {
+                seq,
+                event: StreamEvent::System(line),
+            };
+            let _ =
+                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+            state.broadcast_event(session_id, &env);
+            let seq = state.next_seq(session_id);
+            let env = StreamEnvelope {
+                seq,
+                event: StreamEvent::TaskStarted { id, command },
+            };
+            let _ =
+                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+            state.broadcast_event(session_id, &env);
+        }
+        TE::Finished {
+            notice,
+            status,
+            exit_code,
+            duration,
+        } => {
+            let path = lock_map(&state.sessions)
+                .get(session_id)
+                .map(|e| e.path.clone());
+            let Some(path) = path else { return };
+            let Ok(mut journal) = crate::session::Session::from_path_for_events(&path) else {
+                return;
+            };
+            let line = notice.text();
+            let seq = state.next_seq(session_id);
+            let env = StreamEnvelope {
+                seq,
+                event: StreamEvent::System(line),
+            };
+            let _ =
+                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+            state.broadcast_event(session_id, &env);
+            let seq = state.next_seq(session_id);
+            let env = StreamEnvelope {
+                seq,
+                event: StreamEvent::TaskFinished {
+                    id: notice.id.clone(),
+                    status: status.word(),
+                    exit_code,
+                    duration,
+                },
+            };
+            let _ =
+                journal.append_event(seq, &serde_json::to_string(&env.event).unwrap_or_default());
+            state.broadcast_event(session_id, &env);
+            crate::daemon::wake::schedule_idle_wake(state.clone(), session_id.to_string());
+        }
     }
 }

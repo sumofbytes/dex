@@ -964,6 +964,8 @@ async fn child_run(
     // prompts): a child blocked on a decision must be able to ask, and its
     // question rides the same labeled prompt path as its approvals.
     allowed.insert("ask_user".to_string());
+    // Session tasks are shared: any agent in the session can poll/stop them.
+    allowed.insert(crate::agent::delegate::BACKGROUND_TOOL.to_string());
     if may_delegate {
         allowed.insert(DELEGATION_TOOL.to_string());
     }

@@ -192,6 +192,24 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                 }),
             },
         });
+        tools.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "background".to_string(),
+                description: "Background shell tasks. action=spawn: run a shell command detached from the turn and return its task id immediately — dev servers, watchers, long test runs. Completions are announced automatically at the next turn boundary. action=output: incremental output past cursor (byte offset from a previous result; omit for the tail). action=wait: block up to timeout_secs (0-120, default 30) for exit, then return the output shape; 0 polls once. action=stop: SIGKILL the process group (unix). action=list: this session's tasks, running first. Any agent in the session can poll/stop.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["spawn", "output", "stop", "wait", "list"], "description": "spawn a task, read its output, stop it, wait for exit, or list this session's tasks" },
+                        "command": { "type": "string", "description": "spawn: shell command, same grammar as bash" },
+                        "id": { "type": "string", "description": "output/stop/wait: task id (task-1)" },
+                        "cursor": { "type": "integer", "description": "output/wait: byte offset into total_written from a previous result" },
+                        "timeout_secs": { "type": "integer", "description": "wait: how long to wait for exit (0-120, default 30); 0 polls once" }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        });
     }
     tools
 }
@@ -241,8 +259,12 @@ mod tests {
         );
 
         let with_delegation = builtin_tools(true);
-        assert_eq!(with_delegation.len(), without_delegation.len() + 1);
-        assert_eq!(with_delegation.last().unwrap().function.name, "delegate");
+        assert_eq!(with_delegation.len(), without_delegation.len() + 2);
+        assert_eq!(
+            with_delegation[with_delegation.len() - 2].function.name,
+            "delegate"
+        );
+        assert_eq!(with_delegation.last().unwrap().function.name, "background");
     }
 
     #[test]

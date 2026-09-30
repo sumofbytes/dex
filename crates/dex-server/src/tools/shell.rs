@@ -176,6 +176,20 @@ async fn kill_process_group_async(pid: Option<u32>, child: &mut tokio::process::
     let _ = child.kill().await;
 }
 
+/// Pid-only process-group kill for background tasks (spec Rev 3): `stop`
+/// and teardown run without the `Child` handle (the drain task owns it),
+/// so the `&mut Child` fallback in `kill_process_group_async` is
+/// unavailable. Unix sends SIGKILL to the group; non-unix is a no-op and
+/// the drain's `child.kill().await` fallback covers single-process kill.
+pub(crate) fn kill_process_group_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = kill(-(pid as i32), SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// Spawn the workspace shell. Unix gets `sh -c` in a fresh session so tool
 /// children can never write to or race the user's terminal for input: a child
 /// that probes the terminal (e.g. `cargo test` running the theme tests →
@@ -185,7 +199,7 @@ async fn kill_process_group_async(pid: Option<u32>, child: &mut tokio::process::
 /// SAFETY: runs in the forked child before exec; it is not yet a process
 /// group leader, so setsid() succeeds.
 #[cfg(unix)]
-fn shell_command(command: &str) -> tokio::process::Command {
+pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
     let mut builder = tokio::process::Command::new("sh");
     builder
         .arg("-c")
@@ -205,7 +219,7 @@ fn shell_command(command: &str) -> tokio::process::Command {
 }
 
 #[cfg(not(unix))]
-fn shell_command(command: &str) -> tokio::process::Command {
+pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
     let mut builder = tokio::process::Command::new("cmd");
     builder
         .arg("/C")

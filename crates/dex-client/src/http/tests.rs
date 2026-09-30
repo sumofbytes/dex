@@ -85,6 +85,29 @@ fn sse_framer_skips_the_removed_agent_recovered_type() {
     assert!(framer.pending.is_empty());
 }
 
+/// Background tasks (spec Rev 3, P7): a future unknown `task_*` type still
+/// advances the cursor without queuing, while the current task lifecycle
+/// types parse into typed events.
+#[test]
+fn sse_framer_task_types_parse_and_future_ones_skip() {
+    let mut framer = SseFramer::default();
+    let started = StreamEnvelope {
+        seq: 11,
+        event: StreamEvent::TaskStarted {
+            id: "task-1".into(),
+            command: "npm run dev".into(),
+        },
+    };
+    framer.push_bytes(format!("data: {}\n", serde_json::to_string(&started).unwrap()).as_bytes());
+    assert_eq!(framer.next_seq, 12);
+    assert_eq!(framer.pending.len(), 1);
+    framer.push_bytes(
+        b"data: {\"seq\":12,\"type\":\"task_frobnicated\",\"data\":{\"id\":\"task-9\"}}\n",
+    );
+    assert_eq!(framer.next_seq, 13);
+    assert_eq!(framer.pending.len(), 1, "unknown type queues nothing");
+}
+
 #[test]
 fn sse_framer_reassembles_split_lines_and_trailing_terminal() {
     // One envelope split across TCP chunks reassembles; keep-alives and

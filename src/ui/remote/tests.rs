@@ -1176,6 +1176,42 @@ fn agent_lines_buffer_into_child_log_and_leave_parent_alone() {
 }
 
 #[test]
+fn task_events_drive_chips_and_capped_logs() {
+    let mut remote = test_remote();
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskStarted {
+            id: "task-1".into(),
+            command: "npm run dev".into(),
+        },
+    );
+    assert_eq!(remote.app.tasks.len(), 1);
+    assert!(!remote.app.tasks[0].done);
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskOutput {
+            id: "task-1".into(),
+            chunk: "listening\non :3000".into(),
+        },
+    );
+    assert_eq!(remote.app.task_logs.len(), 1);
+    assert_eq!(remote.app.task_logs[0].lines, vec!["listening", "on :3000"]);
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskFinished {
+            id: "task-1".into(),
+            status: "exit 0".into(),
+            exit_code: Some(0),
+            duration: 1.0,
+        },
+    );
+    assert!(remote.app.tasks[0].done);
+    let status = crate::ui::status::ui_status(&remote.app);
+    assert!(status.contains("tasks:"), "{status}");
+    assert!(status.contains("task-1"), "{status}");
+}
+
+#[test]
 fn child_view_toggles_and_cycles_with_keys() {
     let mut remote = test_remote();
     for id in ["a1", "a2"] {

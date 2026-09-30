@@ -9,6 +9,7 @@ use super::super::resume::resume_note;
 use super::super::resume::ResumeHandle;
 use super::lifecycle::EventHook;
 use super::lifecycle::ProgressReporter;
+use super::lifecycle::TaskEventHook;
 use crate::runtime::console::CancellationToken;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -151,6 +152,19 @@ pub struct Inner {
     pub notices: VecDeque<AgentNotice>,
     /// Completions dropped because `notices` was full.
     pub overflowed: usize,
+    /// Background shell-task registry (spec Rev 3): per-session, ids
+    /// `task-1`…, reachable via the daemon's per-session manager so tool
+    /// calls (which hold a manager, not `DaemonState`) can poll/stop.
+    pub bg: crate::daemon::tasks::TaskRegistry,
+    /// Background-task completion notices, sibling to `notices` (never
+    /// conflated so agent drains never misrender task rows).
+    pub bg_notices: VecDeque<crate::daemon::tasks::TaskNotice>,
+    /// Lifecycle hook for task events (journal + broadcast + wake),
+    /// attached by the daemon beside `events`; `None` for test managers.
+    pub bg_events: Option<TaskEventHook>,
+    /// Drain-task handles, aborted on stop/teardown (the drain owns the
+    /// `Child`; the registry keeps only the pid).
+    pub bg_handles: HashMap<String, JoinHandle<()>>,
 }
 
 /// Named snapshot of the registry entry at `finish` time. `None` only

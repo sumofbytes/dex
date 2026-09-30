@@ -346,6 +346,7 @@ pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
     }
     // Session cost: `$X.XXX`, catalog-priced when possible
     // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
+    pieces.extend(tasks_pieces(app));
     push_cost(&mut pieces, app);
     pieces
 }
@@ -367,6 +368,33 @@ fn agents_pieces(app: &App) -> Vec<Piece> {
         .collect::<Vec<_>>()
         .join(", ");
     vec![sep(), (format!("agents: {text}"), fg(theme::ok_fg()))]
+}
+
+/// Background shell tasks (spec Rev 3): `⟳ task-1, ✓ task-2` capped at 3 +
+/// overflow, mirroring the agent-chip discipline.
+fn tasks_pieces(app: &App) -> Vec<Piece> {
+    if app.tasks.is_empty() {
+        return Vec::new();
+    }
+    const SHOWN: usize = 3;
+    let mut names: Vec<String> = app
+        .tasks
+        .iter()
+        .map(|t| {
+            if t.done {
+                format!("✓ {}", t.id)
+            } else {
+                format!("⟳ {}", t.id)
+            }
+        })
+        .collect();
+    let overflow = names.len().saturating_sub(SHOWN);
+    names.truncate(SHOWN);
+    let mut text = names.join(", ");
+    if overflow > 0 {
+        text.push_str(&format!(" +{overflow}"));
+    }
+    vec![sep(), (format!("tasks: {text}"), fg(theme::ok_fg()))]
 }
 
 /// Test shim: the status row as plain text (string asserts in `render/tests`).
@@ -395,6 +423,7 @@ fn compact_pieces(app: &App) -> Vec<Piece> {
     pieces.push(sep());
     pieces.push(mode_piece(app));
     pieces.extend(agents_pieces(app));
+    pieces.extend(tasks_pieces(app));
     push_cost(&mut pieces, app);
     pieces
 }
