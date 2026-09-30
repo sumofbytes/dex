@@ -146,10 +146,10 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 #[cfg(feature = "tui")]
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 #[cfg(feature = "tui")]
-use self::palette::{blend, faint_rgb, fg_rgb, muted_rgb, term_palette, Background};
+use self::palette::{blend, fg_rgb, muted_rgb, term_palette, tinted_rgb, Background};
 
 /// A raised surface: the terminal's actual background lifted a step toward
 /// its foreground, so the hue matches the active theme. `amount` controls how
@@ -210,14 +210,26 @@ pub fn muted_fg() -> Color {
     tool_muted_fg()
 }
 
-/// Foreground for hairline separator rules (the sheet top rule): barely
-/// visible, far dimmer than readable muted text. Keeps the terminal's hue via
-/// the same foreground-toward-background blend.
+/// Style for hairline separator rules (the composer's top/bottom rules and
+/// the submitted prompt's echo rule): subdued but clearly visible — dimmer
+/// than prominent text, brighter than a barely-there edge. When a voice is
+/// active the rules carry its hue: the voice's tint re-lit to the muted
+/// band's luminance, so it reads at the same dimness as the plain blend but
+/// marks the frame with the user's identity color (`Alt+V` retints it live).
+/// The plain voice uses the foreground-toward-background blend, which keeps
+/// the terminal's hue on tinted light/dark terminals. When the OSC 11
+/// palette query fails there is nothing to blend or tint — a fixed ANSI gray
+/// (`DarkGray`) would bypass whatever theme the terminal remaps its palette
+/// to — so the fallback dims (SGR 2) the terminal's *own* default foreground
+/// instead: the terminal derives the dimmed edge from its active theme on
+/// any background.
 #[cfg(feature = "tui")]
-pub fn hairline_fg() -> Color {
-    match faint_rgb() {
-        Some((r, g, b)) => Color::Rgb(r, g, b),
-        None => Color::DarkGray,
+pub fn hairline_style() -> Style {
+    match tinted_rgb(VOICES[voice_idx()].tint) {
+        Some((r, g, b)) => Style::default().fg(Color::Rgb(r, g, b)),
+        None => Style::default()
+            .fg(Color::Reset)
+            .add_modifier(Modifier::DIM),
     }
 }
 
@@ -225,12 +237,16 @@ pub fn hairline_fg() -> Color {
 /// for dark terminals and the deep shade for light ones. Every accent entry
 /// steers clear of the claimed slots — Cyan chrome, LightGreen ok-states,
 /// Yellow warnings, Red errors; `plain` is the pre-voice original, the
-/// inherited foreground on both themes.
+/// inherited foreground on both themes. `tint` is a representative hue used
+/// only to color the hairline rules (re-lit to the muted band's luminance,
+/// so one shade serves both themes); it is fixed RGB because ANSI-slot
+/// voices can't be converted from their slots — themes remap those freely.
 #[cfg(feature = "tui")]
 struct Voice {
     name: &'static str,
     dark: Color,
     light: Color,
+    tint: Option<(u8, u8, u8)>,
 }
 
 #[cfg(feature = "tui")]
@@ -239,41 +255,49 @@ const VOICES: &[Voice] = &[
         name: "magenta",
         dark: Color::LightMagenta,
         light: Color::Magenta,
+        tint: Some((214, 112, 214)),
     },
     Voice {
         name: "sky",
         dark: Color::LightBlue,
         light: Color::Blue,
+        tint: Some((90, 140, 250)),
     },
     Voice {
         name: "peach",
         dark: Color::Rgb(255, 190, 130),
         light: Color::Rgb(176, 92, 24),
+        tint: Some((255, 165, 95)),
     },
     Voice {
         name: "violet",
         dark: Color::Rgb(200, 160, 255),
         light: Color::Rgb(110, 60, 180),
+        tint: Some((150, 110, 250)),
     },
     Voice {
         name: "rose",
         dark: Color::Rgb(255, 150, 180),
         light: Color::Rgb(190, 45, 95),
+        tint: Some((235, 100, 150)),
     },
     Voice {
         name: "amber",
         dark: Color::Rgb(255, 195, 85),
         light: Color::Rgb(150, 95, 5),
+        tint: Some((235, 170, 60)),
     },
     Voice {
         name: "coral",
         dark: Color::Rgb(255, 140, 115),
         light: Color::Rgb(185, 65, 40),
+        tint: Some((245, 120, 100)),
     },
     Voice {
         name: "plain",
         dark: Color::Reset,
         light: Color::Reset,
+        tint: None,
     },
 ];
 
@@ -533,7 +557,39 @@ mod tests {
                     "voice {} needs distinct dark/light shades",
                     voice.name
                 );
+                assert!(
+                    voice.tint.is_some(),
+                    "voice {} needs a hairline tint",
+                    voice.name
+                );
             }
+        }
+    }
+
+    #[test]
+    fn plain_voice_has_no_hairline_tint() {
+        // The plain voice is the pre-voice original: its rules fall back to
+        // the neutral muted blend, not a tinted edge.
+        assert_eq!(VOICES[default_voice()].tint, None);
+    }
+
+    #[test]
+    fn tinted_rgb_relights_to_the_muted_luminance() {
+        // On a known palette a tinted rule must land at the muted blend's
+        // luminance (same dimness, borrowed hue); without a tint or without
+        // a palette it falls back to the plain muted blend.
+        let tint = Some((235, 170, 60));
+        match (tinted_rgb(tint), muted_rgb()) {
+            (Some(tinted), Some(base)) => {
+                let lu = |c: (u8, u8, u8)| {
+                    f32::from(c.0) * 0.2126 + f32::from(c.1) * 0.7152 + f32::from(c.2) * 0.0722
+                };
+                assert!(
+                    (lu(tinted) - lu(base)).abs() < 6.0,
+                    "tinted rule {tinted:?} drifted from the muted band {base:?}"
+                );
+            }
+            (a, b) => assert!(a.is_none() && b.is_none(), "palette disagreement"),
         }
     }
 
