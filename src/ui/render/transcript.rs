@@ -83,19 +83,18 @@ fn surface_rows(
 }
 
 /// One `─` hairline framing a submitted prompt, same style as the live
-/// composer's top/bottom rules (`input_block`: `hairline_fg()`). The row is
+/// composer's top/bottom rules (`input_block`: `hairline_style()`). The row is
 /// inset by the shared transcript indent so its dashes start on the text
 /// column — the same cell the composer's band starts on — and padded out to
 /// the full wrap width on the terminal background like every other echo row.
 fn user_rule_row(width: u16) -> Line<'static> {
-    use super::super::style::fg;
     use crate::render::theme;
     let w = width.max(1) as usize;
     let indent = TRANSCRIPT_INDENT.min(w);
     let dashes = w.saturating_sub(indent);
     let mut row = Line::from(vec![
         Span::raw(" ".repeat(indent)),
-        Span::styled("─".repeat(dashes), fg(theme::hairline_fg())),
+        Span::styled("─".repeat(dashes), theme::hairline_style()),
     ]);
     row.style.bg = Some(Color::Reset);
     row

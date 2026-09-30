@@ -72,7 +72,7 @@ pub(super) fn input_block() -> Block<'static> {
     // Borderless sides, hairline rules top and bottom: the composer is a
     // band on the terminal's own background (no surface fill — the
     // transcript's user band has none either), framed by two `─` rules in
-    // the shared `hairline_fg()` so it reads as an edge, not a box. The
+    // the shared `hairline_style()` so it reads as an edge, not a box. The
     // band is already inset one column from the window edges
     // (`composer_band`), which supplies both the rules' air and the text
     // column, so the block adds no horizontal padding and the caret and
@@ -81,7 +81,7 @@ pub(super) fn input_block() -> Block<'static> {
     // and grows only as the input wraps.
     Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(fg(theme::hairline_fg()))
+        .border_style(theme::hairline_style())
 }
 
 pub(super) fn input_outer_height(content_rows: u16) -> u16 {

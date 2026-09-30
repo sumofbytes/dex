@@ -1639,10 +1639,9 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
                 s.trim().chars().all(|c| c == '─'),
                 "box edge must be a clean ─ rule at w {w}: {s:?}"
             );
+            let hl = theme::hairline_style();
             assert!(
-                rule.spans
-                    .iter()
-                    .any(|sp| sp.style.fg == Some(theme::hairline_fg())),
+                rule.spans.iter().any(|sp| sp.style == hl),
                 "box edge must wear the composer hairline color at w {w}: {rule:?}"
             );
         }

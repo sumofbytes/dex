@@ -187,7 +187,7 @@ impl SlashSuggestionsView {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(inner_w),
-                fg(theme::hairline_fg()),
+                theme::hairline_style(),
             ))),
             sheet_row(0),
         );

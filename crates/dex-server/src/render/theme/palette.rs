@@ -61,12 +61,30 @@ pub fn muted_rgb() -> Option<(u8, u8, u8)> {
     })
 }
 
-/// Hairline-rule dim: barely-visible separator lines (the sheet top rule).
-/// Far fainter than `muted_rgb` — not readable text, just an edge.
-pub fn faint_rgb() -> Option<(u8, u8, u8)> {
+/// Perceived luminance, Rec. 709 weights (0..=255 scale).
+fn luminance(c: (u8, u8, u8)) -> f32 {
+    let (r, g, b) = (f32::from(c.0), f32::from(c.1), f32::from(c.2));
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/// Hairline edge color with an optional accent tint: the accent hue re-lit
+/// to the muted band's luminance, so it reads at the same dimness as the
+/// plain [`muted_rgb`] blend but carries the accent's hue instead of the
+/// foreground's. A chromatic line at the same luminance as an achromatic
+/// one still reads as more present, which keeps the rule an edge — not
+/// dialogue, not chrome shouting for attention. `None` (plain voice,
+/// unknown theme) falls back to the plain muted blend.
+pub fn tinted_rgb(tint: Option<(u8, u8, u8)>) -> Option<(u8, u8, u8)> {
     term_palette().map(|p| {
-        let amount = if p.dark { 0.80 } else { 0.75 };
-        blend(p.foreground, p.background, amount)
+        let amount = if p.dark { 0.38 } else { 0.42 };
+        let base = blend(p.foreground, p.background, amount);
+        let Some(t) = tint else { return base };
+        // Re-light the accent hue to the muted band's luminance. The factor
+        // is bounded so a near-black tint can't explode the channels.
+        let src = luminance(t).max(1.0);
+        let factor = (luminance(base) / src).clamp(0.25, 6.0);
+        let scale = |ch: u8| ((f32::from(ch) * factor).round() as i32).clamp(0, 255) as u8;
+        (scale(t.0), scale(t.1), scale(t.2))
     })
 }
 
