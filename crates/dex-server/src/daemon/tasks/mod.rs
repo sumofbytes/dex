@@ -184,10 +184,9 @@ impl TaskRegistry {
         self.tasks.len()
     }
 
-    /// Highest id ever allocated (ids are dense `task-1..=counter` minus
-    /// evicted finished) — lets `list` probe without an iterator.
-    pub fn task_count_hint(&self) -> u64 {
-        self.counter
+    /// Borrow all tasks (for `list` snapshots).
+    pub fn iter(&self) -> impl Iterator<Item = &BgTask> {
+        self.tasks.values()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -841,46 +841,37 @@ impl AgentManager {
         self.lock().bg.get(id).map(|t| t.is_running())
     }
 
-    /// One line per task, running first then id order (for `list`).
+    /// One line per task, running first then numeric id order (for `list`).
     pub fn bg_snapshot(&self) -> Vec<(String, String, String)> {
-        let inner = self.lock();
-        // TaskRegistry has no iterator; rebuild via finished_order is
-        // private — snapshot through a debug-free path: ids are
-        // `task-1..=counter`. Probe sequentially (counter is small).
-        let mut out = Vec::new();
-        let mut n = 1u64;
-        loop {
-            let id = format!("task-{n}");
-            match inner.bg.get(&id) {
-                Some(task) => {
+        // Snapshot `now` before locking so the lock stays short.
+        let now = std::time::Instant::now();
+        let mut out: Vec<(String, String, String)> = {
+            let inner = self.lock();
+            inner
+                .bg
+                .iter()
+                .map(|task| {
                     let elapsed = task
                         .ended_at
-                        .unwrap_or_else(std::time::Instant::now)
+                        .unwrap_or(now)
                         .saturating_duration_since(task.started_at);
                     let age = if elapsed.as_secs() >= 60 {
                         format!("{}m", elapsed.as_secs() / 60)
                     } else {
                         format!("{}s", elapsed.as_secs())
                     };
-                    out.push((id, task.status.word(), format!("{age}  {}", task.command)));
-                }
-                None => {
-                    // Ids are dense from 1..=counter minus evicted finished;
-                    // stop probing well past any live id.
-                    if n > inner.bg.task_count_hint() {
-                        break;
-                    }
-                }
-            }
-            n += 1;
-            if n > 4096 {
-                break;
-            }
-        }
+                    (
+                        task.id.clone(),
+                        task.status.word(),
+                        format!("{age}  {}", task.command),
+                    )
+                })
+                .collect()
+        };
         out.sort_by(|a, b| {
             let arun = a.1 == "running";
             let brun = b.1 == "running";
-            brun.cmp(&arun).then(a.0.cmp(&b.0))
+            brun.cmp(&arun).then(task_num(&a.0).cmp(&task_num(&b.0)))
         });
         out
     }
@@ -921,4 +912,12 @@ impl AgentManager {
             let _ = handle.await;
         }
     }
+}
+
+/// Numeric suffix of a `task-N` id for ordering (`u64::MAX` for anything
+/// unexpected, so it sorts last instead of breaking the sort).
+fn task_num(id: &str) -> u64 {
+    id.strip_prefix("task-")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX)
 }

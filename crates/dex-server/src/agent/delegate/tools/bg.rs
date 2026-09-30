@@ -93,10 +93,9 @@ pub async fn execute_background(
             )));
         }
     }
-    let action = args
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("spawn");
+    let Some(action) = args.get("action").and_then(Value::as_str) else {
+        return Err(ToolError::Missing("action"));
+    };
     // Per-action gate before anything runs, so a denial never prompts twice.
     let requirement = match action {
         "spawn" | "stop" => PermissionRequirement::Shell,
@@ -196,8 +195,11 @@ async fn drain_task(
         tokio::select! {
             biased;
             status = child.wait() => {
-                // Drain whatever remains, then record.
-                let _ = drain_rest(stdout, stderr, &manager, &id, cap).await;
+                // Drain whatever remains, then record. `drain_rest` feeds
+                // the tail bytes through `pending` so the final live chunk
+                // still broadcasts (fast tasks would otherwise vanish from
+                // the TUI log — the buffer had them, the stream didn't).
+                drain_rest(stdout, stderr, &manager, &id, &mut pending, cap).await;
                 flush_pending(&manager, &id, &mut pending);
                 let (status_word, code) = match status {
                     Ok(st) => match st.code() {
@@ -268,19 +270,23 @@ async fn drain_task(
     }
 }
 
+/// Drain both pipes to EOF after the child exited, appending to the tail
+/// buffer and feeding `pending` so the caller emits one final live chunk.
 async fn drain_rest(
     stdout: &mut tokio::process::ChildStdout,
     stderr: &mut tokio::process::ChildStderr,
     manager: &AgentManager,
     id: &str,
+    pending: &mut Vec<u8>,
     cap: usize,
-) -> Result<(), ()> {
+) {
     let mut buf = [0u8; 8192];
     loop {
         match stdout.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
                 manager.bg_append(id, &buf[..n], cap);
+                pending.extend_from_slice(&buf[..n]);
             }
             Err(_) => break,
         }
@@ -290,11 +296,11 @@ async fn drain_rest(
             Ok(0) => break,
             Ok(n) => {
                 manager.bg_append(id, &buf[..n], cap);
+                pending.extend_from_slice(&buf[..n]);
             }
             Err(_) => break,
         }
     }
-    Ok(())
 }
 
 fn flush_pending(manager: &AgentManager, id: &str, pending: &mut Vec<u8>) {
@@ -492,6 +498,23 @@ mod tests {
                 "{action}: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn background_missing_action_errors_cleanly() {
+        let ctx = test_ctx("/tmp");
+        let policy = policy_for(&ctx);
+        let error = execute_background(
+            BACKGROUND_TOOL,
+            &Map::new(),
+            &GlobalCancellation,
+            &policy,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("action"), "{error}");
+        ctx.manager.shutdown().await;
     }
 
     #[tokio::test]
