@@ -13,7 +13,6 @@ use crate::render::theme;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -317,11 +316,14 @@ fn question_lines(
         Line::from(Span::raw(String::new())),
     ];
     for (i, option) in current.options.iter().enumerate() {
-        let marker = if current.multi_select && question.toggled[i] {
-            "[x] "
-        } else if current.multi_select {
-            "[ ] "
-        } else if question.selected == i {
+        let selected = !current.multi_select && question.selected == i;
+        let marker = if current.multi_select {
+            if question.toggled[i] {
+                "[x] "
+            } else {
+                "[ ] "
+            }
+        } else if selected {
             "› "
         } else {
             "  "
@@ -331,10 +333,27 @@ fn question_lines(
         } else {
             ""
         };
+        // The cursor row inverts the terminal's own colors (max contrast on
+        // any theme); a toggled `[x]` gets the accent so multi-select state
+        // survives a glance.
+        let marker_style = if selected {
+            theme::selection_style()
+        } else if current.multi_select && question.toggled[i] {
+            fg(theme::accent_fg())
+        } else {
+            fg(theme::muted_fg())
+        };
         rows.push(Line::from(vec![
-            Span::styled(format!("{marker}{}", i + 1), fg(theme::muted_fg())),
+            Span::styled(format!("{marker}{}", i + 1), marker_style),
             Span::raw(" "),
-            Span::styled(option.label.clone(), fg(theme::surface_fg())),
+            Span::styled(
+                option.label.clone(),
+                if selected {
+                    theme::selection_style()
+                } else {
+                    fg(theme::surface_fg())
+                },
+            ),
             Span::styled(default.to_string(), fg(theme::warn_fg())),
         ]));
         rows.push(Line::from(Span::styled(
@@ -358,7 +377,7 @@ fn question_lines(
         rows.push(Line::from(Span::styled(
             format!("{marker}{}) other", current.options.len() + 1),
             if other_selected {
-                fg(theme::surface_fg())
+                theme::selection_style()
             } else {
                 fg(theme::muted_fg())
             },
@@ -370,7 +389,7 @@ fn question_lines(
         rows.push(Line::from(Span::styled(
             format!("{marker}submit  [Space: toggle]"),
             if submit_selected {
-                fg(theme::surface_fg())
+                theme::selection_style()
             } else {
                 fg(theme::muted_fg())
             },
@@ -523,37 +542,30 @@ impl ApprovalOverlay {
             .enumerate()
             .map(|(idx, (label, key, hint))| {
                 let sel = approval.selected == idx;
-                let style = if sel {
-                    // Black-on-yellow inversion is emphasis enough; no bold.
-                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                // The cursor row inverts the terminal's own colors —
+                // readable on any theme; fixed `Black` on `Yellow` broke
+                // when themes remapped those slots toward the background.
+                let row_style = if sel {
+                    theme::selection_style()
                 } else {
                     Style::default()
                         .fg(theme::surface_fg())
                         .bg(theme::popup_bg())
                 };
+                let hint_style = if sel {
+                    theme::selection_style()
+                } else {
+                    Style::default().fg(theme::muted_fg()).bg(theme::popup_bg())
+                };
                 let marker = if sel { "› " } else { "  " };
                 ListItem::new(Line::from(vec![
                     // Numbered like the question wizard: 1/2/3 resolve
                     // directly, arrows just move the cursor.
-                    Span::styled(format!("{}{}. {}", marker, idx + 1, label), style),
-                    Span::styled(
-                        format!("  [{}]  ", key),
-                        if sel {
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
-                        } else {
-                            Style::default().fg(theme::muted_fg()).bg(theme::popup_bg())
-                        },
-                    ),
-                    Span::styled(
-                        *hint,
-                        if sel {
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
-                        } else {
-                            Style::default().fg(theme::muted_fg()).bg(theme::popup_bg())
-                        },
-                    ),
+                    Span::styled(format!("{}{}. {}", marker, idx + 1, label), row_style),
+                    Span::styled(format!("  [{}]  ", key), hint_style),
+                    Span::styled(*hint, hint_style),
                 ]))
-                .style(style)
+                .style(row_style)
             })
             .collect();
         f.render_widget(List::new(items), chunks[4]);
