@@ -533,7 +533,9 @@ impl ApprovalOverlay {
                 };
                 let marker = if sel { "› " } else { "  " };
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{}{}", marker, label), style),
+                    // Numbered like the question wizard: 1/2/3 resolve
+                    // directly, arrows just move the cursor.
+                    Span::styled(format!("{}{}. {}", marker, idx + 1, label), style),
                     Span::styled(
                         format!("  [{}]  ", key),
                         if sel {
@@ -556,7 +558,7 @@ impl ApprovalOverlay {
             .collect();
         f.render_widget(List::new(items), chunks[4]);
         f.render_widget(
-            Paragraph::new("↑↓ navigate · Enter confirm · Esc deny · y / s / n quick")
+            Paragraph::new("↑↓ navigate · Enter confirm · Esc deny · y / s / n or 1 / 2 / 3 quick")
                 .style(
                     Style::default()
                         .fg(theme::muted_fg())
