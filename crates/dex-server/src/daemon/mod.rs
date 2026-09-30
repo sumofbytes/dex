@@ -9,6 +9,7 @@ pub(crate) mod lookup;
 pub(crate) mod questions;
 pub mod server;
 pub(crate) mod shell;
+pub(crate) mod tasks;
 pub(crate) mod turn;
 pub(crate) mod wake;
 

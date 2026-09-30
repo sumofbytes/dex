@@ -241,6 +241,11 @@ pub(crate) struct App {
     /// parent's transcript window (composer and footer stay visible),
     /// `None` while the parent transcript is showing.
     pub(crate) child_view: Option<String>,
+    /// Background shell tasks (spec Rev 3): status-bar chips flipped at
+    /// `TaskFinished`, plus capped output logs fed by `TaskOutput`.
+    pub(crate) tasks: Vec<TaskChip>,
+    pub(crate) task_logs: Vec<TaskLog>,
+    pub(crate) task_view: Option<String>,
     pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
@@ -382,6 +387,9 @@ impl App {
             agents: Vec::new(),
             child_logs: Vec::new(),
             child_view: None,
+            tasks: Vec::new(),
+            task_logs: Vec::new(),
+            task_view: None,
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -627,6 +635,30 @@ impl PendingQuestionUi {
             .collect()
     }
 }
+
+/// One background shell task, from the typed task lifecycle events (spec
+/// Rev 3): the status-bar chip. Entries arrive at `TaskStarted` and flip to
+/// done at `TaskFinished` (chips persist like agent chips cap discipline).
+#[derive(Clone, Debug)]
+pub(crate) struct TaskChip {
+    pub(crate) id: String,
+    pub(crate) command: String,
+    pub(crate) done: bool,
+}
+
+/// One background task's output log: id + command plus capped raw lines fed
+/// by live `TaskOutput` events. Read-only in v1; stopping is the model's job.
+pub(crate) struct TaskLog {
+    pub(crate) id: String,
+    pub(crate) command: String,
+    pub(crate) lines: Vec<String>,
+}
+
+/// Line cap per task log: a runaway task must not grow client memory.
+pub(crate) const TASK_LOG_MAX_LINES: usize = 2000;
+
+/// Cap on retained task logs (mirrors `CHILD_LOG_MAX_LOGS` order).
+pub(crate) const TASK_LOG_MAX_LOGS: usize = 16;
 
 /// One live child agent, from the V1b typed lifecycle events (§15): the
 /// status-bar chip. Entries arrive at `AgentSpawned`, update on

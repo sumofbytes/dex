@@ -49,8 +49,9 @@ pub(crate) mod app;
 pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
-    AgentChip, App, ChildLog, EnableMouseScroll, PendingApproval, TranscriptBlock, WrappedBlock,
-    CHILD_LOG_MAX_BLOCKS, CHILD_LOG_MAX_LOGS, NOTICE_LIFETIME,
+    AgentChip, App, ChildLog, EnableMouseScroll, PendingApproval, TaskChip, TaskLog,
+    TranscriptBlock, WrappedBlock, CHILD_LOG_MAX_BLOCKS, CHILD_LOG_MAX_LOGS, NOTICE_LIFETIME,
+    TASK_LOG_MAX_LINES, TASK_LOG_MAX_LOGS,
 };
 #[cfg(test)]
 pub(crate) use selection::{b64, line_width};

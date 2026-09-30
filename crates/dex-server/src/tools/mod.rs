@@ -11,7 +11,7 @@ pub(crate) mod policy;
 mod read;
 pub(crate) mod sandbox;
 mod search;
-mod shell;
+pub(crate) mod shell;
 pub(crate) mod then_run;
 mod write;
 

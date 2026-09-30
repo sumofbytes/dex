@@ -45,7 +45,7 @@ use std::time::Duration;
 
 mod lifecycle;
 mod registry;
-pub(crate) use lifecycle::{AgentEvent, AgentManager, ProgressReporter};
+pub(crate) use lifecycle::{AgentEvent, AgentManager, ProgressReporter, TaskEvent, TaskEventHook};
 #[cfg(test)]
 pub(crate) use lifecycle::{MAX_CHILDREN, MAX_NOTICES};
 pub(crate) use registry::{AgentNotice, ChildInfo, SpawnError, SpawnMeta, WaitOutcome};

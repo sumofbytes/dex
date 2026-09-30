@@ -87,6 +87,11 @@ pub(crate) const COMMANDS: &[SlashCommandSpec] = &[
         description: "Undo the last recorded file change",
     },
     SlashCommandSpec {
+        command: "/tasks",
+        usage: "/tasks [id]",
+        description: "List background tasks (or show one's recent output)",
+    },
+    SlashCommandSpec {
         command: "/help",
         usage: "/help",
         description: "Show available commands",

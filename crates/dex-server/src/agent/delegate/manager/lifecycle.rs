@@ -155,6 +155,31 @@ pub enum AgentEvent {
 /// broadcast beside the V1a `System` lines.
 pub type EventHook = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
+/// Background shell-task lifecycle event (spec Rev 3): fired through the
+/// daemon's task hook at spawn, per output coalesce, and on every terminal
+/// path. The daemon journals + broadcasts Started/Finished, broadcasts
+/// Output live-only, and schedules the idle wake on finish.
+#[derive(Clone)]
+pub enum TaskEvent {
+    Started {
+        id: String,
+        command: String,
+    },
+    Output {
+        id: String,
+        chunk: String,
+    },
+    Finished {
+        notice: crate::daemon::tasks::TaskNotice,
+        status: crate::daemon::tasks::TaskStatus,
+        exit_code: Option<i32>,
+        duration: f64,
+    },
+}
+
+/// Daemon-supplied task hook (sibling to [`EventHook`]).
+pub type TaskEventHook = Arc<dyn Fn(TaskEvent) + Send + Sync>;
+
 impl AgentManager {
     pub fn new(session: &str) -> Self {
         Self {
@@ -169,6 +194,10 @@ impl AgentManager {
                 result_order: VecDeque::new(),
                 notices: VecDeque::new(),
                 overflowed: 0,
+                bg: crate::daemon::tasks::TaskRegistry::new(),
+                bg_notices: VecDeque::new(),
+                bg_events: None,
+                bg_handles: HashMap::new(),
             })),
         }
     }
@@ -178,6 +207,13 @@ impl AgentManager {
     /// managers leave it `None`.
     pub fn with_events(self, hook: EventHook) -> Self {
         self.lock().events = Some(hook);
+        self
+    }
+
+    /// Attach the background-task hook (spec Rev 3). Chain after
+    /// `with_events` in `DaemonState::manager_for`.
+    pub fn with_task_events(self, hook: TaskEventHook) -> Self {
+        self.lock().bg_events = Some(hook);
         self
     }
 
@@ -645,5 +681,243 @@ impl AgentManager {
         for handle in handles {
             let _ = handle.await;
         }
+        self.shutdown_bg_tasks().await;
     }
+
+    // ---- Background shell tasks (spec Rev 3) ----
+
+    /// Insert a new running background task; fires the Started hook outside
+    /// the lock. `Err` past the 8-running cap.
+    pub fn bg_spawn(&self, command: String, cwd: std::path::PathBuf) -> Result<String, String> {
+        let (id, hook) = {
+            let mut inner = self.lock();
+            if inner.closed {
+                return Err("agent manager is shut down; no new children can start".to_string());
+            }
+            let id = inner.bg.spawn(command.clone(), cwd)?;
+            let hook = inner.bg_events.clone();
+            (id, hook)
+        };
+        if let Some(hook) = hook {
+            hook(TaskEvent::Started {
+                id: id.clone(),
+                command,
+            });
+        }
+        Ok(id)
+    }
+
+    pub fn bg_set_pid(&self, id: &str, pid: u32) {
+        if let Some(task) = self.lock().bg.get_mut(id) {
+            task.pid = Some(pid);
+        }
+    }
+
+    pub fn bg_set_handle(&self, id: &str, handle: JoinHandle<()>) {
+        self.lock().bg_handles.insert(id.to_string(), handle);
+    }
+
+    /// Append output bytes; returns the new virtual length. Pure accounting
+    /// via `daemon::tasks::pure::push_bytes`.
+    pub fn bg_append(&self, id: &str, chunk: &[u8], cap: usize) -> Option<u64> {
+        let mut inner = self.lock();
+        let task = inner.bg.get_mut(id)?;
+        crate::daemon::tasks::pure::push_bytes(
+            &mut task.buf,
+            &mut task.total_written,
+            &mut task.dropped_prefix,
+            chunk,
+            cap,
+        );
+        Some(task.total_written)
+    }
+
+    /// Fire one coalesced live-output chunk (broadcast-only).
+    pub fn bg_emit_output(&self, id: &str, chunk: String) {
+        let hook = self.lock().bg_events.clone();
+        if let Some(hook) = hook {
+            hook(TaskEvent::Output {
+                id: id.to_string(),
+                chunk,
+            });
+        }
+    }
+
+    /// Mark terminal, queue the notice, fire the Finished hook outside the
+    /// lock. Returns the notice for the caller (wake scheduling reuses it).
+    pub fn bg_finish(
+        &self,
+        id: &str,
+        status: crate::daemon::tasks::TaskStatus,
+        exit_code: Option<i32>,
+    ) -> Option<crate::daemon::tasks::TaskNotice> {
+        let (notice, hook, duration) = {
+            let mut inner = self.lock();
+            let task = inner.bg.get_mut(id)?;
+            if !task.is_running() {
+                return None;
+            }
+            let duration = task.started_at.elapsed().as_secs_f64();
+            // Tail for the notice: last 512 bytes decoded lossy.
+            let tail_len = task.buf.len().min(512);
+            let tail_bytes: Vec<u8> = task
+                .buf
+                .iter()
+                .skip(task.buf.len() - tail_len)
+                .copied()
+                .collect();
+            let tail = crate::daemon::tasks::pure::decode_lossy(&tail_bytes);
+            let word = status.word();
+            let notice = crate::daemon::tasks::TaskNotice {
+                id: id.to_string(),
+                command: task.command.clone(),
+                status: word,
+                tail,
+            };
+            inner.bg.finish(id, status.clone());
+            inner.bg_notices.push_back(notice.clone());
+            inner.bg_handles.remove(id);
+            (notice, inner.bg_events.clone(), duration)
+        };
+        if let Some(hook) = hook {
+            hook(TaskEvent::Finished {
+                notice: notice.clone(),
+                status,
+                exit_code,
+                duration,
+            });
+        }
+        Some(notice)
+    }
+
+    /// Read the new byte range for `output`/`wait`: resolved virtual slice
+    /// plus a copy of the buffered bytes in `[start, end)`.
+    pub fn bg_read(
+        &self,
+        id: &str,
+        cursor: Option<u64>,
+    ) -> Result<(crate::daemon::tasks::pure::Slice, Vec<u8>, String, bool), String> {
+        let inner = self.lock();
+        let task = inner
+            .bg
+            .get(id)
+            .ok_or_else(|| format!("unknown background task '{id}': never spawned in this session, or its result aged out of retention"))?;
+        let slice = crate::daemon::tasks::pure::slice_range(
+            task.total_written,
+            task.dropped_prefix,
+            task.buf.len(),
+            cursor,
+        );
+        // Map virtual offsets back into the buffer: buffer covers
+        // `[total - buf.len(), total)`.
+        let buf_start = task.total_written.saturating_sub(task.buf.len() as u64);
+        let from = slice.start.saturating_sub(buf_start) as usize;
+        let to = slice.end.saturating_sub(buf_start) as usize;
+        let bytes: Vec<u8> = task
+            .buf
+            .iter()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .copied()
+            .collect();
+        Ok((slice, bytes, task.status.word(), task.is_running()))
+    }
+
+    /// Pid + abort handle for `stop`/teardown. The drain observes the death
+    /// and records `Killed` via `bg_finish`.
+    pub fn bg_take_handle(&self, id: &str) -> Option<JoinHandle<()>> {
+        self.lock().bg_handles.remove(id)
+    }
+
+    pub fn bg_pid(&self, id: &str) -> Option<u32> {
+        self.lock().bg.get(id)?.pid
+    }
+
+    pub fn bg_status_word(&self, id: &str) -> Option<String> {
+        self.lock().bg.get(id).map(|t| t.status.word())
+    }
+
+    pub fn bg_is_running(&self, id: &str) -> Option<bool> {
+        self.lock().bg.get(id).map(|t| t.is_running())
+    }
+
+    /// One line per task, running first then numeric id order (for `list`).
+    pub fn bg_snapshot(&self) -> Vec<(String, String, String)> {
+        // Snapshot `now` before locking so the lock stays short.
+        let now = std::time::Instant::now();
+        let mut out: Vec<(String, String, String)> = {
+            let inner = self.lock();
+            inner
+                .bg
+                .iter()
+                .map(|task| {
+                    let elapsed = task
+                        .ended_at
+                        .unwrap_or(now)
+                        .saturating_duration_since(task.started_at);
+                    let age = if elapsed.as_secs() >= 60 {
+                        format!("{}m", elapsed.as_secs() / 60)
+                    } else {
+                        format!("{}s", elapsed.as_secs())
+                    };
+                    (
+                        task.id.clone(),
+                        task.status.word(),
+                        format!("{age}  {}", task.command),
+                    )
+                })
+                .collect()
+        };
+        out.sort_by(|a, b| {
+            let arun = a.1 == "running";
+            let brun = b.1 == "running";
+            brun.cmp(&arun).then(task_num(&a.0).cmp(&task_num(&b.0)))
+        });
+        out
+    }
+
+    pub fn has_task_notices(&self) -> bool {
+        !self.lock().bg_notices.is_empty()
+    }
+
+    /// Any queued notices at all (agents or tasks) — the idle wake's fire
+    /// condition.
+    pub fn has_any_notices(&self) -> bool {
+        let inner = self.lock();
+        !inner.notices.is_empty() || !inner.bg_notices.is_empty()
+    }
+
+    pub fn drain_task_notices(&self) -> Vec<crate::daemon::tasks::TaskNotice> {
+        self.lock().bg_notices.drain(..).collect()
+    }
+
+    /// Kill all running tasks (pid-group) and join their drains. Daemon
+    /// shutdown / session-delete path; turn cancel never calls this.
+    pub async fn shutdown_bg_tasks(&self) {
+        let (pids, handles): (Vec<u32>, Vec<JoinHandle<()>>) = {
+            let mut inner = self.lock();
+            let pids: Vec<u32> = inner
+                .bg_handles
+                .keys()
+                .filter_map(|id| inner.bg.get(id)?.pid)
+                .collect();
+            let handles: Vec<JoinHandle<()>> = inner.bg_handles.drain().map(|(_, h)| h).collect();
+            (pids, handles)
+        };
+        for pid in pids {
+            crate::tools::shell::kill_process_group_pid(pid);
+        }
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Numeric suffix of a `task-N` id for ordering (`u64::MAX` for anything
+/// unexpected, so it sorts last instead of breaking the sort).
+fn task_num(id: &str) -> u64 {
+    id.strip_prefix("task-")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX)
 }

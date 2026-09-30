@@ -153,6 +153,16 @@ fn handle_event_with(
         // Child transcript lines (plan §20 child view): a TUI-only surface;
         // headless clients render the parent transcript's lifecycle lines.
         StreamEvent::AgentLine { .. } => {}
+        // Background tasks (spec Rev 3): lifecycle lines already render via
+        // the System arm; typed variants add one line each, output chunks
+        // stay TUI-only (the model polls them).
+        StreamEvent::TaskStarted { id, command } => {
+            eprintln!("[task {id}] started: {command}");
+        }
+        StreamEvent::TaskFinished { id, status, .. } => {
+            eprintln!("[task {id}] finished, {status}");
+        }
+        StreamEvent::TaskOutput { .. } => {}
     }
     EventReply::None
 }

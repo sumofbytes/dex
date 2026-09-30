@@ -25,7 +25,7 @@ pub(crate) use exit::{classify_body_error, transcript_holds_progress, ExhaustKin
 #[allow(unused_imports)]
 pub(crate) use manager::{
     AgentEvent, AgentManager, AgentNotice, ChildInfo, ProgressReporter, SpawnError, SpawnMeta,
-    WaitOutcome,
+    TaskEvent, TaskEventHook, WaitOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use model::{AgentId, AgentInstance, AgentResult, AgentState, AgentUsage, ContextSeed};
@@ -35,3 +35,5 @@ pub use tools::{
     delegation_enabled, execute_delegation, is_delegation, set_daemon_linked, status_word,
     AgentTurnContext,
 };
+#[allow(unused_imports)]
+pub(crate) use tools::{execute_background, is_background, BACKGROUND_TOOL};

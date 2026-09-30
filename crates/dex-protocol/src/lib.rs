@@ -419,6 +419,33 @@ pub enum StreamEvent {
         name: String,
         event: Box<StreamEvent>,
     },
+
+    /// Background shell task started (spec Rev 3): journaled + broadcast.
+    /// Old clients skip the unknown type via `SseFramer::ingest` while still
+    /// advancing the seq cursor.
+    #[serde(rename = "task_started")]
+    TaskStarted { id: String, command: String },
+
+    /// Background shell task reached a terminal status: `status` is the
+    /// `TaskStatus::word` (`exit 0`/`exit N`/`killed`/`failed`).
+    /// Journaled + broadcast.
+    #[serde(rename = "task_finished")]
+    TaskFinished {
+        id: String,
+        status: String,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        duration: f64,
+    },
+
+    /// Live output chunk from a running task: broadcast-only, never
+    /// journaled (the in-memory tail buffer is the source of truth; the
+    /// model's `background(output)` poll re-reads it, so dropped SSE chunks
+    /// are lossless). Allocates a journal seq for the live broadcast and
+    /// leaves an intentional seq gap in the journal.
+    #[serde(rename = "task_output")]
+    TaskOutput { id: String, chunk: String },
 }
 
 /// One numbered SSE event (P10). `seq` is the daemon-assigned, per-session
@@ -592,6 +619,43 @@ mod tests {
         let back: ShellResponse = serde_json::from_str(&json).unwrap();
         assert!(back.success);
         assert_eq!(back.code, Some(0));
+    }
+
+    #[test]
+    fn task_events_round_trip_and_default_fields() {
+        let started = StreamEvent::TaskStarted {
+            id: "task-1".into(),
+            command: "npm run dev".into(),
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        assert!(json.contains("\"type\":\"task_started\""));
+        let back: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // exit_code/duration default for older payloads.
+        let finished: StreamEvent = serde_json::from_str(
+            r#"{"type":"task_finished","data":{"id":"task-1","status":"exit 0"}}"#,
+        )
+        .unwrap();
+        match finished {
+            StreamEvent::TaskFinished {
+                exit_code,
+                duration,
+                status,
+                ..
+            } => {
+                assert_eq!(status, "exit 0");
+                assert_eq!(exit_code, None);
+                assert_eq!(duration, 0.0);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let output = StreamEvent::TaskOutput {
+            id: "task-1".into(),
+            chunk: "hi".into(),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let back: StreamEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
     #[test]

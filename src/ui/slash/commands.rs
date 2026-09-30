@@ -79,6 +79,7 @@ pub(crate) enum SlashCommand<'a> {
     Undo,
     Mcp(Option<&'a str>),
     Extensions(Option<&'a str>),
+    Tasks(Option<&'a str>),
     /// A registered extension slash command; carries the full line.
     Extension(&'a str),
     Help,
@@ -115,6 +116,7 @@ pub(crate) fn parse(line: &str) -> SlashCommand<'_> {
         "thinking" => SlashCommand::Thinking(arg),
         "waive" => SlashCommand::Waive(arg),
         "undo" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Undo,
+        "tasks" => SlashCommand::Tasks(arg.filter(|a| !a.is_empty())),
         "mcp" => SlashCommand::Mcp(arg),
         "extensions" => SlashCommand::Extensions(arg),
         "help" if arg.is_none_or(|a| a.is_empty()) => SlashCommand::Help,
@@ -142,6 +144,7 @@ pub(crate) fn handle_slash(app: &mut App, line: &str) -> bool {
         SlashCommand::Thinking(arg) => cmd_thinking(app, arg),
         SlashCommand::Waive(reason) => cmd_waive(app, reason),
         SlashCommand::Undo => cmd_undo(app),
+        SlashCommand::Tasks(arg) => cmd_tasks(app, arg),
         SlashCommand::Help => cmd_help(app, false),
         SlashCommand::Unknown => push_info(app, format!("unknown command: {line}")),
     }
@@ -767,6 +770,53 @@ fn cmd_undo(app: &mut App) {
         Ok(message) => push_info(app, message),
         Err(e) => push_info(app, format!("undo: {e}")),
     }
+}
+
+/// `/tasks [id]`: list background shell tasks (running + recent finished)
+/// from the typed lifecycle state, or show one task's recent output tail.
+/// Read-only in v1 — stopping is the model's job.
+fn cmd_tasks(app: &mut App, arg: Option<&str>) {
+    if let Some(id) = arg.filter(|s| !s.trim().is_empty()) {
+        let id = id.trim().to_string();
+        let found = app.task_logs.iter().find(|l| l.id == id).map(|l| {
+            let done = app.tasks.iter().find(|t| t.id == id).is_none_or(|c| c.done);
+            let cmd = if l.command.is_empty() {
+                "(unknown command)".to_string()
+            } else {
+                l.command.clone()
+            };
+            let lines = l.lines.clone();
+            (done, cmd, lines)
+        });
+        match found {
+            None => push_info(app, format!("unknown background task '{id}'")),
+            Some((done, cmd, lines)) => {
+                let state = if done { "finished" } else { "running" };
+                push_info(app, format!("{id} {state}: {cmd}"));
+                let n = lines.len().saturating_sub(lines.len().min(30));
+                for line in lines.iter().skip(n) {
+                    push_info(app, format!("  {line}"));
+                }
+            }
+        }
+        return;
+    }
+    if app.tasks.is_empty() {
+        push_info(app, "no background tasks".to_string());
+        return;
+    }
+    let rows: Vec<String> = app
+        .tasks
+        .iter()
+        .map(|chip| {
+            let state = if chip.done { "done" } else { "running" };
+            format!("{}  {}  {}", chip.id, state, chip.command)
+        })
+        .collect();
+    for row in rows {
+        push_info(app, row);
+    }
+    push_info(app, "usage: /tasks [id] shows recent output".to_string());
 }
 
 /// Re-apply provider/model overrides that were persisted with the session

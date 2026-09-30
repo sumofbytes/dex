@@ -48,6 +48,16 @@ pub fn native_tool_metadata(name: &str) -> Option<ToolMetadata> {
             requires_shell: true,
             permission: PermissionRequirement::Shell,
         },
+        // Strictest row for introspection/shadow re-dispatch; the live
+        // `background` gate is per-action in dispatch (spawn/stop Shell,
+        // output/wait/list Read).
+        "background" => ToolMetadata {
+            read_only: false,
+            mutating: true,
+            idempotent: false,
+            requires_shell: true,
+            permission: PermissionRequirement::Shell,
+        },
         "write" | "edit" => ToolMetadata {
             read_only: false,
             mutating: true,
