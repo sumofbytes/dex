@@ -922,6 +922,43 @@ fn back_tab_clamps_at_the_daemon_ceiling() {
     assert!(text.contains("ask"), "{text}");
 }
 
+#[test]
+fn approval_number_keys_resolve_directly() {
+    // 1/2/3 mirror the question wizard: resolve immediately without
+    // moving the cursor first (1=allow once, 2=allow session, 3=deny).
+    let mut remote = test_remote();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    remote
+        .app
+        .pending_approvals
+        .push(crate::ui::PendingApproval::new(
+            "bash".into(),
+            "{}".into(),
+            tx,
+            None,
+        ));
+    handle_key(&mut remote, key(KeyCode::Char('2'), KeyModifiers::empty()));
+    assert!(remote.app.pending_approvals.is_empty(), "resolved");
+    assert_eq!(
+        rx.try_recv().expect("decision sent"),
+        crate::protocol::ApprovalDecision::AllowSession
+    );
+}
+
+#[test]
+fn question_other_number_opens_text_entry() {
+    // The "other" row renders as `3)` (2 options); its number opens the
+    // free-text entry like Enter on it, and stays unsubmitted.
+    let mut remote = test_remote();
+    let mut rx = park_question(&mut remote, vec![one_question()]);
+    handle_key(&mut remote, key(KeyCode::Char('3'), KeyModifiers::empty()));
+    assert!(
+        remote.app.pending_questions[0].text_entry.is_some(),
+        "other's number opens text entry"
+    );
+    assert!(rx.try_recv().is_err(), "entry open, batch unsubmitted");
+}
+
 fn one_question() -> crate::protocol::Question {
     crate::protocol::Question {
         question: "Which database?".into(),

@@ -92,7 +92,7 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
     }
     // Approval overlay takes precedence: the worker is blocked until a
     // decision arrives. The overlay draws on top of the child view too
-    // (render/mod.rs), so `y`/`n`/`s`/arrows resolve it from inside the
+    // (render/mod.rs), so `y`/`n`/`s`/`1`-`3`/arrows resolve it from inside the
     // view; only Esc differs — it closes the view instead of denying.
     if handle_approval_key(remote, key) {
         return;
@@ -389,7 +389,13 @@ fn handle_question_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
             let Some(current) = question.questions.get(question.current) else {
                 return true;
             };
-            if index >= current.options.len() {
+            if index == current.options.len() {
+                // The "other" row's number: open free-text entry, same as
+                // Enter on it.
+                question.text_entry = Some(String::new());
+                return true;
+            }
+            if index > current.options.len() {
                 return true;
             }
             if current.multi_select {
@@ -536,6 +542,17 @@ fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
             resolve_approval(app, ApprovalDecision::Deny);
+        }
+        // Number keys mirror the question wizard: 1/2/3 resolve directly
+        // (allow once / allow session / deny), matching the numbers the
+        // overlay renders next to each row.
+        KeyCode::Char(c @ '1'..='3') => {
+            let decision = match c {
+                '1' => ApprovalDecision::AllowOnce,
+                '2' => ApprovalDecision::AllowSession,
+                _ => ApprovalDecision::Deny,
+            };
+            resolve_approval(app, decision);
         }
         // Esc over an open child view closes the view, not the approval:
         // a user reading a transcript presses Esc to leave, and a silent
