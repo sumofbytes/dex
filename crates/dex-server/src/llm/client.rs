@@ -218,11 +218,15 @@ impl WireProtocol for AnthropicMessages {
         sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
-        // A warming ping caps output and drops thinking: the reply is
-        // discarded, only the cache hit matters — and a thinking budget
-        // could not fit under the cap anyway.
+        // A warming ping caps output: the reply is discarded, only the
+        // cache hit matters. History replaying signed thinking blocks keeps
+        // the session's effort (thinking blocks without the parameter are
+        // rejected); `warm_effort_and_cap` owns that rule.
         let (effort, output_limit) = if call.warm_ping {
-            (None, Some(crate::agent::cache_warming::WARM_MAX_TOKENS))
+            crate::agent::cache_warming::warm_effort_and_cap(
+                call.thinking_effort.as_deref(),
+                messages,
+            )
         } else {
             (call.thinking_effort.as_deref(), None)
         };

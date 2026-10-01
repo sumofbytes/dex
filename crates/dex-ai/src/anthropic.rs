@@ -16,7 +16,7 @@ use crate::{ChatMessage, LlmToolCall, Role, ToolDefinition};
 const DEFAULT_MAX_TOKENS: u64 = 16_384;
 
 /// Headroom the thinking budget must keep below `max_tokens`.
-const THINKING_HEADROOM: u64 = 4096;
+pub const THINKING_HEADROOM: u64 = 4096;
 
 /// Messages request path. Native base (`https://api.anthropic.com`) gets
 /// `/v1/messages`; a base already ending in `/v1` (gateways that mirror the
@@ -228,6 +228,21 @@ fn assistant_blocks(message: &ChatMessage) -> Vec<Value> {
         blocks.push(tool_use_block(call));
     }
     blocks
+}
+
+/// True when any assistant message would replay a thinking block on the
+/// wire (the same subset [`assistant_blocks`] forwards). Requests that
+/// drop the `thinking` parameter — e.g. cache-warming pings — must keep it
+/// enabled for such history: the API rejects thinking blocks without it.
+pub fn replays_thinking(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.reasoning_items.iter().flatten().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        })
+    })
 }
 
 /// OpenAI-shaped tool call → Anthropic `tool_use` block. `input` must be a
