@@ -291,6 +291,10 @@ pub(crate) async fn extensions_run(
 
 pub(crate) async fn list_skills() -> Json<serde_json::Value> {
     let dirs = skill_dirs();
+    // Listed skills are advertised for autoload — grant their dirs to `read`
+    // (same contract as the per-turn grant in daemon/turn.rs).
+    dirs.iter()
+        .for_each(|dir| crate::workspace::grant_readable_dir(dir));
     let skills = discover_skills_async(&dirs).await;
     let infos: Vec<SkillInfo> = skills
         .into_iter()
@@ -320,6 +324,8 @@ pub(crate) async fn load_skill(
     let extra_dirs = req.skill_dirs.clone();
     let mut dirs = skill_dirs();
     dirs.extend(extra_dirs.iter().map(std::path::PathBuf::from));
+    dirs.iter()
+        .for_each(|dir| crate::workspace::grant_readable_dir(dir));
     // Explicit user load: bypass the discovery cache so a just-added
     // skill resolves immediately (async dir scans + concurrent reads).
     let skills = discover_skills_fresh_async(&dirs).await;

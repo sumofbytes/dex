@@ -9,7 +9,9 @@ use crate::render::format::clamp_lines;
 use crate::runtime::cancel::wait_cancelled;
 
 use super::args::arg_str;
-use super::{resolve_workspace_path, workspace_path, workspace_root, ToolError};
+use super::{
+    readable_granted_path, resolve_workspace_path, workspace_path, workspace_root, ToolError,
+};
 
 /// Multi-file read caps: enough for the "search, then read the hits" pattern
 /// in one call, small enough that a fan-out cannot flood the context.
@@ -34,6 +36,10 @@ pub(crate) const READ_FANOUT_PER_FILE_LINES: usize = 200;
 /// read several files in ONE call — the "search, then read what it found"
 /// chain collapses into a single tool call. Per-file errors are isolated and
 /// the call succeeds when at least one file is readable.
+///
+/// Absolute paths outside the workspace resolve only under a granted skill
+/// dir (`workspace::grant_readable_dir`) — the prompt's skills appendix
+/// advertises those paths for autoload.
 pub(crate) async fn tool_read(args: &Map<String, Value>) -> Result<String, ToolError> {
     if let Some(paths) = args.get("paths").and_then(Value::as_array) {
         // Some providers serialize schema optionals with empty defaults
@@ -48,7 +54,8 @@ pub(crate) async fn tool_read(args: &Map<String, Value>) -> Result<String, ToolE
             return fanout_read(expand_glob(glob).await?, args).await;
         }
     }
-    let path = workspace_path(&arg_str(args, "path")?)?;
+    let raw = arg_str(args, "path")?;
+    let path = workspace_path(&raw).or_else(|err| readable_granted_path(&raw).ok_or(err))?;
     let (body, _more) =
         read_file_numbered(&path, read_offset(args), read_limit(args, READ_MAX_LINES)).await?;
     Ok(body)
@@ -80,7 +87,11 @@ fn parse_path_list(paths: &[Value]) -> Result<Vec<PathBuf>, ToolError> {
         .map(|value| {
             value
                 .as_str()
-                .map(|s| workspace_path(s).map_err(ToolError::from))
+                .map(|s| {
+                    workspace_path(s)
+                        .or_else(|err| readable_granted_path(s).ok_or(err))
+                        .map_err(ToolError::from)
+                })
                 .unwrap_or_else(|| {
                     Err(ToolError::InvalidArgument(
                         "paths entries must be strings".to_string(),

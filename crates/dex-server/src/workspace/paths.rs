@@ -6,6 +6,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use super::WorkspaceError;
 
@@ -47,6 +48,41 @@ pub fn resolve_workspace_path(root: &Path, raw: &str) -> Result<PathBuf, Workspa
     } else {
         Err(WorkspaceError::OutsideWorkspace(raw.to_string()))
     }
+}
+
+/// Read-only dirs outside the workspace that `read` may touch. The skills
+/// appendix advertises SKILL.md paths from `skill_dirs()` — user-level ones
+/// live under `$XDG_CONFIG_HOME`, outside any workspace — so discovery grants
+/// its dirs here and `tool_read` falls back to [`readable_granted_path`] when
+/// the workspace gate rejects a path. Write/edit/grep/find stay confined.
+pub fn grant_readable_dir(dir: &Path) {
+    let Ok(canon) = dir.canonicalize() else {
+        return;
+    };
+    let mut dirs = granted_read_dirs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !dirs.contains(&canon) {
+        dirs.push(canon);
+    }
+}
+
+/// Resolve `raw` when it canonicalizes under a granted dir; `None` keeps the
+/// workspace gate's rejection. Canonicalization walks symlinks, so a link out
+/// of a granted dir resolves to its real (ungranted) target and is refused.
+pub fn readable_granted_path(raw: &str) -> Option<PathBuf> {
+    let resolved = PathBuf::from(raw).canonicalize().ok()?;
+    granted_read_dirs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|dir| resolved.starts_with(dir))
+        .then_some(resolved)
+}
+
+fn granted_read_dirs() -> &'static Mutex<Vec<PathBuf>> {
+    static DIRS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    DIRS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Normalize a tool-call `path` argument for same-path conflict detection:
