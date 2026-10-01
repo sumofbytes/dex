@@ -287,7 +287,7 @@ pub(crate) async fn summarize_old_messages(
     // repaint. A dropped receiver makes every send fail silently instead.
     let (sink, rx) = mpsc::channel(16);
     drop(rx);
-    let turn = call_llm(config, &prompt, &[], Some(sink), cancel).await?;
+    let turn = call_llm(config, &prompt, &[], Some(sink), cancel, false).await?;
     Ok((turn.message.content.unwrap_or_default(), turn.usage))
 }
 
@@ -439,7 +439,9 @@ async fn llm_summary(
         ];
         let (sink, rx) = mpsc::channel(16);
         drop(rx);
-        let prefix_summary = match call_llm(config, &prefix_prompt, &[], Some(sink), cancel).await {
+        let prefix_summary = match call_llm(config, &prefix_prompt, &[], Some(sink), cancel, false)
+            .await
+        {
             Ok(turn) => {
                 merge_usage(usage_total, turn.usage);
                 turn.message.content.unwrap_or_default()

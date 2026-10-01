@@ -497,12 +497,11 @@ mod tests {
         // Whatever the detected background, surfaces must resolve without
         // panicking and stay on-theme: Reset when the theme is unknown, or
         // RGB derived from the queried palette.
-        for color in [popup_bg()] {
-            match color {
-                Color::Reset => {}
-                Color::Rgb(..) if background() != Background::Unknown => {}
-                other => panic!("color leaks theme: {other:?}"),
-            }
+        let color = popup_bg();
+        match color {
+            Color::Reset => {}
+            Color::Rgb(..) if background() != Background::Unknown => {}
+            other => panic!("color leaks theme: {other:?}"),
         }
         // With a known theme the surface foreground is the terminal's own
         // default foreground, never a fixed ANSI slot the theme may remap.

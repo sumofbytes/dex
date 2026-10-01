@@ -201,7 +201,19 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
     }
 
     fn tool_schemas(&self) -> Vec<dex_ai::ToolDefinition> {
-        self.harness.tool_schemas()
+        let schemas = self.harness.tool_schemas();
+        // Read-only (plan) turns only see tools the gate lets through: the
+        // schema drops what the gate hard-denies (`gated_in_read_only`)
+        // instead of advertising a call that only invites a denied
+        // round-trip. `delegate` and `background` stay — they gate
+        // per-action inside, and their `Read` actions remain allowed here.
+        if self.policy.mode != crate::protocol::PermissionMode::ReadOnly {
+            return schemas;
+        }
+        schemas
+            .into_iter()
+            .filter(|t| !crate::tools::gated_in_read_only(&self.policy, &t.function.name))
+            .collect()
     }
 
     fn start_model_events(&mut self) -> Option<mpsc::Sender<ModelEvent>> {
