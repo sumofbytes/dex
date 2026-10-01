@@ -2564,6 +2564,7 @@ fn doctor_output_is_byte_stable() {
                 "thinking                (unset)                                       model default\n",
                 "permission              trusted                                       built-in default\n",
                 "agent wake              on                                            built-in default\n",
+                "cache warming           on                                            built-in default\n",
                 "headers                 0                                             none\n",
                 "system prompt           default                                       built-in default\n",
                 "extensions              none                                          cwd/.dex, XDG config dirs\n",

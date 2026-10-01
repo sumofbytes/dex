@@ -1,3 +1,4 @@
+pub(crate) mod cache_warming;
 pub(crate) mod compaction;
 pub mod composable;
 pub mod delegate;
