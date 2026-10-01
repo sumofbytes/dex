@@ -16,6 +16,7 @@ pub(crate) fn messages_body(
     thinking_effort: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
+    cache_write: bool,
 ) -> Value {
     dex_ai::anthropic::messages_body(
         model,
@@ -23,6 +24,7 @@ pub(crate) fn messages_body(
         thinking_effort,
         messages,
         tools,
+        cache_write,
     )
 }
 
@@ -169,9 +171,9 @@ mod tests {
         let _catalog = HermeticCatalog::empty("prefix-stable");
         let mut base = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
         let tools = crate::llm::tool_descriptions::tools_schema();
-        let body1 = messages_body("m-r", None, &base, &tools);
+        let body1 = messages_body("m-r", None, &base, &tools, true);
         base.push(ChatMessage::user("follow-up"));
-        let body2 = messages_body("m-r", None, &base, &tools);
+        let body2 = messages_body("m-r", None, &base, &tools, true);
         assert_eq!(body1["system"], body2["system"]);
         assert_eq!(body1["tools"], body2["tools"]);
     }
@@ -245,7 +247,7 @@ mod tests {
         // hold regardless of the machine's real models.dev cache.
         let _catalog = HermeticCatalog::empty("body-shape");
         let model = "claude-sonnet-4-5";
-        let body = messages_body(model, None, &[ChatMessage::user("hi")], &[]);
+        let body = messages_body(model, None, &[ChatMessage::user("hi")], &[], true);
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["max_tokens"], 16_384);
         assert_eq!(body["stream"], true);
@@ -262,7 +264,7 @@ mod tests {
         // Thinking enabled: budget maps from the effort knob and sits
         // strictly below max_tokens.
         let tools = crate::llm::tool_descriptions::tools_schema();
-        let body = messages_body(model, Some("low"), &[ChatMessage::user("hi")], &tools);
+        let body = messages_body(model, Some("low"), &[ChatMessage::user("hi")], &tools, true);
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
         assert_eq!(body["max_tokens"], 16_384);
         let tools = body["tools"].as_array().unwrap();
@@ -272,12 +274,18 @@ mod tests {
         // Tool-schema breakpoint marks the last definition.
         assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
 
-        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], &[]);
+        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], &[], true);
         assert_eq!(body["thinking"]["budget_tokens"], 32_768);
         assert_eq!(body["max_tokens"], 36_864);
 
         // Unknown / non-OpenAI-vocabulary picks land on the middle bucket.
-        let body = messages_body(model, Some("mystery"), &[ChatMessage::user("hi")], &[]);
+        let body = messages_body(
+            model,
+            Some("mystery"),
+            &[ChatMessage::user("hi")],
+            &[],
+            true,
+        );
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
 
         // System content lands in the top-level `system` block array with
@@ -287,6 +295,7 @@ mod tests {
             Some("mystery"),
             &[ChatMessage::system("be brief"), ChatMessage::user("hi")],
             &[],
+            true,
         );
         assert_eq!(body["system"][0]["text"], "be brief");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
@@ -301,13 +310,25 @@ mod tests {
         let model = "claude-haiku-mini";
 
         // No thinking: the cap replaces the constant outright.
-        let body = messages_body(model, None, &[ChatMessage::user("hi")], &[]);
+        let body = messages_body(model, None, &[ChatMessage::user("hi")], &[], true);
         assert_eq!(body["max_tokens"], 8_192);
 
         // Thinking: the budget shrinks so it stays strictly below the cap.
-        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], &[]);
+        let body = messages_body(model, Some("xhigh"), &[ChatMessage::user("hi")], &[], true);
         assert_eq!(body["max_tokens"], 8_192);
         assert_eq!(body["thinking"]["budget_tokens"], 4_096);
+    }
+
+    #[test]
+    fn messages_body_drops_cache_marks_for_one_off_requests() {
+        let body = messages_body(
+            "m-r",
+            None,
+            &[ChatMessage::system("sys"), ChatMessage::user("hi")],
+            &[],
+            false,
+        );
+        assert!(!body.to_string().contains("cache_control"), "{body}");
     }
 
     #[test]
@@ -327,7 +348,7 @@ mod tests {
         msg.reasoning_items = Some(vec![
             json!({"type": "thinking", "thinking": "hmm", "signature": "sig1"}),
         ]);
-        let body = messages_body("m-r", None, &[msg], &[]);
+        let body = messages_body("m-r", None, &[msg], &[], true);
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         // The marker lands on the tool_use block; the thinking block —
         // which can't carry cache_control — stays untouched.

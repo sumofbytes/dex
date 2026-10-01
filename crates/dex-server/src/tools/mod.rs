@@ -22,7 +22,7 @@ pub use error::ToolError;
 pub(crate) use outcome::ToolOutcome;
 #[cfg(test)]
 pub(crate) use policy::PermissionRequirement;
-pub(crate) use policy::{metadata, ToolFilter};
+pub(crate) use policy::{gated_in_read_only, metadata, ToolFilter};
 pub(crate) use sandbox::{
     normalize_conflict_path, resolve_workspace_path, workspace_path, workspace_root,
 };

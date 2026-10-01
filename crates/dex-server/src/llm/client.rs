@@ -60,13 +60,13 @@ impl ModelClient for LlmConfig {
         // dispatch directly (never `served.complete`, which would re-enter
         // this check).
         if let Some(served) = current_served_model() {
-            return crate::llm::dispatch::complete(&served, messages, tools, sink, cancel)
+            return crate::llm::dispatch::complete(&served, messages, tools, sink, cancel, true)
                 .await
                 .map_err(|e| {
                     Box::<dyn std::error::Error + Send + Sync>::from(error_chain_message(&*e))
                 });
         }
-        crate::llm::dispatch::complete(self, messages, tools, sink, cancel)
+        crate::llm::dispatch::complete(self, messages, tools, sink, cancel, true)
             .await
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(error_chain_message(&*e)))
     }
@@ -74,7 +74,12 @@ impl ModelClient for LlmConfig {
 
 /// Resolve one streaming provider call from config. `hint_model` is
 /// `Some` only for `/responses` calls whose protocol wasn't pinned.
-pub(crate) fn http_call(config: &LlmConfig, url: String, hint_model: Option<String>) -> HttpCall {
+pub(crate) fn http_call(
+    config: &LlmConfig,
+    url: String,
+    hint_model: Option<String>,
+    cache_write: bool,
+) -> HttpCall {
     HttpCall {
         url,
         model: config.model.clone(),
@@ -92,6 +97,7 @@ pub(crate) fn http_call(config: &LlmConfig, url: String, hint_model: Option<Stri
             .credentials_refreshable()
             .then(|| (config.provider.clone(), config.provider_entries.clone())),
         hint_model,
+        cache_write,
         thinking_effort: config.thinking_effort.clone(),
         idle_timeout: crate::llm::transport::sse::stream_idle_timeout_for(
             &config.model,
@@ -216,6 +222,7 @@ impl WireProtocol for AnthropicMessages {
             call.thinking_effort.as_deref(),
             messages,
             tools,
+            call.cache_write,
         );
         // Anthropic can report rate limits as a terminal `error` event on a
         // 200 body (no HTTP status to trigger `post_with_retry`), so a
@@ -571,7 +578,7 @@ mod tests {
     #[test]
     fn http_call_resolves_refresh_and_hint() {
         let config = crate::llm::config::tests::test_cfg();
-        let call = http_call(&config, "https://x/v1/chat/completions".into(), None);
+        let call = http_call(&config, "https://x/v1/chat/completions".into(), None, true);
         assert_eq!(call.url, "https://x/v1/chat/completions");
         assert_eq!(call.model, config.model);
         assert!(call.refresh.is_none(), "non-codex cannot refresh");
@@ -586,6 +593,7 @@ mod tests {
             &codex,
             "https://x/responses".into(),
             (!codex.api_pinned).then(|| codex.model.clone()),
+            true,
         );
         assert!(call.refresh.is_some());
         assert_eq!(call.hint_model, None);

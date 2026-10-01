@@ -46,6 +46,9 @@ pub(crate) struct HttpCall {
     /// rate-limit failures say nothing about the protocol, and the hint is
     /// only built when nothing pinned the protocol (`api_pinned`).
     pub(crate) hint_model: Option<String>,
+    /// Write prompt-cache breakpoints on the Anthropic wire. `false` for
+    /// one-off requests (compaction) whose prefix is never re-read.
+    pub(crate) cache_write: bool,
     /// Reasoning-effort knob, spelled per wire protocol in the request body.
     pub(crate) thinking_effort: Option<String>,
     /// Idle budget for the stream reader, computed once per call.

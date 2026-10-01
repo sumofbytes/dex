@@ -879,6 +879,31 @@ async fn temporary_workspace_paths_are_confined() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn read_only_schema_filter_mirrors_the_gate() {
+    // Everything the read-only gate hard-denies must drop from the schema;
+    // reads and row-less tools (`delegate`) stay advertised.
+    let policy = Policy {
+        mode: crate::protocol::PermissionMode::ReadOnly,
+        console: None,
+        agent: None,
+        approval: None,
+    };
+    for kept in ["read", "grep", "find", "ls", "ask_user", "delegate"] {
+        assert!(!gated_in_read_only(&policy, kept), "{kept} must stay");
+    }
+    for dropped in [
+        "bash",
+        "write",
+        "edit",
+        "background",
+        "mcp__srv_tool",
+        "ext__lua",
+    ] {
+        assert!(gated_in_read_only(&policy, dropped), "{dropped} must drop");
+    }
+}
+
 #[tokio::test]
 async fn shell_timeout_terminates_long_running_command() {
     let (result, code) = run_bash_with_limits(

@@ -54,12 +54,15 @@ fn try_responses_fallback(config: &LlmConfig, err: &str) -> bool {
     !crate::llm::http::is_cancelled_message(err)
 }
 
+/// `cache_write: false` skips Anthropic prompt-cache breakpoints — for
+/// one-off requests (compaction summaries) whose prefix is never re-read.
 pub(crate) async fn complete(
     config: &LlmConfig,
     messages: &[ChatMessage],
     tools: &[crate::protocol::ToolDefinition],
     sink: Option<tokio::sync::mpsc::Sender<crate::protocol::ModelEvent>>,
     cancel: &(dyn crate::agent::state::CancellationSource + Send + Sync),
+    cache_write: bool,
 ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
     match effective_api(config) {
         ApiProtocol::ChatCompletions => {
@@ -67,6 +70,7 @@ pub(crate) async fn complete(
                 config,
                 format!("{}/chat/completions", config.base_url),
                 None,
+                cache_write,
             );
             crate::llm::client::ChatCompletions
                 .stream(&call, messages, tools, sink, cancel)
@@ -80,6 +84,7 @@ pub(crate) async fn complete(
                 config,
                 crate::llm::anthropic::messages_url(&config.base_url),
                 None,
+                cache_write,
             );
             crate::llm::client::AnthropicMessages
                 .stream(&call, messages, tools, sink, cancel)
@@ -93,6 +98,7 @@ pub(crate) async fn complete(
                 config,
                 format!("{}/responses", config.base_url),
                 hint_model,
+                cache_write,
             );
             match crate::llm::client::Responses
                 .stream(&call, messages, tools, sink.clone(), cancel)

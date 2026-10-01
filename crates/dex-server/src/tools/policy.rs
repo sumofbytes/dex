@@ -91,6 +91,17 @@ use crate::runtime::console::Console;
 use super::error::ToolError;
 use super::meta::Policy;
 
+/// Schema-side mirror of the read-only gate: rows the gate would hard-deny
+/// (`enforce_policy` rejects anything above `Read` outright) should not be
+/// advertised to the model at all. Tools with no metadata row (`delegate` —
+/// per-action gating inside delegation) stay advertised.
+pub fn gated_in_read_only(policy: &Policy, name: &str) -> bool {
+    match metadata_for(policy, name) {
+        Some(meta) => needs_approval(meta.permission, PermissionMode::ReadOnly),
+        None => false,
+    }
+}
+
 impl Policy {
     pub fn trusted() -> Self {
         Self {

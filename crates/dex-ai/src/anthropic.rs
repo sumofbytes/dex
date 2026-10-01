@@ -50,16 +50,22 @@ pub fn thinking_budget(effort: &str) -> u64 {
 /// Prompt caching is always on: breakpoints mark the ends of the three
 /// reusable prefixes (system, tool schemas, conversation-so-far) so each
 /// turn reuses the previous turn's cached prefix instead of re-reading it.
+/// `cache_write: false` skips the prompt-cache breakpoints — for one-off
+/// requests (compaction summaries) whose prefix will never be re-read, so
+/// the cache-write premium buys nothing.
 pub fn messages_body(
     model: &str,
     max_output_tokens: Option<u64>,
     thinking_effort: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
+    cache_write: bool,
 ) -> Value {
     let (system, mut msgs) = messages_input(messages);
-    if let Some(last) = msgs.last_mut() {
-        mark_cacheable(last);
+    if cache_write {
+        if let Some(last) = msgs.last_mut() {
+            mark_cacheable(last);
+        }
     }
     let (max_tokens, budget) = max_tokens_and_budget(max_output_tokens, thinking_effort);
     let mut body = json!({
@@ -69,12 +75,18 @@ pub fn messages_body(
         "stream": true,
     });
     if let Some(system) = system {
-        body["system"] = json!([{ "type": "text", "text": system, "cache_control": cache_mark() }]);
+        let mut system_blocks = json!([{ "type": "text", "text": system }]);
+        if cache_write {
+            system_blocks[0]["cache_control"] = cache_mark();
+        }
+        body["system"] = system_blocks;
     }
     if !tools.is_empty() {
         let mut wire_tools = anthropic_tools(tools);
-        if let Some(last) = wire_tools.last_mut() {
-            last["cache_control"] = cache_mark();
+        if cache_write {
+            if let Some(last) = wire_tools.last_mut() {
+                last["cache_control"] = cache_mark();
+            }
         }
         body["tools"] = json!(wire_tools);
     }
@@ -259,7 +271,18 @@ pub fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::messages_body;
-    use crate::ChatMessage;
+    use crate::{ChatMessage, FunctionDef, ToolDefinition};
+
+    fn one_tool() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDef {
+                name: "read".into(),
+                description: "read".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }]
+    }
 
     #[test]
     fn request_body_applies_host_output_limit_to_thinking_budget() {
@@ -269,9 +292,33 @@ mod tests {
             Some("xhigh"),
             &[ChatMessage::user("hi")],
             &[],
+            true,
         );
 
         assert_eq!(body["max_tokens"], 8_192);
         assert_eq!(body["thinking"]["budget_tokens"], 4_096);
+    }
+
+    #[test]
+    fn request_body_skips_cache_marks_for_one_off_requests() {
+        let warm = messages_body(
+            "claude-sonnet",
+            None,
+            None,
+            &[ChatMessage::system("sys"), ChatMessage::user("hi")],
+            &one_tool(),
+            true,
+        );
+        assert!(warm.to_string().contains("cache_control"));
+
+        let cold = messages_body(
+            "claude-sonnet",
+            None,
+            None,
+            &[ChatMessage::system("sys"), ChatMessage::user("hi")],
+            &one_tool(),
+            false,
+        );
+        assert!(!cold.to_string().contains("cache_control"), "{cold}");
     }
 }
