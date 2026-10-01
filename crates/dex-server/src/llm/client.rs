@@ -97,6 +97,7 @@ pub(crate) fn http_call(
             .credentials_refreshable()
             .then(|| (config.provider.clone(), config.provider_entries.clone())),
         hint_model,
+        warm_ping: false,
         cache_write,
         thinking_effort: config.thinking_effort.clone(),
         idle_timeout: crate::llm::transport::sse::stream_idle_timeout_for(
@@ -217,12 +218,25 @@ impl WireProtocol for AnthropicMessages {
         sink: Option<mpsc::Sender<ModelEvent>>,
         cancel: &(dyn CancellationSource + Send + Sync),
     ) -> Result<Turn, Box<dyn std::error::Error + Send + Sync>> {
+        // A warming ping caps output: the reply is discarded, only the
+        // cache hit matters. History replaying signed thinking blocks keeps
+        // the session's effort (thinking blocks without the parameter are
+        // rejected); `warm_effort_and_cap` owns that rule.
+        let (effort, output_limit) = if call.warm_ping {
+            crate::agent::cache_warming::warm_effort_and_cap(
+                call.thinking_effort.as_deref(),
+                messages,
+            )
+        } else {
+            (call.thinking_effort.as_deref(), None)
+        };
         let body = crate::llm::anthropic::messages_body(
             &call.model,
-            call.thinking_effort.as_deref(),
+            effort,
             messages,
             tools,
             call.cache_write,
+            output_limit,
         );
         // Anthropic can report rate limits as a terminal `error` event on a
         // 200 body (no HTTP status to trigger `post_with_retry`), so a

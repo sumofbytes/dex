@@ -11,7 +11,7 @@ use crate::protocol::{ApiProtocol, ChatMessage, ModelEvent};
 /// provider entry's, baked into `config.api_pinned`) or a `DEX_MODEL_APIS`
 /// entry always wins; otherwise a learned fallback overrides the configured
 /// default (`openai-responses`).
-fn effective_api(config: &LlmConfig) -> ApiProtocol {
+pub(crate) fn effective_api(config: &LlmConfig) -> ApiProtocol {
     if config.api_pinned {
         return config.api;
     }

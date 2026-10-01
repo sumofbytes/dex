@@ -197,6 +197,20 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             &self.harness,
         )
         .await?;
+        // Cache-warming capture: these messages are exactly what the engine
+        // sends next (schemas follow from the same request), so the last
+        // capture per turn is the last wire request. Anthropic-native only —
+        // other wires have no explicit cache to keep alive.
+        if matches!(
+            crate::llm::dispatch::effective_api(self.config),
+            crate::protocol::ApiProtocol::Anthropic
+        ) {
+            self.state.warm = Some(super::super::cache_warming::WarmCapture {
+                messages: messages.clone(),
+                tools: AgentHost::tool_schemas(self),
+                cached_tokens: self.state.last_cached,
+            });
+        }
         Ok(())
     }
 

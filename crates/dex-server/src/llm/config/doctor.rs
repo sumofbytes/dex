@@ -1,6 +1,7 @@
 use super::{pinned_key_env, stored_thinking_effort};
 
 use super::agent_wake_origin;
+use super::cache_warming_origin;
 use super::catalog_query::catalog_env_vars;
 use super::config_file_path;
 use super::context_index::catalog_context_window;
@@ -536,6 +537,13 @@ fn shared_rows(
         "agent wake",
         if wake { "on" } else { "off" },
         wake_source,
+    );
+    let (warming, warming_source) = cache_warming_origin();
+    row(
+        out,
+        "cache warming",
+        if warming { "on" } else { "off" },
+        warming_source,
     );
     // Headers: count per layer, sources joined.
     let mut header_count = 0;

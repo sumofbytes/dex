@@ -146,6 +146,9 @@ pub struct DaemonState {
     /// expire after `NEGATIVE_TTL` so a session created out-of-band (CLI/TUI
     /// direct file) after a miss becomes visible without a restart.
     pub missing_sessions: Mutex<HashMap<String, Instant>>,
+    /// Pending cache-warming pings per session (one per completed turn);
+    /// a newer schedule cancels the older token.
+    pub warm_tokens: Mutex<HashMap<String, CancellationToken>>,
 }
 
 /// Negative-cache TTL for absent session ids (see `missing_sessions`).
@@ -208,6 +211,7 @@ impl DaemonState {
             wakes: Mutex::new(HashMap::new()),
             last_client_seen: Mutex::new(HashMap::new()),
             missing_sessions: Mutex::new(HashMap::new()),
+            warm_tokens: Mutex::new(HashMap::new()),
         }
     }
 

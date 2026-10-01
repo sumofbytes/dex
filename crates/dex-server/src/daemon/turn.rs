@@ -872,6 +872,11 @@ pub(crate) async fn run_turn_inner(
             .turn_event("turn_failed")
             .map_err(|e| format!("failed to record turn_failed: {e}"))?,
     }
+    if turn_result.is_ok() {
+        if let Some(capture) = tool_state.warm.take() {
+            crate::agent::cache_warming::schedule(state, session_id, &config, capture);
+        }
+    }
     turn_result.map_err(|e| e.to_string())
 }
 

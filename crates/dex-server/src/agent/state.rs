@@ -4,6 +4,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use super::cache_warming::WarmCapture;
+
 pub use crate::runtime::cancel::{wait_cancelled, CancellationSource, GlobalCancellation};
 
 pub const CACHE_FILE_NAME: &str = "dex-tool-cache.json";
@@ -42,6 +44,10 @@ pub fn cache_fingerprint(name: &str, input: &str) -> String {
 #[derive(Clone, Default)]
 pub struct ToolState {
     pub cache: HashMap<String, String>,
+    /// The turn's last wire request, captured in `before_model` for the
+    /// post-turn cache-warming ping. In-memory only (`save` serializes just
+    /// `cache`); replaced on every model request, so the final one wins.
+    pub warm: Option<WarmCapture>,
     pub dirty: bool,
     /// Last API-reported prompt token count for the main conversation.
     pub last_usage: Option<u64>,

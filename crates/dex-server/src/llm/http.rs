@@ -46,6 +46,9 @@ pub(crate) struct HttpCall {
     /// rate-limit failures say nothing about the protocol, and the hint is
     /// only built when nothing pinned the protocol (`api_pinned`).
     pub(crate) hint_model: Option<String>,
+    /// Cache-warming ping: tiny output cap, no thinking — the response is
+    /// dropped, only the cache-hit matters.
+    pub(crate) warm_ping: bool,
     /// Write prompt-cache breakpoints on the Anthropic wire. `false` for
     /// one-off requests (compaction) whose prefix is never re-read.
     pub(crate) cache_write: bool,
