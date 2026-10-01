@@ -58,7 +58,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit".to_string(),
-                description: "Replace text in a file: one oldText/newText pair, or a batch of disjoint replacements via edits[] (every entry is matched against the original file — merge nearby changes into one entry, never overlap). Each oldText must match exactly one location — include 2-3 surrounding lines to make it unique, or pass replaceAll for every occurrence. Matching ignores indentation, trailing whitespace, and quote/dash variants. On failure, read the file and retry with exact text. Pass then_run to verify the change in the same call — its output comes back in this result.".to_string(),
+                description: "Replace exact text in a file: one oldText/newText pair or a batch of disjoint edits[] — every entry is matched against the original file, so merge nearby changes into one entry and never overlap. Each oldText must match exactly one location: include 2-3 surrounding lines for uniqueness or pass replaceAll. Matching tolerates indentation, trailing whitespace, and dash/quote variants; on failure, read the file and retry with exact text.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -174,7 +174,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "delegate".to_string(),
-                description: "Sub-agents. action=spawn: run a task in a background sub-agent and return its agent_id immediately — it never blocks this turn. Available agents: explorer (understand code, read-only), reviewer (review a change, read-only), tester (run tests; its shell runs only under a trusted permission policy). The child gets only the task you write plus optional file hints, never this conversation; it runs with its own tool set and reports its final message back. Completions are announced automatically at the next turn boundary — don't poll unless you need the result before continuing. Pass resume_from (a prior agent_id) to continue a resumable child from its transcript as a new generation — task is then optional and instruction plus file_hints fold into the continuation note; action=list shows resumable children. Omit model to inherit this turn's model (on resume, to keep the prior generation's model); pass provider/model only when the task's complexity needs a different trade-off (stronger for hard reasoning, cheaper for simple lookups). action=wait: fetch a child's result — terminal result (status, summary, error) as soon as it is done, otherwise the current state plus what it is running now; wait_seconds (0-120, default 0) bounds the wait, 0 polls, the wait returns early on cancel, and steering sent while waiting is acted on right after it returns; finished results stay fetchable after their announcement. action=stop: cancel a running child and return its terminal result (status cancelled); safe on ids that already finished. action=list: this session's sub-agent children — live ones with progress, finished ones with status and resumability, and interrupted on-disk runs a daemon restart left behind; read-only; use when spawn-result lines scrolled away or after compaction.".to_string(),
+                description: "Sub-agents. action=spawn: run a task as a background sub-agent and return its agent_id immediately (explorer: read-only code understanding; reviewer: read-only review; tester: runs tests, trusted shell). action=wait: fetch a child's terminal result, or its current state while running. action=stop: cancel a child. action=list: this session's children — running, finished, resumable.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -196,7 +196,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "background".to_string(),
-                description: "Background shell tasks. action=spawn: run a shell command detached from the turn and return its task id immediately — dev servers, watchers, long test runs. Completions are announced automatically at the next turn boundary. action=output: incremental output past cursor (byte offset from a previous result; omit for the tail). action=wait: block up to timeout_secs (0-120, default 30) for exit, then return the output shape; 0 polls once. action=stop: SIGKILL the process group (unix). action=list: this session's tasks, running first. Any agent in the session can poll/stop.".to_string(),
+                description: "Background shell tasks. action=spawn: run a shell command detached from the turn and return its task id immediately. action=output: output past a byte cursor. action=wait: block up to timeout_secs (0-120, default 30) for exit. action=stop: SIGKILL the process group (unix). action=list: this session's tasks.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -212,6 +212,21 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
         });
     }
     tools
+}
+
+// Prompt-side usage rules (pi-style description/guideline split): the schema
+// `description` keeps call-time mechanics at each tool decision; these
+// behavioral rules ride the system prompt once instead of in every schema blob.
+pub fn native_tool_guidelines(delegation_enabled: bool) -> Vec<&'static str> {
+    if !delegation_enabled {
+        return Vec::new();
+    }
+    vec![
+        "Sub-agents (delegate) never see this conversation — write self-contained tasks, file_hints give starting paths",
+        "Delegate spawn returns immediately and completions announce at the next turn boundary — wait only when the result gates the next step",
+        "Pass delegate resume_from on a finished child to continue from its transcript; inherit the turn's model unless the task needs a different trade-off",
+        "Background tasks announce at the next turn boundary too — poll output/wait only when the result gates the next step",
+    ]
 }
 
 /// Merge optional host-provided tools after native tools in stable name order.

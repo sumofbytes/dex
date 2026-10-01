@@ -7,7 +7,8 @@ pub mod paths;
 pub use atomic::unique_tmp_path;
 pub use cache::{cached_parse, fnv_bytes, FileCache};
 pub use paths::{
-    normalize_conflict_path, resolve_workspace_path, workspace_path, workspace_root, xdg_path,
+    grant_readable_dir, normalize_conflict_path, readable_granted_path, resolve_workspace_path,
+    workspace_path, workspace_root, xdg_path,
 };
 
 #[derive(Debug)]

@@ -104,6 +104,10 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // cache in the background; one-shot turns need the schema inline.
     let mut skill_dirs = skill_dirs();
     skill_dirs.extend(args.skill_dirs.iter().cloned());
+    // The prompt advertises these paths for autoload; let `read` honor it.
+    skill_dirs
+        .iter()
+        .for_each(|dir| dex_server::workspace::grant_readable_dir(dir));
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();

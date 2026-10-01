@@ -17,9 +17,30 @@ pub(crate) fn format_skills_for_prompt(skills: &[Skill]) -> String {
     let mut out = String::new();
     out.push_str("\n\nAvailable skills:\n");
     for skill in sorted {
-        out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+        out.push_str(&format!(
+            "- {}: {} (load {} with the read tool)\n",
+            skill.name,
+            skill.description,
+            skill.path.display()
+        ));
     }
-    out.push_str("\nTo use a skill, type /skill:<name> or ask about it.\n");
+    out.push_str(
+        "\nWhen the task matches a skill's description, use the read tool to load that SKILL.md and follow it.\n",
+    );
+    out
+}
+
+/// Pi-style tool guideline appendix: schema descriptions stay lean; these
+/// usage rules carry the behavior guidance once. Empty in OneShot/no-daemon
+/// runs (native_tool_guidelines gates on delegation).
+pub(crate) fn format_tool_guidelines_for_prompt(rules: &[&str]) -> String {
+    let mut out = String::new();
+    out.push_str("\n\n--- Tools ---\n");
+    for rule in rules {
+        out.push_str("- ");
+        out.push_str(rule);
+        out.push('\n');
+    }
     out
 }
 
@@ -154,6 +175,9 @@ pub(crate) fn system_prompt_with_override_for(
     cwd: Option<&Path>,
     plan_mode: bool,
 ) -> String {
+    // Read once per render so the appendix bytes stay stable within a turn
+    // (the flag lives in an atomic set at daemon startup).
+    let delegation = crate::agent::delegate::delegation_enabled();
     let (custom, _) = crate::llm::config::system_prompt_origin(explicit);
     let mut prompt = custom.unwrap_or_else(|| {
         concat!(
@@ -184,6 +208,10 @@ pub(crate) fn system_prompt_with_override_for(
     }
     if !skills.is_empty() {
         prompt.push_str(&format_skills_for_prompt(skills));
+    }
+    let guidelines = dex_coding_agent::native_tool_guidelines(delegation);
+    if !guidelines.is_empty() {
+        prompt.push_str(&format_tool_guidelines_for_prompt(&guidelines));
     }
     if plan_mode {
         prompt.push_str(PLAN_MODE_DIRECTIVE);
@@ -227,7 +255,24 @@ mod tests {
         }];
         let out = format_skills_for_prompt(&skills);
         assert!(out.contains("x: does x"));
-        assert!(out.contains("/skill:"));
+        assert!(out.contains("/tmp"));
+        assert!(out.contains("use the read tool to load"), "{out}");
+    }
+
+    #[test]
+    fn tool_guidelines_appendix_formats_rules() {
+        let out = format_tool_guidelines_for_prompt(&["rule one", "rule two"]);
+        assert!(out.starts_with("\n\n--- Tools ---\n"), "{out}");
+        assert!(out.contains("- rule one\n- rule two\n"), "{out}");
+    }
+
+    /// With the daemon gate off (dex-server lib tests keep it down), the
+    /// delegation rules are absent from the prompt entirely.
+    #[test]
+    fn tool_guidelines_off_without_delegation() {
+        assert!(dex_coding_agent::native_tool_guidelines(false).is_empty());
+        let on = dex_coding_agent::native_tool_guidelines(true);
+        assert!(on.iter().any(|r| r.contains("Sub-agents (delegate)")));
     }
 
     #[test]

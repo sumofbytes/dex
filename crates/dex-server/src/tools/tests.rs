@@ -880,6 +880,50 @@ async fn temporary_workspace_paths_are_confined() {
 }
 
 #[tokio::test]
+async fn read_reaches_granted_skill_dirs_outside_the_workspace() {
+    // The `~/.config/dex/skills` shape: a user-level dir the prompt
+    // advertises for autoload, which the workspace gate rejects until skill
+    // discovery grants it (`grant_readable_dir`).
+    let skill_dir = std::env::temp_dir().join(format!("dex-skill-grant-{}", std::process::id()));
+    fs::create_dir_all(skill_dir.join("demo")).unwrap();
+    let skill = skill_dir.join("demo/SKILL.md");
+    fs::write(&skill, "autoload body").unwrap();
+
+    let mut args = Map::new();
+    args.insert("path".into(), Value::String(skill.display().to_string()));
+    assert!(
+        execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
+            .await
+            .is_err()
+    );
+
+    crate::workspace::grant_readable_dir(&skill_dir);
+    let body = execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
+        .await
+        .unwrap();
+    assert!(body.contains("autoload body"), "{body}");
+
+    // Symlink escape: a link inside the granted dir resolves to its real
+    // (ungranted) target and stays refused.
+    #[cfg(unix)]
+    {
+        let outside =
+            std::env::temp_dir().join(format!("dex-skill-grant-out-{}", std::process::id()));
+        fs::write(&outside, "secret").unwrap();
+        let link = skill_dir.join("demo/escape.md");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        args.insert("path".into(), Value::String(link.display().to_string()));
+        assert!(
+            execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
+                .await
+                .is_err()
+        );
+        let _ = fs::remove_file(&outside);
+    }
+    let _ = fs::remove_dir_all(&skill_dir);
+}
+
+#[tokio::test]
 async fn shell_timeout_terminates_long_running_command() {
     let (result, code) = run_bash_with_limits(
         "sleep 1",

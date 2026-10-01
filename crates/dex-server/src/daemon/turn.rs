@@ -548,6 +548,10 @@ pub(crate) async fn run_turn_inner(
     // Skills are resolved on the daemon (its filesystem is the workspace).
     let mut dirs = skill_dirs();
     dirs.extend(req.skill_dirs.iter().map(std::path::PathBuf::from));
+    // The prompt advertises these paths for autoload; let `read` honor it
+    // even for user-level dirs outside the workspace.
+    dirs.iter()
+        .for_each(|dir| crate::workspace::grant_readable_dir(dir));
     let skills = discover_skills_async(&dirs).await;
 
     // Rebuild the conversation: system prompt + persisted history + prompt.
