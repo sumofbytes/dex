@@ -12,7 +12,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "read".to_string(),
-                description: "Read file contents with line numbers. Use offset/limit for large files. Batch independent reads with paths:[...] or glob:'src/**/*.rs' (up to 10 files) in ONE call.".to_string(),
+                description: "Read text file contents with line numbers (reference only). Use offset/limit for large files. Batch independent reads with paths:[...] (up to 10) or glob:'src/**/*.rs' (up to 8) in ONE call.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -30,7 +30,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "bash".to_string(),
-                description: "Run a shell command. Output is capped. Prefer read/grep/find over cat/grep/find; use targeted commands (grep -n, tail -N) over dumping files.".to_string(),
+                description: "Run a shell command (120s timeout, output truncated to 400 lines/32KB). Prefer read/grep/find over cat/grep/find; use targeted commands (grep -n, tail -N) over dumping files; use background spawn for long-running commands.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "command": { "type": "string", "description": "shell command to run" } },
@@ -77,7 +77,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "grep".to_string(),
-                description: "Fast content search (respects .gitignore). Regex when pattern has metacharacters, plain text otherwise; zero matches are retried as fuzzy. Default returns file paths; content mode gives path:line:text. Keep queries short — one term. Use path prefix 'src/ TODO' or exclude 'TODO !test/'.".to_string(),
+                description: "Fast content search (respects .gitignore). Regex when pattern has metacharacters, plain text otherwise; zero matches are retried as fuzzy. Default returns file paths; content mode gives path:line:text. Keep queries short — one term. Scope with a path ('src/ TODO') or exclude ('TODO !tests/').".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -174,7 +174,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "delegate".to_string(),
-                description: "Sub-agents. action=spawn: run a task as a background sub-agent and return its agent_id immediately (explorer: read-only code understanding; reviewer: read-only review; tester: runs tests, trusted shell). action=wait: fetch a child's terminal result, or its current state while running. action=stop: cancel a child. action=list: this session's children — running, finished, resumable.".to_string(),
+                description: "Sub-agents (spawn/wait/stop/list). spawn runs a task as a background child (explorer: code understanding; reviewer: review; tester: runs tests) and returns its agent_id. Children never see this conversation — pass a self-contained task + file_hints.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -196,7 +196,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "background".to_string(),
-                description: "Background shell tasks. action=spawn: run a shell command detached from the turn and return its task id immediately. action=output: output past a byte cursor. action=wait: block up to timeout_secs (0-120, default 30) for exit. action=stop: SIGKILL the process group (unix). action=list: this session's tasks.".to_string(),
+                description: "Background shell tasks (spawn/output/wait/stop/list). spawn detaches and returns a task id; output pages past a byte cursor; wait blocks up to timeout_secs.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
