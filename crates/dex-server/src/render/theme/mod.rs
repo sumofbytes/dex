@@ -210,6 +210,24 @@ pub fn muted_fg() -> Color {
     tool_muted_fg()
 }
 
+/// Inverted highlight for the selected row in modal pickers (approval
+/// choices, question-wizard options): the terminal's own foreground becomes
+/// the background and its background the text, so the cursor row has maximal
+/// contrast on any theme without fixed ANSI slots — themes remap
+/// `Color::Black`/`Color::Yellow` freely (e.g. Gruvbox Light paints slot 0
+/// cream), which left the old black-on-yellow selection unreadable. When the
+/// OSC 11 query fails there is nothing to invert, so the style falls back to
+/// the terminal-native `REVERSED` modifier.
+#[cfg(feature = "tui")]
+pub fn selection_style() -> Style {
+    match term_palette() {
+        Some(p) => Style::default()
+            .fg(Color::Rgb(p.background.0, p.background.1, p.background.2))
+            .bg(Color::Rgb(p.foreground.0, p.foreground.1, p.foreground.2)),
+        None => Style::default().add_modifier(Modifier::REVERSED),
+    }
+}
+
 /// Style for hairline separator rules (the composer's top/bottom rules and
 /// the submitted prompt's echo rule): subdued but clearly visible — dimmer
 /// than prominent text, brighter than a barely-there edge. When a voice is
@@ -495,6 +513,29 @@ mod tests {
         // color that could match the surface it sits on.
         if background() == Background::Unknown {
             assert_eq!(surface_fg(), Color::Reset);
+        }
+    }
+
+    #[test]
+    fn selection_style_inverts_the_palette() {
+        // Known palette: the selection is a full fg/bg inversion of the
+        // terminal's own colors — maximal contrast, no fixed ANSI slots.
+        // Unknown palette: the terminal-native REVERSED modifier instead.
+        match term_palette() {
+            Some(p) => {
+                let s = selection_style();
+                assert_eq!(
+                    s.fg,
+                    Some(Color::Rgb(p.background.0, p.background.1, p.background.2))
+                );
+                assert_eq!(
+                    s.bg,
+                    Some(Color::Rgb(p.foreground.0, p.foreground.1, p.foreground.2))
+                );
+            }
+            None => {
+                assert!(selection_style().add_modifier.contains(Modifier::REVERSED))
+            }
         }
     }
 
