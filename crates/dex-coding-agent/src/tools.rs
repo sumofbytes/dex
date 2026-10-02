@@ -12,7 +12,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "read".to_string(),
-                description: "Read text file contents with line numbers (read-only; use edit/write to change files). Use offset/limit for large files. Batch independent reads with paths:[...] (up to 10) or glob:'src/**/*.rs' (up to 8) in ONE call.".to_string(),
+                description: "Read text file contents with line numbers (read-only; use edit/write to change files). Use offset/limit for large files; batch independent reads with paths:[...] or glob:'...' in ONE call (caps noted on the parameters).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
