@@ -20,10 +20,9 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "paths": { "type": "array", "items": { "type": "string" }, "description": "several files to read in one call (max 10)" },
                         "glob": { "type": "string", "description": "glob fan-out, e.g. 'src/tools/*.rs' or '*.rs' (max 8 files, sorted)" },
                         "offset": { "type": "integer", "description": "1-based line to start from (default 1)" },
-                        "limit": { "type": "integer", "description": "maximum lines per file (default 2000 single-file, 200 multi-file)" }
-                    },
-                    "required": []
-                }),
+                      "limit": { "type": "integer", "description": "maximum lines per file (default 2000 single-file, 200 multi-file)" }
+                      }
+                  }),
             },
         },
         ToolDefinition {
@@ -48,7 +47,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                     "properties": {
                         "path": { "type": "string" },
                         "content": { "type": "string" },
-                        "then_run": { "type": "string", "description": "optional shell command to run in this same call after a successful write (e.g. a build, formatter or test); its output is appended to this result. Skipped, and never reported as if it ran, when the write fails." }
+                        "then_run": { "type": "string", "description": "shell command run after a successful write; its output is appended to this result" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -65,9 +64,9 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "path": { "type": "string" },
                         "oldText": { "type": "string", "description": "exact existing text to replace" },
                         "newText": { "type": "string", "description": "replacement text" },
-                        "edits": { "type": "array", "description": "batch of disjoint {oldText, newText} replacements applied in one call; pass either this or oldText/newText, not both", "items": { "type": "object", "properties": { "oldText": { "type": "string" }, "newText": { "type": "string" } }, "required": ["oldText", "newText"] } },
+                        "edits": { "type": "array", "description": "batch of {oldText, newText} replacements; pass either this or oldText/newText, not both", "items": { "type": "object", "properties": { "oldText": { "type": "string" }, "newText": { "type": "string" } }, "required": ["oldText", "newText"] } },
                         "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
-                        "then_run": { "type": "string", "description": "optional shell command to run in this same call after a successful edit (e.g. a build, formatter or test); its output is appended to this result. Skipped, and never reported as if it ran, when the edit fails." }
+                        "then_run": { "type": "string", "description": "shell command run after a successful edit; its output is appended to this result" }
                     },
                     "required": ["path"]
                 }),
@@ -114,10 +113,9 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "directory to list (default '.')" }
-                    },
-                    "required": []
-                }),
+                      "path": { "type": "string", "description": "directory to list (default '.')" }
+                      }
+                  }),
             },
         },
         ToolDefinition {
@@ -132,7 +130,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 4,
-                            "description": "1-4 related questions, each rendered as its own picker screen",
+                            "description": "related questions, each rendered as its own picker screen",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -142,14 +140,14 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                                         "type": "array",
                                         "minItems": 2,
                                         "maxItems": 4,
-                                        "description": "2-4 labeled choices; a free-text 'Other' row is added implicitly",
+                                        "description": "labeled choices; a free-text 'Other' row is added implicitly",
                                         "items": {
                                             "type": "object",
                                             "properties": {
                                                 "label": { "type": "string", "maxLength": 20, "description": "what the user selects" },
-                                                "description": { "type": "string", "description": "one line shown under the label" }
-                                            },
-                                            "required": ["label", "description"]
+                                                "description": { "type": "string", "description": "one line shown under the label (optional)" }
+                                              },
+                                              "required": ["label"]
                                         }
                                     },
                                     "multiSelect": { "type": "boolean", "description": "checkbox behavior allowing several options (default false)" },
