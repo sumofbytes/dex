@@ -19,10 +19,9 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "path": { "type": "string", "description": "relative path to a single file" },
                         "paths": { "type": "array", "items": { "type": "string" }, "description": "several files to read in one call (max 10)" },
                         "glob": { "type": "string", "description": "glob fan-out, e.g. 'src/tools/*.rs' or '*.rs' (max 8 files, sorted)" },
-                        "offset": { "type": "integer", "description": "1-based line to start from (default 1)" },
-                      "limit": { "type": "integer", "description": "maximum lines per file (default 2000 single-file, 200 multi-file)" }
-                      }
-                  }),
+                        "limit": { "type": "integer", "description": "maximum lines per file (default 2000 single-file, 200 multi-file)" }
+                    }
+                }),
             },
         },
         ToolDefinition {
@@ -47,7 +46,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                     "properties": {
                         "path": { "type": "string" },
                         "content": { "type": "string" },
-                        "then_run": { "type": "string", "description": "shell command run after a successful write; its output is appended to this result" }
+                        "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the write fails" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -66,7 +65,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "newText": { "type": "string", "description": "replacement text" },
                         "edits": { "type": "array", "description": "batch of {oldText, newText} replacements; pass either this or oldText/newText, not both", "items": { "type": "object", "properties": { "oldText": { "type": "string" }, "newText": { "type": "string" } }, "required": ["oldText", "newText"] } },
                         "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
-                        "then_run": { "type": "string", "description": "shell command run after a successful edit; its output is appended to this result" }
+                        "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the edit fails" }
                     },
                     "required": ["path"]
                 }),
@@ -83,7 +82,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "pattern": { "type": "string", "description": "text or regex to search; may include path prefixes ('src/') and excludes ('!tests/')" },
                         "output_mode": { "type": "string", "enum": ["files", "content"], "description": "files (default): paths only; content: path:line:text" },
                         "head_limit": { "type": "integer", "description": "maximum results (default 50)" },
-"file_offset": { "type": "integer", "description": "file index to resume from when a result ends with a '[... shown, more files unscanned; continue with file_offset ...]' trailer" },
+                        "file_offset": { "type": "integer", "description": "file index to resume from when a result ends with a '[... shown, more files unscanned; continue with file_offset ...]' trailer" },
                         "context": { "type": "integer", "description": "lines of context around each match in content mode (0-10, default 0)" }
                     },
                     "required": ["pattern"]
@@ -113,9 +112,9 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                      "path": { "type": "string", "description": "directory to list (default '.')" }
-                      }
-                  }),
+                        "path": { "type": "string", "description": "directory to list (default '.')" }
+                    }
+                }),
             },
         },
         ToolDefinition {
@@ -146,8 +145,8 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                                             "properties": {
                                                 "label": { "type": "string", "maxLength": 20, "description": "what the user selects" },
                                                 "description": { "type": "string", "description": "one line shown under the label (optional)" }
-                                              },
-                                              "required": ["label"]
+                                            },
+                                            "required": ["label"]
                                         }
                                     },
                                     "multiSelect": { "type": "boolean", "description": "checkbox behavior allowing several options (default false)" },
