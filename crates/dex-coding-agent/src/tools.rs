@@ -75,7 +75,11 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                             }
                         },
                         "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
-                        "then_run": { "type": "string", "description": "shell verification in the same call; skipped if the edit fails" }
+                        // `edit`'s own description can't carry the `write`
+                        // phrasing ("its output comes back in this result")
+                        // without a second copy of the edit rules, so the
+                        // in-band result rides the param instead.
+                        "then_run": { "type": "string", "description": "shell verification in the same call, its output returned here; skipped if the edit fails" }
                     },
                     "required": ["path", "edits"]
                 }),
@@ -320,6 +324,30 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(required, ["path", "edits"]);
+    }
+
+    /// The batch rules live in the `edit` description + the always-on
+    /// guidelines exactly once; trimming the `edits[]` params must never
+    /// drop them from all three places at the same time.
+    #[test]
+    fn edit_rules_ride_the_description_not_the_params() {
+        let edit = builtin_tools(false)
+            .into_iter()
+            .find(|t| t.function.name == "edit")
+            .unwrap();
+        assert!(edit
+            .function
+            .description
+            .contains("matched against the original file"));
+        let properties = &edit.function.parameters["properties"];
+        for lean in [
+            properties["edits"]["description"].as_str().unwrap(),
+            properties["edits"]["items"]["properties"]["oldText"]["description"]
+                .as_str()
+                .unwrap(),
+        ] {
+            assert!(!lean.contains("matched against the original"), "{lean}");
+        }
     }
 
     #[test]
