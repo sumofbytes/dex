@@ -129,6 +129,90 @@ pub(crate) fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     )])
 }
 
+/// The base-context line for the session-start header: how much context a
+/// fresh session's first turn starts with and what share each contributor
+/// (system prompt, project instructions, skills, tool schemas, …) adds.
+/// Daemon-estimated, muted like the rest of the banner; `None` when the
+/// daemon sent no estimate (older daemon, or no usable config).
+pub(crate) fn base_context_line(
+    breakdown: &[crate::protocol::BaseContextPart],
+) -> Option<Line<'static>> {
+    let total: u64 = breakdown.iter().map(|p| p.tokens).sum();
+    if total == 0 {
+        return None;
+    }
+    let muted = fg(crate::render::theme::muted_fg());
+    let mut text = format!(
+        "base context ~{}: ",
+        crate::protocol::tokens::format_tokens(total)
+    );
+    let shares = percent_shares(
+        &breakdown.iter().map(|p| p.tokens).collect::<Vec<_>>(),
+        total,
+    );
+    for (i, part) in breakdown.iter().enumerate() {
+        if i > 0 {
+            text.push_str(" · ");
+        }
+        text.push_str(&format!("{} {}%", part.label, shares[i]));
+    }
+    Some(Line::from(Span::styled(text, muted)))
+}
+
+/// Largest-remainder rounding so the shown shares always sum to exactly
+/// 100%: floor each part, then hand the leftover points to the parts with
+/// the biggest fractional remainders (stable for ties).
+fn percent_shares(tokens: &[u64], total: u64) -> Vec<u64> {
+    let mut shares: Vec<(u64, u64)> = tokens
+        .iter()
+        .map(|t| (t * 100 / total, t * 100 % total))
+        .collect();
+    let leftover = 100 - shares.iter().map(|s| s.0).sum::<u64>();
+    if leftover > 0 {
+        let mut order: Vec<usize> = (0..shares.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(shares[i].1));
+        for &i in order.iter().take(leftover as usize) {
+            shares[i].0 += 1;
+        }
+    }
+    shares.into_iter().map(|s| s.0).collect()
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    fn part(label: &str, tokens: u64) -> crate::protocol::BaseContextPart {
+        crate::protocol::BaseContextPart {
+            label: label.into(),
+            tokens,
+        }
+    }
+
+    #[test]
+    fn shares_round_to_100() {
+        // 1/3 each: floors sum to 99, leftovers hand out by remainder.
+        let shares = percent_shares(&[1, 1, 1], 3);
+        assert_eq!(shares, vec![34, 33, 33]);
+        // Mirror of the server header test's mix; shares must sum to 100.
+        // 320+80+2224+3200 of 5824: floors [5,1,38,54], remainders 2880,
+        // 2176, 1088, 5504 → the 2 leftover points go to schemas then system.
+        let breakdown = [
+            part("system", 320),
+            part("project", 80),
+            part("skills", 2224),
+            part("schemas", 3200),
+        ];
+        let total: u64 = breakdown.iter().map(|p| p.tokens).sum();
+        let shares = percent_shares(
+            &breakdown.iter().map(|p| p.tokens).collect::<Vec<_>>(),
+            total,
+        );
+        assert_eq!(shares.iter().sum::<u64>(), 100);
+        assert_eq!(shares, vec![6, 1, 38, 55]);
+    }
+}
+
 /// Whatever the render/event loop needs after boot: live app state plus the
 /// initialized terminal (raw mode entered, alternate screen on) and its restore
 /// guard.
@@ -256,6 +340,9 @@ pub(crate) fn bootstrap(
 
     // Per-request overrides so client flags keep working in remote mode.
     let mut options = crate::cli::chat_options_from_args(args);
+    // Daemon-estimated fresh-session base context (banner line); captured
+    // before `info` feeds App construction.
+    let base_breakdown = info.base_breakdown.clone();
     // Seed the mode from an explicit client `--permission` (a stricter
     // per-run choice), else from the daemon's reported ceiling. Clamp to
     // the ceiling, which a client may only go stricter than.
@@ -523,11 +610,15 @@ pub(crate) fn bootstrap(
 
     // Session-start header: one Banner block holding the DEX wordmark, the
     // skills the daemon discovered, and the ready time — contiguous rows, no
-    // inter-block gap air between them.
-    let header = vec![
-        skills_header_line(&remote.app.skills),
-        launch_time_line(launch_start.elapsed().as_secs_f64()),
-    ];
+    // inter-block gap air between them. The base-context breakdown rides
+    // along (daemon-estimated; absent on older daemons). The ready time is
+    // measured and pushed last so it covers everything before it, including
+    // the base-context breakdown itself.
+    let mut header = vec![skills_header_line(&remote.app.skills)];
+    if let Some(line) = base_context_line(&base_breakdown) {
+        header.push(line);
+    }
+    header.push(launch_time_line(launch_start.elapsed().as_secs_f64()));
     push_banner(&mut remote.app, header);
     // Lazy-auth empty state (the pi/opencode pattern): the daemon reports
     // an empty provider exactly when its config build fails (missing key,
@@ -608,5 +699,35 @@ mod seed_tests {
             seed_mode(Some(PermissionMode::Trusted), PermissionMode::ReadOnly),
             AgentMode::Plan
         );
+    }
+
+    #[test]
+    fn base_context_line_renders_shares_and_skips_empty() {
+        use crate::protocol::BaseContextPart;
+        let parts = vec![
+            BaseContextPart {
+                label: "system prompt".into(),
+                tokens: 600,
+            },
+            BaseContextPart {
+                label: "tool schemas".into(),
+                tokens: 400,
+            },
+        ];
+        let line = base_context_line(&parts).unwrap();
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("base context"), "{text}");
+        assert!(text.contains("system prompt 60%"), "{text}");
+        assert!(text.contains("tool schemas 40%"), "{text}");
+        assert!(base_context_line(&[]).is_none());
+        assert!(base_context_line(&[BaseContextPart {
+            label: "x".into(),
+            tokens: 0,
+        }])
+        .is_none());
     }
 }

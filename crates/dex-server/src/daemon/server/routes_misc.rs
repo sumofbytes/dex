@@ -155,6 +155,8 @@ fn default_daemon_info(
         git_dirty,
         thinking_effort: None,
         thinking_warning: None,
+        base_tokens: 0,
+        base_breakdown: Vec::new(),
     }
 }
 
@@ -170,8 +172,12 @@ async fn resolve_daemon_info_async(ceiling: crate::protocol::PermissionMode) -> 
     );
     match config {
         Ok(config) => {
-            let mut info =
-                default_daemon_info(cwd, git_branch, git_dirty, ceiling.as_str().to_string());
+            let mut info = default_daemon_info(
+                cwd.clone(),
+                git_branch,
+                git_dirty,
+                ceiling.as_str().to_string(),
+            );
             info.thinking_warning = config.thinking_mismatch_warning();
             info.provider = config.provider.name().to_string();
             info.api = config.api.name().to_string();
@@ -179,6 +185,20 @@ async fn resolve_daemon_info_async(ceiling: crate::protocol::PermissionMode) -> 
             info.available_models = config.available_models;
             info.context_window = config.context_window;
             info.thinking_effort = config.thinking_effort;
+            // Fresh-session base-context estimate. Skills are resolved on
+            // the daemon (its filesystem is the workspace); per-request
+            // `skill_dirs` don't exist yet, so only the daemon's dirs count.
+            // Remaining `~` caveats: MCP/extension schemas are counted from
+            // whatever the background `global_manager()` connect has filled
+            // so far (a client arriving right after `dex serve` may see only
+            // the native catalog until the next `/api/config` refresh), and
+            // the plan-mode directive is left out (a per-session switch,
+            // not part of the fresh default).
+            let skills = discover_skills_async(&skill_dirs()).await;
+            let breakdown =
+                crate::agent::tokens::base_context_breakdown(std::path::Path::new(&cwd), &skills);
+            info.base_tokens = breakdown.iter().map(|p| p.tokens).sum();
+            info.base_breakdown = breakdown;
             info
         }
         Err(_) => {
