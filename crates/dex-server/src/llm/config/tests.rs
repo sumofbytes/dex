@@ -3210,3 +3210,50 @@ fn with_catalog_index_persists_index_for_the_next_process() {
     assert!(restored.by_id.contains_key("m1"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The background persist must target the cache dir the catalog came from,
+/// even if `XDG_CACHE_HOME` moves on before the thread runs. Resolving the
+/// path on the thread let one test's generation land in another's cache dir,
+/// where the restore rejected it on the hash (`"persisted index must match
+/// the catalog it was built from"`) — the CI flake this pins.
+#[test]
+fn catalog_index_background_persist_pins_its_cache_dir() {
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = std::env::temp_dir().join(format!("dex-persist-pin-{}", std::process::id()));
+    let spawn_dir = root.join("spawned-in");
+    let moved_dir = root.join("moved-after");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&spawn_dir).unwrap();
+    let _guard = EnvRestore::take(&["XDG_CACHE_HOME"]);
+
+    let catalog = std::sync::Arc::new(serde_json::json!({
+        "prov": {"api": "https://x", "models": {"m1": {"limit": {"context": 8000}}}}
+    }));
+    let hash = super::catalog_index::fnv_bytes(&catalog.to_string());
+
+    env::set_var("XDG_CACHE_HOME", &spawn_dir);
+    // Resolve while the spawn dir is live — that's the identity the persist
+    // thread must keep.
+    let spawn_path = super::catalog_index::persisted_index_path().unwrap();
+    super::catalog_index::spawn_persist_index(hash, catalog, None, 0);
+    // Flip before the thread is scheduled: the exact interleaving that used
+    // to redirect the write.
+    env::set_var("XDG_CACHE_HOME", &moved_dir);
+
+    for _ in 0..200 {
+        if spawn_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        spawn_path.exists(),
+        "background persist never wrote {spawn_path:?}"
+    );
+    // …and not into the cache dir that was live by the time it ran.
+    let moved_path = moved_dir.join("dex/models.idx.json");
+    assert!(!moved_path.exists(), "persist leaked into {moved_path:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

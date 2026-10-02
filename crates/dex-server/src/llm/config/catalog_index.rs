@@ -587,17 +587,22 @@ pub(super) fn restore_persisted_index_meta(
 /// catalog generation (only after a full rebuild; a successful restore
 /// means the file is already current). Atomic rename, like the ctx index,
 /// so a concurrent writer never leaves a torn file behind.
-fn spawn_persist_index(
+pub(super) fn spawn_persist_index(
     hash: u64,
     catalog: std::sync::Arc<serde_json::Value>,
     cat_mtime: Option<SystemTime>,
     cat_len: u64,
 ) {
+    // Resolve the destination here, not on the spawned thread: the path must
+    // belong to the same `XDG_CACHE_HOME` the catalog was read from, and env
+    // can change in between (tests redirect it). Resolving late can write this
+    // generation's index into another cache dir — or land a stale generation
+    // on top of the one the next reader restores.
+    let Some(path) = persisted_index_path() else {
+        return;
+    };
     std::thread::spawn(move || {
         let Some(text) = persisted_index_text(hash, &catalog, cat_mtime, cat_len) else {
-            return;
-        };
-        let Some(path) = persisted_index_path() else {
             return;
         };
         if let Some(parent) = path.parent() {
