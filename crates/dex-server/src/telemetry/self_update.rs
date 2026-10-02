@@ -21,6 +21,16 @@ use crate::runtime::runtime::http::VERSION;
 
 pub(crate) const DEFAULT_REPO: &str = "sumofbytes/dex";
 
+/// Progress line for a long network/IO phase, so a multi-MB download never
+/// reads as a hung command. A plain stderr line like `install.sh` prints —
+/// deliberately not an animated spinner: an update is three finite phases, so
+/// a background thread and its escape codes buy nothing here, and stderr text
+/// still lands in a log when stdout is piped. The final result goes to stdout
+/// (see `Mode::Update`), so `dex update` stays script-friendly.
+fn progress(message: &str) {
+    eprintln!("{message}");
+}
+
 /// Sync entry point for `dex update`: blocks on the shared runtime.
 pub fn self_update() -> Result<String, String> {
     crate::runtime::http::block_on(self_update_async())
@@ -60,6 +70,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         None => {
             // Follow the /releases/latest redirect; the tag is the last path
             // segment of the URL we landed on.
+            progress("checking the latest release ...");
             let resp = client
                 .get(format!("https://github.com/{repo}/releases/latest"))
                 .timeout(Duration::from_secs(300))
@@ -96,10 +107,11 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         let asset = asset_name(&tag, target);
         let archive = dir.join(&asset);
 
+        progress(&format!("downloading {asset} ..."));
         let bytes = fetch_bytes(&client, &format!("{base}/{asset}")).await?;
+        let sums = fetch_bytes(&client, &format!("{base}/SHA256SUMS")).await?;
         fs::write(&archive, &bytes)
             .map_err(|e| format!("cannot write {}: {e}", archive.display()))?;
-        let sums = fetch_bytes(&client, &format!("{base}/SHA256SUMS")).await?;
         let expected = checksum_for(&String::from_utf8_lossy(&sums), &asset)
             .ok_or_else(|| format!("no SHA256SUMS entry for {asset}"))?;
         let actual = sha256_hex(&bytes);
@@ -111,6 +123,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
 
         // System tar, same assumption install.sh already makes; avoids adding
         // flate2 + tar crates just for this.
+        progress("installing ...");
         let status = Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
@@ -302,6 +315,26 @@ fn temp_download_dir() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for DEX-22: `VERSION` must be the workspace root release
+    /// version, not this crate's own `CARGO_PKG_VERSION` — `dex update`
+    /// compares it against the latest release tag, and a sub-crate version
+    /// made every install look stale (printed as `0.0.1`).
+    #[test]
+    fn version_is_the_workspace_release_version() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let text = fs::read_to_string(&root).expect("workspace root Cargo.toml is readable");
+        let root_version = text
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+            .expect("workspace root [package] has a version");
+        assert_eq!(VERSION, root_version);
+        assert_ne!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(
+            parse_version(VERSION).is_some(),
+            "VERSION must be comparable semver"
+        );
+    }
 
     #[test]
     fn parses_and_compares_versions() {
