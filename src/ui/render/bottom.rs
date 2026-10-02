@@ -84,18 +84,19 @@ impl SlashSuggestionsView {
             .saturating_sub(visible.saturating_sub(1))
             .min(max_start);
         let window = &suggestions[start..start + visible];
-        // Sheet width matches the composer band minus its left gutter: the
-        // labels share the composer's text column (glyph + gap to the
-        // left). The sheet is inset one extra column (so its text lands on
-        // the composer's text column, past the band's rule start), leaving
-        // one column of air on each side like the composer's rules.
+        // Sheet width matches the composer band's width, and its left edge
+        // is the band's own left edge: the transcript's text column is one
+        // cell inside the band, so a sheet inset any further right leaves
+        // the first character of every parent row orphaned beside the
+        // overlay (DEX-21). Starting on the band clears the whole column
+        // and keeps the sheet's own `> ` marker in that first gutter cell,
+        // so rows still copy as plain commands with the same two-cell
+        // marker lead as before.
         // Inside a picker (`/model `, `/provider `, `/resume …`) rows show
         // just the item (`> gpt-5`), not the repeated command (`/model
         // <item>`) — the header already names the picker.
         let band = composer_band(area);
-        let width = band
-            .width
-            .saturating_sub(super::super::style::HORIZONTAL_GUTTER);
+        let width = band.width;
         let avail = width.saturating_sub(2) as usize;
         let cmd_col = window
             .iter()
@@ -105,7 +106,7 @@ impl SlashSuggestionsView {
             .min(48)
             .min(avail.max(1));
         let popup = Rect {
-            x: band.x + super::super::style::HORIZONTAL_GUTTER,
+            x: band.x,
             y: area.y - height,
             width,
             height,

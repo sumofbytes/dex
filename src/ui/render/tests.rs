@@ -1193,6 +1193,80 @@ fn slash_popup_header_has_gutter_below_header() {
 }
 
 #[test]
+fn slash_popup_covers_the_column_the_parent_transcript_wrote() {
+    // DEX-21: the sheet's left edge must land on the composer band's own
+    // left edge. It used to start one column further right, so the first
+    // character of every parent transcript row survived `Clear` and peeked
+    // out to the left of the overlay — a column of orphaned glyphs. Render
+    // the whole view (transcript underneath, popup on top) and require every
+    // row the popup covers to start clear of the parent's text.
+    let mut app = test_app();
+    // Fill the whole transcript window so every popup row has parent text
+    // behind it — a short transcript leaves the overlay over blank rows and
+    // the leak stays invisible.
+    app.transcript = vec![super::super::TranscriptBlock::Assistant {
+        stamp: 0,
+        lines: (0..12)
+            .map(|i| {
+                super::super::indent_transcript_line(Line::from(format!("parent row {i} ████")))
+            })
+            .collect(),
+    }];
+    app.input = InputField::from_text("/");
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..24)
+        .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+    let rule = rows.iter().position(|r| r.contains('─')).expect("top rule");
+    // The sheet's left edge is the composer band's left edge, which is
+    // exactly the column the parent transcript's first character sits on
+    // (`band.x`): the transcript renders into the full area and its leading
+    // indent lands at `area.x`, so text starts one cell in. The sheet used
+    // to start one column further right, so `Clear` never touched that
+    // column and the parent's first character survived beside the overlay.
+    //
+    // Derive the edge from the layout rather than hardcoding it, then require
+    // that column to hold nothing but the sheet's own `> ` selection marker
+    // or gutter on every content row the sheet covers.
+    let band_x = composer_band(Rect::new(0, 0, 80, 24)).x as usize;
+    // The sheet spans from its top rule down to the composer's top rule (the
+    // sheet is anchored directly above the composer band), so the sheet's own
+    // rows are `rule .. composer_top_rule` — exclusive at both ends, which
+    // drops the two `─` rules that legitimately span that column.
+    let composer_rule = rows
+        .iter()
+        .position(|r| r.contains(super::super::style::INPUT_PROMPT))
+        .and_then(|prompt| {
+            rows[rule..prompt]
+                .iter()
+                .rposition(|r| r.chars().all(|c| c == '─' || c == ' '))
+                .map(|i| rule + i)
+        })
+        .expect("composer top rule");
+    let popup_rows = &rows[rule + 1..composer_rule];
+    assert!(
+        popup_rows.len() > 2,
+        "expected the sheet to span several content rows: {popup_rows:?}"
+    );
+    let leaked: Vec<char> = popup_rows
+        .iter()
+        .map(|r| r.chars().nth(band_x).unwrap_or(' '))
+        .filter(|c| *c != ' ' && *c != '>')
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "parent transcript must not show through the popup's left edge: {leaked:?}"
+    );
+    // Sanity: the popup really is over the parent (a command row renders).
+    assert!(rows.iter().any(|r| r.contains("> /quit")), "{rows:?}");
+}
+
+#[test]
 fn virtual_terminal_renders_at_normal_and_narrow_sizes() {
     for (width, height) in [(80, 24), (24, 12), (24, 8)] {
         let backend = TestBackend::new(width, height);
