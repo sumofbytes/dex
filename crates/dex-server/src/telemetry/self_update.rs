@@ -17,9 +17,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::runtime::console::{Console, SpinnerGuard};
 use crate::runtime::runtime::http::VERSION;
 
 pub(crate) const DEFAULT_REPO: &str = "sumofbytes/dex";
+
+/// Transient progress for a long network/IO phase, so a multi-MB download
+/// never looks hung: an animated label on a terminal, nothing when stdout is
+/// piped (the guard no-ops off-terminal).
+fn progress(label: &str) -> SpinnerGuard {
+    SpinnerGuard::start(&Console::none(), label)
+}
 
 /// Sync entry point for `dex update`: blocks on the shared runtime.
 pub fn self_update() -> Result<String, String> {
@@ -60,6 +68,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         None => {
             // Follow the /releases/latest redirect; the tag is the last path
             // segment of the URL we landed on.
+            let _progress = progress("checking the latest release");
             let resp = client
                 .get(format!("https://github.com/{repo}/releases/latest"))
                 .timeout(Duration::from_secs(300))
@@ -96,10 +105,15 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         let asset = asset_name(&tag, target);
         let archive = dir.join(&asset);
 
-        let bytes = fetch_bytes(&client, &format!("{base}/{asset}")).await?;
+        let label = format!("downloading {asset}");
+        let (bytes, sums) = {
+            let _progress = progress(&label);
+            let bytes = fetch_bytes(&client, &format!("{base}/{asset}")).await?;
+            let sums = fetch_bytes(&client, &format!("{base}/SHA256SUMS")).await?;
+            (bytes, sums)
+        };
         fs::write(&archive, &bytes)
             .map_err(|e| format!("cannot write {}: {e}", archive.display()))?;
-        let sums = fetch_bytes(&client, &format!("{base}/SHA256SUMS")).await?;
         let expected = checksum_for(&String::from_utf8_lossy(&sums), &asset)
             .ok_or_else(|| format!("no SHA256SUMS entry for {asset}"))?;
         let actual = sha256_hex(&bytes);
@@ -111,6 +125,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
 
         // System tar, same assumption install.sh already makes; avoids adding
         // flate2 + tar crates just for this.
+        let installing = progress("installing");
         let status = Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
@@ -125,7 +140,9 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         if !new_bin.is_file() {
             return Err(format!("archive did not contain a dex binary ({asset})"));
         }
-        install(&new_bin, &exe)
+        let installed = install(&new_bin, &exe);
+        drop(installing);
+        installed
     }
     .await;
     let _ = fs::remove_dir_all(&dir);
@@ -302,6 +319,26 @@ fn temp_download_dir() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for DEX-22: `VERSION` must be the workspace root release
+    /// version, not this crate's own `CARGO_PKG_VERSION` — `dex update`
+    /// compares it against the latest release tag, and a sub-crate version
+    /// made every install look stale (printed as `0.0.1`).
+    #[test]
+    fn version_is_the_workspace_release_version() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let text = fs::read_to_string(&root).expect("workspace root Cargo.toml is readable");
+        let root_version = text
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+            .expect("workspace root [package] has a version");
+        assert_eq!(VERSION, root_version);
+        assert_ne!(VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(
+            parse_version(VERSION).is_some(),
+            "VERSION must be comparable semver"
+        );
+    }
 
     #[test]
     fn parses_and_compares_versions() {
