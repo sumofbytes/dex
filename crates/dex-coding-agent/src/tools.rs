@@ -12,7 +12,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "read".to_string(),
-                description: "Read text file contents with line numbers (reference only). Use offset/limit for large files. Batch independent reads with paths:[...] (up to 10) or glob:'src/**/*.rs' (up to 8) in ONE call.".to_string(),
+                description: "Read text file contents with line numbers (read-only; use edit/write to change files). Use offset/limit for large files. Batch independent reads with paths:[...] (up to 10) or glob:'src/**/*.rs' (up to 8) in ONE call.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -30,7 +30,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "bash".to_string(),
-                description: "Run a shell command (120s timeout, output truncated to 400 lines/32KB). Prefer read/grep/find over cat/grep/find; use targeted commands (grep -n, tail -N) over dumping files; use background spawn for long-running commands.".to_string(),
+                description: "Run a shell command (120s timeout, output truncated to 400 lines/32KB). Prefer read/grep/find over shell cat/grep/find dumps; use targeted commands (grep -n, tail -N) over dumping files; use background spawn for long-running commands (daemon sessions only).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "command": { "type": "string", "description": "shell command to run" } },
