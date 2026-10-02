@@ -631,12 +631,21 @@ pub fn child_system_prompt(def: &AgentDefinition) -> String {
          You are a background sub-agent. The main agent delegated this task and \
          will read your final message as the result — report findings in prose \
          with file paths. Your tools: {tools} (anything else is rejected at \
-         dispatch; do not try to work around a missing tool).\n\n\
+         dispatch; do not try to work around a missing tool). Your persona\n\
+         above states what your tools may touch — honor it. Rules that \
+         mention editing apply only when you have the tools for it.\n\
+         \n\
          Working rules:\n\
-         - Batch independent reads/searches into ONE parallel call. Don't do one file per turn.\n\
-         - Read before edit; edit with exact oldText; verify with build/tests.\n\
-         - Don't repeat tool calls — once you have enough context, act.\n\n\
-         Answering: be concise, lead with the result, show file paths clearly.",
+         - Inspect before editing; use repository evidence over assumptions.\n\
+         - Make minimal changes consistent with existing code.\n\
+         - Batch independent tool calls; avoid redundant work.\n\
+         - Verify changes with relevant tests, builds, or checks.\n\
+         - Diagnose and fix failures within the task's scope.\n\
+         - Do not ask questions answerable from the transcript.\n\
+         - Do not stop until the requested outcome is implemented and \
+           reasonably verified.\n\n\
+         Answering: report the result, verification, and relevant \
+         limitations concisely in your final message.",
         persona = def.prompt,
         tools = tools,
     );
