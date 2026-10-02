@@ -28,9 +28,12 @@ pub(crate) use sandbox::{
     workspace_root,
 };
 // Leaf tool implementations live in per-tool modules; re-exported so
-// existing `tools::...` paths keep working.
+// existing `tools::...` paths keep working. `parse_edit_ops` is also the
+// shared parser for the approval/summary surfaces (render/format), which
+// must see exactly the pairs the executor will apply.
+pub(crate) use edit::parse_edit_ops;
 #[cfg(test)]
-use edit::{apply_edit, apply_edit_batch, change_diff_async, parse_edit_ops};
+use edit::{apply_edit, apply_edit_batch, change_diff_async};
 pub(crate) use meta::Policy;
 #[cfg(test)]
 use read::expand_glob_in;

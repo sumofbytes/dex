@@ -833,6 +833,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actions, ["spawn", "output", "stop", "wait", "list"]);
         assert!(enabled.iter().any(|t| t.function.name == "delegate"));
+        // edit rides the pi-style canonical batch shape: schema shows
+        // `path` + `edits[]` only, legacy single-pair spellings are
+        // repaired in the executor, not advertised.
+        let edit = schema
+            .iter()
+            .find(|t| t.function.name == "edit")
+            .expect("edit in native catalog");
+        let props = &edit.function.parameters["properties"];
+        assert!(props["oldText"].is_null(), "{props}");
+        assert!(props["newText"].is_null(), "{props}");
+        assert_eq!(props["edits"]["minItems"], 1);
     }
 
     #[test]

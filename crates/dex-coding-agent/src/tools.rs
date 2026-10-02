@@ -56,18 +56,28 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit".to_string(),
-                description: "Replace exact text in a file: one oldText/newText pair or a batch of disjoint edits[] — every entry is matched against the original file, so merge nearby changes into one entry and never overlap. Each oldText must match exactly one location: include 2-3 surrounding lines for uniqueness or pass replaceAll. Matching tolerates indentation, trailing whitespace, and dash/quote variants; on failure, read the file and retry with exact text.".to_string(),
+                description: "Replace exact text in a file. Each edits[] entry is matched against the original file, not incrementally — merge nearby changes into one entry and never overlap. Each oldText must match exactly one location: include just enough context for uniqueness or pass replaceAll. Matching tolerates indentation, trailing whitespace, and dash/quote variants; on failure, read the file and retry with exact text.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "oldText": { "type": "string", "description": "exact existing text to replace" },
-                        "newText": { "type": "string", "description": "replacement text" },
-                        "edits": { "type": "array", "description": "batch of {oldText, newText} replacements; pass either this or oldText/newText, not both", "items": { "type": "object", "properties": { "oldText": { "type": "string" }, "newText": { "type": "string" } }, "required": ["oldText", "newText"] } },
+                        "edits": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
+                                    "newText": { "type": "string", "description": "Replacement text for this targeted edit." }
+                                },
+                                "required": ["oldText", "newText"]
+                            }
+                        },
                         "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
                         "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the edit fails" }
                     },
-                    "required": ["path"]
+                    "required": ["path", "edits"]
                 }),
             },
         },
@@ -212,18 +222,24 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
 }
 
 // Prompt-side usage rules (pi-style description/guideline split): the schema
-// `description` keeps call-time mechanics at each tool decision; these
-// behavioral rules ride the system prompt once instead of in every schema blob.
+// `description` stays lean; these behavioral rules ride the system prompt
+// once instead of in every schema blob. The edit batch rules apply wherever
+// `edit` exists; the delegation/background rules only exist on daemon-linked
+// processes, so they stay behind the delegation gate.
 pub fn native_tool_guidelines(delegation_enabled: bool) -> Vec<&'static str> {
-    if !delegation_enabled {
-        return Vec::new();
+    let mut rules: Vec<&'static str> = vec![
+        "Use one edit call with multiple edits[] entries for several changes in one file, instead of several edit calls; each entry is matched against the original file, so entries must not overlap",
+        "Keep edits[].oldText as small as possible while still being unique in the file — do not pad with large unchanged regions",
+    ];
+    if delegation_enabled {
+        rules.extend([
+            "Sub-agents (delegate) never see this conversation — write self-contained tasks, file_hints give starting paths",
+            "Delegate spawn returns immediately and completions announce at the next turn boundary — wait only when the result gates the next step",
+            "Pass delegate resume_from on a finished child to continue from its transcript; inherit the turn's model unless the task needs a different trade-off",
+            "Background tasks announce at the next turn boundary too — poll output/wait only when the result gates the next step",
+        ]);
     }
-    vec![
-        "Sub-agents (delegate) never see this conversation — write self-contained tasks, file_hints give starting paths",
-        "Delegate spawn returns immediately and completions announce at the next turn boundary — wait only when the result gates the next step",
-        "Pass delegate resume_from on a finished child to continue from its transcript; inherit the turn's model unless the task needs a different trade-off",
-        "Background tasks announce at the next turn boundary too — poll output/wait only when the result gates the next step",
-    ]
+    rules
 }
 
 /// Merge optional host-provided tools after native tools in stable name order.
@@ -277,6 +293,33 @@ mod tests {
             "delegate"
         );
         assert_eq!(with_delegation.last().unwrap().function.name, "background");
+    }
+
+    #[test]
+    fn edit_schema_exposes_one_canonical_batch_shape() {
+        // pi-style single-vs-batch: the schema shows only `path` + `edits[]`;
+        // historical single-pair / JSON-string spellings are repaired in the
+        // executor instead of being advertised here.
+        let edit = builtin_tools(false)
+            .into_iter()
+            .find(|t| t.function.name == "edit")
+            .unwrap();
+        let params = edit.function.parameters;
+        let properties = &params["properties"];
+        assert!(properties["oldText"].is_null(), "{properties}");
+        assert!(properties["newText"].is_null(), "{properties}");
+        assert_eq!(properties["edits"]["minItems"], 1);
+        assert_eq!(
+            properties["edits"]["items"]["required"],
+            json!(["oldText", "newText"])
+        );
+        let required: Vec<String> = params["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(required, ["path", "edits"]);
     }
 
     #[test]

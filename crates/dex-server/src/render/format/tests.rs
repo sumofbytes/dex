@@ -61,6 +61,35 @@ fn approval_prompt_shows_the_then_run_command() {
     );
 }
 
+/// The canonical edit shape is the batch: the approval surface must
+/// summarize and preview every edits[] entry, not show a degenerate
+/// `-0 +0` fallback. The JSON-string `edits` variant the executor repairs
+/// renders as the batch it will become, too.
+#[test]
+fn approval_prompt_renders_an_edit_batch() {
+    let input = r#"{"path":"src/a.rs","edits":[{"oldText":"a\nb","newText":"1\n2\n3"},{"oldText":"c","newText":"d"}]}"#;
+    assert_eq!(
+        approval_summary("edit", input),
+        "src/a.rs · 2 edits · -3 +4"
+    );
+    let details = approval_details("edit", input);
+    assert!(
+        details.iter().any(|l| l == "edit 1: 2 lines → 3 lines"),
+        "{details:?}"
+    );
+    assert!(
+        details.iter().any(|l| l == "edit 2: 1 lines → 1 lines"),
+        "{details:?}"
+    );
+    assert!(
+        details.iter().filter(|l| l.starts_with("  − old:")).count() == 2,
+        "{details:?}"
+    );
+    // A one-entry batch keeps the compact single-edit wording.
+    let string_input = r#"{"path":"src/a.rs","edits":"[{\"oldText\":\"a\",\"newText\":\"b\"}]"}"#;
+    assert_eq!(approval_summary("edit", string_input), "src/a.rs · -1 +1");
+}
+
 /// A `then_run` mutation is a shell command in disguise: the approval
 /// overlay must not label it a plain write or under-rate its risk.
 #[cfg(all(test, feature = "tui"))]
@@ -561,6 +590,13 @@ fn edit_diffstat_counts_replicated_hunks_from_the_diff() {
     );
     // No diff available: the input-based estimate still applies.
     assert_eq!(summary("edit", input, "edited x.rs", true), "+1 −1");
+    // The batch shape sums every entry in the same fallback and names the
+    // batch size.
+    let batch_input = r#"{"path":"x.rs","edits":[{"oldText":"a","newText":"x\ny"},{"oldText":"b","newText":"z"}]}"#;
+    assert_eq!(
+        summary("edit", batch_input, "edited x.rs", true),
+        "+3 −2 · 2 edits"
+    );
 }
 
 #[test]
