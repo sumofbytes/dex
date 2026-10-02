@@ -49,6 +49,13 @@ fn prepare_edit_args(args: &Map<String, Value>) -> Map<String, Value> {
         }
         _ => return map,
     };
+    // A present-but-invalid `edits` (failed string repair, number/object)
+    // must error loudly, not be silently discarded in favor of the legacy
+    // pair. Only fold when `edits` is absent/null/already an array.
+    match map.get("edits") {
+        None | Some(Value::Null) | Some(Value::Array(_)) => {}
+        Some(_) => return map,
+    }
     let mut edits = match map.get("edits") {
         Some(Value::Array(existing)) => existing.clone(),
         _ => Vec::new(),
@@ -65,7 +72,10 @@ fn prepare_edit_args(args: &Map<String, Value>) -> Map<String, Value> {
 /// sent (`edits[i]`) regardless of which surface spelling it used.
 pub(crate) fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
     let args = prepare_edit_args(args);
-    let entries = match args.get("edits") {
+    // Explicit `null` counts as absent (serializer emits null for omitted
+    // optionals), so `edits: null` alone reports "at least one entry" —
+    // the same as a missing key — not a type error.
+    let entries = match args.get("edits").filter(|value| !value.is_null()) {
         Some(Value::Array(entries)) => entries,
         Some(_) => {
             // A failed JSON-string repair lands here too (still a string);

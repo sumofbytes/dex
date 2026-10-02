@@ -795,6 +795,23 @@ async fn edit_batch_null_optional_args_are_treated_as_absent() {
         .unwrap_err()
         .to_string()
         .contains("edits must be an array"));
+    // An invalid `edits` shape beside a legacy pair must not silently drop
+    // the bad shape and apply only the pair — it errors loudly.
+    let mut args = Map::new();
+    args.insert("edits".into(), Value::String("not json".into()));
+    args.insert("oldText".into(), Value::String("a".into()));
+    args.insert("newText".into(), Value::String("A".into()));
+    assert!(parse_edit_ops(&args)
+        .unwrap_err()
+        .to_string()
+        .contains("edits must be an array"));
+    // `edits: null` alone counts as absent, like a missing key.
+    let mut args = Map::new();
+    args.insert("edits".into(), Value::Null);
+    assert!(parse_edit_ops(&args)
+        .unwrap_err()
+        .to_string()
+        .contains("at least one"));
 }
 
 #[tokio::test]
