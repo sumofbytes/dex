@@ -1719,12 +1719,17 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
                 "box edge must wear the composer hairline color at w {w}: {rule:?}"
             );
         }
-        for row in &rows {
+        for (i, row) in rows.iter().enumerate() {
             let s: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            // The two rule rows carry the indent plus a full `w` of dashes:
+            // the composer's band is `w` wide and starts on the indent
+            // column, so matching it reaches one cell past the transcript's
+            // wrap edge (the Paragraph clips there). Content rows fill `w`.
+            let is_rule = i == 0 || i + 1 == rows.len();
             assert_eq!(
                 UnicodeWidthStr::width(s.as_str()),
-                w as usize,
-                "user row must fill the full width like the composer at w {w}: {s:?}"
+                if is_rule { w as usize + 1 } else { w as usize },
+                "user row must fill the width like the composer at w {w}: {s:?}"
             );
             // Line-level bg is the row carrier (`Line` renders each
             // span as `line.style.patch(span.style)`); spans either
@@ -1782,6 +1787,45 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
             assert_eq!(
                 cell.bg, bg,
                 "cell must paint the terminal background at w {w}: {cell:?}"
+            );
+        }
+    }
+}
+
+/// Regression: the submitted prompt's hairlines must span exactly the same
+/// columns as the live composer's rules. The transcript wraps at
+/// `content_width` but renders into the full-width area, so a rule dashed
+/// from the indent to the wrap edge stopped one cell short of the composer's
+/// right end and the echo read as a narrower box.
+#[test]
+fn submitted_prompt_rules_span_the_composer_columns() {
+    for w in [80u16, 61, 43] {
+        let h = 20u16;
+        let backend = TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = test_app();
+        super::super::render_user_prompt(&mut app, "hello probe");
+        terminal.draw(|f| view(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let dashes = |y: u16| -> Vec<u16> {
+            (0..w)
+                .filter(|x| buffer.cell((*x, y)).unwrap().symbol() == "─")
+                .collect()
+        };
+        let row_text = |y: u16| {
+            (0..w)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect::<String>()
+        };
+        let text_row = (0..h)
+            .find(|y| row_text(*y).contains("hello probe"))
+            .expect("prompt rendered");
+        // The echo's two rules and the live composer's two rules.
+        for y in [text_row - 1, text_row + 1, h - 4, h - 2] {
+            assert_eq!(
+                dashes(y),
+                (1..w - 1).collect::<Vec<u16>>(),
+                "rule at y {y} must span the composer's columns at w {w}"
             );
         }
     }
