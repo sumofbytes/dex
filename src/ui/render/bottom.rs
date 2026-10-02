@@ -356,10 +356,12 @@ fn question_lines(
             ),
             Span::styled(default.to_string(), fg(theme::warn_fg())),
         ]));
-        rows.push(Line::from(Span::styled(
-            format!("     {}", option.description),
-            fg(theme::muted_fg()),
-        )));
+        if !option.description.is_empty() {
+            rows.push(Line::from(Span::styled(
+                format!("     {}", option.description),
+                fg(theme::muted_fg()),
+            )));
+        }
     }
     // The implicit "Other" row (display-only index: never shifts options).
     let other_selected = question.selected == current.options.len();
