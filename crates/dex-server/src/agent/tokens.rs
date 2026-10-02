@@ -40,12 +40,19 @@ pub(crate) fn schema_budget_tokens() -> u64 {
 pub(crate) fn base_context_breakdown(cwd: &Path, skills: &[Skill]) -> Vec<BaseContextPart> {
     let parts = crate::llm::prompt::system_prompt_parts_for(skills, None, Some(cwd), false);
     let mut out = Vec::new();
+    // Prefix-carry rounding: each part's token count is floor((prefix+len)/4)
+    // minus floor(prefix/4), so the parts telescope and always sum to the
+    // whole-prompt `/4` estimate that the compaction threshold uses —
+    // independent of where the section boundaries happen to fall.
+    let mut prefix_chars: u64 = 0;
     let mut push = |label: &str, section: &str| {
         if !section.is_empty() {
+            let next = prefix_chars + section.len() as u64;
             out.push(BaseContextPart {
                 label: label.to_string(),
-                tokens: section.len() as u64 / 4,
+                tokens: next / 4 - prefix_chars / 4,
             });
+            prefix_chars = next;
         }
     };
     push("system prompt", &parts.base);

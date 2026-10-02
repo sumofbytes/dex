@@ -611,14 +611,14 @@ pub(crate) fn bootstrap(
     // Session-start header: one Banner block holding the DEX wordmark, the
     // skills the daemon discovered, and the ready time — contiguous rows, no
     // inter-block gap air between them. The base-context breakdown rides
-    // along (daemon-estimated; absent on older daemons).
-    let mut header = vec![
-        skills_header_line(&remote.app.skills),
-        launch_time_line(launch_start.elapsed().as_secs_f64()),
-    ];
+    // along (daemon-estimated; absent on older daemons). The ready time is
+    // measured and pushed last so it covers everything before it, including
+    // the base-context breakdown itself.
+    let mut header = vec![skills_header_line(&remote.app.skills)];
     if let Some(line) = base_context_line(&base_breakdown) {
         header.push(line);
     }
+    header.push(launch_time_line(launch_start.elapsed().as_secs_f64()));
     push_banner(&mut remote.app, header);
     // Lazy-auth empty state (the pi/opencode pattern): the daemon reports
     // an empty provider exactly when its config build fails (missing key,
