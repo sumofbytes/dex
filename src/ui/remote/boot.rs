@@ -146,13 +146,71 @@ pub(crate) fn base_context_line(
         "base context ~{}: ",
         crate::protocol::tokens::format_tokens(total)
     );
+    let shares = percent_shares(
+        &breakdown.iter().map(|p| p.tokens).collect::<Vec<_>>(),
+        total,
+    );
     for (i, part) in breakdown.iter().enumerate() {
         if i > 0 {
             text.push_str(" · ");
         }
-        text.push_str(&format!("{} {}%", part.label, part.tokens * 100 / total));
+        text.push_str(&format!("{} {}%", part.label, shares[i]));
     }
     Some(Line::from(Span::styled(text, muted)))
+}
+
+/// Largest-remainder rounding so the shown shares always sum to exactly
+/// 100%: floor each part, then hand the leftover points to the parts with
+/// the biggest fractional remainders (stable for ties).
+fn percent_shares(tokens: &[u64], total: u64) -> Vec<u64> {
+    let mut shares: Vec<(u64, u64)> = tokens
+        .iter()
+        .map(|t| (t * 100 / total, t * 100 % total))
+        .collect();
+    let leftover = 100 - shares.iter().map(|s| s.0).sum::<u64>();
+    if leftover > 0 {
+        let mut order: Vec<usize> = (0..shares.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(shares[i].1));
+        for &i in order.iter().take(leftover as usize) {
+            shares[i].0 += 1;
+        }
+    }
+    shares.into_iter().map(|s| s.0).collect()
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    fn part(label: &str, tokens: u64) -> crate::protocol::BaseContextPart {
+        crate::protocol::BaseContextPart {
+            label: label.into(),
+            tokens,
+        }
+    }
+
+    #[test]
+    fn shares_round_to_100() {
+        // 1/3 each: floors sum to 99, leftovers hand out by remainder.
+        let shares = percent_shares(&[1, 1, 1], 3);
+        assert_eq!(shares, vec![34, 33, 33]);
+        // Mirror of the server header test's mix; shares must sum to 100.
+        // 320+80+2224+3200 of 5824: floors [5,1,38,54], remainders 2880,
+        // 2176, 1088, 5504 → the 2 leftover points go to schemas then system.
+        let breakdown = [
+            part("system", 320),
+            part("project", 80),
+            part("skills", 2224),
+            part("schemas", 3200),
+        ];
+        let total: u64 = breakdown.iter().map(|p| p.tokens).sum();
+        let shares = percent_shares(
+            &breakdown.iter().map(|p| p.tokens).collect::<Vec<_>>(),
+            total,
+        );
+        assert_eq!(shares.iter().sum::<u64>(), 100);
+        assert_eq!(shares, vec![6, 1, 38, 55]);
+    }
 }
 
 /// Whatever the render/event loop needs after boot: live app state plus the

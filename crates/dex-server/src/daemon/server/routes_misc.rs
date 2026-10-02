@@ -188,6 +188,12 @@ async fn resolve_daemon_info_async(ceiling: crate::protocol::PermissionMode) -> 
             // Fresh-session base-context estimate. Skills are resolved on
             // the daemon (its filesystem is the workspace); per-request
             // `skill_dirs` don't exist yet, so only the daemon's dirs count.
+            // Remaining `~` caveats: MCP/extension schemas are counted from
+            // whatever the background `global_manager()` connect has filled
+            // so far (a client arriving right after `dex serve` may see only
+            // the native catalog until the next `/api/config` refresh), and
+            // the plan-mode directive is left out (a per-session switch,
+            // not part of the fresh default).
             let skills = discover_skills_async(&skill_dirs()).await;
             let breakdown =
                 crate::agent::tokens::base_context_breakdown(std::path::Path::new(&cwd), &skills);
