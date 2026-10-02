@@ -129,6 +129,32 @@ pub(crate) fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
     )])
 }
 
+/// The base-context line for the session-start header: how much context a
+/// fresh session's first turn starts with and what share each contributor
+/// (system prompt, project instructions, skills, tool schemas, …) adds.
+/// Daemon-estimated, muted like the rest of the banner; `None` when the
+/// daemon sent no estimate (older daemon, or no usable config).
+pub(crate) fn base_context_line(
+    breakdown: &[crate::protocol::BaseContextPart],
+) -> Option<Line<'static>> {
+    let total: u64 = breakdown.iter().map(|p| p.tokens).sum();
+    if total == 0 {
+        return None;
+    }
+    let muted = fg(crate::render::theme::muted_fg());
+    let mut text = format!(
+        "base context ~{}: ",
+        crate::protocol::tokens::format_tokens(total)
+    );
+    for (i, part) in breakdown.iter().enumerate() {
+        if i > 0 {
+            text.push_str(" · ");
+        }
+        text.push_str(&format!("{} {}%", part.label, part.tokens * 100 / total));
+    }
+    Some(Line::from(Span::styled(text, muted)))
+}
+
 /// Whatever the render/event loop needs after boot: live app state plus the
 /// initialized terminal (raw mode entered, alternate screen on) and its restore
 /// guard.
@@ -256,6 +282,9 @@ pub(crate) fn bootstrap(
 
     // Per-request overrides so client flags keep working in remote mode.
     let mut options = crate::cli::chat_options_from_args(args);
+    // Daemon-estimated fresh-session base context (banner line); captured
+    // before `info` feeds App construction.
+    let base_breakdown = info.base_breakdown.clone();
     // Seed the mode from an explicit client `--permission` (a stricter
     // per-run choice), else from the daemon's reported ceiling. Clamp to
     // the ceiling, which a client may only go stricter than.
@@ -523,11 +552,15 @@ pub(crate) fn bootstrap(
 
     // Session-start header: one Banner block holding the DEX wordmark, the
     // skills the daemon discovered, and the ready time — contiguous rows, no
-    // inter-block gap air between them.
-    let header = vec![
+    // inter-block gap air between them. The base-context breakdown rides
+    // along (daemon-estimated; absent on older daemons).
+    let mut header = vec![
         skills_header_line(&remote.app.skills),
         launch_time_line(launch_start.elapsed().as_secs_f64()),
     ];
+    if let Some(line) = base_context_line(&base_breakdown) {
+        header.push(line);
+    }
     push_banner(&mut remote.app, header);
     // Lazy-auth empty state (the pi/opencode pattern): the daemon reports
     // an empty provider exactly when its config build fails (missing key,
@@ -608,5 +641,35 @@ mod seed_tests {
             seed_mode(Some(PermissionMode::Trusted), PermissionMode::ReadOnly),
             AgentMode::Plan
         );
+    }
+
+    #[test]
+    fn base_context_line_renders_shares_and_skips_empty() {
+        use crate::protocol::BaseContextPart;
+        let parts = vec![
+            BaseContextPart {
+                label: "system prompt".into(),
+                tokens: 600,
+            },
+            BaseContextPart {
+                label: "tool schemas".into(),
+                tokens: 400,
+            },
+        ];
+        let line = base_context_line(&parts).unwrap();
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("base context"), "{text}");
+        assert!(text.contains("system prompt 60%"), "{text}");
+        assert!(text.contains("tool schemas 40%"), "{text}");
+        assert!(base_context_line(&[]).is_none());
+        assert!(base_context_line(&[BaseContextPart {
+            label: "x".into(),
+            tokens: 0,
+        }])
+        .is_none());
     }
 }

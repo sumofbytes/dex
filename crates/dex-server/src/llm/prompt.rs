@@ -175,11 +175,45 @@ pub(crate) fn system_prompt_with_override_for(
     cwd: Option<&Path>,
     plan_mode: bool,
 ) -> String {
+    system_prompt_parts_for(skills, explicit, cwd, plan_mode).join()
+}
+
+/// The composed system prompt split by section, each section including its
+/// own `\n\n--- … ---` separator (the base has none). [`join`] reproduces
+/// [`system_prompt_with_override_for`] byte-for-byte; the split exists so
+/// token-budget code can attribute cost per section.
+pub(crate) struct SystemPromptParts {
+    pub base: String,
+    pub project_context: String,
+    pub extensions: String,
+    pub skills: String,
+    pub tool_guidelines: String,
+    pub plan_mode: String,
+}
+
+impl SystemPromptParts {
+    pub fn join(self) -> String {
+        let mut prompt = self.base;
+        prompt.push_str(&self.project_context);
+        prompt.push_str(&self.extensions);
+        prompt.push_str(&self.skills);
+        prompt.push_str(&self.tool_guidelines);
+        prompt.push_str(&self.plan_mode);
+        prompt
+    }
+}
+
+pub(crate) fn system_prompt_parts_for(
+    skills: &[Skill],
+    explicit: Option<&str>,
+    cwd: Option<&Path>,
+    plan_mode: bool,
+) -> SystemPromptParts {
     // Read once per render so the appendix bytes stay stable within a turn
     // (the flag lives in an atomic set at daemon startup).
     let delegation = crate::agent::delegate::delegation_enabled();
     let (custom, _) = crate::llm::config::system_prompt_origin(explicit);
-    let mut prompt = custom.unwrap_or_else(|| {
+    let base = custom.unwrap_or_else(|| {
         concat!(
             "You are a coding agent. Use read, ls, grep, find, edit, write, bash to get the job done and report the result.",
             //
@@ -195,28 +229,41 @@ pub(crate) fn system_prompt_with_override_for(
         Some(dir) => project_context_for(dir),
         None => project_context(),
     };
-    if let Some(ctx) = ctx {
-        prompt.push_str("\n\n--- Project instructions ---\n");
-        prompt.push_str(&ctx);
-    }
+    let project_context = ctx
+        .map(|ctx| format!("\n\n--- Project instructions ---\n{ctx}"))
+        .unwrap_or_default();
     // Load-time extension contributions (`dex.prompt.append`): read-only
     // influence, no gate interaction (plan §7).
     let appendix = crate::extensions::prompt_appendix();
-    if !appendix.is_empty() {
-        prompt.push_str("\n\n--- Extensions ---\n");
-        prompt.push_str(&appendix);
-    }
-    if !skills.is_empty() {
-        prompt.push_str(&format_skills_for_prompt(skills));
-    }
+    let extensions = if appendix.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n--- Extensions ---\n{appendix}")
+    };
+    let skills = if skills.is_empty() {
+        String::new()
+    } else {
+        format_skills_for_prompt(skills)
+    };
     let guidelines = dex_coding_agent::native_tool_guidelines(delegation);
-    if !guidelines.is_empty() {
-        prompt.push_str(&format_tool_guidelines_for_prompt(&guidelines));
+    let tool_guidelines = if guidelines.is_empty() {
+        String::new()
+    } else {
+        format_tool_guidelines_for_prompt(&guidelines)
+    };
+    let plan_mode = if plan_mode {
+        PLAN_MODE_DIRECTIVE.to_string()
+    } else {
+        String::new()
+    };
+    SystemPromptParts {
+        base,
+        project_context,
+        extensions,
+        skills,
+        tool_guidelines,
+        plan_mode,
     }
-    if plan_mode {
-        prompt.push_str(PLAN_MODE_DIRECTIVE);
-    }
-    prompt
 }
 
 /// Appended to the system prompt when the client selected `plan` mode. The

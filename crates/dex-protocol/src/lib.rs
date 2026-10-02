@@ -497,6 +497,16 @@ pub struct LoadSkillResponse {
     pub content: String,
 }
 
+/// One slice of the fresh-session base-context estimate
+/// (`DaemonInfo::base_breakdown`): a display label and its approximate token
+/// cost. Empty contributors are omitted; percentages are computed client-side
+/// against the sum of the slices (== `base_tokens`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseContextPart {
+    pub label: String,
+    pub tokens: u64,
+}
+
 /// Runtime info about the daemon, returned by `GET /api/config`. The client
 /// TUI uses it for the status footer and slash-command suggestions; the
 /// daemon resolves provider/model/permission from its own environment.
@@ -522,6 +532,18 @@ pub struct DaemonInfo {
     /// which shares the TUI's terminal and would corrupt it.
     #[serde(default)]
     pub thinking_warning: Option<String>,
+    /// Approximate always-present context of a fresh session's first turn
+    /// (system prompt + per-request tool schemas), estimated daemon-side so
+    /// the client's startup banner can show it without building the prompt
+    /// itself. `0` when the daemon couldn't estimate (no usable cwd).
+    #[serde(default)]
+    pub base_tokens: u64,
+    /// `base_tokens` split by contributor (system prompt, project
+    /// instructions, skills, tool schemas, …) so the client's startup banner
+    /// can show what consumes what share of the base. Empty when the daemon
+    /// couldn't estimate.
+    #[serde(default)]
+    pub base_breakdown: Vec<BaseContextPart>,
 }
 
 /// Lightweight git status for the footer, returned by `GET /api/git`.
