@@ -46,7 +46,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                     "properties": {
                         "path": { "type": "string" },
                         "content": { "type": "string" },
-                        "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the write fails" }
+                        "then_run": { "type": "string", "description": "shell verification in the same call; skipped if the write fails" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -64,18 +64,22 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "edits": {
                             "type": "array",
                             "minItems": 1,
-                            "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+                            "description": "One or more targeted replacements.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
+                                    "oldText": { "type": "string", "description": "Exact text to replace; must be unique in the file." },
                                     "newText": { "type": "string", "description": "Replacement text for this targeted edit." }
                                 },
                                 "required": ["oldText", "newText"]
                             }
                         },
                         "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
-                        "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the edit fails" }
+                        // `edit`'s own description can't carry the `write`
+                        // phrasing ("its output comes back in this result")
+                        // without a second copy of the edit rules, so the
+                        // in-band result rides the param instead.
+                        "then_run": { "type": "string", "description": "shell verification in the same call, its output returned here; skipped if the edit fails" }
                     },
                     "required": ["path", "edits"]
                 }),
@@ -320,6 +324,30 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(required, ["path", "edits"]);
+    }
+
+    /// The batch rules live in the `edit` description + the always-on
+    /// guidelines exactly once; trimming the `edits[]` params must never
+    /// drop them from all three places at the same time.
+    #[test]
+    fn edit_rules_ride_the_description_not_the_params() {
+        let edit = builtin_tools(false)
+            .into_iter()
+            .find(|t| t.function.name == "edit")
+            .unwrap();
+        assert!(edit
+            .function
+            .description
+            .contains("matched against the original file"));
+        let properties = &edit.function.parameters["properties"];
+        for lean in [
+            properties["edits"]["description"].as_str().unwrap(),
+            properties["edits"]["items"]["properties"]["oldText"]["description"]
+                .as_str()
+                .unwrap(),
+        ] {
+            assert!(!lean.contains("matched against the original"), "{lean}");
+        }
     }
 
     #[test]
