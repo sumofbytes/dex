@@ -46,7 +46,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                     "properties": {
                         "path": { "type": "string" },
                         "content": { "type": "string" },
-                        "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the write fails" }
+                        "then_run": { "type": "string", "description": "shell verification in the same call; skipped if the write fails" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -75,7 +75,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                             }
                         },
                         "replaceAll": { "type": "boolean", "description": "replace every occurrence instead of requiring exactly one (default false)" },
-                        "then_run": { "type": "string", "description": "shell command to run in this same call to verify the change (e.g. a build, formatter, or test); its output is appended to this result, and it never runs — nor is reported as run — when the edit fails" }
+                        "then_run": { "type": "string", "description": "shell verification in the same call; skipped if the edit fails" }
                     },
                     "required": ["path", "edits"]
                 }),
