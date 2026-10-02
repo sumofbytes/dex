@@ -503,14 +503,25 @@ pub fn tool_result_summary(
         "edit" => {
             // Diffstat from the actual unified diff when available — it
             // counts replicated hunks too, so a `replaceAll` edit reports
-            // every occurrence, not just the input's one spelling.
+            // every occurrence, not just the input's one spelling. The
+            // fallback sums every replacement the input carries (batch
+            // `edits[]` included, parsed exactly like the executor).
+            let pairs = match obj.as_ref() {
+                Some(obj) => crate::tools::parse_edit_ops(obj).unwrap_or_default(),
+                None => Vec::new(),
+            };
             let (added, removed) = diff_stat(diff).unwrap_or_else(|| {
                 (
-                    get("newText").unwrap_or_default().lines().count(),
-                    get("oldText").unwrap_or_default().lines().count(),
+                    pairs.iter().map(|(_, n)| n.lines().count()).sum(),
+                    pairs.iter().map(|(o, _)| o.lines().count()).sum(),
                 )
             });
-            format!("+{added} −{removed}{}", then_run_tail(text))
+            let count = if pairs.len() > 1 {
+                format!(" · {} edits", pairs.len())
+            } else {
+                String::new()
+            };
+            format!("+{added} −{removed}{count}{}", then_run_tail(text))
         }
         _ => overall_summary(text),
     }

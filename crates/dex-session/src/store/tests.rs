@@ -785,6 +785,10 @@ fn dangling_middle_batch_repairs_in_place_not_at_end() {
 fn child_session_writes_its_own_file_with_markers() {
     // §16: the child's JSONL lands in `agents/` beside the parent file
     // with the same turn-marker discipline.
+    // Sessions live under XDG_DATA_HOME: serialize against tests that redirect it.
+    let _lock = TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let parent = Session::new("/tmp/dex-child-parent".into(), None).unwrap();
     let parent_path = parent.path().unwrap().to_path_buf();
     let mut child =

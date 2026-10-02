@@ -31,8 +31,9 @@ pub(crate) fn format_skills_for_prompt(skills: &[Skill]) -> String {
 }
 
 /// Pi-style tool guideline appendix: schema descriptions stay lean; these
-/// usage rules carry the behavior guidance once. Empty in OneShot/no-daemon
-/// runs (native_tool_guidelines gates on delegation).
+/// usage rules carry the behavior guidance once. The edit rules are
+/// base-supplied (edit exists everywhere); the delegation rules only apply
+/// to daemon-linked runs (native_tool_guidelines gates those on delegation).
 pub(crate) fn format_tool_guidelines_for_prompt(rules: &[&str]) -> String {
     let mut out = String::new();
     out.push_str("\n\n--- Tools ---\n");
@@ -322,11 +323,13 @@ mod tests {
         assert!(out.contains("- rule one\n- rule two\n"), "{out}");
     }
 
-    /// With the daemon gate off (dex-server lib tests keep it down), the
-    /// delegation rules are absent from the prompt entirely.
+    /// Without the daemon gate the delegation/background rules are absent from
+    /// the prompt entirely; the always-on edit rules remain.
     #[test]
     fn tool_guidelines_off_without_delegation() {
-        assert!(dex_coding_agent::native_tool_guidelines(false).is_empty());
+        let off = dex_coding_agent::native_tool_guidelines(false);
+        assert!(off.iter().any(|r| r.contains("edits[]")));
+        assert!(off.iter().all(|r| !r.contains("delegate")), "{off:?}");
         let on = dex_coding_agent::native_tool_guidelines(true);
         assert!(on.iter().any(|r| r.contains("Sub-agents (delegate)")));
     }

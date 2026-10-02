@@ -63,6 +63,19 @@ pub fn input_has_then_run(input: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The replacement pairs a raw edit input carries, parsed exactly the way
+/// `tools::edit` parses it at execution time — so a legacy single pair or a
+/// JSON-string `edits` spelling still previews and summarizes as itself.
+/// Unparseable inputs yield an empty list; callers count zeros, matching
+/// the old `-0 +0` degenerate display.
+fn edit_replacements(obj: Option<&serde_json::Map<String, Value>>) -> Vec<(String, String)> {
+    let obj = match obj {
+        Some(obj) => obj,
+        None => return Vec::new(),
+    };
+    crate::tools::parse_edit_ops(obj).unwrap_or_default()
+}
+
 pub fn approval_summary(name: &str, input: &str) -> String {
     let v = serde_json::from_str::<Value>(input).ok();
     let obj = v.as_ref().and_then(|v| v.as_object());
@@ -81,9 +94,15 @@ pub fn approval_summary(name: &str, input: &str) -> String {
         }
         "edit" => {
             let path = get("path").unwrap_or("(unknown path)");
-            let old = get("oldText").unwrap_or("").lines().count();
-            let new = get("newText").unwrap_or("").lines().count();
-            format!("{} · -{} +{}{}", path, old, new, then_run_suffix(obj))
+            let pairs = edit_replacements(obj);
+            let old: usize = pairs.iter().map(|(o, _)| o.lines().count()).sum();
+            let new: usize = pairs.iter().map(|(_, n)| n.lines().count()).sum();
+            let count = if pairs.len() > 1 {
+                format!("{} edits · ", pairs.len())
+            } else {
+                String::new()
+            };
+            format!("{path} · {count}-{old} +{new}{}", then_run_suffix(obj))
         }
         "read" => {
             if let Some(paths) = obj
@@ -202,15 +221,28 @@ pub fn approval_details(name: &str, input: &str) -> Vec<String> {
             if let Some(command) = then_run_of(obj) {
                 out.push(format!("then: $ {command}"));
             }
-            if let (Some(old), Some(new)) = (get("oldText"), get("newText")) {
-                out.push(format!(
-                    "replace {} lines → {} lines",
-                    old.lines().count(),
-                    new.lines().count()
-                ));
+            // Iterate the exact pairs the executor will apply: a single
+            // edit keeps the compact head, a batch labels each entry.
+            let pairs = edit_replacements(obj);
+            let total = pairs.len();
+            for (index, (old, new)) in pairs.iter().enumerate() {
                 // The old/new previews are verbatim twins: same 3-line
                 // take, same 68-char clip, same indent — only the label and
                 // the source differ.
+                if total > 1 {
+                    out.push(format!(
+                        "edit {}: {} lines → {} lines",
+                        index + 1,
+                        old.lines().count(),
+                        new.lines().count()
+                    ));
+                } else {
+                    out.push(format!(
+                        "replace {} lines → {} lines",
+                        old.lines().count(),
+                        new.lines().count()
+                    ));
+                }
                 let push_preview = |out: &mut Vec<String>, label: &str, text: &str| {
                     let preview: Vec<&str> = text.lines().take(3).collect();
                     if !preview.is_empty() {

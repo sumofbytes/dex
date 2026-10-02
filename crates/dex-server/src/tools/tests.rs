@@ -758,11 +758,22 @@ async fn edit_batch_null_optional_args_are_treated_as_absent() {
     args.insert("replaceAll".into(), Value::Null);
     let ops = parse_edit_ops(&args).unwrap();
     assert_eq!(ops, vec![("a".to_string(), "A".to_string())]);
-    // A real oldText alongside edits[] still fails loudly.
-    args.insert("oldText".into(), Value::String("a".into()));
-    assert!(parse_edit_ops(&args).is_err());
+    // A real oldText/newText pair alongside edits[] is no longer an error:
+    // the pair folds in as one more entry (pi's repair), keeping a
+    // half-migrated call whole instead of bouncing a whole batch.
+    args.insert("oldText".into(), Value::String("b".into()));
+    args.insert("newText".into(), Value::String("B".into()));
+    let ops = parse_edit_ops(&args).unwrap();
+    assert_eq!(
+        ops,
+        vec![
+            ("a".to_string(), "A".to_string()),
+            ("b".to_string(), "B".to_string())
+        ]
+    );
     // Mirror case: `edits: null` with a real single shape parses as the
     // single edit (the same serializer that nulls oldText nulls edits).
+    // Also: `edits` as a JSON string (Opus/GLM serializer) is re-parsed.
     let mut args = Map::new();
     args.insert("path".into(), Value::String("f".into()));
     args.insert("edits".into(), Value::Null);
@@ -770,6 +781,37 @@ async fn edit_batch_null_optional_args_are_treated_as_absent() {
     args.insert("newText".into(), Value::String("A".into()));
     let ops = parse_edit_ops(&args).unwrap();
     assert_eq!(ops, vec![("a".to_string(), "A".to_string())]);
+    let mut args = Map::new();
+    args.insert(
+        "edits".into(),
+        Value::String(r#"[{"oldText":"a","newText":"A"}]"#.into()),
+    );
+    let ops = parse_edit_ops(&args).unwrap();
+    assert_eq!(ops, vec![("a".to_string(), "A".to_string())]);
+    // A string that is not JSON stays an error naming the shape.
+    let mut args = Map::new();
+    args.insert("edits".into(), Value::String("not json".into()));
+    assert!(parse_edit_ops(&args)
+        .unwrap_err()
+        .to_string()
+        .contains("edits must be an array"));
+    // An invalid `edits` shape beside a legacy pair must not silently drop
+    // the bad shape and apply only the pair — it errors loudly.
+    let mut args = Map::new();
+    args.insert("edits".into(), Value::String("not json".into()));
+    args.insert("oldText".into(), Value::String("a".into()));
+    args.insert("newText".into(), Value::String("A".into()));
+    assert!(parse_edit_ops(&args)
+        .unwrap_err()
+        .to_string()
+        .contains("edits must be an array"));
+    // `edits: null` alone counts as absent, like a missing key.
+    let mut args = Map::new();
+    args.insert("edits".into(), Value::Null);
+    assert!(parse_edit_ops(&args)
+        .unwrap_err()
+        .to_string()
+        .contains("at least one"));
 }
 
 #[tokio::test]
@@ -820,7 +862,7 @@ async fn edit_batch_rejects_overlapping_entries() {
 }
 
 #[tokio::test]
-async fn edit_batch_arg_shapes_are_validated() {
+async fn edit_batch_arg_shapes_are_repaired() {
     let cwd = std::env::current_dir().unwrap();
     fs::create_dir_all(cwd.join("target")).unwrap();
     let rel = "target/dex-edit-batch-shapes.txt";
@@ -828,7 +870,16 @@ async fn edit_batch_arg_shapes_are_validated() {
     let run = |args: Map<String, Value>| async move {
         execute("edit", &args, &GlobalCancellation, &Policy::trusted(), None).await
     };
-    // Mixing the two shapes fails loudly.
+    // The historical single-pair spelling still applies end to end.
+    let mut single = Map::new();
+    single.insert("path".into(), Value::String(rel.into()));
+    single.insert("oldText".into(), Value::String("aaa".into()));
+    single.insert("newText".into(), Value::String("A".into()));
+    run(single).await.expect("legacy pair applies");
+    assert_eq!(fs::read_to_string(cwd.join(rel)).unwrap(), "A\nbbb\nccc\n");
+    // A half-migrated call (top-level pair beside edits[]) is repaired,
+    // not rejected: the pair folds in as one more entry.
+    fs::write(cwd.join(rel), "aaa\nbbb\nccc\n").unwrap();
     let mut mixed = Map::new();
     mixed.insert("path".into(), Value::String(rel.into()));
     mixed.insert("oldText".into(), Value::String("aaa".into()));
@@ -837,8 +888,13 @@ async fn edit_batch_arg_shapes_are_validated() {
         "edits".into(),
         Value::Array(vec![serde_json::json!({"oldText": "bbb", "newText": "B"})]),
     );
-    assert!(run(mixed).await.is_err());
+    let out = run(mixed)
+        .await
+        .expect("mixed shapes repair into one batch");
+    assert!(out.contains("2 edits"), "{out}");
+    assert_eq!(fs::read_to_string(cwd.join(rel)).unwrap(), "A\nB\nccc\n");
     // A disjoint batch applies end to end through `execute`.
+    fs::write(cwd.join(rel), "aaa\nbbb\nccc\n").unwrap();
     let mut batched = Map::new();
     batched.insert("path".into(), Value::String(rel.into()));
     batched.insert(

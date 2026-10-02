@@ -26,62 +26,101 @@ pub(crate) async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolE
 /// One `oldText` → `newText` replacement; a batch holds several.
 type EditOp = (String, String);
 
-/// Accept either the single `oldText`/`newText` pair or a batch `edits[]`
-/// array of `{oldText, newText}` objects (pi's shape): every entry is matched
-/// against the original file, so disjoint replacements land in one call
-/// instead of one round-trip each. The two shapes do not mix.
+/// Normalize the canonical `edits[]` shape and repair the variants models
+/// actually send (pi's `prepareEditArguments`). The schema exposes exactly
+/// one shape — `path` + `edits[]` — but history shows callers drift:
+/// - `edits` arriving as a JSON string (some serializers stringify array
+///   args) is re-parsed into the array;
+/// - a legacy top-level `oldText`/`newText` pair folds in as one more
+///   entry instead of erroring, so a model that half-migrates keeps its
+///   whole batch in one call;
+/// - explicit `null` optionals (`edits: null`, `oldText: null`) count as
+///   absent, exactly like `then_run`.
+fn prepare_edit_args(args: &Map<String, Value>) -> Map<String, Value> {
+    let mut map = args.clone();
+    if let Some(Value::String(raw)) = map.get("edits") {
+        if let Ok(Value::Array(parsed)) = serde_json::from_str::<Value>(raw) {
+            map.insert("edits".into(), Value::Array(parsed));
+        }
+    }
+    let legacy = match (map.get("oldText"), map.get("newText")) {
+        (Some(Value::String(old)), Some(Value::String(new))) => {
+            serde_json::json!({ "oldText": old, "newText": new })
+        }
+        _ => return map,
+    };
+    // A present-but-invalid `edits` (failed string repair, number/object)
+    // must error loudly, not be silently discarded in favor of the legacy
+    // pair. Only fold when `edits` is absent/null/already an array.
+    match map.get("edits") {
+        None | Some(Value::Null) | Some(Value::Array(_)) => {}
+        Some(_) => return map,
+    }
+    let mut edits = match map.get("edits") {
+        Some(Value::Array(existing)) => existing.clone(),
+        _ => Vec::new(),
+    };
+    edits.push(legacy);
+    map.remove("oldText");
+    map.remove("newText");
+    map.insert("edits".into(), Value::Array(edits));
+    map
+}
+
+/// The canonical parse: after `prepare_edit_args` every accepted shape has
+/// become `edits[]`, so validation names positions in the batch the model
+/// sent (`edits[i]`) regardless of which surface spelling it used.
 pub(crate) fn parse_edit_ops(args: &Map<String, Value>) -> Result<Vec<EditOp>, ToolError> {
-    // Treat explicit `null` as absent: some clients (and some providers'
-    // tool-call argument serializers) emit `null` for omitted optional
-    // fields — `edits: null` as well as `oldText: null`/`newText: null` —
-    // which used to trip the both-shapes guard or the array check.
-    let present = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
-    if let Some(edits) = args.get("edits").filter(|value| !value.is_null()) {
-        if present("oldText") || present("newText") {
+    let args = prepare_edit_args(args);
+    // Explicit `null` counts as absent (serializer emits null for omitted
+    // optionals), so `edits: null` alone reports "at least one entry" —
+    // the same as a missing key — not a type error.
+    let entries = match args.get("edits").filter(|value| !value.is_null()) {
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            // A failed JSON-string repair lands here too (still a string);
+            // the message names the shape, not the serializer.
             return Err(ToolError::InvalidArgument(
-                "pass either oldText/newText or edits[], not both".to_string(),
+                "edits must be an array of {oldText, newText}".to_string(),
             ));
         }
-        let entries = edits.as_array().ok_or_else(|| {
-            ToolError::InvalidArgument("edits must be an array of {oldText, newText}".to_string())
-        })?;
-        if entries.is_empty() {
+        None => {
             return Err(ToolError::InvalidArgument(
                 "edits must contain at least one {oldText, newText} entry".to_string(),
-            ));
+            ))
         }
-        return entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                if !entry.is_object() {
-                    return Err(ToolError::InvalidArgument(format!(
-                        "edits[{index}] must be an object with oldText and newText"
-                    )));
-                }
-                let old = entry
-                    .get("oldText")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        ToolError::InvalidArgument(format!("edits[{index}] is missing oldText"))
-                    })?;
-                let new = entry
-                    .get("newText")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        ToolError::InvalidArgument(format!("edits[{index}] is missing newText"))
-                    })?;
-                check_edit_texts(old, new).map_err(|error| {
-                    ToolError::InvalidArgument(format!("edits[{index}]: {error}"))
-                })?;
-                Ok((old.to_string(), new.to_string()))
-            })
-            .collect();
+    };
+    if entries.is_empty() {
+        return Err(ToolError::InvalidArgument(
+            "edits must contain at least one {oldText, newText} entry".to_string(),
+        ));
     }
-    let old = arg_str(args, "oldText")?;
-    let new = arg_str(args, "newText")?;
-    check_edit_texts(&old, &new)?;
-    Ok(vec![(old, new)])
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if !entry.is_object() {
+                return Err(ToolError::InvalidArgument(format!(
+                    "edits[{index}] must be an object with oldText and newText"
+                )));
+            }
+            let old = entry
+                .get("oldText")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::InvalidArgument(format!("edits[{index}] is missing oldText"))
+                })?;
+            let new = entry
+                .get("newText")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::InvalidArgument(format!("edits[{index}] is missing newText"))
+                })?;
+            check_edit_texts(old, new)
+                .map_err(|error| ToolError::InvalidArgument(format!("edits[{index}]: {error}")))?;
+            Ok((old.to_string(), new.to_string()))
+        })
+        .collect()
 }
 
 fn check_edit_texts(old: &str, new: &str) -> Result<(), ToolError> {
