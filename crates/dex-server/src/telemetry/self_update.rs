@@ -17,16 +17,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::runtime::console::{Console, SpinnerGuard};
 use crate::runtime::runtime::http::VERSION;
 
 pub(crate) const DEFAULT_REPO: &str = "sumofbytes/dex";
 
-/// Transient progress for a long network/IO phase, so a multi-MB download
-/// never looks hung: an animated label on a terminal, nothing when stdout is
-/// piped (the guard no-ops off-terminal).
-fn progress(label: &str) -> SpinnerGuard {
-    SpinnerGuard::start(&Console::none(), label)
+/// Progress line for a long network/IO phase, so a multi-MB download never
+/// reads as a hung command. A plain stderr line like `install.sh` prints —
+/// deliberately not an animated spinner: an update is three finite phases, so
+/// a background thread and its escape codes buy nothing here, and stderr text
+/// still lands in a log when stdout is piped. The final result goes to stdout
+/// (see `Mode::Update`), so `dex update` stays script-friendly.
+fn progress(message: &str) {
+    eprintln!("{message}");
 }
 
 /// Sync entry point for `dex update`: blocks on the shared runtime.
@@ -68,7 +70,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         None => {
             // Follow the /releases/latest redirect; the tag is the last path
             // segment of the URL we landed on.
-            let _progress = progress("checking the latest release");
+            progress("checking the latest release ...");
             let resp = client
                 .get(format!("https://github.com/{repo}/releases/latest"))
                 .timeout(Duration::from_secs(300))
@@ -105,13 +107,9 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         let asset = asset_name(&tag, target);
         let archive = dir.join(&asset);
 
-        let label = format!("downloading {asset}");
-        let (bytes, sums) = {
-            let _progress = progress(&label);
-            let bytes = fetch_bytes(&client, &format!("{base}/{asset}")).await?;
-            let sums = fetch_bytes(&client, &format!("{base}/SHA256SUMS")).await?;
-            (bytes, sums)
-        };
+        progress(&format!("downloading {asset} ..."));
+        let bytes = fetch_bytes(&client, &format!("{base}/{asset}")).await?;
+        let sums = fetch_bytes(&client, &format!("{base}/SHA256SUMS")).await?;
         fs::write(&archive, &bytes)
             .map_err(|e| format!("cannot write {}: {e}", archive.display()))?;
         let expected = checksum_for(&String::from_utf8_lossy(&sums), &asset)
@@ -125,7 +123,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
 
         // System tar, same assumption install.sh already makes; avoids adding
         // flate2 + tar crates just for this.
-        let installing = progress("installing");
+        progress("installing ...");
         let status = Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
@@ -140,9 +138,7 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
         if !new_bin.is_file() {
             return Err(format!("archive did not contain a dex binary ({asset})"));
         }
-        let installed = install(&new_bin, &exe);
-        drop(installing);
-        installed
+        install(&new_bin, &exe)
     }
     .await;
     let _ = fs::remove_dir_all(&dir);

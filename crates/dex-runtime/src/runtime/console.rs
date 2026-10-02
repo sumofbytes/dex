@@ -423,21 +423,13 @@ impl SpinnerGuard {
 
 impl Drop for SpinnerGuard {
     fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
+        if self.worker.take().is_some() {
             // Final erase under the lock: after RUNNING flips false no new
-            // frame can appear.
-            {
-                let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                SPINNER_RUNNING.store(false, Ordering::SeqCst);
-                erase_spinner_frame();
-            }
-            // Join *after* releasing the lock — the worker takes CONSOLE_LOCK
-            // to draw, and it is not reentrant, so joining while holding it
-            // deadlocks. The worker wakes within one 80ms tick, so this only
-            // ever waits a single frame; it is what guarantees no frame is
-            // drawn after the erase above (which garbles progress output when
-            // a long multi-MB download finishes right after a tick).
-            let _ = worker.join();
+            // frame can appear, and the worker exits on its next tick
+            // without blocking turn teardown.
+            let _lock = CONSOLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            SPINNER_RUNNING.store(false, Ordering::SeqCst);
+            erase_spinner_frame();
         }
     }
 }
