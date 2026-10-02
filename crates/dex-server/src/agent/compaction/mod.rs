@@ -168,7 +168,8 @@ fn find_cut_point(
 }
 
 /// Serialize the conversation for the summarizer — prevents it from continuing the conversation.
-/// Tool results truncated to 2000 chars.
+/// Tool results truncated to 2000 *chars* (char-boundary-safe: byte slicing
+/// panics on multibyte tool output like emoji or accented text).
 fn serialize_conversation(messages: &[ChatMessage]) -> String {
     const TOOL_RESULT_MAX: usize = 2000;
     let mut parts = Vec::new();
@@ -202,11 +203,12 @@ fn serialize_conversation(messages: &[ChatMessage]) -> String {
             }
             Role::Tool => {
                 if let Some(c) = &msg.content {
-                    let truncated = if c.len() > TOOL_RESULT_MAX {
+                    let char_len = c.chars().count();
+                    let truncated = if char_len > TOOL_RESULT_MAX {
+                        let head: String = c.chars().take(TOOL_RESULT_MAX).collect();
                         format!(
-                            "{}[... {} more characters truncated]",
-                            &c[..TOOL_RESULT_MAX],
-                            c.len() - TOOL_RESULT_MAX
+                            "{head}[... {} more characters truncated]",
+                            char_len - TOOL_RESULT_MAX
                         )
                     } else {
                         c.clone()
@@ -687,7 +689,7 @@ pub(crate) async fn compact_history(
 mod tests {
     use super::{
         compact_history, deterministic_summary, estimate_tokens, extract_file_ops_from_message,
-        find_cutoff_by_tokens, ChatMessage, FileOps, KEEP_RECENT_MESSAGES,
+        find_cutoff_by_tokens, serialize_conversation, ChatMessage, FileOps, KEEP_RECENT_MESSAGES,
     };
     use crate::protocol::{FunctionCall, LlmToolCall, Role};
 
@@ -874,6 +876,74 @@ mod tests {
             last_user
         );
         assert_ne!(messages[cutoff].role, Role::Tool);
+    }
+
+    /// The compaction serializer truncates every tool result to
+    /// `TOOL_RESULT_MAX` *characters*, and it runs on the **default**
+    /// (deterministic, `DEX_COMPACTION` unset) path too — the
+    /// `harness.summarize` seam serializes the span before deciding whether
+    /// any hook consumes it. Byte slicing that budget panicked with
+    /// "end byte index 2000 is not a char boundary" on any multibyte tool
+    /// output and killed the process mid-compaction.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env var must stay unset across the compaction awaits
+    async fn default_compaction_survives_multibyte_tool_results() {
+        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvRestore::take(&["DEX_COMPACTION"]);
+        std::env::remove_var("DEX_COMPACTION");
+        let config = crate::llm::config::tests::test_cfg();
+        let mut messages = vec![msg(Role::System, "sys")];
+        messages.push(msg(Role::User, "goal: build the thing"));
+        // Early in the transcript so the result lands inside the summarized
+        // span. 3-byte scalars: the byte budget lands mid-character, which
+        // is what used to panic.
+        messages.insert(2, ChatMessage::tool_result("c1", "\u{4e2d}".repeat(3000)));
+        for i in 0..20 {
+            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
+            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
+        }
+        let (compacted, _) = compact_history(
+            &config,
+            &mut messages,
+            &crate::agent::state::GlobalCancellation,
+            false,
+            false,
+            crate::agent::compaction::verbatim::summary_mode(),
+            &crate::agent::composable::DexHarness::default(),
+        )
+        .await
+        .unwrap();
+        assert!(compacted, "compaction must have run");
+    }
+
+    /// A tool result whose 2000-char cut lands inside a multibyte scalar used
+    /// to panic with "end byte index 2000 is not a char boundary". Truncation
+    /// must be char-based and report the true remaining char count. The scalar
+    /// is 3 bytes so the byte budget lands mid-character; a 2-byte char would
+    /// straddle only odd byte offsets and could pass by luck.
+    #[test]
+    fn serialize_conversation_truncates_multibyte_tool_results() {
+        let content = "\u{4e2d}".repeat(2500);
+        let out = serialize_conversation(&[ChatMessage::tool_result("c1", content.clone())]);
+        assert!(
+            out.contains("[... 500 more characters truncated]"),
+            "char count wrong: {out}"
+        );
+        // 500 chars cut, prefix kept, marker appended.
+        assert!(out.starts_with("[Tool result]: "));
+        let head = out
+            .strip_prefix("[Tool result]: ")
+            .unwrap()
+            .split("[... 500 more characters truncated]")
+            .next()
+            .unwrap();
+        assert_eq!(head.chars().count(), 2000);
+        assert_eq!(head, "\u{4e2d}".repeat(2000));
+        // Short ASCII results pass through unchanged.
+        let short = serialize_conversation(&[ChatMessage::tool_result("c2", "done")]);
+        assert_eq!(short, "[Tool result]: done");
     }
 
     #[test]
