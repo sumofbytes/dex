@@ -64,11 +64,11 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
                         "edits": {
                             "type": "array",
                             "minItems": 1,
-                            "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+                            "description": "One or more targeted replacements.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
+                                    "oldText": { "type": "string", "description": "Exact text to replace; must be unique in the file." },
                                     "newText": { "type": "string", "description": "Replacement text for this targeted edit." }
                                 },
                                 "required": ["oldText", "newText"]
