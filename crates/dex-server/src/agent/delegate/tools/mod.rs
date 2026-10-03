@@ -62,7 +62,7 @@ use std::time::Duration;
 mod bg;
 mod exec;
 mod schema;
-pub use bg::{execute_background, is_background, BACKGROUND_TOOL};
+pub use bg::{execute_task, is_task, TASK_TOOL};
 pub use exec::execute_delegation;
 #[cfg(test)]
 pub(crate) use exec::{

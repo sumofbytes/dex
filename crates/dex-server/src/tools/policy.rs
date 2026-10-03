@@ -95,14 +95,13 @@ use super::meta::Policy;
 /// (`enforce_policy` rejects anything above `Read` outright) should not be
 /// advertised to the model at all. The turn's approval override decides the
 /// gate, same as dispatch does. Tools that stay: no metadata row (`delegate`
-/// — per-action gating inside delegation) and `background` (its row is the
+/// — per-action gating inside delegation) and `task` (its row is the
 /// strictest one only for shadow re-dispatch; the live gate is per-action
 /// and `output`/`wait`/`list` remain `Read` in read-only).
 pub fn gated_in_read_only(policy: &Policy, name: &str) -> bool {
     match metadata_for(policy, name) {
         Some(meta) => {
-            name != "background"
-                && needs_approval_for(policy, meta.permission, PermissionMode::ReadOnly)
+            name != "task" && needs_approval_for(policy, meta.permission, PermissionMode::ReadOnly)
         }
         None => false,
     }

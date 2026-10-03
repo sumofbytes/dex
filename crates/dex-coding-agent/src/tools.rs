@@ -28,7 +28,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "bash".to_string(),
-                description: "Run a shell command (120s timeout, output truncated to 400 lines/32KB). Prefer read/grep/find over shell cat/grep/find dumps; use targeted commands (grep -n, tail -N) over dumping files; use background spawn for long-running commands (daemon sessions only).".to_string(),
+                description: "Run a shell command (120s timeout, output truncated to 400 lines/32KB). Prefer read/grep/find over shell cat/grep/find dumps; use targeted commands (grep -n, tail -N) over dumping files; use task spawn for long-running commands (daemon sessions only).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": { "command": { "type": "string", "description": "shell command to run" } },
@@ -206,7 +206,7 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
-                name: "background".to_string(),
+                name: "task".to_string(),
                 description: "Background shell tasks (spawn/output/wait/stop/list). spawn detaches and returns a task id; output pages past a byte cursor; wait blocks up to timeout_secs.".to_string(),
                 parameters: json!({
                     "type": "object",
@@ -296,7 +296,7 @@ mod tests {
             with_delegation[with_delegation.len() - 2].function.name,
             "delegate"
         );
-        assert_eq!(with_delegation.last().unwrap().function.name, "background");
+        assert_eq!(with_delegation.last().unwrap().function.name, "task");
     }
 
     #[test]

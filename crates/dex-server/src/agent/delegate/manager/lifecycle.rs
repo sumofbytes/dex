@@ -198,6 +198,7 @@ impl AgentManager {
                 bg_notices: VecDeque::new(),
                 bg_events: None,
                 bg_handles: HashMap::new(),
+                bg_watch: HashMap::new(),
             })),
         }
     }
@@ -696,6 +697,8 @@ impl AgentManager {
             }
             let id = inner.bg.spawn(command.clone(), cwd)?;
             let hook = inner.bg_events.clone();
+            let (tx, _rx) = tokio::sync::watch::channel(crate::daemon::tasks::TaskStatus::Running);
+            inner.bg_watch.insert(id.clone(), tx);
             (id, hook)
         };
         if let Some(hook) = hook {
@@ -777,6 +780,11 @@ impl AgentManager {
             inner.bg.finish(id, status.clone());
             inner.bg_notices.push_back(notice.clone());
             inner.bg_handles.remove(id);
+            // Publish the terminal status, then drop the sender: waiters
+            // see `changed` and read the final value before close.
+            if let Some(tx) = inner.bg_watch.remove(id) {
+                let _ = tx.send(status.clone());
+            }
             (notice, inner.bg_events.clone(), duration)
         };
         if let Some(hook) = hook {
@@ -841,6 +849,15 @@ impl AgentManager {
         self.lock().bg.get(id).map(|t| t.is_running())
     }
 
+    /// Receiver of status changes for `id`, or `None` when the task is
+    /// unknown/finished (terminal status already in the registry).
+    pub fn bg_watch_rx(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::watch::Receiver<crate::daemon::tasks::TaskStatus>> {
+        self.lock().bg_watch.get(id).map(|tx| tx.subscribe())
+    }
+
     /// One line per task, running first then numeric id order (for `list`).
     pub fn bg_snapshot(&self) -> Vec<(String, String, String)> {
         // Snapshot `now` before locking so the lock stays short.
@@ -893,19 +910,72 @@ impl AgentManager {
 
     /// Kill all running tasks (pid-group) and join their drains. Daemon
     /// shutdown / session-delete path; turn cancel never calls this.
+    /// SIGTERM every running task group, grace, then SIGKILL the
+    /// stragglers; mark any survivor row `Killed`, abort the drains, and
+    /// join them. Daemon shutdown / session-delete path; turn cancel
+    /// never calls this.
     pub async fn shutdown_bg_tasks(&self) {
-        let (pids, handles): (Vec<u32>, Vec<JoinHandle<()>>) = {
+        let (pids, mut rxs, handles): (
+            Vec<u32>,
+            Vec<tokio::sync::watch::Receiver<crate::daemon::tasks::TaskStatus>>,
+            Vec<JoinHandle<()>>,
+        ) = {
             let mut inner = self.lock();
-            let pids: Vec<u32> = inner
+            let running_ids: Vec<String> = inner
                 .bg_handles
                 .keys()
-                .filter_map(|id| inner.bg.get(id)?.pid)
+                .filter(|id| inner.bg.get(id).map(|t| t.is_running()).unwrap_or(false))
+                .cloned()
                 .collect();
+            let mut pids = Vec::new();
+            let mut rxs = Vec::new();
+            for id in &running_ids {
+                if let Some(pid) = inner.bg.get(id).and_then(|t| t.pid) {
+                    pids.push(pid);
+                }
+                if let Some(tx) = inner.bg_watch.get(id) {
+                    rxs.push(tx.subscribe());
+                }
+            }
             let handles: Vec<JoinHandle<()>> = inner.bg_handles.drain().map(|(_, h)| h).collect();
-            (pids, handles)
+            (pids, rxs, handles)
         };
-        for pid in pids {
-            crate::tools::shell::kill_process_group_pid(pid);
+        // Phase 1: graceful.
+        for pid in &pids {
+            crate::tools::shell::sigterm_process_group_pid(*pid);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for rx in &mut rxs {
+            while !rx.borrow().is_terminal() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, rx.changed()).await {
+                    Ok(Ok(())) => {}
+                    _ => break,
+                }
+            }
+        }
+        // Phase 2: force + settle. SIGKILL the still-running groups, then
+        // record their kill synchronously (first-write-wins vs the drain)
+        // so no row is left `Running` after we abort the drains.
+        {
+            let inner_ids: Vec<(String, u32)> = {
+                let inner = self.lock();
+                inner
+                    .bg
+                    .iter()
+                    .filter(|t| t.is_running())
+                    .filter_map(|t| t.pid.map(|pid| (t.id.clone(), pid)))
+                    .collect()
+            };
+            for (_, pid) in &inner_ids {
+                crate::tools::shell::kill_process_group_pid(*pid);
+            }
+            for (id, _) in inner_ids {
+                self.bg_finish(&id, crate::daemon::tasks::TaskStatus::Killed(None), None);
+            }
         }
         for handle in handles {
             handle.abort();

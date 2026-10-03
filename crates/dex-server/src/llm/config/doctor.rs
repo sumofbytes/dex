@@ -538,6 +538,25 @@ fn shared_rows(
         if wake { "on" } else { "off" },
         wake_source,
     );
+    // Wake cadence knobs: value + origin (env override or built-in).
+    for (name, env_var, default) in [
+        ("wake debounce", "DEX_AGENT_WAKE_DEBOUNCE_MS", 2000u64),
+        ("wake retry delay", "DEX_AGENT_WAKE_RETRY_MS", 5000),
+        ("wake presence", "DEX_AGENT_WAKE_PRESENCE_MS", 30_000),
+    ] {
+        match env::var(env_var) {
+            Ok(raw) if raw.trim().parse::<u64>().map(|ms| ms > 0).unwrap_or(false) => {
+                row(out, name, &format!("{}ms", raw.trim()), env_var);
+            }
+            _ => row(out, name, &format!("{default}ms"), "built-in default"),
+        }
+    }
+    match env::var("DEX_AGENT_WAKE_RETRIES") {
+        Ok(raw) if raw.trim().parse::<usize>().map(|n| n > 0).unwrap_or(false) => {
+            row(out, "wake retries", raw.trim(), "DEX_AGENT_WAKE_RETRIES");
+        }
+        _ => row(out, "wake retries", "12", "built-in default"),
+    }
     let (warming, warming_source) = cache_warming_origin();
     row(
         out,

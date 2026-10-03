@@ -323,7 +323,7 @@ mod tests {
         assert!(out.contains("- rule one\n- rule two\n"), "{out}");
     }
 
-    /// Without the daemon gate the delegation/background rules are absent from
+    /// Without the daemon gate the delegation/task rules are absent from
     /// the prompt entirely; the always-on edit rules remain.
     #[test]
     fn tool_guidelines_off_without_delegation() {

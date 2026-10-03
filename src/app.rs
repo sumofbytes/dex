@@ -815,7 +815,7 @@ mod tests {
         assert!(!names.contains(&"delegate_output"), "merged into delegate");
         assert!(!names.contains(&"delegate_stop"), "merged into delegate");
         assert!(!names.contains(&"delegate_list"), "merged into delegate");
-        // `background` + `delegate` ride the daemon-linked gate: enable the
+        // `task` + `delegate` ride the daemon-linked gate: enable the
         // link for this assert only, then restore (unit tests run in one
         // process; leaving it set would leak daemon tools into other tests).
         crate::agent::delegate::set_daemon_linked(true);
@@ -823,8 +823,8 @@ mod tests {
         crate::agent::delegate::set_daemon_linked(false);
         let bg = enabled
             .iter()
-            .find(|t| t.function.name == "background")
-            .expect("background in enabled catalog");
+            .find(|t| t.function.name == "task")
+            .expect("task in enabled catalog");
         let actions = bg.function.parameters["properties"]["action"]["enum"]
             .as_array()
             .unwrap()

@@ -36,4 +36,4 @@ pub use tools::{
     AgentTurnContext,
 };
 #[allow(unused_imports)]
-pub(crate) use tools::{execute_background, is_background, BACKGROUND_TOOL};
+pub(crate) use tools::{execute_task, is_task, TASK_TOOL};

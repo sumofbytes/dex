@@ -938,7 +938,7 @@ async fn temporary_workspace_paths_are_confined() {
 #[test]
 fn read_only_schema_filter_mirrors_the_gate() {
     // Everything the read-only gate hard-denies must drop from the schema.
-    // Reads stay; `delegate` (no metadata row) and `background` (per-action
+    // Reads stay; `delegate` (no metadata row) and `task` (per-action
     // gate: `output`/`wait`/`list` are `Read`) stay advertised.
     let policy = Policy {
         mode: crate::protocol::PermissionMode::ReadOnly,
@@ -946,15 +946,7 @@ fn read_only_schema_filter_mirrors_the_gate() {
         agent: None,
         approval: None,
     };
-    for kept in [
-        "read",
-        "grep",
-        "find",
-        "ls",
-        "ask_user",
-        "delegate",
-        "background",
-    ] {
+    for kept in ["read", "grep", "find", "ls", "ask_user", "delegate", "task"] {
         assert!(!gated_in_read_only(&policy, kept), "{kept} must stay");
     }
     for dropped in ["bash", "write", "edit", "mcp__srv_tool", "ext__lua"] {

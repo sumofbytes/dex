@@ -18,8 +18,36 @@ use pure::{cap_running, next_id, retain_last8, MAX_FINISHED_RETAINED};
 pub enum TaskStatus {
     Running,
     Exited(i32),
-    Killed,
-    Failed(String),
+    Killed(Option<i32>),
+    /// The command never started (spawn failed).
+    SpawnFailed(String),
+    /// Started, but collecting its exit status failed.
+    WaitFailed(String),
+}
+
+/// Signal number → name for the common Unix signals; unknown ones render
+/// as `signal N`. Non-unix always keeps the numeric form.
+pub fn signal_name(signal: i32) -> String {
+    #[cfg(unix)]
+    {
+        match signal {
+            1 => "SIGHUP",
+            2 => "SIGINT",
+            3 => "SIGQUIT",
+            6 => "SIGABRT",
+            9 => "SIGKILL",
+            11 => "SIGSEGV",
+            13 => "SIGPIPE",
+            14 => "SIGALRM",
+            15 => "SIGTERM",
+            other => return format!("signal {other}"),
+        }
+        .to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        format!("signal {signal}")
+    }
 }
 
 impl TaskStatus {
@@ -30,8 +58,10 @@ impl TaskStatus {
             Self::Running => "running".to_string(),
             Self::Exited(0) => "exit 0".to_string(),
             Self::Exited(code) => format!("exit {code}"),
-            Self::Killed => "killed".to_string(),
-            Self::Failed(_) => "failed".to_string(),
+            Self::Killed(Some(sig)) => format!("killed ({})", signal_name(*sig)),
+            Self::Killed(None) => "killed".to_string(),
+            Self::SpawnFailed(_) => "spawn failed".to_string(),
+            Self::WaitFailed(_) => "wait failed".to_string(),
         }
     }
 
@@ -243,7 +273,11 @@ mod tests {
         assert_eq!(TaskStatus::Running.word(), "running");
         assert_eq!(TaskStatus::Exited(0).word(), "exit 0");
         assert_eq!(TaskStatus::Exited(3).word(), "exit 3");
-        assert_eq!(TaskStatus::Killed.word(), "killed");
+        assert_eq!(TaskStatus::Killed(None).word(), "killed");
+        #[cfg(unix)]
+        assert_eq!(TaskStatus::Killed(Some(9)).word(), "killed (SIGKILL)");
+        assert_eq!(TaskStatus::SpawnFailed("x".into()).word(), "spawn failed");
+        assert_eq!(TaskStatus::WaitFailed("x".into()).word(), "wait failed");
     }
 }
 

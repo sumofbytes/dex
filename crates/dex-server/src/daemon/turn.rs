@@ -893,11 +893,29 @@ async fn drain_agent_notices(
     messages: &mut Vec<ChatMessage>,
 ) -> Result<bool, String> {
     let manager = state.manager_for(session_id);
+    let Some(text) = collect_notice_text(&manager).await? else {
+        return Ok(false);
+    };
+    let message = ChatMessage::user_named(text, "agent-notifications");
+    session
+        .append_message(&message)
+        .map_err(|e| format!("failed to persist agent notice: {e}"))?;
+    messages.push(message);
+    Ok(true)
+}
+
+/// Drain the manager's queued notices (children + background tasks) and
+/// render the shared `agent-notifications` payload. Both the turn-boundary
+/// drain and the mid-turn (per tool-round) drain in the turn host use
+/// this, so the two paths never drift.
+pub(crate) async fn collect_notice_text(
+    manager: &crate::agent::delegate::AgentManager,
+) -> Result<Option<String>, String> {
     let notices = manager.drain_notices();
     let task_notices = manager.drain_task_notices();
     let overflow = manager.take_overflow();
     if notices.is_empty() && task_notices.is_empty() && overflow == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let mut text = String::new();
     for notice in notices {
@@ -928,10 +946,5 @@ async fn drain_agent_notices(
         }
         text.push_str(&notice.text());
     }
-    let message = ChatMessage::user_named(text, "agent-notifications");
-    session
-        .append_message(&message)
-        .map_err(|e| format!("failed to persist agent notice: {e}"))?;
-    messages.push(message);
-    Ok(true)
+    Ok(Some(text))
 }

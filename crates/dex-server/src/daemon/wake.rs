@@ -14,11 +14,34 @@ use super::{lock_map, DaemonState};
 
 /// Wake scheduling (§10b V1b): debounce bursts, retry around a live user
 /// turn a bounded number of times, and gate on recent client presence.
-const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
-const WAKE_RETRY: Duration = Duration::from_secs(5);
-const WAKE_RETRIES: usize = 12;
-/// A client reading the journal within this window counts as an audience.
-const WAKE_PRESENCE_WINDOW: Duration = Duration::from_secs(30);
+/// Each knob is env-tunable (milliseconds); defaults preserve prior
+/// behavior. `DEX_AGENT_WAKE_RETRIES` takes a plain count.
+fn env_ms(var: &str, default_ms: u64) -> Duration {
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => Duration::from_millis(default_ms),
+        },
+        Err(_) => Duration::from_millis(default_ms),
+    }
+}
+
+pub(crate) fn wake_debounce() -> Duration {
+    env_ms("DEX_AGENT_WAKE_DEBOUNCE_MS", 2000)
+}
+fn wake_retry_delay() -> Duration {
+    env_ms("DEX_AGENT_WAKE_RETRY_MS", 5000)
+}
+fn wake_retries() -> usize {
+    std::env::var("DEX_AGENT_WAKE_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(12)
+}
+fn wake_presence_window() -> Duration {
+    env_ms("DEX_AGENT_WAKE_PRESENCE_MS", 30_000)
+}
 
 /// The idle wake turn's prompt: the drained notices themselves ride the
 /// agent-notifications user message (the same seam a user turn uses), so
@@ -35,22 +58,22 @@ const WAKE_PROMPT: &str = "A background task or agent finished while this sessio
 pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
     tokio::spawn(async move {
         // Debounce: children finishing in a burst wake once, not per child.
-        tokio::time::sleep(WAKE_DEBOUNCE).await;
+        tokio::time::sleep(wake_debounce()).await;
         let mut attempts = 0usize;
         loop {
             attempts += 1;
-            if attempts > WAKE_RETRIES || !agent_wake_enabled() {
+            if attempts > wake_retries() || !agent_wake_enabled() {
                 return;
             }
             // Presence gate: no client reading the journal → no audience.
             // The notices wait in the queue for the next real turn.
-            if !state.client_seen_fresh(&session_id, WAKE_PRESENCE_WINDOW) {
+            if !state.client_seen_fresh(&session_id, wake_presence_window()) {
                 return;
             }
             if lock_map(&state.active_turns).contains(&session_id) {
                 // A user turn is live: it drains at its boundary. Re-check
                 // after it ends so a notice landing mid-turn still wakes.
-                tokio::time::sleep(WAKE_RETRY).await;
+                tokio::time::sleep(wake_retry_delay()).await;
                 continue;
             }
             let manager = state.manager_for(&session_id);
@@ -141,7 +164,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             if !state.manager_for(&session_id).has_any_notices() {
                 return;
             }
-            tokio::time::sleep(WAKE_DEBOUNCE).await;
+            tokio::time::sleep(wake_debounce()).await;
         }
     });
 }
