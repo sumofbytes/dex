@@ -694,7 +694,7 @@ mod tests {
             (
                 "command",
                 Value::String(
-                    "bash -c \"trap 'echo term-received; exit 0' TERM; sleep 60 & wait\""
+                    "exec bash -c \"trap 'echo term-received; exit 0' TERM; sleep 60 & wait\""
                         .to_string(),
                 ),
             ),
@@ -735,7 +735,7 @@ mod tests {
             (
                 "command",
                 Value::String(
-                    "bash -c \"trap '' TERM; while true; do sleep 0.2; done\"".to_string(),
+                    "exec bash -c \"trap '' TERM; while true; do sleep 0.2; done\"".to_string(),
                 ),
             ),
         ]);
@@ -772,7 +772,7 @@ mod tests {
             ("action", Value::String("spawn".to_string())),
             (
                 "command",
-                Value::String("bash -c 'kill -TERM $$'".to_string()),
+                Value::String("exec bash -c 'kill -TERM $$'".to_string()),
             ),
         ]);
         execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
