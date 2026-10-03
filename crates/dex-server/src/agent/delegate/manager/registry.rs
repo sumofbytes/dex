@@ -162,6 +162,9 @@ pub struct Inner {
     /// Lifecycle hook for task events (journal + broadcast + wake),
     /// attached by the daemon beside `events`; `None` for test managers.
     pub bg_events: Option<TaskEventHook>,
+    /// Per-task status broadcast: `bg_finish` publishes the terminal
+    /// status here so `wait`/`stop` can await changes instead of polling.
+    pub bg_watch: HashMap<String, tokio::sync::watch::Sender<crate::daemon::tasks::TaskStatus>>,
     /// Drain-task handles, aborted on stop/teardown (the drain owns the
     /// `Child`; the registry keeps only the pid).
     pub bg_handles: HashMap<String, JoinHandle<()>>,

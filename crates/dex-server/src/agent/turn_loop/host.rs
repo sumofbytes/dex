@@ -219,7 +219,7 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         // Read-only (plan) turns only see tools the gate lets through: the
         // schema drops what the gate hard-denies (`gated_in_read_only`)
         // instead of advertising a call that only invites a denied
-        // round-trip. `delegate` and `background` stay — they gate
+        // round-trip. `delegate` and `task` stay — they gate
         // per-action inside, and their `Read` actions remain allowed here.
         if self.policy.mode != crate::protocol::PermissionMode::ReadOnly {
             return schemas;
@@ -502,6 +502,24 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         if self.state.dirty {
             self.state.save_async().await;
             self.state.dirty = false;
+        }
+        // Mid-turn completion notices: drain queued delegate/task
+        // completions after each tool round so the model sees them
+        // within the same turn, not only at its end. Same payload and
+        // user-named message shape as the boundary drain.
+        if let Some(agent_ctx) = &self.policy.agent {
+            let manager = agent_ctx.manager.clone();
+            if manager.has_any_notices() {
+                if let Ok(Some(text)) = crate::daemon::turn::collect_notice_text(&manager).await {
+                    messages.push(ChatMessage::user_named(text, "agent-notifications"));
+                    ledger.push(messages.last().expect("just pushed"));
+                    let _ = self.harness.transcript.append_pending(
+                        &mut self.session,
+                        messages,
+                        &mut self.persisted_cursor,
+                    );
+                }
+            }
         }
         Ok(())
     }

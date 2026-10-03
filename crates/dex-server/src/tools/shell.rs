@@ -22,6 +22,8 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
 
 /// Model-facing caps. Capture limits (1 MiB shell) guard memory; clamp
 /// limits guard the context window. Head+tail clamping keeps both the
@@ -185,6 +187,16 @@ pub(crate) fn kill_process_group_pid(pid: u32) {
     #[cfg(unix)]
     unsafe {
         let _ = kill(-(pid as i32), SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// SIGTERM the whole process group (graceful phase of two-phase stop).
+pub(crate) fn sigterm_process_group_pid(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = kill(-(pid as i32), SIGTERM);
     }
     #[cfg(not(unix))]
     let _ = pid;

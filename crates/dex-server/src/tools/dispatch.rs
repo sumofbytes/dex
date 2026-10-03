@@ -33,7 +33,7 @@ pub async fn execute(
     let mut hooks_ran = false;
     // Zero-cost when no extension subscribes: the args pass through uncloned.
     let args = if crate::agent::delegate::is_delegation(name)
-        || crate::agent::delegate::is_background(name)
+        || crate::agent::delegate::is_task(name)
         || !crate::extensions::has_event_handlers("tool.before")
     {
         args
@@ -161,10 +161,9 @@ async fn dispatch_tool(
     }
     // Background shell tasks route with delegation (no static permission
     // row governs them — the per-action Shell/Read gate lives inside
-    // `execute_background`, mirroring the delegate early-route).
-    if crate::agent::delegate::is_background(name) {
-        return crate::agent::delegate::execute_background(name, args, cancel, policy, filter)
-            .await;
+    // `execute_task`, mirroring the delegate early-route).
+    if crate::agent::delegate::is_task(name) {
+        return crate::agent::delegate::execute_task(name, args, cancel, policy, filter).await;
     }
     // Inside a shadow re-dispatch (`resolve_shadow == false`) the shadow's
     // Shell row must not raise the gate again — use the native requirement.

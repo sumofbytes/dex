@@ -1,4 +1,4 @@
-//! Background shell tasks: `background` with `action` —
+//! Background shell tasks: `task` with `action` —
 //! spawn/output/stop/wait/list (spec Rev 3). Runs on the per-session
 //! [`AgentManager`], so tool calls (which hold a manager, not `DaemonState`)
 //! can spawn, poll, and stop without extra plumbing.
@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt as _;
 
-pub const BACKGROUND_TOOL: &str = "background";
+pub const TASK_TOOL: &str = "task";
 pub const BACKGROUND_ACTIONS: [&str; 5] = ["spawn", "output", "stop", "wait", "list"];
-const WAIT_SLEEP: Duration = Duration::from_millis(250);
 const MAX_WAIT_SECONDS: u64 = 120;
+/// Grace window between SIGTERM and SIGKILL in `stop` / manager shutdown.
+const SIGTERM_GRACE: Duration = Duration::from_secs(2);
 
-pub fn is_background(name: &str) -> bool {
-    name == BACKGROUND_TOOL
+pub fn is_task(name: &str) -> bool {
+    name == TASK_TOOL
 }
 
 fn output_cap() -> usize {
@@ -69,10 +70,10 @@ fn timeout_arg(args: &Map<String, Value>) -> Result<u64, ToolError> {
     Ok(secs.min(MAX_WAIT_SECONDS))
 }
 
-/// Dispatch `background` from [`crate::tools::execute`]. The allowlist gate
+/// Dispatch `task` from [`crate::tools::execute`]. The allowlist gate
 /// already ran for children. Per-action permission gate (spec Rev 3):
 /// `spawn`/`stop` need `Shell`, `output`/`wait`/`list` need `Read`.
-pub async fn execute_background(
+pub async fn execute_task(
     name: &str,
     args: &Map<String, Value>,
     cancel: &(dyn CancellationSource + Send + Sync),
@@ -137,7 +138,7 @@ async fn bg_spawn(
     cmd.current_dir(&cwd);
     let mut child = cmd.spawn().map_err(|e| {
         ctx.manager
-            .bg_finish(&id, TaskStatus::Failed(e.to_string()), None);
+            .bg_finish(&id, TaskStatus::SpawnFailed(e.to_string()), None);
         ToolError::Io(e)
     })?;
     let pid = child.id();
@@ -146,7 +147,7 @@ async fn bg_spawn(
     } else {
         ctx.manager.bg_finish(
             &id,
-            TaskStatus::Failed("spawn produced no pid".to_string()),
+            TaskStatus::SpawnFailed("spawn produced no pid".to_string()),
             None,
         );
         return Err(ToolError::Internal(
@@ -202,12 +203,8 @@ async fn drain_task(
                 drain_rest(stdout, stderr, &manager, &id, &mut pending, cap).await;
                 flush_pending(&manager, &id, &mut pending);
                 let (status_word, code) = match status {
-                    Ok(st) => match st.code() {
-                        Some(0) => (TaskStatus::Exited(0), Some(0)),
-                        Some(c) => (TaskStatus::Exited(c), Some(c)),
-                        None => (TaskStatus::Killed, None),
-                    },
-                    Err(e) => (TaskStatus::Failed(e.to_string()), None),
+                    Ok(st) => status_from_exit(&st),
+                    Err(e) => (TaskStatus::WaitFailed(e.to_string()), None),
                 };
                 // `stop` may have already recorded Killed; keep first write.
                 if manager.bg_is_running(&id).unwrap_or(false) {
@@ -253,18 +250,14 @@ async fn drain_task(
     flush_pending(&manager, &id, &mut pending);
     match child.wait().await {
         Ok(st) => {
-            let (status_word, code) = match st.code() {
-                Some(0) => (TaskStatus::Exited(0), Some(0)),
-                Some(c) => (TaskStatus::Exited(c), Some(c)),
-                None => (TaskStatus::Killed, None),
-            };
+            let (status_word, code) = status_from_exit(&st);
             if manager.bg_is_running(&id).unwrap_or(false) {
                 manager.bg_finish(&id, status_word, code);
             }
         }
         Err(e) => {
             if manager.bg_is_running(&id).unwrap_or(false) {
-                manager.bg_finish(&id, TaskStatus::Failed(e.to_string()), None);
+                manager.bg_finish(&id, TaskStatus::WaitFailed(e.to_string()), None);
             }
         }
     }
@@ -299,6 +292,26 @@ async fn drain_rest(
                 pending.extend_from_slice(&buf[..n]);
             }
             Err(_) => break,
+        }
+    }
+}
+
+/// Exit status → (TaskStatus, exit_code). Signal death keeps the Unix
+/// signal number so notices/`wait` can say which signal ended it.
+fn status_from_exit(status: &std::process::ExitStatus) -> (TaskStatus, Option<i32>) {
+    match status.code() {
+        Some(0) => (TaskStatus::Exited(0), Some(0)),
+        Some(c) => (TaskStatus::Exited(c), Some(c)),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                (TaskStatus::Killed(status.signal()), None)
+            }
+            #[cfg(not(unix))]
+            {
+                (TaskStatus::Killed(None), None)
+            }
         }
     }
 }
@@ -360,7 +373,7 @@ async fn bg_stop(
     let id = string_arg(args, "id").ok_or(ToolError::Missing("id"))?;
     let running = ctx.manager.bg_is_running(&id).ok_or_else(|| {
         ToolError::InvalidArgument(format!(
-            "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+            "unknown task '{id}': never spawned in this session, or its result aged out of retention"
         ))
     })?;
     if !running {
@@ -371,22 +384,60 @@ async fn bg_stop(
         return Ok(format!("{id}: already {word}"));
     }
     if let Some(pid) = ctx.manager.bg_pid(&id) {
-        crate::tools::shell::kill_process_group_pid(pid);
+        // Two-phase stop: SIGTERM the group first, then give it a grace
+        // window to exit on its own before SIGKILL (SIGKILL denies
+        // handlers, temp cleanup, and pipe flush).
+        crate::tools::shell::sigterm_process_group_pid(pid);
+        if let Some(mut rx) = ctx.manager.bg_watch_rx(&id) {
+            let deadline = Instant::now() + SIGTERM_GRACE;
+            while matches!(ctx.manager.bg_is_running(&id), Some(true)) {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match tokio::time::timeout(deadline - now, rx.changed()).await {
+                    Ok(Ok(())) => {}
+                    _ => break,
+                }
+            }
+        }
+        if ctx.manager.bg_is_running(&id).unwrap_or(false) {
+            if let Some(pid) = ctx.manager.bg_pid(&id) {
+                crate::tools::shell::kill_process_group_pid(pid);
+            }
+        }
     }
-    // Give the drain a beat to observe the death and record Killed; then
-    // record synchronously so `stop` never leaves a zombie row if the drain
-    // was already gone. `bg_finish` is first-write-wins (guarded by
-    // `is_running`), so a racing drain can't double-notice.
+    // Give the drain a beat to observe the death and record the real
+    // status (it knows the actual signal), then record synchronously so
+    // `stop` never leaves a zombie row if the drain was already gone.
+    // `bg_finish` is first-write-wins (guarded by `is_running`), so a
+    // racing drain can't double-notice.
     let manager = ctx.manager.clone();
     let stop_id = id.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(mut rx) = manager.bg_watch_rx(&stop_id) {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while manager.bg_is_running(&stop_id).unwrap_or(false) {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                if tokio::time::timeout(deadline - now, rx.changed())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
         if manager.bg_is_running(&stop_id).unwrap_or(false) {
-            manager.bg_finish(&stop_id, TaskStatus::Killed, None);
+            manager.bg_finish(&stop_id, TaskStatus::Killed(None), None);
         }
     });
     #[cfg(unix)]
-    return Ok(format!("{id}: stopped (SIGKILL to process group)"));
+    return Ok(format!(
+        "{id}: stopped (SIGTERM to process group; SIGKILL after grace if ignored)"
+    ));
     #[cfg(not(unix))]
     return Ok(format!("{id}: stopped"));
 }
@@ -399,29 +450,68 @@ async fn bg_wait(
     let id = string_arg(args, "id").ok_or(ToolError::Missing("id"))?;
     if ctx.manager.bg_read(&id, None).is_err() {
         return Err(ToolError::InvalidArgument(format!(
-            "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+            "unknown task '{id}': never spawned in this session, or its result aged out of retention"
         )));
     }
     let timeout = timeout_arg(args)?;
     let cursor = cursor_arg(args)?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
+    // Event-driven wait: subscribe once to the task's status channel and
+    // block on `changed` — no polling loop, wakes as soon as the drain
+    // records the terminal status.
+    let mut rx = match ctx.manager.bg_watch_rx(&id) {
+        Some(rx) => rx,
+        None => {
+            // Already finished (or aged out): one-shot read decides.
+            return match ctx.manager.bg_is_running(&id) {
+                Some(true) => {
+                    Err(ToolError::Internal("task status channel closed".into()))
+                }
+                Some(false) => render_output(&ctx.manager, &id, cursor),
+                None => Err(ToolError::InvalidArgument(format!(
+                    "unknown task '{id}': never spawned in this session, or its result aged out of retention"
+                ))),
+            };
+        }
+    };
     loop {
         match ctx.manager.bg_is_running(&id) {
             None => {
                 return Err(ToolError::InvalidArgument(format!(
-                    "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+                    "unknown task '{id}': never spawned in this session, or its result aged out of retention"
                 )));
             }
             Some(false) => return render_output(&ctx.manager, &id, cursor),
             Some(true) => {
-                if cancel.is_cancelled() || Instant::now() >= deadline {
+                let now = Instant::now();
+                if cancel.is_cancelled() || now >= deadline {
                     let mut out = render_output(&ctx.manager, &id, cursor)?;
                     out = format!("still running after {timeout}s\n{out}");
                     return Ok(out);
                 }
+                let remaining = deadline - now;
+                // Race the status change against the deadline and the
+                // cancellation waiter; either one wins and the loop
+                // re-checks the authoritative registry state.
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            // Sender dropped: the drain either finished the
+                            // task or the row was evicted — re-read decides.
+                            continue;
+                        }
+                    }
+                    _ = tokio::time::sleep(remaining) => {
+                        continue;
+                    }
+                    _ = crate::agent::state::wait_cancelled(cancel) => {
+                        let mut out = render_output(&ctx.manager, &id, cursor)?;
+                        out = format!("wait cancelled\n{out}");
+                        return Ok(out);
+                    }
+                }
             }
         }
-        tokio::time::sleep(WAIT_SLEEP).await;
     }
 }
 
@@ -476,21 +566,21 @@ mod tests {
     }
 
     #[test]
-    fn background_is_one_tool_with_five_actions() {
-        assert!(is_background(BACKGROUND_TOOL));
+    fn task_is_one_tool_with_five_actions() {
+        assert!(is_task(TASK_TOOL));
         assert_eq!(
             BACKGROUND_ACTIONS,
             ["spawn", "output", "stop", "wait", "list"]
         );
-        assert!(!is_background("bash"));
+        assert!(!is_task("bash"));
     }
 
     #[tokio::test]
-    async fn background_without_a_daemon_context_rejects_cleanly() {
+    async fn task_without_a_daemon_context_rejects_cleanly() {
         let policy = Policy::trusted();
         for action in BACKGROUND_ACTIONS {
             let a = args(&[("action", Value::String(action.to_string()))]);
-            let error = execute_background(BACKGROUND_TOOL, &a, &GlobalCancellation, &policy, None)
+            let error = execute_task(TASK_TOOL, &a, &GlobalCancellation, &policy, None)
                 .await
                 .unwrap_err();
             assert!(
@@ -501,24 +591,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_missing_action_errors_cleanly() {
+    async fn task_missing_action_errors_cleanly() {
         let ctx = test_ctx("/tmp");
         let policy = policy_for(&ctx);
-        let error = execute_background(
-            BACKGROUND_TOOL,
-            &Map::new(),
-            &GlobalCancellation,
-            &policy,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let error = execute_task(TASK_TOOL, &Map::new(), &GlobalCancellation, &policy, None)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("action"), "{error}");
         ctx.manager.shutdown().await;
     }
 
     #[tokio::test]
-    async fn background_unknown_id_errors_cleanly() {
+    async fn task_unknown_id_errors_cleanly() {
         let ctx = test_ctx("/tmp");
         let policy = policy_for(&ctx);
         for action in ["output", "stop", "wait"] {
@@ -526,7 +610,7 @@ mod tests {
                 ("action", Value::String(action.to_string())),
                 ("id", Value::String("task-99".to_string())),
             ]);
-            let error = execute_background(BACKGROUND_TOOL, &a, &GlobalCancellation, &policy, None)
+            let error = execute_task(TASK_TOOL, &a, &GlobalCancellation, &policy, None)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("task-99"), "{action}: {error}");
@@ -535,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_echo_round_trip() {
+    async fn task_echo_round_trip() {
         let dir = std::env::temp_dir();
         let ctx = test_ctx(dir.to_str().unwrap());
         let policy = policy_for(&ctx);
@@ -543,7 +627,7 @@ mod tests {
             ("action", Value::String("spawn".to_string())),
             ("command", Value::String("echo hello-bg".to_string())),
         ]);
-        let out = execute_background(BACKGROUND_TOOL, &spawn, &GlobalCancellation, &policy, None)
+        let out = execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
             .await
             .unwrap();
         assert!(out.contains("task-1"), "{out}");
@@ -553,13 +637,13 @@ mod tests {
             ("id", Value::String("task-1".to_string())),
             ("timeout_secs", Value::from(10)),
         ]);
-        let waited = execute_background(BACKGROUND_TOOL, &wait, &GlobalCancellation, &policy, None)
+        let waited = execute_task(TASK_TOOL, &wait, &GlobalCancellation, &policy, None)
             .await
             .unwrap();
         assert!(waited.contains("hello-bg"), "{waited}");
         assert!(waited.contains("exit 0"), "{waited}");
         let list = args(&[("action", Value::String("list".to_string()))]);
-        let listed = execute_background(BACKGROUND_TOOL, &list, &GlobalCancellation, &policy, None)
+        let listed = execute_task(TASK_TOOL, &list, &GlobalCancellation, &policy, None)
             .await
             .unwrap();
         assert!(listed.contains("task-1"), "{listed}");
@@ -567,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_stop_kills_sleep() {
+    async fn task_stop_kills_sleep() {
         let dir = std::env::temp_dir();
         let ctx = test_ctx(dir.to_str().unwrap());
         let policy = policy_for(&ctx);
@@ -575,17 +659,16 @@ mod tests {
             ("action", Value::String("spawn".to_string())),
             ("command", Value::String("sleep 30".to_string())),
         ]);
-        execute_background(BACKGROUND_TOOL, &spawn, &GlobalCancellation, &policy, None)
+        execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
             .await
             .unwrap();
         let stop = args(&[
             ("action", Value::String("stop".to_string())),
             ("id", Value::String("task-1".to_string())),
         ]);
-        let stopped =
-            execute_background(BACKGROUND_TOOL, &stop, &GlobalCancellation, &policy, None)
-                .await
-                .unwrap();
+        let stopped = execute_task(TASK_TOOL, &stop, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
         assert!(stopped.contains("stopped"), "{stopped}");
         // The drain observes the SIGKILL shortly after.
         let wait = args(&[
@@ -593,10 +676,140 @@ mod tests {
             ("id", Value::String("task-1".to_string())),
             ("timeout_secs", Value::from(10)),
         ]);
-        let waited = execute_background(BACKGROUND_TOOL, &wait, &GlobalCancellation, &policy, None)
+        let waited = execute_task(TASK_TOOL, &wait, &GlobalCancellation, &policy, None)
             .await
             .unwrap();
         assert!(waited.contains("killed"), "{waited}");
         ctx.manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_sends_sigterm_first_and_wellbehaved_task_exits_clean() {
+        let dir = std::env::temp_dir();
+        let ctx = test_ctx(dir.to_str().unwrap());
+        let policy = policy_for(&ctx);
+        let spawn = args(&[
+            ("action", Value::String("spawn".to_string())),
+            (
+                "command",
+                Value::String(
+                    "exec bash -c \"trap 'echo term-received; exit 0' TERM; sleep 60 & wait\""
+                        .to_string(),
+                ),
+            ),
+        ]);
+        execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        // Let the trap install before signaling.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stop = args(&[
+            ("action", Value::String("stop".to_string())),
+            ("id", Value::String("task-1".to_string())),
+        ]);
+        execute_task(TASK_TOOL, &stop, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        let wait = args(&[
+            ("action", Value::String("wait".to_string())),
+            ("id", Value::String("task-1".to_string())),
+            ("timeout_secs", Value::from(10)),
+        ]);
+        let waited = execute_task(TASK_TOOL, &wait, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        assert!(waited.contains("exit 0"), "{waited}");
+        assert!(waited.contains("term-received"), "{waited}");
+        ctx.manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let dir = std::env::temp_dir();
+        let ctx = test_ctx(dir.to_str().unwrap());
+        let policy = policy_for(&ctx);
+        let spawn = args(&[
+            ("action", Value::String("spawn".to_string())),
+            (
+                "command",
+                Value::String(
+                    "exec bash -c \"trap '' TERM; while true; do sleep 0.2; done\"".to_string(),
+                ),
+            ),
+        ]);
+        execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stop = args(&[
+            ("action", Value::String("stop".to_string())),
+            ("id", Value::String("task-1".to_string())),
+        ]);
+        execute_task(TASK_TOOL, &stop, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        let wait = args(&[
+            ("action", Value::String("wait".to_string())),
+            ("id", Value::String("task-1".to_string())),
+            ("timeout_secs", Value::from(15)),
+        ]);
+        let waited = execute_task(TASK_TOOL, &wait, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        assert!(waited.contains("killed (SIGKILL)"), "{waited}");
+        ctx.manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_death_is_recorded_with_the_signal() {
+        let dir = std::env::temp_dir();
+        let ctx = test_ctx(dir.to_str().unwrap());
+        let policy = policy_for(&ctx);
+        let spawn = args(&[
+            ("action", Value::String("spawn".to_string())),
+            (
+                "command",
+                Value::String("exec bash -c 'kill -TERM $$'".to_string()),
+            ),
+        ]);
+        execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        let wait = args(&[
+            ("action", Value::String("wait".to_string())),
+            ("id", Value::String("task-1".to_string())),
+            ("timeout_secs", Value::from(10)),
+        ]);
+        let waited = execute_task(TASK_TOOL, &wait, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        assert!(waited.contains("killed (SIGTERM)"), "{waited}");
+        ctx.manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_reaps_running_task_and_records_terminal() {
+        let dir = std::env::temp_dir();
+        let ctx = test_ctx(dir.to_str().unwrap());
+        let policy = policy_for(&ctx);
+        let spawn = args(&[
+            ("action", Value::String("spawn".to_string())),
+            ("command", Value::String("sleep 60".to_string())),
+        ]);
+        execute_task(TASK_TOOL, &spawn, &GlobalCancellation, &policy, None)
+            .await
+            .unwrap();
+        ctx.manager.shutdown().await;
+        // Row is terminal (SIGTERM from the graceful phase), not "running".
+        assert_eq!(ctx.manager.bg_is_running("task-1"), Some(false));
+        let status = ctx.manager.bg_status_word("task-1").unwrap_or_default();
+        assert!(
+            status.contains("killed"),
+            "expected killed word, got {status}"
+        );
     }
 }
