@@ -809,7 +809,7 @@ impl AgentManager {
         let task = inner
             .bg
             .get(id)
-            .ok_or_else(|| format!("unknown background task '{id}': never spawned in this session, or its result aged out of retention"))?;
+            .ok_or_else(|| format!("unknown task '{id}': never spawned in this session, or its result aged out of retention"))?;
         let slice = crate::daemon::tasks::pure::slice_range(
             task.total_written,
             task.dropped_prefix,

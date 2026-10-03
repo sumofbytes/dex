@@ -544,18 +544,19 @@ fn shared_rows(
         ("wake retry delay", "DEX_AGENT_WAKE_RETRY_MS", 5000),
         ("wake presence", "DEX_AGENT_WAKE_PRESENCE_MS", 30_000),
     ] {
-        match env::var(env_var) {
-            Ok(raw) if raw.trim().parse::<u64>().map(|ms| ms > 0).unwrap_or(false) => {
-                row(out, name, &format!("{}ms", raw.trim()), env_var);
-            }
-            _ => row(out, name, &format!("{default}ms"), "built-in default"),
+        match crate::daemon::wake::env_ms_override(env_var) {
+            Some(d) => row(out, name, &format!("{}ms", d.as_millis()), env_var),
+            None => row(out, name, &format!("{default}ms"), "built-in default"),
         }
     }
-    match env::var("DEX_AGENT_WAKE_RETRIES") {
-        Ok(raw) if raw.trim().parse::<usize>().map(|n| n > 0).unwrap_or(false) => {
-            row(out, "wake retries", raw.trim(), "DEX_AGENT_WAKE_RETRIES");
-        }
-        _ => row(out, "wake retries", "12", "built-in default"),
+    match crate::daemon::wake::env_count_override("DEX_AGENT_WAKE_RETRIES") {
+        Some(n) => row(
+            out,
+            "wake retries",
+            &n.to_string(),
+            "DEX_AGENT_WAKE_RETRIES",
+        ),
+        None => row(out, "wake retries", "12", "built-in default"),
     }
     let (warming, warming_source) = cache_warming_origin();
     row(

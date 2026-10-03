@@ -17,13 +17,28 @@ use super::{lock_map, DaemonState};
 /// Each knob is env-tunable (milliseconds); defaults preserve prior
 /// behavior. `DEX_AGENT_WAKE_RETRIES` takes a plain count.
 fn env_ms(var: &str, default_ms: u64) -> Duration {
+    env_ms_override(var).unwrap_or(Duration::from_millis(default_ms))
+}
+
+/// Parse a millisecond-count env override; `None` when unset or invalid
+/// (zero counts as invalid). Shared with `dex doctor` so the reported
+/// origin and the effective value can't drift apart.
+pub(crate) fn env_ms_override(var: &str) -> Option<Duration> {
     match std::env::var(var) {
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(ms) if ms > 0 => Duration::from_millis(ms),
-            _ => Duration::from_millis(default_ms),
+            Ok(ms) if ms > 0 => Some(Duration::from_millis(ms)),
+            _ => None,
         },
-        Err(_) => Duration::from_millis(default_ms),
+        Err(_) => None,
     }
+}
+
+/// Parse a plain-count env override; `None` when unset, invalid, or zero.
+pub(crate) fn env_count_override(var: &str) -> Option<usize> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
 }
 
 pub(crate) fn wake_debounce() -> Duration {
@@ -33,11 +48,7 @@ fn wake_retry_delay() -> Duration {
     env_ms("DEX_AGENT_WAKE_RETRY_MS", 5000)
 }
 fn wake_retries() -> usize {
-    std::env::var("DEX_AGENT_WAKE_RETRIES")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(12)
+    env_count_override("DEX_AGENT_WAKE_RETRIES").unwrap_or(12)
 }
 fn wake_presence_window() -> Duration {
     env_ms("DEX_AGENT_WAKE_PRESENCE_MS", 30_000)

@@ -441,7 +441,7 @@ pub enum StreamEvent {
 
     /// Live output chunk from a running task: broadcast-only, never
     /// journaled (the in-memory tail buffer is the source of truth; the
-    /// model's `background(output)` poll re-reads it, so dropped SSE chunks
+    /// model's `task(output)` read re-reads it, so dropped SSE chunks
     /// are lossless). Allocates a journal seq for the live broadcast and
     /// leaves an intentional seq gap in the journal.
     #[serde(rename = "task_output")]

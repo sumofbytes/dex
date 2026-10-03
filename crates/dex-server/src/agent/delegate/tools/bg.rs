@@ -373,7 +373,7 @@ async fn bg_stop(
     let id = string_arg(args, "id").ok_or(ToolError::Missing("id"))?;
     let running = ctx.manager.bg_is_running(&id).ok_or_else(|| {
         ToolError::InvalidArgument(format!(
-            "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+            "unknown task '{id}': never spawned in this session, or its result aged out of retention"
         ))
     })?;
     if !running {
@@ -407,14 +407,29 @@ async fn bg_stop(
             }
         }
     }
-    // Give the drain a beat to observe the death and record Killed; then
-    // record synchronously so `stop` never leaves a zombie row if the drain
-    // was already gone. `bg_finish` is first-write-wins (guarded by
-    // `is_running`), so a racing drain can't double-notice.
+    // Give the drain a beat to observe the death and record the real
+    // status (it knows the actual signal), then record synchronously so
+    // `stop` never leaves a zombie row if the drain was already gone.
+    // `bg_finish` is first-write-wins (guarded by `is_running`), so a
+    // racing drain can't double-notice.
     let manager = ctx.manager.clone();
     let stop_id = id.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(mut rx) = manager.bg_watch_rx(&stop_id) {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while manager.bg_is_running(&stop_id).unwrap_or(false) {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                if tokio::time::timeout(deadline - now, rx.changed())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
         if manager.bg_is_running(&stop_id).unwrap_or(false) {
             manager.bg_finish(&stop_id, TaskStatus::Killed(None), None);
         }
@@ -435,7 +450,7 @@ async fn bg_wait(
     let id = string_arg(args, "id").ok_or(ToolError::Missing("id"))?;
     if ctx.manager.bg_read(&id, None).is_err() {
         return Err(ToolError::InvalidArgument(format!(
-            "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+            "unknown task '{id}': never spawned in this session, or its result aged out of retention"
         )));
     }
     let timeout = timeout_arg(args)?;
@@ -454,7 +469,7 @@ async fn bg_wait(
                 }
                 Some(false) => render_output(&ctx.manager, &id, cursor),
                 None => Err(ToolError::InvalidArgument(format!(
-                    "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+                    "unknown task '{id}': never spawned in this session, or its result aged out of retention"
                 ))),
             };
         }
@@ -463,7 +478,7 @@ async fn bg_wait(
         match ctx.manager.bg_is_running(&id) {
             None => {
                 return Err(ToolError::InvalidArgument(format!(
-                    "unknown background task '{id}': never spawned in this session, or its result aged out of retention"
+                    "unknown task '{id}': never spawned in this session, or its result aged out of retention"
                 )));
             }
             Some(false) => return render_output(&ctx.manager, &id, cursor),
@@ -551,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn background_is_one_tool_with_five_actions() {
+    fn task_is_one_tool_with_five_actions() {
         assert!(is_task(TASK_TOOL));
         assert_eq!(
             BACKGROUND_ACTIONS,
@@ -561,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_without_a_daemon_context_rejects_cleanly() {
+    async fn task_without_a_daemon_context_rejects_cleanly() {
         let policy = Policy::trusted();
         for action in BACKGROUND_ACTIONS {
             let a = args(&[("action", Value::String(action.to_string()))]);
@@ -576,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_missing_action_errors_cleanly() {
+    async fn task_missing_action_errors_cleanly() {
         let ctx = test_ctx("/tmp");
         let policy = policy_for(&ctx);
         let error = execute_task(TASK_TOOL, &Map::new(), &GlobalCancellation, &policy, None)
@@ -587,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_unknown_id_errors_cleanly() {
+    async fn task_unknown_id_errors_cleanly() {
         let ctx = test_ctx("/tmp");
         let policy = policy_for(&ctx);
         for action in ["output", "stop", "wait"] {
@@ -604,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_echo_round_trip() {
+    async fn task_echo_round_trip() {
         let dir = std::env::temp_dir();
         let ctx = test_ctx(dir.to_str().unwrap());
         let policy = policy_for(&ctx);
@@ -636,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_stop_kills_sleep() {
+    async fn task_stop_kills_sleep() {
         let dir = std::env::temp_dir();
         let ctx = test_ctx(dir.to_str().unwrap());
         let policy = policy_for(&ctx);
