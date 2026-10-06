@@ -535,20 +535,27 @@ fn known_provider_names(app: &App) -> Vec<String> {
 /// routing-stripped; the provider prefix is what selects it. An empty
 /// provider (daemon resolved no config yet) renders `unconfigured`, never
 /// `/unknown`.
-fn canonical_model(app: &App) -> String {
+pub(super) fn canonical_model(app: &App) -> String {
     if app.config.provider.name().is_empty() {
         return "unconfigured".to_string();
     }
-    let model = app.config.model.as_str();
-    if model.contains('/') {
-        model.to_string()
-    } else {
-        format!("{}/{}", app.config.provider.name(), model)
-    }
+    // Always `provider/model`: a namespaced id (`qwen/qwen3-coder-flash` on
+    // openrouter) still needs its provider prefix to round-trip into
+    // `model:` / `/model`.
+    format!("{}/{}", app.config.provider.name(), app.config.model)
 }
 
 fn cmd_model(app: &mut App, arg: Option<&str>) {
-    let m = arg.unwrap_or("").trim().to_string();
+    let (save, m) = {
+        let raw = arg.unwrap_or("");
+        let save = raw.split_whitespace().any(|t| t == "--save");
+        let rest = raw
+            .split_whitespace()
+            .filter(|t| *t != "--save")
+            .collect::<Vec<_>>()
+            .join(" ");
+        (save, rest)
+    };
     if m.is_empty() {
         let current = canonical_model(app);
         let cost = crate::llm::config::cost_hint_for(&current)
@@ -565,9 +572,38 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
             app,
             format!("providers: {}", known_provider_names(app).join(", ")),
         );
-        push_info(app, "usage: /model <provider>/<id>".to_string());
+        push_info(
+            app,
+            "usage: /model [--save] <provider>/<id>  (--save writes it to config.yaml)".to_string(),
+        );
         return;
     }
+    let known: std::collections::BTreeSet<String> =
+        app.config.provider_entries.keys().cloned().collect();
+    // `<endpoint>/<model>` stays valid (the provider is unchanged), and a
+    // remote client can't validate the prefix — the daemon owns the
+    // `providers:` config — so any `<name>/<model>` goes through there.
+    let prefixed = m
+        .trim()
+        .split_once('/')
+        .filter(|(prefix, rest)| !prefix.is_empty() && !rest.trim().is_empty());
+    let parsed = match prefixed {
+        Some((prefix, rest)) if app.config.endpoints.contains_key(prefix) => Ok((
+            app.config.provider.name().to_string(),
+            rest.trim().to_string(),
+        )),
+        Some((prefix, rest)) if app.remote_mode => {
+            Ok((prefix.trim().to_ascii_lowercase(), rest.trim().to_string()))
+        }
+        _ => crate::llm::config::parse_user_selection(&m, &known),
+    };
+    let (selected_provider, selected_model) = match parsed {
+        Ok(parts) => parts,
+        Err(error) => {
+            push_info(app, format!("could not switch model: {error}"));
+            return;
+        }
+    };
     let old_provider = app.config.provider.clone();
     // Remote TUI: the daemon owns endpoint routing and credentials — the
     // client may not even have the target provider's key, so resolve
@@ -575,17 +611,33 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
     // the raw selection and the daemon persists it in the session state,
     // never in the shared config file.
     if app.remote_mode {
-        if !app.config.available_models.iter().any(|c| c == &m) {
-            app.config.available_models.push(m.clone());
+        if save {
+            push_info(
+                app,
+                "config.yaml lives on the daemon host; --save is not available from a remote client"
+                    .to_string(),
+            );
+            return;
         }
-        app.config.model = m;
+        if !app
+            .config
+            .available_models
+            .iter()
+            .any(|c| c == &selected_model)
+        {
+            app.config.available_models.push(selected_model.clone());
+        }
+        if let Some(provider) = Provider::parse_known(&selected_provider, &known) {
+            app.config.provider = provider;
+        }
+        app.config.model = selected_model;
         push_info(
             app,
-            format!("model selection sent to the daemon: {}", app.config.model),
+            format!("model selection sent to the daemon: {m} (this session only)"),
         );
         return;
     }
-    let endpoint = match app.config.apply_model(&m, true) {
+    let endpoint = match app.config.apply_model(&m, save) {
         Ok(endpoint) => endpoint,
         Err(error) => {
             push_info(app, format!("could not switch model: {error}"));
@@ -596,11 +648,11 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
         .config
         .available_models
         .iter()
-        .any(|candidate| candidate == &m)
+        .any(|candidate| candidate == &selected_model)
     {
-        app.config.available_models.push(m.clone());
+        app.config.available_models.push(selected_model.clone());
     }
-    let _ = app.session.set_state("model", &m);
+    let _ = app.session.set_state("model", &selected_model);
     if app.config.provider != old_provider {
         let _ = app
             .session
@@ -621,11 +673,16 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
     push_info(
         app,
         format!(
-            "switched to {} ({}{}{}){endpoint_suffix}",
+            "switched to {} ({}{}{}){endpoint_suffix}{}",
             canonical_model(app),
             app.config.api.name(),
             cost_suffix,
             thinking_suffix,
+            if save {
+                " — saved to config.yaml"
+            } else {
+                " (this session; /model --save to keep)"
+            },
         ),
     );
 }
@@ -667,7 +724,7 @@ fn cmd_provider(app: &mut App, arg: Option<&str>) {
         // Defensive: `handle_remote_slash` intercepts `/provider <name>`
         // before this runs, so remote clients never reach it — the gate
         // mirrors `cmd_model` in case that routing ever changes.
-        Some(provider) => match app.config.switch_provider(&provider, !app.remote_mode) {
+        Some(provider) => match app.config.switch_provider(&provider, false) {
             Ok(()) => {
                 let _ = app.session.set_state("provider", provider.name());
                 push_info(app, format!("switched to provider: {}", provider.name()));

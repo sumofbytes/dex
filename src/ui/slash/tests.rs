@@ -692,7 +692,7 @@ fn handle_slash_model_switch_and_persist_is_hermetic() {
         )
         .unwrap();
     app.session = Session::from_path(&session_path).unwrap();
-    assert!(!handle_slash(&mut app, "/model beta-model"));
+    assert!(!handle_slash(&mut app, "/model anthropic/beta-model"));
     assert!(
         has_info(&app, "switched to anthropic/beta-model"),
         "{}",
@@ -718,6 +718,36 @@ fn handle_slash_model_switch_and_persist_is_hermetic() {
     assert!(!handle_slash(&mut app, "/model  "));
     assert_eq!(app.config.model, "test");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn model_requires_provider_qualified_selection() {
+    // Bare model ids and bare providers are errors, never implicit guesses.
+    let mut app = new_app();
+    assert!(!handle_slash(&mut app, "/model beta-model"));
+    assert!(
+        has_info(&app, "has no provider"),
+        "{}",
+        info_texts(&app).join(" | ")
+    );
+    assert_eq!(app.config.model, "test");
+    assert!(!handle_slash(&mut app, "/model anthropic"));
+    assert!(
+        has_info(&app, "names a provider but no model"),
+        "{}",
+        info_texts(&app).join(" | ")
+    );
+    assert_eq!(app.config.model, "test");
+}
+
+#[test]
+fn model_display_keeps_provider_prefix_for_namespaced_ids() {
+    let mut app = new_app();
+    app.config.model = "qwen/qwen3-coder-flash".to_string();
+    assert_eq!(
+        super::commands::canonical_model(&app),
+        "anthropic/qwen/qwen3-coder-flash"
+    );
 }
 
 #[test]

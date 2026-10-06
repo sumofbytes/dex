@@ -8,6 +8,7 @@ use crate::protocol::Provider;
 
 use super::catalog_query::catalog_env_vars;
 use super::provider::ProviderEntry;
+use super::secrets::{stored_key, SecretRef};
 
 #[derive(Deserialize)]
 pub struct CodexAuthFile {
@@ -61,11 +62,29 @@ pub fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
     }
 }
 
+/// Ordered env var names tried for a provider's key: pinned builtin, then
+/// the catalog `env` map. Shared with `dex doctor`.
+pub fn key_env_names(provider: &Provider) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for n in pinned_key_env(provider)
+        .into_iter()
+        .map(str::to_string)
+        .chain(catalog_env_vars(provider.name()))
+    {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    names
+}
+
 /// Per-provider credentials — the uniform deposit order for every provider
 /// except codex (which reads its own credential file):
-/// 1. `providers.<name>.api_key` in config.yaml,
-/// 2. the provider's own conventional env vars from the catalog `env` map
-///    (`OPENCODE_API_KEY`, `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, …).
+/// 1. `providers.<name>.api_key` in config.yaml — a literal or a reference
+///    (`$NAME`, `!command`, `file:path`; see `secrets`),
+/// 2. `$XDG_DATA_HOME/dex/auth.json` (`dex auth login <provider>`),
+/// 3. the provider's own conventional env vars (pinned builtin, then the
+///    catalog `env` map: `OPENCODE_API_KEY`, `ZHIPU_API_KEY`, …).
 ///
 /// Then a loud error naming the deposit places.
 pub fn resolve_credentials(
@@ -76,22 +95,25 @@ pub fn resolve_credentials(
         return load_codex_credentials();
     }
     let name = provider.name();
-    if let Some(key) = entries
+    if let Some(raw) = entries
         .get(name)
-        .and_then(|e| e.api_key.clone())
-        .filter(|k| !k.is_empty())
+        .and_then(|e| e.api_key.as_deref())
+        .filter(|k| !k.trim().is_empty())
     {
-        return Ok((key, None));
-    }
-    // The provider's own documented env vars; pinned builtin vars (see
-    // `pinned_key_env`) work cache-less — the catalog is the source for
-    // every other provider.
-    let mut env_names: Vec<String> = catalog_env_vars(name);
-    if let Some(pinned) = pinned_key_env(provider) {
-        if !env_names.iter().any(|v| v == pinned) {
-            env_names.insert(0, pinned.to_string());
+        // A reference that resolves empty (unset env var) falls through;
+        // a broken command/file is a loud error, not a silent fallback.
+        let reference = SecretRef::parse(raw);
+        if let Some(key) = reference
+            .resolve()
+            .map_err(|e| format!("providers.{name}.api_key: {e}"))?
+        {
+            return Ok((key, None));
         }
     }
+    if let Some(key) = stored_key(name) {
+        return Ok((key, None));
+    }
+    let env_names = key_env_names(provider);
     for var in &env_names {
         if let Ok(key) = env::var(var) {
             if !key.trim().is_empty() {
@@ -100,13 +122,14 @@ pub fn resolve_credentials(
         }
     }
     Err(format!(
-        "no API key for provider '{name}': set providers.{name}.api_key in config.yaml{}:\n  providers:\n    {name}:\n      api_key: <key>",
+        "no API key for provider '{name}': run `dex auth login {name}`, or set providers.{name}.api_key in config.yaml{}:\n  providers:\n    {name}:\n      api_key: $MY_{upper}_KEY   # or a literal, !command, file:path",
         if env_names.is_empty() {
             " or export the provider's key env var (run `dex update --models` to learn its name)"
                 .to_string()
         } else {
             format!(" or export {}", env_names.join(", "))
-        }
+        },
+        upper = name.to_ascii_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
     )
     .into())
 }
@@ -115,6 +138,12 @@ pub fn resolve_credentials(
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn pinned_env_name_comes_first() {
+        let names = key_env_names(&Provider::Anthropic);
+        assert_eq!(names.first().map(String::as_str), Some("ANTHROPIC_API_KEY"));
+    }
 
     #[test]
     fn load_resolves_env_then_file() {
@@ -166,6 +195,72 @@ mod tests {
         match prev_home {
             Some(v) => env::set_var("CODEX_HOME", v),
             None => env::remove_var("CODEX_HOME"),
+        }
+    }
+
+    #[test]
+    fn key_precedence_config_ref_then_auth_json_then_env() {
+        let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = [
+            ("XDG_DATA_HOME", env::var_os("XDG_DATA_HOME")),
+            ("ANTHROPIC_API_KEY", env::var_os("ANTHROPIC_API_KEY")),
+            ("DEX_TEST_KEY_REF", env::var_os("DEX_TEST_KEY_REF")),
+        ];
+        let dir = env::temp_dir().join(format!("dex-keyprec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        env::set_var("XDG_DATA_HOME", &dir);
+        env::set_var("ANTHROPIC_API_KEY", "from-env");
+        env::remove_var("DEX_TEST_KEY_REF");
+        let mut entries = BTreeMap::new();
+        let key = |entries: &BTreeMap<String, ProviderEntry>| {
+            resolve_credentials(&Provider::Anthropic, entries)
+                .map(|(k, _)| k)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(key(&entries).unwrap(), "from-env");
+        // auth.json beats env, is 0600, and `logout` removes it.
+        super::super::secrets::store_key("anthropic", "from-auth").unwrap();
+        assert_eq!(key(&entries).unwrap(), "from-auth");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(dir.join("dex/auth.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+            // A group/world-readable store is ignored, not trusted.
+            fs::set_permissions(dir.join("dex/auth.json"), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert_eq!(key(&entries).unwrap(), "from-env");
+            fs::set_permissions(dir.join("dex/auth.json"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        // Config reference beats auth.json; an unset `$VAR` falls through.
+        let entry = |k: &str| ProviderEntry {
+            api_key: Some(k.to_string()),
+            ..Default::default()
+        };
+        entries.insert("anthropic".into(), entry("$DEX_TEST_KEY_REF"));
+        assert_eq!(key(&entries).unwrap(), "from-auth");
+        env::set_var("DEX_TEST_KEY_REF", "from-ref");
+        assert_eq!(key(&entries).unwrap(), "from-ref");
+        entries.insert("anthropic".into(), entry("!printf from-cmd"));
+        assert_eq!(key(&entries).unwrap(), "from-cmd");
+        // A failing command is a loud error, not a silent fallback.
+        entries.insert("anthropic".into(), entry("!exit 1"));
+        assert!(key(&entries)
+            .unwrap_err()
+            .contains("providers.anthropic.api_key"));
+        assert!(super::super::secrets::remove_key("anthropic").unwrap());
+        let _ = fs::remove_dir_all(&dir);
+        for (k, v) in prev {
+            match v {
+                Some(v) => env::set_var(k, v),
+                None => env::remove_var(k),
+            }
         }
     }
 }

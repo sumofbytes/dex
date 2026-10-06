@@ -1,8 +1,10 @@
-use super::{pinned_key_env, stored_thinking_effort};
+use super::secrets::SecretRef;
+use super::{
+    auth_file_path, auth_file_too_open, key_env_names, stored_providers, stored_thinking_effort,
+};
 
 use super::agent_wake_origin;
 use super::cache_warming_origin;
-use super::catalog_query::catalog_env_vars;
 use super::config_file_path;
 use super::context_index::catalog_context_window;
 use super::context_index::ctx_from_index;
@@ -142,27 +144,46 @@ fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String 
                 .unwrap_or_default();
             format!("{} (codex auth)", home.join("auth.json").display())
         }
-    } else if entry
-        .and_then(|e| e.api_key.clone())
-        .filter(|k| !k.is_empty())
-        .is_some()
+    } else if let Some(raw) = entry
+        .and_then(|e| e.api_key.as_deref())
+        .filter(|k| !k.trim().is_empty())
+        .filter(|raw| !matches!(SecretRef::parse(raw), SecretRef::Env(n) if env::var(&n).map(|v| v.trim().is_empty()).unwrap_or(true)))
     {
-        format!("config providers.{}.api_key", provider.name())
+        let r = SecretRef::parse(raw);
+        let warn = if let Err(e) = r.resolve() {
+            format!(" — ERROR: {e}")
+        } else if r.is_literal() {
+            " — literal key in config; prefer `dex auth login`, $NAME or !command".to_string()
+        } else {
+            String::new()
+        };
+        format!(
+            "config providers.{}.api_key ({}){warn}",
+            provider.name(),
+            r.describe()
+        )
     } else {
-        let mut names = catalog_env_vars(provider.name());
-        // Mirror `resolve_credentials`: pinned builtin vars resolve cache-less,
-        // ahead of any catalog `env` discovery.
-        if let Some(pinned) = pinned_key_env(provider) {
-            if !names.iter().any(|v| v == pinned) {
-                names.insert(0, pinned.to_string());
-            }
-        }
-        match names
+        // `stored_key` skips a group/world-readable auth.json, so resolution
+        // falls through to the env var — report that, not the ignored file.
+        let stored = stored_providers().iter().any(|p| p == provider.name());
+        let ignored = stored && auth_file_too_open();
+        let names = key_env_names(provider);
+        let env_hit = names
             .iter()
-            .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
-        {
-            Some(name) => format!("{name} (environment)"),
-            None => "MISSING — set providers.<name>.api_key or the provider's env var".to_string(),
+            .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false));
+        let path = auth_file_path().unwrap_or_default();
+        match (stored && !ignored, env_hit) {
+            (true, _) => format!("{} (dex auth login)", path.display()),
+            (false, Some(name)) if ignored => format!(
+                "{name} (environment) — {} IGNORED: readable by others, chmod 600",
+                path.display()
+            ),
+            (false, Some(name)) => format!("{name} (environment)"),
+            (false, None) if ignored => format!(
+                "MISSING — {} IGNORED: readable by others, chmod 600",
+                path.display()
+            ),
+            (false, None) => "MISSING — run `dex auth login <provider>`, set providers.<name>.api_key, or export the provider's env var".to_string(),
         }
     }
 }

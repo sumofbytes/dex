@@ -21,6 +21,7 @@ mod headers;
 mod permission;
 mod prompt_source;
 mod provider;
+mod secrets;
 mod selection;
 /// Per-model reasoning effort — see `llm::thinking` (single owner of
 /// `thinking-effort.json`); re-exported so existing `config::...` paths
@@ -34,7 +35,10 @@ pub use crate::workspace::unique_tmp_path;
 /// Builtin providers whose canonical key env var is pinned in dex rather
 /// than catalog-discovered — see `config::credentials` (single owner of key
 /// resolution); re-exported so existing `config::...` paths keep working.
-pub use credentials::{pinned_key_env, resolve_credentials};
+pub use credentials::{key_env_names, pinned_key_env, resolve_credentials};
+pub use secrets::{
+    auth_file_path, auth_file_too_open, remove_key, store_key, stored_providers, SecretRef,
+};
 // `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use catalog_query::{
@@ -70,8 +74,8 @@ pub use provider::{
     ResolvedProvider,
 };
 pub use selection::{
-    classify_selection, env_parse, persist_selection, provider_without_prefix, resolve_selection,
-    split_selection, Resolved, SelectionRoute,
+    classify_selection, env_parse, parse_user_selection, persist_selection,
+    provider_without_prefix, resolve_selection, split_selection, Resolved, SelectionRoute,
 };
 
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
@@ -956,7 +960,7 @@ impl LlmConfig {
             self.api = api;
         }
         if persist && (self.model != prev_model || self.provider != prev_provider) {
-            persist_selection(&self.model, &self.provider, &self.base_url, &self.endpoints);
+            self.persist_selection();
         }
         // Refresh from the models.dev catalog unless the env or the file
         // pinned the window; without a catalog hit the previous value (a
@@ -972,6 +976,18 @@ impl LlmConfig {
         // choice, else `DEX_THINKING_EFFORT`.
         self.refresh_thinking_effort();
         Ok(result)
+    }
+
+    /// Write the current provider/model back as `model:` in config.yaml.
+    fn persist_selection(&self) {
+        let landing = resolve_provider(&self.provider, &self.provider_entries).landing;
+        persist_selection(
+            &self.model,
+            &self.provider,
+            &self.base_url,
+            landing.as_deref(),
+            &self.endpoints,
+        );
     }
 
     /// Trigger compaction when prompt exceeds this many tokens.
@@ -1082,7 +1098,7 @@ impl LlmConfig {
         // for the new endpoint+model too.
         self.refresh_thinking_effort();
         if persist {
-            persist_selection(&self.model, &self.provider, &self.base_url, &self.endpoints);
+            self.persist_selection();
         }
         Ok(())
     }

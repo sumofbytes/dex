@@ -76,6 +76,14 @@ pub enum Mode {
         /// Server name for `login`/`logout`.
         server: Option<String>,
     },
+    /// Provider API keys in `auth.json` (`dex auth [list|login <provider>|
+    /// logout <provider>]`).
+    Auth {
+        /// Subcommand (`list` when omitted).
+        action: String,
+        /// Provider name for `login`/`logout`.
+        provider: Option<String>,
+    },
     /// Lua extensions (`dex extensions [list|enable <id>|disable <id>|
     /// install <dir|git-url>|remove <id>]`).
     Extensions {
@@ -244,6 +252,23 @@ pub fn resolve_mode(args: &Args) -> Mode {
                     .cloned()
                     .unwrap_or_else(|| "status".to_string()),
                 server: args.rest.get(2).cloned(),
+            }
+        }
+        Some("auth") => {
+            // Strict like `mcp`: extra args are an error, never a prompt.
+            if args.rest.len() > 3 {
+                return Mode::Auth {
+                    action: "__invalid__".to_string(),
+                    provider: None,
+                };
+            }
+            Mode::Auth {
+                action: args
+                    .rest
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "list".to_string()),
+                provider: args.rest.get(2).cloned(),
             }
         }
         Some("run") if args.rest.len() >= 2 => Mode::RunTool {
@@ -526,6 +551,25 @@ mod tests {
         match resolve_mode(&args_with_rest(&["mcp", "login", "a", "b"])) {
             Mode::Mcp { action, .. } => assert_eq!(action, "__invalid__"),
             other => panic!("expected invalid Mcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_resolves_to_auth_mode() {
+        match resolve_mode(&args_with_rest(&["auth", "login", "zai"])) {
+            Mode::Auth { action, provider } => {
+                assert_eq!(action, "login");
+                assert_eq!(provider.as_deref(), Some("zai"));
+            }
+            other => panic!("expected Mode::Auth, got {other:?}"),
+        }
+        match resolve_mode(&args_with_rest(&["auth"])) {
+            Mode::Auth { action, .. } => assert_eq!(action, "list"),
+            other => panic!("expected Mode::Auth, got {other:?}"),
+        }
+        match resolve_mode(&args_with_rest(&["auth", "login", "a", "b"])) {
+            Mode::Auth { action, .. } => assert_eq!(action, "__invalid__"),
+            other => panic!("expected invalid Auth, got {other:?}"),
         }
     }
 

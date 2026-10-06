@@ -121,6 +121,38 @@ fn bare_provider_needs_model(selection: &str, provider: &str) -> String {
     )
 }
 
+/// User-facing selection grammar (`/model`, `--model`, `DEX_MODEL`,
+/// config `model:`): exactly `<provider>/<model-id>`. Unlike the lenient
+/// `apply_model` (which also restores stored session state and serves
+/// extension selectors), a bare provider or a bare model id is an error —
+/// never an implicit guess. Returns `(provider, model-id)`.
+pub fn parse_user_selection(
+    selection: &str,
+    known: &BTreeSet<String>,
+) -> Result<(String, String), String> {
+    let selection = selection.trim();
+    match classify_selection(selection, known) {
+        SelectionRoute::ProviderQualified { provider, rest } if !rest.is_empty() => {
+            Ok((provider, rest))
+        }
+        SelectionRoute::ProviderQualified { provider, .. }
+        | SelectionRoute::BareProvider { provider } => {
+            Err(bare_provider_needs_model(selection, &provider))
+        }
+        SelectionRoute::Model(_) => Err(format!(
+            "'{selection}' has no provider — use '<provider>/<model-id>' (known providers: {})",
+            Provider::BUILTINS
+                .iter()
+                .map(|s| s.to_string())
+                .chain(known.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 pub fn split_selection(
     selection: &str,
     known: &BTreeSet<String>,
@@ -143,8 +175,8 @@ pub fn split_selection(
 /// Persist a `/model`/`/provider` selection as the new default under the
 /// single canonical key: `model: <endpoint|provider>/<model>`. The prefix
 /// is re-derived on load, never stored twice: `endpoint/model` when the
-/// current URL is a named endpoint (exact routing survives without a
-/// `base_url:`), else `provider/model`. The now-redundant
+/// current URL is a named endpoint other than the provider's landing URL
+/// (exact routing survives without a `base_url:`), else `provider/model`. The now-redundant
 /// `active_provider:`, legacy `provider:`, and top-level `base_url:` keys
 /// are removed so files converge on the one-knob schema — a stale
 /// top-level `base_url:` would fight the stored prefix by pinning the old
@@ -157,6 +189,7 @@ pub fn persist_selection(
     selection: &str,
     provider: &Provider,
     base_url: &str,
+    landing: Option<&str>,
     endpoints: &BTreeMap<String, String>,
 ) {
     let Some(path) = config_file_path() else {
@@ -167,11 +200,15 @@ pub fn persist_selection(
         .and_then(|text| serde_yaml::from_str(&text).ok())
         .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
     if let Some(map) = root.as_mapping_mut() {
-        let prefix = endpoints
-            .iter()
-            .find(|(_, url)| url.as_str() == base_url)
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| provider.name().to_string());
+        let prefix = if landing == Some(base_url) {
+            provider.name().to_string()
+        } else {
+            endpoints
+                .iter()
+                .find(|(_, url)| url.as_str() == base_url)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| provider.name().to_string())
+        };
         map.insert(
             serde_yaml::Value::from("model"),
             serde_yaml::Value::from(format!("{prefix}/{selection}")),
@@ -192,5 +229,32 @@ pub fn persist_selection(
             let _ = std::fs::rename(&tmp, &path);
         }
         invalidate_config_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_selection_requires_provider_and_model() {
+        let known: BTreeSet<String> = ["zai".to_string()].into();
+        assert_eq!(
+            parse_user_selection("zai/glm-5", &known).unwrap(),
+            ("zai".to_string(), "glm-5".to_string())
+        );
+        // Provider-native slashes stay in the model id.
+        assert_eq!(
+            parse_user_selection("zai/a/b", &known).unwrap(),
+            ("zai".to_string(), "a/b".to_string())
+        );
+        assert!(parse_user_selection("zai", &known)
+            .unwrap_err()
+            .contains("no model"));
+        assert!(parse_user_selection("zai/", &known)
+            .unwrap_err()
+            .contains("no model"));
+        let err = parse_user_selection("glm-5", &known).unwrap_err();
+        assert!(err.contains("no provider") && err.contains("zai"), "{err}");
     }
 }

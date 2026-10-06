@@ -50,6 +50,7 @@ pub(crate) fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         }
         _ => {
             let had_model = remote.app.config.model.clone();
+            let had_provider = remote.app.config.provider.clone();
             let had_permission = remote.app.config.permission;
             let had_plan = remote.app.plan.clone();
             // Raw `/model <selection>` argument: the daemon routes endpoint
@@ -58,7 +59,7 @@ pub(crate) fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
             // already resolved to the bare id.
             let raw_model = line.strip_prefix("/model ").map(|s| s.trim().to_string());
             let quit = handle_slash(&mut remote.app, line);
-            if remote.app.config.model != had_model {
+            if remote.app.config.model != had_model || remote.app.config.provider != had_provider {
                 remote.options.model = Some(match raw_model {
                     Some(raw) if !raw.is_empty() => raw,
                     _ => remote.app.config.model.clone(),

@@ -63,7 +63,7 @@ pub(crate) const COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         command: "/model",
-        usage: "/model [<m>]",
+        usage: "/model [--save] [<provider>/<id>]",
         description: "Show or switch the model",
     },
     SlashCommandSpec {

@@ -1978,10 +1978,22 @@ fn legacy_provider_keys_ignored_and_dropped() {
         "m",
         &Provider::Generic("opencode".to_string()),
         "https://opencode.ai/zen/v1",
+        Some("https://opencode.ai/zen/v1"),
         &endpoints,
     );
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("model: zen/m"), "{text}");
+    // The landing endpoint persists as plain `provider/model`…
+    assert!(text.contains("model: opencode/m"), "{text}");
+    // …a non-default named endpoint keeps its prefix.
+    persist_selection(
+        "m",
+        &Provider::Generic("opencode".to_string()),
+        "https://opencode.ai/zen/go/v1",
+        Some("https://opencode.ai/zen/v1"),
+        &endpoints,
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("model: go/m"), "{text}");
     assert!(
         !text.lines().any(|l| {
             l.starts_with("provider:")
