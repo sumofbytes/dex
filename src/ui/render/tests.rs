@@ -835,7 +835,7 @@ fn footer_keeps_only_the_actionable_live_number() {
     // Context pressure stays, against the window.
     app.tool_state.last_usage = Some(12_000);
     assert!(
-        ui_status(&app).contains("ctx 12k/128k 9%"),
+        ui_status(&app).contains("ctx 12k/128k 9.3%"),
         "{}",
         ui_status(&app)
     );
@@ -964,7 +964,7 @@ fn footer_pins_right_side_and_sheds_static_facts_first() {
         "{text}"
     );
     assert!(
-        text.ends_with("ctx 12k/128k 9% · $0.023 · remote daemon.internal"),
+        text.ends_with("ctx 12k/128k 9.3% · $0.023 · remote daemon.internal"),
         "{text}"
     );
     assert_eq!(UnicodeWidthStr::width(text.as_str()), 120);
@@ -974,12 +974,15 @@ fn footer_pins_right_side_and_sheds_static_facts_first() {
     assert!(!text.contains("/tmp/dex-ui-test"), "{text}");
     assert!(text.ends_with("remote daemon.internal"), "{text}");
     // Narrow: absolute ctx numbers shorten to a percentage, cost stays.
-    let text = footer_text(&app, 70);
-    assert!(text.contains("ctx 9%") && text.contains("$0.023"), "{text}");
+    let text = footer_text(&app, 72);
+    assert!(
+        text.contains("ctx 9.3%") && text.contains("$0.023"),
+        "{text}"
+    );
     assert!(text.starts_with("auto · "), "{text}");
     // Tight: cost goes before the pressure readout and the mode.
     let text = footer_text(&app, 62);
-    assert!(text.contains("ctx 9%") && !text.contains('$'), "{text}");
+    assert!(text.contains("ctx 9.3%") && !text.contains('$'), "{text}");
     assert!(text.starts_with("auto · "), "{text}");
     assert_eq!(UnicodeWidthStr::width(text.as_str()), 62);
 }
@@ -3460,4 +3463,16 @@ fn working_row_does_not_shift_while_the_dots_animate() {
     let col = |s: &str| s.find("Esc").unwrap();
     assert_eq!(col(&at(0)), col(&at(2)));
     assert_eq!(col(&at(2)), col(&at(4)));
+}
+
+#[test]
+fn context_share_keeps_a_decimal_below_ten_percent() {
+    use super::super::status::pct_label;
+    assert_eq!(pct_label(8_000, 1_000_000), "0.8%");
+    assert_eq!(pct_label(90_800, 1_000_000), "9.0%");
+    assert_eq!(pct_label(100_000, 1_000_000), "10%");
+    assert_eq!(pct_label(123_000, 1_000_000), "12%");
+    assert_eq!(pct_label(120, 1_000_000), "<0.1%");
+    assert_eq!(pct_label(0, 1_000_000), "0.0%");
+    assert_eq!(pct_label(5, 0), "<0.1%");
 }

@@ -260,16 +260,31 @@ fn notice_pieces(app: &App) -> Option<Vec<Piece>> {
 fn ctx_piece(app: &App, short: bool) -> Piece {
     let tokens = status_tokens(app);
     let window = app.config.context_window;
-    let text = match tokens.saturating_mul(100).checked_div(window) {
-        None => format!("ctx {}", format_tokens(tokens)),
-        Some(pct) if short => format!("ctx {pct}%"),
-        Some(pct) => format!(
-            "ctx {}/{} {pct}%",
+    let text = if window == 0 {
+        format!("ctx {}", format_tokens(tokens))
+    } else if short {
+        format!("ctx {}", pct_label(tokens, window))
+    } else {
+        format!(
+            "ctx {}/{} {}",
             format_tokens(tokens),
-            format_tokens(window)
-        ),
+            format_tokens(window),
+            pct_label(tokens, window)
+        )
     };
     (text, context_style(app, tokens))
+}
+
+/// `tokens` as a share of `window`: whole percents from 10% up, one decimal
+/// below that (8k of a 1M window is `0.8%`, not a flat `0%`), and `<0.1%`
+/// instead of a misleading zero once anything is in context.
+pub(super) fn pct_label(tokens: u64, window: u64) -> String {
+    let tenths = tokens.saturating_mul(1000).checked_div(window).unwrap_or(0);
+    match tenths {
+        0 if tokens > 0 => "<0.1%".to_string(),
+        0..=99 => format!("{}.{}%", tenths / 10, tenths % 10),
+        _ => format!("{}%", tenths / 10),
+    }
 }
 
 /// Identity + activity, left side. `cwd`/`branch` are the static facts shed
