@@ -127,8 +127,8 @@ model boundary has been injected and can no longer be recalled.
 
 The transcript has three tiers. Your prompts (`❯ …`) and the assistant's
 answers are full-contrast text. Everything the agent *does* is a compact, dim
-step row — `✓ read src/a.rs:1-40      lines 1-40 of 200` — with the outcome
-right-aligned: `◌` while running, green `✓` when done, red `✗` on failure
+step (`✓ read src/a.rs:1-40`) with its outcome (`lines 1-40 of 200`) on the
+row beneath: `◌` while running, green `✓` when done, red `✗` on failure
 (failures keep their output; `Ctrl+O` shows the rest). Every block is separated
 by one blank row. Durations print only for calls over a second, and thinking shorter than 2s leaves no row.
 

@@ -1,5 +1,5 @@
-//! Tool steps: one row per call — `✓ read  src/a.rs:1-40      41 lines` — with
-//! the outcome right-aligned. Output previews stay folded for successful
+//! Tool steps: the call (`✓ read src/a.rs:1-40`) with its outcome (`41 lines`)
+//! on the row beneath. Output previews stay folded for successful
 //! calls (Ctrl+O unfolds them); failures and write/edit diffs always show.
 
 use super::super::style::fg;
@@ -10,11 +10,7 @@ use crate::render::theme;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthStr;
 
-/// Right edge of the aligned outcome column: wide terminals keep the outcome
-/// near its call instead of flung to the far edge.
-const OUTCOME_EDGE: usize = 100;
 /// Diff rows a collapsed write/edit shows before folding.
 const COLLAPSED_DIFF_ROWS: usize = 10;
 /// Calls faster than this don't print a duration; it is noise.
@@ -56,7 +52,6 @@ pub(crate) fn tool_rows(
     width: u16,
     expand: bool,
 ) -> Vec<Line<'static>> {
-    let w = width.max(1) as usize;
     let (glyph, color) = match result {
         None => ("◌", theme::muted_fg()),
         Some(r) if r.ok => ("✓", theme::success_fg()),
@@ -81,24 +76,12 @@ pub(crate) fn tool_rows(
             } else {
                 fg(theme::failure_fg())
             };
-            let edge = w.min(OUTCOME_EDGE);
-            let tw = UnicodeWidthStr::width(text.as_str());
-            let single = rows.len() == 1;
-            match rows.last_mut() {
-                Some(last) if single && last.width() + 2 + tw <= edge => {
-                    let pad = edge - last.width() - tw;
-                    last.spans.push(Span::raw(" ".repeat(pad)));
-                    last.spans.push(Span::styled(text, style));
-                }
-                _ => {
-                    // Too long to share the row: its own row under the name.
-                    let line = Line::from(vec![
-                        Span::raw(" ".repeat(TRANSCRIPT_INDENT)),
-                        Span::styled(format!("  {text}"), style),
-                    ]);
-                    rows.extend(wrap_line_display(&line, width, 0));
-                }
-            }
+            // Always its own row under the call, aligned with the tool name.
+            let line = Line::from(vec![
+                Span::raw(" ".repeat(TRANSCRIPT_INDENT)),
+                Span::styled(format!("  {text}"), style),
+            ]);
+            rows.extend(wrap_line_display(&line, width, 0));
         }
     }
     if let Some(result) = result {

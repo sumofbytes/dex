@@ -72,7 +72,7 @@ pub(crate) enum TranscriptBlock {
         /// Tool name (`bash`, `read`, `mcp__srv__tool`): heads the step row.
         name: String,
         /// The call's argument, highlighted, without indent/glyph/name — the
-        /// step row is composed at wrap time (it right-aligns the outcome).
+        /// step row is composed at wrap time (the outcome goes on the row beneath).
         input: Line<'static>,
         started: Instant,
         /// Outcome once the call finishes; `None` while it runs.
@@ -161,7 +161,7 @@ pub(crate) struct Settled {
     pub(crate) tone: TurnTone,
 }
 
-/// A finished tool call: outcome glyph/color come from `ok`, the right-hand
+/// A finished tool call: outcome glyph/color come from `ok`, the outcome
 /// text from `summary`.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolResult {

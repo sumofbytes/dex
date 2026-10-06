@@ -2370,29 +2370,24 @@ fn done(ok: bool, summary: &str, duration: f64) -> crate::ui::ToolResult {
 }
 
 #[test]
-fn tool_step_row_leads_with_status_then_name_and_aligns_the_outcome() {
+fn tool_step_leads_with_status_then_name_and_puts_the_outcome_beneath() {
     let arg = render_tool_arg("read", "src/main.rs:1-20");
     // Pending: muted `◌`, no outcome yet.
     let rows = super::tool::tool_rows("read", &arg, None, &[], 60, false);
     assert_eq!(rows.len(), 1);
     assert_eq!(row_text(&rows[0]).trim_start(), "◌ read src/main.rs:1-20");
-    // Done: green `✓`, outcome right-aligned on the same row, no duration
-    // under a second.
+    // Done: green `✓`; the outcome is the next row, aligned under the name,
+    // with no duration under a second.
     let ok = done(true, "20 lines", 0.04);
     let rows = super::tool::tool_rows("read", &arg, Some(&ok), &[], 60, false);
-    assert_eq!(rows.len(), 1);
-    let text = row_text(&rows[0]);
-    assert!(
-        text.trim_start().starts_with("✓ read src/main.rs:1-20"),
-        "{text}"
-    );
-    assert!(text.ends_with("20 lines"), "{text}");
-    assert_eq!(text.width(), 60);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(row_text(&rows[0]).trim_end(), " ✓ read src/main.rs:1-20");
+    assert_eq!(row_text(&rows[1]), "   20 lines");
     assert_eq!(rows[0].spans[1].style.fg, Some(Color::LightGreen));
     // A slow call shows its time.
     let slow = done(true, "20 lines", 3.2);
-    let text = row_text(&super::tool::tool_rows("read", &arg, Some(&slow), &[], 60, false)[0]);
-    assert!(text.ends_with("20 lines · 3.2s"), "{text}");
+    let rows = super::tool::tool_rows("read", &arg, Some(&slow), &[], 60, false);
+    assert_eq!(row_text(&rows[1]), "   20 lines · 3.2s");
     // Failure: red `✗`, outcome drops the redundant `failed` word.
     let bad = done(false, "failed (exit 101) · test x ... FAILED", 3.2);
     let rows = super::tool::tool_rows(
@@ -2403,18 +2398,18 @@ fn tool_step_row_leads_with_status_then_name_and_aligns_the_outcome() {
         80,
         false,
     );
-    let text = row_text(&rows[0]);
-    assert!(text.trim_start().starts_with("✗ bash cargo test"), "{text}");
     assert!(
-        text.ends_with("exit 101 · test x ... FAILED · 3.2s"),
-        "{text}"
+        row_text(&rows[0])
+            .trim_start()
+            .starts_with("✗ bash cargo test"),
+        "{rows:?}"
     );
+    assert_eq!(row_text(&rows[1]), "   exit 101 · test x ... FAILED · 3.2s");
     assert_eq!(rows[0].spans[1].style.fg, Some(Color::LightRed));
-    // An outcome that can't share the row drops under the name instead of
-    // overflowing.
-    let rows = super::tool::tool_rows("read", &arg, Some(&bad), &[], 40, false);
-    assert!(rows.len() > 1, "{rows:?}");
-    assert!(rows.iter().all(|r| row_text(r).width() <= 40));
+    // A long outcome wraps instead of overflowing.
+    let rows = super::tool::tool_rows("read", &arg, Some(&bad), &[], 20, false);
+    assert!(rows.len() > 2, "{rows:?}");
+    assert!(rows.iter().all(|r| row_text(r).width() <= 20));
 }
 
 #[test]
@@ -2422,23 +2417,23 @@ fn tool_previews_fold_unless_failed_or_diff_or_expanded() {
     let preview = vec![Line::from("   a"), Line::from("   b"), Line::from("   c")];
     let arg = render_tool_arg("grep", "x");
     let ok = done(true, "3 files matched", 0.0);
-    // Successful reads/greps/bash: outcome row only.
+    // Successful reads/greps/bash: the call and its outcome row only.
     let rows = super::tool::tool_rows("grep", &arg, Some(&ok), &preview, 80, false);
-    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
     // Ctrl+O unfolds them.
     let rows = super::tool::tool_rows("grep", &arg, Some(&ok), &preview, 80, true);
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     // Failures always show their output.
     let bad = done(false, "failed · boom", 0.0);
     let rows = super::tool::tool_rows("bash", &arg, Some(&bad), &preview, 80, false);
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     // write/edit diffs show, folded past a handful of rows.
     let diff: Vec<Line<'static>> = (0..14).map(|i| Line::from(format!("  +{i}"))).collect();
     let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, false);
-    assert_eq!(rows.len(), 1 + 10 + 1, "{rows:?}");
+    assert_eq!(rows.len(), 2 + 10 + 1, "{rows:?}");
     assert!(row_text(rows.last().unwrap()).contains("+4 more diff lines"));
     let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, true);
-    assert_eq!(rows.len(), 1 + 14);
+    assert_eq!(rows.len(), 2 + 14);
 }
 
 #[test]
@@ -3152,8 +3147,9 @@ fn every_block_is_separated_by_one_blank_row() {
     let steps: Vec<usize> = (0..rows.len())
         .filter(|i| rows[*i].contains("✓ read"))
         .collect();
-    assert_eq!(steps[1], steps[0] + 2, "{rows:?}");
-    assert_eq!(at("boom"), steps[1] + 2, "{rows:?}");
+    // Each step is two rows (call + outcome), then the blank row.
+    assert_eq!(steps[1], steps[0] + 3, "{rows:?}");
+    assert_eq!(at("boom"), steps[1] + 3, "{rows:?}");
     assert_eq!(at("note"), at("boom") + 2, "{rows:?}");
 }
 
