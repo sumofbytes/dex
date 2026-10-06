@@ -580,14 +580,30 @@ fn cmd_model(app: &mut App, arg: Option<&str>) {
     }
     let known: std::collections::BTreeSet<String> =
         app.config.provider_entries.keys().cloned().collect();
-    let (selected_provider, selected_model) =
-        match crate::llm::config::parse_user_selection(&m, &known) {
-            Ok(parts) => parts,
-            Err(error) => {
-                push_info(app, format!("could not switch model: {error}"));
-                return;
-            }
-        };
+    // `<endpoint>/<model>` stays valid (the provider is unchanged), and a
+    // remote client can't validate the prefix — the daemon owns the
+    // `providers:` config — so any `<name>/<model>` goes through there.
+    let prefixed = m
+        .trim()
+        .split_once('/')
+        .filter(|(prefix, rest)| !prefix.is_empty() && !rest.trim().is_empty());
+    let parsed = match prefixed {
+        Some((prefix, rest)) if app.config.endpoints.contains_key(prefix) => Ok((
+            app.config.provider.name().to_string(),
+            rest.trim().to_string(),
+        )),
+        Some((prefix, rest)) if app.remote_mode => {
+            Ok((prefix.trim().to_ascii_lowercase(), rest.trim().to_string()))
+        }
+        _ => crate::llm::config::parse_user_selection(&m, &known),
+    };
+    let (selected_provider, selected_model) = match parsed {
+        Ok(parts) => parts,
+        Err(error) => {
+            push_info(app, format!("could not switch model: {error}"));
+            return;
+        }
+    };
     let old_provider = app.config.provider.clone();
     // Remote TUI: the daemon owns endpoint routing and credentials — the
     // client may not even have the target provider's key, so resolve

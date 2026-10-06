@@ -129,11 +129,26 @@ pub fn auth_file_path() -> Option<PathBuf> {
     crate::runtime::logging::data_home().map(|base| base.join("dex/auth.json"))
 }
 
+/// Missing file → empty store. An unreadable or unparsable file is an error,
+/// so a read-modify-write never silently drops the other stored keys.
+fn read_store_checked() -> Result<BTreeMap<String, StoredKey>, String> {
+    let Some(path) = auth_file_path() else {
+        return Ok(BTreeMap::new());
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "auth: {} is not valid ({e}); fix or remove it",
+                path.display()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(format!("auth: cannot read {}: {e}", path.display())),
+    }
+}
+
 fn read_store() -> BTreeMap<String, StoredKey> {
-    auth_file_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    read_store_checked().unwrap_or_default()
 }
 
 fn write_store(store: &BTreeMap<String, StoredKey>) -> Result<(), String> {
@@ -197,7 +212,7 @@ pub fn store_key(provider: &str, key: &str) -> Result<(), String> {
     if key.is_empty() {
         return Err("empty key".to_string());
     }
-    let mut store = read_store();
+    let mut store = read_store_checked()?;
     store.insert(
         provider.to_string(),
         StoredKey {
@@ -210,7 +225,7 @@ pub fn store_key(provider: &str, key: &str) -> Result<(), String> {
 
 /// True when an entry was removed.
 pub fn remove_key(provider: &str) -> Result<bool, String> {
-    let mut store = read_store();
+    let mut store = read_store_checked()?;
     let removed = store.remove(provider).is_some();
     if removed {
         write_store(&store)?;

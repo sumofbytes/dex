@@ -643,6 +643,17 @@ fn run_mcp(action: &str, server: Option<&str>) {
 fn read_key_from_stdin(provider: &str) -> Result<String, String> {
     use std::io::{BufRead as _, IsTerminal as _};
     let tty = std::io::stdin().is_terminal();
+    // Restores echo on every exit path, including unwinding.
+    struct EchoGuard(bool);
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                #[cfg(unix)]
+                let _ = std::process::Command::new("stty").arg("echo").status();
+            }
+        }
+    }
+    let _guard = EchoGuard(tty);
     if tty {
         eprint!("API key for {provider}: ");
         #[cfg(unix)]
@@ -651,8 +662,6 @@ fn read_key_from_stdin(provider: &str) -> Result<String, String> {
     let mut line = String::new();
     let read = std::io::stdin().lock().read_line(&mut line);
     if tty {
-        #[cfg(unix)]
-        let _ = std::process::Command::new("stty").arg("echo").status();
         eprintln!();
     }
     read.map_err(|e| e.to_string())?;

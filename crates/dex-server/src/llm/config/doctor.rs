@@ -150,31 +150,40 @@ fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String 
         .filter(|raw| !matches!(SecretRef::parse(raw), SecretRef::Env(n) if env::var(&n).map(|v| v.trim().is_empty()).unwrap_or(true)))
     {
         let r = SecretRef::parse(raw);
-        let warn = if r.is_literal() {
-            " — literal key in config; prefer `dex auth login`, $NAME or !command"
+        let warn = if let Err(e) = r.resolve() {
+            format!(" — ERROR: {e}")
+        } else if r.is_literal() {
+            " — literal key in config; prefer `dex auth login`, $NAME or !command".to_string()
         } else {
-            ""
+            String::new()
         };
         format!(
             "config providers.{}.api_key ({}){warn}",
             provider.name(),
             r.describe()
         )
-    } else if stored_providers().iter().any(|p| p == provider.name()) {
-        let path = auth_file_path().unwrap_or_default();
-        if auth_file_too_open() {
-            format!("{} — IGNORED: readable by others, chmod 600", path.display())
-        } else {
-            format!("{} (dex auth login)", path.display())
-        }
     } else {
+        // `stored_key` skips a group/world-readable auth.json, so resolution
+        // falls through to the env var — report that, not the ignored file.
+        let stored = stored_providers().iter().any(|p| p == provider.name());
+        let ignored = stored && auth_file_too_open();
         let names = key_env_names(provider);
-        match names
+        let env_hit = names
             .iter()
-            .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
-        {
-            Some(name) => format!("{name} (environment)"),
-            None => "MISSING — run `dex auth login <provider>`, set providers.<name>.api_key, or export the provider's env var".to_string(),
+            .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false));
+        let path = auth_file_path().unwrap_or_default();
+        match (stored && !ignored, env_hit) {
+            (true, _) => format!("{} (dex auth login)", path.display()),
+            (false, Some(name)) if ignored => format!(
+                "{name} (environment) — {} IGNORED: readable by others, chmod 600",
+                path.display()
+            ),
+            (false, Some(name)) => format!("{name} (environment)"),
+            (false, None) if ignored => format!(
+                "MISSING — {} IGNORED: readable by others, chmod 600",
+                path.display()
+            ),
+            (false, None) => "MISSING — run `dex auth login <provider>`, set providers.<name>.api_key, or export the provider's env var".to_string(),
         }
     }
 }
