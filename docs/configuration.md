@@ -20,11 +20,18 @@ gateway — is an ordinary `providers:` entry resolved through the models.dev
 catalog.
 
 `model:` is the only selection knob and names provider _and_ model:
-`<provider>/<model>` — the stored key always carries a model id (an
-in-session `/model anthropic` may switch just the provider; the key stays
-qualified). Write-back keeps that form: a `/model` or `/provider` pick updates
-`model:` in the file, so the switch becomes the default for later runs. Session
-state still re-applies the exact provider/model on `/resume`.
+`<provider>/<model>`. The same exact form is required everywhere a user
+types a selection (`model:`, `DEX_MODEL`, `--model`, `/model`): a bare
+provider (`anthropic`) or a bare model id (`gpt-5-nano`) is an error, never
+a guess. Provider-native slashes stay in the id (`openrouter/qwen/qwen3-coder-flash`).
+
+`/model <provider>/<id>` switches for the current session only (local and
+remote TUIs alike, and `/resume` restores it). `/model --save <provider>/<id>`
+also writes `model:` in the file (local only — a remote client can't edit the
+daemon host's config). The stored form is `<provider>/<model>`; an endpoint
+prefix (`go/…`) is written only when the model rides a non-default endpoint
+of its provider. `/provider <name>` switches provider and keeps the current
+model id.
 
 A minimal `~/.config/dex/config.yaml` (the endpoint comes from the
 models.dev catalog, so no `base_url:` is needed here):

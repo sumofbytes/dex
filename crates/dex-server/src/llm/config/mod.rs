@@ -74,8 +74,8 @@ pub use provider::{
     ResolvedProvider,
 };
 pub use selection::{
-    classify_selection, env_parse, persist_selection, provider_without_prefix, resolve_selection,
-    split_selection, Resolved, SelectionRoute,
+    classify_selection, env_parse, parse_user_selection, persist_selection,
+    provider_without_prefix, resolve_selection, split_selection, Resolved, SelectionRoute,
 };
 
 /// Config file location: `$DEX_CONFIG` > `$XDG_CONFIG_HOME/dex/config.yaml`
@@ -960,7 +960,7 @@ impl LlmConfig {
             self.api = api;
         }
         if persist && (self.model != prev_model || self.provider != prev_provider) {
-            persist_selection(&self.model, &self.provider, &self.base_url, &self.endpoints);
+            self.persist_selection();
         }
         // Refresh from the models.dev catalog unless the env or the file
         // pinned the window; without a catalog hit the previous value (a
@@ -976,6 +976,18 @@ impl LlmConfig {
         // choice, else `DEX_THINKING_EFFORT`.
         self.refresh_thinking_effort();
         Ok(result)
+    }
+
+    /// Write the current provider/model back as `model:` in config.yaml.
+    fn persist_selection(&self) {
+        let landing = resolve_provider(&self.provider, &self.provider_entries).landing;
+        persist_selection(
+            &self.model,
+            &self.provider,
+            &self.base_url,
+            landing.as_deref(),
+            &self.endpoints,
+        );
     }
 
     /// Trigger compaction when prompt exceeds this many tokens.
@@ -1086,7 +1098,7 @@ impl LlmConfig {
         // for the new endpoint+model too.
         self.refresh_thinking_effort();
         if persist {
-            persist_selection(&self.model, &self.provider, &self.base_url, &self.endpoints);
+            self.persist_selection();
         }
         Ok(())
     }

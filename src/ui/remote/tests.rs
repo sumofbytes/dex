@@ -736,7 +736,7 @@ fn remote_model_switch_drops_stale_thinking_override() {
     let mut remote = test_remote();
     handle_remote_slash(&mut remote, "/thinking high");
     assert!(remote.options.thinking_effort.is_some());
-    handle_remote_slash(&mut remote, "/model other-model");
+    handle_remote_slash(&mut remote, "/model anthropic/other-model");
     assert!(
         remote.options.thinking_effort.is_none(),
         "model switch clears the old override so the daemon default applies"
@@ -774,7 +774,7 @@ fn remote_model_switch_does_not_write_config_file_back() {
 
     let mut remote = test_remote();
     remote.app.config.model = "opencode/other-model".into();
-    handle_remote_slash(&mut remote, "/model other-model");
+    handle_remote_slash(&mut remote, "/model anthropic/other-model");
     assert!(remote.options.model.is_some(), "override still forwards");
     assert_eq!(
         remote.app.config.model, "other-model",
