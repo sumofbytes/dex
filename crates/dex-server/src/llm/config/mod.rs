@@ -21,6 +21,7 @@ mod headers;
 mod permission;
 mod prompt_source;
 mod provider;
+mod secrets;
 mod selection;
 /// Per-model reasoning effort — see `llm::thinking` (single owner of
 /// `thinking-effort.json`); re-exported so existing `config::...` paths
@@ -35,6 +36,9 @@ pub use crate::workspace::unique_tmp_path;
 /// than catalog-discovered — see `config::credentials` (single owner of key
 /// resolution); re-exported so existing `config::...` paths keep working.
 pub use credentials::{key_env_names, pinned_key_env, resolve_credentials};
+pub use secrets::{
+    auth_file_path, auth_file_too_open, remove_key, store_key, stored_providers, SecretRef,
+};
 // `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use catalog_query::{

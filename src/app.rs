@@ -639,6 +639,68 @@ fn run_mcp(action: &str, server: Option<&str>) {
     }
 }
 
+/// Read a key from stdin; echo is suppressed when stdin is a terminal.
+fn read_key_from_stdin(provider: &str) -> Result<String, String> {
+    use std::io::{BufRead as _, IsTerminal as _};
+    let tty = std::io::stdin().is_terminal();
+    if tty {
+        eprint!("API key for {provider}: ");
+        #[cfg(unix)]
+        let _ = std::process::Command::new("stty").arg("-echo").status();
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    if tty {
+        #[cfg(unix)]
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        eprintln!();
+    }
+    read.map_err(|e| e.to_string())?;
+    Ok(line.trim().to_string())
+}
+
+/// `dex auth <action>` — provider API keys in `auth.json` (0600).
+fn run_auth(action: &str, provider: Option<&str>) {
+    use crate::llm::config::{auth_file_path, remove_key, store_key, stored_providers};
+    let provider = provider.map(|p| p.trim().to_ascii_lowercase());
+    match (action, provider.as_deref()) {
+        ("list", None) => {
+            let path = auth_file_path().unwrap_or_default();
+            let names = stored_providers();
+            if names.is_empty() {
+                println!("no stored keys ({})", path.display());
+            }
+            for n in names {
+                println!("{n}  api_key  ({})", path.display());
+            }
+        }
+        ("login", Some(p)) if !p.is_empty() && !p.contains('/') => {
+            let result = read_key_from_stdin(p).and_then(|key| store_key(p, &key));
+            run_or_exit(
+                Some(result.map(|()| format!("saved key for {p}"))),
+                "",
+                "auth login failed: ",
+            );
+        }
+        ("logout", Some(p)) => run_or_exit(
+            Some(remove_key(p).map(|removed| {
+                if removed {
+                    format!("removed key for {p}")
+                } else {
+                    format!("no stored key for {p}")
+                }
+            })),
+            "",
+            "auth logout failed: ",
+        ),
+        _ => run_or_exit(
+            None,
+            "usage: dex auth [list|login <provider>|logout <provider>]",
+            "",
+        ),
+    }
+}
+
 pub fn run() {
     crate::runtime::logging::init();
     #[cfg(feature = "tui")]
@@ -791,6 +853,7 @@ pub fn run() {
         Mode::RunTool { name, args } => run_run_tool(&name, &args),
         Mode::Extensions { action, name } => run_extensions(&action, name.as_deref()),
         Mode::Mcp { action, server } => run_mcp(&action, server.as_deref()),
+        Mode::Auth { action, provider } => run_auth(&action, provider.as_deref()),
     }
 }
 

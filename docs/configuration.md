@@ -36,6 +36,25 @@ providers:
 model: opencode/gpt-5-nano # provider / model
 ```
 
+## API keys
+
+`providers.<name>.api_key` is a reference, not necessarily a literal:
+
+| Value | Meaning |
+|---|---|
+| `$NAME` / `${NAME}` | the env var (unset or empty falls through to the next source) |
+| `!pass show zai` | stdout of `sh -c` (a failing command is an error, not a fallback) |
+| `file:~/.secrets/zai` | file contents, trimmed |
+| anything else | a literal key (`$$…` / `!!…` escape a literal starting with `$` / `!`) |
+
+To keep `config.yaml` free of secrets, store keys with `dex auth login <provider>`
+(reads the key from stdin, no echo on a terminal) into
+`$XDG_DATA_HOME/dex/auth.json` (0600; ignored if group/world-readable).
+`dex auth list` shows stored providers, `dex auth logout <provider>` removes one.
+Lookup order: config `api_key` > `auth.json` > the provider's catalog env var.
+`dex doctor` shows which source supplied the key and flags literal keys in config.
+OAuth providers (codex, MCP) keep their own login flows.
+
 ## Provider examples
 
 Copy-paste samples for popular providers live in `examples/config.yaml`
@@ -155,10 +174,11 @@ providers:
 `zai/<id>` once configured). The endpoint, model list, pricing, context windows
 and reasoning options come from the cached models.dev catalog — run
 `dex update --models` once. The key resolves per provider: config
-`providers.<name>.api_key` > the provider's own documented env var (from the
-catalog, e.g. `ZHIPU_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY`). There
-is no per-provider default key var outside the catalog
-— one provider's key never leaks into another. A model's advertised thinking
+`providers.<name>.api_key` > `auth.json` (`dex auth login <name>`) > the
+provider's own documented env var (from the catalog, e.g. `ZHIPU_API_KEY`,
+`OPENROUTER_API_KEY`, `OPENCODE_API_KEY`). There is no per-provider default key
+var outside the catalog — one provider's key never leaks into another; to use a
+different variable write `api_key: $MY_VAR`. A model's advertised thinking
 options (e.g. `low/high/max`) are shown in the `/model` confirmation;
 `/thinking <level>` pins one per model (remembered per endpoint+model and
 validated against the advertised list — unknown models accept anything, a stale

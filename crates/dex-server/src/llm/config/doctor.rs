@@ -1,4 +1,7 @@
-use super::{key_env_names, stored_thinking_effort};
+use super::secrets::SecretRef;
+use super::{
+    auth_file_path, auth_file_too_open, key_env_names, stored_providers, stored_thinking_effort,
+};
 
 use super::agent_wake_origin;
 use super::cache_warming_origin;
@@ -141,12 +144,29 @@ fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String 
                 .unwrap_or_default();
             format!("{} (codex auth)", home.join("auth.json").display())
         }
-    } else if entry
-        .and_then(|e| e.api_key.clone())
-        .filter(|k| !k.is_empty())
-        .is_some()
+    } else if let Some(raw) = entry
+        .and_then(|e| e.api_key.as_deref())
+        .filter(|k| !k.trim().is_empty())
+        .filter(|raw| !matches!(SecretRef::parse(raw), SecretRef::Env(n) if env::var(&n).map(|v| v.trim().is_empty()).unwrap_or(true)))
     {
-        format!("config providers.{}.api_key", provider.name())
+        let r = SecretRef::parse(raw);
+        let warn = if r.is_literal() {
+            " — literal key in config; prefer `dex auth login`, $NAME or !command"
+        } else {
+            ""
+        };
+        format!(
+            "config providers.{}.api_key ({}){warn}",
+            provider.name(),
+            r.describe()
+        )
+    } else if stored_providers().iter().any(|p| p == provider.name()) {
+        let path = auth_file_path().unwrap_or_default();
+        if auth_file_too_open() {
+            format!("{} — IGNORED: readable by others, chmod 600", path.display())
+        } else {
+            format!("{} (dex auth login)", path.display())
+        }
     } else {
         let names = key_env_names(provider);
         match names
@@ -154,7 +174,7 @@ fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String 
             .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
         {
             Some(name) => format!("{name} (environment)"),
-            None => "MISSING — set providers.<name>.api_key or the provider's env var".to_string(),
+            None => "MISSING — run `dex auth login <provider>`, set providers.<name>.api_key, or export the provider's env var".to_string(),
         }
     }
 }
