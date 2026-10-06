@@ -1,5 +1,6 @@
 use super::super::append_sink_line;
 use super::super::close_thinking;
+use super::super::deny_all_approvals;
 use super::super::flush_assistant;
 use super::super::last_col;
 use super::super::line_selection_text;
@@ -14,6 +15,7 @@ use super::super::AgentChip;
 use super::super::Selection;
 use super::super::TurnTone;
 use super::super::{PendingApproval, PendingQuestionUi};
+use super::keys::resolve_all_questions;
 use super::pollers::refresh_git_async;
 use super::pollers::{spawn_approval_poster, spawn_question_poster};
 use super::state::RemoteApp;
@@ -566,6 +568,14 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
         if !restored.is_empty() {
             app.input = crate::ui::input::InputField::from_text(&restored.join("\n"));
         }
+    }
+    // A finished turn leaves nothing to answer: the daemon resolves or
+    // tears down parked approvals/questions without the tail telling us
+    // (external resolution, session teardown), so drop the UI copies — the
+    // composer slot returns and the dead channels unwind rather than wait.
+    if !app.pending_approvals.is_empty() || !app.pending_questions.is_empty() {
+        deny_all_approvals(app);
+        resolve_all_questions(app);
     }
     app.busy = false;
     app.cancel_requested = false;

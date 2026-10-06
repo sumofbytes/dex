@@ -43,7 +43,7 @@ pub(crate) fn render_approval_detail(name: &str, detail: &str) -> Line<'static> 
         } else {
             ("", detail)
         };
-        // Single-line only (same first-row truncation as render_tool_input).
+        // Single-line only (same first-row truncation as render_tool_arg).
         if !code.is_empty() && !code.contains('\n') {
             if let Some(mut rows) = highlight_code_block("bash", code) {
                 if let Some(first) = rows.first_mut() {

@@ -166,7 +166,7 @@ impl RenderHooks for CopySafeCodeHooks {
             lines.push(Line::from(Span::styled(format!("  {lang}"), dim)));
         }
         // One shared helper (sorted segments, byte-safe split): the same
-        // rows `render_tool_input` highlights and headless output prints.
+        // rows `render_tool_arg` highlights and headless output prints.
         let highlighted = highlight_code_block(lang, content);
         match highlighted {
             Some(rows) => {
