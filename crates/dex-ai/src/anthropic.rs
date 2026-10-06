@@ -2,8 +2,8 @@
 //! the request side: history → `POST /v1/messages` body. The response side
 //! is the SSE parser in `sse::AnthropicParser`, and auth is
 //! `provider::AuthScheme::Anthropic` — the same one-module-per-protocol
-//! split the OpenAI pair (`protocol.rs` + `stream.rs` parsers) uses, so a
-//! wire detail is only ever touched in one place.
+//! split the OpenAI pair (`wire.rs` + the `streaming::parser` SSE parsers)
+//! uses, so a wire detail is only ever touched in one place.
 
 use serde_json::{json, Value};
 

@@ -70,6 +70,8 @@ fn pi_key_env_aliases(provider: &str) -> &'static [&'static str] {
         "zai" | "zai-coding-plan" => &["ZAI_API_KEY"],
         "zhipuai-coding-plan" => &["ZAI_CODING_CN_API_KEY"],
         "meta" => &["META_API_KEY"],
+        "minimax-cn" | "minimax-cn-coding-plan" => &["MINIMAX_CN_API_KEY"],
+        "radius" => &["RADIUS_API_KEY"],
         "bailing" => &["ANT_LING_API_KEY"],
         "cloudflare-ai-gateway" => &["CLOUDFLARE_API_KEY"],
         "alibaba-token-plan" => &["QWEN_TOKEN_PLAN_API_KEY"],
