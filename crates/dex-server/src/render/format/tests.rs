@@ -812,3 +812,11 @@ fn bash_failure_explains_itself_with_stderr_or_the_last_line() {
         vec!["---", "--- stderr ---", "fatal: bad"]
     );
 }
+
+#[test]
+fn read_short_arg_ignores_empty_paths() {
+    assert_eq!(
+        short_arg("read", r#"{"path":"src/main.rs","paths":[]}"#),
+        "src/main.rs"
+    );
+}
