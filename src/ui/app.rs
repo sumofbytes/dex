@@ -171,20 +171,6 @@ pub(crate) struct ToolResult {
     pub(crate) duration: f64,
 }
 
-/// Blank rows between two adjacent transcript blocks. Process steps (tools,
-/// thinking, system notes) hug the narration that introduces them and each
-/// other; speaker changes (prompt, answer, notices, turn summary) get air.
-pub(crate) fn block_gap(prev: &TranscriptBlock, next: &TranscriptBlock) -> usize {
-    use TranscriptBlock as B;
-    let step = |b: &B| matches!(b, B::Tool { .. } | B::Thinking { .. } | B::System { .. });
-    let opens_steps = matches!(next, B::Activity { settled: None, .. }) && step(prev);
-    if (step(next) && (step(prev) || matches!(prev, B::Assistant { .. }))) || opens_steps {
-        0
-    } else {
-        super::style::BLOCK_GAP_ROWS
-    }
-}
-
 /// Per-block wrapped display rows, parallel to `transcript`. Blocks are
 /// append-only, so a streaming flush re-wraps only the blocks whose stamp
 /// changed instead of the whole transcript.

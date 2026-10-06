@@ -129,9 +129,8 @@ The transcript has three tiers. Your prompts (`❯ …`) and the assistant's
 answers are full-contrast text. Everything the agent *does* is a compact, dim
 step row — `✓ read src/a.rs:1-40      lines 1-40 of 200` — with the outcome
 right-aligned: `◌` while running, green `✓` when done, red `✗` on failure
-(failures keep their output; `Ctrl+O` shows the rest). Steps hug the narration
-that introduces them; speaker changes get a blank row. Durations print only
-for calls over a second, and thinking shorter than 2s leaves no row.
+(failures keep their output; `Ctrl+O` shows the rest). Every block is separated
+by one blank row. Durations print only for calls over a second, and thinking shorter than 2s leaves no row.
 
 While a turn runs the last row reads `● Working 12s · bash 3s · Esc to
 interrupt` (turn time, the call in flight, its own time). It settles into

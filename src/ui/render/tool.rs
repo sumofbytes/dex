@@ -123,11 +123,5 @@ pub(crate) fn tool_rows(
             }
         }
     }
-    // A step that took more than its one row (wrapped command, outcome on its
-    // own row, preview) gets air after it, so the next step doesn't read as
-    // its continuation; one-row steps stay tight.
-    if rows.len() > 1 && result.is_some() {
-        rows.push(Line::default());
-    }
     rows
 }

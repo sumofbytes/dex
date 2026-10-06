@@ -1,4 +1,4 @@
-use super::super::block_gap;
+use super::super::style::BLOCK_GAP_ROWS;
 use super::super::style::INPUT_PROMPT_WIDTH;
 use super::super::transcript_indent;
 use super::super::App;
@@ -271,9 +271,8 @@ pub(crate) fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
         if app.wrapped_cache[idx].rows.is_empty() {
             continue;
         }
-        if let Some(p) = prev {
-            let gap = block_gap(&app.transcript[p], &app.transcript[idx]);
-            for _ in 0..gap {
+        if prev.is_some() {
+            for _ in 0..BLOCK_GAP_ROWS {
                 app.display_cache.push(Line::default());
             }
         }
@@ -293,8 +292,8 @@ pub(crate) fn display_offset(app: &App, upto: usize) -> usize {
         if wb.rows.is_empty() {
             continue;
         }
-        if let Some(p) = prev {
-            start += block_gap(&app.transcript[p], &app.transcript[idx]);
+        if prev.is_some() {
+            start += BLOCK_GAP_ROWS;
         }
         start += wb.rows.len();
         prev = Some(idx);
@@ -376,11 +375,7 @@ impl TranscriptView {
                                 // open activity (0 rows while thinking
                                 // streams) plus its separator when
                                 // non-empty.
-                                let sep = if tail_rows > 0 {
-                                    block_gap(&app.transcript[idx], &app.transcript[tail])
-                                } else {
-                                    0
-                                };
+                                let sep = usize::from(tail_rows > 0) * BLOCK_GAP_ROWS;
                                 thinking_row = Some(app.display_cache.len() - tail_rows - sep - 1);
                             }
                         }

@@ -2427,18 +2427,18 @@ fn tool_previews_fold_unless_failed_or_diff_or_expanded() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     // Ctrl+O unfolds them.
     let rows = super::tool::tool_rows("grep", &arg, Some(&ok), &preview, 80, true);
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 4);
     // Failures always show their output.
     let bad = done(false, "failed · boom", 0.0);
     let rows = super::tool::tool_rows("bash", &arg, Some(&bad), &preview, 80, false);
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 4);
     // write/edit diffs show, folded past a handful of rows.
     let diff: Vec<Line<'static>> = (0..14).map(|i| Line::from(format!("  +{i}"))).collect();
     let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, false);
-    assert_eq!(rows.len(), 1 + 10 + 1 + 1, "{rows:?}");
-    assert!(row_text(&rows[rows.len() - 2]).contains("+4 more diff lines"));
+    assert_eq!(rows.len(), 1 + 10 + 1, "{rows:?}");
+    assert!(row_text(rows.last().unwrap()).contains("+4 more diff lines"));
     let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, true);
-    assert_eq!(rows.len(), 1 + 14 + 1);
+    assert_eq!(rows.len(), 1 + 14);
 }
 
 #[test]
@@ -3111,7 +3111,7 @@ fn plain(rows: &[Line<'_>]) -> Vec<String> {
 }
 
 #[test]
-fn process_steps_hug_each_other_and_speakers_get_air() {
+fn every_block_is_separated_by_one_blank_row() {
     use crate::protocol::SinkLine;
     let mut app = test_app();
     app.transcript.clear();
@@ -3146,14 +3146,13 @@ fn process_steps_hug_each_other_and_speakers_get_air() {
     terminal.draw(|f| view(f, &mut app)).unwrap();
     let rows: Vec<String> = app.display_cache.iter().map(row_text).collect();
     let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
-    // Prompt → narration: air. Narration → steps → steps: tight.
+    // One blank row between every pair of blocks, steps included.
     assert_eq!(at("looking"), at("go") + 2, "{rows:?}");
-    assert_eq!(at("✓ read"), at("looking") + 1, "{rows:?}");
+    assert_eq!(at("✓ read"), at("looking") + 2, "{rows:?}");
     let steps: Vec<usize> = (0..rows.len())
         .filter(|i| rows[*i].contains("✓ read"))
         .collect();
-    assert_eq!(steps[1], steps[0] + 1, "{rows:?}");
-    // Step → error → note: speaker changes get a gap row each.
+    assert_eq!(steps[1], steps[0] + 2, "{rows:?}");
     assert_eq!(at("boom"), steps[1] + 2, "{rows:?}");
     assert_eq!(at("note"), at("boom") + 2, "{rows:?}");
 }
