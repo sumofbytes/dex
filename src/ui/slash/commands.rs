@@ -198,10 +198,10 @@ pub(crate) fn usage_rows(app: &App) -> Vec<String> {
     let ctx = super::super::status::status_tokens(app);
     rows.push(if app.config.context_window > 0 {
         format!(
-            "context: {}/{} ({}%)",
+            "context: {}/{} ({})",
             format_tokens(ctx),
             format_tokens(app.config.context_window),
-            ctx.saturating_mul(100) / app.config.context_window
+            super::super::status::pct_label(ctx, app.config.context_window)
         )
     } else {
         format!("context: {}", format_tokens(ctx))
