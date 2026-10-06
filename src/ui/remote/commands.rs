@@ -1,8 +1,7 @@
 use super::super::push_info;
-use super::super::push_info_line;
+use super::super::push_info_block;
 use super::super::slash::handle_slash;
 use super::super::slash::reset_session_state;
-use super::boot::skills_header_line;
 use super::input::find_local_session_file;
 use super::input::no_paint;
 use super::input::rebuild_remote_from_messages;
@@ -23,8 +22,10 @@ pub(crate) fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
         SlashCommand::Clear => remote_reset(remote, false),
         SlashCommand::New => remote_reset(remote, true),
         SlashCommand::Session => {
-            let id = remote.session_id.clone();
-            push_info(&mut remote.app, format!("session: {id} (on daemon)"));
+            let mut rows = vec![format!("session: {} (on daemon)", remote.session_id)];
+            rows.push(format!("turns: {}", remote.app.session.count_turns()));
+            rows.extend(super::super::slash::usage_rows(&remote.app));
+            push_info_block(&mut remote.app, rows);
         }
         SlashCommand::Undo => remote_undo(remote),
         SlashCommand::Mcp(arg) => remote_mcp(remote, arg),
@@ -135,8 +136,6 @@ fn remote_reset(remote: &mut RemoteApp, new_session: bool) {
             fresh.set_name(name).ok();
             remote.app.session = fresh;
             push_info(&mut remote.app, label.to_string());
-            let header = skills_header_line(&remote.app.skills);
-            push_info_line(&mut remote.app, header);
         }
         Err(e) => push_info(&mut remote.app, format!("could not start new session: {e}")),
     }
@@ -190,14 +189,12 @@ fn remote_mcp(remote: &mut RemoteApp, arg: Option<&str>) {
                         .unwrap_or_default();
                     // No per-tool detail over the wire yet: headers + errors.
                     let truncated = body["truncated"].as_u64().unwrap_or(0) as usize;
-                    for line in crate::render::format::render_mcp_panel(&statuses, &[], truncated) {
-                        push_info(&mut remote.app, line);
-                    }
+                    let mut rows =
+                        crate::render::format::render_mcp_panel(&statuses, &[], truncated);
                     // Auth rides the same body (`auth`, null for stdio) so a
                     // remote TUI never needs the daemon host's token files.
-                    for line in crate::client::http::mcp_auth_lines(&body) {
-                        push_info(&mut remote.app, line);
-                    }
+                    rows.extend(crate::client::http::mcp_auth_lines(&body));
+                    push_info_block(&mut remote.app, rows);
                 }
                 Err(e) => push_info(&mut remote.app, format!("could not fetch MCP status: {e}")),
             }
@@ -236,10 +233,9 @@ fn remote_skill(remote: &mut RemoteApp, name: Option<&str>) {
                 }
                 let names: Vec<String> = remote.app.skills.iter().map(|s| s.name.clone()).collect();
                 if !names.is_empty() {
-                    push_info(&mut remote.app, "available skills:".to_string());
-                    for n in names {
-                        push_info(&mut remote.app, format!("  - {n}"));
-                    }
+                    let mut rows = vec!["available skills:".to_string()];
+                    rows.extend(names.into_iter().map(|n| format!("  - {n}")));
+                    push_info_block(&mut remote.app, rows);
                 }
             } else {
                 push_info(
@@ -467,7 +463,7 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
             if sessions.is_empty() {
                 push_info(&mut remote.app, "no sessions found.".to_string());
             } else {
-                push_info(&mut remote.app, "sessions:".to_string());
+                let mut rows = vec!["sessions:".to_string()];
                 for (i, s) in sessions.iter().enumerate() {
                     let name = s.name.as_deref().unwrap_or("(unnamed)");
                     let mut row = format!("  {}: {} ({})", i, name, s.session_id);
@@ -477,12 +473,10 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
                     if s.interrupted_children > 0 {
                         row.push_str(&format!(" · {} interrupted", s.interrupted_children));
                     }
-                    push_info(&mut remote.app, row);
+                    rows.push(row);
                 }
-                push_info(
-                    &mut remote.app,
-                    "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
-                );
+                rows.push("use /resume <index|id> to resume (reattaches on daemon)".to_string());
+                push_info_block(&mut remote.app, rows);
             }
         } else {
             let sessions = Session::list(&remote.app.cwd).unwrap_or_default();
@@ -501,18 +495,13 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
             if filtered.is_empty() {
                 push_info(&mut remote.app, "no sessions found.".to_string());
             } else {
-                push_info(&mut remote.app, "sessions:".to_string());
+                let mut rows = vec!["sessions:".to_string()];
                 for (i, (path, header)) in filtered.iter().enumerate() {
                     let name = header.name().unwrap_or("(unnamed)");
-                    push_info(
-                        &mut remote.app,
-                        format!("  {}: {} ({})", i, name, path.display()),
-                    );
+                    rows.push(format!("  {}: {} ({})", i, name, path.display()));
                 }
-                push_info(
-                    &mut remote.app,
-                    "use /resume <index|id> to resume (reattaches on daemon)".to_string(),
-                );
+                rows.push("use /resume <index|id> to resume (reattaches on daemon)".to_string());
+                push_info_block(&mut remote.app, rows);
             }
         }
         return;

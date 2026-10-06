@@ -1,6 +1,6 @@
 //! `ui::render` unit tests (moved verbatim from the pre-split monolith).
 
-use super::super::status::{cell_safe, footer_text, status_pieces, ui_status};
+use super::super::status::{cell_safe, footer_text, ui_status};
 use super::*;
 use crate::protocol::PermissionMode;
 use crate::ui::style::{composer_band, content_width as input_content_width, BLOCK_GAP_ROWS};
@@ -375,7 +375,7 @@ fn full_queue_height_stays_bounded() {
     assert_eq!(queue.items, 4); // 3 items + tail
     assert_eq!(queue.rows, 3 * QUEUE_MAX_ITEM_ROWS as u16 + 1);
 
-    let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, queue, false)
+    let layout = compute_layout(Rect::new(0, 0, 80, 24), 1, queue, 0)
         .expect("maxed queue must fit a 24-row terminal");
     assert!(layout.activity.height > 0);
     assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
@@ -402,8 +402,7 @@ fn degenerate_layout_keeps_composer_and_footer() {
     }
     let queue = queue_metrics_of(&queue_groups(&app));
     // activity_h = 15 here, so a 12-row terminal can't fit the strip.
-    let layout =
-        compute_layout(Rect::new(0, 0, 80, 12), 1, queue, false).expect("layout should exist");
+    let layout = compute_layout(Rect::new(0, 0, 80, 12), 1, queue, 0).expect("layout should exist");
     assert_eq!(layout.activity.height, 0);
     assert!(layout.input.height >= crate::ui::style::INPUT_MIN_ROWS);
     assert_eq!(layout.footer.height, status_height());
@@ -411,8 +410,7 @@ fn degenerate_layout_keeps_composer_and_footer() {
 
     // Three rows can't fit even the composer (min is transcript 1 + input 3
     // + footer 1): transcript-only.
-    let layout =
-        compute_layout(Rect::new(0, 0, 80, 3), 1, queue, false).expect("layout should exist");
+    let layout = compute_layout(Rect::new(0, 0, 80, 3), 1, queue, 0).expect("layout should exist");
     assert_eq!(layout.transcript.height, 3);
     assert_eq!(layout.input.height, 0);
     assert_eq!(layout.footer.height, 0);
@@ -436,7 +434,7 @@ fn transcript_wrapper_keeps_first_content_grapheme() {
 #[test]
 fn layout_reserves_bottom_pane_before_transcript() {
     let area = Rect::new(0, 0, 80, 24);
-    let layout = compute_layout(area, 1, QueueMetrics { items: 1, rows: 1 }, false)
+    let layout = compute_layout(area, 1, QueueMetrics { items: 1, rows: 1 }, 0)
         .expect("terminal should fit layout");
     assert_eq!(layout.transcript.y, 0);
     assert!(layout.transcript.height > 0);
@@ -618,7 +616,10 @@ fn activity_block_animates_then_settles_to_worked_for() {
     app.transcript[0] = super::super::TranscriptBlock::Activity {
         stamp: 1,
         started: Instant::now(),
-        settled: Some("Worked for 12s · 4.2k tokens".into()),
+        settled: Some(super::super::Settled {
+            text: "Done in 12s · 3 tools · ↓1.2k".into(),
+            tone: super::super::TurnTone::Done,
+        }),
     };
     terminal
         .draw(|frame| view(frame, &mut app))
@@ -627,7 +628,7 @@ fn activity_block_animates_then_settles_to_worked_for() {
     assert!(
         settled
             .iter()
-            .any(|l| l.contains("Worked for 12s · 4.2k tokens")),
+            .any(|l| l.contains("Done in 12s · 3 tools · ↓1.2k")),
         "{settled:?}"
     );
     assert!(
@@ -818,57 +819,31 @@ fn session_banner_renders_without_inter_row_gaps() {
 }
 
 #[test]
-fn ui_status_shows_cumulative_token_total() {
+fn footer_keeps_only_the_actionable_live_number() {
     let mut app = test_app();
-    // No LLM calls yet: no totals.
-    assert!(!ui_status(&app).contains('↑'), "{}", ui_status(&app));
-    assert!(!ui_status(&app).contains('↓'), "{}", ui_status(&app));
-    // After calls, the cumulative spend figure appears and grows.
+    // Spend detail (tokens, cache, speed) lives in `/session`, not the footer.
     app.tool_state.total_usage = 42_000;
-    let text = ui_status(&app);
-    assert!(text.contains("↑42k"), "{text}");
-    app.tool_state.total_usage = 215_000;
-    let text = ui_status(&app);
-    assert!(text.contains("↑215k"), "{text}");
-    // Cumulative completion tokens join the prompt total (one piece,
-    // arrows for direction) and stay hidden until the first output
-    // tokens are billed.
-    assert!(!ui_status(&app).contains('↓'), "{}", ui_status(&app));
     app.tool_state.total_output = 1_250;
-    let text = ui_status(&app);
-    assert!(text.contains("↓1.2k"), "{text}");
-    // Live context usage (% of window) still renders from last_usage,
-    // compacted to `ctx in/window %`.
-    app.tool_state.last_usage = Some(12_000);
-    let text = ui_status(&app);
-    assert!(text.contains("ctx 12k/128k 9%"), "{text}");
-    // Cached-token subset appears once a provider reports it, collapsed
-    // to a % of the last call's prompt (the glanceable cache-health
-    // readout; the absolute count is the ctx number times this %). It
-    // stays hidden when absent or zero, and the absolute is the
-    // fallback when the prompt size is unknown or the hit is below
-    // one percent; the % clamps at 100 for nonconforming endpoints.
-    assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
     app.tool_state.last_cached = Some(8_000);
-    let text = ui_status(&app);
-    assert!(text.contains("66% cached"), "{text}");
-    app.tool_state.last_cached = Some(15_000);
-    let text = ui_status(&app);
-    assert!(text.contains("100% cached"), "{text}");
-    app.tool_state.last_cached = Some(60);
-    let text = ui_status(&app);
-    assert!(text.contains("60 cached"), "{text}");
-    app.tool_state.last_cached = Some(8_000);
-    app.tool_state.last_usage = None;
-    assert!(ui_status(&app).contains("8k cached"), "{}", ui_status(&app));
-    app.tool_state.last_cached = Some(0);
-    assert!(!ui_status(&app).contains("cached"), "{}", ui_status(&app));
-    // The last call's output rate appears once a timed call lands and
-    // is absent before that.
-    assert!(!ui_status(&app).contains("tok/s"), "{}", ui_status(&app));
     app.tool_state.last_tok_s = Some(123.4);
     let text = ui_status(&app);
-    assert!(text.contains("123 tok/s"), "{text}");
+    for gone in ['↑', '↓'] {
+        assert!(!text.contains(gone), "{text}");
+    }
+    assert!(!text.contains("cached"), "{text}");
+    assert!(!text.contains("tok/s"), "{text}");
+    // Context pressure stays, against the window.
+    app.tool_state.last_usage = Some(12_000);
+    assert!(
+        ui_status(&app).contains("ctx 12k/128k 9%"),
+        "{}",
+        ui_status(&app)
+    );
+    // `/session` carries what the footer dropped.
+    let rows = crate::ui::slash::usage_rows(&app).join("\n");
+    assert!(rows.contains("tokens: ↑42k ↓1.2k"), "{rows}");
+    assert!(rows.contains("cached: 66%"), "{rows}");
+    assert!(rows.contains("123 tok/s"), "{rows}");
 }
 
 #[test]
@@ -876,33 +851,24 @@ fn status_separators_never_double_without_branch() {
     // Regression: the branch separator was pushed even when there was
     // no branch, so any non-repo directory rendered `path ·  · model`.
     let app = test_app();
-    for (label, pieces) in [
-        ("full tier", status_pieces(&app, true)),
-        ("no-cwd tier", status_pieces(&app, false)),
-    ] {
-        let text: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
-        assert!(!text.contains("·  ·"), "{label}: {text}");
-        assert!(!text.starts_with('·'), "{label}: {text}");
-    }
+    let text = ui_status(&app);
+    assert!(!text.contains("·  ·"), "{text}");
+    assert!(!text.starts_with('·'), "{text}");
     // With a branch the separators around it appear exactly once.
     let mut branched = test_app();
     branched.git_branch = Some("main".into());
     let text = ui_status(&branched);
     assert!(
-        text.contains("/tmp/dex-ui-test · main · anthropic/test-model"),
+        text.contains("auto · anthropic/test-model · /tmp/dex-ui-test · main"),
         "{text}"
     );
-    // The compact tier (reached once the cumulative total widens the
-    // earlier tiers) keeps the same invariant. Width 72: the no-cwd full
-    // line no longer fits, but the canonical `provider/model` compact line
-    // (~70 cells with the badge) still does.
-    let mut app = test_app();
-    app.connection = Some("[L] 127.0.0.1".into());
-    app.tool_state.total_usage = 45_100;
-    app.tool_state.total_cost = 0.023;
-    let narrow = footer_text(&app, 72);
-    assert!(narrow.starts_with("/tmp/dex-ui-test"), "{narrow}");
-    assert!(!narrow.contains("·  ·"), "{narrow}");
+    // Narrow tiers keep the invariant.
+    let mut narrow = test_app();
+    narrow.tool_state.total_cost = 0.023;
+    for width in [50, 40, 30] {
+        let text = footer_text(&narrow, width);
+        assert!(!text.contains("·  ·"), "{width}: {text}");
+    }
 }
 
 #[test]
@@ -910,20 +876,17 @@ fn status_bar_colors_are_semantic_per_item() {
     let mut app = test_app();
     let muted = theme::muted_fg();
     let fg_of = |app: &App, needle: &str| {
-        status_pieces(app, true)
+        footer_line(app, 240)
+            .spans
             .into_iter()
-            .find(|(text, _)| text.contains(needle))
-            .map(|(_, style)| style.fg)
-            .unwrap_or_else(|| panic!("no status piece contains {needle}"))
+            .find(|span| span.content.contains(needle))
+            .map(|span| span.style.fg)
+            .unwrap_or_else(|| panic!("no footer span contains {needle}"))
     };
-    // Quiet facts: model and token counts use the theme's muted fg.
+    // Quiet facts: the model uses the theme's muted fg.
     assert_eq!(fg_of(&app, "test-model"), Some(muted));
     app.tool_state.last_usage = Some(12_000);
     assert_eq!(fg_of(&app, "ctx"), Some(muted));
-    // The output rate is a quiet fact too.
-    app.tool_state.last_tok_s = Some(84.0);
-    assert_eq!(fg_of(&app, "tok/s"), Some(muted));
-    app.tool_state.last_tok_s = None;
     // Repo state: clean branch reads as ok, the dirty marker warns.
     app.git_branch = Some("main".into());
     assert_eq!(fg_of(&app, "main"), Some(Color::LightGreen));
@@ -936,21 +899,20 @@ fn status_bar_colors_are_semantic_per_item() {
     assert_eq!(fg_of(&app, "ctx"), Some(Color::Yellow));
     app.tool_state.last_usage = Some(112_000);
     assert_eq!(fg_of(&app, "ctx"), Some(Color::LightRed));
-    // The scroll hint is an attention flag; a remote badge is an accent
-    // while a local one stays quiet.
+    // The scroll hint is an attention flag.
     app.autoscroll = false;
-    assert_eq!(
-        footer_line(&app, 200).spans[0].style.fg,
-        Some(Color::Yellow)
-    );
+    let hint = footer_line(&app, 200);
+    assert!(hint.spans[0].content.contains("scrolled up"), "{hint:?}");
+    assert_eq!(hint.spans[0].style.fg, Some(Color::Yellow));
     app.autoscroll = true;
+    // A local daemon is the unremarkable default: no badge. A remote one
+    // is an accent, pinned right.
     app.connection = Some("[L] local".into());
-    let local = footer_line(&app, 200);
-    assert_eq!(local.spans.last().unwrap().style.fg, Some(muted));
+    assert!(!footer_text(&app, 200).contains("local"));
     app.connection = Some("[R] daemon.internal".into());
     let badge_spans = footer_line(&app, 200).spans;
     let badge = badge_spans.last().unwrap();
-    assert_eq!(badge.content.as_ref(), "[R] daemon.internal");
+    assert_eq!(badge.content.as_ref(), "remote daemon.internal");
     assert_eq!(badge.style.fg, Some(Color::Cyan));
 }
 
@@ -958,14 +920,16 @@ fn status_bar_colors_are_semantic_per_item() {
 fn status_mode_chip_is_colored_per_mode() {
     let mut app = test_app();
     let fg_of = |app: &App| {
-        status_pieces(app, true)
+        footer_line(app, 240)
+            .spans
             .into_iter()
-            .find(|(text, _)| matches!(text.as_str(), "plan" | "manual" | "auto"))
-            .map(|(_, style)| style.fg)
-            .unwrap_or_else(|| panic!("no mode chip in {:?}", status_pieces(app, true)))
+            .find(|span| matches!(span.content.as_ref(), "plan" | "manual" | "auto"))
+            .map(|span| span.style.fg)
+            .unwrap_or_else(|| panic!("no mode chip in {:?}", footer_text(app, 240)))
     };
-    // `trusted` (the test default) derives `auto` → green.
-    assert_eq!(fg_of(&app), Some(Color::Green));
+    // `trusted` (the test default) derives `auto`: plain — the least
+    // restrictive mode is not a "good" state to paint green.
+    assert_eq!(fg_of(&app), Some(theme::surface_fg()));
     app.config.permission = PermissionMode::Ask;
     assert_eq!(fg_of(&app), Some(Color::Yellow));
     app.config.permission = PermissionMode::ReadOnly;
@@ -988,55 +952,36 @@ fn footer_text_is_width_bounded() {
 }
 
 #[test]
-fn footer_pins_connection_badge_right() {
+fn footer_pins_right_side_and_sheds_static_facts_first() {
     let mut app = test_app();
     app.connection = Some("[R] daemon.internal".into());
-    // Wide enough for the full line + badge: cwd leads, badge flush right.
-    let text = footer_text(&app, 82);
-    assert!(text.starts_with("/tmp/dex-ui-test"), "{text}");
-    assert!(text.ends_with("[R] daemon.internal"), "{text}");
-    assert_eq!(UnicodeWidthStr::width(text.as_str()), 82);
-    // Narrower: the static cwd is shed before the mode chip — the line
-    // still opens with live facts, never a dangling separator.
-    let text = footer_text(&app, 80);
-    assert!(text.starts_with("anthropic/test-model"), "{text}");
-    assert!(text.ends_with("[R] daemon.internal"), "{text}");
-    assert_eq!(UnicodeWidthStr::width(text.as_str()), 80);
-    // Narrow: badge survives over the bare mode + model pair.
-    let text = footer_text(&app, 40);
-    assert!(text.ends_with("[R] daemon.internal"), "{text}");
-    assert!(text.starts_with("auto · test-model"), "{text}");
-    assert_eq!(UnicodeWidthStr::width(text.as_str()), 40);
-}
-
-#[test]
-fn footer_keeps_cost_when_full_status_does_not_fit() {
-    // Regression: spend pieces sit at the end of the full status line, so
-    // once totals/output/cached outgrew a typical width the footer fell
-    // back to `cwd · model` and the $ cost vanished entirely.
-    let mut app = test_app();
-    app.connection = Some("[L] 127.0.0.1".into());
-    app.tool_state.total_usage = 45_100;
-    app.tool_state.total_output = 8_200;
+    app.tool_state.last_usage = Some(12_000);
     app.tool_state.total_cost = 0.023;
-    app.tool_state.last_usage = Some(12_300);
-    let full = footer_text(&app, 200);
-    assert!(full.contains("$0.023"), "{full}");
-    // Full line (~100+ cells with totals) cannot fit at 60 cols: the
-    // compact fallback must still carry the spend figure.
-    let narrow = footer_text(&app, 60);
-    assert!(narrow.contains("$0.023"), "{narrow}");
-    // Ultra-narrow: bare model tier keeps the cost while it still fits.
-    let tiny = footer_text(&app, 30);
-    assert!(tiny.contains("$0.023"), "{tiny}");
-    // Unbilled sessions render exactly as before (no stray separator).
-    let mut fresh = test_app();
-    fresh.connection = Some("[L] 127.0.0.1".into());
+    // Wide: identity left (mode, model, cwd), pressure/spend/badge flush right.
+    let text = footer_text(&app, 120);
     assert!(
-        !footer_text(&fresh, 60).contains('$'),
-        "{}",
-        footer_text(&fresh, 60)
+        text.starts_with("auto · anthropic/test-model · /tmp/dex-ui-test"),
+        "{text}"
     );
+    assert!(
+        text.ends_with("ctx 12k/128k 9% · $0.023 · remote daemon.internal"),
+        "{text}"
+    );
+    assert_eq!(UnicodeWidthStr::width(text.as_str()), 120);
+    // Narrower: the static cwd goes first; mode and model stay.
+    let text = footer_text(&app, 90);
+    assert!(text.starts_with("auto · anthropic/test-model"), "{text}");
+    assert!(!text.contains("/tmp/dex-ui-test"), "{text}");
+    assert!(text.ends_with("remote daemon.internal"), "{text}");
+    // Narrow: absolute ctx numbers shorten to a percentage, cost stays.
+    let text = footer_text(&app, 70);
+    assert!(text.contains("ctx 9%") && text.contains("$0.023"), "{text}");
+    assert!(text.starts_with("auto · "), "{text}");
+    // Tight: cost goes before the pressure readout and the mode.
+    let text = footer_text(&app, 62);
+    assert!(text.contains("ctx 9%") && !text.contains('$'), "{text}");
+    assert!(text.starts_with("auto · "), "{text}");
+    assert_eq!(UnicodeWidthStr::width(text.as_str()), 62);
 }
 
 #[test]
@@ -1061,6 +1006,7 @@ fn control_characters_are_expanded_not_rendered_raw() {
             duration: 0.0,
         },
     );
+    app.expand_tools = true;
     let backend = TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
     terminal
@@ -1297,7 +1243,7 @@ fn virtual_terminal_keeps_composer_and_footer_separate() {
         Rect::new(0, 0, 80, 24),
         1,
         QueueMetrics { items: 1, rows: 1 },
-        false,
+        0,
     )
     .unwrap();
     assert!(layout.transcript.bottom() <= layout.activity.top());
@@ -1358,11 +1304,12 @@ fn approval_overlay_renders_action_and_choices() {
         symbols.contains("Esc deny") || symbols.contains("Esc"),
         "{symbols}"
     );
-    // Modal is centered, not gutter-aligned — just ensure the key hints are present
-    assert!(
-        symbols.contains("navigate") || symbols.contains("select"),
-        "{symbols}"
-    );
+    // Inline panel (the composer's slot), not a modal: the transcript
+    // stays on screen, and the composer is replaced while it is pending.
+    assert!(symbols.contains("hello from the transcript"), "{symbols}");
+    assert!(!symbols.contains("Message dex"), "{symbols}");
+    assert!(symbols.contains("↑↓ move"), "{symbols}");
+    assert!(symbols.contains("› 2. Allow for session"), "{symbols}");
     // Second check: write tool formats path/lines, not raw JSON
     let (tx2, _rx2) = tokio::sync::mpsc::channel(1);
     let mut app2 = test_app();
@@ -1384,6 +1331,9 @@ fn approval_overlay_renders_action_and_choices() {
         .collect();
     assert!(s2.contains("src/main.rs"), "{s2}");
     assert!(s2.contains("Create") || s2.contains("write"), "{s2}");
+    // A child agent's prompt is labeled with its name, once.
+    assert!(s2.contains("explorer · "), "{s2}");
+    assert!(!s2.contains("wants to agent"), "{s2}");
 }
 
 #[test]
@@ -1574,8 +1524,7 @@ fn composer_shows_cursor_while_busy() {
     let input_rows = render_input(&app.input, input_content_width(area.width), false)
         .0
         .len() as u16;
-    let layout =
-        compute_layout(area, input_rows, QueueMetrics { items: 1, rows: 1 }, false).unwrap();
+    let layout = compute_layout(area, input_rows, QueueMetrics { items: 1, rows: 1 }, 0).unwrap();
     let inner = input_block().inner(composer_band(layout.input));
     let (_, cursor) = render_input(&app.input, inner.width, false);
     terminal
@@ -1694,41 +1643,25 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
     for w in [80, 90, 100, 120, 70, 50, 40] {
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, long);
-        // The submitted prompt is the composer's echo boxed in the same
-        // top/bottom hairlines: `wrap_block` pads every row out to the
-        // full width on the terminal background (spacing outside the box
-        // is the inter-block gap).
+        // The submitted prompt is the composer's `❯ ` echo with no rules
+        // (those are the live composer's): `wrap_block` pads every row out
+        // to the full width on the terminal background.
         let block = &app.transcript[1]; // 0 is hello, 1 is user
-        let rows = wrap_block(block, w, false, false);
+        let rows = wrap_block(block, w, false, false, false);
         let bg = Color::Reset;
         assert!(!rows.is_empty(), "user block must hold content at w {w}");
-        // Box frame: first/last rows are the hairline rules.
-        assert!(
-            rows.len() >= 3,
-            "user box must hold top rule + content + bottom rule at w {w}"
-        );
-        for rule in [&rows[0], &rows[rows.len() - 1]] {
-            let s: String = rule.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        for row in &rows {
+            let s: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert!(
-                s.trim().chars().all(|c| c == '─'),
-                "box edge must be a clean ─ rule at w {w}: {s:?}"
-            );
-            let hl = theme::hairline_style();
-            assert!(
-                rule.spans.iter().any(|sp| sp.style == hl),
-                "box edge must wear the composer hairline color at w {w}: {rule:?}"
+                !s.trim().chars().all(|c| c == '─') || s.trim().is_empty(),
+                "echo carries no rules at w {w}: {s:?}"
             );
         }
-        for (i, row) in rows.iter().enumerate() {
+        for row in rows.iter() {
             let s: String = row.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            // The two rule rows carry the indent plus a full `w` of dashes:
-            // the composer's band is `w` wide and starts on the indent
-            // column, so matching it reaches one cell past the transcript's
-            // wrap edge (the Paragraph clips there). Content rows fill `w`.
-            let is_rule = i == 0 || i + 1 == rows.len();
             assert_eq!(
                 UnicodeWidthStr::width(s.as_str()),
-                if is_rule { w as usize + 1 } else { w as usize },
+                w as usize,
                 "user row must fill the width like the composer at w {w}: {s:?}"
             );
             // Line-level bg is the row carrier (`Line` renders each
@@ -1743,8 +1676,7 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
             );
             assert_eq!(row.style.bg, Some(bg), "user row line bg at w {w}");
         }
-        // No baked air: every inner row is wrapped content; the two
-        // outer rows are the box frame rules.
+        // No baked air: every row is wrapped content.
         let text = |row: &Line<'static>| {
             row.spans
                 .iter()
@@ -1792,13 +1724,11 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
     }
 }
 
-/// Regression: the submitted prompt's hairlines must span exactly the same
-/// columns as the live composer's rules. The transcript wraps at
-/// `content_width` but renders into the full-width area, so a rule dashed
-/// from the indent to the wrap edge stopped one cell short of the composer's
-/// right end and the echo read as a narrower box.
+/// The submitted prompt carries no hairlines: the only rules on screen are
+/// the live composer's two, so a scrolled-back prompt can't be mistaken for
+/// the input.
 #[test]
-fn submitted_prompt_rules_span_the_composer_columns() {
+fn submitted_prompt_has_no_rules_of_its_own() {
     for w in [80u16, 61, 43] {
         let h = 20u16;
         let backend = TestBackend::new(w, h);
@@ -1807,27 +1737,13 @@ fn submitted_prompt_rules_span_the_composer_columns() {
         super::super::render_user_prompt(&mut app, "hello probe");
         terminal.draw(|f| view(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
-        let dashes = |y: u16| -> Vec<u16> {
-            (0..w)
-                .filter(|x| buffer.cell((*x, y)).unwrap().symbol() == "─")
-                .collect()
-        };
-        let row_text = |y: u16| {
-            (0..w)
-                .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                .collect::<String>()
-        };
-        let text_row = (0..h)
-            .find(|y| row_text(*y).contains("hello probe"))
-            .expect("prompt rendered");
-        // The echo's two rules and the live composer's two rules.
-        for y in [text_row - 1, text_row + 1, h - 4, h - 2] {
-            assert_eq!(
-                dashes(y),
-                (1..w - 1).collect::<Vec<u16>>(),
-                "rule at y {y} must span the composer's columns at w {w}"
-            );
-        }
+        let is_rule = |y: u16| (1..w - 1).all(|x| buffer.cell((x, y)).unwrap().symbol() == "─");
+        let rules: Vec<u16> = (0..h).filter(|y| is_rule(*y)).collect();
+        assert_eq!(
+            rules,
+            vec![h - 4, h - 2],
+            "only the composer's rules at w {w}: {rules:?}"
+        );
     }
 }
 
@@ -1898,7 +1814,7 @@ fn ghost_key_facts_does_not_overflow_or_overlap_bottom() {
             .0
             .len() as u16;
         let queue = queue_metrics_of(&queue_groups(&app));
-        let layout = compute_layout(area, input_rows, queue, false).unwrap();
+        let layout = compute_layout(area, input_rows, queue, 0).unwrap();
         // Check every cell in input and footer does not contain ghost fragments
         // Ghost contains distinctive substrings that should never leak into chrome
         let forbidden = [
@@ -2045,12 +1961,11 @@ fn submitted_prompt_is_one_row_above_tool_block() {
     };
     let text_row = row_of("can you check pillar").expect("prompt text rendered");
     let tool_row = row_of("read HARNESS.md").expect("tool block rendered");
-    // Boxed composer echo: top rule, content row, bottom rule, then the
-    // inter-block gap rows (BLOCK_GAP_ROWS) — the tool block adds no air
-    // of its own — then the tool content.
+    // One echo row, then the inter-block gap rows (BLOCK_GAP_ROWS) — the
+    // tool block adds no air of its own — then the tool step.
     assert_eq!(
         tool_row,
-        text_row + 2 + BLOCK_GAP_ROWS as u16,
+        text_row + 1 + BLOCK_GAP_ROWS as u16,
         "a phantom row from Paragraph::wrap shifts the tool block down"
     );
     // On the shared transcript margin — the prompt row starts one gutter
@@ -2073,41 +1988,16 @@ fn submitted_prompt_is_one_row_above_tool_block() {
             bg,
             "prompt row must sit on the terminal background"
         );
-        assert_eq!(
-            buffer.cell((x, text_row - 1)).unwrap().bg,
-            bg,
-            "box top rule must be the terminal background"
-        );
-        assert_eq!(
-            buffer.cell((x, text_row + 1)).unwrap().bg,
-            bg,
-            "box bottom rule must be the terminal background"
-        );
-    }
-    // The box frame: ─ rules directly above and below the content row.
-    for dy in [-1i16, 1] {
-        let rule: String = (0..area.width)
-            .map(|x| {
-                buffer
-                    .cell((x, (text_row as i16 + dy) as u16))
-                    .unwrap()
-                    .symbol()
-            })
-            .collect();
-        assert!(
-            rule.trim().chars().all(|c| c == '─'),
-            "box edge must be a clean ─ rule: {rule:?}"
-        );
     }
     let gap: String = (0..area.width)
-        .map(|x| buffer.cell((x, text_row + 2)).unwrap().symbol())
+        .map(|x| buffer.cell((x, text_row + 1)).unwrap().symbol())
         .collect();
     assert!(
         gap.trim().is_empty(),
-        "inter-block gap after the prompt box must be blank: {gap:?}"
+        "inter-block gap after the prompt must be blank: {gap:?}"
     );
-    // The tool block adds no baked air: the row right above the tool
-    // content is the universal inter-block gap (blank, terminal bg).
+    // The tool step adds no baked air: the row right above it is the
+    // universal inter-block gap (blank, terminal bg).
     let tool_gap: String = (0..area.width)
         .map(|x| buffer.cell((x, tool_row - 1)).unwrap().symbol())
         .collect();
@@ -2122,7 +2012,7 @@ fn submitted_prompt_is_one_row_above_tool_block() {
             "inter-block gap row must be the terminal background"
         );
         assert_eq!(
-            buffer.cell((x, text_row + 2)).unwrap().bg,
+            buffer.cell((x, text_row + 1)).unwrap().bg,
             ratatui::style::Color::Reset,
             "inter-block gap must stay terminal background"
         );
@@ -2144,7 +2034,7 @@ fn blank_runs_render_one_air_row() {
         .collect();
     assert_eq!(
         rows,
-        vec!["para one", "", "para two", "", "•  a", "•  b", "", "tail"],
+        vec!["para one", "", "para two", "", "• a", "• b", "", "tail"],
     );
 }
 
@@ -2395,16 +2285,17 @@ fn markdown_fence_drops_trailing_blank_body_rows() {
 }
 
 #[test]
-fn markdown_lines_render_tables_as_boxes() {
+fn markdown_lines_render_tables_as_aligned_columns() {
     let lines = markdown_lines("| A | B |\n|---|---|\n| 1 | 2 |");
     let text: String = lines
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
         .collect::<Vec<_>>()
         .join("\n");
-    // Box-drawn table, not the raw pipe + dash delimiter row.
+    // Aligned columns under a header rule, not the raw pipe + dash
+    // delimiter row — and no box glyphs (copy-safe).
     assert!(text.contains('─'), "no rule drawn: {text}");
-    assert!(text.contains('│'), "no column borders: {text}");
+    assert!(!text.contains('│'), "no column borders: {text}");
     assert!(!text.contains("|---"), "raw delimiter leaked: {text}");
     assert!(text.contains('A') && text.contains('2'), "{text}");
 }
@@ -2442,7 +2333,7 @@ fn streamed_table_renders_as_one_block() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains('─'), "no rule drawn: {text}");
-    assert!(text.contains('│'), "no column borders: {text}");
+    assert!(!text.contains('│'), "no column borders: {text}");
     assert!(!text.contains("|---"), "raw delimiter leaked: {text}");
     assert!(text.contains("loop.rs") && text.contains("done"), "{text}");
     // Narrow terminal: the table degrades by wrapping, never panics.
@@ -2462,48 +2353,110 @@ fn table_rows_stay_tight_across_seams() {
     assert_eq!(out, "|---|---|\n");
 }
 
-#[test]
-fn tool_glyphs_head_the_input_row() {
-    // Every known tool heads its row with its own glyph; unknown tools
-    // keep the generic `▸`.
-    let text = |name: &str, arg: &str| -> String {
-        render_tool_input(name, arg)
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>()
-            .trim_start()
-            .to_string()
-    };
-    assert!(text("bash", "ls -la").starts_with("$ bash ls -la"));
-    assert!(text("read", "a.rs").starts_with("¶ read a.rs"));
-    assert!(text("write", "a.rs").starts_with("✎ write a.rs"));
-    assert!(text("edit", "a.rs").starts_with("± edit a.rs"));
-    assert!(text("grep", "pat").starts_with("/ grep pat"));
-    assert!(text("fffind", "*.rs").starts_with("/ fffind *.rs"));
-    assert!(text("ls", ".").starts_with("☰ ls ."));
-    assert!(text("mcp__srv__t", "{}").starts_with("⇄ mcp__srv__t"));
-    assert!(text("mystery", "x").starts_with("▸ mystery x"));
+fn step_rows(name: &str, arg: &str, width: u16) -> Vec<Line<'static>> {
+    super::tool::tool_rows(name, &render_tool_arg(name, arg), None, &[], width, false)
+}
+
+fn row_text(row: &Line<'_>) -> String {
+    row.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+fn done(ok: bool, summary: &str, duration: f64) -> crate::ui::ToolResult {
+    crate::ui::ToolResult {
+        ok,
+        summary: summary.to_string(),
+        duration,
+    }
 }
 
 #[test]
-fn bash_tool_input_highlights_while_other_tools_stay_dim() {
-    // A bash command with a string + comment must split into styled spans
-    // past the `$ bash ` prefix; a plain tool arg stays one dim span.
-    let line = render_tool_input("bash", "echo \"hi\" # done");
-    // indent + glyph + name + ` ` + highlighted code spans.
-    assert!(line.spans.len() > 4, "bash should highlight: {line:?}");
+fn tool_step_row_leads_with_status_then_name_and_aligns_the_outcome() {
+    let arg = render_tool_arg("read", "src/main.rs:1-20");
+    // Pending: muted `◌`, no outcome yet.
+    let rows = super::tool::tool_rows("read", &arg, None, &[], 60, false);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(row_text(&rows[0]).trim_start(), "◌ read src/main.rs:1-20");
+    // Done: green `✓`, outcome right-aligned on the same row, no duration
+    // under a second.
+    let ok = done(true, "20 lines", 0.04);
+    let rows = super::tool::tool_rows("read", &arg, Some(&ok), &[], 60, false);
+    assert_eq!(rows.len(), 1);
+    let text = row_text(&rows[0]);
+    assert!(
+        text.trim_start().starts_with("✓ read src/main.rs:1-20"),
+        "{text}"
+    );
+    assert!(text.ends_with("20 lines"), "{text}");
+    assert_eq!(text.width(), 60);
+    assert_eq!(rows[0].spans[1].style.fg, Some(Color::LightGreen));
+    // A slow call shows its time.
+    let slow = done(true, "20 lines", 3.2);
+    let text = row_text(&super::tool::tool_rows("read", &arg, Some(&slow), &[], 60, false)[0]);
+    assert!(text.ends_with("20 lines · 3.2s"), "{text}");
+    // Failure: red `✗`, outcome drops the redundant `failed` word.
+    let bad = done(false, "failed (exit 101) · test x ... FAILED", 3.2);
+    let rows = super::tool::tool_rows(
+        "bash",
+        &render_tool_arg("bash", "cargo test"),
+        Some(&bad),
+        &[],
+        80,
+        false,
+    );
+    let text = row_text(&rows[0]);
+    assert!(text.trim_start().starts_with("✗ bash cargo test"), "{text}");
+    assert!(
+        text.ends_with("exit 101 · test x ... FAILED · 3.2s"),
+        "{text}"
+    );
+    assert_eq!(rows[0].spans[1].style.fg, Some(Color::LightRed));
+    // An outcome that can't share the row drops under the name instead of
+    // overflowing.
+    let rows = super::tool::tool_rows("read", &arg, Some(&bad), &[], 40, false);
+    assert!(rows.len() > 1, "{rows:?}");
+    assert!(rows.iter().all(|r| row_text(r).width() <= 40));
+}
+
+#[test]
+fn tool_previews_fold_unless_failed_or_diff_or_expanded() {
+    let preview = vec![Line::from("   a"), Line::from("   b"), Line::from("   c")];
+    let arg = render_tool_arg("grep", "x");
+    let ok = done(true, "3 files matched", 0.0);
+    // Successful reads/greps/bash: outcome row only.
+    let rows = super::tool::tool_rows("grep", &arg, Some(&ok), &preview, 80, false);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    // Ctrl+O unfolds them.
+    let rows = super::tool::tool_rows("grep", &arg, Some(&ok), &preview, 80, true);
+    assert_eq!(rows.len(), 4);
+    // Failures always show their output.
+    let bad = done(false, "failed · boom", 0.0);
+    let rows = super::tool::tool_rows("bash", &arg, Some(&bad), &preview, 80, false);
+    assert_eq!(rows.len(), 4);
+    // write/edit diffs show, folded past a handful of rows.
+    let diff: Vec<Line<'static>> = (0..14).map(|i| Line::from(format!("  +{i}"))).collect();
+    let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, false);
+    assert_eq!(rows.len(), 1 + 10 + 1, "{rows:?}");
+    assert!(row_text(rows.last().unwrap()).contains("+4 more diff lines"));
+    let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, true);
+    assert_eq!(rows.len(), 1 + 14);
+}
+
+#[test]
+fn bash_tool_arg_highlights_while_other_tools_stay_dim() {
+    // A bash command with a string + comment must split into styled spans;
+    // a plain tool arg stays one dim span.
+    let line = render_tool_arg("bash", "echo \"hi\" # done");
+    assert!(line.spans.len() > 1, "bash should highlight: {line:?}");
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(text.contains("echo"), "{text}");
 
-    let line = render_tool_input("read", "src/main.rs:1-20");
-    // indent + glyph + name + dim arg: no highlight split.
-    assert_eq!(line.spans.len(), 4, "{line:?}");
+    let line = render_tool_arg("read", "src/main.rs:1-20");
+    assert_eq!(line.spans.len(), 1, "{line:?}");
 
     // Multi-line bash keeps the full dim arg (highlighting splits per
     // row; appending only the first would silently drop lines 2+).
-    let line = render_tool_input("bash", "echo a\necho b");
-    assert_eq!(line.spans.len(), 4, "{line:?}");
+    let line = render_tool_arg("bash", "echo a\necho b");
+    assert_eq!(line.spans.len(), 1, "{line:?}");
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(text.contains('\n'), "{text}");
 }
@@ -2626,28 +2579,20 @@ fn submitted_prompt_wraps_like_the_composer() {
     for w in [40u16, 60, 80] {
         // Live composer rows at this width.
         let composer = render_input(&InputField::from_text(text), input_content_width(w), false).0;
-        // Echoed prompt rows at the same width (boxed: top rule +
-        // content + bottom rule).
+        // Echoed prompt rows at the same width.
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, text);
         let block = &app.transcript[1];
-        let echo = wrap_block(block, w, false, false);
-        // Box frame around the content rows.
-        assert!(
-            echo.len() == composer.len() + 2,
-            "echo must be content rows plus top/bottom rules at w {w}"
+        let echo = wrap_block(block, w, false, false, false);
+        assert_eq!(
+            echo.len(),
+            composer.len(),
+            "echo rows == composer rows at w {w}"
         );
-        for rule in [&echo[0], &echo[echo.len() - 1]] {
-            let s: String = rule.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            assert!(
-                s.trim().chars().all(|c| c == '─'),
-                "echo edge must be a ─ rule at w {w}: {s:?}"
-            );
-        }
-        // Strip the frame plus the echo's leading transcript indent (the
+        // Strip the echo's leading transcript indent (the
         // composer lives inside the band and has no indent span) and
         // trailing pad fill, so both sides compare as bare text lines.
-        let echo_text: Vec<String> = echo[1..echo.len() - 1]
+        let echo_text: Vec<String> = echo
             .iter()
             .map(|r| {
                 let mut s: String = r
@@ -2684,8 +2629,8 @@ fn rebuild_truncation_counts_full_block_gap() {
     // gap, not one — otherwise the gap above the dirty block grows by
     // BLOCK_GAP_ROWS - 1 on every re-extend.
     let mut app = test_app();
-    super::super::append_sink_line(&mut app, crate::protocol::SinkLine::System("one".into()));
-    super::super::append_sink_line(&mut app, crate::protocol::SinkLine::System("two".into()));
+    super::super::push_info(&mut app, "one".into());
+    super::super::push_info(&mut app, "two".into());
     super::super::append_sink_line(
         &mut app,
         crate::protocol::SinkLine::Assistant("tail".into()),
@@ -2846,15 +2791,14 @@ fn echoed_prompt_narrows_only_the_first_logical_line() {
     let mut app = test_app();
     super::super::render_user_prompt(&mut app, text);
     let block = &app.transcript[1];
-    let rows = wrap_block(block, 40, false, false);
+    let rows = wrap_block(block, 40, false, false, false);
     let row_text = |r: &Line<'static>| {
         r.spans
             .iter()
             .map(|sp| sp.content.as_ref())
             .collect::<String>()
     };
-    // Boxed echo: content rows plus the top/bottom rules.
-    let content = &rows[1..rows.len() - 1];
+    let content = &rows[..];
     assert_eq!(
         composer.len(),
         content.len(),
@@ -2884,9 +2828,9 @@ fn echoed_prompt_wraps_at_the_composer_content_width() {
     let mut app = test_app();
     super::super::render_user_prompt(&mut app, text);
     let block = &app.transcript[1];
-    let rows = wrap_block(block, 20, false, false);
+    let rows = wrap_block(block, 20, false, false, false);
     assert_eq!(
-        composer.len() + 2,
+        composer.len(),
         rows.len(),
         "echo must reflow like the composer: composer {} rows, echo {} rows",
         composer.len(),
@@ -2966,33 +2910,32 @@ fn tool_input_wraps_under_the_glyph_column() {
     // Regression: a long tool input wrapped flush at the margin, so
     // continuations slid under the `$` glyph. The whole `$ bash ` prefix
     // (glyph + name + gap) is structural and hangs on every continuation
-    // row, like the composer's glyph hang. `render_tool_input` already
-    // indents its line — no extra wrap here.
+    // row, like the composer's glyph hang. `tool_rows` wraps its own row.
     let text = |r: &Line<'static>| {
         r.spans
             .iter()
             .map(|sp| sp.content.as_ref())
             .collect::<String>()
     };
-    let line = render_tool_input(
+    let rows = step_rows(
         "bash",
         "cargo build --release --features tui && cargo test --all-targets --quiet",
+        40,
     );
-    let rows = wrap_line_display(&line, 40, 0);
     assert!(rows.len() > 1, "must wrap at 40 cols: {rows:?}");
-    let hang = "$ bash ".width();
+    let hang = "◌ bash ".width();
     for (i, row) in rows.iter().enumerate() {
         let t = text(row);
         let cont: String = t.chars().skip(TRANSCRIPT_INDENT).collect();
         if i == 0 {
-            assert!(cont.starts_with("$ bash"), "row 0 heads the tool: {t:?}");
+            assert!(cont.starts_with("◌ bash"), "row 0 heads the tool: {t:?}");
         } else {
             assert!(
                 cont.starts_with(&" ".repeat(hang)),
                 "continuation must hang under the glyph column: {t:?}"
             );
             assert!(
-                !cont[hang..].starts_with('$'),
+                !cont[hang..].starts_with('◌'),
                 "continuation must pad, not repeat the marker: {t:?}"
             );
         }
@@ -3001,12 +2944,12 @@ fn tool_input_wraps_under_the_glyph_column() {
 
     // A long arg that breaks inside its first word still hangs (no
     // last-space break, no marker) — bash, a builtin and an MCP name.
-    for (name, glyph) in [("bash", "$"), ("read", "¶"), ("mcp__srv__tool", "⇄")] {
-        let line = render_tool_input(
+    for (name, glyph) in [("bash", "◌"), ("read", "◌"), ("mcp__srv__tool", "◌")] {
+        let rows = step_rows(
             name,
             "a-very-long-unbroken-command-token-that-forces-a-hard-wrap-at-any-width",
+            40,
         );
-        let rows = wrap_line_display(&line, 40, 0);
         assert!(rows.len() > 1, "{name}: must wrap at 40 cols: {rows:?}");
         let hang = format!("{glyph} {name} ").width();
         for (i, row) in rows.iter().enumerate() {
@@ -3043,13 +2986,13 @@ fn tool_input_wraps_under_the_glyph_column() {
 
     // The cap still bounds tool hangs: at w=15 `tool_cap` is 7, so the
     // 7-cell `$ bash ` marker hangs exactly at the boundary, while the
-    // 17-cell `⇄ mcp__srv__tool ` prefix exceeds it and falls back to
+    // 17-cell `◌ mcp__srv__tool ` prefix exceeds it and falls back to
     // flush-left continuations (nothing overflows either way).
-    let line = render_tool_input(
+    let rows = step_rows(
         "bash",
         "supercalifragilisticexpialidocious-and-then-some-more-text-here",
+        15,
     );
-    let rows = wrap_line_display(&line, 15, 0);
     assert!(rows.len() > 1, "must wrap at 15 cols: {rows:?}");
     for r in &rows {
         let t: String = r.spans.iter().map(|sp| sp.content.as_ref()).collect();
@@ -3060,11 +3003,11 @@ fn tool_input_wraps_under_the_glyph_column() {
         cont.starts_with(&" ".repeat(7)),
         "boundary hang kept: {cont:?}"
     );
-    let line = render_tool_input(
+    let rows = step_rows(
         "mcp__srv__tool",
         "supercalifragilisticexpialidocious-and-then-some-more-text-here",
+        15,
     );
-    let rows = wrap_line_display(&line, 15, 0);
     assert!(rows.len() > 1, "must wrap at 15 cols: {rows:?}");
     for r in &rows {
         let t: String = r.spans.iter().map(|sp| sp.content.as_ref()).collect();
@@ -3158,9 +3101,305 @@ fn approval_overlay_draws_over_open_child_view() {
         "child view missing: {rendered:?}"
     );
     assert!(
-        rendered
-            .iter()
-            .any(|row| row.contains("bash") && row.contains("—")),
-        "approval overlay must draw over the child view: {rendered:?}"
+        rendered.iter().any(|row| row.contains("high risk")),
+        "approval panel must show over the child view: {rendered:?}"
+    );
+}
+
+fn plain(rows: &[Line<'_>]) -> Vec<String> {
+    rows.iter().map(row_text).collect()
+}
+
+#[test]
+fn process_steps_hug_each_other_and_speakers_get_air() {
+    use crate::protocol::SinkLine;
+    let mut app = test_app();
+    app.transcript.clear();
+    let call = |app: &mut App, id: &str| {
+        super::super::append_sink_line(
+            app,
+            SinkLine::ToolInput {
+                id: id.into(),
+                input: "read a.rs".into(),
+            },
+        );
+        super::super::append_sink_line(
+            app,
+            SinkLine::ToolOutput {
+                id: id.into(),
+                name: "read".into(),
+                summary: "3 lines".into(),
+                success: true,
+                preview: vec![],
+                duration: 0.0,
+            },
+        );
+    };
+    super::super::render_user_prompt(&mut app, "go");
+    super::super::append_sink_line(&mut app, SinkLine::Assistant("looking".into()));
+    super::super::flush_assistant(&mut app);
+    call(&mut app, "1");
+    call(&mut app, "2");
+    super::super::append_sink_line(&mut app, SinkLine::Error("boom".into()));
+    super::super::push_info(&mut app, "note".into());
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap();
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let rows: Vec<String> = app.display_cache.iter().map(row_text).collect();
+    let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+    // Prompt → narration: air. Narration → steps → steps: tight.
+    assert_eq!(at("looking"), at("go") + 2, "{rows:?}");
+    assert_eq!(at("✓ read"), at("looking") + 1, "{rows:?}");
+    let steps: Vec<usize> = (0..rows.len())
+        .filter(|i| rows[*i].contains("✓ read"))
+        .collect();
+    assert_eq!(steps[1], steps[0] + 1, "{rows:?}");
+    // Step → error → note: speaker changes get a gap row each.
+    assert_eq!(at("boom"), steps[1] + 2, "{rows:?}");
+    assert_eq!(at("note"), at("boom") + 2, "{rows:?}");
+}
+
+#[test]
+fn working_row_names_the_running_call_and_the_interrupt_key() {
+    let mut app = test_app();
+    app.transcript.clear();
+    app.busy = true;
+    super::super::start_activity(&mut app);
+    super::super::append_sink_line(
+        &mut app,
+        crate::protocol::SinkLine::ToolInput {
+            id: "1".into(),
+            input: "bash cargo test".into(),
+        },
+    );
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let rows = rendered_rows(&terminal);
+    let working = rows
+        .iter()
+        .find(|r| r.contains("Working"))
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert!(working.contains("bash 0s"), "{working}");
+    assert!(working.contains("Esc to interrupt"), "{working}");
+    // The step itself shows the pending marker, with the call.
+    assert!(
+        rows.iter().any(|r| r.starts_with("◌ bash cargo test")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn settled_summary_reflects_how_the_turn_ended() {
+    use super::super::TurnTone;
+    for (tone, text, color) in [
+        (TurnTone::Done, "Done in", Color::LightGreen),
+        (TurnTone::Cancelled, "Cancelled after", Color::Yellow),
+        (TurnTone::Failed, "Failed after", Color::LightRed),
+    ] {
+        let mut app = test_app();
+        app.transcript.clear();
+        app.busy = true;
+        super::super::start_activity(&mut app);
+        super::super::settle_activity(&mut app, tone);
+        let super::super::TranscriptBlock::Activity {
+            settled: Some(s), ..
+        } = &app.transcript[0]
+        else {
+            panic!("settled");
+        };
+        assert!(s.text.starts_with(text), "{}", s.text);
+        let rows = wrap_block(&app.transcript[0], 80, false, false, false);
+        assert_eq!(rows[0].spans.last().unwrap().style.fg, Some(color));
+    }
+}
+
+#[test]
+fn blink_of_thinking_renders_no_row_but_a_long_one_does() {
+    let mut app = test_app();
+    app.transcript.clear();
+    for (ms, rows) in [(300u64, 0usize), (4_000, 1)] {
+        let block = super::super::TranscriptBlock::Thinking {
+            stamp: 0,
+            text: "hm".into(),
+            started: Instant::now(),
+            elapsed: Some(Duration::from_millis(ms)),
+        };
+        assert_eq!(
+            wrap_block(&block, 80, false, false, false).len(),
+            rows,
+            "{ms}ms"
+        );
+        // Ctrl+T always shows the text.
+        assert_eq!(wrap_block(&block, 80, true, false, false).len(), 1);
+    }
+}
+
+#[test]
+fn empty_idle_composer_hints_and_typing_replaces_it() {
+    let (rows, _) = render_input(&InputField::new(), 80, false);
+    assert!(
+        row_text(&rows[0]).starts_with("❯ Message dex"),
+        "{:?}",
+        row_text(&rows[0])
+    );
+    // Busy (dimmed) and typed composers carry no hint.
+    let (rows, _) = render_input(&InputField::new(), 80, true);
+    assert_eq!(row_text(&rows[0]), "❯ ");
+    let (rows, _) = render_input(&InputField::from_text("x"), 80, false);
+    assert_eq!(row_text(&rows[0]), "❯ x");
+}
+
+#[test]
+fn tables_fit_the_width_without_box_glyphs() {
+    let md = "| file | change | why |\n|---|---|---|\n| a-rather-long-file-name.rs | clamp | stops the overflow when n is large |\n";
+    for width in [100u16, 60, 40] {
+        let rows = plain(&markdown_lines_at(md, width));
+        assert!(rows.len() >= 3, "{rows:?}");
+        for row in &rows {
+            assert!(row.width() < width as usize, "{width}: {row:?}");
+            assert!(!row.contains(['│', '┌', '└', '├']), "{row:?}");
+        }
+        assert!(rows[0].starts_with("file"), "{rows:?}");
+        assert!(rows[1].starts_with('─'), "header rule: {rows:?}");
+        // One row per source row: nothing wraps into the next.
+        assert_eq!(rows.len(), 3, "{width}: {rows:?}");
+    }
+    // Wide enough: cells keep their full text; narrow: they end in `…`.
+    assert!(plain(&markdown_lines_at(md, 100))[2].contains("a-rather-long-file-name.rs"));
+    assert!(plain(&markdown_lines_at(md, 40))[2].contains('…'));
+}
+
+#[test]
+fn markdown_tidies_bullets_and_inline_code_punctuation() {
+    let rows = plain(&markdown_lines(
+        "The cap is `n >= 32`.\n\n- first\n- second\n",
+    ));
+    assert!(
+        rows.iter().any(|r| r.trim_end() == "The cap is n >= 32."),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|r| r == "• first"), "{rows:?}");
+}
+
+#[test]
+fn code_rows_carry_a_block_fill_that_pads_to_the_width() {
+    let mut app = test_app();
+    app.transcript.clear();
+    app.stream_last_flush = Instant::now() - Duration::from_millis(500);
+    super::super::append_sink_line(
+        &mut app,
+        crate::protocol::SinkLine::Assistant("```rust\nlet a = 1;\n```".into()),
+    );
+    super::super::flush_assistant(&mut app);
+    let rows = wrap_block(&app.transcript[0], 40, false, false, false);
+    let code = rows.iter().find(|r| row_text(r).contains("let a")).unwrap();
+    assert_eq!(code.style.bg, Some(theme::code_bg()));
+    assert_eq!(row_text(code).width(), 40, "fill pads to the full width");
+}
+
+#[test]
+fn approval_panel_replaces_the_composer_and_folds_long_details() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut app = test_app();
+    let command = (0..20)
+        .map(|i| format!("echo {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut approval = super::super::PendingApproval::new(
+        "bash".into(),
+        serde_json::json!({ "command": command }).to_string(),
+        tx,
+        Some("explorer".into()),
+    );
+    approval.details = (0..20).map(|i| format!("  line {i}")).collect();
+    app.pending_approvals = vec![approval];
+    let rows = approval_panel_rows(&app, 80);
+    // rule + header + summary + 8 detail rows + folded marker + 3 choices + hint
+    assert!((14..=17).contains(&rows), "{rows}");
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 30)).unwrap();
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let screen = rendered_rows(&terminal);
+    assert!(
+        screen.iter().any(|r| r.starts_with("explorer · ")),
+        "{screen:?}"
+    );
+    assert!(
+        screen.iter().any(|r| r.contains("more lines")),
+        "{screen:?}"
+    );
+    assert!(
+        screen.iter().any(|r| r.starts_with("› 1. Allow once")),
+        "{screen:?}"
+    );
+    assert!(
+        !screen.iter().any(|r| r.contains("Message dex")),
+        "{screen:?}"
+    );
+    // The transcript keeps a few rows even with a tall panel on a short screen.
+    let mut short = ratatui::Terminal::new(TestBackend::new(80, 12)).unwrap();
+    short.draw(|f| view(f, &mut app)).unwrap();
+}
+
+#[test]
+fn live_agents_show_in_the_full_footer_too() {
+    let mut app = test_app();
+    app.agents.push(super::super::AgentChip {
+        id: "a1".into(),
+        name: "explorer".into(),
+        tool: Some("grep".into()),
+    });
+    let wide = footer_text(&app, 200);
+    assert!(wide.contains("agents: explorer·grep"), "{wide}");
+}
+
+#[test]
+fn lifecycle_and_error_rows_read_cleanly() {
+    let mut app = test_app();
+    app.transcript.clear();
+    super::super::append_sink_line(
+        &mut app,
+        crate::protocol::SinkLine::System("[agent explorer:ab12] started".into()),
+    );
+    super::super::append_sink_line(
+        &mut app,
+        crate::protocol::SinkLine::Error("provider returned 429".into()),
+    );
+    let text = |i: usize| row_text(&wrap_block(&app.transcript[i], 80, false, false, false)[0]);
+    assert_eq!(text(0).trim(), "◈ explorer started · ab12");
+    assert_eq!(text(1).trim(), "✗ provider returned 429");
+}
+
+#[test]
+fn ctrl_o_toggle_refolds_tool_output() {
+    use crate::protocol::SinkLine;
+    let mut app = test_app();
+    app.transcript.clear();
+    super::super::append_sink_line(
+        &mut app,
+        SinkLine::ToolInput {
+            id: "1".into(),
+            input: "grep x".into(),
+        },
+    );
+    super::super::append_sink_line(
+        &mut app,
+        SinkLine::ToolOutput {
+            id: "1".into(),
+            name: "grep".into(),
+            summary: "2 files matched".into(),
+            success: true,
+            preview: vec!["a.rs".into(), "b.rs".into()],
+            duration: 0.0,
+        },
+    );
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    assert!(!rendered_rows(&terminal).iter().any(|r| r == "a.rs"));
+    app.expand_tools = true;
+    super::super::bump_tool_stamps(&mut app);
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    assert!(
+        rendered_rows(&terminal).iter().any(|r| r == "a.rs"),
+        "{:?}",
+        rendered_rows(&terminal)
     );
 }

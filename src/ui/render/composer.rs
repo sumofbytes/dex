@@ -126,5 +126,16 @@ pub(crate) fn render_input(
             cur_x = INPUT_PROMPT_WIDTH as u16;
         }
     }
+    // Empty idle composer: say what it takes, once, in the quietest color.
+    if !dim && input.lines.iter().all(String::is_empty) {
+        if let Some(first) = lines.first_mut() {
+            first
+                .spans
+                .push(Span::styled(PLACEHOLDER, fg(theme::muted_fg())));
+        }
+    }
     (lines, (cur_row, cur_x, cur_row))
 }
+
+/// Shown in the empty, idle composer.
+const PLACEHOLDER: &str = "Message dex · / commands · Shift+Tab mode";

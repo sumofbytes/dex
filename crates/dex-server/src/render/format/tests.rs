@@ -754,3 +754,30 @@ fn exit_code_requires_a_marker_shaped_line() {
         "failed (exit 2) · boom"
     );
 }
+
+#[test]
+fn read_summary_names_the_window_once() {
+    let numbered = |a: u32, b: u32| {
+        (a..=b)
+            .map(|n| format!("{n:>4}  line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let summary = |input: &str, text: &str| tool_result_summary("read", input, text, true, None);
+    // Whole file: a plain count.
+    assert_eq!(summary(r#"{"path":"a.rs"}"#, &numbered(1, 3)), "3 lines");
+    // A window of a longer file: range and total, no overlapping counts.
+    let text = format!(
+        "{}\n[... 120 more lines; continue with offset 81 ...]",
+        numbered(40, 80)
+    );
+    assert_eq!(
+        summary(r#"{"path":"a.rs","offset":40,"limit":41}"#, &text),
+        "lines 40-80 of 200"
+    );
+    // An offset window that reaches the end.
+    assert_eq!(
+        summary(r#"{"path":"a.rs","offset":10}"#, &numbered(10, 12)),
+        "lines 10-12"
+    );
+}

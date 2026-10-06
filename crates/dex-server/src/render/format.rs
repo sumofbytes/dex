@@ -352,29 +352,38 @@ fn read_summary(obj: Option<&serde_json::Map<String, Value>>, text: &str) -> Str
             last = n;
         }
     }
-    let mut out = if files > 0 {
-        format!(
+    if files > 0 {
+        let mut out = format!(
             "{} file{} · {} line{}",
             files,
             if files == 1 { "" } else { "s" },
             shown,
             plural(shown)
-        )
-    } else if offset > 1 || more > 0 {
-        match first {
-            Some(a) if a != last => {
-                format!("lines {a}-{last} · {} line{}", shown, plural(shown))
-            }
-            Some(a) => format!("line {a} · {} line{}", shown, plural(shown)),
-            None => format!("{} line{}", shown, plural(shown)),
+        );
+        if more > 0 {
+            out.push_str(&format!(" (+{more} more)"));
         }
-    } else {
-        format!("{} line{}", shown, plural(shown))
-    };
-    if more > 0 {
-        out.push_str(&format!(" (+{more} more)"));
+        return out;
     }
-    out
+    // `lines A-B of N` when the read shows a window of a longer file (the
+    // trailer's remainder past the last numbered row gives N); otherwise a
+    // plain count. Never two overlapping counts.
+    match first {
+        Some(a) if offset > 1 || more > 0 => {
+            let range = if a == last {
+                format!("line {a}")
+            } else {
+                format!("lines {a}-{last}")
+            };
+            if more > 0 {
+                format!("{range} of {}", last + more)
+            } else {
+                range
+            }
+        }
+        _ if more > 0 => format!("{shown} line{} (+{more} more)", plural(shown)),
+        _ => format!("{} line{}", shown, plural(shown)),
+    }
 }
 
 /// Line number from read's `{:>4}  content` gutter; `None` for `==>`

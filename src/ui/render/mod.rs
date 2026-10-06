@@ -41,15 +41,20 @@ mod composer;
 mod markdown;
 mod preview;
 mod thinking;
+mod tool;
 mod transcript;
 pub(super) use activity::{queue_groups, queue_metrics_of};
-pub(crate) use bottom::{ApprovalOverlay, BottomPane, QuestionOverlay, SlashSuggestionsView};
+pub(crate) use bottom::{approval_panel_rows, BottomPane, QuestionOverlay, SlashSuggestionsView};
 pub(super) use composer::render_input;
+#[cfg(test)]
 pub(super) use markdown::markdown_lines;
+pub(super) use markdown::markdown_lines_at;
 #[cfg(test)]
 pub(crate) use markdown::split_markdown;
-pub(super) use preview::{render_read_preview, render_search_preview, render_tool_input};
+pub(super) use markdown::DEFAULT_TABLE_WIDTH;
+pub(super) use preview::{render_read_preview, render_search_preview, render_tool_arg};
 pub(super) use thinking::format_elapsed;
+pub(super) use transcript::display_offset;
 #[cfg(test)]
 pub(crate) use transcript::wrap_line_display;
 pub(super) use transcript::TranscriptView;
@@ -124,29 +129,26 @@ pub(crate) struct QueueMetrics {
     pub(super) rows: u16,
 }
 
+/// Bottom-pane layout. `approval_rows > 0` swaps the composer for the approval
+/// panel (same slot, `approval_rows` tall); the transcript keeps at least a
+/// few rows either way.
 pub(super) fn compute_layout(
     area: Rect,
     input_rows: u16,
     queue: QueueMetrics,
-    approval_pending: bool,
+    approval_rows: u16,
 ) -> Option<UiLayout> {
     let mut activity_h = activity_height(queue.items, queue.rows);
-    let mut approval_h = if approval_pending {
-        super::APPROVAL_HEIGHT
-    } else {
-        0
-    };
     let footer_height = super::INPUT_STATUS_GUTTER + status_height();
-    // Too short for the full bottom pane: drop the queue strip and the
-    // reserved approval band before touching the composer. Queued text
-    // survives in app state and reappears once space returns; a vanished
-    // composer leaves the agent uncontrollable.
-    if area.height < minimum_view_height(activity_h, approval_h) {
+    // Too short for the full bottom pane: drop the queue strip before
+    // touching the composer. Queued text survives in app state and
+    // reappears once space returns; a vanished composer leaves the agent
+    // uncontrollable.
+    if area.height < minimum_view_height(activity_h, 0) {
         activity_h = 0;
-        approval_h = 0;
     }
     // Below composer + footer minimums nothing fits: transcript-only.
-    if area.height < minimum_view_height(activity_h, approval_h) {
+    if area.height < minimum_view_height(activity_h, 0) {
         return Some(UiLayout {
             transcript: area,
             activity: Rect::new(area.x, area.y, area.width, 0),
@@ -155,12 +157,17 @@ pub(super) fn compute_layout(
         });
     }
 
-    let input_h = input_outer_height(input_rows)
-        .clamp(super::INPUT_MIN_ROWS, 8)
-        .min(
-            area.height
-                .saturating_sub(activity_h + approval_h + footer_height),
-        );
+    let wanted = if approval_rows > 0 {
+        approval_rows.max(super::INPUT_MIN_ROWS)
+    } else {
+        input_outer_height(input_rows).clamp(super::INPUT_MIN_ROWS, 8)
+    };
+    let input_h = wanted.min(
+        area.height
+            .saturating_sub(activity_h + footer_height + MIN_TRANSCRIPT_ROWS),
+    );
+    let input_h = input_h
+        .max(super::INPUT_MIN_ROWS.min(area.height.saturating_sub(activity_h + footer_height)));
     let chunks = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(activity_h),
@@ -177,6 +184,9 @@ pub(super) fn compute_layout(
         footer: chunks[4],
     })
 }
+
+/// Transcript rows the bottom pane may not squeeze out.
+const MIN_TRANSCRIPT_ROWS: u16 = 3;
 
 /// Plan §20 child view: the child log rendered inside the parent's
 /// transcript window — a one-row title (definition name + id + key hints)
@@ -235,10 +245,11 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     // below, instead of rebuilt in both sizing and drawing.
     let groups = queue_groups(app);
     let queue = queue_metrics_of(&groups);
-    // Approval is a centered modal, not a bottom-pane split — don't reserve
-    // APPROVAL_HEIGHT in the main layout; it would shrink the transcript for
-    // no reason and push the composer up.
-    let layout = compute_layout(area, input_rows, queue, false).expect("layout always exists");
+    // A pending approval takes the composer's slot (inline, transcript stays
+    // visible); the `ask_user` wizard is still a centered modal.
+    let approval_rows = approval_panel_rows(app, area.width);
+    let layout =
+        compute_layout(area, input_rows, queue, approval_rows).expect("layout always exists");
     // Plan §20 child view: the open child transcript replaces only the
     // parent's transcript window (title bar + child log); the composer and
     // footer stay so the session remains controllable. The approval
@@ -256,10 +267,9 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     if !app.pending_questions.is_empty() {
         QuestionOverlay::render(f, area, app);
     }
-    if !app.pending_approvals.is_empty() {
-        ApprovalOverlay::render(f, area, app);
+    if app.pending_approvals.is_empty() {
+        SlashSuggestionsView::render(f, layout.input, app);
     }
-    SlashSuggestionsView::render(f, layout.input, app);
 }
 
 #[test]

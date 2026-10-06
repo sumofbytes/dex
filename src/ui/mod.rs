@@ -34,12 +34,12 @@ pub(crate) use metrics::UsageState;
 pub(crate) use remote::{mark_launch_start, run_ratatui_repl_with_remote};
 pub(crate) use render::view;
 pub(crate) use style::{
-    fg, APPROVAL_HEIGHT, INPUT_BORDER_ROWS, INPUT_MIN_ROWS, INPUT_STATUS_GUTTER,
-    STATUS_CONTENT_ROWS, TAB_WIDTH, TRANSCRIPT_INDENT,
+    fg, INPUT_BORDER_ROWS, INPUT_MIN_ROWS, INPUT_STATUS_GUTTER, STATUS_CONTENT_ROWS, TAB_WIDTH,
+    TRANSCRIPT_INDENT,
 };
 pub(crate) use transcript::{
-    bump_thinking_stamps, deny_all_approvals, push_info, push_info_line, resolve_approval,
-    scroll_transcript,
+    bump_thinking_stamps, bump_tool_stamps, deny_all_approvals, push_info, push_info_block,
+    resolve_approval, scroll_transcript,
 };
 pub(crate) mod style;
 #[cfg(test)]
@@ -49,9 +49,9 @@ pub(crate) mod app;
 pub(crate) mod selection;
 pub(crate) mod transcript;
 pub(crate) use app::{
-    AgentChip, App, ChildLog, EnableMouseScroll, PendingApproval, TaskChip, TaskLog,
-    TranscriptBlock, WrappedBlock, CHILD_LOG_MAX_BLOCKS, CHILD_LOG_MAX_LOGS, NOTICE_LIFETIME,
-    TASK_LOG_MAX_LINES, TASK_LOG_MAX_LOGS,
+    block_gap, AgentChip, App, ChildLog, EnableMouseScroll, PendingApproval, Settled, TaskChip,
+    TaskLog, ToolResult, TranscriptBlock, TurnTone, WrappedBlock, CHILD_LOG_MAX_BLOCKS,
+    CHILD_LOG_MAX_LOGS, NOTICE_LIFETIME, TASK_LOG_MAX_LINES, TASK_LOG_MAX_LOGS,
 };
 #[cfg(test)]
 pub(crate) use selection::{b64, line_width};

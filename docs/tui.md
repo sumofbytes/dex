@@ -58,7 +58,7 @@ The TUI has one autonomy selector, cycled with **Shift+Tab** or set with
 | Mode | Intent | Tool gate | Model directive |
 | ------- | ---------------------------------------- | --------------------------------- | -------------------------------------- |
 | `plan` | Research and produce a plan; make **no** changes | `read-only` — every mutation/shell call denied | explore first, then present a plan; do not edit |
-| `manual` | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the approval overlay | none |
+| `manual` | Author with a human in the loop | `ask` — `write`/`edit`/`bash` raise the inline approval panel | none |
 | `auto` (default) | Hands-off execution | `trusted` — no prompts | none |
 
 The default is `auto`: a stock launch seeds the mode from the permission
@@ -95,6 +95,8 @@ unaffected.
   third Ctrl+C force-quits a stuck turn); **Ctrl+C** with a drafted prompt
   clears it first, and **Ctrl+D** on an empty line quits.
 - **Ctrl+T** — expand/collapse the full thinking block.
+- **Ctrl+O** — unfold/fold the output of successful tool calls (failures and
+  write/edit diffs always show theirs).
 - **Shift+Tab** — cycle the agent mode: `plan` → `manual` → `auto` → `plan`
   (clamped to the daemon's `--permission`/`DEX_PERMISSION` ceiling, which it
   cannot exceed). See [Agent modes](#agent-modes).
@@ -120,3 +122,30 @@ from the transcript so pending messages do not scroll away. **Alt+Up** recalls
 queued steers (newest first), then follow-ups, back into the composer for
 editing (the daemon drops its queued copy); a message already accepted at a
 model boundary has been injected and can no longer be recalled.
+
+## Reading the transcript
+
+The transcript has three tiers. Your prompts (`❯ …`) and the assistant's
+answers are full-contrast text. Everything the agent *does* is a compact, dim
+step row — `✓ read src/a.rs:1-40      lines 1-40 of 200` — with the outcome
+right-aligned: `◌` while running, green `✓` when done, red `✗` on failure
+(failures keep their output; `Ctrl+O` shows the rest). Steps hug the narration
+that introduces them; speaker changes get a blank row. Durations print only
+for calls over a second, and thinking shorter than 2s leaves no row.
+
+While a turn runs the last row reads `● Working 12s · bash 3s · Esc to
+interrupt` (turn time, the call in flight, its own time). It settles into
+`Done in 12s · 3 tools · ↓1.2k` (`↓` = tokens generated this turn), or
+`Cancelled after …` / `Failed after …`.
+
+Tables render as aligned columns fitted to the terminal width at the time they
+stream (they do not re-fit on resize); fenced code has a faint block fill.
+
+## Footer and `/session`
+
+The footer keeps one row: mode, `provider/model`, cwd and branch on the left
+(live agents/tasks follow); context pressure (`ctx 12k/128k 9%`, yellow at 75%
+of the compaction trigger, red past it), session cost and — only when remote —
+`remote <host>` on the right. Narrow terminals shed cwd, then branch, then the
+absolute ctx numbers, then cost; never the mode or the model. Tokens (`↑`/`↓`),
+cache hit rate, output speed, and the base-context breakdown are in `/session`.

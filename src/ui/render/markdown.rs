@@ -8,6 +8,8 @@ use ratatui_markdown::markdown::MarkdownBlock;
 use ratatui_markdown::markdown::MarkdownRenderer;
 use ratatui_markdown::markdown::RenderHooks;
 use ratatui_markdown::ThemeConfig;
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 pub(crate) fn split_markdown(s: &str) -> Vec<MarkdownBlock> {
     let lines: Vec<&str> = s.lines().collect();
@@ -188,11 +190,160 @@ impl RenderHooks for CopySafeCodeHooks {
                 }
             }
         }
+        // Line-level bg marks the block's rows; `wrap_block` re-applies it to
+        // every wrapped row and fills out to the full width.
+        let bg = theme::code_bg();
+        for line in &mut lines {
+            line.style.bg = Some(bg);
+        }
         Some(lines)
     }
 }
 
+/// Width the markdown renders tables at when the transcript width is unknown
+/// (before the first frame, headless tests).
+pub(crate) const DEFAULT_TABLE_WIDTH: u16 = 100;
+
+#[cfg(test)]
 pub(crate) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
+    markdown_lines_at(s, DEFAULT_TABLE_WIDTH)
+}
+
+/// Strip the inline emphasis/code markers a table cell may carry: cells are
+/// laid out as aligned plain text, so the markers would only add width.
+fn plain_cell(cell: &str) -> String {
+    cell.replace("**", "")
+        .replace("__", "")
+        .replace("~~", "")
+        .replace('`', "")
+}
+
+fn truncate_cell(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// A table as aligned columns on the terminal background: bold header, a thin
+/// rule under it, two-space gutters, no box glyphs (copy-safe, like code
+/// blocks). Column widths fit their content; when the table is wider than
+/// `avail` the widest columns give way first and cells end in `…`, so a row
+/// never wraps into the next.
+fn table_lines(headers: &[String], rows: &[Vec<String>], avail: usize) -> Vec<Line<'static>> {
+    const GUTTER: usize = 2;
+    const MIN_COL: usize = 4;
+    let cols = headers
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if cols == 0 {
+        return Vec::new();
+    }
+    let cell = |row: &[String], c: usize| plain_cell(row.get(c).map_or("", String::as_str));
+    let mut widths: Vec<usize> = (0..cols)
+        .map(|c| {
+            std::iter::once(cell(headers, c))
+                .chain(rows.iter().map(|r| cell(r, c)))
+                .map(|t| UnicodeWidthStr::width(t.as_str()))
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
+    let gutters = GUTTER * (cols - 1);
+    // Shave the widest column one cell at a time until the table fits (or
+    // every column is at its floor).
+    while widths.iter().sum::<usize>() + gutters > avail {
+        let (idx, widest) = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, w)| (i, *w))
+            .unwrap_or((0, 0));
+        if widest <= MIN_COL {
+            break;
+        }
+        widths[idx] -= 1;
+    }
+    let render_row = |row: &[String], style: ratatui::style::Style| {
+        let mut spans = Vec::new();
+        for (c, width) in widths.iter().enumerate() {
+            let text = truncate_cell(&cell(row, c), *width);
+            let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+            let last = c + 1 == cols;
+            spans.push(Span::styled(
+                if last {
+                    text
+                } else {
+                    format!("{text}{}", " ".repeat(pad))
+                },
+                style,
+            ));
+            if !last {
+                spans.push(Span::raw(" ".repeat(GUTTER)));
+            }
+        }
+        Line::from(spans)
+    };
+    let mut out = vec![render_row(
+        headers,
+        fg(theme::surface_fg()).add_modifier(ratatui::style::Modifier::BOLD),
+    )];
+    let rule: Vec<Span<'static>> = widths
+        .iter()
+        .enumerate()
+        .flat_map(|(c, w)| {
+            let mut v = vec![Span::styled("─".repeat(*w), fg(theme::muted_fg()))];
+            if c + 1 < cols {
+                v.push(Span::raw(" ".repeat(GUTTER)));
+            }
+            v
+        })
+        .collect();
+    out.push(Line::from(rule));
+    out.extend(rows.iter().map(|r| render_row(r, fg(theme::surface_fg()))));
+    out
+}
+
+/// Tidy the renderer's output: bullets read `• text` (one space), and a space
+/// the renderer leaves between an inline-code span and the punctuation that
+/// follows it (`` `x` . ``) is dropped.
+fn tidy_inline(lines: &mut [Line<'static>]) {
+    for line in lines {
+        if let Some(first) = line.spans.first_mut() {
+            if let Some(rest) = first.content.strip_prefix("•  ") {
+                first.content = format!("• {rest}").into();
+            }
+        }
+        for i in 1..line.spans.len() {
+            let (head, tail) = line.spans.split_at_mut(i);
+            let (prev, cur) = (&head[i - 1], &mut tail[0]);
+            if prev.style != cur.style {
+                if let Some(rest) = cur.content.strip_prefix(' ') {
+                    if rest.starts_with(['.', ',', ';', ':', '!', '?', ')']) {
+                        cur.content = rest.to_string().into();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Markdown to transcript rows; `width` is the transcript's text width, which
+/// tables fit themselves to (the rows are stored pre-rendered, so a later
+/// resize does not re-fit them).
+pub(crate) fn markdown_lines_at(s: &str, width: u16) -> Vec<Line<'static>> {
     // Borderless code blocks (see `CopySafeCodeHooks`): the `│ ` gutter and
     // `╭─`/`╰─` rules copy as text in native terminal selections and force
     // edits before pasted commands run. Indent + highlight distinguishes
@@ -201,7 +352,24 @@ pub(crate) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
     let blocks = split_markdown(s);
     let renderer = MarkdownRenderer::new(0)
         .with_render_hooks(Box::new(CopySafeCodeHooks) as Box<dyn RenderHooks>);
-    renderer.render(&blocks, &markdown_theme())
+    let theme = markdown_theme();
+    // Tables lay themselves out (the renderer's box ignores the width);
+    // everything between them renders in runs.
+    let avail = (width as usize)
+        .saturating_sub(super::super::TRANSCRIPT_INDENT)
+        .max(20);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut run_start = 0;
+    for (i, block) in blocks.iter().enumerate() {
+        if let MarkdownBlock::Table { headers, rows } = block {
+            out.extend(renderer.render(&blocks[run_start..i], &theme));
+            out.extend(table_lines(headers, rows, avail));
+            run_start = i + 1;
+        }
+    }
+    out.extend(renderer.render(&blocks[run_start..], &theme));
+    tidy_inline(&mut out);
+    out
 }
 
 /// Theme-aware markdown palette: prose/borders use the terminal's real

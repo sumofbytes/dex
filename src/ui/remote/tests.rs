@@ -115,94 +115,6 @@ fn recognizes_leaked_color_reports() {
     assert!(!is_osc_report("10;rgb:0505/1818"));
 }
 
-fn skill(name: &str) -> crate::protocol::Skill {
-    crate::protocol::Skill {
-        name: name.to_string(),
-        description: String::new(),
-        path: std::path::PathBuf::new(),
-    }
-}
-
-#[test]
-fn skills_listing_is_one_comma_separated_line() {
-    let line = skills_listing_line(&[skill("a"), skill("b"), skill("c")])
-        .expect("non-empty skills produce a line");
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, "skills loaded (3): a, b, c · /skill:<name> loads one");
-    // Every span is muted like the DEX banner: session-start chrome.
-    let muted = crate::render::theme::muted_fg();
-    for span in &line.spans {
-        assert_eq!(span.style.fg, Some(muted), "span is muted: {span:?}");
-    }
-    assert!(skills_listing_line(&[]).is_none());
-}
-
-#[test]
-fn launch_time_line_shows_ready_duration() {
-    let line = launch_time_line(1.23);
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, "ready in 1.2s");
-}
-
-fn row_width(line: &ratatui::text::Line<'_>) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    line.spans.iter().map(|s| s.content.width()).sum()
-}
-
-#[test]
-fn skills_listing_wraps_within_terminal_width() {
-    let skills: Vec<_> = (0..8)
-        .map(|i| skill(&format!("very-long-skill-name-{i:02}")))
-        .collect();
-    let line = skills_listing_line(&skills).expect("non-empty skills produce a line");
-    let width = 40u16;
-    let rows = crate::ui::render::wrap_line_display(&line, width, 0);
-    assert!(rows.len() > 1, "long listing must wrap into multiple rows");
-    for row in &rows {
-        assert!(
-            row_width(row) <= width as usize,
-            "row width {} exceeds {width}",
-            row_width(row)
-        );
-    }
-    // Wrapping splits at grapheme level; only the whitespace at each
-    // break point is consumed (standard word-wrap), so the rows rejoin
-    // to the original line modulo whitespace — nothing dropped or
-    // duplicated.
-    let strip_ws = |text: &str| {
-        text.chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-    };
-    let joined: String = rows
-        .iter()
-        .flat_map(|r| r.spans.iter().map(|s| s.content.as_ref()))
-        .collect();
-    let original: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(strip_ws(&joined), strip_ws(&original));
-    // Theme fg survives onto continuation rows.
-    let fg = line.spans[1].style.fg.expect("names span carries a fg");
-    assert!(
-        rows.iter()
-            .skip(1)
-            .flat_map(|r| r.spans.iter())
-            .any(|s| s.style.fg == Some(fg) && s.content != " "),
-        "continuation rows must keep the names' theme fg"
-    );
-}
-
-#[test]
-fn skills_listing_hard_breaks_overlong_single_name() {
-    // One unbroken word (no whitespace) wider than the terminal must be
-    // hard-split rather than overflow.
-    let line = skills_listing_line(&[skill(&"x".repeat(120))]).expect("one skill");
-    let rows = crate::ui::render::wrap_line_display(&line, 40, 0);
-    assert!(rows.len() > 1, "overlong single name must hard-break");
-    for row in &rows {
-        assert!(row_width(row) <= 40, "row overflow: {}", row_width(row));
-    }
-}
-
 #[test]
 fn local_session_file_resolves_by_id_when_files_are_shared() {
     // `/resume` resolves the daemon sid (an id, not an index/path), so the
@@ -717,9 +629,10 @@ fn remote_thinking_sets_override_without_touching_client_file() {
         .transcript
         .iter()
         .filter_map(|b| match b {
-            crate::ui::TranscriptBlock::Info { line, .. } => Some(
-                line.spans
+            crate::ui::TranscriptBlock::Info { lines, .. } => Some(
+                lines
                     .iter()
+                    .flat_map(|l| l.spans.iter())
                     .map(|s| s.content.to_string())
                     .collect::<String>(),
             ),
@@ -828,9 +741,10 @@ fn every_documented_command_is_handled_remotely() {
             .transcript
             .iter()
             .filter_map(|b| match b {
-                crate::ui::TranscriptBlock::Info { line, .. } => Some(
-                    line.spans
+                crate::ui::TranscriptBlock::Info { lines, .. } => Some(
+                    lines
                         .iter()
+                        .flat_map(|l| l.spans.iter())
                         .map(|s| s.content.to_string())
                         .collect::<String>(),
                 ),

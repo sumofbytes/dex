@@ -219,7 +219,7 @@ the same idempotency key: finished turns replay their result, still-running
 turns answer 409 — use `--reattach <id>` to take over — and turns that died
 with the daemon re-execute from their last journal event. Everything looks
 local: text streams live, tool calls and results appear as they happen, tool
-approvals pop up as an overlay (the daemon parks the turn until you decide),
+approvals take the composer's place (the daemon parks the turn until you decide),
 and Ctrl+C cancels the in-flight turn. API keys and permissions resolve in the
 daemon's environment; client flags like `--model` are forwarded as
 per-request overrides. Tools execute on the daemon's machine, confined to its
@@ -259,8 +259,8 @@ Defaults, all overridable via `DEX_*` env vars — see
 - Paths: tools are confined to the current workspace (`bash` can still run
   arbitrary commands there — use `trusted` only in environments you trust).
 
-In the interactive TUI, actions requiring approval open a dedicated overlay. Use
-the arrow keys and Enter to choose `Allow once`, `Allow for this session`, or
+In the interactive TUI, actions requiring approval replace the composer with an inline panel (the
+transcript stays visible). Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`, or
 `Deny`; `y`, `s`, and `n` are direct shortcuts, and Esc denies.
 
 Any other arguments are treated as a one-shot prompt. Subcommands (`serve`,

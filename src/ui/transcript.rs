@@ -1,12 +1,13 @@
 use super::app::App;
+use super::app::Settled;
+use super::app::ToolResult;
 use super::app::TranscriptBlock;
+use super::app::TurnTone;
 use super::app::STREAM_FLUSH_INTERVAL;
 use super::app::THINKING_TEXT_CAP;
 use super::app::THINKING_TEXT_SLACK;
 use super::render;
-use super::status;
 use super::style::fg;
-use super::style::BLOCK_GAP_ROWS;
 use super::style::INPUT_PROMPT;
 use super::style::TRANSCRIPT_INDENT;
 use crate::protocol::tokens::format_tokens;
@@ -37,14 +38,29 @@ fn line_is_air(line: &Line) -> bool {
 }
 
 pub(crate) fn push_info_line(app: &mut App, line: Line<'static>) {
+    push_info_lines(app, vec![line]);
+}
+
+/// One notice block of several rows: they render contiguously (no gap rows
+/// between them), so a list or a help sheet reads as one thing.
+pub(crate) fn push_info_lines(app: &mut App, lines: Vec<Line<'static>>) {
     flush_assistant(app);
     close_thinking(app);
     app.assistant_open = false;
     app.transcript.push(TranscriptBlock::Info {
         stamp: 0,
-        line: indent_transcript_line(line),
+        lines: lines.into_iter().map(indent_transcript_line).collect(),
     });
     move_activity_to_tail(app);
+}
+
+/// [`push_info_lines`] for plain text rows in the notice color.
+pub(crate) fn push_info_block(app: &mut App, rows: Vec<String>) {
+    let lines = rows
+        .into_iter()
+        .map(|text| Line::from(Span::styled(text, fg(theme::accent_fg()))))
+        .collect();
+    push_info_lines(app, lines);
 }
 
 pub(crate) fn push_info(app: &mut App, text: String) {
@@ -126,10 +142,17 @@ pub(crate) fn flush_assistant(app: &mut App) {
         return;
     }
     note_stream_flush(app);
-    let new_lines: Vec<Line<'static>> = render::markdown_lines(app.assistant_pending.trim_end())
-        .into_iter()
-        .map(indent_transcript_line)
-        .collect();
+    // Tables fit the width the transcript last wrapped at (0 = no frame yet).
+    let width = if app.wrapped_width == 0 {
+        render::DEFAULT_TABLE_WIDTH
+    } else {
+        app.wrapped_width
+    };
+    let new_lines: Vec<Line<'static>> =
+        render::markdown_lines_at(app.assistant_pending.trim_end(), width)
+            .into_iter()
+            .map(indent_transcript_line)
+            .collect();
     app.assistant_pending.clear();
     if app.assistant_open {
         if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
@@ -270,18 +293,18 @@ fn append_thinking(app: &mut App, s: String) {
     app.thinking_open = true;
 }
 
-/// `SinkLine::ToolInput`: start a tool block (glyph line).
+/// `SinkLine::ToolInput`: start a tool step (pending until its output lands).
 fn append_tool_input(app: &mut App, id: String, input: String) {
-    dim_intermediate_assistant_block(app);
     app.assistant_open = false;
     let mut it = input.splitn(2, ' ');
     let name = it.next().unwrap_or("").to_string();
     let arg = it.next().unwrap_or("").to_string();
-    let line = render::render_tool_input(&name, &arg);
     app.transcript.push(TranscriptBlock::Tool {
         stamp: 0,
-        input: line,
-        output: None,
+        input: render::render_tool_arg(&name, &arg),
+        name,
+        started: Instant::now(),
+        result: None,
         preview: Vec::new(),
         tool_arg: arg,
         tool_id: id,
@@ -303,26 +326,12 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     else {
         return false;
     };
-    // The glyph line above already names the tool; the └ line leads with the
-    // outcome (glyph + summary) and trails timing in dim.
-    let failed = !success;
-    let color = if failed {
-        theme::failure_fg()
-    } else {
-        theme::success_fg()
+    let tool_name = name.clone();
+    let tool_result = ToolResult {
+        ok: success,
+        summary,
+        duration,
     };
-    let mut spans = vec![
-        Span::styled("└ ", fg(color)),
-        Span::styled(if failed { "✗ " } else { "✓ " }, fg(color)),
-        Span::styled(summary, fg(color)),
-    ];
-    if duration > 0.0 {
-        spans.push(Span::styled(
-            format!(" · {}", crate::render::format::format_duration(duration)),
-            fg(theme::muted_fg()),
-        ));
-    }
-    let output = indent_transcript_line(Line::from(spans));
     // Pair with the open block for this call: parallel batches interleave
     // inputs/outputs, so the tail is not necessarily ours. Empty id = legacy
     // (session rebuild, old journals, shell blocks): keep the old tail
@@ -333,12 +342,12 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
         content_tail_idx(app).filter(|&i| {
             matches!(
                 app.transcript.get(i),
-                Some(TranscriptBlock::Tool { output: None, .. })
+                Some(TranscriptBlock::Tool { result: None, .. })
             )
         })
     } else {
         app.transcript.iter().rposition(
-            |b| matches!(b, TranscriptBlock::Tool { tool_id, output: None, .. } if tool_id == &id),
+            |b| matches!(b, TranscriptBlock::Tool { tool_id, result: None, .. } if tool_id == &id),
         )
     };
     // write/edit previews are a git diff: color like git does. read previews
@@ -395,14 +404,14 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     // Complete the tool block started by ToolInput if it is still open.
     if let Some(i) = open_idx {
         if let Some(TranscriptBlock::Tool {
-            output: out,
+            result: slot,
             preview: prev,
             stamp,
             ..
         }) = app.transcript.get_mut(i)
         {
-            if out.is_none() {
-                *out = Some(output);
+            if slot.is_none() {
+                *slot = Some(tool_result);
                 *prev = preview_lines;
                 *stamp = stamp.wrapping_add(1);
                 // A mid-transcript completion shifts every display row below
@@ -419,8 +428,10 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     // arg for highlighting.
     app.transcript.push(TranscriptBlock::Tool {
         stamp: 0,
-        input: indent_transcript_line(Line::from(Span::styled("▸ tool", fg(theme::warn_fg())))),
-        output: Some(output),
+        name: tool_name,
+        input: Line::default(),
+        started: Instant::now(),
+        result: Some(tool_result),
         preview: preview_lines,
         tool_arg: String::new(),
         tool_id: id,
@@ -428,16 +439,28 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
     false
 }
 
-/// `SinkLine::System`: a muted system note; child-agent lifecycle lines
-/// (`[agent <name>:<id>] started|finished …`) get their own bold green glyph so
-/// a delegation pops out of the muted notes, like per-tool glyphs do.
+/// `SinkLine::System`: a muted system note. Child-agent lifecycle lines
+/// (`[agent <name>:<id>] started|finished …`) read as `◈ name started` with
+/// the id dim, so a delegation stands out from plain notes without raw
+/// bracket syntax.
 fn append_system(app: &mut App, s: String) {
     app.assistant_open = false;
     let line = match agent_lifecycle(&s) {
-        Some((glyph, _)) => indent_transcript_line(Line::from(vec![
-            Span::styled(format!("{glyph} "), fg(theme::ok_fg())),
-            Span::styled(s, fg(theme::ok_fg())),
-        ])),
+        Some((glyph, rest)) => {
+            let (who, tail) = rest.split_once("] ").unwrap_or((rest, ""));
+            let (name, id) = who.split_once(':').unwrap_or((who, ""));
+            let mut spans = vec![
+                Span::styled(format!("{glyph} "), fg(theme::ok_fg())),
+                Span::styled(
+                    format!("{name} {tail}").trim_end().to_string(),
+                    fg(theme::ok_fg()),
+                ),
+            ];
+            if !id.is_empty() {
+                spans.push(Span::styled(format!(" · {id}"), fg(theme::muted_fg())));
+            }
+            indent_transcript_line(Line::from(spans))
+        }
         None => indent_transcript_line(Line::from(vec![
             Span::styled("· ", fg(theme::muted_fg())),
             Span::styled(s, fg(theme::muted_fg())),
@@ -452,8 +475,8 @@ fn append_error(app: &mut App, s: String) {
     app.transcript.push(TranscriptBlock::Error {
         stamp: 0,
         line: indent_transcript_line(Line::from(vec![
-            Span::styled("! ", fg(theme::error_fg())),
-            Span::styled(format!("error: {s}"), fg(theme::error_fg())),
+            Span::styled("✗ ", fg(theme::error_fg())),
+            Span::styled(s, fg(theme::error_fg())),
         ])),
     });
 }
@@ -536,6 +559,7 @@ pub(crate) fn start_activity(app: &mut App) {
     {
         return;
     }
+    app.turn_out_base = app.tool_state.total_output;
     app.transcript.push(TranscriptBlock::Activity {
         stamp: 0,
         started: Instant::now(),
@@ -549,22 +573,7 @@ pub(crate) fn start_activity(app: &mut App) {
 /// above `pos` keeps pointing at unchanged rows, so it survives the
 /// streaming appends that re-trail the activity spinner.
 fn drop_shifted_selection(app: &mut App, pos: usize) {
-    // Start row of block `pos` in display space: cached rows plus the
-    // `BLOCK_GAP_ROWS` separator before each non-empty block after the first.
-    let first_shifted: usize = app
-        .wrapped_cache
-        .iter()
-        .take(pos)
-        .enumerate()
-        .map(|(j, wb)| {
-            wb.rows.len()
-                + if j > 0 && !wb.rows.is_empty() {
-                    BLOCK_GAP_ROWS
-                } else {
-                    0
-                }
-        })
-        .sum();
+    let first_shifted = render::display_offset(app, pos);
     if let Some(sel) = app.selection {
         if sel.norm().1 .0 >= first_shifted {
             app.selection = None;
@@ -603,11 +612,11 @@ pub(crate) fn move_activity_to_tail(app: &mut App) {
 
 /// Settle the open turn-activity block: move it to the transcript tail and
 /// swap the animated "● Working" indicator for the turn's summary —
-/// "Worked for 12s · 4.2k tokens". Duration is measured from the block's
-/// start, so it spans the whole turn (thinking included). Token count is
-/// read only once a block to settle exists, so replayed turns that never
-/// saw a turn start skip the estimate entirely.
-pub(crate) fn settle_activity(app: &mut App) {
+/// "Done in 12s · 3 tools · ↓1.2k". Duration is measured from the block's
+/// start, so it spans the whole turn (thinking included); the tool count is
+/// the steps since the turn's prompt and `↓` the tokens generated this turn.
+/// A cancelled or failed turn says so (and drops the success color).
+pub(crate) fn settle_activity(app: &mut App, tone: TurnTone) {
     let Some(pos) = app
         .transcript
         .iter()
@@ -619,16 +628,36 @@ pub(crate) fn settle_activity(app: &mut App) {
         TranscriptBlock::Activity { started, .. } => *started,
         _ => unreachable!(),
     };
-    let tokens = status::status_tokens(app);
+    let tools = app.transcript[..pos]
+        .iter()
+        .rev()
+        .take_while(|b| !matches!(b, TranscriptBlock::User { .. }))
+        .filter(|b| matches!(b, TranscriptBlock::Tool { .. }))
+        .count();
+    let generated = app
+        .tool_state
+        .total_output
+        .saturating_sub(app.turn_out_base);
+    let elapsed = render::format_elapsed(started.elapsed());
+    let mut text = match tone {
+        TurnTone::Done => format!("Done in {elapsed}"),
+        TurnTone::Cancelled => format!("Cancelled after {elapsed}"),
+        TurnTone::Failed => format!("Failed after {elapsed}"),
+    };
+    if tools > 0 {
+        text.push_str(&format!(
+            " · {tools} tool{}",
+            if tools == 1 { "" } else { "s" }
+        ));
+    }
+    if generated > 0 {
+        text.push_str(&format!(" · ↓{}", format_tokens(generated)));
+    }
     app.transcript.remove(pos);
     app.transcript.push(TranscriptBlock::Activity {
         stamp: 0,
         started,
-        settled: Some(format!(
-            "Worked for {} · {} tokens",
-            render::format_elapsed(started.elapsed()),
-            format_tokens(tokens),
-        )),
+        settled: Some(Settled { text, tone }),
     });
     app.wrapped_cache.truncate(pos);
     drop_shifted_selection(app, pos);
@@ -644,14 +673,13 @@ pub(crate) fn bump_thinking_stamps(app: &mut App) {
     }
 }
 
-fn dim_intermediate_assistant_block(app: &mut App) {
-    if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
-        for line in lines.iter_mut() {
-            for span in &mut line.spans {
-                span.style = span.style.fg(theme::muted_fg());
-            }
+/// Ctrl+O folds/unfolds successful tool output; the step rows' wrapped rows
+/// depend on that flag, so stamp-bump every tool block.
+pub(crate) fn bump_tool_stamps(app: &mut App) {
+    for block in &mut app.transcript {
+        if matches!(block, TranscriptBlock::Tool { .. }) {
+            block.bump();
         }
-        *stamp = stamp.wrapping_add(1);
     }
 }
 
