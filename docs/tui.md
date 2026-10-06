@@ -134,8 +134,9 @@ by one blank row. Durations print only for calls over a second, and thinking sho
 
 While a turn runs the last row reads `● Working 12s · bash 3s · Esc to
 interrupt` (turn time, the call in flight, its own time). It settles into
-`Done in 12s · 3 tools · ↓1.2k` (`↓` = tokens generated this turn), or
-`Cancelled after …` / `Failed after …`.
+`Done in 12s · 3 tools · ↓1.2k · 14:32` (`↓` = tokens generated this turn;
+the last field is the local time the turn ended, so you can tell how long the
+session has been idle), or `Cancelled after …` / `Failed after …`.
 
 Tables render as aligned columns fitted to the terminal width at the time they
 stream (they do not re-fit on resize); fenced code has a faint block fill.

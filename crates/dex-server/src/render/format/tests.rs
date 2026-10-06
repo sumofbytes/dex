@@ -349,11 +349,9 @@ fn summary_is_outcome_first_without_ok_prefix() {
     // Empty successful output says so instead of a bare "ok".
     assert_eq!(summary("bash", "{}", "", true), "(no output)");
     assert_eq!(summary("bash", "{}", "hello world", true), "hello world");
-    assert_eq!(summary("bash", "{}", "hello world\nrest", true), "2 lines");
-    assert_eq!(
-        summary("bash", "{}", "hello world\nrest\nthird", true),
-        "3 lines"
-    );
+    // Longer bash output has no summary: a line count only measures `head`.
+    assert_eq!(summary("bash", "{}", "hello world\nrest", true), "");
+    assert_eq!(summary("bash", "{}", "hello world\nrest\nthird", true), "");
 }
 
 #[test]
@@ -680,17 +678,21 @@ fn render_mcp_panel_empty_and_truncated() {
 
 #[test]
 fn freeform_summaries_count_lines_and_carry_exit_codes() {
-    // Multi-line bash collapses to a count; the preview carries content.
-    assert_eq!(summary("bash", "{}", "one\ntwo\nthree", true), "3 lines");
-    // Unknown/generic tools behave the same.
-    assert_eq!(summary("mcp__gh__search", "{}", "a\nb", true), "2 lines");
+    // Multi-line bash has no summary; the preview carries content.
+    assert_eq!(summary("bash", "{}", "one\ntwo\nthree", true), "");
+    // Unknown/generic tools lead with the first line and say how much more.
+    assert_eq!(
+        summary("mcp__gh__search", "{}", "a\nb", true),
+        "a · +1 more"
+    );
     assert_eq!(summary("mcp__gh__search", "{}", "solo", true), "solo");
     assert_eq!(summary("mcp__gh__search", "{}", "", true), "(no output)");
     // Structural rows are not content: stderr separator, trailers, and the
     // exit marker never inflate the count or echo as the summary.
+    assert_eq!(summary("bash", "{}", "out\n--- stderr ---\nerr", true), "");
     assert_eq!(
-        summary("bash", "{}", "out\n--- stderr ---\nerr", true),
-        "2 lines"
+        summary("mcp__x__t", "{}", "out\n--- stderr ---\nerr", true),
+        "out · +1 more"
     );
     assert_eq!(
         summary("bash", "{}", "out\n[... 3 of 5 lines truncated ...]", true),
@@ -751,7 +753,7 @@ fn exit_code_requires_a_marker_shaped_line() {
     // A real trailing marker is recognized even after stderr content.
     assert_eq!(
         summary("bash", "{}", "boom\n--- stderr ---\nerr\n[exit 2]", false),
-        "failed (exit 2) · boom"
+        "failed (exit 2) · err"
     );
 }
 
@@ -779,5 +781,34 @@ fn read_summary_names_the_window_once() {
     assert_eq!(
         summary(r#"{"path":"a.rs","offset":10}"#, &numbered(10, 12)),
         "lines 10-12"
+    );
+}
+
+#[test]
+fn bash_failure_explains_itself_with_stderr_or_the_last_line() {
+    // A banner/separator first line is not the reason: stderr's first line is.
+    assert_eq!(
+        summary(
+            "bash",
+            "{}",
+            "---\n--- stderr ---\nfatal: bad\n[exit 128]",
+            false
+        ),
+        "failed (exit 128) · fatal: bad"
+    );
+    // No stderr section: the verdict is usually the last line.
+    assert_eq!(
+        summary(
+            "bash",
+            "{}",
+            "running 3 tests\ntest a ... FAILED\nerror: test failed\n[exit 101]",
+            false
+        ),
+        "failed (exit 101) · error: test failed"
+    );
+    // The preview skips the echoed line only when it is the first one.
+    assert_eq!(
+        tool_preview("bash", false, None, "---\n--- stderr ---\nfatal: bad"),
+        vec!["---", "--- stderr ---", "fatal: bad"]
     );
 }

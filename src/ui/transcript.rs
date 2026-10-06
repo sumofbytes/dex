@@ -617,7 +617,8 @@ pub(crate) fn move_activity_to_tail(app: &mut App) {
 
 /// Settle the open turn-activity block: move it to the transcript tail and
 /// swap the animated "● Working" indicator for the turn's summary —
-/// "Done in 12s · 3 tools · ↓1.2k". Duration is measured from the block's
+/// "Done in 12s · 3 tools · ↓1.2k · 14:32" (the last field is the local clock
+/// time the turn ended). Duration is measured from the block's
 /// start, so it spans the whole turn (thinking included); the tool count is
 /// the steps since the turn started and `↓` the tokens generated this turn.
 /// A cancelled or failed turn says so (and drops the success color).
@@ -657,6 +658,8 @@ pub(crate) fn settle_activity(app: &mut App, tone: TurnTone) {
     if generated > 0 {
         text.push_str(&format!(" · ↓{}", format_tokens(generated)));
     }
+    // When it ended, so a glance at a long-idle session says how stale it is.
+    text.push_str(&format!(" · {}", chrono::Local::now().format("%H:%M")));
     app.transcript.remove(pos);
     app.transcript.push(TranscriptBlock::Activity {
         stamp: 0,

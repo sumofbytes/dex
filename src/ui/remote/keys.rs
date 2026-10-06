@@ -846,7 +846,10 @@ pub(crate) fn finish_shell_command(
     let mut summary =
         crate::render::format::tool_result_summary("bash", &input, output, success, None);
     if excluded {
-        summary.push_str(" · excluded from context");
+        if !summary.is_empty() {
+            summary.push_str(" · ");
+        }
+        summary.push_str("excluded from context");
     }
     let preview = crate::render::format::tool_preview("bash", success, None, output);
     append_sink_line(

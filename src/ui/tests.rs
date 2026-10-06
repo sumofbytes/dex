@@ -471,6 +471,13 @@ fn activity_block_trails_the_tail_then_settles() {
             assert!(summary.text.starts_with("Done in "), "{}", summary.text);
             assert!(summary.text.contains("1 tool"), "{}", summary.text);
             assert!(summary.text.contains("↓1.2k"), "{}", summary.text);
+            // Ends with the local clock time (`HH:MM`).
+            let clock = summary.text.rsplit(" · ").next().unwrap();
+            assert!(
+                clock.len() == 5 && clock.as_bytes()[2] == b':',
+                "{}",
+                summary.text
+            );
         }
         other => panic!("expected settled activity block, got {other:?}"),
     }
