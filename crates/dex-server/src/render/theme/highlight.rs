@@ -79,6 +79,23 @@ pub fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
 /// tokens keep color only (bold is markdown emphasis, not chrome).
 pub fn highlight_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
     let mut segs = shared_highlighter().highlight(lang, code);
+    // The bundled TypeScript query only covers TS-specific syntax (types);
+    // keywords, strings, numbers and comments are absent. Fill the gaps
+    // with the generic lexer wherever tree-sitter stays silent.
+    if lang == "typescript" {
+        // Unstyled filler segments don't count as coverage.
+        let styled = |s: &StyleSegment| s.style.fg.is_some();
+        let extra: Vec<StyleSegment> = tone_segments(fallback_segments(lang, code))
+            .into_iter()
+            .filter(|b| {
+                !segs
+                    .iter()
+                    .any(|t| styled(t) && t.start < b.end && b.start < t.end)
+            })
+            .collect();
+        segs.retain(|t| styled(t) || !extra.iter().any(|b| t.start < b.end && b.start < t.end));
+        segs.extend(extra);
+    }
     segs.sort_by_key(|s| (s.start, s.end));
     for seg in &mut segs {
         seg.style = seg.style.remove_modifier(Modifier::BOLD);
