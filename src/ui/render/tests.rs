@@ -2427,18 +2427,18 @@ fn tool_previews_fold_unless_failed_or_diff_or_expanded() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     // Ctrl+O unfolds them.
     let rows = super::tool::tool_rows("grep", &arg, Some(&ok), &preview, 80, true);
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     // Failures always show their output.
     let bad = done(false, "failed · boom", 0.0);
     let rows = super::tool::tool_rows("bash", &arg, Some(&bad), &preview, 80, false);
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     // write/edit diffs show, folded past a handful of rows.
     let diff: Vec<Line<'static>> = (0..14).map(|i| Line::from(format!("  +{i}"))).collect();
     let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, false);
-    assert_eq!(rows.len(), 1 + 10 + 1, "{rows:?}");
-    assert!(row_text(rows.last().unwrap()).contains("+4 more diff lines"));
+    assert_eq!(rows.len(), 1 + 10 + 1 + 1, "{rows:?}");
+    assert!(row_text(&rows[rows.len() - 2]).contains("+4 more diff lines"));
     let rows = super::tool::tool_rows("edit", &arg, Some(&ok), &diff, 80, true);
-    assert_eq!(rows.len(), 1 + 14);
+    assert_eq!(rows.len(), 1 + 14 + 1);
 }
 
 #[test]
