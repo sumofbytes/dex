@@ -860,6 +860,44 @@ fn approval_number_keys_resolve_directly() {
 }
 
 #[test]
+fn finish_turn_drains_parked_approvals_and_questions() {
+    // The daemon can resolve or tear down parked approvals/questions
+    // without the turn tail telling us (external resolution, session
+    // teardown); a finished turn must not leave their panels parked on the
+    // composer slot forever. Deny/dismiss so a still-blocked daemon side
+    // unwinds instead of waiting on a prompt nobody answers.
+    let mut remote = test_remote();
+    let (atx, mut arx) = tokio::sync::mpsc::channel(1);
+    remote
+        .app
+        .pending_approvals
+        .push(crate::ui::PendingApproval::new(
+            "bash".into(),
+            "{}".into(),
+            atx,
+            None,
+        ));
+    let mut qrx = park_question(&mut remote, vec![one_question()]);
+    remote.app.busy = true;
+
+    super::input::finish_turn(&mut remote, None);
+
+    assert!(remote.app.pending_approvals.is_empty(), "approval drained");
+    assert!(remote.app.pending_questions.is_empty(), "questions drained");
+    assert!(!remote.app.busy);
+    assert_eq!(
+        arx.try_recv().ok(),
+        Some(crate::protocol::ApprovalDecision::Deny),
+        "unwind a still-blocked daemon side"
+    );
+    assert_eq!(
+        qrx.try_recv().ok(),
+        Some(vec![crate::protocol::QuestionAnswer::Dismiss]),
+        "dismiss a still-blocked daemon side"
+    );
+}
+
+#[test]
 fn question_other_number_opens_text_entry() {
     // The "other" row renders as `3)` (2 options); its number opens the
     // free-text entry like Enter on it, and stays unsubmitted.
