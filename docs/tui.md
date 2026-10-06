@@ -144,7 +144,7 @@ stream (they do not re-fit on resize); fenced code has a faint block fill.
 ## Footer and `/session`
 
 The footer keeps one row: mode, `provider/model`, cwd and branch on the left
-(live agents/tasks follow); context pressure (`ctx 12k/128k 9%`, yellow at 75%
+(live agents/tasks follow); context pressure (`ctx 12k/128k 9.3%`, yellow at 75%
 of the compaction trigger, red past it), session cost and — only when remote —
 `remote <host>` on the right. Narrow terminals shed cwd, then branch, then the
 absolute ctx numbers, then cost; never the mode or the model. Tokens (`↑`/`↓`),
