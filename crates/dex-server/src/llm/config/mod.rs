@@ -34,7 +34,7 @@ pub use crate::workspace::unique_tmp_path;
 /// Builtin providers whose canonical key env var is pinned in dex rather
 /// than catalog-discovered — see `config::credentials` (single owner of key
 /// resolution); re-exported so existing `config::...` paths keep working.
-pub use credentials::{pinned_key_env, resolve_credentials};
+pub use credentials::{key_env_names, pinned_key_env, resolve_credentials};
 // `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use catalog_query::{

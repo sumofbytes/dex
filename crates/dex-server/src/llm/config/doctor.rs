@@ -1,8 +1,7 @@
-use super::{pinned_key_env, stored_thinking_effort};
+use super::{key_env_names, stored_thinking_effort};
 
 use super::agent_wake_origin;
 use super::cache_warming_origin;
-use super::catalog_query::catalog_env_vars;
 use super::config_file_path;
 use super::context_index::catalog_context_window;
 use super::context_index::ctx_from_index;
@@ -149,14 +148,7 @@ fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String 
     {
         format!("config providers.{}.api_key", provider.name())
     } else {
-        let mut names = catalog_env_vars(provider.name());
-        // Mirror `resolve_credentials`: pinned builtin vars resolve cache-less,
-        // ahead of any catalog `env` discovery.
-        if let Some(pinned) = pinned_key_env(provider) {
-            if !names.iter().any(|v| v == pinned) {
-                names.insert(0, pinned.to_string());
-            }
-        }
+        let names = key_env_names(provider);
         match names
             .iter()
             .find(|n| env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))

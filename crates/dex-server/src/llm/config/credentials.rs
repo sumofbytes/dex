@@ -61,6 +61,43 @@ pub fn pinned_key_env(provider: &Provider) -> Option<&'static str> {
     }
 }
 
+/// Extra key env vars `pi` documents that the models.dev catalog doesn't
+/// (or shares across regions), keyed by catalog provider name. Tried ahead
+/// of the catalog names so a region-specific var beats a shared one.
+fn pi_key_env_aliases(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "azure" | "azure-cognitive-services" => &["AZURE_OPENAI_API_KEY"],
+        "zai" | "zai-coding-plan" => &["ZAI_API_KEY"],
+        "zhipuai-coding-plan" => &["ZAI_CODING_CN_API_KEY"],
+        "meta" => &["META_API_KEY"],
+        "bailing" => &["ANT_LING_API_KEY"],
+        "cloudflare-ai-gateway" => &["CLOUDFLARE_API_KEY"],
+        "alibaba-token-plan" => &["QWEN_TOKEN_PLAN_API_KEY"],
+        "alibaba-token-plan-cn" => &["QWEN_TOKEN_PLAN_CN_API_KEY"],
+        "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
+        "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
+        "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// Ordered env var names tried for a provider's key: pinned builtin, `pi`
+/// aliases, then the catalog `env` map. Shared with `dex doctor`.
+pub fn key_env_names(provider: &Provider) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let extra = pinned_key_env(provider)
+        .into_iter()
+        .chain(pi_key_env_aliases(provider.name()).iter().copied())
+        .map(str::to_string)
+        .chain(catalog_env_vars(provider.name()));
+    for n in extra {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    names
+}
+
 /// Per-provider credentials — the uniform deposit order for every provider
 /// except codex (which reads its own credential file):
 /// 1. `providers.<name>.api_key` in config.yaml,
@@ -85,13 +122,8 @@ pub fn resolve_credentials(
     }
     // The provider's own documented env vars; pinned builtin vars (see
     // `pinned_key_env`) work cache-less — the catalog is the source for
-    // every other provider.
-    let mut env_names: Vec<String> = catalog_env_vars(name);
-    if let Some(pinned) = pinned_key_env(provider) {
-        if !env_names.iter().any(|v| v == pinned) {
-            env_names.insert(0, pinned.to_string());
-        }
-    }
+    // every other provider, plus `pi`-compatible aliases.
+    let env_names = key_env_names(provider);
     for var in &env_names {
         if let Ok(key) = env::var(var) {
             if !key.trim().is_empty() {
@@ -115,6 +147,14 @@ pub fn resolve_credentials(
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn pi_aliases_precede_catalog_names() {
+        let names = key_env_names(&Provider::Generic("zai".into()));
+        assert_eq!(names.first().map(String::as_str), Some("ZAI_API_KEY"));
+        let names = key_env_names(&Provider::Anthropic);
+        assert_eq!(names.first().map(String::as_str), Some("ANTHROPIC_API_KEY"));
+    }
 
     #[test]
     fn load_resolves_env_then_file() {
