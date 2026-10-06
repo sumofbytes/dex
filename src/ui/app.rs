@@ -322,6 +322,10 @@ pub(crate) struct App {
     /// `tool_state.total_output` when the current turn started, so the
     /// settled summary reports tokens generated *this turn*.
     pub(crate) turn_out_base: u64,
+    /// Tool steps in the transcript when the current turn started, so the
+    /// settled summary counts this turn's tools (steers add `User` blocks
+    /// mid-turn, so the last prompt is no boundary).
+    pub(crate) turn_tools_base: usize,
     /// Whether the tail `Thinking` block is still streaming deltas. Drives
     /// the collapsed indicator's dot animation; it closes (settles) as soon
     /// as any non-thinking line arrives or the turn ends.
@@ -456,6 +460,7 @@ impl App {
             expand_tools: false,
             base_context: Vec::new(),
             turn_out_base: 0,
+            turn_tools_base: 0,
             thinking_open: false,
             plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),

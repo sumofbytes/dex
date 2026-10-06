@@ -8,6 +8,7 @@ use super::activity::ActivityView;
 use super::activity::QueueGroup;
 use super::composer::ComposerView;
 use super::preview::render_approval_detail;
+use super::transcript::wrap_line_display;
 use super::UiLayout;
 use crate::render::theme;
 use ratatui::layout::Rect;
@@ -455,33 +456,94 @@ const APPROVAL_CHOICES: [(&str, &str); 3] = [
     ("Deny", "n"),
 ];
 
-/// Display rows `detail` occupies at `width` cells.
-fn approval_detail_rows(detail: &str, width: usize) -> usize {
-    UnicodeWidthStr::width(detail).max(1).div_ceil(width.max(1))
-}
-
-/// How many detail lines fit the row budget at `inner` cells, the rows they
-/// take, and how many lines fold into the `… +N more` marker (itself a row).
-fn approval_detail_plan(
+/// The panel's rows at `inner` cells, wrapped here (not by `Paragraph`) so
+/// the height the layout reserves is exactly what gets drawn. Details are
+/// whole lines that fit `max_detail` rows, then a `… +N more` marker; when
+/// even the first line exceeds the budget its first rows are shown anyway —
+/// the command being approved must never be invisible.
+fn approval_panel_lines(
     approval: &super::super::PendingApproval,
+    extra: usize,
     inner: usize,
-) -> (usize, usize, usize) {
-    let mut budget = APPROVAL_MAX_DETAIL_ROWS;
+    max_detail: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let w = inner.max(1) as u16;
+    let warn = fg(theme::warn_fg());
+    let muted = fg(theme::muted_fg());
+    let wrap = |line: Line<'static>| wrap_line_display(&line, w, 0);
+    let mut rows: Vec<Line<'static>> = vec![Line::from(Span::styled("─".repeat(inner), warn))];
+    // What is asking, and how risky.
+    let mut header = Vec::new();
+    if let Some(agent) = &approval.agent {
+        header.push(Span::styled(format!("{agent} · "), fg(theme::ok_fg())));
+    }
+    header.push(Span::styled(
+        approval.title.to_string(),
+        fg(theme::accent_fg()),
+    ));
+    header.push(Span::styled(
+        format!(" · {} risk", approval.risk_label),
+        fg(approval.risk_color),
+    ));
+    if extra > 0 {
+        header.push(Span::styled(format!(" · +{extra} waiting"), warn));
+    }
+    rows.extend(wrap(Line::from(header)));
+    if !approval.summary.is_empty() {
+        rows.extend(wrap(Line::from(Span::styled(
+            approval.summary.clone(),
+            fg(theme::surface_fg()),
+        ))));
+    }
+    // The command / diff itself, folded past the row budget.
+    let mut budget = max_detail;
     let mut shown = 0usize;
+    let mut cut_first = false;
     for detail in &approval.details {
-        let need = approval_detail_rows(detail, inner);
-        if need > budget {
+        let wrapped = wrap(render_approval_detail(&approval.name, detail));
+        if wrapped.len() > budget {
+            if shown == 0 {
+                rows.extend(wrapped.into_iter().take(budget));
+                shown = 1;
+                cut_first = true;
+            }
             break;
         }
-        budget -= need;
+        budget -= wrapped.len();
+        rows.extend(wrapped);
         shown += 1;
     }
     let hidden = approval.details.len() - shown;
-    (
-        shown,
-        APPROVAL_MAX_DETAIL_ROWS - budget + usize::from(hidden > 0),
-        hidden,
-    )
+    if hidden > 0 || cut_first {
+        let text = if hidden > 0 {
+            format!("… +{hidden} more lines")
+        } else {
+            "… line continues".to_string()
+        };
+        rows.extend(wrap(Line::from(Span::styled(text, muted))));
+    }
+    let details_end = rows.len();
+    for (idx, (label, key)) in APPROVAL_CHOICES.iter().enumerate() {
+        let selected = approval.selected == idx;
+        let marker = if selected { "› " } else { "  " };
+        let style = if selected {
+            theme::selection_style()
+        } else {
+            fg(theme::surface_fg())
+        };
+        let text = format!("{marker}{}. {label}", idx + 1);
+        let pad = inner.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 1);
+        rows.extend(wrap(Line::from(vec![
+            Span::styled(text, style),
+            Span::styled(" ".repeat(pad), style),
+            Span::styled(key.to_string(), if selected { style } else { muted }),
+        ])));
+    }
+    rows.extend(wrap(Line::from(Span::styled(
+        "↑↓ move · Enter confirm · y/s/n or 1/2/3 · Esc deny",
+        muted,
+    ))));
+    (rows, details_end)
 }
 
 /// Rows the approval panel needs at `width`; 0 when nothing is pending.
@@ -489,10 +551,11 @@ pub(crate) fn approval_panel_rows(app: &App, width: u16) -> u16 {
     let Some(approval) = app.pending_approvals.first() else {
         return 0;
     };
-    let (_, detail_rows, _) = approval_detail_plan(approval, content_width(width) as usize);
-    // rule + header + (summary) + details + choices + hint
-    let summary = usize::from(!approval.summary.is_empty());
-    (1 + 1 + summary + detail_rows + APPROVAL_CHOICES.len() + 1) as u16
+    let extra = app.pending_approvals.len() - 1;
+    let inner = content_width(width) as usize;
+    approval_panel_lines(approval, extra, inner, APPROVAL_MAX_DETAIL_ROWS)
+        .0
+        .len() as u16
 }
 
 impl ApprovalPanel {
@@ -502,69 +565,22 @@ impl ApprovalPanel {
         };
         let band = composer_band(area);
         f.render_widget(Clear, band);
-        let extra = app.pending_approvals.len().saturating_sub(1);
-        let warn = fg(theme::warn_fg());
-        let muted = fg(theme::muted_fg());
-        let mut rows: Vec<Line> = Vec::new();
-        rows.push(Line::from(Span::styled(
-            "─".repeat(band.width as usize),
-            warn,
-        )));
-        // What is asking, and how risky.
-        let mut header = Vec::new();
-        if let Some(agent) = &approval.agent {
-            header.push(Span::styled(format!("{agent} · "), fg(theme::ok_fg())));
-        }
-        header.push(Span::styled(
-            approval.title.to_string(),
-            fg(theme::accent_fg()),
-        ));
-        header.push(Span::styled(
-            format!(" · {} risk", approval.risk_label),
-            fg(approval.risk_color),
-        ));
-        if extra > 0 {
-            header.push(Span::styled(format!(" · +{extra} waiting"), warn));
-        }
-        rows.push(Line::from(header));
-        if !approval.summary.is_empty() {
-            rows.push(Line::from(Span::styled(
-                approval.summary.clone(),
-                fg(theme::surface_fg()),
-            )));
-        }
-        // The command / diff itself, folded past a few rows.
+        let extra = app.pending_approvals.len() - 1;
         let inner = band.width as usize;
-        let (shown, _, hidden) = approval_detail_plan(approval, inner);
-        for detail in approval.details.iter().take(shown) {
-            rows.push(render_approval_detail(&approval.name, detail));
+        let height = band.height as usize;
+        let (mut rows, mut details_end) =
+            approval_panel_lines(approval, extra, inner, APPROVAL_MAX_DETAIL_ROWS);
+        // Short terminal: shrink the details, never the choices.
+        let mut budget = APPROVAL_MAX_DETAIL_ROWS;
+        while rows.len() > height && budget > 1 {
+            budget -= 1;
+            (rows, details_end) = approval_panel_lines(approval, extra, inner, budget);
         }
-        if hidden > 0 {
-            rows.push(Line::from(Span::styled(
-                format!("… +{hidden} more lines"),
-                muted,
-            )));
+        if rows.len() > height {
+            // Still too tall: drop the rows just above the choices.
+            let excess = rows.len() - height;
+            rows.drain(details_end.saturating_sub(excess)..details_end);
         }
-        for (idx, (label, key)) in APPROVAL_CHOICES.iter().enumerate() {
-            let selected = approval.selected == idx;
-            let marker = if selected { "› " } else { "  " };
-            let style = if selected {
-                theme::selection_style()
-            } else {
-                fg(theme::surface_fg())
-            };
-            let text = format!("{marker}{}. {label}", idx + 1);
-            let pad = inner.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 1);
-            rows.push(Line::from(vec![
-                Span::styled(text, style),
-                Span::styled(" ".repeat(pad), style),
-                Span::styled(key.to_string(), if selected { style } else { muted }),
-            ]));
-        }
-        rows.push(Line::from(Span::styled(
-            "↑↓ move · Enter confirm · y/s/n or 1/2/3 · Esc deny",
-            muted,
-        )));
-        f.render_widget(Paragraph::new(rows).wrap(Wrap { trim: false }), band);
+        f.render_widget(Paragraph::new(rows), band);
     }
 }

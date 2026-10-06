@@ -299,9 +299,8 @@ pub(crate) fn display_offset(app: &App, upto: usize) -> usize {
         start += wb.rows.len();
         prev = Some(idx);
     }
-    // The gap before block `upto` itself belongs to it, not to the offset of
-    // the rows above — except callers truncate at the gap's first row, which
-    // is exactly this offset.
+    // The gap before block `upto` is not counted: it belongs to that block,
+    // and callers truncate at the gap's first row, which is this offset.
     start
 }
 

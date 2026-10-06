@@ -390,6 +390,7 @@ pub(crate) fn bootstrap(
         expand_tools: false,
         base_context: Vec::new(),
         turn_out_base: 0,
+        turn_tools_base: 0,
         thinking_open: false,
         assistant_pending: String::new(),
         assistant_gap: crate::render::theme::markdown::GapState::new(),

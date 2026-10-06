@@ -162,9 +162,16 @@ pub(super) fn compute_layout(
     } else {
         input_outer_height(input_rows).clamp(super::INPUT_MIN_ROWS, 8)
     };
+    // An approval outranks the transcript: deciding blind is worse than a
+    // squeezed history.
+    let min_transcript = if approval_rows > 0 {
+        1
+    } else {
+        MIN_TRANSCRIPT_ROWS
+    };
     let input_h = wanted.min(
         area.height
-            .saturating_sub(activity_h + footer_height + MIN_TRANSCRIPT_ROWS),
+            .saturating_sub(activity_h + footer_height + min_transcript),
     );
     let input_h = input_h
         .max(super::INPUT_MIN_ROWS.min(area.height.saturating_sub(activity_h + footer_height)));

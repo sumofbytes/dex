@@ -210,12 +210,60 @@ pub(crate) fn markdown_lines(s: &str) -> Vec<Line<'static>> {
 }
 
 /// Strip the inline emphasis/code markers a table cell may carry: cells are
-/// laid out as aligned plain text, so the markers would only add width.
+/// laid out as aligned plain text, so the markers would only add width. Only
+/// a balanced pair that wraps text is a marker — a lone `**kwargs` or the
+/// `__init__.py` identifier keeps its characters, and code spans keep theirs
+/// verbatim.
 fn plain_cell(cell: &str) -> String {
-    cell.replace("**", "")
-        .replace("__", "")
-        .replace("~~", "")
-        .replace('`', "")
+    let parts: Vec<&str> = cell.split('`').collect();
+    // An odd number of backticks leaves the last one unpaired: keep it as text.
+    if parts.len().is_multiple_of(2) {
+        return strip_emphasis(cell);
+    }
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            if i % 2 == 1 {
+                (*part).to_string()
+            } else {
+                strip_emphasis(part)
+            }
+        })
+        .collect()
+}
+
+fn strip_emphasis(text: &str) -> String {
+    let text = unwrap_pairs(text, "**", false);
+    let text = unwrap_pairs(&text, "~~", false);
+    unwrap_pairs(&text, "__", true)
+}
+
+/// Remove `marker` pairs that tightly wrap text (`**bold**`). With `spaced`
+/// the wrapped text must contain whitespace, which keeps `__init__` intact.
+fn unwrap_pairs(text: &str, marker: &str, spaced: bool) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find(marker) {
+        let after = &rest[open + marker.len()..];
+        let Some(close) = after.find(marker) else {
+            break;
+        };
+        let inner = &after[..close];
+        let tight = !inner.is_empty()
+            && !inner.starts_with(char::is_whitespace)
+            && !inner.ends_with(char::is_whitespace);
+        if tight && (!spaced || inner.contains(char::is_whitespace)) {
+            out.push_str(&rest[..open]);
+            out.push_str(inner);
+            rest = &after[close + marker.len()..];
+        } else {
+            out.push_str(&rest[..open + marker.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn truncate_cell(text: &str, width: usize) -> String {

@@ -471,6 +471,26 @@ pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
             left_only = Some(line);
         }
     }
+    // Nothing fit with its right side: a remote badge still beats the extras,
+    // so try mode + bare model + badge before settling for the left alone.
+    if let Some(conn) = conn_piece(app) {
+        let cw = pieces_width(std::slice::from_ref(&conn));
+        let bare = if app.config.provider.name().is_empty() {
+            "unconfigured".to_string()
+        } else {
+            app.config.model.clone()
+        };
+        let mut left = hint.clone();
+        left.push(mode_piece(app));
+        push_sep(&mut left);
+        left.push(quiet(bare));
+        let lw = pieces_width(&left);
+        if lw + 2 + cw <= width {
+            left.push((" ".repeat(width - lw - cw), Style::default()));
+            left.push(conn);
+            return to_line(left);
+        }
+    }
     if let Some(left) = left_only {
         return to_line(left);
     }

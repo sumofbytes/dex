@@ -3403,3 +3403,51 @@ fn ctrl_o_toggle_refolds_tool_output() {
         rendered_rows(&terminal)
     );
 }
+
+#[test]
+fn table_cells_keep_identifier_characters() {
+    let md = "| name | note |\n|---|---|\n| __init__.py | **kwargs |\n| `__x__` | **bold** and ~~gone~~ |\n";
+    let rows = plain(&markdown_lines_at(md, 100));
+    assert!(rows[2].contains("__init__.py"), "{rows:?}");
+    assert!(rows[2].contains("**kwargs"), "{rows:?}");
+    assert!(rows[3].contains("__x__"), "{rows:?}");
+    assert!(rows[3].contains("bold and gone"), "{rows:?}");
+}
+
+#[test]
+fn approval_never_hides_the_command_or_the_choices() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let mut app = test_app();
+    let mut approval = super::super::PendingApproval::new(
+        "bash".into(),
+        serde_json::json!({ "command": "x" }).to_string(),
+        tx,
+        None,
+    );
+    // One 88-cell line on a 20-column terminal wraps past the row budget.
+    approval.details = vec![format!("$ {}", "aaaa ".repeat(17)), "  second".into()];
+    app.pending_approvals = vec![approval];
+    for (w, h) in [(20u16, 30u16), (80, 12), (40, 12)] {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| view(f, &mut app)).unwrap();
+        let screen = rendered_rows(&terminal);
+        assert!(
+            screen.iter().any(|r| r.contains("aaaa")),
+            "{w}x{h}: {screen:?}"
+        );
+        assert!(
+            screen.iter().any(|r| r.contains("Deny")),
+            "{w}x{h}: {screen:?}"
+        );
+    }
+}
+
+#[test]
+fn narrow_footer_keeps_the_remote_badge() {
+    let mut app = test_app();
+    app.connection = Some("[R] box".into());
+    for width in [40u16, 34, 30] {
+        let text = footer_text(&app, width);
+        assert!(text.contains("remote box"), "{width}: {text:?}");
+    }
+}

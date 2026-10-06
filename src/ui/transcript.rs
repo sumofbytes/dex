@@ -560,6 +560,11 @@ pub(crate) fn start_activity(app: &mut App) {
         return;
     }
     app.turn_out_base = app.tool_state.total_output;
+    app.turn_tools_base = app
+        .transcript
+        .iter()
+        .filter(|b| matches!(b, TranscriptBlock::Tool { .. }))
+        .count();
     app.transcript.push(TranscriptBlock::Activity {
         stamp: 0,
         started: Instant::now(),
@@ -614,7 +619,7 @@ pub(crate) fn move_activity_to_tail(app: &mut App) {
 /// swap the animated "● Working" indicator for the turn's summary —
 /// "Done in 12s · 3 tools · ↓1.2k". Duration is measured from the block's
 /// start, so it spans the whole turn (thinking included); the tool count is
-/// the steps since the turn's prompt and `↓` the tokens generated this turn.
+/// the steps since the turn started and `↓` the tokens generated this turn.
 /// A cancelled or failed turn says so (and drops the success color).
 pub(crate) fn settle_activity(app: &mut App, tone: TurnTone) {
     let Some(pos) = app
@@ -630,10 +635,9 @@ pub(crate) fn settle_activity(app: &mut App, tone: TurnTone) {
     };
     let tools = app.transcript[..pos]
         .iter()
-        .rev()
-        .take_while(|b| !matches!(b, TranscriptBlock::User { .. }))
         .filter(|b| matches!(b, TranscriptBlock::Tool { .. }))
-        .count();
+        .count()
+        .saturating_sub(app.turn_tools_base);
     let generated = app
         .tool_state
         .total_output

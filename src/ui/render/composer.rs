@@ -11,6 +11,9 @@ use ratatui::text::Span;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
+/// Shown in the empty, idle composer.
+const PLACEHOLDER: &str = "Message dex · / commands · Shift+Tab mode";
+
 pub(crate) struct ComposerView;
 
 impl ComposerView {
@@ -136,6 +139,3 @@ pub(crate) fn render_input(
     }
     (lines, (cur_row, cur_x, cur_row))
 }
-
-/// Shown in the empty, idle composer.
-const PLACEHOLDER: &str = "Message dex · / commands · Shift+Tab mode";

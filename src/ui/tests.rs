@@ -1250,3 +1250,33 @@ fn history_walk_resets_slash_selection() {
     app.history_down();
     assert_eq!(app.slash_selected, 0);
 }
+
+#[test]
+fn a_mid_turn_steer_does_not_reset_the_tool_count() {
+    let tool = |app: &mut App| {
+        append_sink_line(
+            app,
+            crate::protocol::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash ls".into(),
+            },
+        );
+    };
+    let mut app = test_app();
+    app.busy = true;
+    tool(&mut app); // a previous turn's tool
+    start_activity(&mut app);
+    tool(&mut app);
+    app.transcript.push(TranscriptBlock::User {
+        stamp: 0,
+        lines: vec![Line::from("steer")],
+    });
+    tool(&mut app);
+    settle_activity(&mut app, TurnTone::Done);
+    match app.transcript.last() {
+        Some(TranscriptBlock::Activity {
+            settled: Some(s), ..
+        }) => assert!(s.text.contains("2 tools"), "{}", s.text),
+        other => panic!("{other:?}"),
+    }
+}
