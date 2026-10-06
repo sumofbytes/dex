@@ -12,6 +12,7 @@ use super::super::settle_activity;
 use super::super::word_bounds;
 use super::super::AgentChip;
 use super::super::Selection;
+use super::super::TurnTone;
 use super::super::{PendingApproval, PendingQuestionUi};
 use super::pollers::refresh_git_async;
 use super::pollers::{spawn_approval_poster, spawn_question_poster};
@@ -541,10 +542,18 @@ pub(crate) fn replay_remote_events(
 }
 
 pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
+    let failed = error.is_some();
     if let Some(error) = error {
         append_sink_line(&mut remote.app, SinkLine::Error(error));
     }
     let app = &mut remote.app;
+    let tone = if failed {
+        TurnTone::Failed
+    } else if app.cancel_requested {
+        TurnTone::Cancelled
+    } else {
+        TurnTone::Done
+    };
     // Drain any assistant deltas still in the throttle buffer so the final
     // text is in the transcript before the turn is torn down.
     flush_assistant(app);
@@ -565,7 +574,7 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
     remote.cancel_flag.store(false, Ordering::SeqCst);
-    settle_activity(app);
+    settle_activity(app, tone);
     // Tools (bash/git/write/edit) may have switched branches or dirtied the
     // tree mid-turn; refresh the footer now rather than waiting for the next
     // background poll. Async so the UI thread never blocks on HTTP (the

@@ -13,7 +13,8 @@ mod parser;
 
 #[allow(unused_imports)] // used from `ui::mod`/`remote` test modules by full path
 pub(super) use commands::{
-    apply_session_state, cmd_help, handle_slash, parse, reset_session_state, SlashCommand,
+    apply_session_state, cmd_help, handle_slash, parse, reset_session_state, usage_rows,
+    SlashCommand,
 };
 pub(super) use completion::{
     complete_slash, dismiss_slash, expand_bare_command, popup_open, slash_suggestions,
@@ -21,9 +22,6 @@ pub(super) use completion::{
 };
 #[allow(unused_imports)]
 pub(super) use parser::COMMANDS;
-
-#[cfg(test)]
-use commands::commands_help_line;
 
 #[cfg(test)]
 mod tests;

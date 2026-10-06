@@ -1,5 +1,6 @@
 use super::super::append_sink_line;
 use super::super::bump_thinking_stamps;
+use super::super::bump_tool_stamps;
 use super::super::deny_all_approvals;
 use super::super::push_info;
 use super::super::render_user_prompt;
@@ -133,6 +134,12 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
             app.show_thinking = !app.show_thinking;
             bump_thinking_stamps(app);
+        }
+        // Ctrl+O: fold/unfold successful tool output (failures and diffs
+        // always show theirs).
+        KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => {
+            app.expand_tools = !app.expand_tools;
+            bump_tool_stamps(app);
         }
         // Ctrl+A: toggle the child transcript view (plan §20). With no log
         // yet there is nothing to show — say so instead of staying silent.
@@ -839,7 +846,10 @@ pub(crate) fn finish_shell_command(
     let mut summary =
         crate::render::format::tool_result_summary("bash", &input, output, success, None);
     if excluded {
-        summary.push_str(" · excluded from context");
+        if !summary.is_empty() {
+            summary.push_str(" · ");
+        }
+        summary.push_str("excluded from context");
     }
     let preview = crate::render::format::tool_preview("bash", success, None, output);
     append_sink_line(

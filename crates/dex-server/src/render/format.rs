@@ -352,29 +352,38 @@ fn read_summary(obj: Option<&serde_json::Map<String, Value>>, text: &str) -> Str
             last = n;
         }
     }
-    let mut out = if files > 0 {
-        format!(
+    if files > 0 {
+        let mut out = format!(
             "{} file{} · {} line{}",
             files,
             if files == 1 { "" } else { "s" },
             shown,
             plural(shown)
-        )
-    } else if offset > 1 || more > 0 {
-        match first {
-            Some(a) if a != last => {
-                format!("lines {a}-{last} · {} line{}", shown, plural(shown))
-            }
-            Some(a) => format!("line {a} · {} line{}", shown, plural(shown)),
-            None => format!("{} line{}", shown, plural(shown)),
+        );
+        if more > 0 {
+            out.push_str(&format!(" (+{more} more)"));
         }
-    } else {
-        format!("{} line{}", shown, plural(shown))
-    };
-    if more > 0 {
-        out.push_str(&format!(" (+{more} more)"));
+        return out;
     }
-    out
+    // `lines A-B of N` when the read shows a window of a longer file (the
+    // trailer's remainder past the last numbered row gives N); otherwise a
+    // plain count. Never two overlapping counts.
+    match first {
+        Some(a) if offset > 1 || more > 0 => {
+            let range = if a == last {
+                format!("line {a}")
+            } else {
+                format!("lines {a}-{last}")
+            };
+            if more > 0 {
+                format!("{range} of {}", last + more)
+            } else {
+                range
+            }
+        }
+        _ if more > 0 => format!("{shown} line{} (+{more} more)", plural(shown)),
+        _ => format!("{} line{}", shown, plural(shown)),
+    }
 }
 
 /// Line number from read's `{:>4}  content` gutter; `None` for `==>`
@@ -407,7 +416,11 @@ pub fn tool_result_summary(
     diff: Option<&str>,
 ) -> String {
     if !ok {
-        let first = content_first_line(text);
+        let first = if name == "bash" {
+            bash_failure_line(text).map_or_else(String::new, |(_, l)| l)
+        } else {
+            content_first_line(text)
+        };
         return match exit_code(text) {
             Some(code) if first.is_empty() => format!("failed (exit {code})"),
             Some(code) => format!("failed (exit {code}) · {first}"),
@@ -490,7 +503,7 @@ pub fn tool_result_summary(
             }
             out
         }
-        "bash" => overall_summary(text),
+        "bash" => bash_summary(text),
         "write" => {
             let written = get("content").unwrap_or_default().lines().count();
             format!(
@@ -535,34 +548,73 @@ pub(super) fn plural(n: usize) -> &'static str {
     }
 }
 
-/// Overall summary for free-form output (`bash`, unknown/MCP/delegate
-/// tools): a single line echoes itself (it *is* the whole result), empty
-/// output says so, and anything longer collapses to a line count — the
-/// preview below carries the content. This keeps the colored `└` row as
-/// metadata instead of an arbitrary content line painted green.
+/// Summary for free-form output of tools with no dedicated arm (MCP,
+/// delegate, `ask_user`, …): a single line echoes itself (it *is* the whole
+/// result), empty output says so, and longer output leads with its first
+/// line plus how much more there is — a bare line count says nothing about
+/// what such a tool did.
 fn overall_summary(text: &str) -> String {
     let n = content_line_count(text);
-    if n == 0 {
-        "(no output)".to_string()
-    } else if n == 1 {
-        content_first_line(text)
-    } else {
-        format!("{n} lines")
+    match n {
+        0 => "(no output)".to_string(),
+        1 => content_first_line(text),
+        _ => format!("{} · +{} more", content_first_line(text), n - 1),
     }
+}
+
+/// `bash` success: `(no output)` and a single echoed line say something; a
+/// line count only measures how much `head`/`tail` let through, so longer
+/// output has no summary (Ctrl+O shows it).
+fn bash_summary(text: &str) -> String {
+    match content_line_count(text) {
+        0 => "(no output)".to_string(),
+        1 => content_first_line(text),
+        _ => String::new(),
+    }
+}
+
+/// The line that explains a failed `bash`: the first line of the stderr
+/// section when there is one, else the last output line (build/test tools
+/// print their verdict last, so the first line is usually banner noise).
+/// Returns its index among [`content_lines`] and the clamped text.
+fn bash_failure_line(text: &str) -> Option<(usize, String)> {
+    let mut lines: Vec<(String, bool)> = Vec::new();
+    let mut in_stderr = false;
+    for raw in strip_ansi(text).lines() {
+        let line = raw.trim();
+        if line == "--- stderr ---" {
+            in_stderr = true;
+            continue;
+        }
+        if line.is_empty() || line.starts_with("[...") || is_exit_marker_line(line) {
+            continue;
+        }
+        lines.push((line.to_string(), in_stderr));
+    }
+    let idx = lines
+        .iter()
+        .position(|(_, err)| *err)
+        .or(lines.len().checked_sub(1))?;
+    Some((idx, truncate_cols(&lines[idx].0, PREVIEW_LINE_COLS)))
 }
 
 /// Whether the summary already shows the first output line, so the preview
 /// below should skip it instead of repeating it. Failures always echo the
-/// first line (`failed · …`); counts-only tools never do; `bash`/generic
-/// successes echo only the single-line case.
+/// first line (`failed · …`) except `bash` (see below); counts-only tools
+/// never do.
 fn preview_skips_first_line(name: &str, ok: bool, text: &str) -> bool {
     if !ok {
-        return true;
+        // `bash` echoes the line that explains the failure, which is only
+        // the first one when it happens to lead the output.
+        return name != "bash" || bash_failure_line(text).is_some_and(|(idx, _)| idx == 0);
     }
     match name {
         "read" | "grep" | "ffgrep" | "find" | "fffind" | "ls" => false,
         "write" | "edit" => true,
-        _ => content_line_count(text) <= 1,
+        // `bash` only echoes a lone line; the generic summary leads with
+        // the first line of any output.
+        "bash" => content_line_count(text) <= 1,
+        _ => content_line_count(text) >= 1,
     }
 }
 

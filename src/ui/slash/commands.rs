@@ -3,6 +3,7 @@
 //! extensions, ...). Suggestion/completion lives in `completion.rs`.
 
 use super::super::push_info;
+use super::super::push_info_block;
 use super::super::rebuild_transcript;
 use super::super::App;
 use super::parser::is_extension_command;
@@ -151,46 +152,82 @@ pub(crate) fn handle_slash(app: &mut App, line: &str) -> bool {
     false
 }
 
-/// The `/help` "commands:" line, generated from the shared [`COMMANDS`] table
-/// so the local and remote help text cannot drift.
-pub(crate) fn commands_help_line() -> String {
-    let mut line = String::from("commands:");
-    for spec in COMMANDS {
-        if spec.usage.is_empty() {
-            continue;
-        }
-        line.push(' ');
-        line.push_str(spec.usage);
+/// The `/help` block: one notice block (no gap rows between its lines) —
+/// the command table in two aligned columns, then keys. `remote` swaps the
+/// mouse line for the remote TUI's selection behavior; every other line is
+/// shared.
+pub(crate) fn cmd_help(app: &mut App, remote: bool) {
+    let mut rows = vec!["commands".to_string()];
+    let width = COMMANDS
+        .iter()
+        .filter(|spec| !spec.usage.is_empty())
+        .map(|spec| spec.usage.chars().count())
+        .max()
+        .unwrap_or(0);
+    for spec in COMMANDS.iter().filter(|spec| !spec.usage.is_empty()) {
+        rows.push(format!("  {:<width$}  {}", spec.usage, spec.description));
     }
-    line
+    rows.push(String::new());
+    rows.push("shell".to_string());
+    rows.push("  !<command>   run directly; output feeds the next turn".to_string());
+    rows.push("  !!<command>  run directly; output stays out of model context".to_string());
+    rows.push(String::new());
+    rows.push("keys".to_string());
+    rows.push("  Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history".to_string());
+    rows.push(
+        "  Shift+Tab mode · Ctrl+T thinking · Ctrl+O tool output · PgUp/PgDn scroll".to_string(),
+    );
+    rows.push(if remote {
+        "  mouse: drag, double/triple-click to select and copy · wheel scrolls".to_string()
+    } else {
+        "  mouse: drag selects + copies · wheel scrolls transcript".to_string()
+    });
+    rows.push(String::new());
+    rows.push("while working".to_string());
+    rows.push("  Enter queues a steer · Alt+Enter queues a follow-up".to_string());
+    rows.push("  Alt+Up recalls the newest queued message · Esc/Ctrl+C cancels".to_string());
+    push_info_block(app, rows);
 }
 
-/// The `/help` block. `remote` swaps the mouse line for the remote TUI's
-/// selection behavior; every other line is shared.
-pub(crate) fn cmd_help(app: &mut App, remote: bool) {
-    push_info(app, commands_help_line());
-    push_info(
-        app,
-        "prefix: !<command> runs shell directly, output feeds the next turn.".to_string(),
-    );
-    push_info(
-        app,
-        "prefix: !!<command> keeps the output out of model context.".to_string(),
-    );
-    push_info(
-        app,
-        "keys: Enter send · Shift+Enter / Ctrl+J newline · ↑↓ history · PgUp/PgDn/wheel scroll · Ctrl+T thinking"
-            .to_string(),
-    );
-    push_info(
-        app,
-        if remote {
-            "mouse: drag, double/triple-click to select and copy · wheel scrolls".to_string()
-        } else {
-            "mouse: drag selects + copies · wheel scrolls transcript".to_string()
-        },
-    );
-    push_info(app, "while working: Enter queues steer · Alt+Enter queues follow-up · Alt+Up recalls the newest queued message for editing · Esc/Ctrl+C cancels and restores queued input".to_string());
+/// Token/spend facts the footer no longer carries: `/session` prints them.
+pub(crate) fn usage_rows(app: &App) -> Vec<String> {
+    use crate::protocol::tokens::format_tokens;
+    let state = &app.tool_state;
+    let mut rows = Vec::new();
+    rows.extend(super::super::remote::base_context_text(&app.base_context));
+    let ctx = super::super::status::status_tokens(app);
+    rows.push(if app.config.context_window > 0 {
+        format!(
+            "context: {}/{} ({}%)",
+            format_tokens(ctx),
+            format_tokens(app.config.context_window),
+            ctx.saturating_mul(100) / app.config.context_window
+        )
+    } else {
+        format!("context: {}", format_tokens(ctx))
+    });
+    if state.total_usage > 0 || state.total_output > 0 {
+        rows.push(format!(
+            "tokens: ↑{} ↓{}",
+            format_tokens(state.total_usage),
+            format_tokens(state.total_output)
+        ));
+    }
+    if let (Some(cached), Some(prompt)) = (state.last_cached, state.last_usage) {
+        if cached > 0 && prompt > 0 {
+            rows.push(format!(
+                "cached: {}% of last prompt",
+                cached.min(prompt) * 100 / prompt
+            ));
+        }
+    }
+    if let Some(rate) = state.last_tok_s.filter(|r| *r >= 1.0) {
+        rows.push(format!("speed: {rate:.0} tok/s (last call)"));
+    }
+    if state.total_cost > 0.0005 {
+        rows.push(format!("cost: ${:.3}", state.total_cost));
+    }
+    rows
 }
 
 fn cmd_clear(app: &mut App) {
@@ -230,11 +267,13 @@ fn cmd_new(app: &mut App) {
 }
 
 fn cmd_session(app: &mut App) {
-    push_info(app, format!("session: {}", app.session.display_name()));
+    let mut rows = vec![format!("session: {}", app.session.display_name())];
     if let Some(path) = app.session.path() {
-        push_info(app, format!("path: {}", path.display()));
+        rows.push(format!("path: {}", path.display()));
     }
-    push_info(app, format!("turns: {}", app.session.count_turns()));
+    rows.push(format!("turns: {}", app.session.count_turns()));
+    rows.extend(usage_rows(app));
+    push_info_block(app, rows);
 }
 
 fn cmd_permissions(app: &mut App) {
@@ -249,13 +288,15 @@ fn cmd_mode(app: &mut App, arg: Option<&str>) {
     match arg {
         None | Some("") => {
             let mode = AgentMode::from_permission(app.config.permission);
-            push_info(app, format!("mode: {}", mode.label()));
-            push_info(
+            push_info_block(
                 app,
-                format!(
-                    "permission: {} (derived from mode)",
-                    app.config.permission.as_str()
-                ),
+                vec![
+                    format!("mode: {}", mode.label()),
+                    format!(
+                        "permission: {} (derived from mode)",
+                        app.config.permission.as_str()
+                    ),
+                ],
             );
         }
         Some(raw) => match AgentMode::parse(raw) {

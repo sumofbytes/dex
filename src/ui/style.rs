@@ -56,8 +56,6 @@ pub(crate) const STATUS_CONTENT_ROWS: u16 = 1;
 pub(crate) const INPUT_MIN_ROWS: u16 = 3;
 /// Blank rows between the composer band and the status row.
 pub(crate) const INPUT_STATUS_GUTTER: u16 = 0;
-/// Fixed height of the approval overlay.
-pub(crate) const APPROVAL_HEIGHT: u16 = 11;
 /// Tab stop for display expansion.
 pub(crate) const TAB_WIDTH: usize = 8;
 

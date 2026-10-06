@@ -24,6 +24,26 @@ pub(crate) fn effective_api(config: &LlmConfig) -> ApiProtocol {
     crate::llm::learned::lookup(&config.base_url, &config.model).unwrap_or(config.api)
 }
 
+/// Whether a pre-output failure is the endpoint refusing the `reasoning_effort`
+/// parameter we sent (e.g. `native reasoning control reasoning_effort is not
+/// allowed`), so the same call can be re-issued without it.
+fn rejects_reasoning_effort(config: &LlmConfig, err: &str) -> bool {
+    if config.thinking_effort.is_none() {
+        return false;
+    }
+    let err = err.to_ascii_lowercase();
+    err.contains("reasoning_effort")
+        && [
+            "not allowed",
+            "not supported",
+            "unsupported",
+            "unknown parameter",
+            "unrecognized",
+        ]
+        .iter()
+        .any(|marker| err.contains(marker))
+}
+
 /// May we infer the protocol by retrying a failed `/responses` call as
 /// chat-completions? Only when nothing explicitly pinned the protocol, the
 /// provider exposes both wire shapes, and the failure isn't a cancellation.
@@ -72,9 +92,44 @@ pub(crate) async fn complete(
                 None,
                 cache_write,
             );
-            crate::llm::client::ChatCompletions
-                .stream(&call, messages, tools, sink, cancel)
+            match crate::llm::client::ChatCompletions
+                .stream(&call, messages, tools, sink.clone(), cancel)
                 .await
+            {
+                Err(e)
+                    if !is_mid_stream(&*e) && rejects_reasoning_effort(config, &e.to_string()) =>
+                {
+                    // Aggregating gateways route one model to several
+                    // upstreams and only some accept `reasoning_effort`, so
+                    // the rejection can be intermittent: drop it for this
+                    // call only (the stored choice stays) and say so.
+                    let mut bare = config.clone();
+                    bare.thinking_effort = None;
+                    let call = crate::llm::client::http_call(
+                        &bare,
+                        format!("{}/chat/completions", config.base_url),
+                        None,
+                        cache_write,
+                    );
+                    if let Some(sink) = &sink {
+                        let _ = sink
+                            .send(ModelEvent::System(format!(
+                                "{} rejected reasoning_effort; retrying this call without it",
+                                config.model
+                            )))
+                            .await;
+                    }
+                    match crate::llm::client::ChatCompletions
+                        .stream(&call, messages, tools, sink, cancel)
+                        .await
+                    {
+                        Ok(ok) => Ok(ok),
+                        // The original rejection is the canonical error.
+                        Err(_) => Err(e),
+                    }
+                }
+                other => other,
+            }
         }
         // Native Messages endpoint: no empirical fallback — the endpoint
         // speaks one wire, and a pin (or the provider default) already
@@ -270,6 +325,26 @@ mod tests {
         std::env::set_var("DEX_MODEL_APIS", "m-r=openai-completions");
         assert_eq!(effective_api(&cfg), ApiProtocol::ChatCompletions);
         crate::llm::learned::clear_memory();
+    }
+
+    #[test]
+    fn reasoning_effort_rejection_gate() {
+        let mut cfg = test_cfg();
+        let err = r#"400 Bad Request: {"error":{"message":"Upstream request failed: [invalid_request_error] native reasoning control reasoning_effort is not allowed"}}"#;
+        // Nothing was sent, nothing to drop.
+        cfg.thinking_effort = None;
+        assert!(!rejects_reasoning_effort(&cfg, err));
+        cfg.thinking_effort = Some("high".into());
+        assert!(rejects_reasoning_effort(&cfg, err));
+        // Unrelated 400s and other parameters don't trigger the retry.
+        assert!(!rejects_reasoning_effort(
+            &cfg,
+            "400 Bad Request: bad tools"
+        ));
+        assert!(!rejects_reasoning_effort(
+            &cfg,
+            "400: temperature is not allowed"
+        ));
     }
 
     #[test]

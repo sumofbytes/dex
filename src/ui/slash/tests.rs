@@ -13,11 +13,17 @@ fn info_texts(app: &App) -> Vec<String> {
     app.transcript
         .iter()
         .filter_map(|b| match b {
-            crate::ui::TranscriptBlock::Info { line, .. } => Some(
-                line.spans
+            crate::ui::TranscriptBlock::Info { lines, .. } => Some(
+                lines
                     .iter()
-                    .map(|s| s.content.to_string())
-                    .collect::<String>(),
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             ),
             _ => None,
         })
@@ -359,8 +365,8 @@ fn handle_slash_basic_commands() {
     assert!(has_info(&app, "unknown command: /no-such-command"));
     let mut app = new_app();
     assert!(!handle_slash(&mut app, "/help"));
-    assert!(has_info(&app, "commands: /quit"));
-    assert!(has_info(&app, "prefix: !<command>"));
+    assert!(has_info(&app, "/quit"));
+    assert!(has_info(&app, "!<command>"));
 }
 
 #[test]
@@ -407,32 +413,30 @@ fn documented_commands_parse_and_share_one_help_list() {
 
     // Both entry points render the command list from the one table, so the
     // local and remote help text can no longer drift.
-    let expected = commands_help_line();
-    assert!(expected.starts_with("commands: /quit"), "{expected}");
-    for spec in COMMANDS {
-        if !spec.usage.is_empty() {
-            assert!(
-                expected.contains(spec.usage),
-                "help omits {}: {expected}",
-                spec.usage
-            );
-        }
-    }
-
     let mut local = new_app();
     handle_slash(&mut local, "/help");
-    assert!(
-        info_texts(&local).iter().any(|t| t.contains(&expected)),
-        "local help: {}",
-        info_texts(&local).join(" | ")
-    );
-
     let mut remote = new_app();
     cmd_help(&mut remote, true);
-    assert!(
-        info_texts(&remote).iter().any(|t| t.contains(&expected)),
-        "remote help: {}",
-        info_texts(&remote).join(" | ")
+    for (label, app) in [("local", &local), ("remote", &remote)] {
+        let help = info_texts(app).join("\n");
+        for spec in COMMANDS {
+            if !spec.usage.is_empty() {
+                assert!(
+                    help.contains(spec.usage) && help.contains(spec.description),
+                    "{label} help omits {}: {help}",
+                    spec.usage
+                );
+            }
+        }
+    }
+    // One block: no gap rows between help lines.
+    assert_eq!(
+        local
+            .transcript
+            .iter()
+            .filter(|b| matches!(b, crate::ui::TranscriptBlock::Info { .. }))
+            .count(),
+        1
     );
 }
 

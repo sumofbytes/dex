@@ -42,11 +42,10 @@ mod resume;
 mod state;
 mod worker;
 
+pub(crate) use boot::base_context_text;
 pub(crate) use repl::run_ratatui_repl_with_remote;
 pub(crate) use state::mark_launch_start;
 
-#[cfg(test)]
-pub(crate) use boot::{launch_time_line, skills_listing_line};
 #[cfg(test)]
 pub(crate) use commands::{
     handle_remote_slash, is_builtin_command, remote_unknown_or_extension, split_remote_extension,

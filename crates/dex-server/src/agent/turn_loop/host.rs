@@ -432,7 +432,11 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
                         result.diff.as_deref(),
                     );
                     if result.cache_hit {
-                        summary = format!("cached · {summary}");
+                        summary = if summary.is_empty() {
+                            "cached".to_string()
+                        } else {
+                            format!("cached · {summary}")
+                        };
                     }
                     let preview =
                         tool_preview(&name, succeeded, result.diff.as_deref(), &result.text);

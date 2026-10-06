@@ -86,62 +86,44 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
     }
 }
 
-/// The skills line for the session-start header, or the "no skills" note.
-/// Muted like the DEX banner: session-start chrome, not a call to action.
-pub(crate) fn skills_header_line(skills: &[crate::protocol::Skill]) -> Line<'static> {
-    let muted = fg(crate::render::theme::muted_fg());
-    skills_listing_line(skills).unwrap_or_else(|| {
-        Line::from(Span::styled(
-            "no skills loaded (add .dex/skills/<name>/SKILL.md or ~/.config/dex/skills)"
-                .to_string(),
-            muted,
-        ))
-    })
-}
-
-/// The session-start skills line: names comma-separated on a single row, all
-/// muted like the DEX banner above it. `None` when no skills are loaded.
-pub(crate) fn skills_listing_line(skills: &[crate::protocol::Skill]) -> Option<Line<'static>> {
-    let (first, rest) = skills.split_first()?;
-    let mut names = first.name.clone();
-    for skill in rest {
-        names.push_str(", ");
-        names.push_str(&skill.name);
+/// The one session-start detail row under the DEX wordmark: what is loaded
+/// and how fast we got here. Muted chrome; the per-contributor context
+/// breakdown lives in `/session` (see `base_context_text`).
+pub(crate) fn session_header_line(
+    skill_count: usize,
+    base_tokens: u64,
+    elapsed_secs: f64,
+) -> Line<'static> {
+    let mut parts = vec![format!(
+        "{skill_count} skill{}",
+        if skill_count == 1 { "" } else { "s" }
+    )];
+    if base_tokens > 0 {
+        parts.push(format!(
+            "~{} base context",
+            crate::protocol::tokens::format_tokens(base_tokens)
+        ));
     }
-    let muted = fg(crate::render::theme::muted_fg());
-    Some(Line::from(vec![
-        Span::styled(format!("skills loaded ({}): ", skills.len()), muted),
-        Span::styled(names, muted),
-        Span::styled(" · /skill:<name> loads one", muted),
-    ]))
-}
-
-/// The session-start launch-time line, shown below the skills listing so
-/// users can see how fast the TUI was ready to use. Muted so it stays
-/// quiet next to the skills line.
-pub(crate) fn launch_time_line(elapsed_secs: f64) -> Line<'static> {
-    Line::from(vec![Span::styled(
-        format!(
-            "ready in {}",
-            crate::render::format::format_duration(elapsed_secs)
-        ),
+    parts.push(format!(
+        "ready in {}",
+        crate::render::format::format_duration(elapsed_secs)
+    ));
+    parts.push("/help".to_string());
+    Line::from(Span::styled(
+        parts.join(" · "),
         fg(crate::render::theme::muted_fg()),
-    )])
+    ))
 }
 
-/// The base-context line for the session-start header: how much context a
-/// fresh session's first turn starts with and what share each contributor
-/// (system prompt, project instructions, skills, tool schemas, …) adds.
-/// Daemon-estimated, muted like the rest of the banner; `None` when the
-/// daemon sent no estimate (older daemon, or no usable config).
-pub(crate) fn base_context_line(
-    breakdown: &[crate::protocol::BaseContextPart],
-) -> Option<Line<'static>> {
+/// How much context a fresh session's first turn starts with and what share
+/// each contributor (system prompt, project instructions, skills, tool
+/// schemas, …) adds. Daemon-estimated; `None` when the daemon sent no
+/// estimate (older daemon, or no usable config).
+pub(crate) fn base_context_text(breakdown: &[crate::protocol::BaseContextPart]) -> Option<String> {
     let total: u64 = breakdown.iter().map(|p| p.tokens).sum();
     if total == 0 {
         return None;
     }
-    let muted = fg(crate::render::theme::muted_fg());
     let mut text = format!(
         "base context ~{}: ",
         crate::protocol::tokens::format_tokens(total)
@@ -156,7 +138,7 @@ pub(crate) fn base_context_line(
         }
         text.push_str(&format!("{} {}%", part.label, shares[i]));
     }
-    Some(Line::from(Span::styled(text, muted)))
+    Some(text)
 }
 
 /// Largest-remainder rounding so the shown shares always sum to exactly
@@ -405,6 +387,10 @@ pub(crate) fn bootstrap(
         daemon_url: Some(daemon_url.to_string()),
         assistant_open: false,
         show_thinking: false,
+        expand_tools: false,
+        base_context: Vec::new(),
+        turn_out_base: 0,
+        turn_tools_base: 0,
         thinking_open: false,
         assistant_pending: String::new(),
         assistant_gap: crate::render::theme::markdown::GapState::new(),
@@ -614,11 +600,13 @@ pub(crate) fn bootstrap(
     // along (daemon-estimated; absent on older daemons). The ready time is
     // measured and pushed last so it covers everything before it, including
     // the base-context breakdown itself.
-    let mut header = vec![skills_header_line(&remote.app.skills)];
-    if let Some(line) = base_context_line(&base_breakdown) {
-        header.push(line);
-    }
-    header.push(launch_time_line(launch_start.elapsed().as_secs_f64()));
+    let base_total: u64 = base_breakdown.iter().map(|p| p.tokens).sum();
+    let header = vec![session_header_line(
+        remote.app.skills.len(),
+        base_total,
+        launch_start.elapsed().as_secs_f64(),
+    )];
+    remote.app.base_context = base_breakdown;
     push_banner(&mut remote.app, header);
     // Lazy-auth empty state (the pi/opencode pattern): the daemon reports
     // an empty provider exactly when its config build fails (missing key,
@@ -714,17 +702,12 @@ mod seed_tests {
                 tokens: 400,
             },
         ];
-        let line = base_context_line(&parts).unwrap();
-        let text = line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
+        let text = base_context_text(&parts).unwrap();
         assert!(text.contains("base context"), "{text}");
         assert!(text.contains("system prompt 60%"), "{text}");
         assert!(text.contains("tool schemas 40%"), "{text}");
-        assert!(base_context_line(&[]).is_none());
-        assert!(base_context_line(&[BaseContextPart {
+        assert!(base_context_text(&[]).is_none());
+        assert!(base_context_text(&[BaseContextPart {
             label: "x".into(),
             tokens: 0,
         }])

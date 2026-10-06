@@ -167,6 +167,18 @@ fn raised(amount: f32) -> Color {
     }
 }
 
+/// BG for fenced code blocks: a whisper above the terminal background, so a
+/// block reads as a block without a border glyph that would pollute copies.
+/// `Reset` when the theme is unknown (no fill rather than a wrong one).
+#[cfg(feature = "tui")]
+pub fn code_bg() -> Color {
+    match background() {
+        Background::Dark => raised(0.07),
+        Background::Light => raised(0.05),
+        Background::Unknown => Color::Reset,
+    }
+}
+
 /// BG for popup surfaces so they read as floating above the UI.
 #[cfg(feature = "tui")]
 pub fn popup_bg() -> Color {

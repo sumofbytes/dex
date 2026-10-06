@@ -1,59 +1,32 @@
 use super::super::style::fg;
 use super::markdown::highlight_code_block;
 use crate::render::theme;
-use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
-/// Per-tool glyph heading the transcript input row — `$ bash ls -la` —
-/// standing in for the generic `▸`. Each reads like the tool's own notation:
-/// shell `$`, vim-style search `/`, diff `±` for edit.
-/// Bold so it reads as an affordance rather than content. Unknown tools (and
-/// the replay fallback row) keep the generic `▸`.
-fn tool_glyph(name: &str) -> &'static str {
-    match name {
-        "bash" => "$",
-        "read" => "¶",
-        "write" => "✎",
-        "edit" => "±",
-        "grep" | "ffgrep" | "find" | "fffind" => "/",
-        "ls" => "☰",
-        name if name.starts_with("mcp__") => "⇄",
-        _ => "▸",
-    }
-}
-
-/// Transcript `▸ tool arg` row, headed by the tool's own glyph (`$ bash …`).
-/// The glyph + tool-name prefix is structural: `wrap_line_display` hangs it
-/// on wrapped rows so a long command aligns past the name instead of
-/// sliding under the glyph (see `hang_width`). Bash commands highlight via
-/// the compiled bash grammar (keywords/strings/flags read apart instead of
-/// one dim blob); every other tool keeps the dim arg. Unknown/unhighlightable
-/// bash falls back to dim, so this never regresses.
-pub(crate) fn render_tool_input(name: &str, arg: &str) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(
-            format!("{} ", tool_glyph(name)),
-            fg(theme::warn_fg()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(name.to_string(), fg(theme::warn_fg())),
-    ];
+/// The argument half of a tool step row (`✓ bash <this>`): bash commands
+/// highlight via the compiled bash grammar (keywords/strings/flags read apart
+/// instead of one dim blob); every other tool keeps the dim arg.
+/// Unknown/unhighlightable bash falls back to dim, so this never regresses.
+/// The step row itself (status glyph, name, outcome) is composed at wrap time
+/// by `tool::tool_rows`.
+pub(crate) fn render_tool_arg(name: &str, arg: &str) -> Line<'static> {
     // Single-line commands only: highlight_code_block splits per row and
     // only the first row is appended — multi-line would drop lines 2+.
     if name == "bash" && !arg.is_empty() && !arg.contains('\n') {
         if let Some(mut rows) = highlight_code_block("bash", arg) {
             if let Some(first) = rows.first_mut() {
                 if !first.is_empty() {
-                    spans.push(Span::styled(" ".to_string(), fg(theme::tool_input_fg())));
-                    spans.append(first);
-                    return super::super::indent_transcript_line(Line::from(spans));
+                    return Line::from(std::mem::take(first));
                 }
             }
         }
     }
-    spans.push(Span::styled(format!(" {arg}"), fg(theme::tool_input_fg())));
-    super::super::indent_transcript_line(Line::from(spans))
+    if arg.is_empty() {
+        return Line::default();
+    }
+    Line::from(Span::styled(arg.to_string(), fg(theme::tool_input_fg())))
 }
 
 /// Approval-overlay detail row. Bash commands highlight the code after the

@@ -11,6 +11,9 @@ use ratatui::text::Span;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 
+/// Shown in the empty, idle composer.
+const PLACEHOLDER: &str = "Message dex · / commands · Shift+Tab mode";
+
 pub(crate) struct ComposerView;
 
 impl ComposerView {
@@ -124,6 +127,14 @@ pub(crate) fn render_input(
         ]));
         if input.row == 0 {
             cur_x = INPUT_PROMPT_WIDTH as u16;
+        }
+    }
+    // Empty idle composer: say what it takes, once, in the quietest color.
+    if !dim && input.lines.iter().all(String::is_empty) {
+        if let Some(first) = lines.first_mut() {
+            first
+                .spans
+                .push(Span::styled(PLACEHOLDER, fg(theme::muted_fg())));
         }
     }
     (lines, (cur_row, cur_x, cur_row))

@@ -65,12 +65,18 @@ pub(crate) enum TranscriptBlock {
         stamp: u64,
         started: Instant,
         /// Set on turn end; `None` while the turn runs.
-        settled: Option<String>,
+        settled: Option<Settled>,
     },
     Tool {
         stamp: u64,
+        /// Tool name (`bash`, `read`, `mcp__srv__tool`): heads the step row.
+        name: String,
+        /// The call's argument, highlighted, without indent/glyph/name — the
+        /// step row is composed at wrap time (the outcome goes on the row beneath).
         input: Line<'static>,
-        output: Option<Line<'static>>,
+        started: Instant,
+        /// Outcome once the call finishes; `None` while it runs.
+        result: Option<ToolResult>,
         preview: Vec<Line<'static>>,
         /// The LLM tool-call id from `ToolInput`, pairing this block with
         /// its `ToolOutput`. Empty for legacy inputs (session rebuild of
@@ -91,9 +97,11 @@ pub(crate) enum TranscriptBlock {
         stamp: u64,
         line: Line<'static>,
     },
+    /// One slash-command/notice output: every row of it is one block, so a
+    /// list (sessions, help) reads as a list instead of gap-separated rows.
     Info {
         stamp: u64,
-        line: Line<'static>,
+        lines: Vec<Line<'static>>,
     },
     /// Pre-rendered block for the session-start DEX banner. One block, so it
     /// renders without the blank gap line `TranscriptView` inserts between
@@ -138,6 +146,31 @@ impl TranscriptBlock {
     }
 }
 
+/// How a turn ended; picks the settled summary's wording and color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnTone {
+    Done,
+    Cancelled,
+    Failed,
+}
+
+/// The settled turn summary row.
+#[derive(Debug, Clone)]
+pub(crate) struct Settled {
+    pub(crate) text: String,
+    pub(crate) tone: TurnTone,
+}
+
+/// A finished tool call: outcome glyph/color come from `ok`, the outcome
+/// text from `summary`.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolResult {
+    pub(crate) ok: bool,
+    pub(crate) summary: String,
+    /// Seconds the daemon measured for the call; 0 when unknown.
+    pub(crate) duration: f64,
+}
+
 /// Per-block wrapped display rows, parallel to `transcript`. Blocks are
 /// append-only, so a streaming flush re-wraps only the blocks whose stamp
 /// changed instead of the whole transcript.
@@ -169,23 +202,15 @@ impl TranscriptBlock {
             TranscriptBlock::Assistant { lines, .. } => lines.iter().collect(),
             TranscriptBlock::Thinking { .. } => vec![],
             TranscriptBlock::Activity { .. } => vec![],
-            TranscriptBlock::Tool {
-                input,
-                output,
-                preview,
-                ..
-            } => {
-                let mut out = Vec::with_capacity(1 + output.is_some() as usize + preview.len());
+            TranscriptBlock::Tool { input, preview, .. } => {
+                let mut out = Vec::with_capacity(1 + preview.len());
                 out.push(input);
-                if let Some(o) = output {
-                    out.push(o);
-                }
                 out.extend(preview.iter());
                 out
             }
             TranscriptBlock::System { line, .. } => vec![line],
             TranscriptBlock::Error { line, .. } => vec![line],
-            TranscriptBlock::Info { line, .. } => vec![line],
+            TranscriptBlock::Info { lines, .. } => lines.iter().collect(),
             TranscriptBlock::Banner { lines, .. } => lines.iter().collect(),
         }
     }
@@ -273,6 +298,20 @@ pub(crate) struct App {
     /// Whether streamed thinking blocks render in full (Ctrl+T) or as a
     /// one-line preview.
     pub(crate) show_thinking: bool,
+    /// Whether successful tool calls show their output preview (Ctrl+O);
+    /// collapsed (outcome row only) by default. Failures and write/edit
+    /// diffs always show theirs.
+    pub(crate) expand_tools: bool,
+    /// Daemon's estimate of what a fresh session's first turn carries,
+    /// shown by `/session`.
+    pub(crate) base_context: Vec<crate::protocol::BaseContextPart>,
+    /// `tool_state.total_output` when the current turn started, so the
+    /// settled summary reports tokens generated *this turn*.
+    pub(crate) turn_out_base: u64,
+    /// Tool steps in the transcript when the current turn started, so the
+    /// settled summary counts this turn's tools (steers add `User` blocks
+    /// mid-turn, so the last prompt is no boundary).
+    pub(crate) turn_tools_base: usize,
     /// Whether the tail `Thinking` block is still streaming deltas. Drives
     /// the collapsed indicator's dot animation; it closes (settles) as soon
     /// as any non-thinking line arrives or the turn ends.
@@ -404,6 +443,10 @@ impl App {
             daemon_url: None,
             assistant_open: false,
             show_thinking: false,
+            expand_tools: false,
+            base_context: Vec::new(),
+            turn_out_base: 0,
+            turn_tools_base: 0,
             thinking_open: false,
             plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),

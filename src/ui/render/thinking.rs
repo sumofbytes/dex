@@ -109,7 +109,7 @@ pub(crate) fn thinking_indicator_text(
     tick: u16,
 ) -> String {
     if thinking_open {
-        return format!("◌ Thinking {}", dots_for_tick(tick));
+        return format!("◌ Thinking {}", dots_for_tick(tick).trim_end());
     }
     match elapsed {
         Some(elapsed) => format!("Thought for {}", format_elapsed(elapsed)),
@@ -133,10 +133,11 @@ pub(crate) fn format_elapsed(elapsed: Duration) -> String {
 /// the ~8 fps busy heartbeat) — deliberately slower than the stream flush
 /// so the dots read as a calm pulse. Used by both the thinking and the
 /// turn-activity indicators.
+/// Always three cells wide, so text after the dots doesn't shift as they animate.
 fn dots_for_tick(tick: u16) -> &'static str {
     match (tick / 2) % 3 {
-        0 => ".",
-        1 => "..",
+        0 => ".  ",
+        1 => ".. ",
         _ => "...",
     }
 }
@@ -156,25 +157,56 @@ pub(crate) fn thinking_indicator_line(
     )))
 }
 
-/// The collapsed turn-activity block: "● Working .." with the shared dot
-/// cadence while the turn runs (animated by the per-frame overlay), then
-/// the green "Worked for 12s · 4.2k tokens" summary once it settles.
+/// Live facts for the "Working" row.
+pub(crate) struct ActivityStatus {
+    /// Time since the turn started.
+    pub(crate) elapsed: Option<Duration>,
+    /// The call in flight (label, time since it started).
+    pub(crate) tool: Option<(String, Duration)>,
+}
+
+/// The collapsed turn-activity block: "● Working .. 12s · bash 3s · Esc to
+/// interrupt" with the shared dot cadence while the turn runs (animated by the
+/// per-frame overlay), then the settled summary — green when done, yellow when
+/// cancelled, red when failed.
 pub(crate) fn activity_display_lines(
-    settled: Option<&str>,
+    settled: Option<&super::super::Settled>,
     tick: u16,
     width: u16,
 ) -> Vec<Line<'static>> {
+    use super::super::TurnTone;
     match settled {
-        Some(summary) => vec![super::super::indent_transcript_line(Line::from(
-            Span::styled(truncate_display(summary, width), fg(theme::success_fg())),
-        ))],
-        None => vec![activity_indicator_line(tick, width)],
+        Some(settled) => {
+            let color = match settled.tone {
+                TurnTone::Done => theme::success_fg(),
+                TurnTone::Cancelled => theme::warn_fg(),
+                TurnTone::Failed => theme::failure_fg(),
+            };
+            vec![super::super::indent_transcript_line(Line::from(
+                Span::styled(truncate_display(&settled.text, width), fg(color)),
+            ))]
+        }
+        None => vec![activity_indicator_line(tick, width, None)],
     }
 }
 
-pub(crate) fn activity_indicator_line(tick: u16, width: u16) -> Line<'static> {
+pub(crate) fn activity_indicator_line(
+    tick: u16,
+    width: u16,
+    status: Option<&ActivityStatus>,
+) -> Line<'static> {
+    let mut text = format!("● Working {}", dots_for_tick(tick));
+    if let Some(status) = status {
+        if let Some(elapsed) = status.elapsed {
+            text.push_str(&format!(" {}", format_elapsed(elapsed)));
+        }
+        if let Some((tool, since)) = &status.tool {
+            text.push_str(&format!(" · {tool} {}", format_elapsed(*since)));
+        }
+        text.push_str(" · Esc to interrupt");
+    }
     super::super::indent_transcript_line(Line::from(Span::styled(
-        truncate_display(&format!("● Working {}", dots_for_tick(tick)), width),
+        truncate_display(&text, width),
         fg(theme::muted_fg()),
     )))
 }

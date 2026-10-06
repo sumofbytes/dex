@@ -458,21 +458,31 @@ fn activity_block_trails_the_tail_then_settles() {
         app.transcript[app.transcript.len() - 2],
         TranscriptBlock::Tool { .. }
     ));
-    app.tool_state.last_usage = Some(4200);
-    settle_activity(&mut app);
+    // The summary counts this turn's tools and generated tokens (not the
+    // context size), and says how the turn ended.
+    app.tool_state.total_output = 1200;
+    settle_activity(&mut app, TurnTone::Done);
     match app.transcript.last() {
         Some(TranscriptBlock::Activity {
             settled: Some(summary),
             ..
         }) => {
-            assert!(summary.contains("Worked for"), "{summary}");
-            assert!(summary.contains("4.2k tokens"), "{summary}");
+            assert_eq!(summary.tone, TurnTone::Done);
+            assert!(summary.text.starts_with("Done in "), "{}", summary.text);
+            assert!(summary.text.contains("1 tool"), "{}", summary.text);
+            assert!(summary.text.contains("↓1.2k"), "{}", summary.text);
+            // Ends with the local clock time (`HH:MM`).
+            let clock = summary.text.rsplit(" · ").next().unwrap();
+            assert!(
+                clock.len() == 5 && clock.as_bytes()[2] == b':',
+                "{}",
+                summary.text
+            );
         }
         other => panic!("expected settled activity block, got {other:?}"),
     }
     // Settling again (e.g. a duplicate finish event) is a no-op.
-    app.tool_state.last_usage = Some(1);
-    settle_activity(&mut app);
+    settle_activity(&mut app, TurnTone::Failed);
     assert!(matches!(
         app.transcript.last(),
         Some(TranscriptBlock::Activity { .. })
@@ -524,8 +534,10 @@ fn selection_above_retrailed_activity_survives_streaming() {
             },
             TranscriptBlock::Tool {
                 stamp: 0,
+                name: "bash".into(),
                 input: Line::default(),
-                output: None,
+                started: Instant::now(),
+                result: None,
                 preview: Vec::new(),
                 tool_arg: String::new(),
                 tool_id: String::new(),
@@ -642,7 +654,7 @@ fn tool_output_completes_open_tool_behind_activity() {
     assert!(matches!(
         &app.transcript[0],
         TranscriptBlock::Tool {
-            output: Some(_),
+            result: Some(_),
             ..
         }
     ));
@@ -686,7 +698,7 @@ fn tool_outputs_pair_by_id_when_interleaved() {
         let TranscriptBlock::Tool {
             tool_arg,
             tool_id,
-            output,
+            result,
             ..
         } = block
         else {
@@ -694,9 +706,12 @@ fn tool_outputs_pair_by_id_when_interleaved() {
         };
         assert_eq!(tool_arg, arg);
         assert!(tool_id == "call-A" || tool_id == "call-B");
-        let out = output.as_ref().expect("block completed");
-        let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains(summary), "wrong summary on {arg}: {text}");
+        let out = result.as_ref().expect("block completed");
+        assert!(
+            out.summary.contains(summary),
+            "wrong summary on {arg}: {}",
+            out.summary
+        );
     }
 }
 
@@ -733,7 +748,7 @@ fn rebuild_pairs_tool_results_with_assistant_calls_by_id() {
         let TranscriptBlock::Tool {
             tool_arg,
             tool_id,
-            output,
+            result,
             ..
         } = block
         else {
@@ -741,7 +756,7 @@ fn rebuild_pairs_tool_results_with_assistant_calls_by_id() {
         };
         assert_eq!(tool_arg, arg);
         assert_eq!(tool_id, id);
-        assert!(output.is_some(), "rebuilt block left open for {arg}");
+        assert!(result.is_some(), "rebuilt block left open for {arg}");
     }
 }
 
@@ -782,8 +797,8 @@ fn chunked_replay_matches_one_shot_rebuild() {
                     format!("assistant:{text}")
                 }
                 TranscriptBlock::Tool {
-                    tool_id, output, ..
-                } => format!("tool:{tool_id}:{}", output.is_some()),
+                    tool_id, result, ..
+                } => format!("tool:{tool_id}:{}", result.is_some()),
                 TranscriptBlock::Thinking { text, .. } => format!("thinking:{text}"),
                 _ => "other".to_string(),
             })
@@ -1042,7 +1057,7 @@ fn reset_session_state_clears_per_session_state() {
     app.messages.push(crate::protocol::ChatMessage::user("hi"));
     app.transcript.push(TranscriptBlock::Info {
         stamp: 0,
-        line: Line::from("old"),
+        lines: vec![Line::from("old")],
     });
     app.tool_state.total_usage = 42;
     app.tool_state.total_cost = 1.5;
@@ -1087,7 +1102,7 @@ fn slash_new_refuses_while_busy() {
     assert!(
             app.transcript
                 .iter()
-                  .any(|b| matches!(b, TranscriptBlock::Info { line, .. } if line.spans.iter().any(|s| s.content.contains("turn is running"))))
+                  .any(|b| matches!(b, TranscriptBlock::Info { lines, .. } if lines.iter().flat_map(|l| l.spans.iter()).any(|s| s.content.contains("turn is running"))))
         );
 }
 
@@ -1241,4 +1256,34 @@ fn history_walk_resets_slash_selection() {
     app.slash_selected = 3;
     app.history_down();
     assert_eq!(app.slash_selected, 0);
+}
+
+#[test]
+fn a_mid_turn_steer_does_not_reset_the_tool_count() {
+    let tool = |app: &mut App| {
+        append_sink_line(
+            app,
+            crate::protocol::SinkLine::ToolInput {
+                id: String::new(),
+                input: "bash ls".into(),
+            },
+        );
+    };
+    let mut app = test_app();
+    app.busy = true;
+    tool(&mut app); // a previous turn's tool
+    start_activity(&mut app);
+    tool(&mut app);
+    app.transcript.push(TranscriptBlock::User {
+        stamp: 0,
+        lines: vec![Line::from("steer")],
+    });
+    tool(&mut app);
+    settle_activity(&mut app, TurnTone::Done);
+    match app.transcript.last() {
+        Some(TranscriptBlock::Activity {
+            settled: Some(s), ..
+        }) => assert!(s.text.contains("2 tools"), "{}", s.text),
+        other => panic!("{other:?}"),
+    }
 }

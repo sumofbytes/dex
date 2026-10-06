@@ -12,6 +12,7 @@ use super::thinking::extend_thinking_rows;
 use super::thinking::thinking_display_lines;
 use super::thinking::thinking_indicator_line;
 use super::thinking::wrap_thinking_full;
+use super::thinking::ActivityStatus;
 use super::thinking::ThinkingWrap;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -82,57 +83,36 @@ fn surface_rows(
         .collect()
 }
 
-/// One `─` hairline framing a submitted prompt, same style as the live
-/// composer's top/bottom rules (`input_block`: `hairline_style()`). The row is
-/// inset by the shared transcript indent so its dashes start on the text
-/// column — the same cell the composer's band starts on — and runs the full
-/// wrap width after it: `width` is the transcript's wrap width
-/// (`content_width`), while the composer's band starts one gutter in and is
-/// `width` wide, so its own rule ends one cell further right. Dashing `width`
-/// cells after the indent lands both rules on exactly the same columns.
-fn user_rule_row(width: u16) -> Line<'static> {
-    use crate::render::theme;
-    let w = width.max(1) as usize;
-    let indent = TRANSCRIPT_INDENT.min(w);
-    let mut row = Line::from(vec![
-        Span::raw(" ".repeat(indent)),
-        Span::styled("─".repeat(w), theme::hairline_style()),
-    ]);
-    row.style.bg = Some(Color::Reset);
-    row
-}
-
 pub(crate) fn wrap_block(
     block: &super::super::TranscriptBlock,
     width: u16,
     show_thinking: bool,
     thinking_open: bool,
+    expand_tools: bool,
 ) -> Vec<Line<'static>> {
     match block {
         super::super::TranscriptBlock::User { lines, .. } => {
-            // Submitted input box: the prompt keeps the terminal's own
-            // background, framed by the same top/bottom `─` hairlines as
-            // the live composer (`input_block`). The first content row
-            // wraps `INPUT_PROMPT_WIDTH` narrower for the echoed glyph —
-            // the same wrap the live composer applies, so typed and
-            // submitted prompts reflow identically. Separation from
-            // neighbours is still the universal inter-block gap outside
-            // the box.
-            let mut rows = Vec::new();
-            rows.push(user_rule_row(width));
-            rows.extend(surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH));
-            rows.push(user_rule_row(width));
-            rows
+            // Submitted prompt: the composer's `❯ ` echo in the user's voice,
+            // no rules (those belong to the live composer, so a scrolled-back
+            // prompt can't be mistaken for the input). The first content row
+            // wraps `INPUT_PROMPT_WIDTH` narrower for the echoed glyph — the
+            // same wrap the live composer applies, so typed and submitted
+            // prompts reflow identically.
+            surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH)
         }
-        super::super::TranscriptBlock::Tool { .. } => {
-            // Spacing between tool steps comes solely from the universal
-            // inter-block gap (`rebuild_display_cache`); no baked air of
-            // its own, so every block pair is separated by the same row.
-            surface_rows(block.lines().into_iter().cloned(), width, 0)
-        }
+        super::super::TranscriptBlock::Tool {
+            name,
+            input,
+            result,
+            preview,
+            ..
+        } => super::tool::tool_rows(name, input, result.as_ref(), preview, width, expand_tools),
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
                 thinking_display_lines(text, true, false, None, 0, width)
+            } else if elapsed.is_some_and(|e| e < THINKING_MIN_SHOWN) {
+                // A blink of reasoning isn't worth a row of its own.
+                Vec::new()
             } else {
                 thinking_display_lines(text, false, false, *elapsed, 0, width)
             }
@@ -141,9 +121,23 @@ pub(crate) fn wrap_block(
             if settled.is_none() && thinking_open {
                 Vec::new()
             } else {
-                activity_display_lines(settled.as_deref(), 0, width)
+                activity_display_lines(settled.as_ref(), 0, width)
             }
         }
+        super::super::TranscriptBlock::Assistant { lines, .. } => lines
+            .iter()
+            .flat_map(|l| {
+                // Code rows carry a line-level bg (`wrap_line_display` builds
+                // fresh lines, so re-apply it) and fill out to the full width.
+                let bg = l.style.bg;
+                wrap_line_display(l, width, 0)
+                    .into_iter()
+                    .map(move |row| match bg {
+                        Some(bg) => paint_surface_row(row, width as usize, bg),
+                        None => row,
+                    })
+            })
+            .collect(),
         _ => block
             .lines()
             .into_iter()
@@ -151,6 +145,9 @@ pub(crate) fn wrap_block(
             .collect(),
     }
 }
+
+/// Collapsed thinking shorter than this renders no row.
+const THINKING_MIN_SHOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Keep `wrapped_cache` parallel to the transcript: width changes clear both
 /// caches, a shorter transcript (reset/resume) drops stale entries, appended
@@ -236,7 +233,13 @@ fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
                 continue;
             }
         }
-        let rows = wrap_block(block, width, app.show_thinking, app.thinking_open);
+        let rows = wrap_block(
+            block,
+            width,
+            app.show_thinking,
+            app.thinking_open,
+            app.expand_tools,
+        );
         app.wrapped_cache[idx] = WrappedBlock {
             stamp: block.stamp(),
             rows,
@@ -259,22 +262,45 @@ pub(crate) fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
     let Some(dirty) = first_dirty else {
         return;
     };
-    let mut start = 0usize;
-    for (idx, wb) in app.wrapped_cache.iter().enumerate().take(dirty) {
-        if idx > 0 && !wb.rows.is_empty() {
-            start += BLOCK_GAP_ROWS;
-        }
-        start += wb.rows.len();
-    }
+    let start = display_offset(app, dirty);
     app.display_cache.truncate(start);
-    for (idx, wb) in app.wrapped_cache.iter().enumerate().skip(dirty) {
-        if idx > 0 && !wb.rows.is_empty() {
+    let mut prev = (0..dirty.min(app.wrapped_cache.len()))
+        .rev()
+        .find(|&i| !app.wrapped_cache[i].rows.is_empty());
+    for idx in dirty..app.wrapped_cache.len() {
+        if app.wrapped_cache[idx].rows.is_empty() {
+            continue;
+        }
+        if prev.is_some() {
             for _ in 0..BLOCK_GAP_ROWS {
                 app.display_cache.push(Line::default());
             }
         }
-        app.display_cache.extend(wb.rows.iter().cloned());
+        app.display_cache
+            .extend(app.wrapped_cache[idx].rows.iter().cloned());
+        prev = Some(idx);
     }
+}
+
+/// Display row where block `upto` starts: the wrapped rows of every earlier
+/// block plus the gap rows between adjacent non-empty ones. Length
+/// arithmetic only — no row clones.
+pub(crate) fn display_offset(app: &App, upto: usize) -> usize {
+    let mut start = 0usize;
+    let mut prev: Option<usize> = None;
+    for (idx, wb) in app.wrapped_cache.iter().enumerate().take(upto) {
+        if wb.rows.is_empty() {
+            continue;
+        }
+        if prev.is_some() {
+            start += BLOCK_GAP_ROWS;
+        }
+        start += wb.rows.len();
+        prev = Some(idx);
+    }
+    // The gap before block `upto` is not counted: it belongs to that block,
+    // and callers truncate at the gap's first row, which is this offset.
+    start
 }
 
 impl TranscriptView {
@@ -391,7 +417,8 @@ impl TranscriptView {
         }
         if let Some(row) = activity_row {
             if row >= scroll && row - scroll < window.len() {
-                window[row - scroll] = activity_indicator_line(app.tick, width);
+                window[row - scroll] =
+                    activity_indicator_line(app.tick, width, Some(&activity_status(app)));
             }
         }
         if let Some(sel) = app.selection {
@@ -400,6 +427,39 @@ impl TranscriptView {
         let transcript = Paragraph::new(window).style(Style::default().fg(Color::Gray));
         f.render_widget(transcript, area);
     }
+}
+
+/// What the live "Working" row reports: time on the turn, the call in flight
+/// (`bash`, or `bash +2` for a parallel batch) and its own elapsed time.
+fn activity_status(app: &App) -> ActivityStatus {
+    use super::super::TranscriptBlock as B;
+    let elapsed = app.transcript.iter().rev().find_map(|b| match b {
+        B::Activity {
+            started,
+            settled: None,
+            ..
+        } => Some(started.elapsed()),
+        _ => None,
+    });
+    let mut running = app.transcript.iter().rev().filter_map(|b| match b {
+        B::Tool {
+            name,
+            started,
+            result: None,
+            ..
+        } => Some((name.as_str(), started.elapsed())),
+        _ => None,
+    });
+    let tool = running.next().map(|(name, since)| {
+        let more = running.count();
+        let label = if more > 0 {
+            format!("{name} +{more}")
+        } else {
+            name.to_string()
+        };
+        (label, since)
+    });
+    ActivityStatus { elapsed, tool }
 }
 
 pub(crate) const SEL_BG: Color = Color::Indexed(24);
@@ -545,7 +605,7 @@ pub(crate) fn wrap_line_display(
     ];
 
     /// One-cell glyphs that head a transcript tool-input row (`$ bash …`).
-    const TOOL_GLYPHS: &[&str] = &["▸", "$", "¶", "✎", "±", "/", "☰", "⎇", "→", "⇄"];
+    const TOOL_GLYPHS: &[&str] = &["✓", "✗", "◌"];
 
     /// Cells of the wrapped first row's structural leading marker to carve
     /// out of the wrap body and re-apply as whitespace on every continuation

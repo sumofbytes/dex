@@ -93,7 +93,8 @@ fn mode_piece(app: &App) -> Piece {
     let color = match mode {
         AgentMode::Plan => theme::accent_fg(),
         AgentMode::Manual => theme::warn_fg(),
-        AgentMode::Auto => theme::ok_fg(),
+        // Auto is the least restrictive mode, not a "good" state: plain text.
+        AgentMode::Auto => theme::surface_fg(),
     };
     (mode.label().to_string(), fg(color))
 }
@@ -246,108 +247,64 @@ fn sample_text(mix: &mut impl FnMut(u8), text: &str) {
     }
 }
 
-pub(super) fn status_pieces(app: &App, with_cwd: bool) -> Vec<Piece> {
-    // Transient notice (copy confirmation) takes over the line until it
-    // expires: unmissable feedback beats the quiet facts for two seconds.
-    if let Some((text, at)) = &app.notice {
-        if at.elapsed() < super::NOTICE_LIFETIME {
-            return vec![(text.clone(), fg(theme::ok_fg()))];
-        }
-    }
+/// Transient notice (copy confirmation): takes over the left side until it
+/// expires — unmissable feedback beats the quiet facts for two seconds.
+fn notice_pieces(app: &App) -> Option<Vec<Piece>> {
+    let (text, at) = app.notice.as_ref()?;
+    (at.elapsed() < super::NOTICE_LIFETIME).then(|| vec![(text.clone(), fg(theme::ok_fg()))])
+}
+
+/// Context pressure readout: `ctx 12k/128k 9%` (or `ctx 9%` when narrow).
+/// The only live number the footer keeps — it is the one worth acting on;
+/// tokens, cache and speed live in `/session`.
+fn ctx_piece(app: &App, short: bool) -> Piece {
     let tokens = status_tokens(app);
-    let context_pct = if app.config.context_window == 0 {
-        0
-    } else {
-        tokens
-            .saturating_mul(100)
-            .checked_div(app.config.context_window)
-            .unwrap_or(0)
+    let window = app.config.context_window;
+    let text = match tokens.saturating_mul(100).checked_div(window) {
+        None => format!("ctx {}", format_tokens(tokens)),
+        Some(pct) if short => format!("ctx {pct}%"),
+        Some(pct) => format!(
+            "ctx {}/{} {pct}%",
+            format_tokens(tokens),
+            format_tokens(window)
+        ),
     };
-    let mut pieces = Vec::new();
-    if with_cwd {
-        pieces.push((compact_path(&app.cwd), fg(theme::accent_fg())));
-    }
-    // The branch separator is part of the branch block: emitting it
-    // unconditionally doubled up with the one after an empty branch
-    // (`path ·  · model` in any non-repo directory).
-    let branch = branch_pieces(app);
-    if !branch.is_empty() {
-        push_sep(&mut pieces);
-        pieces.extend(branch);
-    }
+    (text, context_style(app, tokens))
+}
+
+/// Identity + activity, left side. `cwd`/`branch` are the static facts shed
+/// first on narrow terminals; the mode chip (a safety indicator) and the
+/// model never go.
+fn left_pieces(app: &App, cwd: bool, branch: bool) -> Vec<Piece> {
+    let mut pieces = vec![mode_piece(app)];
     push_sep(&mut pieces);
     pieces.push(quiet(model_label(app)));
-    pieces.push(sep());
-    pieces.push(mode_piece(app));
-    pieces.push(sep());
-    // Live context usage against the window. The % duplicates the pair, but
-    // it is the glanceable readout behind the pressure color, so it stays.
-    let ctx_text = if app.config.context_window > 0 {
-        format!(
-            "ctx {}/{} {}%",
-            format_tokens(tokens),
-            format_tokens(app.config.context_window),
-            context_pct
-        )
-    } else {
-        format!("ctx {}", format_tokens(tokens))
-    };
-    pieces.push((ctx_text, context_style(app, tokens)));
-    // Provider-reported cache-hit subset of the last call's prompt (billed
-    // at a fraction of full input price), collapsed to a % of that prompt —
-    // the glanceable "is caching working" readout; the absolute count is
-    // the ctx number times this %. The subset is clamped to the prompt
-    // (some third-party OpenAI-compatible endpoints report nonconforming
-    // usage) and, once a provider reports it, omitted only at zero. The
-    // absolute is the fallback when the prompt size is unknown or the hit
-    // is below one percent.
-    if let Some(cached) = app.tool_state.last_cached {
-        if cached > 0 {
-            pieces.push(sep());
-            let cached_text = match app.tool_state.last_usage {
-                Some(prompt) if prompt > 0 => {
-                    let cached = cached.min(prompt);
-                    match cached.saturating_mul(100) / prompt {
-                        0 => format!("{} cached", format_tokens(cached)),
-                        pct => format!("{pct}% cached"),
-                    }
-                }
-                _ => format!("{} cached", format_tokens(cached)),
-            };
-            pieces.push(quiet(cached_text));
+    if cwd {
+        push_sep(&mut pieces);
+        pieces.push((compact_path(&app.cwd), fg(theme::accent_fg())));
+    }
+    if branch {
+        let b = branch_pieces(app);
+        if !b.is_empty() {
+            push_sep(&mut pieces);
+            pieces.extend(b);
         }
     }
-    // Cumulative prompt (↑) and completion (↓) tokens across all LLM calls
-    // this TUI process has made — the spend-side figures that grow across
-    // turns, vs the % above which is live context usage. Each half appears
-    // only once billed.
-    if app.tool_state.total_usage > 0 || app.tool_state.total_output > 0 {
-        let mut flow = String::new();
-        if app.tool_state.total_usage > 0 {
-            flow.push_str(&format!("↑{}", format_tokens(app.tool_state.total_usage)));
-        }
-        if app.tool_state.total_output > 0 {
-            if !flow.is_empty() {
-                flow.push(' ');
-            }
-            flow.push_str(&format!("↓{}", format_tokens(app.tool_state.total_output)));
-        }
-        pieces.push(sep());
-        pieces.push(quiet(flow));
-    }
-    // Output rate of the most recent LLM call (completion tokens over the
-    // daemon-measured call duration). Sub-1 tok/s rounds to a lie, so it
-    // stays hidden.
-    if let Some(rate) = app.tool_state.last_tok_s {
-        if rate >= 1.0 {
-            pieces.push(sep());
-            pieces.push(quiet(format!("{rate:.0} tok/s")));
-        }
-    }
-    // Session cost: `$X.XXX`, catalog-priced when possible
-    // else `DEX_COST_PER_1K` fallback. Shown once any prompt has been billed.
+    pieces.extend(agents_pieces(app));
     pieces.extend(tasks_pieces(app));
-    push_cost(&mut pieces, app);
+    pieces
+}
+
+/// Pressure + spend, right side, then the connection badge when remote.
+fn right_pieces(app: &App, short_ctx: bool, cost: bool) -> Vec<Piece> {
+    let mut pieces = vec![ctx_piece(app, short_ctx)];
+    if cost {
+        push_cost(&mut pieces, app);
+    }
+    if let Some(conn) = conn_piece(app) {
+        push_sep(&mut pieces);
+        pieces.push(conn);
+    }
     pieces
 }
 
@@ -400,64 +357,15 @@ fn tasks_pieces(app: &App) -> Vec<Piece> {
 /// Test shim: the status row as plain text (string asserts in `render/tests`).
 #[cfg(test)]
 pub(super) fn ui_status(app: &App) -> String {
-    status_pieces(app, true)
-        .into_iter()
-        .map(|(text, _)| text)
-        .collect::<Vec<_>>()
-        .concat()
+    footer_text(app, 240).trim_end().to_string()
 }
 
-fn compact_pieces(app: &App) -> Vec<Piece> {
-    // Narrow tier: cwd + branch + model + spend. Branch and cost share
-    // helpers with the full line so the tiers cannot drift. The model stays
-    // canonical `provider/model` like the full line — width tiers shed the
-    // cwd/branch first, never the provider.
-    let mut pieces = vec![(compact_path(&app.cwd), fg(theme::accent_fg()))];
-    let branch = branch_pieces(app);
-    if !branch.is_empty() {
-        push_sep(&mut pieces);
-        pieces.extend(branch);
-    }
-    push_sep(&mut pieces);
-    pieces.push(quiet(model_label(app)));
-    pieces.push(sep());
-    pieces.push(mode_piece(app));
-    pieces.extend(agents_pieces(app));
-    pieces.extend(tasks_pieces(app));
-    push_cost(&mut pieces, app);
-    pieces
-}
-
-fn bare_pieces(app: &App) -> Vec<Piece> {
-    // Narrowest tier: brevity beats precision — the bare id keeps the
-    // connection badge on screen when even `provider/model` won't fit.
-    // Still `unconfigured` when the daemon resolved no config yet, never
-    // `unknown` or an empty string.
-    let mut pieces = vec![mode_piece(app)];
-    push_sep(&mut pieces);
-    let bare = if app.config.provider.name().is_empty() {
-        "unconfigured".to_string()
-    } else {
-        app.config.model.clone()
-    };
-    pieces.push(quiet(bare));
-    push_cost(&mut pieces, app);
-    pieces
-}
-
-/// How this TUI reached its engine. Remote is the exceptional state worth
-/// noticing; a local daemon is a quiet fact.
-fn conn_piece(app: &App) -> Piece {
-    let conn = app
-        .connection
-        .clone()
-        .unwrap_or_else(|| "[L] local".to_string());
-    let style = if conn.starts_with("[R]") {
-        fg(theme::accent_fg())
-    } else {
-        quiet_style()
-    };
-    (conn, style)
+/// Connection badge, only when remote: a local daemon is the unremarkable
+/// default and prints nothing. `[R] host` reads as `remote host`.
+fn conn_piece(app: &App) -> Option<Piece> {
+    let conn = app.connection.as_deref()?;
+    let host = conn.strip_prefix("[R]")?.trim();
+    Some((format!("remote {host}"), fg(theme::accent_fg())))
 }
 
 /// Scroll hint: an attention flag ("you're missing content above"), styled
@@ -466,7 +374,13 @@ fn hint_pieces(app: &App) -> Vec<Piece> {
     if app.autoscroll {
         Vec::new()
     } else {
-        vec![("▲ more above".to_string(), fg(theme::warn_fg())), sep()]
+        vec![
+            (
+                "▲ scrolled up · PgDn for latest".to_string(),
+                fg(theme::warn_fg()),
+            ),
+            sep(),
+        ]
     }
 }
 
@@ -507,37 +421,74 @@ fn truncate_pieces(pieces: Vec<Piece>, width: usize) -> Vec<Piece> {
     out
 }
 
-/// Connection badge pinned to the right edge. On a remote box knowing
-/// that beats any left-side detail, so it survives narrowing at the
-/// left's expense. The left candidates shed width in order of how static
-/// they are: first the cwd (fixed for the whole session; every live number
-/// stays), then branch/model, then only model + spend.
+/// The footer: identity and activity on the left (mode, model, cwd, branch,
+/// agents/tasks), pressure and spend on the right (ctx, cost, remote badge).
+/// Narrow terminals shed the static facts first — cwd, then branch, then the
+/// absolute ctx numbers, then cost — and never the mode or the model.
 pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
     let width = width as usize;
     let hint = hint_pieces(app);
-    let conn = conn_piece(app);
-    let conn_w = pieces_width(std::slice::from_ref(&conn));
-    // Tier candidates build lazily, widest first: the full line almost
-    // always fits, so on a wide terminal the narrower tiers (and their
-    // transcript walks) never build at all.
+    // (left, right) candidates widest first; built lazily, since the full
+    // line almost always fits.
+    let tiers: [&dyn Fn() -> (Vec<Piece>, Vec<Piece>); 4] = [
+        &|| (left_pieces(app, true, true), right_pieces(app, false, true)),
+        &|| {
+            (
+                left_pieces(app, false, true),
+                right_pieces(app, false, true),
+            )
+        },
+        &|| {
+            (
+                left_pieces(app, false, false),
+                right_pieces(app, true, true),
+            )
+        },
+        &|| {
+            (
+                left_pieces(app, false, false),
+                right_pieces(app, true, false),
+            )
+        },
+    ];
     let mut left_only: Option<Vec<Piece>> = None;
-    for tier in 0..4 {
-        let candidate = match tier {
-            0 => status_pieces(app, true),
-            1 => status_pieces(app, false),
-            2 => compact_pieces(app),
-            _ => bare_pieces(app),
-        };
-        let mut left = hint.clone();
-        left.extend(candidate);
-        let lw = pieces_width(&left);
-        if lw + 1 + conn_w <= width {
-            left.push((" ".repeat(width - lw - conn_w), Style::default()));
-            left.push(conn);
-            return to_line(left);
+    for tier in tiers {
+        let (left, right) = tier();
+        let mut left = left;
+        if let Some(notice) = notice_pieces(app) {
+            left = notice;
+        }
+        let mut line = hint.clone();
+        line.extend(left);
+        let lw = pieces_width(&line);
+        let rw = pieces_width(&right);
+        if lw + 2 + rw <= width {
+            line.push((" ".repeat(width - lw - rw), Style::default()));
+            line.extend(right);
+            return to_line(line);
         }
         if left_only.is_none() && lw <= width {
-            left_only = Some(left);
+            left_only = Some(line);
+        }
+    }
+    // Nothing fit with its right side: a remote badge still beats the extras,
+    // so try mode + bare model + badge before settling for the left alone.
+    if let Some(conn) = conn_piece(app) {
+        let cw = pieces_width(std::slice::from_ref(&conn));
+        let bare = if app.config.provider.name().is_empty() {
+            "unconfigured".to_string()
+        } else {
+            app.config.model.clone()
+        };
+        let mut left = hint.clone();
+        left.push(mode_piece(app));
+        push_sep(&mut left);
+        left.push(quiet(bare));
+        let lw = pieces_width(&left);
+        if lw + 2 + cw <= width {
+            left.push((" ".repeat(width - lw - cw), Style::default()));
+            left.push(conn);
+            return to_line(left);
         }
     }
     if let Some(left) = left_only {
