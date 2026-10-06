@@ -3451,3 +3451,18 @@ fn narrow_footer_keeps_the_remote_badge() {
         assert!(text.contains("remote box"), "{width}: {text:?}");
     }
 }
+
+#[test]
+fn working_row_does_not_shift_while_the_dots_animate() {
+    let status = super::thinking::ActivityStatus {
+        elapsed: Some(std::time::Duration::from_secs(5)),
+        tool: None,
+    };
+    let at = |tick: u16| {
+        let line = super::thinking::activity_indicator_line(tick, 80, Some(&status));
+        row_text(&line)
+    };
+    let col = |s: &str| s.find("Esc").unwrap();
+    assert_eq!(col(&at(0)), col(&at(2)));
+    assert_eq!(col(&at(2)), col(&at(4)));
+}

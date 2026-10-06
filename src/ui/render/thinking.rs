@@ -109,7 +109,7 @@ pub(crate) fn thinking_indicator_text(
     tick: u16,
 ) -> String {
     if thinking_open {
-        return format!("◌ Thinking {}", dots_for_tick(tick));
+        return format!("◌ Thinking {}", dots_for_tick(tick).trim_end());
     }
     match elapsed {
         Some(elapsed) => format!("Thought for {}", format_elapsed(elapsed)),
@@ -133,10 +133,11 @@ pub(crate) fn format_elapsed(elapsed: Duration) -> String {
 /// the ~8 fps busy heartbeat) — deliberately slower than the stream flush
 /// so the dots read as a calm pulse. Used by both the thinking and the
 /// turn-activity indicators.
+/// Always three cells wide, so text after the dots doesn't shift as they animate.
 fn dots_for_tick(tick: u16) -> &'static str {
     match (tick / 2) % 3 {
-        0 => ".",
-        1 => "..",
+        0 => ".  ",
+        1 => ".. ",
         _ => "...",
     }
 }
