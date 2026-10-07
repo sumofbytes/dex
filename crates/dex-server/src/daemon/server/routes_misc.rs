@@ -366,7 +366,7 @@ pub(crate) async fn load_skill(
                 .map_err(|e| format!("create session: {e}"))?
         };
         let msg = ChatMessage::user_named(
-            format!("--- Skill: {} ---\n{}", skill_for_msg.name, content_for_msg),
+            dex_skills::format_loaded_skill(&skill_for_msg, &content_for_msg),
             "skill",
         );
         session
