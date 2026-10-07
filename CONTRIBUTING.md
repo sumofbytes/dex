@@ -39,8 +39,9 @@ Requires a stable Rust toolchain (edition 2021).
 
 - Tool behavior belongs in the tool descriptions (`src/tools/`, wire types),
   not in the system prompt; `src/llm/prompt.rs` stays minimal.
-- Tools are workspace-confined through `resolve_workspace_path` — never add a
-  code path that can escape it.
+- Tools are not workspace-confined: tool paths resolve through `tool_path`
+  (relative to the workspace, `~` expanded). Don't add per-tool path gates —
+  confinement is the sandbox's job.
 - Sessions journal incrementally with `turn_start` / `turn_complete` /
   `turn_failed` markers; keep the crash-safe guarantees intact (a crash may
   lose at most the in-flight event).

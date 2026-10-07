@@ -1,5 +1,5 @@
 //! Dex server side: the daemon (axum + SSE), the agent turn engine and its
-//! provider clients, workspace-confined tools, MCP integration, Lua
+//! provider clients, coding tools, MCP integration, Lua
 //! extensions, session persistence glue, and headless rendering.
 //!
 //! Everything an embedder needs to run a dex daemon lives here behind a
@@ -28,7 +28,7 @@ pub mod render;
 pub mod session;
 #[doc(hidden)]
 pub mod telemetry;
-/// Historical `crate::tools::` paths for the workspace-confined tools.
+/// Historical `crate::tools::` paths for the coding tools.
 /// Internal: was `pub(crate)` before the crate split.
 #[doc(hidden)]
 pub mod tools;

@@ -1,88 +1,69 @@
-//! Workspace paths: the single owner of "which paths may tools touch".
+//! Tool paths: how a tool `path` argument becomes a filesystem path.
 //!
-//! Existing path components are canonicalized so symlinks cannot silently
-//! escape the workspace; for a new file, the existing parent is
-//! canonicalized instead.
+//! Tools are not confined to the workspace: `bash` can reach anything the
+//! user can, so a path gate on `read`/`write`/`edit` only forces detours.
+//! Run dex in a sandbox or container to restrict what it can touch.
+//! [`resolve_workspace_path`] stays confined for Lua extensions, whose
+//! `workspace.read` capability promises that scope.
 
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use super::WorkspaceError;
 
-pub fn workspace_root() -> Result<PathBuf, WorkspaceError> {
-    env::current_dir().map_err(WorkspaceError::Io)
+pub fn workspace_root() -> io::Result<PathBuf> {
+    env::current_dir()
 }
 
-/// Resolve a user-provided path within the current workspace. Existing path
-/// components are canonicalized so symlinks cannot silently escape it; for a
-/// new file, the existing parent is canonicalized instead.
-pub fn workspace_path(raw: &str) -> Result<PathBuf, WorkspaceError> {
-    let root = workspace_root()?
-        .canonicalize()
-        .map_err(WorkspaceError::Io)?;
-    resolve_workspace_path(&root, raw)
+/// Resolve a tool `path` argument: `~` expands to `$HOME`, relative paths
+/// join the workspace root. Existing paths are canonicalized (for a new
+/// file, its existing parent) so caches and conflict detection see one
+/// spelling per file.
+pub fn tool_path(raw: &str) -> io::Result<PathBuf> {
+    resolve_path(&workspace_root()?.canonicalize()?, raw)
 }
 
+/// [`tool_path`] against an explicit `root`.
+pub fn resolve_path(root: &Path, raw: &str) -> io::Result<PathBuf> {
+    let candidate = root.join(expand_home(raw));
+    if candidate.exists() {
+        return candidate.canonicalize();
+    }
+    let file_name = candidate.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a file path: {raw}"),
+        )
+    })?;
+    let parent = candidate.parent().unwrap_or(root).canonicalize()?;
+    Ok(parent.join(file_name))
+}
+
+/// [`resolve_path`] confined to `root`: symlinks resolve to their targets,
+/// so a link out of `root` is refused too.
 pub fn resolve_workspace_path(root: &Path, raw: &str) -> Result<PathBuf, WorkspaceError> {
-    let candidate = if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
-    } else {
-        root.join(raw)
-    };
-    let resolved = if candidate.exists() {
-        candidate.canonicalize().map_err(WorkspaceError::Io)?
-    } else {
-        let file_name = candidate
-            .file_name()
-            .ok_or_else(|| WorkspaceError::OutsideWorkspace(candidate.display().to_string()))?;
-        let parent = candidate
-            .parent()
-            .unwrap_or(root)
-            .canonicalize()
-            .map_err(WorkspaceError::Io)?;
-        parent.join(file_name)
-    };
-    if resolved == root || resolved.starts_with(root) {
+    let resolved = resolve_path(root, raw).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidInput => WorkspaceError::OutsideWorkspace(raw.to_string()),
+        _ => WorkspaceError::Io(e),
+    })?;
+    if resolved.starts_with(root) {
         Ok(resolved)
     } else {
         Err(WorkspaceError::OutsideWorkspace(raw.to_string()))
     }
 }
 
-/// Read-only dirs outside the workspace that `read` may touch. The skills
-/// appendix advertises SKILL.md paths from `skill_dirs()` — user-level ones
-/// live under `$XDG_CONFIG_HOME`, outside any workspace — so discovery grants
-/// its dirs here and `tool_read` falls back to [`readable_granted_path`] when
-/// the workspace gate rejects a path. Write/edit/grep/find stay confined.
-pub fn grant_readable_dir(dir: &Path) {
-    let Ok(canon) = dir.canonicalize() else {
-        return;
+fn expand_home(raw: &str) -> PathBuf {
+    let rest = match raw.strip_prefix('~') {
+        Some("") => "",
+        Some(rest) if rest.starts_with('/') => &rest[1..],
+        _ => return PathBuf::from(raw),
     };
-    let mut dirs = granted_read_dirs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if !dirs.contains(&canon) {
-        dirs.push(canon);
+    match env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(rest),
+        None => PathBuf::from(raw),
     }
-}
-
-/// Resolve `raw` when it canonicalizes under a granted dir; `None` keeps the
-/// workspace gate's rejection. Canonicalization walks symlinks, so a link out
-/// of a granted dir resolves to its real (ungranted) target and is refused.
-pub fn readable_granted_path(raw: &str) -> Option<PathBuf> {
-    let resolved = PathBuf::from(raw).canonicalize().ok()?;
-    granted_read_dirs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|dir| resolved.starts_with(dir))
-        .then_some(resolved)
-}
-
-fn granted_read_dirs() -> &'static Mutex<Vec<PathBuf>> {
-    static DIRS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-    DIRS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Normalize a tool-call `path` argument for same-path conflict detection:
@@ -95,7 +76,7 @@ fn granted_read_dirs() -> &'static Mutex<Vec<PathBuf>> {
 /// Unresolvable paths fall back to a lexical clean (no symlink resolution),
 /// which still catches `./` and `a/../` spelling differences.
 pub fn normalize_conflict_path(raw: &str) -> String {
-    if let Ok(resolved) = workspace_path(raw) {
+    if let Ok(resolved) = tool_path(raw) {
         return resolved.display().to_string();
     }
     lexical_normalize_fallback(raw)
@@ -105,15 +86,15 @@ pub fn normalize_conflict_path(raw: &str) -> String {
 /// without touching the FS. Catches `./newdir/f` vs `newdir/f` when the
 /// parent doesn't exist yet (canonicalize would fail).
 pub fn lexical_normalize_fallback(raw: &str) -> String {
-    let raw_path = Path::new(raw);
+    let raw_path = expand_home(raw);
     let joined = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
+        raw_path
     } else {
         let root = workspace_root()
             .ok()
             .and_then(|r| r.canonicalize().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        root.join(raw_path)
+        root.join(&raw_path)
     };
     let mut out = PathBuf::new();
     for comp in joined.components() {

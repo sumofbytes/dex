@@ -24,8 +24,7 @@ pub(crate) use outcome::ToolOutcome;
 pub(crate) use policy::PermissionRequirement;
 pub(crate) use policy::{gated_in_read_only, metadata, ToolFilter};
 pub(crate) use sandbox::{
-    normalize_conflict_path, readable_granted_path, resolve_workspace_path, workspace_path,
-    workspace_root,
+    normalize_conflict_path, resolve_path, resolve_workspace_path, tool_path, workspace_root,
 };
 // Leaf tool implementations live in per-tool modules; re-exported so
 // existing `tools::...` paths keep working. `parse_edit_ops` is also the

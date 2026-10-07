@@ -146,7 +146,7 @@ impl HarnessConfig {
     }
 }
 
-/// Runs one tool call to an outcome. The default is the workspace-confined
+/// Runs one tool call to an outcome. The default is the built-in tool
 /// dispatcher; override to stub tools in tests or route calls elsewhere.
 ///
 /// Boxed-future style (not `async fn`) so the trait stays object-safe:

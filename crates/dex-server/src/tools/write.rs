@@ -6,10 +6,10 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use super::args::arg_str;
-use super::{workspace_path, ToolError};
+use super::{tool_path, ToolError};
 
 pub(crate) async fn tool_write(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let path = workspace_path(&arg_str(args, "path")?)?;
+    let path = tool_path(&arg_str(args, "path")?)?;
     let content = arg_str(args, "content")?;
     check_expected_hash(args, &path).await?;
     if let Some(parent) = path.parent() {

@@ -222,7 +222,7 @@ local: text streams live, tool calls and results appear as they happen, tool
 approvals take the composer's place (the daemon parks the turn until you decide),
 and Ctrl+C cancels the in-flight turn. API keys and permissions resolve in the
 daemon's environment; client flags like `--model` are forwarded as
-per-request overrides. Tools execute on the daemon's machine, confined to its
+per-request overrides. Tools execute on the daemon's machine, relative to its
 working directory.
 
 ## Command-line flags
@@ -256,8 +256,9 @@ Defaults, all overridable via `DEX_*` env vars — see
 - Sessions: journals live in `$XDG_DATA_HOME/dex/sessions/*.jsonl`, `fsync`
   on turn/effect events only (`DEX_DURABLE=1` for every line).
 - Audit: off; `DEX_AUDIT=1` writes `audit.jsonl` per tool call.
-- Paths: tools are confined to the current workspace (`bash` can still run
-  arbitrary commands there — use `trusted` only in environments you trust).
+- Paths: tools are not confined — relative paths resolve against the
+  workspace, but `read`/`write`/`edit`/`bash` reach anything your user can.
+  To restrict dex, run it in a sandbox or container.
 
 In the interactive TUI, actions requiring approval replace the composer with an inline panel (the
 transcript stays visible). Use the arrow keys and Enter to choose `Allow once`, `Allow for this session`, or
