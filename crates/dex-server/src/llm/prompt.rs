@@ -25,7 +25,7 @@ pub(crate) fn format_skills_for_prompt(skills: &[Skill]) -> String {
         ));
     }
     out.push_str(
-        "\nWhen the task matches a skill's description, use the read tool to load that SKILL.md and follow it.\n",
+        "\nWhen the task matches a skill's description, use the read tool to load that SKILL.md in full (continue with offset/limit if truncated) and follow it. Resolve relative paths it mentions (scripts/, references/) against the SKILL.md's directory.\n",
     );
     out
 }

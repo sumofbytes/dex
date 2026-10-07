@@ -20,22 +20,57 @@ pub fn parse_skill(path: &Path) -> Option<Skill> {
 /// when the file doesn't start with `---` or has no `name:` key. Shared by
 /// the sync and async discovery paths so the frontmatter rules can't drift.
 pub fn parse_frontmatter(content: &str) -> Option<(String, String)> {
-    let mut lines = content.lines();
-    let first = lines.next()?;
-    if first.trim() != "---" {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines().peekable();
+    if lines.next()?.trim() != "---" {
         return None;
     }
     let mut name = None;
     let mut description = None;
-    for line in lines {
+    while let Some(line) = lines.next() {
         if line.trim() == "---" {
             break;
         }
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("name:") {
-            name = Some(unquote(val.trim()));
-        } else if let Some(val) = line.strip_prefix("description:") {
-            description = Some(unquote(val.trim()));
+        // Only top-level keys: indented `name:` under e.g. `metadata:` must
+        // not shadow the skill's own name.
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key != "name" && key != "description" {
+            continue;
+        }
+        let val = val.trim();
+        // Block scalars (`>`, `|`, with chomping marks) and plain multi-line
+        // values: gather the indented continuation lines, joined by spaces.
+        let mut parts: Vec<String> = Vec::new();
+        let block = val.starts_with('>') || val.starts_with('|');
+        if !block && !val.is_empty() {
+            parts.push(val.to_string());
+        }
+        while let Some(next) = lines.peek() {
+            if next.trim() == "---" || !(next.starts_with([' ', '\t']) || next.trim().is_empty()) {
+                break;
+            }
+            let t = next.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+            lines.next();
+        }
+        let value = if block {
+            parts.join(" ")
+        } else {
+            let joined = parts.join(" ");
+            unquote(&joined)
+        };
+        if key == "name" {
+            name = Some(value);
+        } else {
+            description = Some(value);
         }
     }
     let name = name?;
@@ -87,6 +122,17 @@ mod tests {
         assert_eq!(unquote("bare"), "bare");
         assert_eq!(unquote("\"a\""), "a"); // trimmed then stripped
         assert_eq!(unquote("\"\""), "");
+    }
+
+    #[test]
+    fn frontmatter_handles_block_scalars_nested_keys_and_bom() {
+        let doc = "\u{feff}---\nname: real\ndescription: >\n  Line one\n  line two\nmetadata:\n  name: fake\n  description: nope\n---\nBody";
+        let (name, desc) = parse_frontmatter(doc).unwrap();
+        assert_eq!(name, "real");
+        assert_eq!(desc, "Line one line two");
+        let (_, desc) =
+            parse_frontmatter("---\nname: a\ndescription: first\n  second\n---\n").unwrap();
+        assert_eq!(desc, "first second");
     }
 
     #[test]
