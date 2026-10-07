@@ -603,6 +603,9 @@ dependencies = [
  "similar",
  "terminal-colorsaurus",
  "tokio",
+ "tree-sitter-highlight",
+ "tree-sitter-javascript",
+ "tree-sitter-typescript",
  "unicode-width 0.2.0",
  "uuid",
 ]

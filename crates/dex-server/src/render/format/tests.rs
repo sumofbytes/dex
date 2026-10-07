@@ -814,9 +814,13 @@ fn bash_failure_explains_itself_with_stderr_or_the_last_line() {
 }
 
 #[test]
-fn read_short_arg_ignores_empty_paths() {
+fn read_short_arg_ignores_empty_paths_and_glob() {
     assert_eq!(
         short_arg("read", r#"{"path":"src/main.rs","paths":[]}"#),
+        "src/main.rs"
+    );
+    assert_eq!(
+        short_arg("read", r#"{"path":"src/main.rs","glob":" "}"#),
         "src/main.rs"
     );
 }
