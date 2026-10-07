@@ -23,3 +23,16 @@ pub struct Skill {
     pub description: String,
     pub path: std::path::PathBuf,
 }
+
+/// The user-turn text injected when a skill is loaded explicitly
+/// (`/skill:<name>`): the full `SKILL.md` plus its base directory, so
+/// relative references (`scripts/`, `references/`) resolve.
+pub fn format_loaded_skill(skill: &Skill, content: &str) -> String {
+    let base = skill.path.parent().unwrap_or(&skill.path);
+    format!(
+        "--- Skill: {} ---\nBase directory: {} (resolve relative paths in this skill against it)\n\n{}",
+        skill.name,
+        base.display(),
+        content
+    )
+}

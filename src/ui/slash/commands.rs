@@ -543,7 +543,7 @@ fn cmd_skill(app: &mut App, name: Option<&str>) {
     if let Some(skill) = app.skills.iter().find(|s| s.name == name) {
         let content = fs::read_to_string(&skill.path).unwrap_or_default();
         app.messages.push(ChatMessage::user_named(
-            format!("--- Skill: {} ---\n{}", skill.name, content),
+            dex_skills::format_loaded_skill(skill, &content),
             "skill",
         ));
         let _ = app.session.append_message(app.messages.last().unwrap());
