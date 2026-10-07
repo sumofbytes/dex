@@ -1,4 +1,4 @@
-//! Workspace: paths, file-cache, atomic writes. Single owner of FS confinement.
+//! Workspace: tool path resolution, file-cache, atomic writes.
 
 pub mod atomic;
 pub mod cache;
@@ -7,8 +7,8 @@ pub mod paths;
 pub use atomic::unique_tmp_path;
 pub use cache::{cached_parse, fnv_bytes, FileCache};
 pub use paths::{
-    grant_readable_dir, normalize_conflict_path, readable_granted_path, resolve_workspace_path,
-    workspace_path, workspace_root, xdg_path,
+    normalize_conflict_path, resolve_path, resolve_workspace_path, tool_path, workspace_root,
+    xdg_path,
 };
 
 #[derive(Debug)]

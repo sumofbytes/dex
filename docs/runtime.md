@@ -28,7 +28,7 @@ replacement safe — a turn can never see a half-applied composition.
 | `conflict` | Whether a tool batch has conflicting calls | conflict detector |
 | `scorer` | Which stale tool outputs to prune/drop | heuristic scorer |
 | `approval` | Tool approval policy | built-in permission policy |
-| `executor` | How tool calls execute | workspace-confined dispatcher |
+| `executor` | How tool calls execute | built-in tool dispatcher |
 | `transcript` | Where transcript lines go | session store |
 | `usage` | Token/cost accounting | token ledger |
 | `events` | Event sink | transcript events |

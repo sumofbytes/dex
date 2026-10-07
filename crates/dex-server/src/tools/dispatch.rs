@@ -16,7 +16,7 @@ use super::shell::tool_bash;
 use super::then_run::{append_then_run, then_run_command};
 use super::write::tool_write;
 
-/// Execute a tool using paths confined to the current workspace: the H1
+/// Execute a tool with paths resolved against the current workspace: the H1
 /// `tool.before` seam, the gates, and the `then_run` follow-up — the full
 /// pipeline every model-issued call goes through.
 pub async fn execute(

@@ -7,7 +7,6 @@ pub enum ToolError {
     InvalidArgument(String),
     Io(io::Error),
     EditNotUnique(usize),
-    OutsideWorkspace(String),
     /// A write/edit supplied an `expected_hash` that no longer matches the
     /// file on disk (someone else changed it since the model's last read).
     /// The caller must re-read and retry — the write is not applied.
@@ -34,12 +33,9 @@ pub enum ToolError {
     Unknown(String),
 }
 
-impl From<crate::workspace::WorkspaceError> for ToolError {
-    fn from(e: crate::workspace::WorkspaceError) -> Self {
-        match e {
-            crate::workspace::WorkspaceError::Io(io) => Self::Io(io),
-            crate::workspace::WorkspaceError::OutsideWorkspace(p) => Self::OutsideWorkspace(p),
-        }
+impl From<io::Error> for ToolError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
     }
 }
 
@@ -54,7 +50,6 @@ impl std::fmt::Display for ToolError {
                 f,
                 "oldText matches {n} locations; include more surrounding lines to make it unique, or pass replaceAll: true"
             ),
-            Self::OutsideWorkspace(path) => write!(f, "path is outside the workspace: {}", path),
             Self::StaleFile {
                 path,
                 expected,

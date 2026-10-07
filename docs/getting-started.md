@@ -125,8 +125,9 @@ steering queue are covered in the [TUI guide](tui.md).
 - **"provider but no model"** — `model:` needs both parts:
   `provider/model`, not a bare provider name.
 - **Model not in the list** — run `dex update --models`, then check `/model`.
-- **Agent can't see files outside the project** — that's by design; tools are
-  confined to the workspace where `dex` runs. Launch from the project root.
+- **Restricting what the agent can touch** — tools aren't confined to the
+  workspace (`bash` could reach any path anyway); run dex in a sandbox or
+  container to limit it.
 - **Wrong endpoint or headers** — `dex doctor` shows the origin of every
   resolved value; [Environment variables](environment.md) lists all overrides.
 

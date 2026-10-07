@@ -923,6 +923,7 @@ async fn edit_batch_arg_shapes_are_repaired() {
 
 #[tokio::test]
 async fn temporary_workspace_paths_are_confined() {
+    // Extension `workspace.read` stays confined; tools use `resolve_path`.
     let root = std::env::temp_dir().join(format!("dex-workspace-test-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     assert!(resolve_workspace_path(&root, "inside.txt")
@@ -932,6 +933,14 @@ async fn temporary_workspace_paths_are_confined() {
         resolve_workspace_path(&root, "../outside.txt"),
         Err(crate::workspace::WorkspaceError::OutsideWorkspace(_))
     ));
+    assert!(!resolve_path(&root, "../outside.txt")
+        .unwrap()
+        .starts_with(&root));
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home).canonicalize().unwrap();
+        assert_eq!(resolve_path(&root, "~").unwrap(), home);
+        assert_eq!(resolve_path(&root, "~/x.txt").unwrap(), home.join("x.txt"));
+    }
     let _ = fs::remove_dir_all(root);
 }
 
@@ -955,47 +964,34 @@ fn read_only_schema_filter_mirrors_the_gate() {
 }
 
 #[tokio::test]
-async fn read_reaches_granted_skill_dirs_outside_the_workspace() {
-    // The `~/.config/dex/skills` shape: a user-level dir the prompt
-    // advertises for autoload, which the workspace gate rejects until skill
-    // discovery grants it (`grant_readable_dir`).
-    let skill_dir = std::env::temp_dir().join(format!("dex-skill-grant-{}", std::process::id()));
-    fs::create_dir_all(skill_dir.join("demo")).unwrap();
-    let skill = skill_dir.join("demo/SKILL.md");
-    fs::write(&skill, "autoload body").unwrap();
+async fn file_tools_reach_paths_outside_the_workspace() {
+    // No workspace gate: confinement is the sandbox's job, not the tools'
+    // (bash could reach these paths anyway).
+    let dir = std::env::temp_dir().join(format!("dex-outside-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("note.txt");
+    let path = Value::String(file.display().to_string());
 
     let mut args = Map::new();
-    args.insert("path".into(), Value::String(skill.display().to_string()));
-    assert!(
-        execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
-            .await
-            .is_err()
-    );
+    args.insert("path".into(), path.clone());
+    args.insert("content".into(), Value::String("outside body\n".into()));
+    execute(
+        "write",
+        &args,
+        &GlobalCancellation,
+        &Policy::trusted(),
+        None,
+    )
+    .await
+    .unwrap();
 
-    crate::workspace::grant_readable_dir(&skill_dir);
+    let mut args = Map::new();
+    args.insert("path".into(), path);
     let body = execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
         .await
         .unwrap();
-    assert!(body.contains("autoload body"), "{body}");
-
-    // Symlink escape: a link inside the granted dir resolves to its real
-    // (ungranted) target and stays refused.
-    #[cfg(unix)]
-    {
-        let outside =
-            std::env::temp_dir().join(format!("dex-skill-grant-out-{}", std::process::id()));
-        fs::write(&outside, "secret").unwrap();
-        let link = skill_dir.join("demo/escape.md");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        args.insert("path".into(), Value::String(link.display().to_string()));
-        assert!(
-            execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
-                .await
-                .is_err()
-        );
-        let _ = fs::remove_file(&outside);
-    }
-    let _ = fs::remove_dir_all(&skill_dir);
+    assert!(body.contains("outside body"), "{body}");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -1379,7 +1375,6 @@ async fn fanout_read_is_concurrent_ordered_and_isolated() {
                 .collect(),
         ),
     );
-    // Use workspace_path resolution via execute (paths confined).
     let out = execute("read", &args, &GlobalCancellation, &Policy::trusted(), None)
         .await
         .unwrap();

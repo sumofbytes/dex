@@ -5,10 +5,10 @@ use similar::TextDiff;
 
 use super::args::arg_str;
 use super::write::{atomic_write, check_expected_hash_bytes};
-use super::{workspace_path, ToolError};
+use super::{tool_path, ToolError};
 
 pub(crate) async fn tool_edit(args: &Map<String, Value>) -> Result<String, ToolError> {
-    let path = workspace_path(&arg_str(args, "path")?)?;
+    let path = tool_path(&arg_str(args, "path")?)?;
     let ops = parse_edit_ops(args)?;
     let replace_all = args
         .get("replaceAll")
@@ -178,7 +178,7 @@ fn diff_after(name: &str, args: &Map<String, Value>, before: Option<&str>) -> Op
 
 pub(crate) async fn change_diff_async(name: &str, args: &Map<String, Value>) -> Option<String> {
     let raw_path = arg_str(args, "path").ok()?;
-    let path = workspace_path(&raw_path).ok()?;
+    let path = tool_path(&raw_path).ok()?;
     let before = tokio::fs::read_to_string(&path).await.ok();
     let after = diff_after(name, args, before.as_deref())?;
     build_diff(&raw_path, before.as_deref(), &after)

@@ -8,12 +8,12 @@ use crate::protocol::PermissionMode;
 use crate::render::format::clamp_lines;
 use crate::runtime::console::Console;
 
-use super::workspace_path;
+use super::tool_path;
 use super::ToolError;
 
 pub async fn tool_ls(args: &Map<String, Value>) -> Result<String, ToolError> {
     let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let path = workspace_path(raw)?;
+    let path = tool_path(raw)?;
     let meta = tokio::fs::metadata(&path).await.map_err(ToolError::Io)?;
     if !meta.is_dir() {
         return Ok(path.display().to_string());
