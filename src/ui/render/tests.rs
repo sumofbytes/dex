@@ -3492,6 +3492,21 @@ fn typescript_block_colors_keywords_strings_and_comments() {
 }
 
 #[test]
+fn tsx_block_colors_jsx_and_code_after_it() {
+    // `tsx` normalizes to `typescript`; JSX must not leave the rest bare.
+    let code = "const App = () => <div className=\"x\">hi</div>;\nconst n = 42;";
+    let rows = highlight_code_block("typescript", code).expect("highlight");
+    let colored = |text: &str| {
+        rows.iter()
+            .flatten()
+            .any(|s| s.content.as_ref() == text && s.style.fg.is_some())
+    };
+    for token in ["div", "\"x\"", "42"] {
+        assert!(colored(token), "{token} should be colored: {rows:?}");
+    }
+}
+
+#[test]
 fn typescript_literal_with_type_keeps_string_color() {
     // A type inside a template literal must not strip the literal's color.
     let code = "const s = `n ${(v as Foo).x} items`;";

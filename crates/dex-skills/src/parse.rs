@@ -70,8 +70,10 @@ pub fn parse_frontmatter(content: &str) -> Option<(String, String)> {
                     .iter()
                     .find(|l| !l.trim().is_empty())
                     .map_or(0, |l| indent(l));
+                // Clamp to each line's own indent so an under-indented line
+                // (invalid YAML) loses whitespace, never text.
                 body.iter()
-                    .map(|l| l.get(base..).unwrap_or("").trim_end())
+                    .map(|l| l.get(base.min(indent(l))..).unwrap_or("").trim_end())
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -181,6 +183,9 @@ mod tests {
         let doc = "---\nname: a\ndescription: >-\n  one\n  two\n\n  three\n---\n";
         let (_, desc) = parse_frontmatter(doc).unwrap();
         assert_eq!(desc, "one two\nthree");
+        let doc = "---\nname: a\ndescription: |\n    deep\n  shallow\n---\n";
+        let (_, desc) = parse_frontmatter(doc).unwrap();
+        assert_eq!(desc, "deep\nshallow");
     }
 
     #[test]

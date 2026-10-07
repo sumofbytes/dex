@@ -80,6 +80,8 @@ pub fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
 /// modifiers) and upstream layers it over JavaScript's (`inherits: ecma`);
 /// `ratatui_markdown` uses it alone, leaving keywords, strings and comments
 /// bare. Compose both here — TS first, so its captures win on overlap.
+/// `tsx` fences use this grammar too: its error recovery keeps JSX colored,
+/// while the TSX grammar's tag captures have no color in `HIGHLIGHT_NAMES`.
 fn typescript_segments(code: &str) -> Vec<StyleSegment> {
     use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -87,6 +89,7 @@ fn typescript_segments(code: &str) -> Vec<StyleSegment> {
     static HIGHLIGHTER: Mutex<Option<Highlighter>> = Mutex::new(None);
     static COLORS: OnceLock<CodeColors> = OnceLock::new();
 
+    let fallback = || shared_highlighter().highlight("typescript", code);
     let Some(config) = CONFIG.get_or_init(|| {
         let query = format!(
             "{}\n{}",
@@ -104,13 +107,13 @@ fn typescript_segments(code: &str) -> Vec<StyleSegment> {
         config.configure(HIGHLIGHT_NAMES);
         Some(config)
     }) else {
-        return shared_highlighter().highlight("typescript", code);
+        return fallback();
     };
     let colors = COLORS.get_or_init(code_colors);
     let mut guard = HIGHLIGHTER.lock().unwrap_or_else(|e| e.into_inner());
     let hl = guard.get_or_insert_with(Highlighter::new);
     let Ok(events) = hl.highlight(config, code.as_bytes(), None, |_| None) else {
-        return Vec::new();
+        return fallback();
     };
     let mut segs = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
