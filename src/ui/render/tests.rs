@@ -3490,3 +3490,16 @@ fn typescript_block_colors_keywords_strings_and_comments() {
         assert!(colored(token), "{token} should be colored: {rows:?}");
     }
 }
+
+#[test]
+fn typescript_literal_with_type_keeps_string_color() {
+    // A type inside a template literal must not strip the literal's color.
+    let code = "const s = `n ${(v as Foo).x} items`;";
+    let rows = highlight_code_block("typescript", code).expect("highlight");
+    assert!(
+        rows.iter()
+            .flatten()
+            .any(|s| s.content.contains(" items`") && s.style.fg.is_some()),
+        "template tail should stay colored: {rows:?}"
+    );
+}
