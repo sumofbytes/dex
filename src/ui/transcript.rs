@@ -560,6 +560,8 @@ pub(crate) fn start_activity(app: &mut App) {
         return;
     }
     app.turn_out_base = app.tool_state.total_output;
+    app.recent_done.clear();
+    app.done_tally = 0;
     app.turn_tools_base = app
         .transcript
         .iter()

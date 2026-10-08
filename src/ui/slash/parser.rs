@@ -89,7 +89,7 @@ pub(crate) const COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         command: "/tasks",
         usage: "/tasks [id]",
-        description: "List background tasks (or show one's recent output)",
+        description: "List background tasks (or open one's output)",
     },
     SlashCommandSpec {
         command: "/help",

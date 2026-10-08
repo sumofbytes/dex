@@ -177,6 +177,7 @@ pub(crate) fn cmd_help(app: &mut App, remote: bool) {
     rows.push(
         "  Shift+Tab mode · Ctrl+T thinking · Ctrl+O tool output · PgUp/PgDn scroll".to_string(),
     );
+    rows.push("  Ctrl+A sub-agent transcripts · Ctrl+B background task output".to_string());
     rows.push(if remote {
         "  mouse: drag, double/triple-click to select and copy · wheel scrolls".to_string()
     } else {
@@ -871,31 +872,17 @@ fn cmd_undo(app: &mut App) {
 }
 
 /// `/tasks [id]`: list background shell tasks (running + recent finished)
-/// from the typed lifecycle state, or show one task's recent output tail.
-/// Read-only in v1 — stopping is the model's job.
+/// from the typed lifecycle state, or open one task's output view (the
+/// Ctrl+B view). Read-only in v1 — stopping is the model's job.
 fn cmd_tasks(app: &mut App, arg: Option<&str>) {
     if let Some(id) = arg.filter(|s| !s.trim().is_empty()) {
-        let id = id.trim().to_string();
-        let found = app.task_logs.iter().find(|l| l.id == id).map(|l| {
-            let done = app.tasks.iter().find(|t| t.id == id).is_none_or(|c| c.done);
-            let cmd = if l.command.is_empty() {
-                "(unknown command)".to_string()
-            } else {
-                l.command.clone()
-            };
-            let lines = l.lines.clone();
-            (done, cmd, lines)
-        });
-        match found {
-            None => push_info(app, format!("unknown background task '{id}'")),
-            Some((done, cmd, lines)) => {
-                let state = if done { "finished" } else { "running" };
-                push_info(app, format!("{id} {state}: {cmd}"));
-                let n = lines.len().saturating_sub(lines.len().min(30));
-                for line in lines.iter().skip(n) {
-                    push_info(app, format!("  {line}"));
-                }
-            }
+        let id = id.trim();
+        if app.task_logs.iter().any(|l| l.id == id) {
+            app.task_view = Some(id.to_string());
+            app.task_scroll = 0;
+            app.child_view = None;
+        } else {
+            push_info(app, format!("unknown background task '{id}'"));
         }
         return;
     }
@@ -914,7 +901,10 @@ fn cmd_tasks(app: &mut App, arg: Option<&str>) {
     for row in rows {
         push_info(app, row);
     }
-    push_info(app, "usage: /tasks [id] shows recent output".to_string());
+    push_info(
+        app,
+        "usage: /tasks [id] opens its output (or Ctrl+B)".to_string(),
+    );
 }
 
 /// Re-apply provider/model overrides that were persisted with the session

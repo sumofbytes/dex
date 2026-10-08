@@ -3338,15 +3338,143 @@ fn approval_panel_replaces_the_composer_and_folds_long_details() {
 }
 
 #[test]
-fn live_agents_show_in_the_full_footer_too() {
+fn live_agents_show_in_the_activity_strip_not_the_footer() {
     let mut app = test_app();
+    let strip_text = |app: &App, width| -> Option<String> {
+        super::super::status::activity_line(app, width)
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+    };
+    assert_eq!(strip_text(&app, 80), None, "idle: no strip row");
     app.agents.push(super::super::AgentChip {
         id: "a1".into(),
         name: "explorer".into(),
         tool: Some("grep".into()),
     });
-    let wide = footer_text(&app, 200);
-    assert!(wide.contains("agents: explorer·grep"), "{wide}");
+    app.tasks.push(super::super::TaskChip {
+        id: "task-3".into(),
+        command: "npm test".into(),
+        done: false,
+    });
+    app.recent_done
+        .push(("tester".into(), std::time::Instant::now()));
+    app.done_tally = 2;
+    let wide = strip_text(&app, 80).unwrap();
+    assert_eq!(
+        wide.trim_end(),
+        "⟡ explorer·grep  ⟳ task-3 npm test  ✓ tester  ✓2 done"
+    );
+    assert!(!footer_text(&app, 200).contains("explorer"));
+    // Narrow: chips overflow into `+N`, the tally stays.
+    let narrow = strip_text(&app, 34).unwrap();
+    assert_eq!(narrow, "⟡ explorer·grep  +2  ✓2 done");
+    // The strip renders on the last row, under the footer.
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+    let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
+    assert!(row(23).contains("⟡ explorer"), "{}", row(23));
+    assert!(row(22).contains("ctx"), "{}", row(22));
+}
+
+#[test]
+fn task_view_shows_the_log_tail_in_the_transcript_window() {
+    let mut app = test_app();
+    app.tasks.push(super::super::TaskChip {
+        id: "task-1".into(),
+        command: "npm run dev".into(),
+        done: false,
+    });
+    let mut log = super::super::TaskLog::new("task-1".into(), "npm run dev".into());
+    log.lines = (0..100).map(|i| format!("line {i}")).collect();
+    app.task_logs.push(log);
+    app.task_view = Some("task-1".into());
+    app.task_scroll = 500;
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+    let screen: Vec<String> = (0..24)
+        .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect())
+        .collect();
+    assert!(screen[0].contains("⟳ task-1 · npm run dev"), "{screen:?}");
+    assert!(screen[0].contains("● running"), "{screen:?}");
+    // Over-scroll clamps to the top of the log.
+    assert!(screen[1].contains("line 0"), "{screen:?}");
+    assert!(app.task_scroll < 100);
+    app.task_scroll = 0;
+    term.draw(|f| view(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+    let all: String = (0..24)
+        .flat_map(|y| (0..80).map(move |x| (x, y)))
+        .map(|p| buf[p].symbol().to_string())
+        .collect();
+    assert!(all.contains("line 99"), "following the tail");
+}
+
+#[test]
+fn finished_task_view_title_uses_the_done_glyph() {
+    let mut app = test_app();
+    app.tasks.push(super::super::TaskChip {
+        id: "task-2".into(),
+        command: "make".into(),
+        done: true,
+    });
+    app.task_logs
+        .push(super::super::TaskLog::new("task-2".into(), "make".into()));
+    app.task_view = Some("task-2".into());
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+    let title: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+    assert!(title.contains("✓ task-2 · make"), "{title}");
+    assert!(title.contains("○ done"), "{title}");
+    assert!(!title.contains('⟳'), "{title}");
+}
+
+#[test]
+fn short_terminal_sheds_the_strip_before_the_queue_and_counts_in_the_footer() {
+    let mut app = test_app();
+    app.agents.push(super::super::AgentChip {
+        id: "a1".into(),
+        name: "explorer".into(),
+        tool: None,
+    });
+    app.tasks.push(super::super::TaskChip {
+        id: "task-1".into(),
+        command: "npm test".into(),
+        done: false,
+    });
+    app.pending_steering.push("steer one".into());
+    app.pending_steering.push("steer two".into());
+    let queue = queue_metrics_of(&queue_groups(&app));
+    let needed =
+        minimum_view_height(activity_height(queue.items, queue.rows), 0) + MIN_TRANSCRIPT_ROWS;
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, needed)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    assert!(app.activity_shed, "no room: the strip goes first");
+    let buf = term.backend().buffer();
+    let screen: String = (0..needed)
+        .flat_map(|y| (0..80).map(move |x| (x, y)))
+        .map(|p| buf[p].symbol().to_string())
+        .collect();
+    assert!(screen.contains("steer two"), "queue strip kept: {screen}");
+    assert!(!screen.contains("⟡ explorer"), "{screen}");
+    assert!(footer_text(&app, 200).contains("⟡1 ⟳1"));
+    // One more row fits the strip; the footer drops the count.
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, needed + 1)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    assert!(!app.activity_shed);
+    assert!(!footer_text(&app, 200).contains("⟡1"));
+}
+
+#[test]
+fn finished_items_fade_into_the_tally() {
+    let mut app = test_app();
+    let old = std::time::Instant::now() - super::super::app::DONE_FADE;
+    app.recent_done.push(("task-1".into(), old));
+    assert!(app.tick_done_fade());
+    assert!(app.recent_done.is_empty());
+    assert_eq!(app.done_tally, 1);
+    assert!(!app.tick_done_fade());
 }
 
 #[test]

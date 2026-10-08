@@ -43,35 +43,72 @@ const MULTI_CLICK: Duration = Duration::from_millis(500);
 /// it, triple-click the whole line (and dragging a line select extends it
 /// by whole rows). Both keep the highlight until the next click.
 pub(crate) fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
+    // The task view covers the transcript window: the wheel scrolls the
+    // log, and selection (which maps cells onto the hidden parent
+    // transcript's display cache) is off; Shift+drag still selects natively.
+    if remote.app.task_view.is_some() {
+        let app = &mut remote.app;
+        match m.kind {
+            MouseEventKind::ScrollUp => app.task_scroll = app.task_scroll.saturating_add(3),
+            MouseEventKind::ScrollDown => app.task_scroll = app.task_scroll.saturating_sub(3),
+            _ => {}
+        }
+        app.selection = None;
+        return;
+    }
+    // The child view renders its log through the same transcript
+    // machinery (area, display cache, selection), so the wheel and
+    // selection act on that log; a copy notice surfaces in the footer.
+    let child = remote
+        .app
+        .child_view
+        .as_ref()
+        .and_then(|id| remote.app.child_logs.iter().position(|log| &log.id == id));
+    match child {
+        Some(idx) => {
+            let log_app = &mut remote.app.child_logs[idx].app;
+            transcript_mouse(log_app, &mut remote.last_click, m);
+            if let Some(notice) = log_app.notice.take() {
+                remote.app.notice = Some(notice);
+            }
+        }
+        None => transcript_mouse(&mut remote.app, &mut remote.last_click, m),
+    }
+}
+
+/// Wheel and selection over one transcript `app` (the parent's, or an open
+/// child log's); `last_click` chains double/triple clicks.
+fn transcript_mouse(
+    app: &mut crate::ui::App,
+    last_click: &mut Option<(Instant, (usize, usize), u8)>,
+    m: event::MouseEvent,
+) {
     match m.kind {
-        MouseEventKind::ScrollUp => scroll_transcript(&mut remote.app, -3),
-        MouseEventKind::ScrollDown => scroll_transcript(&mut remote.app, 3),
+        MouseEventKind::ScrollUp => scroll_transcript(app, -3),
+        MouseEventKind::ScrollDown => scroll_transcript(app, 3),
         MouseEventKind::Down(MouseButton::Left) => {
             // Pressing outside the transcript (composer, activity line)
             // clears any live selection instead of starting a new one.
-            let cell = mouse_display_cell(
-                remote.app.scroll,
-                remote.app.transcript_area,
-                remote.app.display_cache.len(),
-                &m,
-            );
-            let clicks = match (remote.last_click, cell) {
+            let cell =
+                mouse_display_cell(app.scroll, app.transcript_area, app.display_cache.len(), &m);
+            let clicks = match (*last_click, cell) {
                 (Some((at, last, n)), Some(c)) if at.elapsed() <= MULTI_CLICK && last == c => {
                     (n + 1).min(3)
                 }
                 _ => 1,
             };
-            remote.app.selection = match cell {
-                Some((row, col)) if clicks == 2 => word_bounds(&remote.app.display_cache[row], col)
-                    .map(|(c0, c1)| Selection {
+            app.selection = match cell {
+                Some((row, col)) if clicks == 2 => {
+                    word_bounds(&app.display_cache[row], col).map(|(c0, c1)| Selection {
                         anchor: (row, c0),
                         end: (row, c1),
                         sticky: true,
                         whole_line: false,
-                    }),
+                    })
+                }
                 Some((row, _)) if clicks == 3 => Some(Selection {
                     anchor: (row, 0),
-                    end: (row, last_col(&remote.app.display_cache[row])),
+                    end: (row, last_col(&app.display_cache[row])),
                     sticky: true,
                     whole_line: true,
                 }),
@@ -83,20 +120,17 @@ pub(crate) fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
                 }),
                 None => None,
             };
-            remote.last_click = cell.map(|c| (Instant::now(), c, clicks));
+            *last_click = cell.map(|c| (Instant::now(), c, clicks));
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(sel) = remote.app.selection.as_mut() {
-                if let Some(cell) = mouse_display_cell(
-                    remote.app.scroll,
-                    remote.app.transcript_area,
-                    remote.app.display_cache.len(),
-                    &m,
-                ) {
+            if let Some(sel) = app.selection.as_mut() {
+                if let Some(cell) =
+                    mouse_display_cell(app.scroll, app.transcript_area, app.display_cache.len(), &m)
+                {
                     if sel.whole_line {
                         // Line selects extend by whole rows; the anchor row
                         // (the press point) stays put, xterm-style.
-                        sel.end = (cell.0, last_col(&remote.app.display_cache[cell.0]));
+                        sel.end = (cell.0, last_col(&app.display_cache[cell.0]));
                     } else {
                         sel.end = cell;
                     }
@@ -107,32 +141,29 @@ pub(crate) fn handle_mouse(remote: &mut RemoteApp, m: event::MouseEvent) {
             // Sticky selections (double-click word picks, triple-click line
             // picks) stay highlighted after release until the next press;
             // drag selections clear.
-            let sticky = remote.app.selection.is_some_and(|s| s.sticky);
+            let sticky = app.selection.is_some_and(|s| s.sticky);
             // A released drag breaks the multi-click chain: the next press
             // starts a fresh count instead of compounding into word/line
             // picks from where the drag happened to begin.
-            let dragged = remote
-                .app
-                .selection
-                .is_some_and(|s| !s.sticky && !s.is_empty());
-            if let Some(sel) = remote.app.selection {
+            let dragged = app.selection.is_some_and(|s| !s.sticky && !s.is_empty());
+            if let Some(sel) = app.selection {
                 if sel.sticky || !sel.is_empty() {
                     let text = if sel.whole_line {
                         let r0 = sel.anchor.0.min(sel.end.0);
                         let r1 = sel.anchor.0.max(sel.end.0);
-                        line_selection_text(&remote.app.display_cache, r0, r1)
+                        line_selection_text(&app.display_cache, r0, r1)
                     } else {
                         let ((r0, c0), (r1, c1)) = sel.norm();
-                        selection_text(&remote.app.display_cache, (r0, c0), (r1, c1))
+                        selection_text(&app.display_cache, (r0, c0), (r1, c1))
                     };
-                    remote.app.copy_selection(&text);
+                    app.copy_selection(&text);
                 }
             }
             if !sticky {
-                remote.app.selection = None;
+                app.selection = None;
             }
             if dragged {
-                remote.last_click = None;
+                *last_click = None;
             }
         }
         _ => {}
@@ -291,6 +322,10 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             }
         }
         StreamEvent::AgentCompleted { agent_id, .. } => {
+            if let Some(chip) = remote.app.agents.iter().find(|a| a.id == agent_id) {
+                let name = chip.name.clone();
+                remote.app.recent_done.push((name, Instant::now()));
+            }
             remote.app.agents.retain(|a| a.id != agent_id);
             if remote.app.agents.is_empty() {
                 remote.live_children.store(false, Ordering::SeqCst);
@@ -323,16 +358,16 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                         remote.app.task_view = None;
                     }
                 }
-                remote.app.task_logs.push(crate::ui::TaskLog {
-                    id,
-                    command,
-                    lines: Vec::new(),
-                });
+                remote
+                    .app
+                    .task_logs
+                    .push(crate::ui::TaskLog::new(id, command));
             }
         }
         StreamEvent::TaskFinished { id, .. } => {
-            if let Some(chip) = remote.app.tasks.iter_mut().find(|t| t.id == id) {
+            if let Some(chip) = remote.app.tasks.iter_mut().find(|t| t.id == id && !t.done) {
                 chip.done = true;
+                remote.app.recent_done.push((id, Instant::now()));
             }
         }
         StreamEvent::TaskOutput { id, chunk } => append_task_log(remote, &id, &chunk),
@@ -514,6 +549,10 @@ pub(crate) fn replay_remote_events(
                         handle_stream_event(remote, env.event);
                     }
                 }
+                // Replayed finishes are history, not news: keep them out
+                // of the activity strip's just-finished chips and tally.
+                remote.app.recent_done.clear();
+                remote.app.done_tally = 0;
                 since = resp.next_seq;
                 // The idle poller resumes from here.
                 remote
@@ -653,20 +692,18 @@ fn append_task_log(remote: &mut RemoteApp, id: &str, chunk: &str) {
                     remote.app.task_view = None;
                 }
             }
-            remote.app.task_logs.push(crate::ui::TaskLog {
-                id: id.to_string(),
-                command: String::new(),
-                lines: Vec::new(),
-            });
+            remote
+                .app
+                .task_logs
+                .push(crate::ui::TaskLog::new(id.to_string(), String::new()));
             remote.app.task_logs.last_mut().expect("just pushed")
         }
     };
-    for line in chunk.split('\n') {
-        log.lines.push(line.to_string());
-    }
-    if log.lines.len() > crate::ui::TASK_LOG_MAX_LINES {
-        let excess = log.lines.len() - crate::ui::TASK_LOG_MAX_LINES;
-        log.lines.drain(..excess);
+    let grown = log.push_chunk(chunk);
+    // `task_scroll` counts up from the tail: a scrolled-up view moves with
+    // the new lines so the text under the reader stays put.
+    if remote.app.task_scroll > 0 && remote.app.task_view.as_deref() == Some(id) {
+        remote.app.task_scroll += grown;
     }
 }
 

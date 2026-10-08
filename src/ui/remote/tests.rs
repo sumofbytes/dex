@@ -1195,9 +1195,14 @@ fn task_events_drive_chips_and_capped_logs() {
         },
     );
     assert!(remote.app.tasks[0].done);
-    let status = crate::ui::status::ui_status(&remote.app);
-    assert!(status.contains("tasks:"), "{status}");
-    assert!(status.contains("task-1"), "{status}");
+    assert_eq!(remote.app.recent_done.len(), 1);
+    let strip: String = crate::ui::status::activity_line(&remote.app, 80)
+        .expect("a just-finished task shows in the strip")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(strip.contains("✓ task-1"), "{strip}");
 }
 
 #[test]
@@ -1228,6 +1233,178 @@ fn child_view_toggles_and_cycles_with_keys() {
     handle_key(&mut remote, key(KeyCode::PageUp, KeyModifiers::empty()));
     assert!(!remote.app.child_logs[0].app.autoscroll);
     assert_eq!(remote.app.scroll, 0);
+}
+
+#[test]
+fn task_view_opens_cycles_and_scrolls_with_keys() {
+    let mut remote = test_remote();
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(remote.app.task_view.is_none());
+    assert!(remote.app.notice.is_some(), "no tasks: a notice explains");
+    for id in ["task-1", "task-2"] {
+        input::handle_stream_event(
+            &mut remote,
+            crate::protocol::StreamEvent::TaskStarted {
+                id: id.into(),
+                command: "make".into(),
+            },
+        );
+    }
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskOutput {
+            id: "task-1".into(),
+            chunk: "\x1b[31merror\x1b[0m: boom".into(),
+        },
+    );
+    assert_eq!(remote.app.task_logs[0].lines, vec!["error: boom"]);
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskFinished {
+            id: "task-2".into(),
+            status: "exit 0".into(),
+            exit_code: Some(0),
+            duration: 1.0,
+        },
+    );
+    // Ctrl+B prefers the newest running task over a newer finished one.
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-1"));
+    // Scroll keys move the task log, not the parent transcript.
+    handle_key(&mut remote, key(KeyCode::PageUp, KeyModifiers::empty()));
+    assert_eq!(remote.app.task_scroll, 20);
+    assert_eq!(remote.app.scroll, 0);
+    // Ctrl+B cycles, then closes after the last log.
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-2"));
+    assert_eq!(remote.app.task_scroll, 0);
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(remote.app.task_view.is_none());
+    // `/tasks <id>` opens a specific log; Esc closes it.
+    crate::ui::slash::handle_slash(&mut remote.app, "/tasks task-2");
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-2"));
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(remote.app.task_view.is_none());
+}
+
+#[test]
+fn task_log_joins_chunks_into_terminal_lines() {
+    let mut log = crate::ui::TaskLog::new("task-1".into(), "make".into());
+    // An escape and a line split across chunks rejoin; a trailing newline
+    // adds no blank row.
+    log.push_chunk("build ok\nstep 2 \x1b[3");
+    log.push_chunk("1mdo");
+    log.push_chunk("ne\x1b[0m\n");
+    assert_eq!(log.lines, vec!["build ok", "step 2 done"]);
+    // `\r` redraws the open line; CRLF ends one.
+    log.push_chunk("10%\r20%\r");
+    assert_eq!(log.lines.last().unwrap(), "20%");
+    log.push_chunk("100%\r\nok\r\n");
+    assert_eq!(log.lines, vec!["build ok", "step 2 done", "100%", "ok"]);
+    assert!(log.partial.is_empty());
+    // A newline-free progress bar keeps only its last frame.
+    for i in 0..100 {
+        log.push_chunk(&format!("\r{i}%"));
+    }
+    assert_eq!(log.partial, "\r99%");
+    assert_eq!(log.lines.last().unwrap(), "99%");
+}
+
+#[test]
+fn scrolled_up_task_view_holds_its_place_and_the_mouse_scrolls_it() {
+    let mut remote = test_remote();
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskStarted {
+            id: "task-1".into(),
+            command: "npm run dev".into(),
+        },
+    );
+    let output = |remote: &mut RemoteApp, chunk: &str| {
+        input::handle_stream_event(
+            remote,
+            crate::protocol::StreamEvent::TaskOutput {
+                id: "task-1".into(),
+                chunk: chunk.into(),
+            },
+        );
+    };
+    output(&mut remote, "a\nb\nc\n");
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    // Following the tail: new output leaves the offset at 0.
+    output(&mut remote, "d\n");
+    assert_eq!(remote.app.task_scroll, 0);
+    let wheel = |kind| crossterm::event::MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::empty(),
+    };
+    input::handle_mouse(
+        &mut remote,
+        wheel(crossterm::event::MouseEventKind::ScrollUp),
+    );
+    assert_eq!(remote.app.task_scroll, 3);
+    assert_eq!(remote.app.scroll, 0, "the parent transcript stays put");
+    // Scrolled up: two new lines move the offset by two.
+    output(&mut remote, "e\nf\n");
+    assert_eq!(remote.app.task_scroll, 5);
+    input::handle_mouse(
+        &mut remote,
+        wheel(crossterm::event::MouseEventKind::ScrollDown),
+    );
+    assert_eq!(remote.app.task_scroll, 2);
+    input::handle_mouse(
+        &mut remote,
+        wheel(crossterm::event::MouseEventKind::Down(
+            crossterm::event::MouseButton::Left,
+        )),
+    );
+    assert!(remote.app.selection.is_none(), "no selection over the log");
+}
+
+#[test]
+fn mouse_wheel_scrolls_the_open_child_log_not_the_parent() {
+    let mut remote = test_remote();
+    input::handle_stream_event(&mut remote, child_line("a1"));
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    input::handle_mouse(
+        &mut remote,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        },
+    );
+    assert_eq!(remote.app.child_logs[0].app.scroll, 3);
+    assert!(!remote.app.child_logs[0].app.autoscroll);
+    assert_eq!(remote.app.scroll, 0);
+    assert!(
+        remote.app.autoscroll,
+        "the parent transcript keeps following"
+    );
+}
+
+#[test]
+fn ctrl_a_and_ctrl_b_switch_between_child_and_task_views() {
+    let mut remote = test_remote();
+    input::handle_stream_event(&mut remote, child_line("a1"));
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskStarted {
+            id: "task-1".into(),
+            command: "make".into(),
+        },
+    );
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-1"));
+    handle_key(&mut remote, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.child_view.as_deref(), Some("a1"));
+    assert!(remote.app.task_view.is_none());
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-1"));
+    assert!(remote.app.child_view.is_none());
 }
 
 fn child_line(id: &str) -> crate::protocol::StreamEvent {

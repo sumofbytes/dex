@@ -97,6 +97,12 @@ unaffected.
 - **Ctrl+T** — expand/collapse the full thinking block.
 - **Ctrl+O** — unfold/fold the output of successful tool calls (failures and
   write/edit diffs always show theirs).
+- **Ctrl+A** — open a sub-agent's transcript in place of the main one (again
+  to cycle, **Esc** to close; from the task view it switches over).
+- **Ctrl+B** — open a background task's output log (a running task first;
+  again to cycle, **Esc** to close; from an agent transcript it switches
+  over). `/tasks <id>` opens a specific one; PgUp/PgDn, the arrows and the
+  mouse wheel scroll it.
 - **Shift+Tab** — cycle the agent mode: `plan` → `manual` → `auto` → `plan`
   (clamped to the daemon's `--permission`/`DEX_PERMISSION` ceiling, which it
   cannot exceed). See [Agent modes](#agent-modes).
@@ -106,9 +112,10 @@ unaffected.
 - **PageUp/PageDown**, **Shift+Up/Down**, or **mouse wheel** — scroll the
   transcript.
 - **Paste** — pasted text is inserted at the cursor.
-- **Mouse wheel** — scrolls the transcript. **Drag** — selects transcript text
-  with a visible highlight and copies it to the clipboard on release (OSC 52; a
-  click just clears). **Shift+drag** (Option+drag in iTerm2) still bypasses
+- **Mouse wheel** — scrolls the transcript (or the open sub-agent transcript or
+  task log). **Drag** — selects transcript text (sub-agent transcripts too; not
+  task logs) with a visible highlight and copies it to the clipboard on release
+  (OSC 52; a click just clears). **Shift+drag** (Option+drag in iTerm2) still bypasses
   mouse reporting for native selection; tmux users may need
   `set -g set-clipboard on`.
 
@@ -143,9 +150,16 @@ stream (they do not re-fit on resize); fenced code has a faint block fill.
 
 ## Footer and `/session`
 
-The footer keeps one row: mode, `provider/model`, cwd and branch on the left
-(live agents/tasks follow); context pressure (`ctx 12k/128k 9.3%`, yellow at 75%
-of the compaction trigger, red past it), session cost and — only when remote —
-`remote <host>` on the right. Narrow terminals shed cwd, then branch, then the
-absolute ctx numbers, then cost; never the mode or the model. Tokens (`↑`/`↓`),
-cache hit rate, output speed, and the base-context breakdown are in `/session`.
+The footer keeps one row: mode, `provider/model`, cwd and branch on the left;
+context pressure (`ctx 12k/128k 9.3%`, yellow at 75% of the compaction trigger,
+red past it), session cost and — only when remote — `remote <host>` on the
+right. Narrow terminals shed cwd, then branch, then the absolute ctx numbers,
+then cost; never the mode or the model. Tokens (`↑`/`↓`), cache hit rate,
+output speed, and the base-context breakdown are in `/session`.
+
+While sub-agents or background tasks are active, an activity row appears under
+the footer: `⟡ explorer·grep` per live agent, `⟳ task-3 npm test` per running
+task, `✓ name` for ~10s after one finishes (then folded into a `✓N done` tally
+that resets when you send a prompt), and `^A agents · ^B tasks` hints on the
+right. Chips that don't fit collapse into `+N`; on a short terminal the row is
+dropped first and the footer shows a compact count (`⟡2 ⟳1`) instead.

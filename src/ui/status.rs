@@ -287,7 +287,7 @@ pub(super) fn pct_label(tokens: u64, window: u64) -> String {
     }
 }
 
-/// Identity + activity, left side. `cwd`/`branch` are the static facts shed
+/// Identity, left side. `cwd`/`branch` are the static facts shed
 /// first on narrow terminals; the mode chip (a safety indicator) and the
 /// model never go.
 fn left_pieces(app: &App, cwd: bool, branch: bool) -> Vec<Piece> {
@@ -305,9 +305,28 @@ fn left_pieces(app: &App, cwd: bool, branch: bool) -> Vec<Piece> {
             pieces.extend(b);
         }
     }
-    pieces.extend(agents_pieces(app));
-    pieces.extend(tasks_pieces(app));
+    if let Some(running) = shed_activity_piece(app) {
+        push_sep(&mut pieces);
+        pieces.push(running);
+    }
     pieces
+}
+
+/// `⟡2 ⟳1`: live agents and running tasks, only while a short terminal has
+/// shed the activity strip — otherwise nothing would show them.
+fn shed_activity_piece(app: &App) -> Option<Piece> {
+    if !app.activity_shed {
+        return None;
+    }
+    let agents = app.agents.len();
+    let tasks = app.tasks.iter().filter(|t| !t.done).count();
+    let text = match (agents, tasks) {
+        (0, 0) => return None,
+        (a, 0) => format!("⟡{a}"),
+        (0, t) => format!("⟳{t}"),
+        (a, t) => format!("⟡{a} ⟳{t}"),
+    };
+    Some((text, fg(theme::accent_fg())))
 }
 
 /// Pressure + spend, right side, then the connection badge when remote.
@@ -323,50 +342,101 @@ fn right_pieces(app: &App, short_ctx: bool, cost: bool) -> Vec<Piece> {
     pieces
 }
 
-/// Live child agents (V1b typed events): `agents: explorer·bash, tester`.
-/// The typed `AgentSpawned/Progress/Completed` events keep this current
-/// without parsing the V1a transcript lines.
-fn agents_pieces(app: &App) -> Vec<Piece> {
-    if app.agents.is_empty() {
-        return Vec::new();
+/// Widest a running task's command may render in the activity strip.
+const TASK_COMMAND_WIDTH: u16 = 24;
+
+/// One chip per live child agent (`⟡ explorer·grep`), running background
+/// task (`⟳ task-3 npm test`), and agent/task finished within `DONE_FADE`
+/// (`✓ tester`). Live work first, so it is the last to overflow.
+fn activity_chips(app: &App) -> Vec<Vec<Piece>> {
+    let mut chips = Vec::new();
+    for agent in &app.agents {
+        let mut chip = vec![(format!("⟡ {}", agent.name), fg(theme::accent_fg()))];
+        if let Some(tool) = &agent.tool {
+            chip.push((format!("·{tool}"), quiet_style()));
+        }
+        chips.push(chip);
     }
-    let text = app
-        .agents
-        .iter()
-        .map(|agent| match &agent.tool {
-            Some(tool) => format!("{}·{}", agent.name, tool),
-            None => agent.name.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    vec![sep(), (format!("agents: {text}"), fg(theme::ok_fg()))]
+    for task in app.tasks.iter().filter(|t| !t.done) {
+        let command = truncate_display(&task.command, TASK_COMMAND_WIDTH);
+        chips.push(vec![
+            (format!("⟳ {}", task.id), fg(theme::accent_fg())),
+            (format!(" {command}"), quiet_style()),
+        ]);
+    }
+    for (name, _) in &app.recent_done {
+        chips.push(vec![(format!("✓ {name}"), fg(theme::success_fg()))]);
+    }
+    chips
 }
 
-/// Background shell tasks (spec Rev 3): `⟳ task-1, ✓ task-2` capped at 3 +
-/// overflow, mirroring the agent-chip discipline.
-fn tasks_pieces(app: &App) -> Vec<Piece> {
-    if app.tasks.is_empty() {
-        return Vec::new();
+/// The activity strip under the footer: live agents and background tasks,
+/// recently finished ones, a `✓N done` tally, and the Ctrl+A / Ctrl+B
+/// hints while a child transcript or task log exists. `None` when there is
+/// nothing to show, so the row only costs space while something is
+/// happening. Chips that do not fit collapse into a `+N` overflow; the hint
+/// is dropped before any chip.
+pub(super) fn activity_line(app: &App, width: u16) -> Option<Line<'static>> {
+    let chips = activity_chips(app);
+    if chips.is_empty() && app.done_tally == 0 {
+        return None;
     }
-    const SHOWN: usize = 3;
-    let mut names: Vec<String> = app
-        .tasks
-        .iter()
-        .map(|t| {
-            if t.done {
-                format!("✓ {}", t.id)
+    let width = width as usize;
+    let gap = || ("  ".to_string(), Style::default());
+    let tally = (app.done_tally > 0).then(|| quiet(format!("✓{} done", app.done_tally)));
+    let tally_w = tally
+        .as_ref()
+        .map_or(0, |t| pieces_width(std::slice::from_ref(t)) + 2);
+    let mut line: Vec<Piece> = Vec::new();
+    let mut shown = 0;
+    for chip in &chips {
+        let sep_w = if line.is_empty() { 0 } else { 2 };
+        let rest = chips.len() - shown - 1;
+        // Reserve room for the tally and, when chips remain, a `+N` marker.
+        let reserve = tally_w
+            + if rest > 0 {
+                2 + format!("+{rest}").len()
             } else {
-                format!("⟳ {}", t.id)
-            }
-        })
-        .collect();
-    let overflow = names.len().saturating_sub(SHOWN);
-    names.truncate(SHOWN);
-    let mut text = names.join(", ");
-    if overflow > 0 {
-        text.push_str(&format!(" +{overflow}"));
+                0
+            };
+        if pieces_width(&line) + sep_w + pieces_width(chip) + reserve > width {
+            break;
+        }
+        if sep_w > 0 {
+            line.push(gap());
+        }
+        line.extend(chip.iter().cloned());
+        shown += 1;
     }
-    vec![sep(), (format!("tasks: {text}"), fg(theme::ok_fg()))]
+    let overflow = chips.len() - shown;
+    if overflow > 0 {
+        if !line.is_empty() {
+            line.push(gap());
+        }
+        line.push(quiet(format!("+{overflow}")));
+    }
+    if let Some(tally) = tally {
+        if !line.is_empty() {
+            line.push(gap());
+        }
+        line.push(tally);
+    }
+    let hint = match (!app.child_logs.is_empty(), !app.task_logs.is_empty()) {
+        (true, true) => Some("^A agents · ^B tasks"),
+        (true, false) => Some("^A agents"),
+        (false, true) => Some("^B tasks"),
+        (false, false) => None,
+    };
+    if let Some(hint) = hint {
+        let hint = quiet(hint);
+        let used = pieces_width(&line);
+        let hw = pieces_width(std::slice::from_ref(&hint));
+        if used + 2 + hw <= width {
+            line.push((" ".repeat(width - used - hw), Style::default()));
+            line.push(hint);
+        }
+    }
+    Some(to_line(truncate_pieces(line, width)))
 }
 
 /// Test shim: the status row as plain text (string asserts in `render/tests`).
@@ -436,8 +506,9 @@ fn truncate_pieces(pieces: Vec<Piece>, width: usize) -> Vec<Piece> {
     out
 }
 
-/// The footer: identity and activity on the left (mode, model, cwd, branch,
-/// agents/tasks), pressure and spend on the right (ctx, cost, remote badge).
+/// The footer: identity on the left (mode, model, cwd, branch), pressure
+/// and spend on the right (ctx, cost, remote badge). Live agents/tasks get
+/// their own row under it ([`activity_line`]).
 /// Narrow terminals shed the static facts first — cwd, then branch, then the
 /// absolute ctx numbers, then cost — and never the mode or the model.
 pub(super) fn footer_line(app: &App, width: u16) -> Line<'static> {
