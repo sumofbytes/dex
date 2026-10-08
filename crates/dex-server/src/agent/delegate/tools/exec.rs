@@ -1,12 +1,15 @@
 use super::super::definition::AgentDefinition;
 use super::super::exit::classify_body_error;
 use super::super::exit::ExitReason;
+use super::super::manager::ChildQueues;
 use super::super::manager::ProgressReporter;
+use super::super::manager::SendDelivery;
+use super::super::manager::SendError;
+use super::super::manager::SendOutcome;
 use super::super::manager::WaitOutcome;
 use super::super::model::AgentId;
 use super::super::model::AgentResult;
 use super::super::model::AgentState;
-use super::super::model::AgentUsage;
 use super::super::model::ContextSeed;
 use super::super::resume::ResumeHandle;
 use super::super::resume::ResumeRequest;
@@ -50,7 +53,8 @@ use tokio::sync::mpsc;
 
 /// Dispatch the `delegate` tool from [`crate::tools::execute`]. The
 /// allowlist gate already ran (a child calling it was rejected there, §11).
-/// One tool, four actions: spawn/wait/stop/list route on `args["action"]`.
+/// One tool, five actions: spawn/wait/stop/list/send route on
+/// `args["action"]`.
 pub async fn execute_delegation(
     name: &str,
     args: &Map<String, Value>,
@@ -73,6 +77,7 @@ pub async fn execute_delegation(
         "wait" => delegate_output(&ctx, args, cancel).await,
         "stop" => delegate_stop(&ctx, args).await,
         "list" => delegate_list(&ctx).await,
+        "send" => delegate_send(&ctx, args, policy).await,
         other => Err(ToolError::InvalidArgument(format!(
             "action must be one of {} (got '{other}')",
             DELEGATION_ACTIONS.join(" | ")
@@ -353,6 +358,145 @@ async fn delegate_stop(
     }
 }
 
+/// `delegate_send(agent_id, message, delivery?)` — deliver one message to
+/// an existing child (spec G1/G2). On a live child, `steer` (default) is
+/// injected before the child's next model call (the same drain points the
+/// main turn uses; a steer racing the child's final answer chains as a new
+/// turn), `follow_up` queues a new turn after the current one ends — a
+/// parent polling `action=wait` observes either within one 250 ms
+/// [`WAIT_SLEEP`] quantum. On a retained `Completed` child, `send` continues
+/// it (spec G2): the next generation replays the transcript, appends the
+/// message as a follow-up, and runs a full tool budget under the parent's
+/// *current* approvals (live-consulted, not the spawn-time snapshot). It
+/// occupies a [`MAX_CHILDREN`] slot like any spawn.
+pub async fn delegate_send(
+    ctx: &Arc<AgentTurnContext>,
+    args: &Map<String, Value>,
+    policy: &Policy,
+) -> Result<String, ToolError> {
+    let id = agent_id_arg(args)?;
+    let message = string_arg(args, "message").ok_or(ToolError::Missing("message"))?;
+    let delivery_raw = args
+        .get("delivery")
+        .and_then(Value::as_str)
+        .unwrap_or("steer");
+    let delivery = SendDelivery::parse(delivery_raw).ok_or_else(|| {
+        ToolError::InvalidArgument(format!(
+            "delivery must be 'steer' or 'follow_up' (got '{delivery_raw}')"
+        ))
+    })?;
+    match ctx.manager.send(&id, message.clone(), delivery) {
+        Ok(outcome) => Ok(match outcome {
+            SendOutcome::Steered => json!({
+                "agent_id": id.to_string(),
+                "accepted": "steer",
+                "note": "injected at the child's next round boundary"
+            })
+            .to_string(),
+            SendOutcome::Queued => json!({
+                "agent_id": id.to_string(),
+                "accepted": "follow_up",
+                "note": "runs as the child's next turn after this one ends"
+            })
+            .to_string(),
+        }),
+        Err(SendError::Full) => Err(ToolError::Denied(format!(
+            "cannot send to agent '{id}': the delivery queue is full; wait for it \
+             to drain before sending more"
+        ))),
+        Err(error @ SendError::Unknown { .. }) => {
+            Err(ToolError::InvalidArgument(error.to_string()))
+        }
+        Err(SendError::NotRunning) => {
+            let result = match ctx.manager.wait(&id, Duration::ZERO).await {
+                WaitOutcome::Finished(result) => result,
+                WaitOutcome::Running(_) | WaitOutcome::Unknown => {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "agent '{id}' ended and its result aged out of retention; \
+                         delegate action=list shows this session's children"
+                    )));
+                }
+            };
+            let Some(handle) = result.resume.as_ref().filter(|handle| handle.continuable) else {
+                // Spec table: failures/cancels/timeouts answer to
+                // `resume_from`, not to a send.
+                let hint = if result.resume.is_some() {
+                    "it re-enters with delegate(resume_from = \"{id}\") instead"
+                } else {
+                    "only resumable endings answer to delegate(resume_from = …); \
+                     delegate action=list shows which children are continuable"
+                };
+                return Err(ToolError::InvalidArgument(format!(
+                    "agent '{id}' ended {} and cannot be continued with send; {hint}",
+                    status_word(result.status)
+                )));
+            };
+            // Continuation (spec G2): same transcript, one generation on,
+            // the message is the follow-up instruction. Model: the handle's
+            // per-spawn pick is re-applied unless this send overrides it —
+            // `send` carries no `model` argument, so the handle wins.
+            let name = ctx
+                .manager
+                .snapshot()
+                .iter()
+                .find(|child| child.agent_id == id)
+                .map(|child| child.name.clone())
+                .unwrap_or_default();
+            let mut def =
+                super::super::find_definition(&name).map_err(ToolError::InvalidArgument)?;
+            let base = def.model.clone();
+            def.model = effective_child_model(None, handle.model.as_deref(), base);
+            let child_config: Arc<LlmConfig> = Arc::new(
+                resolve_child_config(&ctx.config, def.model.as_deref())
+                    .map_err(ToolError::InvalidArgument)?,
+            );
+            let generation = handle.generation + 1;
+            let mut continue_handle = handle.clone();
+            // A continuation always runs a full budget (the definition cap).
+            continue_handle.remaining_budget = None;
+            let resume = ResumeRequest {
+                handle: continue_handle,
+                instruction: Some(message),
+                file_hints: Vec::new(),
+            };
+            let seed = ContextSeed {
+                // Unused on the resume path (messages replay from the
+                // transcript), but the spawn still files one: record why.
+                task: format!("continue {id} generation {generation}"),
+                file_hints: Vec::new(),
+                parent_summary: None,
+            };
+            let new_id = ctx
+                .manager
+                .spawn(
+                    &def,
+                    SpawnMeta {
+                        generation,
+                        parent_session: Some(ctx.session_path.clone()),
+                        remaining_budget: None,
+                    },
+                    child_body(ctx.clone(), def.clone(), seed, Some(resume), child_config),
+                )
+                .map_err(|error| ToolError::Denied(error.to_string()))?;
+            if let Some(console) = policy.console.as_ref() {
+                console
+                    .emit_async(SinkLine::System(format!(
+                        "[agent {}:{new_id}] started",
+                        def.name
+                    )))
+                    .await;
+            }
+            Ok(json!({
+                "agent_id": new_id.to_string(),
+                "state": "running",
+                "continued_from": id.to_string(),
+                "generation": generation,
+            })
+            .to_string())
+        }
+    }
+}
+
 /// Assemble a resume generation's conversation (§24.3): the definition's
 /// system prompt first (re-derived — the transcript never journals it and
 /// the loader drops `Role::System` lines), the prior generation's
@@ -379,7 +523,34 @@ pub fn resume_conversation(
 
 /// The interruption nudge appended to a replayed transcript (§24.3):
 /// why the prior generation stopped, what changed, and the meter left.
+/// A continuation (`send` into a finished child, spec G2) says follow-up
+/// instead — the child did not fail, the parent asked for more work.
 pub fn resume_nudge(request: &ResumeRequest) -> String {
+    if request.handle.continuable {
+        let mut nudge = format!(
+            "You already reported your final result ({}). The parent has a \
+             follow-up: work from the transcript above — nothing needs repeating \
+             unless the follow-up asks for it.",
+            request.handle.note
+        );
+        if let Some(instruction) = request
+            .instruction
+            .as_deref()
+            .filter(|instruction| !instruction.trim().is_empty())
+        {
+            nudge.push_str(&format!("\n\nFollow-up: {instruction}"));
+        }
+        if !request.file_hints.is_empty() {
+            let hints = request
+                .file_hints
+                .iter()
+                .map(|hint| hint.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            nudge.push_str(&format!("\n\nFile hints: {hints}"));
+        }
+        return nudge;
+    }
     let mut nudge = format!(
         "You were interrupted: {}. Continue from the transcript above — \
          do not redo completed work, pick up where it stopped.",
@@ -442,8 +613,21 @@ pub async fn resolve_resume_handle(
 ) -> Result<ResumeHandle, ToolError> {
     match ctx.manager.wait(id, Duration::ZERO).await {
         WaitOutcome::Finished(result) => {
-            if let Some(handle) = result.resume {
-                return Ok(handle);
+            // A retained Completed child advertises a *continuation* handle
+            // (spec G2): `resume_from` is for recoverable endings — a
+            // finished child is followed up with `delegate send` instead.
+            if let Some(handle) = result.resume.as_ref().filter(|h| !h.continuable) {
+                return Ok(handle.clone());
+            }
+            if result
+                .resume
+                .as_ref()
+                .is_some_and(|handle| handle.continuable)
+            {
+                return Err(ToolError::InvalidArgument(format!(
+                    "agent '{id}' ended completed: continue it with delegate \
+                     send (message = what to do next), not a resume"
+                )));
             }
             return Err(ToolError::InvalidArgument(format!(
                 "agent '{id}' ended {} and is not resumable; delegate action=list shows resumable children",
@@ -490,6 +674,8 @@ pub async fn resolve_resume_handle(
             // Predates model tracking: the resume falls back to the definition.
             model: None,
             note: "interrupted (daemon restart or crash); prior spend unknown".to_string(),
+            // On-disk runs are re-entry targets, not continuation targets.
+            continuable: false,
         });
     }
     Err(ToolError::InvalidArgument(format!(
@@ -519,6 +705,7 @@ pub async fn delegate_list(ctx: &Arc<AgentTurnContext>) -> Result<String, ToolEr
                 "state": status_word(child.state),
                 "progress": child.progress,
                 "resumable": child.resumable,
+                "continuable": child.continuable,
             })
         })
         .collect();
@@ -591,9 +778,16 @@ pub fn resume_messages(
             request.handle.transcript.display()
         ));
     }
+    // A continuation labels its nudge `follow-up`; a re-entry after an
+    // interruption says `resume` (the child reads the author on the wire).
+    let label = if request.handle.continuable {
+        "follow-up"
+    } else {
+        "resume"
+    };
     let mut messages = vec![ChatMessage::system(child_system_prompt(def))];
     messages.extend(replayed.iter().cloned());
-    messages.push(ChatMessage::user_named(resume_nudge(request), "resume"));
+    messages.push(ChatMessage::user_named(resume_nudge(request), label));
     Ok(messages)
 }
 
@@ -693,17 +887,21 @@ fn forward_coalesced(
     }
 }
 
-/// The child body handed to [`AgentManager::spawn`]: one standard
-/// `process_turn` run with an isolated bundle — no parent transcript, no
-/// steering, no parent session, no parent cancel token (§8). Concrete
-/// (boxed) so the spawn signature never resolves through an async opaque:
-/// `child_run` calls `process_turn`, and a non-boxed closure return would
-/// make the two functions' opaque types cycle.
+/// The child body handed to [`AgentManager::spawn`]: one or more standard
+/// `process_turn` runs with an isolated bundle — no parent transcript, no
+/// parent session, no parent cancel token (§8). Unlike before spec G1, the
+/// child carries its own steering/follow-up queues: `steer` lands inside
+/// the running turn, `follow_up` (and a steer that raced the final answer)
+/// chains another turn on the same history once the current one ends.
+/// Concrete (boxed) so the spawn signature never resolves through an async
+/// opaque: `child_run` calls `process_turn`, and a non-boxed closure return
+/// would make the two functions' opaque types cycle.
 pub type ChildBody = Box<
     dyn FnOnce(
             CancellationToken,
             ProgressReporter,
             AgentId,
+            ChildQueues,
         ) -> Pin<Box<dyn Future<Output = AgentResult> + Send>>
         + Send,
 >;
@@ -715,7 +913,7 @@ pub fn child_body(
     resume: Option<ResumeRequest>,
     child_config: Arc<LlmConfig>,
 ) -> ChildBody {
-    Box::new(move |token, progress, id| {
+    Box::new(move |token, progress, id, queues| {
         Box::pin(child_run(
             ctx,
             def,
@@ -725,6 +923,7 @@ pub fn child_body(
             id,
             resume,
             child_config,
+            queues,
         ))
     })
 }
@@ -739,6 +938,7 @@ async fn child_run(
     id: AgentId,
     resume: Option<ResumeRequest>,
     child_config: Arc<LlmConfig>,
+    queues: ChildQueues,
 ) -> AgentResult {
     // §13: `child_config` is the dispatch-resolved model (parent plus
     // definition / per-spawn `model` override, validated once in
@@ -839,9 +1039,13 @@ async fn child_run(
         .with_agent(id.0.clone(), def.name.clone());
     console.seed_session_approvals(ctx.session_approvals.clone());
     let last_assistant = Arc::new(Mutex::new(None::<String>));
-    let usage = Arc::new(Mutex::new(AgentUsage::default()));
     let capture = last_assistant.clone();
-    let tally = usage.clone();
+    // Clones for the accepted-echo forwarders and the final usage read
+    // must exist before the consumer spawn moves `progress` into the sink
+    // loop.
+    let meter = progress.clone();
+    let echo_steer = progress.clone();
+    let echo_follow = progress.clone();
     // §24.1 spend meter: the body runs a single `process_turn`, so
     // sink-counted tool invocations are the budget resume carries over
     // (calls, not rounds — conservative when the child fanned out).
@@ -856,14 +1060,15 @@ async fn child_run(
     // The child's sink lines drive three things: the §6 partial-summary
     // capture (last assistant text), the §15 progress label (the tool the
     // child is currently running, read by the `wait` action), and the §18
-    // usage tally (each `record_usage` emission folds into the result).
-    // Under the daemon they also stream the live child transcript (plan §20
-    // child view): each console line maps onto the same `StreamEvent` shape
-    // the parent turn streams (turn.rs's sink pump), with the same Thinking
-    // coalescing — providers emit one sink line per token, and each event
-    // costs a seq bump, a journal append, and an SSE write. `Usage` and
-    // `Plan` stay local: the usage folds into the result (§18) and the
-    // child never owns a plan.
+    // usage tally (each `record_usage` emission folds into the registry's
+    // spend meter — the only tally, so a synthesized ending still reports
+    // its spend, spec G3). Under the daemon they also stream the live
+    // child transcript (plan §20 child view): each console line maps onto
+    // the same `StreamEvent` shape the parent turn streams (turn.rs's sink
+    // pump), with the same Thinking coalescing — providers emit one sink
+    // line per token, and each event costs a seq bump, a journal append,
+    // and an SSE write. `Usage` and `Plan` stay local: the meter lives in
+    // the registry and the child never owns a plan.
     let child_name = def.name.clone();
     let consumer = tokio::spawn(async move {
         let mut pending: Option<StreamEvent> = None;
@@ -935,10 +1140,10 @@ async fn child_run(
                     cost,
                     ..
                 } => {
-                    tally
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .absorb(tokens, output, cost);
+                    // Straight into the registry's spend meter: it outlives
+                    // the body, so the wrapper can attach spend to a
+                    // synthesized result (spec G3).
+                    progress.absorb_usage(tokens, output, cost);
                 }
                 SinkLine::System(text) => {
                     forward_coalesced(StreamEvent::System(text), false, &mut pending, &mut emit)
@@ -1004,7 +1209,7 @@ async fn child_run(
     } else {
         None
     };
-    // Agent lifecycle hooks (plan §7 P2): fired around the child's run with
+    // Agent lifecycle hooks (plan §7 P2): fired around each child turn with
     // the child's own policy, so a nested `dex.tools.call` from a hook is
     // gated exactly like a model-issued child call. A panicked or timed-out
     // body never reaches the end event — the registry result is the record
@@ -1012,55 +1217,120 @@ async fn child_run(
     // Scoped so the hook-host policy (which clones the console, keeping the
     // child sink open) drops before `drop(console)` below — otherwise the
     // consumer await deadlocks on a channel that never closes.
-    let result = {
-        let agent_policy = Policy::turn(config.permission, &console);
-        crate::extensions::fire_event_global(
-            "agent.start",
-            serde_json::json!({ "agent": def.name, "id": id.0 }),
-            &token,
-            &agent_policy,
-            Some(&filter),
-        )
-        .await;
-        let result = process_turn(AgentRuntime {
-            config: &config,
-            messages: &mut messages,
-            state: &mut tool_state,
-            steering_rx: None,
-            steering_accepted_tx: None,
-            session: Some(&mut session),
-            client: &config,
-            cancel: &token,
-            console: &console,
-            filter: Some(&filter),
-            agent_ctx: child_ctx,
-            // Resume honors the remaining meter (§24.2). `None` (unlimited
-            // or unknown spend) falls back to the definition's cap.
-            tool_budget: resume
-                .as_ref()
-                .and_then(|request| request.handle.remaining_budget)
-                .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
-            harness: None,
-        })
-        .await;
-        let payload = match &result {
-            Ok(_) => serde_json::json!({ "agent": def.name, "ok": true }),
-            Err(e) => {
-                serde_json::json!({ "agent": def.name, "ok": false, "error": e.to_string() })
-            }
+    let ChildQueues {
+        steering_rx: mut steer_rx,
+        followup_rx: mut follow_rx,
+    } = queues;
+    // Acceptance echoes (the child's counterpart of the daemon's main-turn
+    // forwarder): a consumed steer or a chained follow-up shows in the
+    // child's live transcript view with the same event the parent uses.
+    let (steer_accepted_tx, steer_accepted_rx) = mpsc::channel::<String>(16);
+    let (followup_accepted_tx, followup_accepted_rx) = mpsc::channel::<String>(16);
+    spawn_accepted_forwarder(echo_steer, def.name.clone(), steer_accepted_rx, |c| {
+        StreamEvent::SteeringAccepted { content: c }
+    });
+    spawn_accepted_forwarder(echo_follow, def.name.clone(), followup_accepted_rx, |c| {
+        StreamEvent::FollowupAccepted { content: c }
+    });
+    // §8 + spec G1: one `process_turn` per turn; when the turn ends with a
+    // follow-up parked (or a steer that raced the final answer), the same
+    // history chains another turn — journal markers stay per-turn (§16).
+    // Drain points inside `process_turn` are the main turn's: top of every
+    // loop iteration and after an assistant message without tool calls.
+    let ending: TurnEnd = loop {
+        let result = {
+            let agent_policy = Policy::turn(config.permission, &console);
+            crate::extensions::fire_event_global(
+                "agent.start",
+                serde_json::json!({ "agent": def.name, "id": id.0 }),
+                &token,
+                &agent_policy,
+                Some(&filter),
+            )
+            .await;
+            let result = process_turn(AgentRuntime {
+                config: &config,
+                messages: &mut messages,
+                state: &mut tool_state,
+                steering_rx: Some(&mut steer_rx),
+                steering_accepted_tx: Some(&steer_accepted_tx),
+                session: Some(&mut session),
+                client: &config,
+                cancel: &token,
+                console: &console,
+                filter: Some(&filter),
+                agent_ctx: child_ctx.clone(),
+                // Resume honors the remaining meter (§24.2); a continuation
+                // and a fresh spawn run the definition cap. Per-turn: each
+                // chained turn starts on the full meter.
+                tool_budget: resume
+                    .as_ref()
+                    .and_then(|request| request.handle.remaining_budget)
+                    .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
+                harness: None,
+            })
+            .await;
+            let payload = match &result {
+                Ok(_) => serde_json::json!({ "agent": def.name, "ok": true }),
+                Err(e) => {
+                    serde_json::json!({ "agent": def.name, "ok": false, "error": e.to_string() })
+                }
+            };
+            // Fired while the child's console is still open: a hook prompt (ask
+            // modes) routes through the child's approval bridge like any tool
+            // call.
+            crate::extensions::fire_event_global(
+                "agent.end",
+                payload,
+                &token,
+                &agent_policy,
+                Some(&filter),
+            )
+            .await;
+            result
         };
-        // Fired while the child's console is still open: a hook prompt (ask
-        // modes) routes through the child's approval bridge like any tool
-        // call.
-        crate::extensions::fire_event_global(
-            "agent.end",
-            payload,
-            &token,
-            &agent_policy,
-            Some(&filter),
-        )
-        .await;
-        result
+        let _ = session.turn_event(if result.is_ok() {
+            "turn_complete"
+        } else {
+            "turn_failed"
+        });
+        match result {
+            Err(error) => break TurnEnd::Failed(error.to_string()),
+            Ok(text) => {
+                // Post-turn drain: a steered message that raced the child's
+                // final answer (past `process_turn`'s last drain point) and
+                // every queued follow-up chain one more turn; arrival order
+                // is preserved, recalls remove only not-yet-injected text.
+                let mut queued: Vec<(String, &'static str)> = Vec::new();
+                while let Ok(msg) = steer_rx.try_recv() {
+                    if let crate::protocol::QueueMsg::Content(content) = &msg {
+                        let _ = steer_accepted_tx.send(content.clone()).await;
+                    }
+                    enqueue(&mut queued, msg, "steering");
+                }
+                while let Ok(msg) = follow_rx.try_recv() {
+                    if let crate::protocol::QueueMsg::Content(content) = &msg {
+                        let _ = followup_accepted_tx.send(content.clone()).await;
+                    }
+                    enqueue(&mut queued, msg, "follow-up");
+                }
+                if queued.is_empty() {
+                    // Completed guarantees a non-empty summary (§6): an
+                    // empty final message is not a usable result.
+                    if text.trim().is_empty() {
+                        break TurnEnd::EmptyFinal;
+                    } else {
+                        break TurnEnd::Completed(text);
+                    }
+                }
+                let _ = session.turn_event("turn_start");
+                for (content, kind) in queued {
+                    let message = ChatMessage::user_named(content, kind);
+                    let _ = session.append_message(&message);
+                    messages.push(message);
+                }
+            }
+        }
     };
     // Dropping the console closes the child sink, so the consumer drains
     // every buffered line and exits — awaiting it makes the captured
@@ -1069,22 +1339,17 @@ async fn child_run(
     // assistant text.)
     drop(console);
     let _ = consumer.await;
-    let _ = session.turn_event(if result.is_ok() {
-        "turn_complete"
-    } else {
-        "turn_failed"
-    });
     let partial = last_assistant
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default();
-    let usage = usage.lock().unwrap_or_else(|e| e.into_inner()).reported();
+    // The registry meter is the only tally (spec G3): the sink is fully
+    // drained here, so the snapshot is the total across every turn.
+    let usage = meter.usage_snapshot().reported();
     let tool_calls = *calls.lock().unwrap_or_else(|e| e.into_inner());
-    match result {
-        // Completed guarantees a non-empty summary (§6): an empty final
-        // message is not a usable result.
-        Ok(text) if !text.trim().is_empty() => AgentResult {
+    match ending {
+        TurnEnd::Completed(text) => AgentResult {
             status: AgentState::Completed,
             summary: text,
             error: None,
@@ -1095,7 +1360,7 @@ async fn child_run(
             tool_calls,
             resume: None,
         },
-        Ok(_) => AgentResult {
+        TurnEnd::EmptyFinal => AgentResult {
             status: AgentState::Failed,
             summary: partial,
             error: Some("child ended without a final message".to_string()),
@@ -1104,17 +1369,56 @@ async fn child_run(
             tool_calls,
             resume: None,
         },
-        Err(error) => {
-            let message = error.to_string();
-            AgentResult {
-                status: AgentState::Failed,
-                summary: partial,
-                error: Some(message.clone()),
-                usage,
-                reason: classify_body_error(&message),
-                tool_calls,
-                resume: None,
+        TurnEnd::Failed(message) => AgentResult {
+            status: AgentState::Failed,
+            summary: partial,
+            error: Some(message.clone()),
+            usage,
+            reason: classify_body_error(&message),
+            tool_calls,
+            resume: None,
+        },
+    }
+}
+
+/// How the turn chain ended inside `child_run` — the shell for the
+/// [`AgentResult`] the body synthesizes after its sink has drained.
+enum TurnEnd {
+    Completed(String),
+    EmptyFinal,
+    Failed(String),
+}
+
+/// Apply one drained queue message to the not-yet-appended list, keeping
+/// each message's journal kind ("steering" vs "follow-up") alongside it.
+/// Recall semantics match `apply_queue_msg`: only a queued item can be
+/// recalled; one already pushed into the conversation is history.
+fn enqueue(
+    pending: &mut Vec<(String, &'static str)>,
+    msg: crate::protocol::QueueMsg,
+    kind: &'static str,
+) {
+    match msg {
+        crate::protocol::QueueMsg::Content(text) => pending.push((text, kind)),
+        crate::protocol::QueueMsg::Recall(text) => {
+            if let Some(pos) = pending.iter().rposition(|(item, _)| *item == text) {
+                pending.remove(pos);
             }
         }
     }
+}
+
+/// Echo consumed sends into the child's live transcript view, the child
+/// counterpart of the main daemon turn's accepted forwarder.
+fn spawn_accepted_forwarder(
+    progress: ProgressReporter,
+    name: String,
+    mut rx: mpsc::Receiver<String>,
+    wrap: fn(String) -> StreamEvent,
+) {
+    tokio::spawn(async move {
+        while let Some(content) = rx.recv().await {
+            progress.emit_line(&name, wrap(content));
+        }
+    });
 }

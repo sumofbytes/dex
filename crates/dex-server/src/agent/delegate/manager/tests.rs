@@ -45,6 +45,7 @@ async fn token_body(
     token: CancellationToken,
     _progress: ProgressReporter,
     _id: AgentId,
+    _queues: ChildQueues,
 ) -> AgentResult {
     token.cancelled().await;
     AgentResult {
@@ -83,9 +84,11 @@ async fn journal_hook_fires_on_every_terminal_path() {
         capture.lock().unwrap_or_else(|e| e.into_inner()).push(text);
     }));
     let completed = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            completed("findings")
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("findings") },
+        )
         .unwrap();
     let cancelled_id = mgr
         .spawn(&test_def("tester"), SpawnMeta::fresh(), token_body)
@@ -121,14 +124,18 @@ async fn spawn_assigns_session_scoped_ids_and_reports_running() {
     // `spawn` never yields before returning, so on a single-threaded
     // runtime the wrapper cannot have run yet: fully deterministic.
     let first = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            completed("findings")
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("findings") },
+        )
         .unwrap();
     let second = mgr
-        .spawn(&test_def("tester"), SpawnMeta::fresh(), |_, _, _| async {
-            completed("pass")
-        })
+        .spawn(
+            &test_def("tester"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("pass") },
+        )
         .unwrap();
     assert_eq!(first.to_string(), "sess-0");
     assert_eq!(second.to_string(), "sess-1");
@@ -144,9 +151,11 @@ async fn spawn_assigns_session_scoped_ids_and_reports_running() {
 async fn completing_child_files_result_and_notice() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            completed("findings")
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("findings") },
+        )
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => {
@@ -167,6 +176,7 @@ async fn completing_child_files_result_and_notice() {
             status: AgentState::Completed,
             usage: None,
             resumable: false,
+            continuable: false,
         }]
     );
     assert_eq!(mgr.take_overflow(), 0);
@@ -176,9 +186,11 @@ async fn completing_child_files_result_and_notice() {
 async fn failed_result_preserved_with_error() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(&test_def("tester"), SpawnMeta::fresh(), |_, _, _| async {
-            failed("boom")
-        })
+        .spawn(
+            &test_def("tester"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { failed("boom") },
+        )
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => {
@@ -196,10 +208,14 @@ async fn failed_result_preserved_with_error() {
 async fn wait_times_out_then_finishes() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            completed("late")
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                completed("late")
+            },
+        )
         .unwrap();
     match mgr.wait(&id, Duration::from_millis(50)).await {
         WaitOutcome::Running(state) => assert_eq!(state, AgentState::Running),
@@ -289,9 +305,11 @@ async fn notices_bound_and_overflow_folds() {
     let mgr = AgentManager::new("sess");
     for _ in 0..(MAX_NOTICES + 3) {
         let id = mgr
-            .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-                completed("done")
-            })
+            .spawn(
+                &test_def("explorer"),
+                SpawnMeta::fresh(),
+                |_, _, _, _| async { completed("done") },
+            )
             .unwrap();
         assert!(matches!(
             mgr.wait(&id, Duration::from_secs(5)).await,
@@ -310,9 +328,11 @@ async fn notices_bound_and_overflow_folds() {
 async fn results_survive_notice_drain() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            completed("durable")
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("durable") },
+        )
         .unwrap();
     assert!(matches!(
         mgr.wait(&id, Duration::from_secs(5)).await,
@@ -358,7 +378,7 @@ async fn concurrent_completions_stay_consistent() {
             mgr.spawn(
                 &test_def(&format!("agent-{n}")),
                 SpawnMeta::fresh(),
-                |_, _, _| async move {
+                |_, _, _, _| async move {
                     gate.wait().await;
                     completed("through the gate")
                 },
@@ -383,9 +403,11 @@ async fn concurrent_completions_stay_consistent() {
 async fn panicking_body_fails_without_orphaning_the_entry() {
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            panic!("body exploded")
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { panic!("body exploded") },
+        )
         .unwrap();
     // The wrapper catches the panic and funnels a synthesized `Failed`
     // through `finish` — no entry left Running, no slot leaked (§14).
@@ -411,7 +433,7 @@ async fn child_timeout_ends_timed_out() {
     let mut def = test_def("explorer");
     def.timeout = Duration::from_millis(50);
     let id = mgr
-        .spawn(&def, SpawnMeta::fresh(), |_, _, _| async {
+        .spawn(&def, SpawnMeta::fresh(), |_, _, _, _| async {
             tokio::time::sleep(Duration::from_secs(60)).await;
             completed("never")
         })
@@ -457,7 +479,7 @@ async fn progress_reports_current_tool_and_clears() {
         .spawn(
             &test_def("explorer"),
             SpawnMeta::fresh(),
-            move |_, progress, _| {
+            move |_, progress, _, _| {
                 async move {
                     progress.set("bash");
                     let _ = rx.await; // hold the "tool call" until observed
@@ -487,15 +509,21 @@ async fn one_child_failing_does_not_disturb_a_sibling() {
     // cascade.
     let mgr = AgentManager::new("sess");
     let doomed = mgr
-        .spawn(&test_def("doomed"), SpawnMeta::fresh(), |_, _, _| async {
-            failed("boom")
-        })
+        .spawn(
+            &test_def("doomed"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { failed("boom") },
+        )
         .unwrap();
     let sibling = mgr
-        .spawn(&test_def("sibling"), SpawnMeta::fresh(), |_, _, _| async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            completed("fine")
-        })
+        .spawn(
+            &test_def("sibling"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                completed("fine")
+            },
+        )
         .unwrap();
     match mgr.wait(&doomed, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => {
@@ -532,6 +560,7 @@ fn notice_text_carries_usage_and_hides_unpriced_cost() {
             cost_usd: 0.0312,
         }),
         resumable: false,
+        continuable: false,
     };
     assert_eq!(
         notice.text(),
@@ -548,6 +577,7 @@ fn notice_text_carries_usage_and_hides_unpriced_cost() {
             cost_usd: 0.0,
         }),
         resumable: false,
+        continuable: false,
     };
     assert_eq!(
         unpriced.text(),
@@ -560,6 +590,7 @@ fn notice_text_carries_usage_and_hides_unpriced_cost() {
         status: AgentState::Completed,
         usage: None,
         resumable: false,
+        continuable: false,
     };
     assert_eq!(bare.text(), "[agent explorer:sess-3] finished completed");
     // A resumable result advertises the re-entry — same prefix the TUI
@@ -570,6 +601,7 @@ fn notice_text_carries_usage_and_hides_unpriced_cost() {
         status: AgentState::TimedOut,
         usage: None,
         resumable: true,
+        continuable: false,
     };
     assert_eq!(
             resumable.text(),
@@ -601,7 +633,7 @@ async fn transient_wrapper_death_advertises_a_resume_handle() {
                 parent_session: Some(dir.join("sess.jsonl")),
                 remaining_budget: None,
             },
-            |_, _, _| async { panic!("boom") },
+            |_, _, _, _| async { panic!("boom") },
         )
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
@@ -640,7 +672,7 @@ async fn escalate_clamps_exhausted_meter_to_full_cap() {
                 parent_session: Some(dir.join("sess.jsonl")),
                 remaining_budget: None,
             },
-            |_, _, _| async {
+            |_, _, _, _| async {
                 AgentResult {
                     status: AgentState::TimedOut,
                     summary: "partial".to_string(),
@@ -661,7 +693,7 @@ async fn escalate_clamps_exhausted_meter_to_full_cap() {
                 parent_session: Some(dir.join("sess.jsonl")),
                 remaining_budget: None,
             },
-            |_, _, _| async {
+            |_, _, _, _| async {
                 AgentResult {
                     status: AgentState::TimedOut,
                     summary: "partial".to_string(),
@@ -691,17 +723,21 @@ async fn normal_completion_advertises_no_handle() {
     // `Normal` never advertises a handle, even with progress.
     let mgr = AgentManager::new("sess");
     let id = mgr
-        .spawn(&test_def("explorer"), SpawnMeta::fresh(), |_, _, _| async {
-            AgentResult {
-                status: AgentState::Completed,
-                summary: "done".to_string(),
-                error: None,
-                usage: None,
-                reason: ExitReason::Normal,
-                tool_calls: 7,
-                resume: None,
-            }
-        })
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async {
+                AgentResult {
+                    status: AgentState::Completed,
+                    summary: "done".to_string(),
+                    error: None,
+                    usage: None,
+                    reason: ExitReason::Normal,
+                    tool_calls: 7,
+                    resume: None,
+                }
+            },
+        )
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
         WaitOutcome::Finished(result) => assert!(result.resume.is_none()),
@@ -764,7 +800,7 @@ async fn wrapper_synthesized_ending_reconciles_the_spend_meter() {
                 parent_session: Some(dir.join("sess.jsonl")),
                 remaining_budget: None,
             },
-            |token, progress, _| async move {
+            |token, progress, _, _| async move {
                 progress.set("read");
                 progress.set("bash");
                 // Body reports no count — it never got to synthesize.
@@ -812,7 +848,7 @@ async fn escalated_handle_carries_def_model_for_resume_inheritance() {
                 parent_session: Some(dir.join("sess.jsonl")),
                 remaining_budget: None,
             },
-            |_, _, _| async { panic!("boom") },
+            |_, _, _, _| async { panic!("boom") },
         )
         .unwrap();
     match mgr.wait(&id, Duration::from_secs(5)).await {
@@ -833,7 +869,7 @@ async fn snapshot_lists_live_and_retained() {
         .spawn(
             &test_def("explorer"),
             SpawnMeta::fresh(),
-            |token, _, _| async move {
+            |token, _, _, _| async move {
                 token.cancelled().await;
                 AgentResult {
                     status: AgentState::Cancelled,
@@ -848,9 +884,11 @@ async fn snapshot_lists_live_and_retained() {
         )
         .unwrap();
     let done = mgr
-        .spawn(&test_def("tester"), SpawnMeta::fresh(), |_, _, _| async {
-            completed("ok")
-        })
+        .spawn(
+            &test_def("tester"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("ok") },
+        )
         .unwrap();
     match mgr.wait(&done, Duration::from_secs(5)).await {
         WaitOutcome::Finished(_) => {}
@@ -866,4 +904,360 @@ async fn snapshot_lists_live_and_retained() {
     assert_eq!(done_row.name, "tester");
     assert!(!done_row.resumable);
     mgr.shutdown().await;
+}
+
+// ---- spec G1: send into a live child's queues ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_steers_a_running_child_through_its_queue() {
+    // G1 wiring: the manager's sender reaches the body's receiver — the
+    // same `QueueMsg` channel shape the main turn drains at round
+    // boundaries.
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, mut queues| async move {
+                let steered = match queues.steering_rx.recv().await {
+                    Some(crate::protocol::QueueMsg::Content(text)) => text,
+                    other => format!("{other:?}"),
+                };
+                completed(&steered)
+            },
+        )
+        .unwrap();
+    match mgr.send(&id, "pivot east".to_string(), SendDelivery::Steer) {
+        Ok(SendOutcome::Steered) => {}
+        other => panic!("expected Steered, got {other:?}"),
+    }
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => assert_eq!(result.summary, "pivot east"),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_follow_up_uses_its_own_queue() {
+    // The two deliveries never share a channel: a follow-up must wait for
+    // the turn to end even while nothing is steered (G1's separate queues).
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, mut queues| {
+                async move {
+                    let follow = match queues.followup_rx.recv().await {
+                        Some(crate::protocol::QueueMsg::Content(text)) => text,
+                        other => format!("{other:?}"),
+                    };
+                    // Nothing was sent to the steering queue.
+                    let steer_empty = queues.steering_rx.try_recv().is_err();
+                    completed(&format!("{follow}/{steer_empty}"))
+                }
+            },
+        )
+        .unwrap();
+    match mgr.send(&id, "chain this".to_string(), SendDelivery::FollowUp) {
+        Ok(SendOutcome::Queued) => {}
+        other => panic!("expected Queued, got {other:?}"),
+    }
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => assert_eq!(result.summary, "chain this/true"),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_unknown_id_names_the_known_ones() {
+    // Unknown ids report what the manager does know, so the caller can
+    // point at the right child without another `action=list` round trip.
+    let mgr = AgentManager::new("sess");
+    let live = mgr
+        .spawn(&test_def("explorer"), SpawnMeta::fresh(), token_body)
+        .unwrap();
+    // Deterministic on a single-threaded runtime: the spawned task has not
+    // run yet, so the child is still in the running registry.
+    match mgr.send(
+        &AgentId("sess-9".to_string()),
+        "hi".to_string(),
+        SendDelivery::Steer,
+    ) {
+        Err(SendError::Unknown { known }) => {
+            assert_eq!(known, vec![(live.clone(), "explorer".to_string())]);
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+    mgr.shutdown().await;
+    // After shutdown the registry also holds retained results; both kinds
+    // are named.
+    match mgr.send(
+        &AgentId("sess-9".to_string()),
+        "hi".to_string(),
+        SendDelivery::Steer,
+    ) {
+        Err(SendError::Unknown { known }) => {
+            assert!(known.iter().any(|(id, _)| id == &live));
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_full_mailbox_rejects_loudly() {
+    // QUEUE_CAPACITY sends park; past that `send` fails with `Full`
+    // instead of blocking the parent turn.
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |token, _, _, _| async move {
+                // Never drains its queues; ends only through cancel.
+                token.cancelled().await;
+                AgentResult {
+                    status: AgentState::Cancelled,
+                    summary: String::new(),
+                    error: Some("cancelled".to_string()),
+                    usage: None,
+                    reason: ExitReason::ShutDown,
+                    tool_calls: 0,
+                    resume: None,
+                }
+            },
+        )
+        .unwrap();
+    let outcome = mgr.send(&id, "first".to_string(), SendDelivery::Steer);
+    match outcome {
+        Ok(SendOutcome::Steered) => {}
+        other => panic!("expected Steered, got {other:?}"),
+    }
+    for n in 1..QUEUE_CAPACITY {
+        match mgr.send(&id, format!("fill {n}"), SendDelivery::Steer) {
+            Ok(SendOutcome::Steered) => {}
+            other => panic!("expected Steered on {n}, got {other:?}"),
+        }
+    }
+    match mgr.send(&id, "one too many".to_string(), SendDelivery::Steer) {
+        Err(SendError::Full) => {}
+        other => panic!("expected Full, got {other:?}"),
+    }
+    mgr.cancel(&id);
+    assert!(matches!(
+        mgr.wait(&id, Duration::from_secs(5)).await,
+        WaitOutcome::Finished(_)
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_to_retained_child_reports_not_running() {
+    // A terminal id is `NotRunning` at the manager level — the tool layer
+    // turns that into either an error (failed child) or a continuation.
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async { completed("done") },
+        )
+        .unwrap();
+    assert!(matches!(
+        mgr.wait(&id, Duration::from_secs(5)).await,
+        WaitOutcome::Finished(_)
+    ));
+    match mgr.send(&id, "again".to_string(), SendDelivery::Steer) {
+        Err(SendError::NotRunning) => {}
+        other => panic!("expected NotRunning, got {other:?}"),
+    }
+    match mgr.send(&id, "again".to_string(), SendDelivery::FollowUp) {
+        Err(SendError::NotRunning) => {}
+        other => panic!("expected NotRunning, got {other:?}"),
+    }
+}
+
+// ---- spec G2: continuation handles on Completed children ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_child_with_transcript_advertises_continuation() {
+    // G2: a `Completed` child that made progress carries a
+    // `continuable` handle — `delegate send` re-enters it with a full
+    // budget; `resume_from` is reserved for recoverable endings.
+    let dir = PathBuf::from("/tmp/dex-continuation-handle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta {
+                generation: 0,
+                parent_session: Some(dir.join("sess.jsonl")),
+                remaining_budget: None,
+            },
+            |_, _, _, _| async { completed("findings delivered") },
+        )
+        .unwrap();
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => {
+            let handle = result
+                .resume
+                .expect("completed + progress advertises a handle");
+            assert!(handle.continuable, "{handle:?}");
+            assert_eq!(
+                handle.remaining_budget, None,
+                "continuation runs full budget"
+            );
+            assert!(
+                handle.note.contains("reported a final result"),
+                "{}",
+                handle.note
+            );
+            assert!(handle.transcript.ends_with("agents/sess-0-explorer.jsonl"));
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    // The notice says continuable — never resumable — and keeps the
+    // finished-completed prefix the TUI matches on.
+    let notices = mgr.drain_notices();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].continuable && !notices[0].resumable);
+    let text = notices[0].text();
+    assert!(
+        text.starts_with("[agent explorer:sess-0] finished completed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("continuable with delegate(send, agent_id = \"sess-0\")"),
+        "{text}"
+    );
+    assert!(!text.contains("resumable"), "{text}");
+    // `list` rows carry the same split.
+    let row = mgr
+        .snapshot()
+        .into_iter()
+        .find(|row| row.agent_id == id)
+        .unwrap();
+    assert!(row.continuable && !row.resumable);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- spec G3: usage on abnormal endings ----
+
+#[tokio::test(flavor = "current_thread")]
+async fn timed_out_body_reports_metered_usage() {
+    // G3: a run that outlives its timeout never builds a result, but its
+    // LLM spend survives in the registry meter and rides the synthesized
+    // `TimedOut` result — the lifecycle line then shows the tokens.
+    let mut def = test_def("tester");
+    def.timeout = Duration::from_millis(60);
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(&def, SpawnMeta::fresh(), |_, progress, _, _| async move {
+            progress.absorb_usage(500, 20, 0.0125);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            completed("never reached")
+        })
+        .unwrap();
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => {
+            assert_eq!(result.status, AgentState::TimedOut);
+            let usage = result.usage.expect("metered spend reported");
+            assert_eq!(usage.prompt_tokens, 500);
+            assert_eq!(usage.output_tokens, 20);
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    let notices = mgr.drain_notices();
+    let text = notices[0].text();
+    assert!(text.contains("520 tok"), "{text}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn panicking_body_reports_metered_usage() {
+    // G3: same meter path for a body that dies mid-flight (panic arm).
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |_, progress, _, _| async move {
+                progress.absorb_usage(300, 0, 0.0);
+                panic!("boom mid-turn")
+            },
+        )
+        .unwrap();
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => {
+            assert_eq!(result.status, AgentState::Failed);
+            let usage = result.usage.expect("metered spend reported");
+            assert_eq!(usage.prompt_tokens, 300);
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_body_reports_metered_usage() {
+    // G3: the cancel arm synthesizes without a body result; spend made
+    // before the cancel lands on the `Cancelled` result.
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |token, progress, _, _| async move {
+                progress.absorb_usage(11, 7, 0.0);
+                // Fold the spend in, THEN hold off until the wrapper's cancel
+                // arm wins its race (a synchronous cancel can beat the body's
+                // first poll on a single-threaded runtime).
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = token;
+                completed("never reached")
+            },
+        )
+        .unwrap();
+    // Give the wrapper task a beat so the body's first poll folds its
+    // spend into the meter before the cancel fires.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    mgr.cancel(&id);
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => {
+            assert_eq!(result.status, AgentState::Cancelled);
+            let usage = result.usage.expect("metered spend reported");
+            assert_eq!(usage.prompt_tokens, 11);
+            assert_eq!(usage.output_tokens, 7);
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn zero_spend_uses_stay_none() {
+    // A child that never reported a call still settles `usage: None` —
+    // no zero rows added by the meter.
+    let mgr = AgentManager::new("sess");
+    let id = mgr
+        .spawn(
+            &test_def("explorer"),
+            SpawnMeta::fresh(),
+            |token, _, _, _| async move {
+                token.cancelled().await;
+                AgentResult {
+                    status: AgentState::Cancelled,
+                    summary: String::new(),
+                    error: Some("cancelled".to_string()),
+                    usage: None,
+                    reason: ExitReason::ShutDown,
+                    tool_calls: 0,
+                    resume: None,
+                }
+            },
+        )
+        .unwrap();
+    mgr.cancel(&id);
+    match mgr.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => assert_eq!(result.usage, None),
+        other => panic!("expected Finished, got {other:?}"),
+    }
 }

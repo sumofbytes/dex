@@ -2559,7 +2559,379 @@ mod e2e_tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
-    // ---- coverage fixes ----
+
+    /// spec G1/G2 over real HTTP: the parent's model calls `delegate` and,
+    /// while the child is mid-turn, re-issues the ONE tool with a `send`
+    /// action — the steered text lands in the child's next model request
+    /// (drained at the top of its next round by the same machinery the
+    /// main turn uses). After the child finishes, the parent's
+    /// `delivery: follow_up` send continues the SAME lineage as generation
+    /// + 1: the replayed transcript plus a follow-up nudge, and the
+    /// completion notice advertises `continuable with delegate(send)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // env must stay redirected for the whole turn
+    async fn delegate_send_steers_then_continues_same_child() {
+        let _guard = lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+        let _ext_lock = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK
+            .lock()
+            .await;
+
+        const DELEGATE_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"delegate","arguments":"{\"agent\":\"explorer\",\"task\":\"find where the gate lives\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        // Child round 1: one tool call so steering has a boundary to drain
+        // at; round 2 answers citing the steering text.
+        const CHILD_TOOL_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"path\":\"spec-sentinel.txt\"}"}}]}}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        const CHILD_ANSWER_SSE: &str = concat!(
+            r#"data: {"choices":[{"delta":{"content":"observed pivot east"}}]}"#,
+            "\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":300}}",
+            "\n\ndata: [DONE]\n\n"
+        );
+        const CHILD_CONTINUED_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"follow-up noted\"}}]}\n\ndata: [DONE]\n\n";
+        const PARENT_DONE_SSE: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ticker\"}}]}\n\ndata: [DONE]\n\n";
+
+        let parent_calls = Arc::new(AtomicUsize::new(0));
+        let child_calls = Arc::new(AtomicUsize::new(0));
+        let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        // Released once the parent's steer has executed (parent counter ≥
+        // 2): the child's first model response parks until then, so round
+        // 2 deterministically drains the steer.
+        let steer_done = parent_calls.clone();
+        let child_shared = child_calls.clone();
+        let fake_llm = Router::new()
+            .route(
+                "/chat/completions",
+                post(
+                    move |AxumState(_): AxumState<Arc<AtomicUsize>>, body: String| {
+                        let seen = seen.clone();
+                        let counters = (parent_calls.clone(), child_shared.clone());
+                        let steer_done = steer_done.clone();
+                        async move {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or_default();
+                            lock_map(&seen).push(parsed.clone());
+                            let system = parsed["messages"][0]["content"]
+                                .as_str()
+                                .unwrap_or_default();
+                            let extract_id = |raw: &str| {
+                                // Find the spawn ack inside the request body:
+                                // `\"agent_id\":\"dex-server-...\"` (escaped).
+                                let plain = "\\\"agent_id\\\":\\\"";
+                                raw.find(plain)
+                                    .map(|pos| {
+                                        raw[pos + plain.len()..]
+                                            .split('\\')
+                                            .next()
+                                            .unwrap_or_default()
+                                            .to_string()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let send_sse = |id: &str, message: &str, delivery: &str| {
+                                let args = format!(
+                                    r#"{{"action":"send","agent_id":"{id}","message":"{message}","delivery":"{delivery}"}}"#
+                                );
+                                let body = serde_json::json!({
+                                    "choices": [{
+                                        "delta": { "tool_calls": [{
+                                            "index": 0,
+                                            "id": "t-send",
+                                            "function": {
+                                                "name": "delegate",
+                                                "arguments": args,
+                                            },
+                                        }]},
+                                    }],
+                                });
+                                format!("data: {body}\n\ndata: [DONE]\n\n")
+                            };
+                            if system.contains("You are an explorer") {
+                                let (_, child_n) = &counters;
+                                let n = child_n.fetch_add(1, Ordering::SeqCst);
+                                let sse: String = match n {
+                                    // Park round 1 until the steer executed.
+                                    0 => {
+                                        while steer_done.load(Ordering::SeqCst) < 2 {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
+                                        CHILD_TOOL_SSE.to_string()
+                                    }
+                                    1 => CHILD_ANSWER_SSE.to_string(),
+                                    _ => CHILD_CONTINUED_SSE.to_string(),
+                                };
+                                return axum::http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/event-stream")
+                                    .body(Body::from(sse))
+                                    .unwrap();
+                            }
+                            let (parent_n, _) = &counters;
+                            let n = parent_n.fetch_add(1, Ordering::SeqCst);
+                            let sse: String = match n {
+                                0 => DELEGATE_SSE.to_string(),
+                                1 => send_sse(&extract_id(&body), "pivot east", "steer"),
+                                2 => PARENT_DONE_SSE.to_string(),
+                                3 => {
+                                    send_sse(&extract_id(&body), "now lint the module", "follow_up")
+                                }
+                                _ => PARENT_DONE_SSE.to_string(),
+                            };
+                            axum::http::Response::builder()
+                                .status(200)
+                                .header("content-type", "text/event-stream")
+                                .body(Body::from(sse))
+                                .unwrap()
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::new(AtomicUsize::new(0)));
+        let llm_base = spawn_app(fake_llm).await;
+        let daemon_state = Arc::new(DaemonState::new());
+        let daemon_base = spawn_app(router(daemon_state.clone())).await;
+
+        let data_dir =
+            std::env::temp_dir().join(format!("dex-delegate-send-{}", std::process::id()));
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "XDG_DATA_HOME",
+            "DEX_CONFIG",
+            "DEX_PERMISSION",
+            "OPENCODE_API_KEY",
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+            "DEX_VERIFY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        let _env = crate::test_env::EnvGuard(saved);
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+        )
+        .unwrap();
+        std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
+        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("OPENCODE_API_KEY", "test-key");
+        std::env::set_var("DEX_VERIFY", "true");
+        for v in [
+            "DEX_MODELS",
+            "DEX_MODEL_APIS",
+            "DEX_CONTEXT_WINDOW",
+            "DEX_THINKING_EFFORT",
+        ] {
+            std::env::remove_var(v);
+        }
+        // The child reads a real file from the session cwd.
+        let cwd = std::env::temp_dir().join(format!("dex-send-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("spec-sentinel.txt"), "gate contents\n").unwrap();
+
+        // Chat 1: delegate spawn, then a steered send while the child is
+        // live; the turn ends with the child still running.
+        let base1 = daemon_base.clone();
+        let cwd1 = cwd.display().to_string();
+        let (session_id, agent_id, chat_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&base1).unwrap();
+            client.wait_until_ready(Duration::from_secs(10)).unwrap();
+            let session_id = client
+                .create_session(&cwd1, Some("send"))
+                .unwrap()
+                .session_id;
+            let mut started_agent: String = String::new();
+            let r = client
+                .chat(
+                    &session_id,
+                    "explore then keep me posted",
+                    ChatOptions::default(),
+                    &mut |event| {
+                        if let crate::protocol::StreamEvent::System(text) = event {
+                            if let Some(rest) = text.strip_prefix("[agent explorer:") {
+                                started_agent = rest.trim_end_matches("] started").to_string();
+                            }
+                        }
+                        EventReply::None
+                    },
+                )
+                .map_err(|e| e.to_string());
+            (session_id, started_agent, r)
+        })
+        .await
+        .unwrap();
+        chat_result.unwrap();
+
+        // The child's next model request carried the steering. It parks on
+        // round 1 until the steer has executed, so wait for the round-2
+        // request to be recorded before reading the captured bodies.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while child_calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(Instant::now() < deadline, "child never reached round 2");
+        }
+        // The child's next model request carried the steering (drained at
+        // the top of its next round, never inside the round it was sent).
+        let bodies = lock_map(&requests).clone();
+        let child_bodies: Vec<serde_json::Value> = bodies
+            .iter()
+            .filter(|body| {
+                body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("You are an explorer"))
+            })
+            .cloned()
+            .collect();
+        assert!(child_bodies.len() >= 2, "{}", child_bodies.len());
+        let round1 = child_bodies[0].to_string();
+        assert!(
+            round1.contains("find where the gate lives") && !round1.contains("pivot east"),
+            "fresh task, no steer on the round it was sent in: {round1}"
+        );
+        let steered = child_bodies[1].to_string();
+        assert!(
+            steered.contains("pivot east"),
+            "steered text present in the next request: {steered}"
+        );
+
+        // After the child completed, chat 2: the notice drains with the
+        // continuable marker and the parent issues the follow-up send.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if daemon_state
+                .manager_for(&session_id)
+                .status(&crate::agent::delegate::AgentId(agent_id.clone()))
+                == Some(crate::agent::delegate::AgentState::Completed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(Instant::now() < deadline, "child never completed");
+        }
+        let base2 = daemon_base.clone();
+        let session_for_second = session_id.clone();
+        let (second_events, second_result) = tokio::task::spawn_blocking(move || {
+            let client = DaemonClient::new(&base2).unwrap();
+            let mut events: Vec<crate::protocol::StreamEvent> = Vec::new();
+            let r = client
+                .chat(
+                    &session_for_second,
+                    "steer it further",
+                    ChatOptions::default(),
+                    &mut |event| {
+                        events.push(event);
+                        EventReply::None
+                    },
+                )
+                .map_err(|e| e.to_string());
+            (events, r)
+        })
+        .await
+        .unwrap();
+        second_result.unwrap();
+        // Chat 2's request carried the notice: spend + continuable prose,
+        // same `finished completed` prefix the TUI matches on. The notice
+        // lands on chat 2's FIRST model request (the drain happens at the
+        // turn boundary, before any steering round it might trigger); the
+        // turn may run further rounds after that (the follow-up send), so
+        // search by the chat-2 prompt rather than taking the last body.
+        let bodies2 = lock_map(&requests).clone();
+        let chat2_bodies: Vec<&serde_json::Value> = bodies2
+            .iter()
+            .filter(|body| {
+                body["messages"]
+                    .as_array()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|msg| msg["role"] == "user")
+                            .any(|msg| msg["content"] == "steer it further")
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(!chat2_bodies.is_empty(), "chat 2 never issued a request");
+        let notice = chat2_bodies[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .filter_map(|m| m["content"].as_str())
+            .find(|c| c.contains("finished completed"))
+            .expect("notice drained into chat 2")
+            .to_string();
+        assert!(
+            notice.contains("finished completed \u{b7} 1.5k tok"),
+            "spend on the lifecycle line: {notice}"
+        );
+        assert!(
+            notice.contains("\u{b7} continuable with delegate(send, agent_id = \""),
+            "continuation hint rides the notice: {notice}"
+        );
+        assert!(!notice.contains("resumable"), "{notice}");
+        // The parent turn ends on plain text.
+        match second_events.iter().find_map(|e| match e {
+            crate::protocol::StreamEvent::TurnComplete { response, .. } => Some(response.clone()),
+            _ => None,
+        }) {
+            Some(response) => assert_eq!(response, "ticker"),
+            None => panic!("expected TurnComplete in {second_events:?}"),
+        }
+
+        // The continuation runs as generation 1: its request replays the
+        // prior generation's history and carries the follow-up nudge.
+        let bodies3 = lock_map(&requests).clone();
+        let gen1 = bodies3
+            .iter()
+            .rev()
+            .find(|body| {
+                body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("You are an explorer"))
+            })
+            .cloned()
+            .expect("continuation request");
+        let gen1_text = gen1.to_string();
+        assert!(
+            gen1_text.contains("observed pivot east"),
+            "history replayed: {gen1_text}"
+        );
+        assert!(
+            gen1_text.contains("Follow-up: now lint the module"),
+            "follow-up nudge: {gen1_text}"
+        );
+        assert!(
+            gen1_text.contains("You already reported your final result"),
+            "continuation frame, not an interruption: {gen1_text}"
+        );
+
+        // The continuation child ends Completed too; wait it out so no
+        // task outlives the test.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = daemon_state.manager_for(&session_id).snapshot();
+            if snapshot
+                .iter()
+                .all(|child| child.state != crate::agent::delegate::AgentState::Running)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(Instant::now() < deadline, "continuation never completed");
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 
     /// Bearer gate over real HTTP: `/health` stays open, every `/api/*` route
     /// requires `Authorization: Bearer <token>` when the daemon requires a

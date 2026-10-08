@@ -28,6 +28,7 @@ async fn done_body(
     _token: CancellationToken,
     _progress: ProgressReporter,
     _id: crate::agent::delegate::AgentId,
+    _queues: crate::agent::delegate::ChildQueues,
 ) -> AgentResult {
     AgentResult {
         status: AgentState::Completed,
@@ -44,6 +45,7 @@ async fn cancel_body(
     token: CancellationToken,
     _progress: ProgressReporter,
     _id: crate::agent::delegate::AgentId,
+    _queues: crate::agent::delegate::ChildQueues,
 ) -> AgentResult {
     token.cancelled().await;
     AgentResult {

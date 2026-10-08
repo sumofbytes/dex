@@ -1,18 +1,24 @@
-//! Phase 5 — the three delegation tools plus the child body that runs the
+//! Phase 5 — the delegation surface plus the child body that runs the
 //! standard turn loop (plan §5, §8, §10): `delegate` spawns through the
-//! per-session [`AgentManager`] and returns the id immediately, `delegate_output`
-//! is the bounded poll-wait (≤120 s, ~250 ms sleeps, early exit on completion
-//! or parent cancel — never `select!` on steering, which is `&mut`-borrowed by
-//! the parent loop and unreachable from a tool call), `delegate_stop` cancels.
+//! per-session [`AgentManager`] and returns the id immediately,
+//! `delegate_output` is the bounded poll-wait (≤120 s, ~250 ms sleeps,
+//! early exit on completion or parent cancel — never `select!` on
+//! steering, which is `&mut`-borrowed by the parent loop and unreachable
+//! from a tool call), `delegate_stop` cancels, and `delegate_send`
+//! delivers a message to an existing child — steering a running turn,
+//! queueing a follow-up turn, or continuing a finished child (spec G1/G2).
 //!
-//! The child body is the same `process_turn` runtime with an isolated bundle:
-//! its own config clone (model override via the one-knob path, §13), its own
-//! JSONL session (§16), its own console (a child-local sink; no approval
-//! channel — background children cannot prompt, §12 V1a detached auto-deny),
-//! the definition's tool allowlist enforced at dispatch (§11), and no
-//! steering. Nesting is a depth counter (`MAX_AGENT_DEPTH`): a child whose
-//! depth is under the cap keeps a daemon context and may delegate further;
-//! at the cap the bundle carries none, so delegation rejects at dispatch.
+//! The child body is the same `process_turn` runtime with an isolated
+//! bundle: its own config clone (model override via the one-knob path,
+//! §13), its own JSONL session (§16), its own console (a child-local
+//! sink; no approval channel — background children cannot prompt, §12 V1a
+//! detached auto-deny), the definition's tool allowlist enforced at
+//! dispatch (§11), and the manager's per-child steering queues (one
+//! `QueueMsg` channel drained at round boundaries, one follow-up queue
+//! chained after the current turn ends). Nesting is a depth counter
+//! (`MAX_AGENT_DEPTH`): a child whose depth is under the cap keeps a
+//! daemon context and may delegate further; at the cap the bundle carries
+//! none, so delegation rejects at dispatch.
 
 #[cfg(test)]
 use super::exit::ExitReason;
@@ -66,9 +72,9 @@ pub use bg::{execute_task, is_task, TASK_TOOL};
 pub use exec::execute_delegation;
 #[cfg(test)]
 pub(crate) use exec::{
-    child_system_prompt, delegate, delegate_list, delegate_output, effective_child_model,
-    parse_generation, resolve_child_config, resolve_resume_handle, resume_messages, resume_nudge,
-    seed_task_text,
+    child_system_prompt, delegate, delegate_list, delegate_output, delegate_send,
+    effective_child_model, parse_generation, resolve_child_config, resolve_resume_handle,
+    resume_messages, resume_nudge, seed_task_text,
 };
 pub use schema::{
     delegation_enabled, is_delegation, set_daemon_linked, status_word, AgentTurnContext,

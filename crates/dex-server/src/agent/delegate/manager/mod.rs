@@ -48,7 +48,12 @@ mod registry;
 pub(crate) use lifecycle::{AgentEvent, AgentManager, ProgressReporter, TaskEvent, TaskEventHook};
 #[cfg(test)]
 pub(crate) use lifecycle::{MAX_CHILDREN, MAX_NOTICES};
-pub(crate) use registry::{AgentNotice, ChildInfo, SpawnError, SpawnMeta, WaitOutcome};
+#[cfg(test)]
+pub(crate) use registry::QUEUE_CAPACITY;
+pub(crate) use registry::{
+    AgentNotice, ChildInfo, ChildQueues, SendDelivery, SendError, SendOutcome, SpawnError,
+    SpawnMeta, WaitOutcome,
+};
 
 #[cfg(test)]
 mod tests;

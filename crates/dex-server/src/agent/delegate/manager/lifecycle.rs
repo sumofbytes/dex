@@ -6,14 +6,19 @@ use super::super::model::AgentId;
 use super::super::model::AgentInstance;
 use super::super::model::AgentResult;
 use super::super::model::AgentState;
+use super::super::model::AgentUsage;
 use super::registry::escalate_handle;
 use super::registry::AgentNotice;
 use super::registry::BodyFuture;
 use super::registry::BoxRun;
 use super::registry::ChildInfo;
+use super::registry::ChildQueues;
 use super::registry::Inner;
 use super::registry::Record;
 use super::registry::RunningChild;
+use super::registry::SendDelivery;
+use super::registry::SendError;
+use super::registry::SendOutcome;
 use super::registry::SpawnError;
 use super::registry::SpawnMeta;
 use super::registry::WaitOutcome;
@@ -27,6 +32,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Max live children per session (plan §7). The next concurrent spawn
@@ -43,6 +49,12 @@ pub const MAX_NOTICES: usize = 32;
 const MAX_RESULTS: usize = 64;
 /// `wait` poll quantum: prompt completion delivery without busy-spinning.
 const WAIT_POLL: Duration = Duration::from_millis(25);
+/// Grace before the wrapper reads the registry usage meter on a
+/// wrapper-synthesized ending (`70ms >` one sink-line flip): the body is
+/// already dead (dropped by cancel/timeout/panic), so this only gives the
+/// consumer task a moment to fold its last queued `SinkLine::Usage` lines
+/// into the meter before `finish` snapshots the spend.
+const USAGE_DRAIN_GRACE: Duration = Duration::from_millis(70);
 
 /// Live progress handle for one child (plan §15: the `progress <tool>`
 /// System line). Phase 5's child body reports around each tool call with
@@ -100,6 +112,30 @@ impl ProgressReporter {
         {
             child.instance.progress = None;
         }
+    }
+
+    /// Also folds provider usage into the registry meter in the same lock:
+    /// the body's own sink tally would die with the body, so a wrapper-
+    /// synthesized ending (panic, timeout, cancel-before-return) reads the
+    /// meter back for its resume budget *and* its spend report (spec G3).
+    pub fn absorb_usage(&self, tokens: u64, output: u64, cost: f64) {
+        let mut m = self.manager.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = m.running.get_mut(&self.id) {
+            child.usage.absorb(tokens, output, cost);
+        }
+    }
+
+    /// Snapshot the registry-side usage meter at the end of the body's run
+    /// (after the sink is closed and the consumer drained): the meter is
+    /// the only tally, so the result carries exactly what the registry saw.
+    pub fn usage_snapshot(&self) -> AgentUsage {
+        self.manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running
+            .get(&self.id)
+            .map(|child| child.usage)
+            .unwrap_or_default()
     }
 
     /// Fire one child transcript line (plan §20 child view) through the
@@ -235,12 +271,13 @@ impl AgentManager {
     /// Spawn a child agent.
     ///
     /// `run` receives the child's [`CancellationToken`], a [`ProgressReporter`]
-    /// scoped to it, and its allocated [`AgentId`] (session paths and results
-    /// need it, plan §4), and produces the terminal [`AgentResult`]; results
-    /// are filed under the allocated id, so bodies cannot misattribute. Every
-    /// terminal path — completion, failure, cancel, timeout, panic — funnels
-    /// through result retention, the notice queue, the journal hook, and
-    /// registry removal.
+    /// scoped to it, its allocated [`AgentId`] (session paths and results
+    /// need it, plan §4), and the per-child [`ChildQueues`] (spec G1: the
+    /// steering/follow-up inbox the body's turn loop drains), and produces
+    /// the terminal [`AgentResult`]; results are filed under the allocated
+    /// id, so bodies cannot misattribute. Every terminal path — completion,
+    /// failure, cancel, timeout, panic — funnels through result retention,
+    /// the notice queue, the journal hook, and registry removal.
     ///
     /// The wrapper enforces the definition's `timeout` (default
     /// [`DEFAULT_AGENT_TIMEOUT`]): a run that outlasts it is dropped and
@@ -264,11 +301,13 @@ impl AgentManager {
         run: F,
     ) -> Result<AgentId, SpawnError>
     where
-        F: FnOnce(CancellationToken, ProgressReporter, AgentId) -> Fut + Send + 'static,
+        F: FnOnce(CancellationToken, ProgressReporter, AgentId, ChildQueues) -> Fut
+            + Send
+            + 'static,
         Fut: Future<Output = AgentResult> + Send + 'static,
     {
-        let run: BoxRun = Box::new(move |token, progress, id| {
-            let future: BodyFuture = Box::pin(run(token, progress, id));
+        let run: BoxRun = Box::new(move |token, progress, id, queues| {
+            let future: BodyFuture = Box::pin(run(token, progress, id, queues));
             future
         });
         self.launch(def, meta, run)
@@ -295,7 +334,7 @@ impl AgentManager {
             }
             Self::next_id(&mut inner)
         };
-        let (token, timeout) = {
+        let (token, timeout, queues) = {
             let mut inner = self.lock();
             if inner.closed {
                 return Err(SpawnError::Closed);
@@ -309,7 +348,7 @@ impl AgentManager {
             }
             Self::register(&mut inner, def, &meta, &id)
         };
-        self.spawn_wrapper(id.clone(), def.name.clone(), timeout, token, run);
+        self.spawn_wrapper(id.clone(), def.name.clone(), timeout, token, run, queues);
         // §15 V1b: the typed spawn event fires after registration, so the
         // journal order can never reference an unregistered id.
         let hook = self.lock().events.clone();
@@ -341,7 +380,7 @@ impl AgentManager {
         def: &AgentDefinition,
         meta: &SpawnMeta,
         id: &AgentId,
-    ) -> (CancellationToken, Duration) {
+    ) -> (CancellationToken, Duration, ChildQueues) {
         // §24.3: the transcript path derives here, once, from the same
         // helper the child body writes through — registry and file can
         // never disagree. Generations share the id; the filename
@@ -351,6 +390,13 @@ impl AgentManager {
             .as_deref()
             .map(|parent| Session::child_path(parent, &id.0, &def.name, meta.generation));
         let token = CancellationToken::new();
+        // Spec G1: one steering + one follow-up queue per child. Senders
+        // enter the registry entry (send looks them up under this same
+        // lock); receivers go to the body with the launch bundle.
+        let (steering_tx, steering_rx) =
+            mpsc::channel::<crate::protocol::QueueMsg>(super::registry::QUEUE_CAPACITY);
+        let (followup_tx, followup_rx) =
+            mpsc::channel::<crate::protocol::QueueMsg>(super::registry::QUEUE_CAPACITY);
         inner.running.insert(
             id.clone(),
             RunningChild {
@@ -364,12 +410,22 @@ impl AgentManager {
                 transcript,
                 generation: meta.generation,
                 calls: 0,
+                usage: AgentUsage::default(),
+                steering_tx,
+                followup_tx,
                 allowance: meta
                     .remaining_budget
                     .or(def.max_tool_iterations.map(|cap| cap as usize)),
             },
         );
-        (token, def.timeout)
+        (
+            token,
+            def.timeout,
+            ChildQueues {
+                steering_rx,
+                followup_rx,
+            },
+        )
     }
 
     /// The cancel/timeout wrapper + handle recording, lock-free (§14).
@@ -380,6 +436,7 @@ impl AgentManager {
         timeout: Duration,
         token: CancellationToken,
         run: BoxRun,
+        queues: ChildQueues,
     ) {
         let manager = self.clone();
         let task_id = id.clone();
@@ -404,6 +461,7 @@ impl AgentManager {
                                 events,
                             },
                             task_id.clone(),
+                            queues,
                         )),
                         "child panicked",
                     ),
@@ -438,6 +496,13 @@ impl AgentManager {
                     resume: None,
                 },
             };
+            // Synthesized endings carry `usage: None`; before `finish`
+            // reads the registry meter, let the body's sink consumer fold
+            // its last queued usage lines (spec G3 — the spend survived in
+            // the registry even though the body did not).
+            if result.usage.is_none() {
+                tokio::time::sleep(USAGE_DRAIN_GRACE).await;
+            }
             manager.finish(&task_id, &name, result.clone());
             result
         });
@@ -462,9 +527,16 @@ impl AgentManager {
     /// orphan an entry or skip its lifecycle line.
     ///
     /// Recoverable endings (interrupted, timed out, or budget-exhausted)
-    /// with progress on disk additionally advertise the resume handle for
-    /// a manual `delegate(resume_from)`; everything else settles
+    /// with progress on disk advertise the resume handle for a manual
+    /// `delegate(resume_from)`; a `Completed` child with a transcript
+    /// advertises a *continuation* handle instead (spec G2 — the parent
+    /// re-enters it with `delegate(send)`). Everything else settles
     /// handle-free. There is no automatic re-entry.
+    ///
+    /// When the body never attached spend (`usage: None` — a synthesized
+    /// panic/timeout/cancel, or a body that never made an LLM call), the
+    /// registry's meter is folded into the result so abnormal endings
+    /// report what they spent (spec G3).
     fn finish(&self, id: &AgentId, name: &str, mut result: AgentResult) {
         // Copy out before `result` moves into retention below.
         let reason = result.reason;
@@ -487,6 +559,7 @@ impl AgentManager {
                 transcript: child.transcript.clone(),
                 allowance: child.allowance,
                 calls: child.calls,
+                usage: child.usage,
                 model: child.instance.definition.model.clone(),
             });
             // Spend reconciliation (§24.1): the body's own count is
@@ -502,11 +575,25 @@ impl AgentManager {
                     .as_ref()
                     .and_then(|record| record.transcript.as_deref())
                     .is_some_and(transcript_holds_progress);
+            // G3: a body that never built a result (or never saw a usage
+            // line) inherits the registry meter — the wrapper's own tally
+            // died with it, the meter did not.
+            if result.usage.is_none() {
+                let metered = record
+                    .as_ref()
+                    .map(|record| record.usage)
+                    .unwrap_or_default();
+                result.usage = metered.reported();
+            }
             // A recoverable ending with progress advertises the handle
             // for a manual re-entry; terminal-by-intent endings
             // (finished, cancelled, failed without progress) settle
             // handle-free.
-            if matches!(reason, ExitReason::Transient | ExitReason::Exhausted(_)) && progress_made {
+            if matches!(
+                reason,
+                ExitReason::Transient | ExitReason::Exhausted(_) | ExitReason::Normal
+            ) && progress_made
+            {
                 let handle = record
                     .as_ref()
                     .and_then(|record| escalate_handle(record, id, reason, tool_calls));
@@ -515,7 +602,13 @@ impl AgentManager {
                 }
             }
             let status = result.status;
-            let resumable = result.resume.is_some();
+            // Exactly one of the two is ever true: a continuation target
+            // (`Completed` with a transcript) is not a `resume_from` one.
+            let continuable = result
+                .resume
+                .as_ref()
+                .is_some_and(|handle| handle.continuable);
+            let resumable = result.resume.is_some() && !continuable;
             inner.result_order.push_back(id.clone());
             inner.names.insert(id.clone(), name.to_string());
             inner.results.insert(id.clone(), result);
@@ -528,6 +621,7 @@ impl AgentManager {
                 // fetches.
                 usage: inner.results.get(id).and_then(|result| result.usage),
                 resumable,
+                continuable,
             };
             if inner.notices.len() >= MAX_NOTICES {
                 inner.overflowed += 1;
@@ -571,7 +665,8 @@ impl AgentManager {
     /// through `finish` — `cancel` itself only signals the token.
     /// Point-in-time view for the `delegate` `list` action (§24.3): live children
     /// with their progress label, plus retained terminal results with
-    /// their resumability. Sorted by id for a stable render.
+    /// their resumability and, for finished ones, their continuality. Sorted
+    /// by id for a stable render.
     pub fn snapshot(&self) -> Vec<ChildInfo> {
         let inner = self.lock();
         let mut out: Vec<ChildInfo> = inner
@@ -583,16 +678,22 @@ impl AgentManager {
                 state: AgentState::Running,
                 progress: child.instance.progress.clone(),
                 resumable: false,
+                continuable: false,
                 transcript: child.transcript.clone(),
             })
             .collect();
         out.extend(inner.results.iter().map(|(id, result)| {
+            let continuable = result
+                .resume
+                .as_ref()
+                .is_some_and(|handle| handle.continuable);
             ChildInfo {
                 agent_id: id.clone(),
                 name: inner.names.get(id).cloned().unwrap_or_default(),
                 state: result.status,
                 progress: None,
-                resumable: result.resume.is_some(),
+                resumable: result.resume.is_some() && !continuable,
+                continuable,
                 transcript: result
                     .resume
                     .as_ref()
@@ -632,6 +733,59 @@ impl AgentManager {
             .running
             .get(id)
             .and_then(|child| child.instance.progress.clone())
+    }
+
+    /// Deliver one message to a child's manager-owned inbox (spec G1).
+    /// Passthrough for the running (steer) or finishing (follow-up) paths:
+    /// a running child gets the message pushed to its per-child queue —
+    /// the body's turn loop drains steering at the next round boundary
+    /// (same [`QueueMsg`](crate::protocol::QueueMsg) machinery the main
+    /// turn uses, via `steering_rx`) and follow-ups at the next turn
+    /// boundary. A retained terminal result reports [`SendError::NotRunning`]
+    /// and the caller decides whether to continue it from its own
+    /// handle; an id neither running nor retained is [`SendError::Unknown`]
+    /// naming the ids this manager does know.
+    pub fn send(
+        &self,
+        id: &AgentId,
+        message: String,
+        delivery: SendDelivery,
+    ) -> Result<SendOutcome, SendError> {
+        let inner = self.lock();
+        if let Some(child) = inner.running.get(id) {
+            let tx = match delivery {
+                SendDelivery::Steer => &child.steering_tx,
+                SendDelivery::FollowUp => &child.followup_tx,
+            };
+            return match tx.try_send(crate::protocol::QueueMsg::Content(message)) {
+                Ok(()) => Ok(match delivery {
+                    SendDelivery::Steer => SendOutcome::Steered,
+                    SendDelivery::FollowUp => SendOutcome::Queued,
+                }),
+                // Receiver dropped: the body ended between the status
+                // lookup and this send — same reply as a terminal child.
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::NotRunning),
+                Err(mpsc::error::TrySendError::Full(_)) => Err(SendError::Full),
+            };
+        }
+        if inner.results.contains_key(id) {
+            return Err(SendError::NotRunning);
+        }
+        // Not here at all: name what is, so the error can point at the
+        // right child without a second `action=list` round trip.
+        let mut known: Vec<(AgentId, String)> = inner
+            .running
+            .iter()
+            .map(|(id, child)| (id.clone(), child.instance.definition.name.clone()))
+            .collect();
+        known.extend(
+            inner
+                .results
+                .keys()
+                .map(|id| (id.clone(), inner.names.get(id).cloned().unwrap_or_default())),
+        );
+        known.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        Err(SendError::Unknown { known })
     }
 
     /// Drain queued completion notices, oldest first. Results stay

@@ -175,29 +175,32 @@ pub fn builtin_tools(delegation_enabled: bool) -> Vec<ToolDefinition> {
             },
         },
     ];
-    // Sub-agent delegation (§10): background spawn + bounded wait + stop.
+    // Sub-agent delegation (§10): background spawn + bounded wait + stop
+    // + list + send into an existing child (spec G1/G2).
     // Registered only in daemon-linked processes with the kill switch unset;
     // OneShot/direct runs reject it at dispatch (no manager to spawn into).
-    // One tool with an `action` — spawn/wait/stop/list share one definition,
-    // so the schema stays small and the four verbs stay discoverable.
+    // One tool with an `action` — spawn/wait/stop/list/send share one
+    // definition, so the schema stays small and the verbs stay discoverable.
     if delegation_enabled {
         tools.push(ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "delegate".to_string(),
-                description: "Sub-agents (spawn/wait/stop/list). spawn runs a task as a background child (explorer: code understanding; reviewer: review; tester: runs tests) and returns its agent_id. Children never see this conversation — pass a self-contained task + file_hints.".to_string(),
+                description: "Sub-agents (spawn/wait/stop/list/send). spawn runs a task as a background child (explorer: code understanding; reviewer: review; tester: runs tests) and returns its agent_id. Children never see this conversation — pass a self-contained task + file_hints. send delivers a message to an existing child: steer injects it before the running child's next model call, follow_up queues it for the child's next turn, and a finished child continues with its history intact as a new generation.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["spawn", "wait", "stop", "list"], "description": "spawn a child, wait for/fetch its result, stop it, or list this session's children" },
+                        "action": { "type": "string", "enum": ["spawn", "wait", "stop", "list", "send"], "description": "spawn a child, wait for/fetch its result, stop it, list this session's children, or send a message to one" },
                         "agent": { "type": "string", "description": "spawn: agent name — explorer | reviewer | tester" },
                         "task": { "type": "string", "description": "spawn: what the child must do, self-contained: findings, file paths, risks; it cannot see this conversation; required unless resume_from is set" },
                         "file_hints": { "type": "array", "items": { "type": "string" }, "description": "spawn: workspace-relative paths the child should start from" },
                         "model": { "type": "string", "description": "spawn: optional model override (provider/model, same knob as --model); omit to inherit this turn's model" },
                         "resume_from": { "type": "string", "description": "spawn: prior agent_id to resume from its transcript as a new generation" },
                         "instruction": { "type": "string", "description": "spawn: refined instruction folded into the resume continuation note" },
-                        "agent_id": { "type": "string", "description": "wait/stop: id returned by a spawn" },
-                        "wait_seconds": { "type": "integer", "description": "wait: how long to wait for completion (0-120, default 0)" }
+                        "agent_id": { "type": "string", "description": "wait/stop/send: agent id returned by a spawn" },
+                        "wait_seconds": { "type": "integer", "description": "wait: how long to wait for completion (0-120, default 0)" },
+                        "message": { "type": "string", "description": "send: the message for the child — steer: a course correction the child applies before its next model call; follow_up: a new task for its next turn; a completed child runs it as a follow-up with history intact" },
+                        "delivery": { "type": "string", "enum": ["steer", "follow_up"], "description": "send: steer (default) injects into a running turn; follow_up queues a new turn after it ends" }
                     },
                     "required": ["action"]
                 }),
@@ -239,7 +242,7 @@ pub fn native_tool_guidelines(delegation_enabled: bool) -> Vec<&'static str> {
         rules.extend([
             "Sub-agents (delegate) never see this conversation — write self-contained tasks, file_hints give starting paths",
             "Delegate spawn returns immediately and completions announce at the next turn boundary — wait only when the result gates the next step",
-            "Pass delegate resume_from on a finished child to continue from its transcript; inherit the turn's model unless the task needs a different trade-off",
+            "delegate send steers a running child (applied at its next round boundary) or continues a finished one with history intact; resume_from only re-enters an interrupted or spent child",
             "Background tasks announce at the next turn boundary too — poll output/wait only when the result gates the next step",
         ]);
     }
