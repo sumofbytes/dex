@@ -131,6 +131,10 @@ pub(crate) fn run_ratatui_repl_with_remote(
             if remote.app.tick_notice() {
                 dirty = true;
             }
+            // Same for a finished agent/task folding into the done tally.
+            if remote.app.tick_done_fade() {
+                dirty = true;
+            }
             // Footer branch/dirty arrives via the background git task (no per-frame
             // `git` or HTTP on the UI thread, even when busy).
             // Animation heartbeat while a turn runs: at most ~8 fps, and

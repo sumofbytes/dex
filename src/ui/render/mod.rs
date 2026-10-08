@@ -232,12 +232,82 @@ fn render_child_view(f: &mut ratatui::Frame, area: Rect, app: &mut App, idx: usi
     TranscriptView::render(f, chunks[1], &mut app.child_logs[idx].app);
 }
 
+/// Split the agents/tasks activity strip off the bottom row, under the
+/// footer, while there is something to show and room to spare: the strip
+/// is the first thing shed on a short terminal (before the queue strip and
+/// the composer). Returns the remaining area for the regular layout.
+fn split_activity_strip(f: &mut ratatui::Frame, area: Rect, app: &App) -> Rect {
+    let Some(line) = super::status::activity_line(app, input_content_width(area.width)) else {
+        return area;
+    };
+    if area.height <= minimum_view_height(0, 0) + MIN_TRANSCRIPT_ROWS {
+        return area;
+    }
+    let strip = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(line)
+            .block(Block::default().padding(super::style::status_padding())),
+        strip,
+    );
+    Rect::new(area.x, area.y, area.width, area.height - 1)
+}
+
+/// Background task output view (Ctrl+B / `/tasks <id>`): a title row (id,
+/// command, state, key hints) over the log's plain lines, bottom-anchored
+/// so new output stays in sight unless scrolled up. Lines are clipped, not
+/// wrapped — they are raw process output, often wide tables/progress bars.
+fn render_task_view(f: &mut ratatui::Frame, area: Rect, app: &mut App, idx: usize) {
+    use ratatui::text::{Line, Span};
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let body_h = chunks[1].height as usize;
+    let log = &app.task_logs[idx];
+    let running = app.tasks.iter().any(|t| t.id == log.id && !t.done);
+    let max_scroll = log.lines.len().saturating_sub(body_h);
+    app.task_scroll = app.task_scroll.min(max_scroll);
+    let end = log.lines.len() - app.task_scroll;
+    let start = end.saturating_sub(body_h);
+    let width = input_content_width(area.width);
+    let title = Line::from(vec![
+        Span::styled(format!("\u{27f3} {}", log.id), fg(theme::accent_fg())),
+        Span::styled(
+            format!(
+                " \u{b7} {}",
+                super::status::truncate_display(&log.command, 40)
+            ),
+            fg(theme::muted_fg()),
+        ),
+        if running {
+            Span::styled("  \u{25cf} running", fg(theme::success_fg()))
+        } else {
+            Span::styled("  \u{25cb} done", fg(theme::muted_fg()))
+        },
+        Span::styled(
+            "   Esc close \u{b7} Ctrl+B next \u{b7} PgUp/PgDn scroll",
+            fg(theme::muted_fg()),
+        ),
+    ]);
+    let body: Vec<Line> = log.lines[start..end]
+        .iter()
+        .map(|line| Line::raw(super::status::truncate_display(line, width)))
+        .collect();
+    let block = Block::default().padding(super::style::status_padding());
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(title).block(block.clone()),
+        chunks[0],
+    );
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(body).block(block),
+        chunks[1],
+    );
+}
+
 pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     // Ratatui only repaints cells the widget touches; without a full clear,
     // a shorter line (e.g. fewer queued-steer badges, or a shrunken input)
     // would leave trailing chars from the previous frame.
     f.render_widget(Clear, area);
+    let area = split_activity_strip(f, area, app);
     // ponytail: wrap the composer once — the rows size the layout and
     // render it, so don't pay `render_input` twice per frame.
     let (input_lines, input_cursor) = render_input(
@@ -267,6 +337,12 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
         .and_then(|id| app.child_logs.iter().position(|log| &log.id == id))
     {
         render_child_view(f, layout.transcript, app, idx);
+    } else if let Some(idx) = app
+        .task_view
+        .as_ref()
+        .and_then(|id| app.task_logs.iter().position(|log| &log.id == id))
+    {
+        render_task_view(f, layout.transcript, app, idx);
     } else {
         TranscriptView::render(f, layout.transcript, app);
     }

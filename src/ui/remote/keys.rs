@@ -105,6 +105,9 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
     if remote.app.child_view.is_some() && handle_child_view_key(remote, key) {
         return;
     }
+    if remote.app.task_view.is_some() && handle_task_view_key(remote, key) {
+        return;
+    }
     let app = &mut remote.app;
 
     // Idle double Ctrl+C guard: any non-Ctrl+C key cancels the pending quit.
@@ -145,6 +148,11 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         // yet there is nothing to show — say so instead of staying silent.
         KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
             toggle_child_view(remote);
+        }
+        // Ctrl+B: open the background task output view (the task twin of
+        // Ctrl+A).
+        KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
+            toggle_task_view(remote);
         }
         // Alt+V: cycle the user voice color. Global chrome like Ctrl+T
         // above, so it sits before the slash-popup arm and works with the
@@ -202,7 +210,10 @@ fn toggle_child_view(remote: &mut RemoteApp) {
         return;
     }
     match remote.app.child_logs.first() {
-        Some(log) => remote.app.child_view = Some(log.id.clone()),
+        Some(log) => {
+            remote.app.child_view = Some(log.id.clone());
+            remote.app.task_view = None;
+        }
         None => {
             remote.app.notice = Some((
                 "no child transcripts — spawn one with delegate".to_string(),
@@ -248,6 +259,69 @@ fn cycle_child_view(remote: &mut RemoteApp) {
         .and_then(|id| logs.iter().position(|log| &log.id == id))
         .map_or(0, |idx| (idx + 1) % logs.len());
     remote.app.child_view = Some(logs[idx].id.clone());
+}
+
+/// Ctrl+B: open the newest task log — a running one first, since that is
+/// the output worth watching — or close the open one. With no log a notice
+/// explains why nothing happened.
+fn toggle_task_view(remote: &mut RemoteApp) {
+    let app = &mut remote.app;
+    if app.task_view.take().is_some() {
+        return;
+    }
+    let running = |id: &str| app.tasks.iter().any(|t| t.id == id && !t.done);
+    let pick = app
+        .task_logs
+        .iter()
+        .rev()
+        .find(|log| running(&log.id))
+        .or_else(|| app.task_logs.last());
+    match pick {
+        Some(log) => {
+            app.task_view = Some(log.id.clone());
+            app.task_scroll = 0;
+            app.child_view = None;
+        }
+        None => {
+            app.notice = Some((
+                "no background tasks — the model starts them with task".to_string(),
+                Instant::now(),
+            ));
+        }
+    }
+}
+
+/// Keys while the task output view is open, mirroring the child view: Esc
+/// closes, Ctrl+B cycles logs (closing after the last), arrows/PgUp/PgDn
+/// scroll, everything else is swallowed. Ctrl+C passes through so a turn
+/// can still be cancelled.
+fn handle_task_view_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    let app = &mut remote.app;
+    let scroll = |app: &mut crate::ui::App, delta: isize| {
+        app.task_scroll = app.task_scroll.saturating_add_signed(delta);
+    };
+    match key.code {
+        KeyCode::Esc => app.task_view = None,
+        KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
+            let logs = &app.task_logs;
+            let next = app
+                .task_view
+                .as_ref()
+                .and_then(|id| logs.iter().position(|log| &log.id == id))
+                .map_or(0, |idx| idx + 1);
+            app.task_view = logs.get(next).map(|log| log.id.clone());
+            app.task_scroll = 0;
+        }
+        KeyCode::PageUp => scroll(app, 20),
+        KeyCode::PageDown => scroll(app, -20),
+        KeyCode::Up => scroll(app, 1),
+        KeyCode::Down => scroll(app, -1),
+        _ => {}
+    }
+    true
 }
 
 fn scroll_child_view(remote: &mut RemoteApp, delta: i32) {
@@ -452,9 +526,10 @@ fn handle_question_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
                 question.record_and_advance(answer);
             }
         }
-        // Esc over an open child view closes the view, not the question.
-        KeyCode::Esc if app.child_view.is_some() => {
+        // Esc over an open child/task view closes the view, not the question.
+        KeyCode::Esc if app.child_view.is_some() || app.task_view.is_some() => {
             app.child_view = None;
+            app.task_view = None;
         }
         KeyCode::Esc => {
             let Some(question) = front_question_mut(app) else {
@@ -561,12 +636,13 @@ fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
             };
             resolve_approval(app, decision);
         }
-        // Esc over an open child view closes the view, not the approval:
+        // Esc over an open child/task view closes the view, not the approval:
         // a user reading a transcript presses Esc to leave, and a silent
         // deny from the pre-overlay ordering was the bug this guard fixes.
         // The approval stays parked, the overlay still shows.
-        KeyCode::Esc if app.child_view.is_some() => {
+        KeyCode::Esc if app.child_view.is_some() || app.task_view.is_some() => {
             app.child_view = None;
+            app.task_view = None;
         }
         KeyCode::Esc => {
             resolve_approval(app, ApprovalDecision::Deny);

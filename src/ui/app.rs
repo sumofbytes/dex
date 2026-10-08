@@ -270,7 +270,16 @@ pub(crate) struct App {
     /// `TaskFinished`, plus capped output logs fed by `TaskOutput`.
     pub(crate) tasks: Vec<TaskChip>,
     pub(crate) task_logs: Vec<TaskLog>,
+    /// The open task output view (Ctrl+B / `/tasks <id>`): the task id shown
+    /// in the transcript window, like `child_view` for agents.
     pub(crate) task_view: Option<String>,
+    /// Lines scrolled up from the task log's tail; 0 follows new output.
+    pub(crate) task_scroll: usize,
+    /// Agents/tasks that finished this turn, named in the activity strip
+    /// until [`DONE_FADE`] passes, then folded into `done_tally`. Both reset
+    /// when the next turn starts.
+    pub(crate) recent_done: Vec<(String, Instant)>,
+    pub(crate) done_tally: usize,
     pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
@@ -429,6 +438,9 @@ impl App {
             tasks: Vec::new(),
             task_logs: Vec::new(),
             task_view: None,
+            task_scroll: 0,
+            recent_done: Vec::new(),
+            done_tally: 0,
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -540,6 +552,16 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Fold finished agents/tasks older than [`DONE_FADE`] into the tally,
+    /// returning true so the caller redraws the activity strip.
+    pub(crate) fn tick_done_fade(&mut self) -> bool {
+        let before = self.recent_done.len();
+        self.recent_done.retain(|(_, at)| at.elapsed() < DONE_FADE);
+        let faded = before - self.recent_done.len();
+        self.done_tally += faded;
+        faded > 0
     }
 }
 
@@ -777,3 +799,7 @@ impl Command for EnableMouseScroll {
 
 /// How long a status-bar notice (e.g. copy confirmation) stays visible.
 pub(crate) const NOTICE_LIFETIME: Duration = Duration::from_secs(2);
+
+/// How long a finished agent/task stays named in the activity strip before
+/// it collapses into the `✓N done` tally.
+pub(crate) const DONE_FADE: Duration = Duration::from_secs(10);

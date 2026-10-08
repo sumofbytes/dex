@@ -291,6 +291,10 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             }
         }
         StreamEvent::AgentCompleted { agent_id, .. } => {
+            if let Some(chip) = remote.app.agents.iter().find(|a| a.id == agent_id) {
+                let name = chip.name.clone();
+                remote.app.recent_done.push((name, Instant::now()));
+            }
             remote.app.agents.retain(|a| a.id != agent_id);
             if remote.app.agents.is_empty() {
                 remote.live_children.store(false, Ordering::SeqCst);
@@ -331,8 +335,9 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
             }
         }
         StreamEvent::TaskFinished { id, .. } => {
-            if let Some(chip) = remote.app.tasks.iter_mut().find(|t| t.id == id) {
+            if let Some(chip) = remote.app.tasks.iter_mut().find(|t| t.id == id && !t.done) {
                 chip.done = true;
+                remote.app.recent_done.push((id, Instant::now()));
             }
         }
         StreamEvent::TaskOutput { id, chunk } => append_task_log(remote, &id, &chunk),
@@ -661,7 +666,9 @@ fn append_task_log(remote: &mut RemoteApp, id: &str, chunk: &str) {
             remote.app.task_logs.last_mut().expect("just pushed")
         }
     };
-    for line in chunk.split('\n') {
+    // Stored plain: the task view and `/tasks` print these as text, and a
+    // raw escape would leave `[31m` debris once the cell filter drops ESC.
+    for line in crate::render::format::strip_ansi(chunk).split('\n') {
         log.lines.push(line.to_string());
     }
     if log.lines.len() > crate::ui::TASK_LOG_MAX_LINES {

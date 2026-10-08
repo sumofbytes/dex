@@ -123,7 +123,7 @@ fn read_short_arg(obj: Option<&serde_json::Map<String, Value>>) -> Option<String
 
 /// Drop ANSI escape sequences (colors, cursor movement) and carriage
 /// returns/bells so tool output renders as plain text in the transcript.
-fn strip_ansi(text: &str) -> String {
+pub fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {

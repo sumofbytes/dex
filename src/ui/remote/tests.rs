@@ -1195,9 +1195,14 @@ fn task_events_drive_chips_and_capped_logs() {
         },
     );
     assert!(remote.app.tasks[0].done);
-    let status = crate::ui::status::ui_status(&remote.app);
-    assert!(status.contains("tasks:"), "{status}");
-    assert!(status.contains("task-1"), "{status}");
+    assert_eq!(remote.app.recent_done.len(), 1);
+    let strip: String = crate::ui::status::activity_line(&remote.app, 80)
+        .expect("a just-finished task shows in the strip")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(strip.contains("✓ task-1"), "{strip}");
 }
 
 #[test]
@@ -1228,6 +1233,58 @@ fn child_view_toggles_and_cycles_with_keys() {
     handle_key(&mut remote, key(KeyCode::PageUp, KeyModifiers::empty()));
     assert!(!remote.app.child_logs[0].app.autoscroll);
     assert_eq!(remote.app.scroll, 0);
+}
+
+#[test]
+fn task_view_opens_cycles_and_scrolls_with_keys() {
+    let mut remote = test_remote();
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(remote.app.task_view.is_none());
+    assert!(remote.app.notice.is_some(), "no tasks: a notice explains");
+    for id in ["task-1", "task-2"] {
+        input::handle_stream_event(
+            &mut remote,
+            crate::protocol::StreamEvent::TaskStarted {
+                id: id.into(),
+                command: "make".into(),
+            },
+        );
+    }
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskOutput {
+            id: "task-1".into(),
+            chunk: "\x1b[31merror\x1b[0m: boom".into(),
+        },
+    );
+    assert_eq!(remote.app.task_logs[0].lines, vec!["error: boom"]);
+    input::handle_stream_event(
+        &mut remote,
+        crate::protocol::StreamEvent::TaskFinished {
+            id: "task-2".into(),
+            status: "exit 0".into(),
+            exit_code: Some(0),
+            duration: 1.0,
+        },
+    );
+    // Ctrl+B prefers the newest running task over a newer finished one.
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-1"));
+    // Scroll keys move the task log, not the parent transcript.
+    handle_key(&mut remote, key(KeyCode::PageUp, KeyModifiers::empty()));
+    assert_eq!(remote.app.task_scroll, 20);
+    assert_eq!(remote.app.scroll, 0);
+    // Ctrl+B cycles, then closes after the last log.
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-2"));
+    assert_eq!(remote.app.task_scroll, 0);
+    handle_key(&mut remote, key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(remote.app.task_view.is_none());
+    // `/tasks <id>` opens a specific log; Esc closes it.
+    crate::ui::slash::handle_slash(&mut remote.app, "/tasks task-2");
+    assert_eq!(remote.app.task_view.as_deref(), Some("task-2"));
+    handle_key(&mut remote, key(KeyCode::Esc, KeyModifiers::empty()));
+    assert!(remote.app.task_view.is_none());
 }
 
 fn child_line(id: &str) -> crate::protocol::StreamEvent {
