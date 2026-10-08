@@ -376,6 +376,7 @@ pub(crate) fn bootstrap(
         task_scroll: 0,
         recent_done: Vec::new(),
         done_tally: 0,
+        activity_shed: false,
         busy: false,
         autoscroll: true,
         scroll: 0,

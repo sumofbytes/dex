@@ -305,7 +305,28 @@ fn left_pieces(app: &App, cwd: bool, branch: bool) -> Vec<Piece> {
             pieces.extend(b);
         }
     }
+    if let Some(running) = shed_activity_piece(app) {
+        push_sep(&mut pieces);
+        pieces.push(running);
+    }
     pieces
+}
+
+/// `⟡2 ⟳1`: live agents and running tasks, only while a short terminal has
+/// shed the activity strip — otherwise nothing would show them.
+fn shed_activity_piece(app: &App) -> Option<Piece> {
+    if !app.activity_shed {
+        return None;
+    }
+    let agents = app.agents.len();
+    let tasks = app.tasks.iter().filter(|t| !t.done).count();
+    let text = match (agents, tasks) {
+        (0, 0) => return None,
+        (a, 0) => format!("⟡{a}"),
+        (0, t) => format!("⟳{t}"),
+        (a, t) => format!("⟡{a} ⟳{t}"),
+    };
+    Some((text, fg(theme::accent_fg())))
 }
 
 /// Pressure + spend, right side, then the connection badge when remote.

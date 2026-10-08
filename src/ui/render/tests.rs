@@ -3384,11 +3384,9 @@ fn task_view_shows_the_log_tail_in_the_transcript_window() {
         command: "npm run dev".into(),
         done: false,
     });
-    app.task_logs.push(super::super::TaskLog {
-        id: "task-1".into(),
-        command: "npm run dev".into(),
-        lines: (0..100).map(|i| format!("line {i}")).collect(),
-    });
+    let mut log = super::super::TaskLog::new("task-1".into(), "npm run dev".into());
+    log.lines = (0..100).map(|i| format!("line {i}")).collect();
+    app.task_logs.push(log);
     app.task_view = Some("task-1".into());
     app.task_scroll = 500;
     let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3410,6 +3408,62 @@ fn task_view_shows_the_log_tail_in_the_transcript_window() {
         .map(|p| buf[p].symbol().to_string())
         .collect();
     assert!(all.contains("line 99"), "following the tail");
+}
+
+#[test]
+fn finished_task_view_title_uses_the_done_glyph() {
+    let mut app = test_app();
+    app.tasks.push(super::super::TaskChip {
+        id: "task-2".into(),
+        command: "make".into(),
+        done: true,
+    });
+    app.task_logs
+        .push(super::super::TaskLog::new("task-2".into(), "make".into()));
+    app.task_view = Some("task-2".into());
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    let buf = term.backend().buffer();
+    let title: String = (0..80).map(|x| buf[(x, 0)].symbol()).collect();
+    assert!(title.contains("✓ task-2 · make"), "{title}");
+    assert!(title.contains("○ done"), "{title}");
+    assert!(!title.contains('⟳'), "{title}");
+}
+
+#[test]
+fn short_terminal_sheds_the_strip_before_the_queue_and_counts_in_the_footer() {
+    let mut app = test_app();
+    app.agents.push(super::super::AgentChip {
+        id: "a1".into(),
+        name: "explorer".into(),
+        tool: None,
+    });
+    app.tasks.push(super::super::TaskChip {
+        id: "task-1".into(),
+        command: "npm test".into(),
+        done: false,
+    });
+    app.pending_steering.push("steer one".into());
+    app.pending_steering.push("steer two".into());
+    let queue = queue_metrics_of(&queue_groups(&app));
+    let needed =
+        minimum_view_height(activity_height(queue.items, queue.rows), 0) + MIN_TRANSCRIPT_ROWS;
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, needed)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    assert!(app.activity_shed, "no room: the strip goes first");
+    let buf = term.backend().buffer();
+    let screen: String = (0..needed)
+        .flat_map(|y| (0..80).map(move |x| (x, y)))
+        .map(|p| buf[p].symbol().to_string())
+        .collect();
+    assert!(screen.contains("steer two"), "queue strip kept: {screen}");
+    assert!(!screen.contains("⟡ explorer"), "{screen}");
+    assert!(footer_text(&app, 200).contains("⟡1 ⟳1"));
+    // One more row fits the strip; the footer drops the count.
+    let mut term = ratatui::Terminal::new(TestBackend::new(80, needed + 1)).unwrap();
+    term.draw(|f| view(f, &mut app)).unwrap();
+    assert!(!app.activity_shed);
+    assert!(!footer_text(&app, 200).contains("⟡1"));
 }
 
 #[test]

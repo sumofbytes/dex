@@ -147,12 +147,12 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
         // Ctrl+A: toggle the child transcript view (plan §20). With no log
         // yet there is nothing to show — say so instead of staying silent.
         KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
-            toggle_child_view(remote);
+            open_child_view(remote);
         }
         // Ctrl+B: open the background task output view (the task twin of
         // Ctrl+A).
         KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
-            toggle_task_view(remote);
+            open_task_view(remote);
         }
         // Alt+V: cycle the user voice color. Global chrome like Ctrl+T
         // above, so it sits before the slash-popup arm and works with the
@@ -203,12 +203,10 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
     }
 }
 
-/// Ctrl+A (plan §20 child view): open the first child log, or close the
-/// open one. With no log there is nothing to show — a notice explains it.
-fn toggle_child_view(remote: &mut RemoteApp) {
-    if remote.app.child_view.take().is_some() {
-        return;
-    }
+/// Ctrl+A (plan §20 child view): open the first child log, replacing an
+/// open task view (inside the child view Ctrl+A cycles instead). With no log
+/// there is nothing to show — a notice explains it.
+fn open_child_view(remote: &mut RemoteApp) {
     match remote.app.child_logs.first() {
         Some(log) => {
             remote.app.child_view = Some(log.id.clone());
@@ -227,11 +225,14 @@ fn toggle_child_view(remote: &mut RemoteApp) {
 /// Ctrl+A cycles among logs (closing when only one), the scroll keys drive
 /// the child log's own scrollback, and everything else is swallowed — the
 /// view is modal over the parent transcript. Returns false only for Ctrl+C
-/// so the main match still cancels a turn. While an approval is pending the
+/// (so the main match still cancels a turn) and Ctrl+B (switch to the task
+/// view). While an approval is pending the
 /// overlay handles keys first (see `handle_key`), with Esc closing this
 /// view rather than denying.
 fn handle_child_view_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
-    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if (matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL))
+        || (matches!(key.code, KeyCode::Char('b')) && key.modifiers == KeyModifiers::CONTROL)
+    {
         return false;
     }
     match key.code {
@@ -262,13 +263,11 @@ fn cycle_child_view(remote: &mut RemoteApp) {
 }
 
 /// Ctrl+B: open the newest task log — a running one first, since that is
-/// the output worth watching — or close the open one. With no log a notice
-/// explains why nothing happened.
-fn toggle_task_view(remote: &mut RemoteApp) {
+/// the output worth watching — replacing an open child view (inside the task
+/// view Ctrl+B cycles instead). With no log a notice explains why nothing
+/// happened.
+fn open_task_view(remote: &mut RemoteApp) {
     let app = &mut remote.app;
-    if app.task_view.take().is_some() {
-        return;
-    }
     let running = |id: &str| app.tasks.iter().any(|t| t.id == id && !t.done);
     let pick = app
         .task_logs
@@ -294,9 +293,11 @@ fn toggle_task_view(remote: &mut RemoteApp) {
 /// Keys while the task output view is open, mirroring the child view: Esc
 /// closes, Ctrl+B cycles logs (closing after the last), arrows/PgUp/PgDn
 /// scroll, everything else is swallowed. Ctrl+C passes through so a turn
-/// can still be cancelled.
+/// can still be cancelled, and Ctrl+A so it switches to the child view.
 fn handle_task_view_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) -> bool {
-    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if (matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL))
+        || (matches!(key.code, KeyCode::Char('a')) && key.modifiers == KeyModifiers::CONTROL)
+    {
         return false;
     }
     let app = &mut remote.app;

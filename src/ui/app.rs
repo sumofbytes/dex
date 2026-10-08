@@ -275,11 +275,15 @@ pub(crate) struct App {
     pub(crate) task_view: Option<String>,
     /// Lines scrolled up from the task log's tail; 0 follows new output.
     pub(crate) task_scroll: usize,
-    /// Agents/tasks that finished this turn, named in the activity strip
-    /// until [`DONE_FADE`] passes, then folded into `done_tally`. Both reset
-    /// when the next turn starts.
+    /// Agents/tasks that finished since the user's last prompt, named in the
+    /// activity strip until [`DONE_FADE`] passes, then folded into
+    /// `done_tally`. Both reset when the user submits a prompt and after a
+    /// journal replay (historical finishes are not news).
     pub(crate) recent_done: Vec<(String, Instant)>,
     pub(crate) done_tally: usize,
+    /// Set by the renderer when the activity strip had something to show
+    /// but no room, so the footer carries a compact running count instead.
+    pub(crate) activity_shed: bool,
     pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
@@ -441,6 +445,7 @@ impl App {
             task_scroll: 0,
             recent_done: Vec::new(),
             done_tally: 0,
+            activity_shed: false,
             busy: false,
             autoscroll: true,
             scroll: 0,
@@ -711,12 +716,72 @@ pub(crate) struct TaskChip {
     pub(crate) done: bool,
 }
 
-/// One background task's output log: id + command plus capped raw lines fed
-/// by live `TaskOutput` events. Read-only in v1; stopping is the model's job.
+/// One background task's output log: id + command plus capped plain lines
+/// fed by live `TaskOutput` events. Read-only in v1; stopping is the model's
+/// job.
 pub(crate) struct TaskLog {
     pub(crate) id: String,
     pub(crate) command: String,
+    /// Plain lines; while `partial` is non-empty the last one is its render.
     pub(crate) lines: Vec<String>,
+    /// Raw text after the last `\n`: chunk boundaries fall anywhere (mid
+    /// line, mid escape), so the open line is kept raw and re-rendered as
+    /// the next chunk completes it.
+    pub(crate) partial: String,
+}
+
+impl TaskLog {
+    pub(crate) fn new(id: String, command: String) -> Self {
+        Self {
+            id,
+            command,
+            lines: Vec::new(),
+            partial: String::new(),
+        }
+    }
+
+    /// Append one output chunk, then trim to [`TASK_LOG_MAX_LINES`].
+    /// Returns how many lines the log grew by before trimming, so a
+    /// scrolled-up view can hold its place.
+    pub(crate) fn push_chunk(&mut self, chunk: &str) -> usize {
+        let before = self.lines.len();
+        if !self.partial.is_empty() {
+            self.lines.pop();
+        }
+        self.partial.push_str(chunk);
+        if let Some(end) = self.partial.rfind('\n') {
+            let rest = self.partial.split_off(end + 1);
+            for line in self.partial[..end].split('\n') {
+                self.lines.push(render_task_line(line));
+            }
+            self.partial = rest;
+        }
+        // A `\r` redraw (progress bar) replaces the open line: keep only
+        // the last frame so a newline-free bar cannot grow without bound.
+        let body = self.partial.strip_suffix('\r').unwrap_or(&self.partial);
+        if let Some(cr) = body.rfind('\r') {
+            self.partial.drain(..cr);
+        }
+        if !self.partial.is_empty() {
+            self.lines.push(render_task_line(&self.partial));
+        }
+        let grown = self.lines.len().saturating_sub(before);
+        if self.lines.len() > TASK_LOG_MAX_LINES {
+            let excess = self.lines.len() - TASK_LOG_MAX_LINES;
+            self.lines.drain(..excess);
+        }
+        grown
+    }
+}
+
+/// One raw output line as the terminal would leave it: a `\r` returns to
+/// the line start, so only the text after the last one shows (a trailing
+/// `\r` of CRLF ends the line), and escapes are stripped — the task view
+/// prints plain text, where a raw escape would leave `[31m` debris.
+fn render_task_line(raw: &str) -> String {
+    let raw = raw.strip_suffix('\r').unwrap_or(raw);
+    let shown = raw.rsplit('\r').next().unwrap_or(raw);
+    crate::render::format::strip_ansi(shown)
 }
 
 /// Line cap per task log: a runaway task must not grow client memory.
