@@ -3476,3 +3476,45 @@ fn context_share_keeps_a_decimal_below_ten_percent() {
     assert_eq!(pct_label(0, 1_000_000), "0.0%");
     assert_eq!(pct_label(5, 0), "<0.1%");
 }
+
+#[test]
+fn typescript_block_colors_keywords_strings_and_comments() {
+    let code = "export const x: number = 1; // hi\nlet s = \"a\";";
+    let rows = highlight_code_block("typescript", code).expect("highlight");
+    let colored = |text: &str| {
+        rows.iter()
+            .flatten()
+            .any(|s| s.content.as_ref() == text && s.style.fg.is_some())
+    };
+    for token in ["const", "1", "// hi", "let", "\"a\""] {
+        assert!(colored(token), "{token} should be colored: {rows:?}");
+    }
+}
+
+#[test]
+fn tsx_block_colors_jsx_and_code_after_it() {
+    // `tsx` normalizes to `typescript`; JSX must not leave the rest bare.
+    let code = "const App = () => <div className=\"x\">hi</div>;\nconst n = 42;";
+    let rows = highlight_code_block("typescript", code).expect("highlight");
+    let colored = |text: &str| {
+        rows.iter()
+            .flatten()
+            .any(|s| s.content.as_ref() == text && s.style.fg.is_some())
+    };
+    for token in ["div", "\"x\"", "42"] {
+        assert!(colored(token), "{token} should be colored: {rows:?}");
+    }
+}
+
+#[test]
+fn typescript_literal_with_type_keeps_string_color() {
+    // A type inside a template literal must not strip the literal's color.
+    let code = "const s = `n ${(v as Foo).x} items`;";
+    let rows = highlight_code_block("typescript", code).expect("highlight");
+    assert!(
+        rows.iter()
+            .flatten()
+            .any(|s| s.content.contains(" items`") && s.style.fg.is_some()),
+        "template tail should stay colored: {rows:?}"
+    );
+}

@@ -3,11 +3,13 @@
 //! stream printer. Tone colors come from [`super::palette`]; the pure
 //! language map and fallback lexer live in [`super::lang`].
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui_markdown::highlight::{CodeHighlighter, StyleSegment, TreeSitterHighlighter};
+use ratatui_markdown::highlight::{
+    highlight_to_style, CodeHighlighter, StyleSegment, TreeSitterHighlighter, HIGHLIGHT_NAMES,
+};
 use ratatui_markdown::CodeColors;
 
 use super::lang::{fallback_enabled, fallback_segments, normalize_code_lang, Tone};
@@ -74,11 +76,75 @@ pub fn shared_highlighter() -> Arc<TreeSitterHighlighter> {
         .clone()
 }
 
+/// TypeScript's bundled query only covers TS-specific syntax (types,
+/// modifiers) and upstream layers it over JavaScript's (`inherits: ecma`);
+/// `ratatui_markdown` uses it alone, leaving keywords, strings and comments
+/// bare. Compose both here — TS first, so its captures win on overlap.
+/// `tsx` fences use this grammar too: its error recovery keeps JSX colored,
+/// while the TSX grammar's tag captures have no color in `HIGHLIGHT_NAMES`.
+fn typescript_segments(code: &str) -> Vec<StyleSegment> {
+    use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+
+    static CONFIG: OnceLock<Option<HighlightConfiguration>> = OnceLock::new();
+    static HIGHLIGHTER: Mutex<Option<Highlighter>> = Mutex::new(None);
+    static COLORS: OnceLock<CodeColors> = OnceLock::new();
+
+    let fallback = || shared_highlighter().highlight("typescript", code);
+    let Some(config) = CONFIG.get_or_init(|| {
+        let query = format!(
+            "{}\n{}",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            tree_sitter_javascript::HIGHLIGHT_QUERY
+        );
+        let mut config = HighlightConfiguration::new(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            &query,
+            "",
+            "",
+        )
+        .ok()?;
+        config.configure(HIGHLIGHT_NAMES);
+        Some(config)
+    }) else {
+        return fallback();
+    };
+    let colors = COLORS.get_or_init(code_colors);
+    let mut guard = HIGHLIGHTER.lock().unwrap_or_else(|e| e.into_inner());
+    let hl = guard.get_or_insert_with(Highlighter::new);
+    let Ok(events) = hl.highlight(config, code.as_bytes(), None, |_| None) else {
+        return fallback();
+    };
+    let mut segs = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for event in events {
+        match event {
+            Ok(HighlightEvent::Source { start, end }) if start != end => {
+                let style = stack
+                    .last()
+                    .map(|&idx| highlight_to_style(idx, colors))
+                    .unwrap_or_default();
+                segs.push(StyleSegment { start, end, style });
+            }
+            Ok(HighlightEvent::Source { .. }) => {}
+            Ok(HighlightEvent::HighlightStart(h)) => stack.push(h.0),
+            Ok(HighlightEvent::HighlightEnd) => {
+                stack.pop();
+            }
+            Err(_) => break,
+        }
+    }
+    segs
+}
+
 /// Shared highlighter segments, sorted and stripped of `BOLD`: the crate's
 /// default theme bolds keywords, which fills code-heavy screens — code
 /// tokens keep color only (bold is markdown emphasis, not chrome).
 pub fn highlight_segments(lang: &str, code: &str) -> Vec<StyleSegment> {
-    let mut segs = shared_highlighter().highlight(lang, code);
+    let mut segs = match lang {
+        "typescript" => typescript_segments(code),
+        _ => shared_highlighter().highlight(lang, code),
+    };
     segs.sort_by_key(|s| (s.start, s.end));
     for seg in &mut segs {
         seg.style = seg.style.remove_modifier(Modifier::BOLD);

@@ -91,11 +91,18 @@ fn truncate_cols(s: &str, max_cols: usize) -> String {
 /// shown.
 fn read_short_arg(obj: Option<&serde_json::Map<String, Value>>) -> Option<String> {
     let get = |k: &str| obj.and_then(|o| o.get(k)).and_then(Value::as_str);
-    if let Some(paths) = obj.and_then(|o| o.get("paths")).and_then(Value::as_array) {
+    // Empty `paths` and blank `glob` are treated as absent by the tool
+    // (tools/read.rs), so the row must fall through to `path` instead of
+    // printing `0 files` or an empty arg.
+    if let Some(paths) = obj
+        .and_then(|o| o.get("paths"))
+        .and_then(Value::as_array)
+        .filter(|p| !p.is_empty())
+    {
         let n = paths.len();
         return Some(format!("{} file{}", n, if n == 1 { "" } else { "s" }));
     }
-    if let Some(glob) = get("glob") {
+    if let Some(glob) = get("glob").filter(|g| !g.trim().is_empty()) {
         return Some(glob.to_string());
     }
     let path = get("path").or_else(|| get("file"))?;

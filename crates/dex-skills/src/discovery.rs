@@ -81,19 +81,9 @@ pub async fn discover_skills_fresh_async(dirs: &[PathBuf]) -> Vec<Skill> {
         let mut subdirs = Vec::new();
         while let Ok(Some(entry)) = rd.next_entry().await {
             let path = entry.path();
-            // is_dir via file_type to avoid extra stat; fallback to path check.
-            // Symlinked skill dirs (common for `.agents/skills`) report
-            // `is_symlink`, not `is_dir`; follow them like the sync scan.
-            let is_dir = match entry.file_type().await {
-                Ok(ft) if ft.is_dir() => true,
-                Ok(ft) if ft.is_symlink() => tokio::fs::metadata(&path)
-                    .await
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false),
-                Ok(_) => false,
-                Err(_) => path.is_dir(),
-            };
-            if is_dir {
+            // `metadata` follows symlinks, so symlinked skill dirs (common
+            // for `.agents/skills`) count like the sync scan; broken links don't.
+            if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
                 subdirs.push(path);
             }
         }

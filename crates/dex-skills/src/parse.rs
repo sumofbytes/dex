@@ -25,15 +25,21 @@ pub fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     if lines.next()?.trim() != "---" {
         return None;
     }
+    let indent = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
     let mut name = None;
     let mut description = None;
+    // Top-level indent is the first key's; files that indent every key
+    // still parse, while deeper `name:` under e.g. `metadata:` is nested.
+    let mut top: Option<usize> = None;
     while let Some(line) = lines.next() {
         if line.trim() == "---" {
             break;
         }
-        // Only top-level keys: indented `name:` under e.g. `metadata:` must
-        // not shadow the skill's own name.
-        if line.starts_with([' ', '\t']) {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let top = *top.get_or_insert(indent(line));
+        if indent(line) != top {
             continue;
         }
         let Some((key, val)) = line.split_once(':') else {
@@ -45,27 +51,37 @@ pub fn parse_frontmatter(content: &str) -> Option<(String, String)> {
         }
         let val = val.trim();
         // Block scalars (`>`, `|`, with chomping marks) and plain multi-line
-        // values: gather the indented continuation lines, joined by spaces.
-        let mut parts: Vec<String> = Vec::new();
-        let block = val.starts_with('>') || val.starts_with('|');
-        if !block && !val.is_empty() {
-            parts.push(val.to_string());
-        }
+        // values: gather the continuation lines indented past the key.
+        let block = val.chars().next().filter(|c| matches!(c, '>' | '|'));
+        let mut body: Vec<&str> = Vec::new();
         while let Some(next) = lines.peek() {
-            if next.trim() == "---" || !(next.starts_with([' ', '\t']) || next.trim().is_empty()) {
+            if next.trim() == "---" || !(indent(next) > top || next.trim().is_empty()) {
                 break;
             }
-            let t = next.trim();
-            if !t.is_empty() {
-                parts.push(t.to_string());
-            }
-            lines.next();
+            body.push(lines.next().unwrap_or_default());
         }
-        let value = if block {
-            parts.join(" ")
-        } else {
-            let joined = parts.join(" ");
-            unquote(&joined)
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        let value = match block {
+            // Literal: keep line breaks, strip the block's own indentation.
+            Some('|') => {
+                let base = body
+                    .iter()
+                    .find(|l| !l.trim().is_empty())
+                    .map_or(0, |l| indent(l));
+                // Clamp to each line's own indent so an under-indented line
+                // (invalid YAML) loses whitespace, never text.
+                body.iter()
+                    .map(|l| l.get(base.min(indent(l))..).unwrap_or("").trim_end())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            Some(_) => fold(&body),
+            None => {
+                let first = (!val.is_empty()).then_some(val);
+                unquote(&fold(&first.into_iter().chain(body).collect::<Vec<_>>()))
+            }
         };
         if key == "name" {
             name = Some(value);
@@ -75,6 +91,29 @@ pub fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     }
     let name = name?;
     Some((name, description.unwrap_or_default()))
+}
+
+/// YAML line folding: lines join with spaces, a blank line is a paragraph
+/// break (`\n`).
+fn fold(lines: &[&str]) -> String {
+    let mut out = String::new();
+    let mut breaks = 0;
+    for line in lines.iter().map(|l| l.trim()) {
+        if line.is_empty() {
+            breaks += 1;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(&if breaks > 0 {
+                "\n".repeat(breaks)
+            } else {
+                " ".to_string()
+            });
+        }
+        breaks = 0;
+        out.push_str(line);
+    }
+    out
 }
 
 /// Name validity shared by both parse paths; an invalid name warns to stderr
@@ -133,6 +172,29 @@ mod tests {
         let (_, desc) =
             parse_frontmatter("---\nname: a\ndescription: first\n  second\n---\n").unwrap();
         assert_eq!(desc, "first second");
+    }
+
+    #[test]
+    fn frontmatter_keeps_literal_breaks_and_folded_paragraphs() {
+        let doc =
+            "---\nname: a\ndescription: |\n  - use for X\n    - nested\n  - not for Y\n\n---\n";
+        let (_, desc) = parse_frontmatter(doc).unwrap();
+        assert_eq!(desc, "- use for X\n  - nested\n- not for Y");
+        let doc = "---\nname: a\ndescription: >-\n  one\n  two\n\n  three\n---\n";
+        let (_, desc) = parse_frontmatter(doc).unwrap();
+        assert_eq!(desc, "one two\nthree");
+        let doc = "---\nname: a\ndescription: |\n    deep\n  shallow\n---\n";
+        let (_, desc) = parse_frontmatter(doc).unwrap();
+        assert_eq!(desc, "deep\nshallow");
+    }
+
+    #[test]
+    fn frontmatter_accepts_uniformly_indented_keys() {
+        let doc = "---\n  name: real\n  description: d\n  metadata:\n    name: fake\n---\n";
+        assert_eq!(
+            parse_frontmatter(doc),
+            Some(("real".to_string(), "d".to_string()))
+        );
     }
 
     #[test]
