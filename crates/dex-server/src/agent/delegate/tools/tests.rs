@@ -1,12 +1,16 @@
 //! Tests, split out of the module body so it stays implementation.
 
 use super::*;
+use crate::agent::delegate::manager::MAX_CHILDREN;
 use crate::agent::state::GlobalCancellation;
 
 #[test]
-fn delegation_is_one_tool_with_four_actions() {
+fn delegation_is_one_tool_with_five_actions() {
     assert!(is_delegation(DELEGATION_TOOL));
-    assert_eq!(DELEGATION_ACTIONS, ["spawn", "wait", "stop", "list"]);
+    assert_eq!(
+        DELEGATION_ACTIONS,
+        ["spawn", "wait", "stop", "list", "send"]
+    );
     assert!(!is_delegation("read"));
     assert!(!is_delegation("mcp__x__y"));
 }
@@ -238,7 +242,7 @@ async fn parent_cancel_ends_delegate_output_without_touching_children() {
             SpawnMeta::fresh(),
             // Ends only through its own token: parent cancel must not
             // reach it.
-            |token, _progress, _id| async move {
+            |token, _progress, _id, _queues| async move {
                 token.cancelled().await;
                 AgentResult {
                     status: AgentState::Cancelled,
@@ -325,6 +329,7 @@ async fn resume_messages_reapplies_persona_and_appends_nudge() {
             remaining_budget: Some(7),
             model: None,
             note: "timed out after 3 tool calls; continue from the transcript".to_string(),
+            continuable: false,
         },
         instruction: Some("skip the build".to_string()),
         file_hints: Vec::new(),
@@ -396,6 +401,7 @@ async fn resume_messages_rejects_an_empty_transcript_loudly() {
             remaining_budget: None,
             model: None,
             note: "interrupted".to_string(),
+            continuable: false,
         },
         instruction: None,
         file_hints: Vec::new(),
@@ -417,6 +423,7 @@ fn resume_nudge_carries_reason_instruction_and_budget() {
             model: None,
             note: "turn budget exhausted after 50 tool calls; continue from the transcript"
                 .to_string(),
+            continuable: false,
         },
         instruction: Some("skip the build".to_string()),
         file_hints: vec![PathBuf::from("src/main.rs")],
@@ -462,6 +469,7 @@ fn resume_conversation_prepends_system_prompt_and_journals_without_it() {
             remaining_budget: Some(5),
             model: None,
             note: "timed out".to_string(),
+            continuable: false,
         },
         instruction: Some("skip the build".to_string()),
         file_hints: Vec::new(),
@@ -523,7 +531,7 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
                 .next()
                 .unwrap(),
             SpawnMeta::fresh(),
-            move |_, _, _| {
+            move |_, _, _, _| {
                 let transcript = held.clone();
                 async move {
                     AgentResult {
@@ -541,6 +549,7 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
                             model: None,
                             note: "timed out after 4 tool calls; continue from the transcript"
                                 .to_string(),
+                            continuable: false,
                         }),
                     }
                 }
@@ -564,7 +573,7 @@ async fn resolve_resume_handle_prefers_retained_then_rejects_live() {
                 .next()
                 .unwrap(),
             SpawnMeta::fresh(),
-            |token, _, _| async move {
+            |token, _, _, _| async move {
                 token.cancelled().await;
                 AgentResult {
                     status: AgentState::Cancelled,
@@ -657,7 +666,7 @@ async fn delegate_list_reports_live_retained_and_disk() {
                 .next()
                 .unwrap(),
             SpawnMeta::fresh(),
-            |token, _, _| async move {
+            |token, _, _, _| async move {
                 token.cancelled().await;
                 AgentResult {
                     status: AgentState::Cancelled,
@@ -678,7 +687,7 @@ async fn delegate_list_reports_live_retained_and_disk() {
                 .next()
                 .unwrap(),
             SpawnMeta::fresh(),
-            |_, _, _| async {
+            |_, _, _, _| async {
                 AgentResult {
                     status: AgentState::Completed,
                     summary: "ok".to_string(),
@@ -774,4 +783,343 @@ end
     assert!(text.contains("no children today"), "reason: {text}");
     std::fs::remove_dir_all(&root).ok();
     crate::extensions::global_manager().reset_for_tests().await;
+}
+
+// ---- spec G1/G2: the delegate send action ----
+
+fn send_ctx(manager: &AgentManager, session_path: PathBuf) -> Arc<AgentTurnContext> {
+    Arc::new(AgentTurnContext {
+        depth: 0,
+        session_id: "sess".to_string(),
+        session_path,
+        cwd: String::new(),
+        config: Arc::new(crate::llm::config::tests::test_cfg()),
+        manager: manager.clone(),
+        session_approvals: HashSet::new(),
+        child_approvals: None,
+        child_questions: None,
+        live_approvals: None,
+    })
+}
+
+fn send_args(agent_id: &str, message: &str, delivery: Option<&str>) -> Map<String, Value> {
+    let mut args = Map::new();
+    args.insert("agent_id".into(), json!(agent_id));
+    args.insert("message".into(), json!(message));
+    if let Some(delivery) = delivery {
+        args.insert("delivery".into(), json!(delivery));
+    }
+    args
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delegate_send_requires_message_and_valid_delivery() {
+    let manager = AgentManager::new("sess");
+    let ctx = send_ctx(&manager, PathBuf::new());
+    // Message is required.
+    let mut args = Map::new();
+    args.insert("agent_id".into(), json!("sess-0"));
+    let error = delegate_send(&ctx, &args, &Policy::trusted())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("message"), "{error}");
+    // Delivery is a closed enum with `steer` as the default spelling.
+    let error = delegate_send(
+        &ctx,
+        &send_args("sess-0", "hi", Some("interrupt")),
+        &Policy::trusted(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("follow_up"), "{error}");
+    // Unknown id names the known ones (none here — the list word only).
+    let error = delegate_send(&ctx, &send_args("sess-0", "hi", None), &Policy::trusted())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown agent id"), "{error}");
+    assert!(error.to_string().contains("action=list"), "{error}");
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delegate_send_unknown_names_known_children() {
+    let manager = AgentManager::new("sess");
+    let ctx = send_ctx(&manager, PathBuf::new());
+    manager
+        .spawn(
+            &super::super::builtin_definitions()
+                .into_iter()
+                .next()
+                .unwrap(),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async {
+                AgentResult {
+                    status: AgentState::Completed,
+                    summary: "first".to_string(),
+                    error: None,
+                    usage: None,
+                    reason: ExitReason::Normal,
+                    tool_calls: 0,
+                    resume: None,
+                }
+            },
+        )
+        .unwrap();
+    let error = delegate_send(&ctx, &send_args("sess-9", "hi", None), &Policy::trusted())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("sess-0 (explorer)"), "{error}");
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delegate_send_steer_reaches_the_running_child() {
+    // Tool → manager → body queue wiring in one pass: the child body is
+    // the one element that can read the queue, and the send delivers into
+    // it before the body's first read.
+    let manager = AgentManager::new("sess");
+    let ctx = send_ctx(&manager, PathBuf::new());
+    let id = manager
+        .spawn(
+            &super::super::builtin_definitions()
+                .into_iter()
+                .next()
+                .unwrap(),
+            SpawnMeta::fresh(),
+            |_, _, _, mut queues| async move {
+                let steer = match queues.steering_rx.recv().await {
+                    Some(crate::protocol::QueueMsg::Content(text)) => text,
+                    other => format!("{other:?}"),
+                };
+                AgentResult {
+                    status: AgentState::Completed,
+                    summary: format!("saw: {steer}"),
+                    error: None,
+                    usage: None,
+                    reason: ExitReason::Normal,
+                    tool_calls: 0,
+                    resume: None,
+                }
+            },
+        )
+        .unwrap();
+    let out = delegate_send(
+        &ctx,
+        &send_args(&id.to_string(), "pivot east", None),
+        &Policy::trusted(),
+    )
+    .await
+    .unwrap();
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["accepted"], "steer");
+    // Delivery: "follow_up" reports Queued instead.
+    let out = delegate_send(
+        &ctx,
+        &send_args(&id.to_string(), "chain", Some("follow_up")),
+        &Policy::trusted(),
+    )
+    .await
+    .unwrap();
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["accepted"], "follow_up");
+    match manager.wait(&id, Duration::from_secs(5)).await {
+        WaitOutcome::Finished(result) => assert_eq!(result.summary, "saw: pivot east"),
+        other => panic!("expected Finished, got {other:?}"),
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delegate_send_to_failed_child_points_at_resume_from() {
+    let manager = AgentManager::new("sess");
+    let ctx = send_ctx(&manager, PathBuf::new());
+    let id = manager
+        .spawn(
+            &super::super::builtin_definitions()
+                .into_iter()
+                .next()
+                .unwrap(),
+            SpawnMeta::fresh(),
+            |_, _, _, _| async {
+                AgentResult {
+                    status: AgentState::Failed,
+                    summary: String::new(),
+                    error: Some("boom".to_string()),
+                    usage: None,
+                    reason: ExitReason::Permanent,
+                    tool_calls: 0,
+                    resume: None,
+                }
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        manager.wait(&id, Duration::from_secs(5)).await,
+        WaitOutcome::Finished(_)
+    ));
+    let error = delegate_send(
+        &ctx,
+        &send_args(&id.to_string(), "again", None),
+        &Policy::trusted(),
+    )
+    .await
+    .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("resume_from"), "{error}");
+    assert!(!text.contains("{id}"), "{error}");
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delegate_continue_at_capacity_rejects_like_a_spawn() {
+    // spec §7: a send into a finished child spawns a continuation; when
+    // the session sits at MAX_CHILDREN the send fails closed with the
+    // same AtCapacity error any spawn would hit.
+    let dir = PathBuf::from(format!("/tmp/dex-send-capacity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let manager = AgentManager::new("sess");
+    let def = super::super::builtin_definitions()
+        .into_iter()
+        .next()
+        .unwrap();
+    let id = manager
+        .spawn(
+            &def,
+            SpawnMeta {
+                generation: 0,
+                parent_session: Some(dir.join("sess.jsonl")),
+                remaining_budget: None,
+            },
+            |_, _, _, _| async {
+                AgentResult {
+                    status: AgentState::Completed,
+                    summary: "findings".to_string(),
+                    error: None,
+                    reason: ExitReason::Normal,
+                    tool_calls: 0,
+                    resume: None,
+                    usage: None,
+                }
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        manager.wait(&id, Duration::from_secs(5)).await,
+        WaitOutcome::Finished(_)
+    ));
+    // Fill every slot with parked children; the continuation spawn has
+    // nowhere to go. Cancellation tokens are test-only imports here, so
+    // the parked body is inlined.
+    for _ in 0..MAX_CHILDREN {
+        manager
+            .spawn(&def, SpawnMeta::fresh(), |token, _, _, _| async move {
+                token.cancelled().await;
+                AgentResult {
+                    status: AgentState::Cancelled,
+                    summary: String::new(),
+                    error: Some("child saw cancel".to_string()),
+                    reason: ExitReason::ShutDown,
+                    tool_calls: 0,
+                    resume: None,
+                    usage: None,
+                }
+            })
+            .unwrap();
+    }
+    let ctx = send_ctx(&manager, dir.join("sess.jsonl"));
+    let error = delegate_send(
+        &ctx,
+        &send_args(&id.to_string(), "continue", None),
+        &Policy::trusted(),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("at child capacity"), "{message}");
+    assert!(
+        error.to_string().contains("wait for or cancel"),
+        "{message}"
+    );
+    manager.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn continuable_nudge_reads_as_followup_not_interruption() {
+    // G2: a send into a finished child gets a follow-up nudge — never the
+    // "You were interrupted" frame.
+    let request = ResumeRequest {
+        handle: ResumeHandle {
+            agent_id: AgentId("sess-7".to_string()),
+            transcript: PathBuf::from("/tmp/x.jsonl"),
+            generation: 1,
+            remaining_budget: None,
+            model: Some("opencode/m-cheap".to_string()),
+            note: "reported a final result after 3 tool calls".to_string(),
+            continuable: true,
+        },
+        instruction: Some("also check spec checks".to_string()),
+        file_hints: Vec::new(),
+    };
+    let nudge = resume_nudge(&request);
+    assert!(!nudge.contains("interrupted"), "{nudge}");
+    assert!(
+        nudge.contains("You already reported your final result"),
+        "{nudge}"
+    );
+    assert!(
+        nudge.contains("Follow-up: also check spec checks"),
+        "{nudge}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resume_messages_labels_continuation_followup() {
+    // Same journal rules as resume; the label on the wire is `follow-up`.
+    let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = PathBuf::from("/tmp/dex-supervision-continuable-msgs");
+    let parent_path = dir.join("sess.jsonl");
+    std::fs::create_dir_all(dir.join("agents")).unwrap();
+    let mut child = Session::child(
+        &parent_path,
+        "/tmp/dex-supervision-continuable-msgs",
+        "sess-6",
+        "tester",
+        0,
+    )
+    .unwrap();
+    let _ = child.turn_event("turn_start");
+    child
+        .append_message(&ChatMessage::user("check the build"))
+        .unwrap();
+    child
+        .append_message(&ChatMessage::assistant("looks green"))
+        .unwrap();
+    drop(child);
+    let def = super::super::builtin_definitions()
+        .into_iter()
+        .find(|def| def.name == "tester")
+        .unwrap();
+    let request = ResumeRequest {
+        handle: ResumeHandle {
+            agent_id: AgentId("sess-6".to_string()),
+            transcript: Session::child_path(&parent_path, "sess-6", "tester", 0),
+            generation: 0,
+            remaining_budget: None,
+            model: None,
+            note: "reported a final result after 2 tool calls".to_string(),
+            continuable: true,
+        },
+        instruction: Some("now lint it".to_string()),
+        file_hints: Vec::new(),
+    };
+    let messages = resume_messages(&def, &request).unwrap();
+    let last = messages.last().unwrap();
+    assert_eq!(last.name.as_deref(), Some("follow-up"), "{:?}", last.name);
+    let text = last.content.as_deref().unwrap();
+    assert!(text.contains("now lint it"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

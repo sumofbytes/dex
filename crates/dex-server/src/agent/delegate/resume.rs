@@ -1,6 +1,9 @@
 //! Manual re-entry (§24.3): [`ResumeHandle`] advertises a recoverable
 //! ending, `delegate(resume_from)` re-enters it as generation + 1.
-//! Resume is spawn-with-history, not a new operation.
+//! Resume is spawn-with-history, not a new operation. A `Completed` child
+//! advertises a *continuation* handle (`continuable: true`) instead:
+//! `delegate(send)` follows up over the kept history as generation + 1
+//! with a fresh budget — same machinery, different nudge.
 
 use std::path::PathBuf;
 
@@ -28,6 +31,11 @@ pub struct ResumeHandle {
     pub model: Option<String>,
     /// Why it died, in one line — becomes the interruption nudge.
     pub note: String,
+    /// True when this handle addresses a *continuation* (spec G2): a
+    /// `Completed` child re-entered with `delegate(send)` — the nudge is a
+    /// follow-up over kept history, not an interruption, and the continue
+    /// always runs a full budget. `resume_from` requires `false`.
+    pub continuable: bool,
 }
 
 /// A manual re-entry (§24.3): replay `handle.transcript` and append the
@@ -48,6 +56,9 @@ pub fn resume_note(reason: ExitReason, tool_calls: u32) -> String {
         n => format!("{n} tool calls"),
     };
     match reason {
+        // Continuation handles (spec G2): the child reported a final
+        // result; the parent's `send` starts a follow-up over the history.
+        ExitReason::Normal => format!("reported a final result after {calls}"),
         ExitReason::Transient => format!("interrupted after {calls}; retry from the transcript"),
         ExitReason::Exhausted(ExhaustKind::Budget) => {
             format!("turn budget exhausted after {calls}; continue from the transcript")

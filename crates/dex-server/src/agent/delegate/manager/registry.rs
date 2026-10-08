@@ -10,6 +10,7 @@ use super::super::resume::ResumeHandle;
 use super::lifecycle::EventHook;
 use super::lifecycle::ProgressReporter;
 use super::lifecycle::TaskEventHook;
+use crate::protocol::QueueMsg;
 use crate::runtime::console::CancellationToken;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -17,6 +18,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Completion announcement queued for the Phase 6 drain site (parent turn
@@ -35,6 +37,12 @@ pub struct AgentNotice {
     /// `[agent …] finished …` prefix the TUI matches on (§24.1:
     /// resumability is notice prose only, zero wire change).
     pub resumable: bool,
+    /// True when the retained result is a `Completed` child whose handle is
+    /// a *continuation* target: the prose advertises `delegate(send)` into
+    /// its history instead of a `resume_from` re-entry. Exactly one of
+    /// `resumable`/`continuable` is ever true (the manager's `finish` sets
+    /// both from the same handle).
+    pub continuable: bool,
 }
 
 impl AgentNotice {
@@ -64,6 +72,11 @@ impl AgentNotice {
                 " · resumable with delegate(resume_from = \"{0}\")",
                 self.agent_id
             ));
+        } else if self.continuable {
+            text.push_str(&format!(
+                " · continuable with delegate(send, agent_id = \"{0}\")",
+                self.agent_id
+            ));
         }
         text
     }
@@ -76,7 +89,11 @@ pub struct ChildInfo {
     pub name: String,
     pub state: AgentState,
     pub progress: Option<String>,
+    /// `resume_from`-capable ending (interrupted / budgeted, with progress).
     pub resumable: bool,
+    /// A `Completed` child whose handle addresses a continuation via
+    /// `delegate(send)`.
+    pub continuable: bool,
     pub transcript: Option<PathBuf>,
 }
 
@@ -129,6 +146,90 @@ impl fmt::Display for SpawnError {
 }
 
 impl std::error::Error for SpawnError {}
+
+/// Which of a child's two queues a `send` message lands in: `Steer` is
+/// drained by the child's *running* turn at its next round boundary (the
+/// same [`QueueMsg`] channel semantics the main turn drains), `FollowUp`
+/// waits for the current turn to end and chains a new one on the same
+/// history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendDelivery {
+    Steer,
+    FollowUp,
+}
+
+impl SendDelivery {
+    /// The `delegate` `send` `delivery` argument strings; `"steer"` is
+    /// the default.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "steer" => Some(Self::Steer),
+            "follow_up" => Some(Self::FollowUp),
+            _ => None,
+        }
+    }
+}
+
+/// Success of [`AgentManager::send`](super::lifecycle::AgentManager::send):
+/// which queue actually took the message (the recorded answer to "will the
+/// child see it mid-turn or next turn?").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Injected into the running turn; consumed at the next drain point.
+    Steered,
+    /// Parked on the follow-up queue; a new turn runs it when this turn ends.
+    Queued,
+}
+
+/// `send` rejection. `Unknown` names the ids the manager does know so the
+/// caller's error can point at the right child without another round trip;
+/// `NotRunning` means the id is known but terminal (the tool layer can then
+/// try the continue-from-completed path); `Full` is a full mailbox.
+#[derive(Debug)]
+pub enum SendError {
+    Unknown { known: Vec<(AgentId, String)> },
+    NotRunning,
+    Full,
+}
+
+impl fmt::Display for SendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown { known } => {
+                let list = known
+                    .iter()
+                    .map(|(id, name)| format!("{id} ({name})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "unknown agent id: delegate action=list shows this session's children (known: {list})")
+            }
+            Self::NotRunning => {
+                write!(f, "agent is not running; its result is retained")
+            }
+            Self::Full => {
+                write!(f, "queue is full; wait (action=wait) before sending more")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
+/// Capacity of each per-child queue (same widening margin the main turn's
+/// steering queue uses): a hand-send burst parks instead of wedging the
+/// parent, and past it `send` fails loudly.
+pub const QUEUE_CAPACITY: usize = 16;
+
+/// The manager-owned input channels handed to a child body at launch:
+/// `steering_rx` is the same `mpsc::Receiver<QueueMsg>` shape the main turn
+/// drains before every model call, `followup_rx` chains new turns when the
+/// current one ends. The matching senders live in the registry entry, so
+/// `AgentManager::send` never races the body's lifetime by value alone.
+pub struct ChildQueues {
+    pub steering_rx: mpsc::Receiver<QueueMsg>,
+    pub followup_rx: mpsc::Receiver<QueueMsg>,
+}
+
 pub struct Inner {
     pub session: String,
     pub next_counter: u64,
@@ -178,6 +279,10 @@ pub struct Record {
     pub transcript: Option<PathBuf>,
     /// Registry-side spend meter (§24.1), surviving body death.
     pub calls: u32,
+    /// Registry-side token spend snapshot at `finish` time (spec G3):
+    /// results that carry none fold this in so synthesized endings report
+    /// what their LLM calls cost.
+    pub usage: AgentUsage,
     /// The tool-round budget this child was launched under: the resume's
     /// remaining budget, else the definition's cap; `None` = uncapped.
     pub allowance: Option<usize>,
@@ -188,7 +293,10 @@ pub struct Record {
 }
 
 /// The resume handle for a recorded child, transcript-gated (§24.1):
-/// only a child whose file is known can advertise a re-entry.
+/// only a child whose file is known can advertise a re-entry. A `Completed`
+/// child (`ExitReason::Normal`) advertises a *continuation* handle instead:
+/// it re-enters via `delegate(send)` with a fresh budget and the parent's
+/// current approvals, not via `resume_from`.
 pub fn escalate_handle(
     record: &Record,
     id: &AgentId,
@@ -196,7 +304,14 @@ pub fn escalate_handle(
     tool_calls: u32,
 ) -> Option<ResumeHandle> {
     let transcript = record.transcript.clone()?;
-    let remaining = advertised_remaining(record.allowance, tool_calls as usize);
+    let continuable = matches!(reason, ExitReason::Normal);
+    let remaining = if continuable {
+        // A continuation is a new task over kept history: it always runs
+        // the full tool budget, never the parent generation's leftover.
+        None
+    } else {
+        advertised_remaining(record.allowance, tool_calls as usize)
+    };
     Some(ResumeHandle {
         agent_id: id.clone(),
         transcript,
@@ -204,6 +319,7 @@ pub fn escalate_handle(
         remaining_budget: remaining,
         model: record.model.clone(),
         note: resume_note(reason, tool_calls),
+        continuable,
     })
 }
 
@@ -211,6 +327,24 @@ pub struct RunningChild {
     pub instance: AgentInstance,
     pub token: CancellationToken,
     pub handle: Option<JoinHandle<AgentResult>>,
+    /// `steer` inbox: `AgentManager::send` tries into this; the body's
+    /// turn loop drains it at round boundaries (spec G1).
+    pub steering_tx: mpsc::Sender<QueueMsg>,
+    /// `follow_up` inbox: drained after the current turn ends, before the
+    /// child is retired.
+    pub followup_tx: mpsc::Sender<QueueMsg>,
+    /// Registry-side token spend (spec G3): the body's sink consumer folds
+    /// every `SinkLine::Usage` in here, so the wrapper can attach spend to
+    /// synthesized results (panic, timeout, cancel) whose body never got
+    /// to build a result. Mirrors the `calls` meter, which lives here for
+    /// the same reason.
+    pub usage: AgentUsage,
+    /// False once the body has made its final inbox drain: `send` refuses
+    /// rather than park a message nobody will read.
+    pub accepting: bool,
+    /// Set by the body's sink consumer registration; notified once its
+    /// channel has drained (see `ProgressReporter::expect_sink_drain`).
+    pub sink_drained: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// Derived transcript path (§16 + §24.3 generations), when the spawn
     /// knew the parent session file. `None` for test-built managers —
     /// then no resume handle is ever advertised.
@@ -231,9 +365,10 @@ pub struct RunningChild {
 /// One attempt's built future.
 pub type BodyFuture = Pin<Box<dyn Future<Output = AgentResult> + Send>>;
 
-/// Spawn bodies (FnOnce) funnel through the shared launch path in this shape.
+/// Spawn bodies (FnOnce) funnel through the shared launch path in this
+/// shape: token, reporter, id, and the per-child steering queues.
 pub type BoxRun =
-    Box<dyn FnOnce(CancellationToken, ProgressReporter, AgentId) -> BodyFuture + Send>;
+    Box<dyn FnOnce(CancellationToken, ProgressReporter, AgentId, ChildQueues) -> BodyFuture + Send>;
 
 /// What `spawn` needs beyond definition + seed (§24.3): which generation
 /// this child is, where its transcript derives from, and the tool-round

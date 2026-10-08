@@ -10,11 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The one model-facing delegation tool (§10, §24.3): `delegate` with an
-/// `action` — spawn (the only mode; background), wait, stop, list.
+/// `action` — spawn (the only mode; background), wait, stop, list, send.
 pub const DELEGATION_TOOL: &str = "delegate";
 
 /// The actions `delegate`'s `action` argument accepts, in schema order.
-pub const DELEGATION_ACTIONS: [&str; 4] = ["spawn", "wait", "stop", "list"];
+/// `send` delivers a message to an existing child (spec G1/G2): steer a
+/// running turn, queue a follow-up turn, or continue a finished child.
+pub const DELEGATION_ACTIONS: [&str; 5] = ["spawn", "wait", "stop", "list", "send"];
 
 /// The `wait` action's ceiling (§10.2): a bounded poll-wait, never an
 /// unbounded block.
@@ -25,9 +27,11 @@ pub const MAX_WAIT_SECONDS: u64 = 120;
 /// at depth 0; each delegation runs at parent depth + 1.
 pub const MAX_AGENT_DEPTH: u32 = 3;
 
-/// Sleep quantum of the `wait` action's poll loop: steering sent during a
-/// wait is acted on at most one interval after the wait returns (§10.2 — the
-/// documented latency, not a claimed interrupt that cannot exist).
+/// Sleep quantum of the `wait` action's poll loop: a `send` toward a
+/// running child is consumed by the child's own turn loop at its next
+/// round boundary; a parent polling `wait` observes the new state at
+/// most one interval later (§10.2 — the documented latency, not a claimed
+/// interrupt that cannot exist).
 pub const WAIT_SLEEP: Duration = Duration::from_millis(250);
 
 pub fn is_delegation(name: &str) -> bool {

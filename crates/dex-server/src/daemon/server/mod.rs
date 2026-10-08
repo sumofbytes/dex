@@ -59,5 +59,4 @@ pub fn router(state: Arc<DaemonState>) -> Router {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests;

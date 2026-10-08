@@ -900,6 +900,30 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>();
         assert_eq!(actions, ["spawn", "output", "stop", "wait", "list"]);
+        // `delegate` stays ONE tool; `send` rides the same action enum, and
+        // the send arguments are the id + message + optional delivery.
+        let delegate = enabled
+            .iter()
+            .find(|t| t.function.name == "delegate")
+            .expect("delegate in enabled catalog");
+        let actions = delegate.function.parameters["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(actions, ["spawn", "wait", "stop", "list", "send"]);
+        let props = &delegate.function.parameters["properties"];
+        assert!(props["message"].is_object(), "send needs its message arg");
+        assert_eq!(
+            props["delivery"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            ["steer", "follow_up"]
+        );
         assert!(enabled.iter().any(|t| t.function.name == "delegate"));
         // edit rides the pi-style canonical batch shape: schema shows
         // `path` + `edits[]` only, legacy single-pair spellings are

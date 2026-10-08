@@ -24,8 +24,8 @@ pub(crate) use definition::{
 pub(crate) use exit::{classify_body_error, transcript_holds_progress, ExhaustKind, ExitReason};
 #[allow(unused_imports)]
 pub(crate) use manager::{
-    AgentEvent, AgentManager, AgentNotice, ChildInfo, ProgressReporter, SpawnError, SpawnMeta,
-    TaskEvent, TaskEventHook, WaitOutcome,
+    AgentEvent, AgentManager, AgentNotice, ChildInfo, ChildQueues, ProgressReporter, SendDelivery,
+    SendError, SendOutcome, SpawnError, SpawnMeta, TaskEvent, TaskEventHook, WaitOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use model::{AgentId, AgentInstance, AgentResult, AgentState, AgentUsage, ContextSeed};

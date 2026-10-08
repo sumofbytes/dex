@@ -21,7 +21,7 @@ schema):
 | `grep`             | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
 | `find`             | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
 | `ls`               | List files and directories (`path`, default `.`).                                                                                                                                                                                                                        |
-| `delegate`*        | Sub-agents via `action`: `spawn` a background child (`explorer`/`reviewer`/`tester`; `resume_from` continues one, `model` overrides — else inherits; resume keeps prior pick), `wait` (bounded, ≤120 s) fetches its result, `stop` cancels it, `list` shows this session's children (live, finished, interrupted on-disk). Daemon sessions only. |
+| `delegate`*        | Sub-agents via `action`: `spawn` a background child (`explorer`/`reviewer`/`tester`; `resume_from` continues one, `model` overrides — else inherits; resume keeps prior pick), `wait` (bounded, ≤120 s) fetches its result, `stop` cancels it, `list` shows this session's children (live, finished, interrupted on-disk), `send` delivers a message to one — `steer` injects it into a running child's next model call, `follow_up` queues its next turn, and a finished child continues with its history intact (new generation, full budget). Daemon sessions only. |
 
 The model-facing schema registers `grep` and `find`; both are also dispatched
 under their fff-engine names, `ffgrep`/`fffind` (so `dex run ffgrep …` works
@@ -64,7 +64,21 @@ for or cancels a child and retries). Under `ask-*` modes a mutating call
 parks a labeled
 prompt in the session's approval queue — "explorer wants to run bash: …" —
 unanswered for five minutes it denies; session-level "allow" approvals apply to
-children too. The `list` action shows live, finished, and interrupted children.
+children too. The `list` action shows live, finished,
+and interrupted children.
+
+`send` addresses an existing child (a finished one is marked `continuable` in
+its lifecycle line): on a live child, `delivery: steer` (default) injects the
+message before the child's next model call — steering that races the final
+answer chains a follow-up turn instead — and `delivery: follow_up` queues it
+for the child's next turn (a parent polling `wait` observes either within one
+250 ms poll quantum). A finished child continues as a new generation: transcript
+replayed, the message as the follow-up instruction, full tool budget, and the
+parent's current approvals. Continuation capacity counts against the child cap
+and finished children stay continuable while their result is within the 64-row
+retention window. Each chained turn (follow-up or continuation) runs a fresh tool
+budget; the child's wall-clock timeout bounds the whole chain. A child that is
+wrapping up refuses further sends until it finishes, then can be continued.
 Set `DEX_SUBAGENTS=0` to unregister the tool.
 
 ## MCP servers
