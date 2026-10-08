@@ -964,7 +964,9 @@ async fn delegate_send_to_failed_child_points_at_resume_from() {
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("resume_from"), "{error}");
+    let text = error.to_string();
+    assert!(text.contains("resume_from"), "{error}");
+    assert!(!text.contains("{id}"), "{error}");
     manager.shutdown().await;
 }
 

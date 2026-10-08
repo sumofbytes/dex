@@ -76,7 +76,9 @@ for the child's next turn (a parent polling `wait` observes either within one
 replayed, the message as the follow-up instruction, full tool budget, and the
 parent's current approvals. Continuation capacity counts against the child cap
 and finished children stay continuable while their result is within the 64-row
-retention window.
+retention window. Each chained turn (follow-up or continuation) runs a fresh tool
+budget; the child's wall-clock timeout bounds the whole chain. A child that is
+wrapping up refuses further sends until it finishes, then can be continued.
 Set `DEX_SUBAGENTS=0` to unregister the tool.
 
 ## MCP servers

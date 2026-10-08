@@ -49,12 +49,9 @@ pub const MAX_NOTICES: usize = 32;
 const MAX_RESULTS: usize = 64;
 /// `wait` poll quantum: prompt completion delivery without busy-spinning.
 const WAIT_POLL: Duration = Duration::from_millis(25);
-/// Grace before the wrapper reads the registry usage meter on a
-/// wrapper-synthesized ending (`70ms >` one sink-line flip): the body is
-/// already dead (dropped by cancel/timeout/panic), so this only gives the
-/// consumer task a moment to fold its last queued `SinkLine::Usage` lines
-/// into the meter before `finish` snapshots the spend.
-const USAGE_DRAIN_GRACE: Duration = Duration::from_millis(70);
+/// Upper bound on how long the wrapper waits for a dead body's sink consumer
+/// to fold its last queued usage lines (spec G3) before snapshotting spend.
+const USAGE_DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 /// Live progress handle for one child (plan §15: the `progress <tool>`
 /// System line). Phase 5's child body reports around each tool call with
@@ -123,6 +120,38 @@ impl ProgressReporter {
         if let Some(child) = m.running.get_mut(&self.id) {
             child.usage.absorb(tokens, output, cost);
         }
+    }
+
+    /// Open or close the child's inboxes to `send`. The body closes them
+    /// (under the manager lock) just before its final drain so a message is
+    /// either drained or refused, never accepted and dropped.
+    pub fn set_accepting(&self, accepting: bool) {
+        if let Some(child) = self
+            .manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running
+            .get_mut(&self.id)
+        {
+            child.accepting = accepting;
+        }
+    }
+
+    /// Register the child's sink consumer: it must call `notify_one` on the
+    /// returned handle once its channel has drained, so a wrapper-synthesized
+    /// ending can wait for the final usage lines instead of guessing.
+    pub fn expect_sink_drain(&self) -> Arc<tokio::sync::Notify> {
+        let drained = Arc::new(tokio::sync::Notify::new());
+        if let Some(child) = self
+            .manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running
+            .get_mut(&self.id)
+        {
+            child.sink_drained = Some(drained.clone());
+        }
+        drained
     }
 
     /// Snapshot the registry-side usage meter at the end of the body's run
@@ -411,6 +440,8 @@ impl AgentManager {
                 generation: meta.generation,
                 calls: 0,
                 usage: AgentUsage::default(),
+                sink_drained: None,
+                accepting: true,
                 steering_tx,
                 followup_tx,
                 allowance: meta
@@ -497,11 +528,18 @@ impl AgentManager {
                 },
             };
             // Synthesized endings carry `usage: None`; before `finish`
-            // reads the registry meter, let the body's sink consumer fold
-            // its last queued usage lines (spec G3 — the spend survived in
-            // the registry even though the body did not).
+            // reads the registry meter, wait for the body's sink consumer
+            // to fold its last queued usage lines (spec G3 — the spend
+            // survived in the registry even though the body did not).
             if result.usage.is_none() {
-                tokio::time::sleep(USAGE_DRAIN_GRACE).await;
+                let drained = manager
+                    .lock()
+                    .running
+                    .get(&task_id)
+                    .and_then(|child| child.sink_drained.clone());
+                if let Some(drained) = drained {
+                    let _ = tokio::time::timeout(USAGE_DRAIN_WAIT, drained.notified()).await;
+                }
             }
             manager.finish(&task_id, &name, result.clone());
             result
@@ -753,6 +791,9 @@ impl AgentManager {
     ) -> Result<SendOutcome, SendError> {
         let inner = self.lock();
         if let Some(child) = inner.running.get(id) {
+            if !child.accepting {
+                return Err(SendError::NotRunning);
+            }
             let tx = match delivery {
                 SendDelivery::Steer => &child.steering_tx,
                 SendDelivery::FollowUp => &child.followup_tx,

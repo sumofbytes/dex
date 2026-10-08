@@ -400,7 +400,7 @@ pub async fn delegate_send(
             })
             .to_string(),
         }),
-        Err(SendError::Full) => Err(ToolError::Denied(format!(
+        Err(SendError::Full) => Err(ToolError::InvalidArgument(format!(
             "cannot send to agent '{id}': the delivery queue is full; wait for it \
              to drain before sending more"
         ))),
@@ -410,7 +410,13 @@ pub async fn delegate_send(
         Err(SendError::NotRunning) => {
             let result = match ctx.manager.wait(&id, Duration::ZERO).await {
                 WaitOutcome::Finished(result) => result,
-                WaitOutcome::Running(_) | WaitOutcome::Unknown => {
+                WaitOutcome::Running(_) => {
+                    return Err(ToolError::InvalidArgument(format!(
+                        "agent '{id}' is wrapping up and no longer accepts messages; \
+                         once it finishes, send again to continue it"
+                    )));
+                }
+                WaitOutcome::Unknown => {
                     return Err(ToolError::InvalidArgument(format!(
                         "agent '{id}' ended and its result aged out of retention; \
                          delegate action=list shows this session's children"
@@ -421,10 +427,11 @@ pub async fn delegate_send(
                 // Spec table: failures/cancels/timeouts answer to
                 // `resume_from`, not to a send.
                 let hint = if result.resume.is_some() {
-                    "it re-enters with delegate(resume_from = \"{id}\") instead"
+                    format!("it re-enters with delegate(resume_from = \"{id}\") instead")
                 } else {
                     "only resumable endings answer to delegate(resume_from = …); \
                      delegate action=list shows which children are continuable"
+                        .to_string()
                 };
                 return Err(ToolError::InvalidArgument(format!(
                     "agent '{id}' ended {} and cannot be continued with send; {hint}",
@@ -1070,6 +1077,7 @@ async fn child_run(
     // and an SSE write. `Usage` and `Plan` stay local: the meter lives in
     // the registry and the child never owns a plan.
     let child_name = def.name.clone();
+    let sink_drained = progress.expect_sink_drain();
     let consumer = tokio::spawn(async move {
         let mut pending: Option<StreamEvent> = None;
         let mut emit = |event: StreamEvent| progress.emit_line(&child_name, event);
@@ -1158,6 +1166,7 @@ async fn child_run(
         if let Some(event) = pending.take() {
             emit(event);
         }
+        sink_drained.notify_one();
     });
 
     let mut tool_state = ToolState::load_async().await;
@@ -1237,6 +1246,8 @@ async fn child_run(
     // history chains another turn — journal markers stay per-turn (§16).
     // Drain points inside `process_turn` are the main turn's: top of every
     // loop iteration and after an assistant message without tool calls.
+    let mut first_turn = true;
+    let mut last_text = String::new();
     let ending: TurnEnd = loop {
         let result = {
             let agent_policy = Policy::turn(config.permission, &console);
@@ -1260,13 +1271,18 @@ async fn child_run(
                 console: &console,
                 filter: Some(&filter),
                 agent_ctx: child_ctx.clone(),
-                // Resume honors the remaining meter (§24.2); a continuation
-                // and a fresh spawn run the definition cap. Per-turn: each
-                // chained turn starts on the full meter.
-                tool_budget: resume
-                    .as_ref()
-                    .and_then(|request| request.handle.remaining_budget)
-                    .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
+                // Resume honors the remaining meter (§24.2) on the first turn
+                // only; a continuation, a fresh spawn and every chained turn
+                // run the definition cap (the wall-clock timeout bounds the
+                // whole chain).
+                tool_budget: if first_turn {
+                    resume
+                        .as_ref()
+                        .and_then(|request| request.handle.remaining_budget)
+                } else {
+                    None
+                }
+                .or_else(|| def.max_tool_iterations.map(|n| n as usize)),
                 harness: None,
             })
             .await;
@@ -1289,6 +1305,7 @@ async fn child_run(
             .await;
             result
         };
+        first_turn = false;
         let _ = session.turn_event(if result.is_ok() {
             "turn_complete"
         } else {
@@ -1302,26 +1319,47 @@ async fn child_run(
                 // every queued follow-up chain one more turn; arrival order
                 // is preserved, recalls remove only not-yet-injected text.
                 let mut queued: Vec<(String, &'static str)> = Vec::new();
-                while let Ok(msg) = steer_rx.try_recv() {
-                    if let crate::protocol::QueueMsg::Content(content) = &msg {
-                        let _ = steer_accepted_tx.send(content.clone()).await;
-                    }
-                    enqueue(&mut queued, msg, "steering");
-                }
-                while let Ok(msg) = follow_rx.try_recv() {
-                    if let crate::protocol::QueueMsg::Content(content) = &msg {
-                        let _ = followup_accepted_tx.send(content.clone()).await;
-                    }
-                    enqueue(&mut queued, msg, "follow-up");
-                }
+                drain_inboxes(
+                    &mut steer_rx,
+                    &mut follow_rx,
+                    &steer_accepted_tx,
+                    &followup_accepted_tx,
+                    &mut queued,
+                )
+                .await;
                 if queued.is_empty() {
-                    // Completed guarantees a non-empty summary (§6): an
-                    // empty final message is not a usable result.
-                    if text.trim().is_empty() {
-                        break TurnEnd::EmptyFinal;
-                    } else {
-                        break TurnEnd::Completed(text);
+                    // Stop accepting under the manager lock, then drain once
+                    // more: a send either landed before the flip (caught
+                    // here) or is refused, never accepted and lost.
+                    meter.set_accepting(false);
+                    drain_inboxes(
+                        &mut steer_rx,
+                        &mut follow_rx,
+                        &steer_accepted_tx,
+                        &followup_accepted_tx,
+                        &mut queued,
+                    )
+                    .await;
+                    if queued.is_empty() {
+                        // Completed guarantees a non-empty summary (§6): an
+                        // empty final message is not a usable result.
+                        // A chained turn that ends empty keeps the previous
+                        // turn's answer rather than discarding good work.
+                        let text = if text.trim().is_empty() {
+                            std::mem::take(&mut last_text)
+                        } else {
+                            text
+                        };
+                        if text.trim().is_empty() {
+                            break TurnEnd::EmptyFinal;
+                        } else {
+                            break TurnEnd::Completed(text);
+                        }
                     }
+                    meter.set_accepting(true);
+                }
+                if !text.trim().is_empty() {
+                    last_text = text;
                 }
                 let _ = session.turn_event("turn_start");
                 for (content, kind) in queued {
@@ -1387,6 +1425,30 @@ enum TurnEnd {
     Completed(String),
     EmptyFinal,
     Failed(String),
+}
+
+/// Move everything parked in the child's steering and follow-up inboxes into
+/// `queued` (arrival order per queue, steering first), echoing each accepted
+/// content message into the child's live transcript.
+async fn drain_inboxes(
+    steer_rx: &mut mpsc::Receiver<crate::protocol::QueueMsg>,
+    follow_rx: &mut mpsc::Receiver<crate::protocol::QueueMsg>,
+    steer_accepted_tx: &mpsc::Sender<String>,
+    followup_accepted_tx: &mpsc::Sender<String>,
+    queued: &mut Vec<(String, &'static str)>,
+) {
+    while let Ok(msg) = steer_rx.try_recv() {
+        if let crate::protocol::QueueMsg::Content(content) = &msg {
+            let _ = steer_accepted_tx.send(content.clone()).await;
+        }
+        enqueue(queued, msg, "steering");
+    }
+    while let Ok(msg) = follow_rx.try_recv() {
+        if let crate::protocol::QueueMsg::Content(content) = &msg {
+            let _ = followup_accepted_tx.send(content.clone()).await;
+        }
+        enqueue(queued, msg, "follow-up");
+    }
 }
 
 /// Apply one drained queue message to the not-yet-appended list, keeping

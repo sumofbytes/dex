@@ -339,6 +339,12 @@ pub struct RunningChild {
     /// to build a result. Mirrors the `calls` meter, which lives here for
     /// the same reason.
     pub usage: AgentUsage,
+    /// False once the body has made its final inbox drain: `send` refuses
+    /// rather than park a message nobody will read.
+    pub accepting: bool,
+    /// Set by the body's sink consumer registration; notified once its
+    /// channel has drained (see `ProgressReporter::expect_sink_drain`).
+    pub sink_drained: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// Derived transcript path (§16 + §24.3 generations), when the spawn
     /// knew the parent session file. `None` for test-built managers —
     /// then no resume handle is ever advertised.
