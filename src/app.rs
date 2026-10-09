@@ -329,6 +329,25 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
     Ok(addr)
 }
 
+/// `dex acp [url]`: serve the Agent Client Protocol on stdio, backed by a
+/// daemon — the given one, or an in-process one on a loopback port. Stdout
+/// belongs to the protocol, so everything else goes to stderr.
+fn run_acp(url: Option<String>, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let url = match url {
+        Some(url) => url,
+        None => format!("http://{}", start_daemon_background()?),
+    };
+    let client = crate::client::http::DaemonClient::new(&url)?;
+    client.wait_until_ready(std::time::Duration::from_secs(10))?;
+    let options = chat_options_from_args(args);
+    tokio::runtime::Runtime::new()?.block_on(dex_acp::serve_stdio(
+        (*client).clone(),
+        options,
+        env!("CARGO_PKG_VERSION"),
+    ))?;
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "dex {version}\n\
@@ -338,6 +357,7 @@ fn print_help() {
         Commands:\n  \
         serve [bind]              daemon on 127.0.0.1:8420\n  \
         connect <url> [prompt]    TUI or one-shot against a daemon\n  \
+        acp [url]                 Agent Client Protocol agent on stdio (Zed, etc.)\n  \
         run <tool> k=v...         one-shot tool (read, ls, bash, write, edit, grep, find)\n  \
           doctor                    show resolved provider/model config + origins\n  \
           usage <id|path>           plot token usage per model call from a session's event journal\n  \
@@ -720,7 +740,10 @@ pub fn run() {
     // Delegation tools register only in daemon-backed processes (§10): a
     // one-shot run has no manager to spawn into, so the tools stay out of
     // its schema entirely. Dispatch rejects them there regardless (§11).
-    crate::agent::delegate::set_daemon_linked(matches!(mode, Mode::Serve { .. } | Mode::Default));
+    crate::agent::delegate::set_daemon_linked(matches!(
+        mode,
+        Mode::Serve { .. } | Mode::Default | Mode::Acp { url: None }
+    ));
     // Extension search dirs: process-global, read by the manager at
     // bootstrap (daemon) and before the in-process one-shot turn.
     crate::extensions::set_extra_dirs(args.extension_dirs.clone());
@@ -773,6 +796,12 @@ pub fn run() {
             };
             if let Err(e) = result {
                 eprintln!("client error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::Acp { url } => {
+            if let Err(e) = run_acp(url, &args) {
+                eprintln!("acp error: {e}");
                 std::process::exit(1);
             }
         }

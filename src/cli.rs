@@ -51,6 +51,9 @@ pub enum Mode {
     Serve { bind: String },
     /// Start the TUI connected to a remote daemon (`dex connect <url>`).
     Connect { url: String },
+    /// Agent Client Protocol agent on stdio (`dex acp [url]`): editors such
+    /// as Zed spawn it. Without a URL it hosts its own in-process daemon.
+    Acp { url: Option<String> },
     /// Start both server + TUI in the same process (default `dex`).
     Default,
     /// One-shot prompt (`dex "prompt"`).
@@ -235,6 +238,9 @@ pub fn resolve_mode(args: &Args) -> Mode {
                 .unwrap_or_else(|| "http://127.0.0.1:8420".to_string());
             Mode::Connect { url }
         }
+        Some("acp") => Mode::Acp {
+            url: args.rest.get(1).cloned(),
+        },
         Some("--tool") => Mode::Tool,
         Some("mcp") => {
             // Strict: extra args are an error, not silently dropped

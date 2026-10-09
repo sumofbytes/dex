@@ -10,8 +10,8 @@ keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
-members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
-default-members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session"]
+members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session", "crates/dex-acp"]
+default-members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session", "crates/dex-acp"]
 resolver = "2"
 
 [features]
@@ -34,6 +34,7 @@ network-tests = []
 dex-server = { version = "0.1.0", path = "crates/dex-server" }
 dex-runtime = { version = "0.1.0", path = "crates/dex-runtime" }
 dex-client = { version = "0.1.0", path = "crates/dex-client" }
+dex-acp = { version = "0.1.0", path = "crates/dex-acp" }
 dex-skills = { version = "0.1.0", path = "crates/dex-skills" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
