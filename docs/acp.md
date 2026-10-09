@@ -26,6 +26,16 @@ Zed (`settings.json`):
 | `plan` | plan updates |
 | `session/request_permission` | tool approval (once / session / deny; anything else denies) |
 
+Sessions start in `auto` mode (dex's default `trusted` permissions: no
+approval prompts). Switch to `manual` in the editor to get
+`session/request_permission` prompts; child-agent approvals are labeled
+`[agent] tool: ...`. Only one prompt runs per session at a time, and a
+cancelled prompt returns within a few seconds even if the daemon is slow to
+stop.
+
+Child-agent transcripts, background-task events and token usage are not
+forwarded to the editor.
+
 Not supported yet: `session/load`, images/audio, client-provided MCP servers,
 `ask_user` questions (dismissed so the turn never hangs).
 

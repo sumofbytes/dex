@@ -333,12 +333,15 @@ fn start_daemon_background() -> std::io::Result<std::net::SocketAddr> {
 /// daemon — the given one, or an in-process one on a loopback port. Stdout
 /// belongs to the protocol, so everything else goes to stderr.
 fn run_acp(url: Option<String>, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let url = match url {
-        Some(url) => url,
-        None => format!("http://{}", start_daemon_background()?),
+    // `start_daemon_background` already waits for readiness.
+    let (url, wait) = match url {
+        Some(url) => (url, true),
+        None => (format!("http://{}", start_daemon_background()?), false),
     };
     let client = crate::client::http::DaemonClient::new(&url)?;
-    client.wait_until_ready(std::time::Duration::from_secs(10))?;
+    if wait {
+        client.wait_until_ready(std::time::Duration::from_secs(10))?;
+    }
     let options = chat_options_from_args(args);
     tokio::runtime::Runtime::new()?.block_on(dex_acp::serve_stdio(
         (*client).clone(),

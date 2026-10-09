@@ -9,15 +9,22 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::sync::Notify;
 
 type RpcError = (i64, String);
 
+/// How long a cancelled prompt waits for the daemon to wind the turn down
+/// before returning `cancelled` anyway.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
 struct Session {
     mode: Mutex<String>,
     cancelled: AtomicBool,
     cancel_signal: Notify,
+    /// A prompt turn is in flight; overlapping prompts are rejected.
+    busy: AtomicBool,
 }
 
 struct Ctx {
@@ -154,10 +161,13 @@ async fn handle_request(ctx: &Arc<Ctx>, method: &str, params: Value) -> Result<V
 }
 
 async fn new_session(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
-    let cwd = params["cwd"].as_str().filter(|c| !c.is_empty()).ok_or((
-        rpc::INVALID_PARAMS,
-        "session/new requires an absolute `cwd`".to_string(),
-    ))?;
+    let cwd = params["cwd"]
+        .as_str()
+        .filter(|c| std::path::Path::new(c).is_absolute())
+        .ok_or((
+            rpc::INVALID_PARAMS,
+            "session/new requires an absolute `cwd`".to_string(),
+        ))?;
     let created = ctx
         .client
         .create_session_async(cwd, None)
@@ -173,6 +183,7 @@ async fn new_session(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> 
         mode: Mutex::new(mode.clone()),
         cancelled: AtomicBool::new(false),
         cancel_signal: Notify::new(),
+        busy: AtomicBool::new(false),
     });
     if let Ok(mut sessions) = ctx.sessions.lock() {
         sessions.insert(created.session_id.clone(), session);
@@ -187,6 +198,13 @@ async fn prompt(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let text = map::prompt_text(blocks);
+    if session.busy.swap(true, Ordering::SeqCst) {
+        return Err((
+            rpc::INVALID_PARAMS,
+            "a prompt is already running in this session".to_string(),
+        ));
+    }
+    let _busy = BusyGuard(&session.busy);
     session.cancelled.store(false, Ordering::SeqCst);
 
     let mut options = ctx.options.clone();
@@ -206,25 +224,49 @@ async fn prompt(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
     let mut ids = ToolIds::default();
     let mut failure: Option<String> = None;
     let mut terminal = false;
-    while let Some(item) = stream.next_event().await {
+    loop {
+        // Register for cancellation before checking the flag so a cancel
+        // landing in between is not lost (`notify_waiters` stores no permit).
+        let notified = session.cancel_signal.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let next = if session.cancelled.load(Ordering::SeqCst) {
+            tokio::time::timeout(CANCEL_GRACE, stream.next_event())
+                .await
+                .unwrap_or(None)
+        } else {
+            tokio::select! {
+                item = stream.next_event() => item,
+                _ = &mut notified => tokio::time::timeout(CANCEL_GRACE, stream.next_event())
+                    .await
+                    .unwrap_or(None),
+            }
+        };
+        let Some(item) = next else { break };
         let event = item.map_err(|e| (rpc::INTERNAL_ERROR, e))?;
         match &event {
             StreamEvent::ApprovalRequired {
                 request_id,
                 name,
                 input,
-                ..
+                agent,
             } => {
                 let decision = if session.cancelled.load(Ordering::SeqCst) {
                     dex_client::protocol::ApprovalDecision::Deny
                 } else {
+                    // A child agent's call is not in this turn's open set:
+                    // don't pair it with a same-named parent call.
+                    let tool_call_id = match agent {
+                        Some(_) => request_id.as_str(),
+                        None => ids.pending_for(name).unwrap_or(request_id),
+                    };
                     let request = ctx.rpc.request(
                         "session/request_permission",
                         json!({
                             "sessionId": session_id,
                             "toolCall": {
-                                "toolCallId": ids.pending_for(name).unwrap_or(request_id),
-                                "title": permission_title(name, input),
+                                "toolCallId": tool_call_id,
+                                "title": permission_title(agent.as_deref(), name, input),
                                 "kind": map::tool_kind(name),
                             },
                             "options": map::permission_options(),
@@ -234,8 +276,7 @@ async fn prompt(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
                         reply = request => reply
                             .map(|r| map::decision_from_outcome(&r))
                             .unwrap_or(dex_client::protocol::ApprovalDecision::Deny),
-                        _ = session.cancel_signal.notified() =>
-                            dex_client::protocol::ApprovalDecision::Deny,
+                        _ = &mut notified => dex_client::protocol::ApprovalDecision::Deny,
                     }
                 };
                 let _ = ctx
@@ -286,13 +327,23 @@ async fn prompt(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
 }
 
 /// Approval title: tool name plus a short one-line view of its input.
-fn permission_title(name: &str, input: &str) -> String {
+fn permission_title(agent: Option<&str>, name: &str, input: &str) -> String {
     let one_line: String = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let short: String = one_line.chars().take(120).collect();
+    let who = agent.map(|a| format!("[{a}] ")).unwrap_or_default();
     if short.is_empty() {
-        name.to_string()
+        format!("{who}{name}")
     } else {
-        format!("{name}: {short}")
+        format!("{who}{name}: {short}")
+    }
+}
+
+/// Clears a session's `busy` flag when the prompt ends, however it ends.
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -344,5 +395,29 @@ mod tests {
         assert_eq!(by_id(2)["error"]["code"], rpc::METHOD_NOT_FOUND);
         assert_eq!(by_id(3)["error"]["code"], rpc::INVALID_PARAMS);
         assert_eq!(by_id(4)["error"]["code"], rpc::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn rejects_relative_cwd() {
+        let out = roundtrip(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"rel/dir"}}),
+        ])
+        .await;
+        assert_eq!(out[0]["error"]["code"], rpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn permission_title_labels_child_agents() {
+        assert_eq!(
+            permission_title(
+                None, "bash", "ls  -la
+"
+            ),
+            "bash: ls -la"
+        );
+        assert_eq!(
+            permission_title(Some("explorer"), "bash", ""),
+            "[explorer] bash"
+        );
     }
 }
