@@ -1,0 +1,12 @@
+[package]
+name = "dex-acp"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Client Protocol (ACP) adapter for the dex daemon"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sumofbytes/dex"
+
+[dependencies]
+dex-client = { version = "0.1.0", path = "../dex-client" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std", "time"] }

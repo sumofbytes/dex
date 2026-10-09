@@ -494,6 +494,7 @@ dependencies = [
  "axum",
  "chrono",
  "crossterm",
+ "dex-acp",
  "dex-client",
  "dex-runtime",
  "dex-server",
@@ -505,6 +506,15 @@ dependencies = [
  "tokio",
  "unicode-width 0.2.0",
  "uuid",
+]
+
+[[package]]
+name = "dex-acp"
+version = "0.1.0"
+dependencies = [
+ "dex-client",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
