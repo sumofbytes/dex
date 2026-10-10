@@ -2601,7 +2601,7 @@ mod e2e_tests {
         let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
         // Released once the parent's steer has executed (parent counter ≥
-        // 2): the child's first model response parks until then, so round
+        // 3: the parent's request after the send ran): the child's first model response parks until then, so round
         // 2 deterministically drains the steer.
         let steer_done = parent_calls.clone();
         let child_shared = child_calls.clone();
@@ -2658,7 +2658,7 @@ mod e2e_tests {
                                 let sse: String = match n {
                                     // Park round 1 until the steer executed.
                                     0 => {
-                                        while steer_done.load(Ordering::SeqCst) < 2 {
+                                        while steer_done.load(Ordering::SeqCst) < 3 {
                                             tokio::time::sleep(Duration::from_millis(20)).await;
                                         }
                                         CHILD_TOOL_SSE.to_string()
@@ -2672,11 +2672,18 @@ mod e2e_tests {
                                     .body(Body::from(sse))
                                     .unwrap();
                             }
-                            let (parent_n, _) = &counters;
+                            let (parent_n, child_n) = &counters;
                             let n = parent_n.fetch_add(1, Ordering::SeqCst);
                             let sse: String = match n {
                                 0 => DELEGATE_SSE.to_string(),
-                                1 => send_sse(&extract_id(&body), "pivot east", "steer"),
+                                1 => {
+                                    // Hold the steer until the child's round-1
+                                    // request is out, so it never lands in it.
+                                    while child_n.load(Ordering::SeqCst) < 1 {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                    send_sse(&extract_id(&body), "pivot east", "steer")
+                                }
                                 2 => PARENT_DONE_SSE.to_string(),
                                 3 => {
                                     send_sse(&extract_id(&body), "now lint the module", "follow_up")
@@ -2889,6 +2896,11 @@ mod e2e_tests {
 
         // The continuation runs as generation 1: its request replays the
         // prior generation's history and carries the follow-up nudge.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while child_calls.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(Instant::now() < deadline, "continuation never requested");
+        }
         let bodies3 = lock_map(&requests).clone();
         let gen1 = bodies3
             .iter()
