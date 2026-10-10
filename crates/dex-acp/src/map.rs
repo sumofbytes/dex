@@ -63,6 +63,12 @@ fn chunk(kind: &str, text: &str) -> Value {
     json!({"sessionUpdate": kind, "content": text_content(text)})
 }
 
+/// User-level prompt content (steered/follow-up messages): the transcript
+/// shows who authored it, unlike agent text chunks.
+fn user_chunk(text: &str) -> Value {
+    chunk("user_message_chunk", text)
+}
+
 /// Tracks `tool_call` ids so results pair with their starters even when an
 /// older daemon omits ids (pair by name, oldest first).
 #[derive(Default)]
@@ -112,7 +118,8 @@ impl ToolIds {
 
 /// `session/update` payload for a stream event, or `None` for events ACP
 /// has no counterpart for (approvals, questions and terminals are handled by
-/// the caller; usage/task/child-agent events are dropped).
+/// the caller; usage/task/child-agent events are dropped; managed sessions
+/// expose steered/follow-up prompts as user chunks instead).
 pub fn update_for(event: &StreamEvent, ids: &mut ToolIds) -> Option<Value> {
     match event {
         StreamEvent::AssistantText(text) => Some(chunk("agent_message_chunk", text)),
@@ -154,6 +161,11 @@ pub fn update_for(event: &StreamEvent, ids: &mut ToolIds) -> Option<Value> {
                 "status": if *done { "completed" } else { "pending" },
             })).collect::<Vec<_>>(),
         })),
+        // Steered/follow-up prompts are the user's own words; render them as
+        // user chunks so a replayed transcript stays readable.
+        StreamEvent::SteeringAccepted { content } | StreamEvent::FollowupAccepted { content } => {
+            Some(user_chunk(content))
+        }
         _ => None,
     }
 }
@@ -282,6 +294,23 @@ mod tests {
         let update = update_for(&plan, &mut ids).unwrap();
         assert_eq!(update["entries"][0]["status"], "completed");
         assert_eq!(update["entries"][1]["status"], "pending");
+        let steer = update_for(
+            &StreamEvent::SteeringAccepted {
+                content: "nudge".into(),
+            },
+            &mut ids,
+        )
+        .unwrap();
+        assert_eq!(steer["sessionUpdate"], "user_message_chunk");
+        assert_eq!(steer["content"]["text"], "nudge");
+        let followup = update_for(
+            &StreamEvent::FollowupAccepted {
+                content: "next turn".into(),
+            },
+            &mut ids,
+        )
+        .unwrap();
+        assert_eq!(followup["sessionUpdate"], "user_message_chunk");
         assert!(update_for(&StreamEvent::System("x".into()), &mut ids).is_none());
     }
 }
