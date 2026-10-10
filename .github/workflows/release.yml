@@ -21,7 +21,7 @@ jobs:
     outputs:
       sha: ${{ steps.bump.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Bump version to match tag
         id: bump
         run: |
@@ -62,7 +62,7 @@ jobs:
             cross: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Build the bump commit, not the tag: the tag's tree still has the
           # old version, so `dex --version` would be stale.
@@ -115,7 +115,7 @@ jobs:
             tar -czf "$name.tar.gz" -C dist dex
           fi
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dex-${{ matrix.target }}
           path: |
