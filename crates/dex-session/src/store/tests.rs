@@ -506,6 +506,31 @@ fn scan_listing_skips_summaries_and_cuts_long_titles() {
 }
 
 #[test]
+fn scan_listing_folds_renames_from_journal_entries() {
+    // Listings prefer the newest appended rename over the header name —
+    // for journals written before the header patch it is the only place
+    // the latest name lives. Non-compact spacing exercises the
+    // parse-and-classify arm, as in the other scans.
+    let path = unique_path("dex-scan-rename");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let rename1 = r#"{"type":"session_info","id":"1","timestamp":"2020-01-01T00:00:00Z","name":"first rename"}"#;
+    let user = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"prompt"}"#;
+    let clear = r#"{"type":"clear","id":"3","timestamp":"2020-01-01T00:00:00Z"}"#;
+    let rename2 = r#"{ "type" : "session_info" , "id" : "4" , "timestamp" : "2020-01-01T00:00:00Z" , "name" : "second rename" }"#;
+    fs::write(&path, format!("{header}\n{rename1}\n{user}\n{rename2}\n")).unwrap();
+    let listing = Session::scan_listing(&path).unwrap();
+    assert_eq!(listing.session_name.as_deref(), Some("second rename"));
+    assert_eq!(listing.message_count, 1, "info rows stay out of the count");
+    assert_eq!(listing.first_prompt.as_deref(), Some("prompt"));
+    // `clear` forgets the prompt, not the name.
+    fs::write(&path, format!("{header}\n{rename1}\n{user}\n{clear}\n")).unwrap();
+    let listing = Session::scan_listing(&path).unwrap();
+    assert_eq!(listing.session_name.as_deref(), Some("first rename"));
+    assert_eq!(listing.first_prompt, None);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn default_names_are_told_from_chosen_ones() {
     let name = Session::default_session_name("/work/dex");
     assert!(Session::is_default_name(&name, "/work/dex"));
@@ -687,6 +712,91 @@ fn new_session_defaults_name_but_keeps_explicit() {
     assert_eq!(s.name(), Some("mine"));
     let path = s.path().unwrap().to_path_buf();
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn rename_lands_in_the_header_line_for_header_only_openers() {
+    // Header-only openers (`from_path` lookups, the `list` scans behind
+    // every picker) read just the first line, so the rename has to be in
+    // the header itself — the appended `session_info` row alone is only
+    // visible to readers that scan the whole journal (`scan_listing`).
+    let _lock = TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new("/tmp/dex-rename-header".into(), None).unwrap();
+    let id = s.id().to_string();
+    s.set_name("Fancy Name".into()).unwrap();
+    assert_eq!(s.name(), Some("Fancy Name"));
+    let path = s.path().unwrap().to_path_buf();
+
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.lines().next().unwrap().contains("\"Fancy Name\""),
+        "header line carries the rename: {raw}"
+    );
+    assert!(
+        raw.lines()
+            .any(|l| l.contains("\"type\":\"session_info\"") && l.contains("Fancy Name")),
+        "rename still recorded in the journal: {raw}"
+    );
+
+    // Reopening from disk sees the chosen name under the same id — this is
+    // what a daemon restart or a fresh `/resume` observes.
+    let reopened = Session::from_path(&path).unwrap();
+    assert_eq!(reopened.id(), id);
+    assert_eq!(reopened.name(), Some("Fancy Name"));
+
+    // A second rename supersedes the first: the header shows the newest,
+    // the journal keeps the rename history for scanning readers.
+    s.set_name("Final Name".into()).unwrap();
+    assert_eq!(
+        Session::from_path(&path).unwrap().name(),
+        Some("Final Name")
+    );
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("Final Name"));
+    assert!(raw.contains("Fancy Name"));
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rename_keeps_the_journal_and_continues_appending() {
+    // The header rewrite copies the remainder of the file unchanged and
+    // reopens the append handle against the new inode: nothing before or
+    // after the rename is lost, and later appends land in the visible
+    // journal — not in the replaced-away one.
+    let _lock = TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new("/tmp/dex-rename-keep".into(), None).unwrap();
+    s.append_message(&ChatMessage::user("before the rename"))
+        .unwrap();
+    s.set_state("model", "gpt-x").unwrap();
+    let path = s.path().unwrap().to_path_buf();
+
+    // The first append opened the handle, so the second rename exercises
+    // the reopen-after-rename path explicitly.
+    s.set_name("Renamed".into()).unwrap();
+    s.set_name("Renamed Again".into()).unwrap();
+    s.append_message(&ChatMessage::assistant("after the rename"))
+        .unwrap();
+    drop(s);
+
+    let msgs = load_messages_from_session(&path).unwrap();
+    assert_eq!(msgs.len(), 2, "whole transcript survives the rewrites");
+    assert!(msgs[0].content_str().contains("before the rename"));
+    assert!(msgs[1].content_str().contains("after the rename"));
+    let state = load_session_state(&path).unwrap();
+    assert_eq!(state.get("model").map(String::as_str), Some("gpt-x"));
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn in_memory_rename_stays_header_only() {
+    let mut s = Session::in_memory("/tmp/dex-rename-memory".into());
+    s.set_name("Memory Name".into()).unwrap();
+    assert_eq!(s.name(), Some("Memory Name"));
+    assert!(s.path().is_none());
 }
 
 #[test]

@@ -131,9 +131,11 @@ impl Session {
     /// `scan_summary` plus the first user prompt, taken in the same pass: the
     /// first line of the first user message still in the transcript (a `clear`
     /// forgets it), at most `TITLE_CHARS` characters. A resume picker titles
-    /// the session with it.
+    /// the session with it. The newest `session_info` rename rides along in
+    /// the same pass (see `Listing.session_name`).
     pub fn scan_listing(path: &Path) -> io::Result<Listing> {
         let mut first_prompt: Option<String> = None;
+        let mut session_name: Option<String> = None;
         let mut reader = BufReader::new(File::open(path)?);
         let mut count = 0usize;
         let mut state = "none";
@@ -147,13 +149,15 @@ impl Session {
             if text.is_empty() {
                 continue;
             }
-            // 0 = message, 1 = clear, 2 = turn marker.
+            // 0 = message, 1 = clear, 2 = turn marker, 3 = rename.
             let kind: Option<u8> = if text.contains("\"type\":\"message\"") {
                 Some(0)
             } else if text.contains("\"type\":\"clear\"") {
                 Some(1)
             } else if text.contains("\"type\":\"turn_") {
                 Some(2)
+            } else if text.contains("\"type\":\"session_info\"") {
+                Some(3)
             } else if text.contains("\"type\"") {
                 match serde_json::from_str::<Value>(text)
                     .ok()
@@ -162,6 +166,7 @@ impl Session {
                     Some(s) if s == "message" => Some(0),
                     Some(s) if s == "clear" => Some(1),
                     Some(s) if s.starts_with("turn_") => Some(2),
+                    Some(s) if s == "session_info" => Some(3),
                     _ => None,
                 }
             } else {
@@ -201,6 +206,18 @@ impl Session {
                         }
                     }
                 }
+                Some(3) => {
+                    // Newest renames win; a later `clear` does not reset the
+                    // name (it clears the transcript, not the session's
+                    // identity). Renames written before `set_name` patched
+                    // the header line exist only in these entries.
+                    if let Some(n) = serde_json::from_str::<Value>(text)
+                        .ok()
+                        .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_owned))
+                    {
+                        session_name = Some(n);
+                    }
+                }
                 _ => {}
             }
         }
@@ -208,6 +225,7 @@ impl Session {
             message_count: count,
             turn_state: state.to_string(),
             first_prompt,
+            session_name,
         })
     }
 }
@@ -220,6 +238,12 @@ pub struct Listing {
     pub message_count: usize,
     pub turn_state: String,
     pub first_prompt: Option<String>,
+    /// Name from the newest `session_info` entry, if any. Journals written
+    /// before renames patched the header line (`set_name`) carry their
+    /// latest name only here; listing consumers show it over a then-stale
+    /// header name, so a rename survives restarts and picks even before
+    /// any header rewrite ever ran.
+    pub session_name: Option<String>,
 }
 
 /// The first non-empty line of a prompt, cut to `TITLE_CHARS`.

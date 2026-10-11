@@ -527,8 +527,18 @@ impl Session {
         (children.len(), interrupted)
     }
 
+    /// Set the session's display name. Two records together, because the
+    /// two reveal it differently: the header line is what header-only
+    /// openers see (`from_path` lookups, the `list` scans behind every
+    /// picker), while the appended `session_info` entry is what
+    /// journal-scanning readers (`scan_listing`) fold without special
+    /// casing. Header-only reads are O(1) by design (perf doc §§22/28),
+    /// so the header line itself must carry the latest name —
+    /// `replace_header_name` rewrites just that line atomically. The
+    /// append records the rename in the journal for the scanning readers
+    /// (and documents what happened: the header is always overwritten).
     pub fn set_name(&mut self, name: String) -> io::Result<()> {
-        self.header.name = Some(name.clone());
+        self.replace_header_name(&name)?;
         let entry = SessionInfoEntry {
             entry_type: "session_info".to_string(),
             id: self.next_id(),
@@ -536,6 +546,69 @@ impl Session {
             name,
         };
         self.append_line(&entry)
+    }
+
+    /// Rewrite the name inside the on-disk header line. In-memory sessions
+    /// (no path) stop at `self.header`; for files, `self.header` commits
+    /// only after `patch_header_line` returns success, so a failed rename
+    /// keeps memory and disk agreeing on the old name.
+    fn replace_header_name(&mut self, name: &str) -> io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            self.header.name = Some(name.to_string());
+            return Ok(());
+        };
+        let mut patched = self.header.clone();
+        patched.name = Some(name.to_string());
+        let header_line = serde_json::to_string(&patched).map_err(io::Error::other)?;
+        self.patch_header_line(&path, &header_line)?;
+        self.header = patched;
+        Ok(())
+    }
+
+    /// Make `header_line` this journal's first line: copy the file to a temp
+    /// file under that line, fsync, rename back — the same discipline
+    /// `rewrite_messages` uses for compaction (atomic, so a crash leaves the
+    /// old or the new header, never a torn one; the temp suffix is outside
+    /// `*.jsonl` so a half-written temp never looks like a session). The rest
+    /// of the journal is copied unchanged, and the append handle is reopened
+    /// against the new inode — it kept pointing into the one the rename moved
+    /// away. `false` when the first line already matches, so repeated renames
+    /// to the current value don't churn the file.
+    fn patch_header_line(&mut self, path: &Path, header_line: &str) -> io::Result<bool> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut first = String::new();
+        if reader.read_line(&mut first)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty session file",
+            ));
+        }
+        if first.trim_end() == header_line {
+            return Ok(false);
+        }
+        let tmp = path.with_extension(format!("rename-{}.tmp", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let mut tmp_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        writeln!(tmp_file, "{header_line}")?;
+        io::copy(&mut reader, &mut tmp_file)?;
+        tmp_file.flush()?;
+        tmp_file.sync_data()?;
+        drop(tmp_file);
+        fs::rename(&tmp, path)?;
+        // Best-effort dir fsync so the rename itself survives a crash.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        if self.journal.take().is_some() {
+            self.journal = Some(Self::open_append(path)?);
+        }
+        Ok(true)
     }
 
     pub fn append_message(&mut self, message: &ChatMessage) -> io::Result<()> {

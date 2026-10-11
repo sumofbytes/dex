@@ -13,7 +13,10 @@ Sessions are stored as JSONL files under:
   k8s-style suffix, e.g. `dex-k3m9x2q`); override with `--name` or `/name`.
 
 Each file starts with a `session` header line followed by `message` entries and
-optional `session_info` (rename) entries. Entries are appended after every turn,
+optional `session_info` (rename) entries; a rename rewrites just that header
+line (atomically) and appends an entry, so every reader — pickers included —
+sees the latest name, and a rename is refused while a turn is streaming.
+Entries are appended after every turn,
 so a crash or Ctrl+C loses at most the in-progress turn. Starting `dex` in a
 directory creates a fresh session; use `--session <path>` to continue a saved
 one.
