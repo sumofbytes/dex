@@ -1080,3 +1080,4 @@ pub fn load_session_state(path: &Path) -> io::Result<std::collections::HashMap<S
 mod tests;
 
 mod journal;
+pub use journal::Listing;

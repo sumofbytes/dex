@@ -101,8 +101,14 @@ pub(crate) async fn list_sessions(
         set.spawn(tokio::task::spawn_blocking(move || {
             // §31: one fused open+scan per file — no full message parse for
             // the count, no second pass for the turn state.
-            let (message_count, turn_state) =
-                crate::session::Session::scan_summary(&path).unwrap_or((0, "unknown".to_string()));
+            let listing = crate::session::Session::scan_listing(&path).ok();
+            let updated_at = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map(|time| {
+                    chrono::DateTime::<chrono::Utc>::from(time)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                })
+                .unwrap_or_default();
             // §16/Phase 8: child runs surface in the listing (the resume
             // picker shows them); loaders keep excluding `agents/*`.
             let dir = session::Session::agents_dir(&path);
@@ -111,8 +117,8 @@ pub(crate) async fn list_sessions(
             (
                 path,
                 header,
-                message_count,
-                turn_state,
+                listing,
+                updated_at,
                 child_agents,
                 interrupted_children,
             )
@@ -130,7 +136,11 @@ pub(crate) async fn list_sessions(
     let mut rows: Vec<(String, String, serde_json::Value)> = scanned
         .into_iter()
         .map(
-            |(path, header, message_count, turn_state, child_agents, interrupted_children)| {
+            |(path, header, listing, updated_at, child_agents, interrupted_children)| {
+                let (message_count, turn_state, first_prompt) = match listing {
+                    Some(l) => (l.message_count, l.turn_state, l.first_prompt),
+                    None => (0, "unknown".to_string(), None),
+                };
                 let name = header.name().map(|n| n.to_string());
                 (
                     header.timestamp().to_string(),
@@ -141,6 +151,8 @@ pub(crate) async fn list_sessions(
                         "name": name,
                         "cwd": header.cwd(),
                         "created_at": header.timestamp(),
+                        "updated_at": updated_at,
+                        "first_prompt": first_prompt,
                         "message_count": message_count,
                         "turn_state": turn_state,
                         "child_agents": child_agents,

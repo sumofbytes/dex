@@ -206,32 +206,75 @@ async fn new_session(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> 
     Ok(json!({"sessionId": created.session_id, "modes": map::modes_state(&mode)}))
 }
 
-/// `session/list`: the daemon's persisted sessions, newest first, optionally
-/// only those recorded in `cwd`. The daemon reports a creation time only, so
-/// that stands in for `updatedAt`. One page; there is no `nextCursor`.
+/// Sessions per `session/list` page.
+const LIST_PAGE: usize = 50;
+
+/// Whether `name` is the `<workspace>-<7 chars>` name a session gets when
+/// nobody named it, which says nothing a client could show.
+fn generated_name(name: &str) -> bool {
+    name.rsplit_once('-').is_some_and(|(workspace, suffix)| {
+        !workspace.is_empty()
+            && suffix.len() == 7
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+/// `session/list`: the daemon's persisted sessions that hold a conversation,
+/// most recently changed first, optionally only those recorded in `cwd`, in
+/// pages of `LIST_PAGE`. `nextCursor` is the offset of the next page.
+///
+/// `title` is the name when someone chose one, else the first line of the
+/// first prompt. `updatedAt` is when the session file last changed, or its
+/// creation time from a daemon that doesn't report that.
 async fn list_sessions(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
     let cwd = params["cwd"].as_str().filter(|c| !c.is_empty());
+    let start = match params["cursor"].as_str() {
+        None => 0,
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| (rpc::INVALID_PARAMS, format!("invalid cursor '{cursor}'")))?,
+    };
     let mut sessions = ctx
         .client
         .list_sessions_async()
         .await
         .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
-    sessions.retain(|s| cwd.is_none_or(|c| s.cwd == c));
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let sessions: Vec<Value> = sessions
+    sessions.retain(|s| s.message_count > 0 && cwd.is_none_or(|c| s.cwd == c));
+    let updated = |s: &dex_client::protocol::SessionInfo| {
+        if s.updated_at.is_empty() {
+            s.created_at.clone()
+        } else {
+            s.updated_at.clone()
+        }
+    };
+    sessions.sort_by_key(|s| std::cmp::Reverse(updated(s)));
+    let page: Vec<Value> = sessions
         .iter()
+        .skip(start)
+        .take(LIST_PAGE)
         .map(|s| {
             let mut entry = json!({"sessionId": s.session_id, "cwd": s.cwd});
-            if let Some(name) = s.name.as_deref().filter(|n| !n.is_empty()) {
-                entry["title"] = json!(name);
+            let named = s
+                .name
+                .as_deref()
+                .filter(|n| !n.is_empty() && !generated_name(n));
+            if let Some(title) = named.or(s.first_prompt.as_deref().filter(|p| !p.is_empty())) {
+                entry["title"] = json!(title);
             }
-            if !s.created_at.is_empty() {
-                entry["updatedAt"] = json!(s.created_at);
+            let updated = updated(s);
+            if !updated.is_empty() {
+                entry["updatedAt"] = json!(updated);
             }
             entry
         })
         .collect();
-    Ok(json!({"sessions": sessions}))
+    let mut result = json!({"sessions": page});
+    if start + LIST_PAGE < sessions.len() {
+        result["nextCursor"] = json!((start + LIST_PAGE).to_string());
+    }
+    Ok(result)
 }
 
 /// `session/load`: take over an existing daemon session and stream its
@@ -657,14 +700,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_list_filters_by_cwd_newest_first() {
+    async fn session_list_titles_filters_and_orders() {
         let daemon = mock_daemon(&[(
             "/api/sessions",
             200,
             r#"{"sessions":[
-                {"session_id":"a","path":"/p","name":"old","cwd":"/w","created_at":"2026-01-01T00:00:00Z"},
-                {"session_id":"b","path":"/p","name":null,"cwd":"/other","created_at":"2026-03-01T00:00:00Z"},
-                {"session_id":"c","path":"/p","name":"new","cwd":"/w","created_at":"2026-02-01T00:00:00Z"}
+                {"session_id":"a","path":"/p","name":"w-abc1234","cwd":"/w","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-04-01T00:00:00Z","message_count":2,"first_prompt":"fix the build"},
+                {"session_id":"b","path":"/p","name":null,"cwd":"/other","created_at":"2026-03-01T00:00:00Z","message_count":2},
+                {"session_id":"c","path":"/p","name":"release","cwd":"/w","created_at":"2026-02-01T00:00:00Z","message_count":4,"first_prompt":"ignored"},
+                {"session_id":"d","path":"/p","name":"w-xyz9876","cwd":"/w","created_at":"2026-05-01T00:00:00Z","message_count":0}
             ]}"#,
         )])
         .await;
@@ -674,6 +718,7 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
                 json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":"/w"}}),
                 json!({"jsonrpc":"2.0","id":3,"method":"session/list","params":{}}),
+                json!({"jsonrpc":"2.0","id":4,"method":"session/list","params":{"cursor":"x"}}),
             ],
         )
         .await;
@@ -690,13 +735,56 @@ mod tests {
                 .map(|s| s["sessionId"].as_str().unwrap().to_string())
                 .collect()
         };
-        assert_eq!(ids(2), ["c", "a"]);
-        assert_eq!(ids(3), ["b", "c", "a"]);
-        assert_eq!(by_id(2)["result"]["sessions"][0]["title"], "new");
+        // `d` is empty and left out; `a` changed last although `c` is newer by creation.
+        assert_eq!(ids(2), ["a", "c"]);
+        assert_eq!(ids(3), ["a", "b", "c"]);
+        let first = &by_id(2)["result"]["sessions"][0];
+        assert_eq!(first["title"], "fix the build");
+        assert_eq!(first["updatedAt"], "2026-04-01T00:00:00Z");
+        assert_eq!(by_id(2)["result"]["sessions"][1]["title"], "release");
+        assert!(by_id(3)["result"]["sessions"][1].get("title").is_none());
+        assert!(by_id(2)["result"].get("nextCursor").is_none());
+        assert_eq!(by_id(4)["error"]["code"], rpc::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn session_list_pages_with_a_cursor() {
+        let rows: Vec<String> = (0..LIST_PAGE + 3)
+            .map(|i| {
+                format!(
+                    r#"{{"session_id":"s{i:03}","path":"/p","name":null,"cwd":"/w","created_at":"2026-01-01T00:{:02}:{:02}Z","message_count":1}}"#,
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect();
+        let body = format!(r#"{{"sessions":[{}]}}"#, rows.join(","));
+        let daemon = mock_daemon(&[("/api/sessions", 200, body.leak())]).await;
+        let out = roundtrip_with(
+            &daemon,
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"session/list","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cursor":LIST_PAGE.to_string()}}),
+            ],
+        )
+        .await;
+        let by_id = |id: u64| out.iter().find(|m| m["id"] == id).unwrap();
         assert_eq!(
-            by_id(2)["result"]["sessions"][0]["updatedAt"],
-            "2026-02-01T00:00:00Z"
+            by_id(1)["result"]["sessions"].as_array().unwrap().len(),
+            LIST_PAGE
         );
+        assert_eq!(by_id(1)["result"]["nextCursor"], LIST_PAGE.to_string());
+        assert_eq!(by_id(2)["result"]["sessions"].as_array().unwrap().len(), 3);
+        assert!(by_id(2)["result"].get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn generated_names_are_recognised() {
+        assert!(generated_name("dex-k3m9x2q"));
+        assert!(generated_name("my-project-k3m9x2q"));
+        assert!(!generated_name("release"));
+        assert!(!generated_name("shell-test"));
+        assert!(!generated_name("-k3m9x2q"));
     }
 
     #[tokio::test]

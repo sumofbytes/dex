@@ -463,6 +463,33 @@ fn scan_summary_matches_full_load() {
 }
 
 #[test]
+fn scan_listing_titles_with_the_first_user_line() {
+    let path = unique_path("dex-scan-listing");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let system = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"system","content":"note"}"#;
+    let user = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"\n  fix the build\nthen the tests"}"#;
+    let later = r#"{"type":"message","id":"3","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"second"}"#;
+    let clear = r#"{"type":"clear","id":"4","timestamp":"2020-01-01T00:00:00Z"}"#;
+    fs::write(&path, format!("{header}\n{system}\n{user}\n{later}\n")).unwrap();
+    let listing = Session::scan_listing(&path).unwrap();
+    assert_eq!(listing.message_count, 2);
+    assert_eq!(listing.first_prompt.as_deref(), Some("fix the build"));
+    // A cleared transcript forgets its first prompt; the next one titles it.
+    fs::write(&path, format!("{header}\n{user}\n{clear}\n{later}\n")).unwrap();
+    assert_eq!(
+        Session::scan_listing(&path)
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("second")
+    );
+    // No user message, no title.
+    fs::write(&path, format!("{header}\n{system}\n")).unwrap();
+    assert_eq!(Session::scan_listing(&path).unwrap().first_prompt, None);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn last_turn_state_tracks_terminal_entries() {
     let path = unique_path("dex-turn-state");
     let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;

@@ -34,6 +34,13 @@ pub struct SessionInfo {
     pub created_at: String,
     #[serde(default)]
     pub message_count: usize,
+    /// When the session file last changed (RFC 3339); empty from older
+    /// daemons or when the file is not readable.
+    #[serde(default)]
+    pub updated_at: String,
+    /// First line of the first user message, for titling the session.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
     /// Child-agent runs recorded under this session (§16); `0` from older
     /// daemons that don't report them.
     #[serde(default)]
