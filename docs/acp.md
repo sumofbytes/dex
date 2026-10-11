@@ -18,6 +18,8 @@ Zed (`settings.json`):
 | ACP | dex |
 | --- | --- |
 | `session/new` (`cwd`) | daemon session |
+| `session/list` (`cwd`) | the daemon's persisted sessions, newest first; `title` is the session name, `updatedAt` its creation time; one page |
+| `session/load` | reattach and replay the journal as updates |
 | `session/prompt` | one chat turn; text, resource links and embedded text are inlined |
 | `session/cancel` | daemon cancel; prompt returns `stopReason: cancelled` |
 | `session/set_mode` (`auto`/`manual`/`plan`) | agent mode |
@@ -36,7 +38,7 @@ stop.
 Child-agent transcripts, background-task events and token usage are not
 forwarded to the editor.
 
-Not supported yet: `session/load`, images/audio, client-provided MCP servers,
+Not supported yet: images/audio, client-provided MCP servers,
 `ask_user` questions (dismissed so the turn never hangs).
 
 ## Web UI
