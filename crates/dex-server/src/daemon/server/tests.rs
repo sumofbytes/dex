@@ -1716,8 +1716,8 @@ not json
         ));
         // Names are trimmed before they are recorded.
         let r = session_name(
-            State(state),
-            Path(id),
+            State(state.clone()),
+            Path(id.clone()),
             Json(json!({"name": "  Fancy Name  "})),
         )
         .await
@@ -1728,6 +1728,25 @@ not json
             text.lines()
                 .any(|l| l.contains("\"type\":\"session_info\"") && l.contains("Fancy Name")),
             "rename persisted: {text}"
+        );
+        // The header line itself carries the rename, so header-only openers
+        // (reattach probes, pickers) keep seeing it after a restart —
+        // renames used to live only in the appended row above and rolled
+        // back to the default name on the next open.
+        let reopened = crate::session::Session::from_path(&path).unwrap();
+        assert_eq!(reopened.name(), Some("Fancy Name"));
+        // The registry follows the header: fast-path lookups serve the
+        // cached entry without reopening the file.
+        let entry = state.sessions.lock().unwrap().get("test-name-1").cloned();
+        assert_eq!(entry.and_then(|e| e.name).as_deref(), Some("Fancy Name"));
+        // A rename during a streamed turn is refused: the rewrite replaces
+        // the file's inode and the turn's own journal handle would keep
+        // appending into the old one (409 = retry when the turn ends).
+        state.active_turns.lock().unwrap().insert(id.clone());
+        let r = session_name(State(state), Path(id), Json(json!({"name": "fancier"}))).await;
+        assert!(
+            matches!(r, Err(StatusCode::CONFLICT)),
+            "expected 409 during an active turn"
         );
         let _ = std::fs::remove_file(&path);
     }

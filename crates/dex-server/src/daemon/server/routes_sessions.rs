@@ -137,11 +137,21 @@ pub(crate) async fn list_sessions(
         .into_iter()
         .map(
             |(path, header, listing, updated_at, child_agents, interrupted_children)| {
-                let (message_count, turn_state, first_prompt) = match listing {
-                    Some(l) => (l.message_count, l.turn_state, l.first_prompt),
-                    None => (0, "unknown".to_string(), None),
+                let (message_count, turn_state, first_prompt, journal_name) = match listing {
+                    Some(l) => (
+                        l.message_count,
+                        l.turn_state,
+                        l.first_prompt,
+                        l.session_name,
+                    ),
+                    None => (0, "unknown".to_string(), None, None),
                 };
-                let name = header.name().map(|n| n.to_string());
+                // The newest appended `session_info` rename beats a stale
+                // header name: header-only opens read just the first line,
+                // so journals written before renames patched it keep their
+                // latest name only in the appended rows. Header and entries
+                // agree for journals written after.
+                let name = journal_name.or_else(|| header.name().map(|n| n.to_string()));
                 let auto_named = name
                     .as_deref()
                     .is_some_and(|n| session::Session::is_default_name(n, header.cwd()));
@@ -379,14 +389,26 @@ pub(crate) async fn session_name(
     let Some(name) = name.filter(|n| !n.is_empty()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    // A rename rewrites the header line, replacing the file's inode: an
+    // active turn's journal handle would keep appending into the old one
+    // and those rows would vanish. Refuse while a turn streams (409 =
+    // retry when the turn ends), like other busy-session writers.
+    if lock_map(&state.active_turns).contains(&session_id) {
+        return Err(StatusCode::CONFLICT);
+    }
     let path = session_path(&state, &session_id).await?;
-    let name = name.to_string();
+    let patch_name = name.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
-        session.set_name(name)
+        session.set_name(patch_name)
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Keep the registry in step with the header: fast-path lookups serve
+    // its cached entry (including this name) without reopening the file.
+    if let Some(entry) = lock_map(&state.sessions).get_mut(&session_id) {
+        entry.name = Some(name.to_string());
+    }
     Ok(Json(json!({ "status": "ok" })))
 }
