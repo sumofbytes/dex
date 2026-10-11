@@ -380,6 +380,12 @@ pub enum StreamEvent {
         acceptance: Vec<(String, bool)>,
     },
 
+    /// The user's prompt that started a turn. Journaled for `?since=` replay
+    /// so a reattached client can show the whole conversation; never sent on
+    /// the live stream, where the client already has what it typed.
+    #[serde(rename = "user_prompt")]
+    UserPrompt { content: String },
+
     /// Steering message was accepted by the agent loop (mid-turn injection).
     /// The client uses this to clear its `pending_steering` badge and render
     /// the user's steer as a transcript block.
@@ -725,6 +731,9 @@ mod tests {
                 cost: 0.0003,
                 output: 4,
                 gen_ms: Some(1234),
+            },
+            StreamEvent::UserPrompt {
+                content: "prompt".into(),
             },
             StreamEvent::SteeringAccepted {
                 content: "steer".into(),

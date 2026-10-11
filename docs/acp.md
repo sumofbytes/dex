@@ -36,9 +36,10 @@ cancelled prompt returns within a few seconds even if the daemon is slow to
 stop.
 
 Child-agent transcripts, background-task events and token usage are not
-forwarded to the editor. `session/load` replays the agent's side of the
-conversation; the user's own first prompts are not in the event journal, so
-they are not replayed (steered and follow-up messages are).
+forwarded to the editor. `session/load` replays the whole conversation, the
+user's prompts included. The daemon journals each prompt as a `user_prompt`
+event (never sent on the live stream), so sessions recorded before that replay
+without their prompts.
 
 Not supported yet: images/audio, client-provided MCP servers,
 `ask_user` questions (dismissed so the turn never hangs).

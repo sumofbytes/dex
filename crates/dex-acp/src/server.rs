@@ -630,12 +630,12 @@ mod tests {
             (
                 "/api/sessions/s-1/events?since=0",
                 200,
-                r#"{"events":[{"seq":0,"type":"assistant_text","data":"hi"},{"seq":1,"type":"tool_call","data":{"name":"bash","args":"ls","id":"c1"}}],"next_seq":2}"#,
+                r#"{"events":[{"seq":0,"type":"user_prompt","data":{"content":"hello"}},{"seq":1,"type":"assistant_text","data":"hi"},{"seq":2,"type":"tool_call","data":{"name":"bash","args":"ls","id":"c1"}}],"next_seq":3}"#,
             ),
             (
-                "/api/sessions/s-1/events?since=2",
+                "/api/sessions/s-1/events?since=3",
                 200,
-                r#"{"events":[{"seq":2,"type":"steering_accepted","data":{"content":"use bash"}}],"next_seq":3}"#,
+                r#"{"events":[{"seq":3,"type":"steering_accepted","data":{"content":"use bash"}}],"next_seq":4}"#,
             ),
         ])
         .await;
@@ -661,13 +661,16 @@ mod tests {
         assert!(!updates.is_empty(), "out: {out:?}");
         let update = |n: usize| updates[n]["params"]["update"].clone();
         // The journal replays in order, before the `session/load` response.
-        let u0 = update(0);
+        let prompt = update(0);
+        assert_eq!(prompt["sessionUpdate"], "user_message_chunk");
+        assert_eq!(prompt["content"]["text"], "hello");
+        let u0 = update(1);
         assert_eq!(u0["sessionUpdate"], "agent_message_chunk");
         assert_eq!(u0["content"]["text"], "hi");
-        let u1 = update(1);
+        let u1 = update(2);
         assert_eq!(u1["sessionUpdate"], "tool_call");
         assert_eq!(u1["toolCallId"], "c1");
-        let u2 = update(2);
+        let u2 = update(3);
         assert_eq!(u2["sessionUpdate"], "user_message_chunk");
         assert_eq!(u2["content"]["text"], "use bash");
 

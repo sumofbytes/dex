@@ -243,6 +243,10 @@ pub(crate) fn handle_stream_event(remote: &mut RemoteApp, event: StreamEvent) {
                 },
             );
         }
+        // Journal-only, for clients that cannot read the session file (ACP
+        // replay). The TUI renders its own prompts when sent, and rebuilds a
+        // resumed transcript from the JSONL messages.
+        StreamEvent::UserPrompt { .. } => {}
         StreamEvent::SteeringAccepted { content } => {
             let app = &mut remote.app;
             // Drop the accepted badge (exact match, then trim-insensitive so a
