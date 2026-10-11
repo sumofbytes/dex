@@ -127,6 +127,8 @@ fn handle_event_with(
         StreamEvent::TurnComplete { .. } => {}
         StreamEvent::Usage { .. } => {}
         StreamEvent::Plan { .. } => {}
+        // Journal-only: this client typed the prompt itself.
+        StreamEvent::UserPrompt { .. } => {}
         StreamEvent::SteeringAccepted { content } => {
             eprintln!("[steer] {content}");
         }

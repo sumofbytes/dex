@@ -163,9 +163,9 @@ pub fn update_for(event: &StreamEvent, ids: &mut ToolIds) -> Option<Value> {
         })),
         // Steered/follow-up prompts are the user's own words; render them as
         // user chunks so a replayed transcript stays readable.
-        StreamEvent::SteeringAccepted { content } | StreamEvent::FollowupAccepted { content } => {
-            Some(user_chunk(content))
-        }
+        StreamEvent::UserPrompt { content }
+        | StreamEvent::SteeringAccepted { content }
+        | StreamEvent::FollowupAccepted { content } => Some(user_chunk(content)),
         _ => None,
     }
 }
@@ -311,6 +311,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(followup["sessionUpdate"], "user_message_chunk");
+        let prompt = update_for(
+            &StreamEvent::UserPrompt {
+                content: "fix it".into(),
+            },
+            &mut ids,
+        )
+        .unwrap();
+        assert_eq!(prompt["sessionUpdate"], "user_message_chunk");
+        assert_eq!(prompt["content"]["text"], "fix it");
         assert!(update_for(&StreamEvent::System("x".into()), &mut ids).is_none());
     }
 }

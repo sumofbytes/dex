@@ -1,4 +1,5 @@
 use super::super::approvals::write_approval_audit;
+use super::super::journal_event;
 use super::super::lock_map;
 use super::super::lookup::lookup_entry_async;
 use super::super::questions::sanitize_answers;
@@ -15,6 +16,7 @@ use crate::protocol::QueueMsg;
 use crate::protocol::RecallRequest;
 use crate::protocol::SteerRequest;
 use crate::protocol::StreamEnvelope;
+use crate::protocol::StreamEvent;
 use crate::runtime::console::CancellationToken;
 use axum::extract::Path;
 use axum::extract::State;
@@ -117,6 +119,13 @@ pub(crate) async fn chat(
         let idem_key = idempotency_key;
         let cancel = cancel_for_turn.unwrap_or_default();
         tokio::spawn(async move {
+            // Journal-only: the live stream's client typed the prompt, but a
+            // replay (`session/load`, reattach) has no other record of it.
+            let seq = state_for_turn.next_seq(&sid);
+            let prompt = StreamEvent::UserPrompt {
+                content: req.prompt.clone(),
+            };
+            journal_event(&state_for_turn, &sid, seq, &prompt);
             run_agent_turn(
                 state_for_turn,
                 sid,

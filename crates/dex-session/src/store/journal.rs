@@ -125,6 +125,15 @@ impl Session {
     /// as today). Stays quiet on malformed lines — unlike the loader, this
     /// runs per file per listing.
     pub fn scan_summary(path: &Path) -> io::Result<(usize, String)> {
+        Self::scan_listing(path).map(|listing| (listing.message_count, listing.turn_state))
+    }
+
+    /// `scan_summary` plus the first user prompt, taken in the same pass: the
+    /// first line of the first user message still in the transcript (a `clear`
+    /// forgets it), at most `TITLE_CHARS` characters. A resume picker titles
+    /// the session with it.
+    pub fn scan_listing(path: &Path) -> io::Result<Listing> {
+        let mut first_prompt: Option<String> = None;
         let mut reader = BufReader::new(File::open(path)?);
         let mut count = 0usize;
         let mut state = "none";
@@ -164,12 +173,24 @@ impl Session {
                 Some(0) => {
                     if let Ok(value) = serde_json::from_str::<Value>(text) {
                         match serde_json::from_value::<ChatMessage>(value) {
-                            Ok(msg) if msg.role != Role::System => count += 1,
+                            Ok(msg) if msg.role != Role::System => {
+                                count += 1;
+                                // The compaction summary is a user message too, but not a prompt.
+                                if first_prompt.is_none()
+                                    && msg.role == Role::User
+                                    && msg.name.as_deref() != Some("summary")
+                                {
+                                    first_prompt = msg.content.as_deref().and_then(prompt_title);
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
-                Some(1) => count = 0,
+                Some(1) => {
+                    count = 0;
+                    first_prompt = None;
+                }
                 Some(2) => {
                     if let Ok(value) = serde_json::from_str::<Value>(text) {
                         match value.get("type").and_then(Value::as_str) {
@@ -183,6 +204,29 @@ impl Session {
                 _ => {}
             }
         }
-        Ok((count, state.to_string()))
+        Ok(Listing {
+            message_count: count,
+            turn_state: state.to_string(),
+            first_prompt,
+        })
     }
+}
+
+/// Longest title taken from a prompt.
+const TITLE_CHARS: usize = 80;
+
+/// What a session listing shows of one transcript (`Session::scan_listing`).
+pub struct Listing {
+    pub message_count: usize,
+    pub turn_state: String,
+    pub first_prompt: Option<String>,
+}
+
+/// The first non-empty line of a prompt, cut to `TITLE_CHARS`.
+fn prompt_title(content: &str) -> Option<String> {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(line.chars().take(TITLE_CHARS).collect())
 }

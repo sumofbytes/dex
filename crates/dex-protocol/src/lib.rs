@@ -34,6 +34,17 @@ pub struct SessionInfo {
     pub created_at: String,
     #[serde(default)]
     pub message_count: usize,
+    /// When the session file last changed (RFC 3339); empty from older
+    /// daemons or when the file is not readable.
+    #[serde(default)]
+    pub updated_at: String,
+    /// The name is the generated default, not one someone chose; `false` from
+    /// older daemons.
+    #[serde(default)]
+    pub auto_named: bool,
+    /// First line of the first user message, for titling the session.
+    #[serde(default)]
+    pub first_prompt: Option<String>,
     /// Child-agent runs recorded under this session (§16); `0` from older
     /// daemons that don't report them.
     #[serde(default)]
@@ -368,6 +379,12 @@ pub enum StreamEvent {
         #[serde(default)]
         acceptance: Vec<(String, bool)>,
     },
+
+    /// The user's prompt that started a turn. Journaled for `?since=` replay
+    /// so a reattached client can show the whole conversation; never sent on
+    /// the live stream, where the client already has what it typed.
+    #[serde(rename = "user_prompt")]
+    UserPrompt { content: String },
 
     /// Steering message was accepted by the agent loop (mid-turn injection).
     /// The client uses this to clear its `pending_steering` badge and render
@@ -714,6 +731,9 @@ mod tests {
                 cost: 0.0003,
                 output: 4,
                 gen_ms: Some(1234),
+            },
+            StreamEvent::UserPrompt {
+                content: "prompt".into(),
             },
             StreamEvent::SteeringAccepted {
                 content: "steer".into(),
