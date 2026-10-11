@@ -159,6 +159,19 @@ impl Session {
         format!("{}-{}", Self::workspace_slug(cwd), Self::random_suffix(7))
     }
 
+    /// Whether `name` is what `default_session_name(cwd)` could have produced,
+    /// i.e. nobody chose it.
+    pub fn is_default_name(name: &str, cwd: &str) -> bool {
+        name.strip_prefix(Self::workspace_slug(cwd).as_str())
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|suffix| {
+                suffix.len() == 7
+                    && suffix
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            })
+    }
+
     /// The cwd basename, lowercased, anything outside `[a-z0-9]` folded to `-`,
     /// runs collapsed and trimmed, capped at 32 chars, `session` when nothing
     /// survives. Shared by the session name and id so both carry the workspace

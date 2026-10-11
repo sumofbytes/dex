@@ -175,7 +175,11 @@ impl Session {
                         match serde_json::from_value::<ChatMessage>(value) {
                             Ok(msg) if msg.role != Role::System => {
                                 count += 1;
-                                if first_prompt.is_none() && msg.role == Role::User {
+                                // The compaction summary is a user message too, but not a prompt.
+                                if first_prompt.is_none()
+                                    && msg.role == Role::User
+                                    && msg.name.as_deref() != Some("summary")
+                                {
                                     first_prompt = msg.content.as_deref().and_then(prompt_title);
                                 }
                             }

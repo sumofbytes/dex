@@ -209,18 +209,6 @@ async fn new_session(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> 
 /// Sessions per `session/list` page.
 const LIST_PAGE: usize = 50;
 
-/// Whether `name` is the `<workspace>-<7 chars>` name a session gets when
-/// nobody named it, which says nothing a client could show.
-fn generated_name(name: &str) -> bool {
-    name.rsplit_once('-').is_some_and(|(workspace, suffix)| {
-        !workspace.is_empty()
-            && suffix.len() == 7
-            && suffix
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-    })
-}
-
 /// `session/list`: the daemon's persisted sessions that hold a conversation,
 /// most recently changed first, optionally only those recorded in `cwd`, in
 /// pages of `LIST_PAGE`. `nextCursor` is the offset of the next page.
@@ -256,10 +244,7 @@ async fn list_sessions(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError
         .take(LIST_PAGE)
         .map(|s| {
             let mut entry = json!({"sessionId": s.session_id, "cwd": s.cwd});
-            let named = s
-                .name
-                .as_deref()
-                .filter(|n| !n.is_empty() && !generated_name(n));
+            let named = s.name.as_deref().filter(|n| !n.is_empty() && !s.auto_named);
             if let Some(title) = named.or(s.first_prompt.as_deref().filter(|p| !p.is_empty())) {
                 entry["title"] = json!(title);
             }
@@ -705,10 +690,11 @@ mod tests {
             "/api/sessions",
             200,
             r#"{"sessions":[
-                {"session_id":"a","path":"/p","name":"w-abc1234","cwd":"/w","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-04-01T00:00:00Z","message_count":2,"first_prompt":"fix the build"},
+                {"session_id":"a","path":"/p","name":"w-abc1234","auto_named":true,"cwd":"/w","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-04-01T00:00:00Z","message_count":2,"first_prompt":"fix the build"},
                 {"session_id":"b","path":"/p","name":null,"cwd":"/other","created_at":"2026-03-01T00:00:00Z","message_count":2},
                 {"session_id":"c","path":"/p","name":"release","cwd":"/w","created_at":"2026-02-01T00:00:00Z","message_count":4,"first_prompt":"ignored"},
-                {"session_id":"d","path":"/p","name":"w-xyz9876","cwd":"/w","created_at":"2026-05-01T00:00:00Z","message_count":0}
+                {"session_id":"e","path":"/p","name":"my-feature","cwd":"/w","created_at":"2026-01-15T00:00:00Z","message_count":1,"first_prompt":"ignored"},
+                {"session_id":"d","path":"/p","name":"w-xyz9876","auto_named":true,"cwd":"/w","created_at":"2026-05-01T00:00:00Z","message_count":0}
             ]}"#,
         )])
         .await;
@@ -736,12 +722,14 @@ mod tests {
                 .collect()
         };
         // `d` is empty and left out; `a` changed last although `c` is newer by creation.
-        assert_eq!(ids(2), ["a", "c"]);
-        assert_eq!(ids(3), ["a", "b", "c"]);
+        assert_eq!(ids(2), ["a", "c", "e"]);
+        assert_eq!(ids(3), ["a", "b", "c", "e"]);
         let first = &by_id(2)["result"]["sessions"][0];
         assert_eq!(first["title"], "fix the build");
         assert_eq!(first["updatedAt"], "2026-04-01T00:00:00Z");
         assert_eq!(by_id(2)["result"]["sessions"][1]["title"], "release");
+        // A chosen name that merely looks generated is still a name.
+        assert_eq!(by_id(2)["result"]["sessions"][2]["title"], "my-feature");
         assert!(by_id(3)["result"]["sessions"][1].get("title").is_none());
         assert!(by_id(2)["result"].get("nextCursor").is_none());
         assert_eq!(by_id(4)["error"]["code"], rpc::INVALID_PARAMS);
@@ -776,15 +764,6 @@ mod tests {
         assert_eq!(by_id(1)["result"]["nextCursor"], LIST_PAGE.to_string());
         assert_eq!(by_id(2)["result"]["sessions"].as_array().unwrap().len(), 3);
         assert!(by_id(2)["result"].get("nextCursor").is_none());
-    }
-
-    #[test]
-    fn generated_names_are_recognised() {
-        assert!(generated_name("dex-k3m9x2q"));
-        assert!(generated_name("my-project-k3m9x2q"));
-        assert!(!generated_name("release"));
-        assert!(!generated_name("shell-test"));
-        assert!(!generated_name("-k3m9x2q"));
     }
 
     #[tokio::test]

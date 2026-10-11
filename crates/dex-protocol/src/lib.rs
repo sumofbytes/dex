@@ -38,6 +38,10 @@ pub struct SessionInfo {
     /// daemons or when the file is not readable.
     #[serde(default)]
     pub updated_at: String,
+    /// The name is the generated default, not one someone chose; `false` from
+    /// older daemons.
+    #[serde(default)]
+    pub auto_named: bool,
     /// First line of the first user message, for titling the session.
     #[serde(default)]
     pub first_prompt: Option<String>,

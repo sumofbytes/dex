@@ -18,7 +18,7 @@ Zed (`settings.json`):
 | ACP | dex |
 | --- | --- |
 | `session/new` (`cwd`) | daemon session |
-| `session/list` (`cwd`, `cursor`) | the daemon's sessions that hold a conversation, most recently changed first, 50 to a page with `nextCursor`; `title` is the session name if someone chose one, else the first line of the first prompt; `updatedAt` is when the session file last changed |
+| `session/list` (`cwd`, `cursor`) | the daemon's sessions that hold a conversation, most recently changed first, 50 to a page with `nextCursor`; `title` is the session name if someone chose one, else the first line of the first prompt; `updatedAt` is when the session file last changed (a rename counts); `cursor` is an offset, so a session that changes between pages can shift the list |
 | `session/load` | reattach and replay the journal as updates |
 | `session/prompt` | one chat turn; text, resource links and embedded text are inlined |
 | `session/cancel` | daemon cancel; prompt returns `stopReason: cancelled` |

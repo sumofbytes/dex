@@ -108,7 +108,7 @@ pub(crate) async fn list_sessions(
                     chrono::DateTime::<chrono::Utc>::from(time)
                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 })
-                .unwrap_or_default();
+                .ok();
             // §16/Phase 8: child runs surface in the listing (the resume
             // picker shows them); loaders keep excluding `agents/*`.
             let dir = session::Session::agents_dir(&path);
@@ -142,6 +142,11 @@ pub(crate) async fn list_sessions(
                     None => (0, "unknown".to_string(), None),
                 };
                 let name = header.name().map(|n| n.to_string());
+                let auto_named = name
+                    .as_deref()
+                    .is_some_and(|n| session::Session::is_default_name(n, header.cwd()));
+                // Without a readable mtime the file's age is its creation.
+                let updated_at = updated_at.unwrap_or_else(|| header.timestamp().to_string());
                 (
                     header.timestamp().to_string(),
                     header.id().to_string(),
@@ -149,6 +154,7 @@ pub(crate) async fn list_sessions(
                         "session_id": header.id(),
                         "path": path.display().to_string(),
                         "name": name,
+                        "auto_named": auto_named,
                         "cwd": header.cwd(),
                         "created_at": header.timestamp(),
                         "updated_at": updated_at,

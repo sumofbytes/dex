@@ -490,6 +490,32 @@ fn scan_listing_titles_with_the_first_user_line() {
 }
 
 #[test]
+fn scan_listing_skips_summaries_and_cuts_long_titles() {
+    let path = unique_path("dex-scan-title");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let summary = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","name":"summary","content":"earlier work"}"#;
+    let long = format!(
+        r#"{{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"{}"}}"#,
+        "é".repeat(200)
+    );
+    fs::write(&path, format!("{header}\n{summary}\n{long}\n")).unwrap();
+    let title = Session::scan_listing(&path).unwrap().first_prompt.unwrap();
+    assert_eq!(title.chars().count(), 80);
+    assert!(title.starts_with('é'));
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn default_names_are_told_from_chosen_ones() {
+    let name = Session::default_session_name("/work/dex");
+    assert!(Session::is_default_name(&name, "/work/dex"));
+    assert!(Session::is_default_name("dex-abcdefg", "/work/dex"));
+    assert!(!Session::is_default_name("my-feature", "/work/dex"));
+    assert!(!Session::is_default_name("dex-abc", "/work/dex"));
+    assert!(!Session::is_default_name("dex-abcdefg", "/work/other"));
+}
+
+#[test]
 fn last_turn_state_tracks_terminal_entries() {
     let path = unique_path("dex-turn-state");
     let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
