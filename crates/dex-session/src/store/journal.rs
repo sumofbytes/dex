@@ -211,8 +211,11 @@ impl Session {
                     // name (it clears the transcript, not the session's
                     // identity). Renames written before `set_name` patched
                     // the header line exist only in these entries.
-                    if let Ok(value) = serde_json::from_str::<Value>(text) {
-                        session_name = value.get("name").and_then(Value::as_str).map(str::to_owned);
+                    if let Some(n) = serde_json::from_str::<Value>(text)
+                        .ok()
+                        .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_owned))
+                    {
+                        session_name = Some(n);
                     }
                 }
                 _ => {}

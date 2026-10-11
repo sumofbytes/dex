@@ -392,11 +392,23 @@ pub(crate) async fn session_name(
     // A rename rewrites the header line, replacing the file's inode: an
     // active turn's journal handle would keep appending into the old one
     // and those rows would vanish. Refuse while a turn streams (409 =
-    // retry when the turn ends), like other busy-session writers.
-    if lock_map(&state.active_turns).contains(&session_id) {
+    // retry when the turn ends), like other busy-session writers. The turn
+    // slot is claimed (not just checked) so a turn can't start mid-rewrite.
+    if !try_claim_slot(&state, &session_id) {
         return Err(StatusCode::CONFLICT);
     }
-    let path = session_path(&state, &session_id).await?;
+    let renamed = rename_session(&state, &session_id, name).await;
+    lock_map(&state.active_turns).remove(&session_id);
+    renamed?;
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn rename_session(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    name: &str,
+) -> Result<(), StatusCode> {
+    let path = session_path(state, session_id).await?;
     let patch_name = name.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut session = Session::from_path(&path)?;
@@ -407,8 +419,8 @@ pub(crate) async fn session_name(
     result.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Keep the registry in step with the header: fast-path lookups serve
     // its cached entry (including this name) without reopening the file.
-    if let Some(entry) = lock_map(&state.sessions).get_mut(&session_id) {
+    if let Some(entry) = lock_map(&state.sessions).get_mut(session_id) {
         entry.name = Some(name.to_string());
     }
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(())
 }
