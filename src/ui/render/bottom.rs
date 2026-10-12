@@ -148,7 +148,9 @@ impl SlashSuggestionsView {
                     Span::styled(desc, description_style),
                 ])
             });
-        let base = if input.starts_with("/model ") {
+        let base = if super::super::mention::active_token(app).is_some() {
+            "Files"
+        } else if input.starts_with("/model ") {
             "Models"
         } else if input.starts_with("/provider ") {
             "Providers"

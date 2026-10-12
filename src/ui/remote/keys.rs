@@ -2,6 +2,7 @@ use super::super::append_sink_line;
 use super::super::bump_thinking_stamps;
 use super::super::bump_tool_stamps;
 use super::super::deny_all_approvals;
+use super::super::mention;
 use super::super::push_info;
 use super::super::render_user_prompt;
 use super::super::resolve_approval;
@@ -131,7 +132,8 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
             // turn/shell falls through to the composer below.
             app.quit = true;
         }
-        KeyCode::Esc if app.busy || shell_running => {
+        // An open `@` popup takes Esc first (closes it); a second Esc cancels.
+        KeyCode::Esc if (app.busy || shell_running) && !mention::is_open(app) => {
             request_cancel(remote);
         }
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
@@ -715,6 +717,8 @@ fn handle_ctrl_c(remote: &mut RemoteApp, shell_running: bool, shell_cancel_reque
 fn handle_popup_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     let app = &mut remote.app;
     match key.code {
+        KeyCode::Esc if mention::dismiss(app) => {}
+        KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() && mention::complete(app) => {}
         KeyCode::Esc => {
             // Discard the drafted slash command and close the popup without
             // completing anything (busy+Esc still cancels).

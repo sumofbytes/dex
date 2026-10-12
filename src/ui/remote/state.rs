@@ -33,6 +33,12 @@ pub(crate) enum WorkerMessage {
     Cursor(u64),
     /// The SSE stream closed; carries a transport error if any.
     Finished(Option<String>),
+    /// Reply to an `@` popup query (`query` is what was asked, so a late
+    /// reply for text the user has since changed is dropped).
+    Files {
+        query: String,
+        files: Vec<crate::protocol::FileMatch>,
+    },
     /// Background git poll result (off UI thread, every 2s).
     Git(crate::protocol::GitInfo),
     /// A direct shell run (`!`/`!!` prefix) finished on the daemon. Rendered

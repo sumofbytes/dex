@@ -74,6 +74,11 @@ pub(crate) struct SlashCache {
 }
 
 pub(crate) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
+    // An `@` mention under the cursor owns the sheet (never on a `/` line).
+    let mentions = super::super::mention::suggestions(app);
+    if !mentions.is_empty() {
+        return mentions;
+    }
     let input = app.input.text();
     // The popup is a typing affordance, not a history companion: while the
     // composer holds a line recalled by the history walk (history_index is

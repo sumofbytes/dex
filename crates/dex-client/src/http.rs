@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{
     ApprovalDecision, ApprovalResponse, ChatRequest, CreateSessionRequest, CreateSessionResponse,
-    DaemonInfo, EventsResponse, FollowupRequest, GitInfo, LoadSkillRequest, LoadSkillResponse,
-    QuestionAnswer, QuestionResponse, ReattachResponse, RecallRequest, SessionInfo, ShellRequest,
-    ShellResponse, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
+    DaemonInfo, EventsResponse, FileMatch, FollowupRequest, GitInfo, LoadSkillRequest,
+    LoadSkillResponse, QuestionAnswer, QuestionResponse, ReattachResponse, RecallRequest,
+    SessionInfo, ShellRequest, ShellResponse, SkillInfo, SteerRequest, StreamEnvelope, StreamEvent,
 };
 
 use super::runtime::{block_on, shared_async_client, shared_streaming_client};
@@ -55,6 +55,19 @@ pub struct ChatOptions {
     pub thinking_effort: Option<String>,
     /// P10: replay-safe submission key; the daemon dedups identical keys within 60s.
     pub idempotency_key: Option<String>,
+}
+
+/// RFC 3986 unreserved bytes pass through; everything else is `%XX`.
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// HTTP client for communicating with the dex daemon.
@@ -595,6 +608,29 @@ impl DaemonClient {
 
     pub fn list_skills(&self) -> Result<Vec<SkillInfo>, Box<dyn std::error::Error>> {
         block_on(self.list_skills_async()).map_err(|e| -> Box<dyn std::error::Error> { e })
+    }
+
+    /// `@` completion candidates (files and folders) for `query` from the
+    /// daemon's workspace index (`GET /api/files`).
+    pub async fn list_files_async(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FileMatch>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/api/files?q={}&limit={limit}",
+                self.base_url,
+                percent_encode(query)
+            ))
+            .headers(self.api_headers())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(lenient_array(&resp, "files"))
     }
 
     /// MCP server status from the daemon (`GET /api/mcp`): per-server

@@ -796,8 +796,9 @@ pub(crate) fn render_message_slice<'m>(
         match msg.role {
             Role::User => {
                 if let Some(content) = &msg.content {
-                    if !content.trim().is_empty() {
-                        render_user_prompt(app, content);
+                    let typed = crate::protocol::strip_mention_block(content);
+                    if !typed.trim().is_empty() {
+                        render_user_prompt(app, typed);
                     }
                 }
             }

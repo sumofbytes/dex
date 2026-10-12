@@ -19,6 +19,7 @@ use std::time::Instant;
 
 pub(crate) mod herdr;
 pub(crate) mod input;
+pub(crate) mod mention;
 pub(crate) mod metrics;
 pub(crate) mod remote;
 pub(crate) mod render;

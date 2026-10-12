@@ -498,6 +498,28 @@ pub struct SkillInfo {
     pub description: String,
 }
 
+/// Separator the daemon puts between a prompt and the `@path` contents it
+/// appends for the model. Session replay cuts at it so a resumed transcript
+/// shows what the user typed.
+pub const MENTION_MARKER: &str =
+    "\n\n[The user referenced these paths with @; their contents follow.]\n";
+
+/// `content` without the `@path` expansion the daemon appended.
+pub fn strip_mention_block(content: &str) -> &str {
+    content
+        .split_once(MENTION_MARKER)
+        .map_or(content, |(typed, _)| typed)
+}
+
+/// One `@` completion candidate from `GET /api/files`: a path relative to the
+/// daemon's workspace, folders flagged so the client can mark and drill into
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMatch {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 /// Request to load a skill into the current session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadSkillRequest {

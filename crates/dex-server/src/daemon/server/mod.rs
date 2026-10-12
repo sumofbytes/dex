@@ -16,7 +16,7 @@ pub(crate) use routes_chat::{
 };
 pub(crate) use routes_misc::{
     extensions_reload, extensions_run, get_config, get_extensions, get_git, get_mcp, health,
-    list_skills, load_skill, log_requests, mcp_reconnect, require_bearer,
+    list_files, list_skills, load_skill, log_requests, mcp_reconnect, require_bearer,
 };
 #[cfg(test)]
 pub(crate) use routes_sessions::steal_wake_and_claim;
@@ -36,6 +36,7 @@ pub fn router(state: Arc<DaemonState>) -> Router {
         .route("/api/extensions/reload", post(extensions_reload))
         .route("/api/extensions/run", post(extensions_run))
         .route("/api/skills", get(list_skills))
+        .route("/api/files", get(list_files))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route("/api/sessions/{id}/chat", post(chat))
         .route("/api/sessions/{id}/approve", post(approve))

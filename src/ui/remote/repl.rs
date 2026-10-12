@@ -1,3 +1,4 @@
+use super::super::mention;
 use super::super::view;
 use super::boot::bootstrap;
 use super::boot::Boot;
@@ -62,6 +63,11 @@ pub(crate) fn run_ratatui_repl_with_remote(
             let mut streamed = false;
             loop {
                 match remote.worker_rx.try_recv() {
+                    Ok(WorkerMessage::Files { query, files }) => {
+                        if mention::apply_results(&mut remote.app, &query, files) {
+                            dirty = true;
+                        }
+                    }
                     Ok(WorkerMessage::Git(info)) => {
                         if apply_git_info(&mut remote, &info) {
                             dirty = true;
@@ -153,7 +159,13 @@ pub(crate) fn run_ratatui_repl_with_remote(
 
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(if busy { 100 } else { 250 }))? {
+            } else if event::poll(Duration::from_millis(if mention::debouncing(&remote.app) {
+                25
+            } else if busy {
+                100
+            } else {
+                250
+            }))? {
                 event::read()?
             } else {
                 continue;
@@ -178,6 +190,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
             }
 
             dirty = true;
+            request_files(&mut remote);
 
             if remote.app.quit {
                 break;
@@ -223,4 +236,22 @@ pub(crate) fn run_ratatui_repl_with_remote(
         daemon_is_local,
     );
     res
+}
+
+/// Ask the daemon for `@` popup candidates when the token under the cursor
+/// changed. Off the UI thread; the reply arrives as `WorkerMessage::Files`.
+fn request_files(remote: &mut super::state::RemoteApp) {
+    let Some(query) = mention::query_to_request(&mut remote.app) else {
+        return;
+    };
+    let client = remote.client.clone();
+    let tx = remote.worker_tx.clone();
+    crate::runtime::http::spawn_task(async move {
+        // A failed lookup answers with no rows so stale ones can't linger.
+        let files = client
+            .list_files_async(&query, mention::MENTION_LIMIT)
+            .await
+            .unwrap_or_default();
+        let _ = tx.send(WorkerMessage::Files { query, files }).await;
+    });
 }

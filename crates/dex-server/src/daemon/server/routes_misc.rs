@@ -6,6 +6,7 @@ use crate::llm::config::LlmConfig;
 use crate::protocol::ChatMessage;
 use crate::protocol::DaemonInfo;
 use crate::protocol::ExtensionRunRequest;
+use crate::protocol::FileMatch;
 use crate::protocol::GitInfo;
 use crate::protocol::LoadSkillRequest;
 use crate::protocol::SkillInfo;
@@ -320,6 +321,31 @@ pub(crate) async fn list_skills() -> Json<serde_json::Value> {
         })
         .collect();
     Json(json!({ "skills": infos }))
+}
+
+/// `GET /api/files?q=<query>&limit=<n>`: fuzzy file + folder candidates for
+/// the composer's `@` popup, served from the same fff index as `find`/`grep`.
+pub(crate) async fn list_files(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let query = params.get("q").cloned().unwrap_or_default();
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let found = tokio::task::spawn_blocking(move || crate::tools::complete_paths(&query, limit))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let files: Vec<FileMatch> = found
+        .into_iter()
+        .map(|m| FileMatch {
+            path: m.path,
+            is_dir: m.is_dir,
+        })
+        .collect();
+    Ok(Json(json!({ "files": files })))
 }
 
 pub(crate) async fn load_skill(
