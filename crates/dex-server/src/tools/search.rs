@@ -300,3 +300,42 @@ pub(crate) fn tool_fffind(args: &Map<String, Value>) -> Result<String, ToolError
         Ok(out)
     })
 }
+
+/// One `@` completion candidate: workspace-relative path, `is_dir` for folders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PathMatch {
+    pub(crate) path: String,
+    pub(crate) is_dir: bool,
+}
+
+/// Files and directories ranked together by fff (frecency + fuzzy score) for
+/// the composer's `@` popup. An empty query lists the best-ranked entries.
+pub(crate) fn complete_paths(query: &str, limit: usize) -> Result<Vec<PathMatch>, ToolError> {
+    with_picker(|p| {
+        let parser = QueryParser::new(::fff::MixedSearchConfig);
+        let parsed = parser.parse(query);
+        let options = FuzzySearchOptions {
+            max_threads: 0,
+            current_file: None,
+            project_path: Some(p.base_path()),
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs { offset: 0, limit },
+        };
+        let result = p.fuzzy_search_mixed(&parsed, None, options);
+        Ok(result
+            .items
+            .iter()
+            .map(|item| match item {
+                ::fff::MixedItemRef::File(f) => PathMatch {
+                    path: f.relative_path(p),
+                    is_dir: false,
+                },
+                ::fff::MixedItemRef::Dir(d) => PathMatch {
+                    path: d.relative_path(p).trim_end_matches('/').to_string(),
+                    is_dir: true,
+                },
+            })
+            .collect())
+    })
+}

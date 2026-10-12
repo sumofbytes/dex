@@ -82,6 +82,12 @@ unaffected.
 - **Enter** — submit the current input.
 - **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓**
   navigate suggestions; **Esc** — discard the draft and close the popup.
+- **@** — type `@` (at the start of a word) to pick a file or folder from the
+  daemon's workspace; **Tab**/**Enter** inserts `@path` (folders end in `/` so
+  you can keep drilling), **Esc** closes the popup. On submit the daemon
+  appends each mentioned path's contents (a folder's listing) to the model's
+  message — the transcript still shows what you typed. Up to 10 mentions per
+  prompt, 256 KiB total; paths that don't exist stay plain text.
 - **Shift+Enter** — insert a newline (multi-line input). Needs a terminal with
   Kitty keyboard-protocol support (e.g. Ghostty, Kitty, WezTerm, foot);
   otherwise use **Ctrl+J**, which works everywhere.

@@ -498,6 +498,15 @@ pub struct SkillInfo {
     pub description: String,
 }
 
+/// One `@` completion candidate from `GET /api/files`: a path relative to the
+/// daemon's workspace, folders flagged so the client can mark and drill into
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMatch {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 /// Request to load a skill into the current session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadSkillRequest {

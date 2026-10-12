@@ -19,9 +19,9 @@ use super::super::turn::TurnChannels;
 #[cfg(test)]
 use crate::daemon::server::{
     answer, approve, cancel, chat, create_session, extensions_reload, extensions_run, followup,
-    get_extensions, get_git, get_mcp, health, list_skills, load_skill, mcp_reconnect, reattach,
-    recall, router, session_events, session_name, session_trace, session_undo, session_waive,
-    steal_wake_and_claim, steer,
+    get_extensions, get_git, get_mcp, health, list_files, list_skills, load_skill, mcp_reconnect,
+    reattach, recall, router, session_events, session_name, session_trace, session_undo,
+    session_waive, steal_wake_and_claim, steer,
 };
 #[cfg(test)]
 use crate::daemon::server::{list_sessions, DaemonState};
@@ -239,6 +239,40 @@ mod handler_tests {
         headers.insert("x-dex-protocol", "2".parse().unwrap());
         let r = chat(State(state), Path("nope".into()), headers, Json(req)).await;
         assert!(matches!(r, Err(StatusCode::BAD_REQUEST)));
+    }
+
+    #[tokio::test]
+    async fn files_endpoint_lists_files_and_folders() {
+        let params = |q: &str| {
+            Query(std::collections::HashMap::from([
+                ("q".to_string(), q.to_string()),
+                ("limit".to_string(), "50".to_string()),
+            ]))
+        };
+        // Runs in the crate dir: `src/daemon` is a folder, `mentions.rs` a file.
+        let body = list_files(params("mentions")).await.unwrap().0;
+        let files = body["files"].as_array().unwrap();
+        assert!(
+            files.iter().any(|f| f["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("tools/mentions.rs"))
+                && f["is_dir"] == false),
+            "{body}"
+        );
+        let body = list_files(params("")).await.unwrap().0;
+        assert!(
+            !body["files"].as_array().unwrap().is_empty(),
+            "bare `@` should offer the best-ranked entries: {body}"
+        );
+        let body = list_files(params("daemon")).await.unwrap().0;
+        assert!(
+            body["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["is_dir"] == true),
+            "{body}"
+        );
     }
 
     #[tokio::test]

@@ -563,7 +563,9 @@ pub(crate) async fn run_turn_inner(
     )));
     // The history above is the exact message list the turn sends.
     messages.extend(history);
-    let user_message = ChatMessage::user(req.prompt.clone());
+    // `@path` mentions expand here, not in the journaled `UserPrompt`, so the
+    // transcript shows what the user typed while the model gets the contents.
+    let user_message = ChatMessage::user(crate::tools::expand_mentions(&req.prompt).await);
     // §10b V1a: completion notices queued while no turn was live drain at
     // the next real turn boundary — the start of this one. They ride the
     // LLM context as a user-role message, never the steering channel.

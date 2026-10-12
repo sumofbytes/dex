@@ -387,6 +387,7 @@ pub(crate) fn bootstrap(
         history_index: None,
         history_draft: String::new(),
         slash_selected: 0,
+        mention: Default::default(),
         connection: Some(connection_label(daemon_url)),
         daemon_url: Some(daemon_url.to_string()),
         assistant_open: false,

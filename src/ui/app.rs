@@ -294,6 +294,8 @@ pub(crate) struct App {
     pub(crate) history_index: Option<usize>,
     pub(crate) history_draft: String,
     pub(crate) slash_selected: usize,
+    /// `@` file/folder popup state (see `ui::mention`).
+    pub(crate) mention: super::mention::MentionState,
     /// How this TUI reached its agent engine, e.g. "[L] 127.0.0.1" (local
     /// loopback) or "[R] daemon.internal" (remote). Pinned to the right edge
     /// of the status bar; the only other session-start block is the DEX banner.
@@ -456,6 +458,7 @@ impl App {
             history_index: None,
             history_draft: String::new(),
             slash_selected: 0,
+            mention: Default::default(),
             connection: None,
             daemon_url: None,
             assistant_open: false,

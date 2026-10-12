@@ -5,6 +5,7 @@ mod audit;
 mod dispatch;
 mod edit;
 pub(crate) mod error;
+mod mentions;
 mod meta;
 pub(crate) mod outcome;
 pub(crate) mod policy;
@@ -33,9 +34,11 @@ pub(crate) use sandbox::{
 pub(crate) use edit::parse_edit_ops;
 #[cfg(test)]
 use edit::{apply_edit, apply_edit_batch, change_diff_async};
+pub(crate) use mentions::expand_mentions;
 pub(crate) use meta::Policy;
 #[cfg(test)]
 use read::expand_glob_in;
+pub(crate) use search::complete_paths;
 #[cfg(test)]
 use shell::run_bash_with_limits;
 pub(crate) use write::{hash_bytes, hash_file};
