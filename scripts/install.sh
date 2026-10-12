@@ -60,14 +60,13 @@ if [ "$VERSION" = "latest" ]; then
         rm -f "$tag_file"
         err "cannot determine latest release (none published yet?)"
     fi
-    # shellcheck disable=SC2116
     VERSION="$(sed 's|.*/tag/||' "$tag_file")"
     rm -f "$tag_file"
 fi
 case "$VERSION" in
 v[0-9]*) ;;
 [0-9]*) VERSION="v$VERSION" ;;
-*) err "invalid version '$VERSION' (expected e.g. 0.2.0 or v0.2.0; no release published yet?)" ;;
+*) err "invalid version '$VERSION' (expected e.g. 0.2.0 or v0.2.0)" ;;
 esac
 
 BASE="https://github.com/$REPO/releases/download/$VERSION"
