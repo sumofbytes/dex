@@ -129,7 +129,12 @@ pub(super) async fn inject_steering(
         if let Some(accepted) = accepted {
             let _ = accepted.send(content.clone()).await;
         }
-        messages.push(ChatMessage::user_named(content, "steering"));
+        // The accepted notice keeps the typed text (`recall` matches on it);
+        // only the model-bound message carries `@path` contents.
+        messages.push(ChatMessage::user_named(
+            crate::tools::expand_mentions(&content).await,
+            "steering",
+        ));
     }
     true
 }

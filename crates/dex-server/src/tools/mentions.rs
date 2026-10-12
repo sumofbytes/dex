@@ -101,7 +101,8 @@ pub(crate) async fn expand_mentions(prompt: &str) -> String {
         return prompt.to_string();
     }
     format!(
-        "{prompt}\n\n[The user referenced these paths with @; their contents follow.]\n{}",
+        "{prompt}{}{}",
+        crate::protocol::MENTION_MARKER,
         blocks.join("\n")
     )
 }
@@ -128,6 +129,7 @@ mod tests {
         let prompt = format!("read @{}. and @{} then @nobody", a.display(), sub.display());
         let out = expand_mentions(&prompt).await;
         assert!(out.starts_with(&prompt));
+        assert_eq!(crate::protocol::strip_mention_block(&out), prompt);
         assert!(out.contains("<file path=\""), "{out}");
         assert!(out.contains("hello"), "{out}");
         assert!(out.contains("<directory path=\""), "{out}");

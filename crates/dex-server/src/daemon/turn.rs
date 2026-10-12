@@ -844,7 +844,10 @@ pub(crate) async fn run_turn_inner(
                 }
                 for content in followups {
                     let _ = channels.followup_accepted_tx.send(content.clone()).await;
-                    let msg = ChatMessage::user_named(content.clone(), "follow-up");
+                    let msg = ChatMessage::user_named(
+                        crate::tools::expand_mentions(&content).await,
+                        "follow-up",
+                    );
                     session
                         .append_message(&msg)
                         .map_err(|e| format!("failed to persist followup: {e}"))?;
