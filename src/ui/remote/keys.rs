@@ -718,8 +718,7 @@ fn handle_popup_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
     let app = &mut remote.app;
     match key.code {
         KeyCode::Esc if mention::dismiss(app) => {}
-        KeyCode::Tab | KeyCode::Enter
-            if !key.modifiers.contains(KeyModifiers::SHIFT) && mention::complete(app) => {}
+        KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() && mention::complete(app) => {}
         KeyCode::Esc => {
             // Discard the drafted slash command and close the popup without
             // completing anything (busy+Esc still cancels).

@@ -73,7 +73,16 @@ pub(crate) async fn expand_mentions(prompt: &str) -> String {
         let Some((shown, path)) = resolve(token) else {
             continue;
         };
+        // Regular files and folders only: FIFOs and devices (`/dev/zero`) would
+        // block or flood the read.
         let is_dir = path.is_dir();
+        if !is_dir && !path.is_file() {
+            continue;
+        }
+        if budget == 0 {
+            blocks.push("[further mentions skipped: mention budget exhausted; use `read`]".into());
+            break;
+        }
         let mut args = Map::new();
         args.insert("path".into(), Value::String(shown.clone()));
         let body = if is_dir {
@@ -95,6 +104,11 @@ pub(crate) async fn expand_mentions(prompt: &str) -> String {
             body.push_str("\n[... truncated: mention budget exhausted; use `read` ...]");
         }
         budget = budget.saturating_sub(body.len());
+        // Keep file text from closing the wrapper early.
+        let body = body
+            .replace("</file>", "<\\/file>")
+            .replace("</directory>", "<\\/directory>");
+        let shown = shown.replace('"', "&quot;");
         blocks.push(format!("<{tag} path=\"{shown}\">\n{body}\n</{tag}>"));
     }
     if blocks.is_empty() {

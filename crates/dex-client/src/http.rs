@@ -57,8 +57,6 @@ pub struct ChatOptions {
     pub idempotency_key: Option<String>,
 }
 
-/// HTTP client for communicating with the dex daemon.
-///
 /// RFC 3986 unreserved bytes pass through; everything else is `%XX`.
 fn percent_encode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -72,6 +70,8 @@ fn percent_encode(raw: &str) -> String {
     out
 }
 
+/// HTTP client for communicating with the dex daemon.
+///
 /// Async-first: one shared `reqwest::Client` (TLS + pool init once, clones
 /// are atomic bumps). Sync methods remain for one-shot CLI + repl; they
 /// `block_on` the async implementations so behavior is identical.

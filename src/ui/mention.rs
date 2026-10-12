@@ -26,8 +26,7 @@ pub(crate) struct Token {
 pub(crate) struct MentionState {
     /// Query the daemon was last asked about (dedupes requests).
     pub(crate) requested: Option<String>,
-    /// Latest results. Kept across keystrokes until the next reply lands so
-    /// the sheet doesn't flicker while a request is in flight.
+    /// Results for `requested`; cleared whenever the query changes.
     pub(crate) results: Vec<FileMatch>,
     /// `(row, start)` of a token Esc closed; typing within it stays closed.
     pub(crate) dismissed: Option<(usize, usize)>,
@@ -155,6 +154,7 @@ pub(crate) fn query_to_request(app: &mut App) -> Option<String> {
     let Some(token) = token else {
         app.mention.dismissed = None;
         app.mention.requested = None;
+        app.mention.results.clear();
         return None;
     };
     if app.mention.dismissed != Some((token.row, token.start)) {
@@ -166,6 +166,8 @@ pub(crate) fn query_to_request(app: &mut App) -> Option<String> {
         return None;
     }
     app.mention.requested = Some(token.query.clone());
+    // Rows for the previous query would capture Enter/Tab for the wrong path.
+    app.mention.results.clear();
     Some(token.query)
 }
 
