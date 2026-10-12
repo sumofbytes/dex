@@ -159,7 +159,13 @@ pub(crate) fn run_ratatui_repl_with_remote(
 
             let next = if let Some(event) = pending.pop_front() {
                 event
-            } else if event::poll(Duration::from_millis(if busy { 100 } else { 250 }))? {
+            } else if event::poll(Duration::from_millis(if mention::debouncing(&remote.app) {
+                25
+            } else if busy {
+                100
+            } else {
+                250
+            }))? {
                 event::read()?
             } else {
                 continue;

@@ -151,7 +151,14 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             return Err("cancelled by user".into());
         }
         if let Some(rx) = self.steering_rx.as_mut() {
-            if inject_steering(rx, self.steering_accepted_tx, messages).await {
+            if inject_steering(
+                rx,
+                self.steering_accepted_tx,
+                messages,
+                &mut self.state.mention_bytes,
+            )
+            .await
+            {
                 *ledger = TokenLedger::rebuild(messages);
                 self.harness.transcript.append_pending(
                     &mut self.session,
@@ -535,7 +542,14 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
         ledger: &mut TokenLedger,
     ) -> Result<bool, AgentTurnError> {
         if let Some(rx) = self.steering_rx.as_mut() {
-            if inject_steering(rx, self.steering_accepted_tx, messages).await {
+            if inject_steering(
+                rx,
+                self.steering_accepted_tx,
+                messages,
+                &mut self.state.mention_bytes,
+            )
+            .await
+            {
                 self.state.last_usage = self.last_usage;
                 *ledger = TokenLedger::rebuild(messages);
                 return Ok(true);

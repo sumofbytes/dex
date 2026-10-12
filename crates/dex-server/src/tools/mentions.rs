@@ -11,7 +11,7 @@ use super::tool_path;
 
 /// Mentions expanded per prompt; extras stay as plain text.
 const MAX_MENTIONS: usize = 10;
-/// Shared byte budget for every expanded body in one prompt.
+/// Shared byte budget for every expanded body in one turn.
 const MAX_TOTAL_BYTES: usize = 256 * 1024;
 
 /// Paths mentioned as `@path` or `@"path with spaces"`, in order, deduped.
@@ -65,10 +65,11 @@ fn resolve(token: &str) -> Option<(String, std::path::PathBuf)> {
 }
 
 /// `prompt` plus a block per existing mentioned path; unchanged when nothing
-/// resolves (`@alice` is just text).
-pub(crate) async fn expand_mentions(prompt: &str) -> String {
+/// resolves (`@alice` is just text). `used` counts expanded bytes already
+/// spent this turn and is advanced by what this call adds.
+pub(crate) async fn expand_mentions(prompt: &str, used: &mut usize) -> String {
     let mut blocks: Vec<String> = Vec::new();
-    let mut budget = MAX_TOTAL_BYTES;
+    let mut budget = MAX_TOTAL_BYTES.saturating_sub(*used);
     for token in parse_mentions(prompt).iter().take(MAX_MENTIONS) {
         let Some((shown, path)) = resolve(token) else {
             continue;
@@ -104,6 +105,7 @@ pub(crate) async fn expand_mentions(prompt: &str) -> String {
             body.push_str("\n[... truncated: mention budget exhausted; use `read` ...]");
         }
         budget = budget.saturating_sub(body.len());
+        *used += body.len();
         // Keep file text from closing the wrapper early.
         let body = body
             .replace("</file>", "<\\/file>")
@@ -141,7 +143,7 @@ mod tests {
         std::fs::write(dir.join("sub/b.txt"), "x").unwrap();
         let (a, sub) = (dir.join("a.txt"), dir.join("sub"));
         let prompt = format!("read @{}. and @{} then @nobody", a.display(), sub.display());
-        let out = expand_mentions(&prompt).await;
+        let out = expand_mentions(&prompt, &mut 0).await;
         assert!(out.starts_with(&prompt));
         assert_eq!(crate::protocol::strip_mention_block(&out), prompt);
         assert!(out.contains("<file path=\""), "{out}");
@@ -149,7 +151,7 @@ mod tests {
         assert!(out.contains("<directory path=\""), "{out}");
         assert!(out.contains("b.txt"), "{out}");
         assert_eq!(
-            expand_mentions("no mentions @nobody").await,
+            expand_mentions("no mentions @nobody", &mut 0).await,
             "no mentions @nobody"
         );
         let _ = std::fs::remove_dir_all(&dir);

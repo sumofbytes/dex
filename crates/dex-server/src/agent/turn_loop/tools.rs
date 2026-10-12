@@ -117,6 +117,7 @@ pub(super) async fn inject_steering(
     rx: &mut mpsc::Receiver<QueueMsg>,
     accepted: Option<&mpsc::Sender<String>>,
     messages: &mut Vec<ChatMessage>,
+    mention_bytes: &mut usize,
 ) -> bool {
     let mut drained: Vec<String> = Vec::new();
     while let Ok(msg) = rx.try_recv() {
@@ -132,7 +133,7 @@ pub(super) async fn inject_steering(
         // The accepted notice keeps the typed text (`recall` matches on it);
         // only the model-bound message carries `@path` contents.
         messages.push(ChatMessage::user_named(
-            crate::tools::expand_mentions(&content).await,
+            crate::tools::expand_mentions(&content, mention_bytes).await,
             "steering",
         ));
     }

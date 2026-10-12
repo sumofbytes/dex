@@ -65,6 +65,9 @@ pub struct ToolState {
     /// Accumulated per `Usage` event from provider pricing (catalog) or
     /// `DEX_COST_PER_1K` fallback. In-memory only, like `total_usage`.
     pub total_cost: f64,
+    /// Bytes of `@path` mention expansion already added this turn (prompt,
+    /// steers, chained follow-ups share one budget). In-memory only.
+    pub mention_bytes: usize,
 }
 
 impl ToolState {

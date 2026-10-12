@@ -565,7 +565,9 @@ pub(crate) async fn run_turn_inner(
     messages.extend(history);
     // `@path` mentions expand here, not in the journaled `UserPrompt`, so the
     // transcript shows what the user typed while the model gets the contents.
-    let user_message = ChatMessage::user(crate::tools::expand_mentions(&req.prompt).await);
+    let mut mention_bytes = 0;
+    let user_message =
+        ChatMessage::user(crate::tools::expand_mentions(&req.prompt, &mut mention_bytes).await);
     // §10b V1a: completion notices queued while no turn was live drain at
     // the next real turn boundary — the start of this one. They ride the
     // LLM context as a user-role message, never the steering channel.
@@ -802,6 +804,7 @@ pub(crate) async fn run_turn_inner(
     }
 
     let mut tool_state = ToolState::load_async().await;
+    tool_state.mention_bytes = mention_bytes;
     // Outer loop for follow-up chaining (mirrors old local `event.rs` loop):
     // `process_turn` consumes steering mid-turn; follow-ups are drained after
     // each successful turn and chained without a new HTTP request. The loop
@@ -845,7 +848,8 @@ pub(crate) async fn run_turn_inner(
                 for content in followups {
                     let _ = channels.followup_accepted_tx.send(content.clone()).await;
                     let msg = ChatMessage::user_named(
-                        crate::tools::expand_mentions(&content).await,
+                        crate::tools::expand_mentions(&content, &mut tool_state.mention_bytes)
+                            .await,
                         "follow-up",
                     );
                     session

@@ -7,6 +7,13 @@
 use super::App;
 use super::InputField;
 use crate::protocol::FileMatch;
+use std::time::{Duration, Instant};
+
+/// Quiet time after the last keystroke before the daemon is asked again.
+#[cfg(not(test))]
+const DEBOUNCE: Duration = Duration::from_millis(80);
+#[cfg(test)]
+const DEBOUNCE: Duration = Duration::ZERO;
 
 /// Rows requested per query; the sheet scrolls past its visible cap.
 pub(crate) const MENTION_LIMIT: usize = 30;
@@ -30,6 +37,8 @@ pub(crate) struct MentionState {
     pub(crate) results: Vec<FileMatch>,
     /// `(row, start)` of a token Esc closed; typing within it stays closed.
     pub(crate) dismissed: Option<(usize, usize)>,
+    /// A changed query waiting out the debounce, and since when.
+    pending: Option<(String, Instant)>,
 }
 
 /// An `@` at the line start or after whitespace, up to the cursor, with no
@@ -146,6 +155,16 @@ pub(crate) fn dismiss(app: &mut App) -> bool {
 /// The query the daemon should be asked about now, if it differs from the
 /// last one asked. Also forgets a stale dismissal once the cursor leaves it.
 pub(crate) fn query_to_request(app: &mut App) -> Option<String> {
+    query_to_request_after(app, DEBOUNCE)
+}
+
+/// Whether a changed query is still waiting out the debounce (the event loop
+/// polls faster meanwhile so the request isn't left to the idle tick).
+pub(crate) fn debouncing(app: &App) -> bool {
+    app.mention.pending.is_some()
+}
+
+fn query_to_request_after(app: &mut App, debounce: Duration) -> Option<String> {
     let token = if app.history_index.is_some() || app.input.text().starts_with('/') {
         None
     } else {
@@ -154,6 +173,7 @@ pub(crate) fn query_to_request(app: &mut App) -> Option<String> {
     let Some(token) = token else {
         app.mention.dismissed = None;
         app.mention.requested = None;
+        app.mention.pending = None;
         app.mention.results.clear();
         return None;
     };
@@ -163,11 +183,27 @@ pub(crate) fn query_to_request(app: &mut App) -> Option<String> {
         return None;
     }
     if app.mention.requested.as_deref() == Some(token.query.as_str()) {
+        app.mention.pending = None;
         return None;
     }
-    app.mention.requested = Some(token.query.clone());
     // Rows for the previous query would capture Enter/Tab for the wrong path.
     app.mention.results.clear();
+    // The first query for a token goes out at once; later edits wait until
+    // typing pauses, so a burst costs one lookup instead of one per key.
+    if app.mention.requested.is_some() && !debounce.is_zero() {
+        let since = match &app.mention.pending {
+            Some((q, t)) if *q == token.query => *t,
+            _ => {
+                app.mention.pending = Some((token.query, Instant::now()));
+                return None;
+            }
+        };
+        if since.elapsed() < debounce {
+            return None;
+        }
+    }
+    app.mention.pending = None;
+    app.mention.requested = Some(token.query.clone());
     Some(token.query)
 }
 
@@ -253,6 +289,28 @@ mod tests {
         app.input = field("@zz");
         assert_eq!(query_to_request(&mut app).as_deref(), Some("zz"));
         assert!(!apply_results(&mut app, "my", Vec::new()));
+    }
+
+    #[test]
+    fn edits_wait_for_a_typing_pause_but_the_first_query_does_not() {
+        let mut app = App::test_app();
+        let pause = Duration::from_millis(30);
+        app.input = field("@s");
+        assert_eq!(
+            query_to_request_after(&mut app, pause).as_deref(),
+            Some("s")
+        );
+        app.input = field("@sr");
+        assert_eq!(query_to_request_after(&mut app, pause), None);
+        assert!(debouncing(&app));
+        app.input = field("@src");
+        assert_eq!(query_to_request_after(&mut app, pause), None);
+        std::thread::sleep(pause * 2);
+        assert_eq!(
+            query_to_request_after(&mut app, pause).as_deref(),
+            Some("src")
+        );
+        assert!(!debouncing(&app));
     }
 
     #[test]
