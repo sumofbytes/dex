@@ -132,7 +132,8 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
             // turn/shell falls through to the composer below.
             app.quit = true;
         }
-        KeyCode::Esc if app.busy || shell_running => {
+        // An open `@` popup takes Esc first (closes it); a second Esc cancels.
+        KeyCode::Esc if (app.busy || shell_running) && !mention::is_open(app) => {
             request_cancel(remote);
         }
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {

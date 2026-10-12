@@ -68,14 +68,20 @@ pub(crate) fn token_at_cursor(input: &InputField) -> Option<Token> {
     })
 }
 
-/// The live token, unless popups are off right now (busy turn, history walk,
-/// slash command line) or Esc closed it.
+/// The live token, unless popups are off right now (history walk, slash
+/// command line) or Esc closed it. Stays on while a turn runs so a steer or
+/// follow-up can reference files too.
 pub(crate) fn active_token(app: &App) -> Option<Token> {
-    if app.busy || app.history_index.is_some() || app.input.text().starts_with('/') {
+    if app.history_index.is_some() || app.input.text().starts_with('/') {
         return None;
     }
     let token = token_at_cursor(&app.input)?;
     (app.mention.dismissed != Some((token.row, token.start))).then_some(token)
+}
+
+/// Whether the `@` popup is showing rows (it then owns Esc/Tab/Enter).
+pub(crate) fn is_open(app: &App) -> bool {
+    !suggestions(app).is_empty()
 }
 
 /// Popup rows as `(label, description)`, folders marked with a trailing `/`.
@@ -141,7 +147,7 @@ pub(crate) fn dismiss(app: &mut App) -> bool {
 /// The query the daemon should be asked about now, if it differs from the
 /// last one asked. Also forgets a stale dismissal once the cursor leaves it.
 pub(crate) fn query_to_request(app: &mut App) -> Option<String> {
-    let token = if app.busy || app.history_index.is_some() || app.input.text().starts_with('/') {
+    let token = if app.history_index.is_some() || app.input.text().starts_with('/') {
         None
     } else {
         token_at_cursor(&app.input)
@@ -257,5 +263,15 @@ mod tests {
         assert_eq!(query_to_request(&mut app), None);
         app.input = field("@ab @c");
         assert_eq!(query_to_request(&mut app).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn popup_stays_available_while_a_turn_runs() {
+        let mut app = App::test_app();
+        app.busy = true;
+        answered(&mut app, "also check @ma", "ma", &[("main.rs", false)]);
+        assert_eq!(suggestions(&app).len(), 1);
+        assert!(complete(&mut app));
+        assert_eq!(app.input.text(), "also check @main.rs ");
     }
 }

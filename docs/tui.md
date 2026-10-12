@@ -82,7 +82,7 @@ unaffected.
 - **Enter** — submit the current input.
 - **Tab** — autocomplete the selected slash command, provider, or model; **↑/↓**
   navigate suggestions; **Esc** — discard the draft and close the popup.
-- **@** — type `@` (at the start of a word) to pick a file or folder from the
+- **@** — type `@` (at the start of a word, also while a turn runs) to pick a file or folder from the
   daemon's workspace; **Tab**/**Enter** inserts `@path` (folders end in `/` so
   you can keep drilling), **Esc** closes the popup. On submit the daemon
   appends each mentioned path's contents (a folder's listing) to the model's

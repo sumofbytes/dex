@@ -346,6 +346,39 @@ fn esc_repress_while_cancelling_stays_put() {
 }
 
 #[test]
+fn at_popup_takes_esc_and_enter_while_busy() {
+    let open = |remote: &mut RemoteApp| {
+        remote.app.busy = true;
+        remote.app.input = crate::ui::input::InputField::from_text("see @ma");
+        assert!(crate::ui::mention::query_to_request(&mut remote.app).is_some());
+        let files = vec![crate::protocol::FileMatch {
+            path: "main.rs".into(),
+            is_dir: false,
+        }];
+        assert!(crate::ui::mention::apply_results(
+            &mut remote.app,
+            "ma",
+            files
+        ));
+    };
+    // Esc closes the popup instead of cancelling the turn.
+    let mut remote = test_remote();
+    open(&mut remote);
+    handle_key(&mut remote, esc_key());
+    assert!(
+        !remote.app.cancel_requested,
+        "first Esc only closes the popup"
+    );
+    assert!(!crate::ui::mention::is_open(&remote.app));
+    // Enter completes the path instead of queueing a steer.
+    let mut remote = test_remote();
+    open(&mut remote);
+    handle_key(&mut remote, key(KeyCode::Enter, KeyModifiers::empty()));
+    assert_eq!(remote.app.input.text(), "see @main.rs ");
+    assert!(remote.app.pending_steering.is_empty());
+}
+
+#[test]
 fn ctrl_d_quits_only_on_empty_idle_composer() {
     let mut remote = test_remote();
     handle_key(&mut remote, ctrl_d());
