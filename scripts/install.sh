@@ -23,6 +23,12 @@ err() {
 command -v curl >/dev/null 2>&1 || err "curl not found"
 command -v tar >/dev/null 2>&1 || err "tar not found"
 
+# github.com occasionally answers a redirect with a transient 5xx/timeout;
+# retry the handful of small fetches instead of failing the install.
+fetch() {
+    curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$@"
+}
+
 # --- detect platform -------------------------------------------------------
 case "$(uname -s)" in
 Linux) os="linux" ;;
@@ -44,12 +50,24 @@ esac
 # --- resolve version -------------------------------------------------------
 if [ "$VERSION" = "latest" ]; then
     # Follow the /releases/latest redirect; no API call, so no rate limits.
-    VERSION="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" | sed 's|.*/tag/||')" ||
+    # Use a temp file instead of a pipeline: POSIX sh reports a pipeline's
+    # status from its last command, so curl's exit status would be swallowed —
+    # and `-w '%{url_effective}'` echoes the *original* URL on failure, which
+    # used to leak into the asset name.
+    tag_file="$(mktemp)"
+    if ! fetch -o /dev/null -w '%{url_effective}' \
+            "https://github.com/$REPO/releases/latest" >"$tag_file"; then
+        rm -f "$tag_file"
         err "cannot determine latest release (none published yet?)"
+    fi
+    # shellcheck disable=SC2116
+    VERSION="$(sed 's|.*/tag/||' "$tag_file")"
+    rm -f "$tag_file"
 fi
 case "$VERSION" in
-v*) ;;
-*) VERSION="v$VERSION" ;;
+v[0-9]*) ;;
+[0-9]*) VERSION="v$VERSION" ;;
+*) err "invalid version '$VERSION' (expected e.g. 0.2.0 or v0.2.0; no release published yet?)" ;;
 esac
 
 BASE="https://github.com/$REPO/releases/download/$VERSION"
@@ -58,9 +76,9 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading dex $VERSION for $TARGET ..."
-curl -fsSL -o "$TMP/$ASSET" "$BASE/$ASSET" ||
+fetch -o "$TMP/$ASSET" "$BASE/$ASSET" ||
     err "download failed ($BASE/$ASSET) — see https://github.com/$REPO/releases"
-curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
+fetch -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
     err "download failed ($BASE/SHA256SUMS)"
 
 # --- verify checksum -------------------------------------------------------
