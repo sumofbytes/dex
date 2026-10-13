@@ -206,6 +206,17 @@ pub(crate) struct Boot {
 
 /// Boot half of the remote REPL: connect, fan out the config/session/skills
 /// fetches, build the app, replay a reattach, and prime the terminal.
+/// The daemon runs a session in the requested directory when that exists on
+/// its host and in its own otherwise (`resp_cwd`; empty from older daemons).
+fn warn_cwd_fallback(requested: &str, resp_cwd: &str) {
+    if !resp_cwd.is_empty() && resp_cwd != requested {
+        crate::runtime::notice::warn_once(
+            "session-cwd-fallback",
+            &format!("daemon has no directory {requested}; session runs in {resp_cwd} on the daemon host"),
+        );
+    }
+}
+
 pub(crate) fn bootstrap(
     args: &Args,
     daemon_url: &str,
@@ -288,6 +299,7 @@ pub(crate) fn bootstrap(
         let resp = client
             .create_session(&local_cwd, Some(name))
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        warn_cwd_fallback(&local_cwd, &resp.cwd);
         let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
@@ -295,11 +307,12 @@ pub(crate) fn bootstrap(
     } else if daemon_is_local && !local_cwd.is_empty() {
         // Local default: the spawned daemon inherits our cwd, so mint the
         // name locally and overlap all three (same as the explicit-name path
-        // above); the server ignores the carried cwd anyway.
+        // above); the daemon runs the session in the cwd we send.
         let session_name = Session::default_session_name(&local_cwd);
         let resp = client
             .create_session(&local_cwd, Some(&session_name))
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        warn_cwd_fallback(&local_cwd, &resp.cwd);
         let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
