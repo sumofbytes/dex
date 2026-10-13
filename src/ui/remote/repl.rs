@@ -46,6 +46,9 @@ pub(crate) fn run_ratatui_repl_with_remote(
     } = bootstrap(args, daemon_url, daemon_is_local)?;
     // Report lifecycle state to the enclosing Herdr pane, if any.
     let mut herdr = super::super::herdr::Reporter::new();
+    // And publish it to the host terminal (OSC 7501); its Drop clears the
+    // status if the loop panics.
+    let mut osc7501 = super::super::osc7501::Reporter::new();
     let mut run = || -> std::io::Result<()> {
         // Events consumed by the OSC-report lookahead, replayed on the next
         // iterations of the loop.
@@ -125,13 +128,16 @@ pub(crate) fn run_ratatui_repl_with_remote(
             // SSE carries those rows) and resumes at the published cursor.
             remote.busy_poll.store(busy, Ordering::SeqCst);
             // Cheap when unchanged (outside Herdr it is a no-op).
-            herdr.sync(
-                busy,
-                remote
-                    .app
-                    .pending_approvals
-                    .first()
-                    .map(|a| a.name.as_str()),
+            let approval = remote
+                .app
+                .pending_approvals
+                .first()
+                .map(|a| a.name.as_str());
+            herdr.sync(busy, approval);
+            osc7501.sync(
+                terminal.backend_mut(),
+                super::super::herdr::State::of(busy, approval),
+                approval,
             );
             // An expired status notice needs one more frame to disappear.
             if remote.app.tick_notice() {
@@ -203,6 +209,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
     // Always release, even if the loop returned early via `?` (draw/poll
     // error) — otherwise a stale agent row lingers in the Herdr sidebar.
     herdr.release();
+    osc7501.release();
     // Always restore the terminal, even if the loop returned early via `?`.
     disable_raw_mode().ok();
     let _ = execute!(

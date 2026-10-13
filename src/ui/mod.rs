@@ -21,6 +21,7 @@ pub(crate) mod herdr;
 pub(crate) mod input;
 pub(crate) mod mention;
 pub(crate) mod metrics;
+pub(crate) mod osc7501;
 pub(crate) mod remote;
 pub(crate) mod render;
 pub(crate) mod slash;
