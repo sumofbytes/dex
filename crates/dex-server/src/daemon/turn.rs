@@ -103,8 +103,7 @@ pub(crate) async fn run_agent_turn(
 ) {
     let root = lock_map(&state.sessions)
         .get(&session_id)
-        .map(|entry| std::path::PathBuf::from(&entry.cwd))
-        .filter(|path| path.is_dir());
+        .map(|entry| std::path::PathBuf::from(&entry.cwd));
     let turn = run_agent_turn_in_root(
         state,
         session_id,
@@ -399,6 +398,17 @@ pub(crate) async fn run_turn_inner(
         }
     }
 
+    // A session whose directory is gone must fail loudly: running on in the
+    // daemon's cwd would write into an unrelated tree.
+    if let Ok(root) = crate::workspace::workspace_root() {
+        if !root.is_dir() {
+            return Err(format!(
+                "session directory {} no longer exists; start a new session",
+                root.display()
+            ));
+        }
+    }
+
     // Permission ceiling: the daemon resolves it once at construction
     // (§3.1); the client may only go stricter. `mode` (when present) is the
     // authority for the derived permission; `permission` rides along for
@@ -425,7 +435,7 @@ pub(crate) async fn run_turn_inner(
     // Model-bound history load: `!!` shell runs stay out of the LLM
     // context, and the turn below reuses exactly these messages.
     let history = if let Some(path) = session.path().map(|p| p.to_path_buf()) {
-        tokio::task::spawn_blocking(move || {
+        crate::workspace::spawn_blocking_in_workspace(move || {
             session::load_llm_messages_from_session(&path).unwrap_or_default()
         })
         .await
@@ -530,7 +540,7 @@ pub(crate) async fn run_turn_inner(
         let state = state.clone();
         let session_id = session_id.to_string();
         let manager = state.manager_for(&session_id);
-        tokio::spawn(child_approval_bridge(
+        crate::workspace::spawn_in_workspace(child_approval_bridge(
             state,
             session_id.clone(),
             manager,
@@ -544,7 +554,7 @@ pub(crate) async fn run_turn_inner(
         let state = state.clone();
         let session_id = session_id.to_string();
         let manager = state.manager_for(&session_id);
-        tokio::spawn(child_question_bridge(
+        crate::workspace::spawn_in_workspace(child_question_bridge(
             state,
             session_id.clone(),
             manager,

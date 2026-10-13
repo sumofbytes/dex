@@ -240,7 +240,9 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
     fn start_model_events(&mut self) -> Option<mpsc::Sender<ModelEvent>> {
         let sink = self.console.sink().cloned()?;
         let (sender, receiver) = mpsc::channel(256);
-        self.event_forwarder = Some(tokio::spawn(forward_model_events(receiver, sink)));
+        self.event_forwarder = Some(crate::workspace::spawn_in_workspace(forward_model_events(
+            receiver, sink,
+        )));
         Some(sender)
     }
 

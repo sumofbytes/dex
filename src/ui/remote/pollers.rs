@@ -85,11 +85,23 @@ pub(crate) fn spawn_events_poller(
     });
 }
 
-pub(crate) fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Sender<WorkerMessage>) {
+/// The session the footer follows: shared with the poller because `/new` and
+/// `/resume` swap the session under it.
+pub(crate) type GitSession = Arc<std::sync::Mutex<String>>;
+
+fn current_session(session: &GitSession) -> String {
+    session.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub(crate) fn spawn_git_poller(
+    client: DaemonClient,
+    tx: tokio::sync::mpsc::Sender<WorkerMessage>,
+    session: GitSession,
+) {
     crate::runtime::http::spawn_task(async move {
         loop {
             tokio::time::sleep(GIT_REFRESH_INTERVAL).await;
-            match client.get_git_async().await {
+            match client.get_git_async(Some(&current_session(&session))).await {
                 Ok(info) => {
                     let _ = tx.send(WorkerMessage::Git(info)).await;
                 }
@@ -103,9 +115,13 @@ pub(crate) fn spawn_git_poller(client: DaemonClient, tx: tokio::sync::mpsc::Send
 /// `GET /api/git` on the shared runtime and forwards the result through the
 /// worker channel (daemon 5s cache keeps it cheap). Used at turn end so
 /// tool mutations show up immediately.
-pub(crate) fn refresh_git_async(client: DaemonClient, tx: mpsc::Sender<WorkerMessage>) {
+pub(crate) fn refresh_git_async(
+    client: DaemonClient,
+    tx: mpsc::Sender<WorkerMessage>,
+    session: String,
+) {
     crate::runtime::http::spawn_task(async move {
-        if let Ok(info) = client.get_git_async().await {
+        if let Ok(info) = client.get_git_async(Some(&session)).await {
             let _ = tx.send(WorkerMessage::Git(info)).await;
         }
     });

@@ -96,7 +96,7 @@ pub(crate) fn parse_config_paths(root: &serde_yaml::Value) -> Vec<PathBuf> {
 /// otherwise: sorted + deduped, hook order deterministic.
 pub(crate) fn scoped_extension_dirs() -> Vec<(PathBuf, Scope)> {
     let mut dirs: Vec<(PathBuf, Scope)> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = crate::workspace::process_cwd() {
         dirs.push((cwd.join(".dex/extensions"), Scope::Project));
         dirs.push((cwd.join(".agents/extensions"), Scope::Project));
     }

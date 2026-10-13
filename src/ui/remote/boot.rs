@@ -417,6 +417,8 @@ pub(crate) fn bootstrap(
     // Shared journal cursor: the turn worker publishes (fetch_max) the seq
     // its SSE stream has delivered; the idle poller resumes from it.
     let events_cursor = Arc::new(AtomicU64::new(0));
+    let git_session: super::pollers::GitSession =
+        Arc::new(std::sync::Mutex::new(session_id.clone()));
     let mut remote = RemoteApp {
         app,
         client: client.clone(),
@@ -433,11 +435,12 @@ pub(crate) fn bootstrap(
         live_children: live_children.clone(),
         busy_poll: busy_poll.clone(),
         events_cursor: events_cursor.clone(),
+        git_session: git_session.clone(),
     };
     // Background git poll off the UI thread (Phase 5): task polls every 2s,
     // pushes into the worker channel; UI loop only applies. Daemon 5s cache
     // stays; per-frame cost zero even when busy.
-    spawn_git_poller(client.clone(), worker_tx.clone());
+    spawn_git_poller(client.clone(), worker_tx.clone(), git_session);
     // Idle events poll (§15 V1b + §12 V1b): once the session may have child
     // agents, poll the journal so lifecycle lines, labeled approvals, and
     // wake turns surface without waiting for a user turn.

@@ -98,7 +98,7 @@ fn client_end_to_end_hits_every_endpoint() {
     // Meta reads.
     let info = client.get_config().unwrap();
     assert_eq!(info.provider, "opencode");
-    let _git = client.get_git().unwrap();
+    let _git = client.get_git(None).unwrap();
     assert!(client.list_skills().is_ok());
     let mcp = client.mcp_status().unwrap();
     assert!(mcp["servers"].is_array());

@@ -110,7 +110,9 @@ pub(crate) async fn run_bash_with_limits(
     // Async shell: `tokio::process` + async pipe drain (tasks, not threads) +
     // `select!(wait, timeout, cancelled)` — no reader threads, no 25ms poll
     // quantum (S5). Process-group kill preserved.
-    let mut child = shell_command(command).spawn().map_err(ToolError::Io)?;
+    let mut child = shell_command(command)
+        .and_then(|mut cmd| cmd.spawn())
+        .map_err(ToolError::Io)?;
     let pid = child.id();
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -211,13 +213,13 @@ pub(crate) fn sigterm_process_group_pid(pid: u32) {
 /// SAFETY: runs in the forked child before exec; it is not yet a process
 /// group leader, so setsid() succeeds.
 #[cfg(unix)]
-pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
+pub(crate) fn shell_command(command: &str) -> std::io::Result<tokio::process::Command> {
     let mut builder = tokio::process::Command::new("sh");
     builder
         .arg("-c")
         .arg(command)
         .envs(tool_runner_env())
-        .current_dir(workspace_root().unwrap_or_else(|_| ".".into()))
+        .current_dir(workspace_root()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -228,22 +230,22 @@ pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
             Ok(())
         });
     }
-    builder
+    Ok(builder)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
+pub(crate) fn shell_command(command: &str) -> std::io::Result<tokio::process::Command> {
     let mut builder = tokio::process::Command::new("cmd");
     builder
         .arg("/C")
         .arg(command)
         .envs(tool_runner_env())
-        .current_dir(workspace_root().unwrap_or_else(|_| ".".into()))
+        .current_dir(workspace_root()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    builder
+    Ok(builder)
 }
 pub(crate) async fn tool_bash(
     args: &Map<String, Value>,

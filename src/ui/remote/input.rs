@@ -632,7 +632,11 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     // tree mid-turn; refresh the footer now rather than waiting for the next
     // background poll. Async so the UI thread never blocks on HTTP (the
     // daemon's 5s git cache keeps it cheap).
-    refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
+    refresh_git_async(
+        remote.client.clone(),
+        remote.worker_tx.clone(),
+        remote.session_id.clone(),
+    );
 }
 
 /// Plan §20 child view: route one child transcript line into its per-agent

@@ -129,7 +129,7 @@ fn remote_reset(remote: &mut RemoteApp, new_session: bool) {
     let name = Session::default_session_name(&cwd);
     match remote.client.create_session(&cwd, Some(&name)) {
         Ok(session) => {
-            remote.session_id = session.session_id;
+            remote.set_session(session.session_id);
             reset_session_state(&mut remote.app);
             remote.options.plan = None;
             let mut fresh = Session::in_memory(cwd);
@@ -602,7 +602,7 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
     // leave the current view intact instead of blanking it.
     match remote.client.reattach(&sid) {
         Ok(resp) => {
-            remote.session_id = resp.session_id.clone();
+            remote.set_session(resp.session_id.clone());
             // Full per-session reset (transcript, usage, plan, scroll,
             // pending steering/approvals) so the old conversation
             // doesn't leak into the resumed one.

@@ -988,6 +988,39 @@ async fn call_roundtrip_and_unknown_tool() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[tokio::test]
+async fn workspace_read_serves_the_calling_sessions_directory() {
+    let lua = r#"
+return function(dex)
+  dex.tools.register({ name = "greet", execute = function(ctx, args)
+    return dex.workspace.read("marker.txt")
+  end })
+end
+"#;
+    let root = fixture_ext(hello_manifest(), lua);
+    let mgr = ExtensionManager::fresh();
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    let session = fixture_root("dex-ext-session");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("marker.txt"), "from-session").unwrap();
+    let policy = crate::tools::Policy::trusted();
+    let host = HostCtx {
+        cancel: &crate::agent::state::GlobalCancellation,
+        policy: &policy,
+        filter: None,
+    };
+    let args = serde_json::Map::new();
+    let out = crate::workspace::with_workspace_root(
+        session.canonicalize().unwrap(),
+        mgr.call("ext__hello__greet", &args, &host),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "from-session");
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&session).ok();
+}
+
 /// A `LlmConfig` for the `model_select` tests (same shape as the turn
 /// tests' mock config — no network, no catalog).
 fn model_select_config(

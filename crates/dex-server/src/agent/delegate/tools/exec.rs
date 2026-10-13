@@ -1078,7 +1078,7 @@ async fn child_run(
     // the registry and the child never owns a plan.
     let child_name = def.name.clone();
     let sink_drained = progress.expect_sink_drain();
-    let consumer = tokio::spawn(async move {
+    let consumer = crate::workspace::spawn_in_workspace(async move {
         let mut pending: Option<StreamEvent> = None;
         let mut emit = |event: StreamEvent| progress.emit_line(&child_name, event);
         while let Some(line) = sink_rx.recv().await {
@@ -1478,7 +1478,7 @@ fn spawn_accepted_forwarder(
     mut rx: mpsc::Receiver<String>,
     wrap: fn(String) -> StreamEvent,
 ) {
-    tokio::spawn(async move {
+    crate::workspace::spawn_in_workspace(async move {
         while let Some(content) = rx.recv().await {
             progress.emit_line(&name, wrap(content));
         }

@@ -945,7 +945,11 @@ pub(crate) fn finish_shell_command(
         },
     );
     // The command may have switched branches or dirtied the tree.
-    refresh_git_async(remote.client.clone(), remote.worker_tx.clone());
+    refresh_git_async(
+        remote.client.clone(),
+        remote.worker_tx.clone(),
+        remote.session_id.clone(),
+    );
 }
 
 /// Alt+Up while a turn is running: pull the newest queued steering message

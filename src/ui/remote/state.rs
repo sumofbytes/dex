@@ -95,4 +95,14 @@ pub(crate) struct RemoteApp {
     /// cursor as it streams; the poller advances it while idle, so rows
     /// a live turn already rendered are never re-fetched.
     pub(crate) events_cursor: Arc<AtomicU64>,
+    /// `session_id` mirrored for the git poller; see [`set_session`].
+    pub(crate) git_session: super::pollers::GitSession,
+}
+
+impl RemoteApp {
+    /// Switch the session and let the footer poller follow it.
+    pub(crate) fn set_session(&mut self, session_id: String) {
+        *self.git_session.lock().unwrap_or_else(|e| e.into_inner()) = session_id.clone();
+        self.session_id = session_id;
+    }
 }

@@ -7,6 +7,9 @@ use super::state::DaemonState;
 
 /// Start the daemon HTTP server on an already-bound listener.
 pub async fn run_daemon(listener: TcpListener) -> Result<(), Box<dyn std::error::Error>> {
+    // Sessions own their directories; an unscoped tool path must fail, not
+    // quietly use the daemon's.
+    crate::workspace::require_session_root();
     // MCP bootstrap: connects servers in the background and merges their
     // tools into the schema cache (plus the 60s liveness sweeper). Without
     // this the manager stays uninitialized and `mcp__*` tools never exist.

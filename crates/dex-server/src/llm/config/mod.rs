@@ -818,7 +818,7 @@ impl LlmConfig {
         permission_override: Option<PermissionMode>,
         header_overrides: Vec<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        tokio::task::spawn_blocking(move || {
+        crate::workspace::spawn_blocking_in_workspace(move || {
             Self::from_env(
                 base_url_override,
                 model_override,

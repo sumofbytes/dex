@@ -245,6 +245,9 @@ enum Request {
         /// drive's duration so `dex.model.*` on the worker thread serves this
         /// call's model even when another turn records a newer one mid-call.
         model: Option<super::DriveModel>,
+        /// The calling session's directory, so `workspace.*` on the worker
+        /// thread (outside the tokio task-local) reads that session's tree.
+        root: Option<PathBuf>,
         tx: mpsc::UnboundedSender<WorkerMsg>,
     },
     /// Drive the registered agent loop (spec §9): no fixed deadline (model
@@ -254,6 +257,7 @@ enum Request {
     AgentLoop {
         call_id: String,
         model: Option<super::DriveModel>,
+        root: Option<PathBuf>,
         abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
         tx: mpsc::UnboundedSender<WorkerMsg>,
     },
@@ -369,6 +373,7 @@ impl ExtensionEngine {
             .send(Request::AgentLoop {
                 call_id,
                 model,
+                root: crate::workspace::scoped_root(),
                 abort,
                 tx,
             })
@@ -410,6 +415,7 @@ impl ExtensionEngine {
                 timeout,
                 call_id,
                 model: drive_model,
+                root: crate::workspace::scoped_root(),
                 tx,
             })
             .await
@@ -605,19 +611,25 @@ fn worker_loop(manifest: Manifest, dir: PathBuf, mut rx: mpsc::Receiver<Request>
                 timeout,
                 call_id,
                 model,
+                root,
                 tx,
             } => {
-                run_call(
-                    &lua, &manifest, &regs, &dir, kind, args, timeout, &call_id, model, &tx,
-                );
+                crate::workspace::with_workspace_root_sync(root, || {
+                    run_call(
+                        &lua, &manifest, &regs, &dir, kind, args, timeout, &call_id, model, &tx,
+                    );
+                });
             }
             Request::AgentLoop {
                 call_id,
                 model,
+                root,
                 abort,
                 tx,
             } => {
-                run_agent_loop(&lua, &manifest, &regs, &dir, &call_id, abort, model, &tx);
+                crate::workspace::with_workspace_root_sync(root, || {
+                    run_agent_loop(&lua, &manifest, &regs, &dir, &call_id, abort, model, &tx);
+                });
             }
         }
     }

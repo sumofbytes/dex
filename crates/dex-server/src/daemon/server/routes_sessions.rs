@@ -27,7 +27,8 @@ pub(crate) async fn create_session(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Tools run in the session's directory, which the client names. It must
     // be a directory on this host; a remote client's path usually isn't, and
-    // then the session falls back to the daemon's own workspace.
+    // then the session falls back to the daemon's own workspace. The
+    // response carries the effective `cwd` so the client can tell.
     let requested = std::path::Path::new(&req.cwd);
     let cwd = if requested.is_absolute() && requested.is_dir() {
         req.cwd.clone()
@@ -39,6 +40,7 @@ pub(crate) async fn create_session(
     let session = Session::new(cwd.clone(), req.name.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let cwd_out = cwd.clone();
     let session_id = session.id().to_string();
     let path = session
         .path()
@@ -51,7 +53,7 @@ pub(crate) async fn create_session(
     let entry = SessionEntry {
         path: path.clone().into(),
         name: session.name().map(ToString::to_string),
-        cwd,
+        cwd: cwd.clone(),
         model: None,
         wake_provider: None,
         wake_base_url: None,
@@ -66,6 +68,7 @@ pub(crate) async fn create_session(
     Ok(Json(json!({
         "session_id": session_id,
         "path": path,
+        "cwd": cwd_out,
     })))
 }
 
