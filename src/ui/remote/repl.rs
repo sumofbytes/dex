@@ -46,7 +46,8 @@ pub(crate) fn run_ratatui_repl_with_remote(
     } = bootstrap(args, daemon_url, daemon_is_local)?;
     // Report lifecycle state to the enclosing Herdr pane, if any.
     let mut herdr = super::super::herdr::Reporter::new();
-    // And publish it to the host terminal (OSC 7501).
+    // And publish it to the host terminal (OSC 7501); its Drop clears the
+    // status if the loop panics.
     let mut osc7501 = super::super::osc7501::Reporter::new();
     let mut run = || -> std::io::Result<()> {
         // Events consumed by the OSC-report lookahead, replayed on the next
@@ -133,7 +134,11 @@ pub(crate) fn run_ratatui_repl_with_remote(
                 .first()
                 .map(|a| a.name.as_str());
             herdr.sync(busy, approval);
-            osc7501.sync(busy, approval);
+            osc7501.sync(
+                terminal.backend_mut(),
+                super::super::herdr::State::of(busy, approval),
+                approval,
+            );
             // An expired status notice needs one more frame to disappear.
             if remote.app.tick_notice() {
                 dirty = true;

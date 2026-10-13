@@ -15,21 +15,36 @@ const AGENT: &str = "dex";
 
 /// Herdr lifecycle states. dex maps them from TUI state: a running turn is
 /// `working`, a pending tool approval is `blocked`, anything else is `idle`.
+/// Shared with the OSC 7501 reporter.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum State {
+pub(super) enum State {
     Idle,
     Working,
     Blocked,
 }
 
 impl State {
-    fn as_str(self) -> &'static str {
+    pub(super) fn of(busy: bool, approval: Option<&str>) -> Self {
+        if approval.is_some() {
+            State::Blocked
+        } else if busy {
+            State::Working
+        } else {
+            State::Idle
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             State::Idle => "idle",
             State::Working => "working",
             State::Blocked => "blocked",
         }
     }
+}
+
+pub(super) fn approval_message(tool: &str) -> String {
+    format!("awaiting {tool} approval")
 }
 
 fn target() -> Option<(String, String)> {
@@ -79,14 +94,8 @@ impl Reporter {
     /// state or message change.
     pub(super) fn sync(&mut self, busy: bool, approval: Option<&str>) {
         self.reap();
-        let state = if approval.is_some() {
-            State::Blocked
-        } else if busy {
-            State::Working
-        } else {
-            State::Idle
-        };
-        let message = approval.map(|tool| format!("awaiting {tool} approval"));
+        let state = State::of(busy, approval);
+        let message = approval.map(approval_message);
         if self
             .last
             .as_ref()

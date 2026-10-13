@@ -1,88 +1,123 @@
 //! Program status for the host terminal (OSC 7501, mitchellh.com/writing/program-status-osc7501).
 //!
 //! `ESC ] 7501 ; state=…[:kind=…]:app=dex[:msg=<base64>] ST` on the TUI's own
-//! tty. Terminals ignore unknown OSCs, so it is emitted unconditionally and
-//! only on a state or message change.
+//! tty, only on a state or message change. Skipped on terminals that print
+//! unknown OSCs (`TERM=linux`/`dumb`); wrapped in tmux's DCS passthrough under
+//! tmux (needs `allow-passthrough on`, otherwise tmux drops it silently).
 
+use super::herdr::State;
 use super::selection::b64;
-use crossterm::Command;
-use std::fmt;
+use std::io::Write;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-enum Status {
-    Idle,
-    Working,
-    /// Waiting on a tool approval for the named tool.
-    Blocked(String),
-}
+/// Byte cap on the decoded `msg` payload.
+const MSG_MAX: usize = 190;
 
-impl Command for Status {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        match self {
-            Status::Idle => write!(f, "\x1b]7501;state=idle:app=dex\x1b\\"),
-            Status::Working => write!(f, "\x1b]7501;state=working:app=dex\x1b\\"),
-            Status::Blocked(tool) => {
-                let msg: String = format!("awaiting {tool} approval")
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(190)
-                    .collect();
-                write!(
-                    f,
-                    "\x1b]7501;state=blocked:kind=permission:app=dex:msg={}\x1b\\",
-                    b64(msg.as_bytes())
-                )
-            }
+fn status_osc(state: State, tool: Option<&str>) -> String {
+    let Some(tool) = tool else {
+        return format!("\x1b]7501;state={}:app=dex\x1b\\", state.as_str());
+    };
+    let mut msg: String = super::herdr::approval_message(tool)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if msg.len() > MSG_MAX {
+        let mut end = MSG_MAX;
+        while !msg.is_char_boundary(end) {
+            end -= 1;
         }
+        msg.truncate(end);
     }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        Ok(())
-    }
+    format!(
+        "\x1b]7501;state={}:kind=permission:app=dex:msg={}\x1b\\",
+        state.as_str(),
+        b64(msg.as_bytes())
+    )
 }
 
 /// `ESC ] 7501 ; state=clear ST`: drop dex's root record when it leaves.
-struct Clear;
+const CLEAR: &str = "\x1b]7501;state=clear\x1b\\";
 
-impl Command for Clear {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b]7501;state=clear\x1b\\")
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sink {
+    Off,
+    Direct,
+    Tmux,
+}
+
+impl Sink {
+    fn detect(term: Option<&str>, tmux: bool) -> Self {
+        match term {
+            None | Some("" | "dumb" | "linux") => Sink::Off,
+            _ if tmux => Sink::Tmux,
+            _ => Sink::Direct,
+        }
     }
 
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        Ok(())
+    fn wrap(self, seq: &str) -> Option<String> {
+        match self {
+            Sink::Off => None,
+            Sink::Direct => Some(seq.to_string()),
+            Sink::Tmux => Some(format!(
+                "\x1bPtmux;{}\x1b\\",
+                seq.replace('\x1b', "\x1b\x1b")
+            )),
+        }
     }
 }
 
 pub(super) struct Reporter {
-    last: Option<Status>,
+    sink: Sink,
+    last: Option<(State, Option<String>)>,
 }
 
 impl Reporter {
     pub(super) fn new() -> Self {
-        Self { last: None }
+        let term = std::env::var("TERM").ok();
+        let tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+        Self {
+            sink: Sink::detect(term.as_deref(), tmux),
+            last: None,
+        }
     }
 
-    /// Called from the TUI loop; writes only when the status changed.
-    pub(super) fn sync(&mut self, busy: bool, approval: Option<&str>) {
-        let status = match approval {
-            Some(tool) => Status::Blocked(tool.to_string()),
-            None if busy => Status::Working,
-            None => Status::Idle,
-        };
-        if self.last.as_ref() == Some(&status) {
+    /// Called from the TUI loop with the terminal's own writer, between
+    /// frames; writes only when the status changed, and retries next tick
+    /// if the write failed.
+    pub(super) fn sync(&mut self, out: &mut impl Write, state: State, tool: Option<&str>) {
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|(s, t)| *s == state && t.as_deref() == tool)
+        {
             return;
         }
-        let _ = crossterm::execute!(std::io::stdout(), status.clone());
-        self.last = Some(status);
+        let Some(seq) = self.sink.wrap(&status_osc(state, tool)) else {
+            return;
+        };
+        if out
+            .write_all(seq.as_bytes())
+            .and_then(|()| out.flush())
+            .is_ok()
+        {
+            self.last = Some((state, tool.map(str::to_string)));
+        }
     }
 
     pub(super) fn release(&mut self) {
         if self.last.take().is_some() {
-            let _ = crossterm::execute!(std::io::stdout(), Clear);
+            if let Some(seq) = self.sink.wrap(CLEAR) {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(seq.as_bytes()).and_then(|()| out.flush());
+            }
         }
+    }
+}
+
+/// Also clears on a panic unwinding out of the TUI loop, before
+/// `TerminalCleanup` restores the screen.
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -90,21 +125,68 @@ impl Reporter {
 mod tests {
     use super::*;
 
-    fn ansi(c: &impl Command) -> String {
-        let mut s = String::new();
-        c.write_ansi(&mut s).unwrap();
-        s
-    }
-
     #[test]
     fn sequences() {
         assert_eq!(
-            ansi(&Status::Working),
+            status_osc(State::Working, None),
             "\x1b]7501;state=working:app=dex\x1b\\"
         );
-        assert_eq!(ansi(&Clear), "\x1b]7501;state=clear\x1b\\");
-        let blocked = ansi(&Status::Blocked("bash\n\x1b".into()));
-        assert!(blocked.starts_with("\x1b]7501;state=blocked:kind=permission:app=dex:msg="));
-        assert!(blocked.contains(&b64(b"awaiting bash approval")));
+        let blocked = status_osc(State::Blocked, Some("bash\n\x1b"));
+        assert_eq!(
+            blocked,
+            format!(
+                "\x1b]7501;state=blocked:kind=permission:app=dex:msg={}\x1b\\",
+                b64(b"awaiting bash approval")
+            )
+        );
+    }
+
+    #[test]
+    fn msg_capped_in_bytes_on_char_boundary() {
+        let tool = "é".repeat(200);
+        let seq = status_osc(State::Blocked, Some(&tool));
+        let encoded = seq.split("msg=").nth(1).unwrap().trim_end_matches("\x1b\\");
+        assert!(
+            encoded.len() <= MSG_MAX.div_ceil(3) * 4,
+            "{}",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn sink_detection_and_tmux_wrap() {
+        assert_eq!(Sink::detect(Some("linux"), false), Sink::Off);
+        assert_eq!(Sink::detect(None, true), Sink::Off);
+        assert_eq!(Sink::detect(Some("xterm-ghostty"), false), Sink::Direct);
+        assert_eq!(Sink::detect(Some("tmux-256color"), true), Sink::Tmux);
+        assert_eq!(
+            Sink::Tmux.wrap(CLEAR).unwrap(),
+            "\x1bPtmux;\x1b\x1b]7501;state=clear\x1b\x1b\\\x1b\\"
+        );
+    }
+
+    #[test]
+    fn dedupes_and_retries_failed_writes() {
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut r = Reporter {
+            sink: Sink::Direct,
+            last: None,
+        };
+        r.sync(&mut Failing, State::Working, None);
+        assert!(r.last.is_none());
+        let mut buf = Vec::new();
+        r.sync(&mut buf, State::Working, None);
+        r.sync(&mut buf, State::Working, None);
+        assert_eq!(buf, b"\x1b]7501;state=working:app=dex\x1b\\");
+        // Don't emit a Clear into the test's stdout.
+        r.last = None;
     }
 }
