@@ -253,7 +253,7 @@ async fn dispatch_tool(
     if matches!(name, "grep" | "ffgrep" | "find" | "fffind") {
         let name_owned = name.to_string();
         let args_owned = args.clone();
-        return tokio::task::spawn_blocking(move || match name_owned.as_str() {
+        return crate::workspace::spawn_blocking_in_workspace(move || match name_owned.as_str() {
             "grep" | "ffgrep" => tool_ffgrep(&args_owned),
             _ => tool_fffind(&args_owned),
         })

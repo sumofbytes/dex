@@ -17,7 +17,7 @@ use crate::protocol::ChatMessage;
 use crate::protocol::StreamEvent;
 use crate::session::Session;
 
-use super::lookup::session_path;
+use super::lookup::lookup_entry_async;
 use super::{lock_map, DaemonState};
 use crate::runtime::console::CancellationToken;
 
@@ -42,9 +42,14 @@ pub(crate) async fn session_shell(
     if command.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // Session must exist — the workspace is resolved from the daemon cwd,
-    // but the lookup guards against typos/stale ids like every other route.
-    let session_file = session_path(&state, &session_id).await?;
+    // Session must exist (typos/stale ids 404 like every other route); the
+    // command runs in the session's directory, not the daemon's.
+    let entry = lookup_entry_async(&state, &session_id).await?;
+    if !entry.path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let session_file = entry.path;
+    let session_root = std::path::PathBuf::from(entry.cwd);
     let shell_cancel = CancellationToken::new();
     {
         let mut running = lock_map(&state.shell_tokens);
@@ -77,12 +82,15 @@ pub(crate) async fn session_shell(
     // Explicit user `!` invocation: the `!` itself is the approval, so this
     // runs trusted (same rationale as `execute_sync` for `dex run`).
     // Unfiltered: explicit invocations never run under a child allowlist.
-    let (output, success, code) = match crate::tools::execute(
-        "bash",
-        &args,
-        &shell_cancel,
-        &crate::tools::Policy::trusted(),
-        None,
+    let (output, success, code) = match crate::workspace::with_workspace_root(
+        session_root,
+        crate::tools::execute(
+            "bash",
+            &args,
+            &shell_cancel,
+            &crate::tools::Policy::trusted(),
+            None,
+        ),
     )
     .await
     {

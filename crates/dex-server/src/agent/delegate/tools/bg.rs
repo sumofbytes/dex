@@ -134,13 +134,16 @@ async fn bg_spawn(
         .map_err(ToolError::Denied)?;
     // Build the child with the foreground shell builder (workspace cwd,
     // `$DEX_BIN`/pager env, fresh session on unix).
-    let mut cmd = crate::tools::shell::shell_command(&command);
-    cmd.current_dir(&cwd);
-    let mut child = cmd.spawn().map_err(|e| {
-        ctx.manager
-            .bg_finish(&id, TaskStatus::SpawnFailed(e.to_string()), None);
-        ToolError::Io(e)
-    })?;
+    let mut child = crate::tools::shell::shell_command(&command)
+        .and_then(|mut cmd| {
+            cmd.current_dir(&cwd);
+            cmd.spawn()
+        })
+        .map_err(|e| {
+            ctx.manager
+                .bg_finish(&id, TaskStatus::SpawnFailed(e.to_string()), None);
+            ToolError::Io(e)
+        })?;
     let pid = child.id();
     if let Some(pid) = pid {
         ctx.manager.bg_set_pid(&id, pid);
@@ -161,7 +164,7 @@ async fn bg_spawn(
     let manager = ctx.manager.clone();
     let task_id = id.clone();
     let cap = output_cap();
-    let handle = tokio::spawn(async move {
+    let handle = crate::workspace::spawn_in_workspace(async move {
         drain_task(manager, task_id, child, &mut stdout, &mut stderr, cap).await;
     });
     ctx.manager.bg_set_handle(&id, handle);
@@ -414,7 +417,7 @@ async fn bg_stop(
     // racing drain can't double-notice.
     let manager = ctx.manager.clone();
     let stop_id = id.clone();
-    tokio::spawn(async move {
+    crate::workspace::spawn_in_workspace(async move {
         if let Some(mut rx) = manager.bg_watch_rx(&stop_id) {
             let deadline = Instant::now() + Duration::from_millis(500);
             while manager.bg_is_running(&stop_id).unwrap_or(false) {

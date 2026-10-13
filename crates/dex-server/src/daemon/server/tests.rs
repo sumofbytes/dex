@@ -64,7 +64,10 @@ mod handler_tests {
     async fn git_endpoint_matches_local_git_context() {
         // `GET /api/git` is the footer's poll source; it must report the same
         // branch/dirty as a direct `git_context` of the daemon cwd.
-        let Json(info) = get_git().await;
+        let state = Arc::new(DaemonState::new());
+        let Json(info) = get_git(State(state), Query(Default::default()))
+            .await
+            .unwrap();
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -82,7 +85,7 @@ mod handler_tests {
             SessionEntry {
                 path: path.to_path_buf(),
                 name: None,
-                cwd: "/tmp/dex-test-cwd".into(),
+                cwd: "/tmp".into(),
                 model: None,
                 wake_provider: None,
                 wake_base_url: None,
@@ -129,7 +132,7 @@ mod handler_tests {
         ));
         std::fs::write(
               &path,
-              "{\"type\":\"session\",\"version\":1,\"id\":\"test-shell-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp/dex-test-cwd\"}\n",
+              "{\"type\":\"session\",\"version\":1,\"id\":\"test-shell-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
           )
           .unwrap();
         let (state, id) = state_with_session(&path);
@@ -242,6 +245,48 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn files_endpoint_searches_the_named_sessions_directory() {
+        let root = std::env::temp_dir().join(format!("dex-files-session-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("only_in_session_dir.txt"), "x").unwrap();
+        let state = Arc::new(DaemonState::new());
+        crate::daemon::lock_map(&state.sessions).insert(
+            "s1".into(),
+            crate::daemon::SessionEntry {
+                path: root.join("s1.jsonl"),
+                name: None,
+                cwd: root.to_string_lossy().into_owned(),
+                model: None,
+                wake_provider: None,
+                wake_base_url: None,
+                plan_persisted: None,
+                model_persisted: None,
+            },
+        );
+        let params = Query(std::collections::HashMap::from([
+            ("q".to_string(), "only_in_session".to_string()),
+            ("session".to_string(), "s1".to_string()),
+        ]));
+        let body = list_files(State(state.clone()), params).await.unwrap().0;
+        assert!(
+            body["files"].as_array().unwrap().iter().any(|f| f["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("only_in_session_dir.txt"))),
+            "{body}"
+        );
+        let unknown = Query(std::collections::HashMap::from([(
+            "session".to_string(),
+            "nope".to_string(),
+        )]));
+        assert!(matches!(
+            get_git(State(state), unknown).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn files_endpoint_lists_files_and_folders() {
         let params = |q: &str| {
             Query(std::collections::HashMap::from([
@@ -250,7 +295,10 @@ mod handler_tests {
             ]))
         };
         // Runs in the crate dir: `src/daemon` is a folder, `mentions.rs` a file.
-        let body = list_files(params("mentions")).await.unwrap().0;
+        let body = list_files(State(Arc::new(DaemonState::new())), params("mentions"))
+            .await
+            .unwrap()
+            .0;
         let files = body["files"].as_array().unwrap();
         assert!(
             files.iter().any(|f| f["path"]
@@ -259,12 +307,18 @@ mod handler_tests {
                 && f["is_dir"] == false),
             "{body}"
         );
-        let body = list_files(params("")).await.unwrap().0;
+        let body = list_files(State(Arc::new(DaemonState::new())), params(""))
+            .await
+            .unwrap()
+            .0;
         assert!(
             !body["files"].as_array().unwrap().is_empty(),
             "bare `@` should offer the best-ranked entries: {body}"
         );
-        let body = list_files(params("daemon")).await.unwrap().0;
+        let body = list_files(State(Arc::new(DaemonState::new())), params("daemon"))
+            .await
+            .unwrap()
+            .0;
         assert!(
             body["files"]
                 .as_array()

@@ -280,10 +280,19 @@ impl DaemonClient {
     /// Poll the daemon workspace's branch/dirty for the status footer.
     /// Short timeout + best-effort: a slow daemon must not hitch the TUI,
     /// the next interval simply retries.
-    pub async fn get_git_async(&self) -> Result<GitInfo, Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// `session` reports that session's directory; `None` the daemon's.
+    pub async fn get_git_async(
+        &self,
+        session: Option<&str>,
+    ) -> Result<GitInfo, Box<dyn std::error::Error + Send + Sync>> {
         let info = self
             .http
-            .get(format!("{}/api/git", self.base_url))
+            .get(format!(
+                "{}/api/git{}",
+                self.base_url,
+                session_query('?', session)
+            ))
             .headers(self.api_headers())
             .timeout(Duration::from_secs(2))
             .send()
@@ -296,8 +305,8 @@ impl DaemonClient {
 
     /// Blocking wrapper. Test-only in the app: the footer polls
     /// `get_git_async`; the app-side e2e reaches this sync form through `Deref`.
-    pub fn get_git(&self) -> Result<GitInfo, Box<dyn std::error::Error>> {
-        block_on(self.get_git_async()).map_err(|e| -> Box<dyn std::error::Error> { e })
+    pub fn get_git(&self, session: Option<&str>) -> Result<GitInfo, Box<dyn std::error::Error>> {
+        block_on(self.get_git_async(session)).map_err(|e| -> Box<dyn std::error::Error> { e })
     }
 
     /// Versioned-protocol headers (P10): declared on every `/api/*` request
@@ -611,18 +620,21 @@ impl DaemonClient {
     }
 
     /// `@` completion candidates (files and folders) for `query` from the
-    /// daemon's workspace index (`GET /api/files`).
+    /// daemon's workspace index (`GET /api/files`), or the index of
+    /// `session`'s directory when given.
     pub async fn list_files_async(
         &self,
         query: &str,
         limit: usize,
+        session: Option<&str>,
     ) -> Result<Vec<FileMatch>, Box<dyn std::error::Error + Send + Sync>> {
         let resp: serde_json::Value = self
             .http
             .get(format!(
-                "{}/api/files?q={}&limit={limit}",
+                "{}/api/files?q={}&limit={limit}{}",
                 self.base_url,
-                percent_encode(query)
+                percent_encode(query),
+                session_query('&', session)
             ))
             .headers(self.api_headers())
             .send()
@@ -969,3 +981,11 @@ impl DaemonClient {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// `<sep>session=<id>` for the endpoints that default to the daemon's
+/// directory, or nothing when no session is named.
+fn session_query(sep: char, session: Option<&str>) -> String {
+    session
+        .map(|id| format!("{sep}session={}", percent_encode(id)))
+        .unwrap_or_default()
+}

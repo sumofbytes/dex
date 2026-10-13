@@ -219,16 +219,24 @@ pub(crate) async fn get_config(State(state): State<Arc<DaemonState>>) -> Json<Da
 /// Lightweight footer poll: just the daemon workspace's branch/dirty, behind
 /// the same 5s `cached_git_context_async` as `/api/config` so a 2s TUI poll costs
 /// at most one `git` spawn per 5s — and never pays `LlmConfig::from_env`.
-pub(crate) async fn get_git() -> Json<GitInfo> {
+///
+/// `?session=<id>` reports that session's directory instead of the daemon's.
+pub(crate) async fn get_git(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<GitInfo>, StatusCode> {
     // `tokio::process` git spawns under the 5s cache; per-frame cost zero.
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let cwd = match params.get("session") {
+        Some(id) => lookup_entry_async(&state, id).await?.cwd,
+        None => std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
     let (git_branch, git_dirty) = cached_git_context_async(&cwd).await;
-    Json(GitInfo {
+    Ok(Json(GitInfo {
         git_branch,
         git_dirty,
-    })
+    }))
 }
 
 pub(crate) async fn get_mcp() -> Json<serde_json::Value> {
@@ -325,7 +333,9 @@ pub(crate) async fn list_skills() -> Json<serde_json::Value> {
 
 /// `GET /api/files?q=<query>&limit=<n>`: fuzzy file + folder candidates for
 /// the composer's `@` popup, served from the same fff index as `find`/`grep`.
+/// `&session=<id>` searches that session's directory instead of the daemon's.
 pub(crate) async fn list_files(
+    State(state): State<Arc<DaemonState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let query = params.get("q").cloned().unwrap_or_default();
@@ -334,7 +344,17 @@ pub(crate) async fn list_files(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(20)
         .clamp(1, 100);
-    let found = tokio::task::spawn_blocking(move || crate::tools::complete_paths(&query, limit))
+    let root = match params.get("session") {
+        Some(id) => std::path::PathBuf::from(lookup_entry_async(&state, id).await?.cwd),
+        None => crate::workspace::process_cwd().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+    };
+    let search = async move {
+        crate::workspace::spawn_blocking_in_workspace(move || {
+            crate::tools::complete_paths(&query, limit)
+        })
+        .await
+    };
+    let found = crate::workspace::with_workspace_root(root, search)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -83,7 +82,7 @@ fn project_cache() -> &'static Mutex<HashMap<(PathBuf, PathBuf), ProjectContextC
 }
 
 pub(crate) fn project_context() -> Option<String> {
-    let cwd = env::current_dir().ok()?;
+    let cwd = crate::tools::workspace_root().ok()?;
     project_context_for(&cwd)
 }
 

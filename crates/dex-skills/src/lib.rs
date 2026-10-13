@@ -11,7 +11,7 @@ mod parse;
 
 pub use discovery::{
     discover_skills, discover_skills_async, discover_skills_fresh, discover_skills_fresh_async,
-    skill_dirs,
+    skill_dirs, skill_dirs_in,
 };
 pub use parse::unquote;
 

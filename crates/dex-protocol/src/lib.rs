@@ -20,6 +20,11 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionResponse {
     pub session_id: String,
     pub path: String,
+    /// Directory the session actually runs in; differs from the requested
+    /// `cwd` when that is not a directory on the daemon host. Empty from
+    /// older daemons.
+    #[serde(default)]
+    pub cwd: String,
 }
 
 /// Summary of a session for listing. Constructed via serde from the

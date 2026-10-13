@@ -390,7 +390,7 @@ where
             let task_console = console.clone();
             let sem = sem.clone();
             let executor = executor.clone();
-            set.spawn(async move {
+            set.spawn(crate::workspace::in_workspace(async move {
                 // The semaphore is never closed, but fail closed with
                 // the index intact rather than run unpermitted.
                 let Ok(_permit) = sem.acquire_owned().await else {
@@ -432,7 +432,7 @@ where
                         Duration::ZERO,
                     ),
                 }
-            });
+            }));
         }
         let mut slots: Vec<Option<(String, String, ToolOutcome, Duration)>> =
             Vec::with_capacity(calls.len());

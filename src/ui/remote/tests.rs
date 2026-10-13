@@ -151,7 +151,7 @@ fn git_poller_spawns_without_blocking_ui() {
     let client = DaemonClient::new("http://127.0.0.1:9").unwrap();
     let (wtx, _wrx) = tokio::sync::mpsc::channel::<WorkerMessage>(8);
     let start = std::time::Instant::now();
-    spawn_git_poller(client, wtx);
+    spawn_git_poller(client, wtx, Arc::new(std::sync::Mutex::new("s".into())));
     assert!(
         start.elapsed() < std::time::Duration::from_secs(1),
         "poller spawn must not block UI thread"
@@ -230,6 +230,7 @@ fn test_remote() -> RemoteApp {
         live_children: Arc::new(AtomicBool::new(false)),
         busy_poll: Arc::new(AtomicBool::new(false)),
         events_cursor: Arc::new(AtomicU64::new(0)),
+        git_session: Arc::new(std::sync::Mutex::new(String::new())),
     }
 }
 

@@ -246,10 +246,11 @@ fn request_files(remote: &mut super::state::RemoteApp) {
     };
     let client = remote.client.clone();
     let tx = remote.worker_tx.clone();
+    let session = remote.session_id.clone();
     crate::runtime::http::spawn_task(async move {
         // A failed lookup answers with no rows so stale ones can't linger.
         let files = client
-            .list_files_async(&query, mention::MENTION_LIMIT)
+            .list_files_async(&query, mention::MENTION_LIMIT, Some(&session))
             .await
             .unwrap_or_default();
         let _ = tx.send(WorkerMessage::Files { query, files }).await;

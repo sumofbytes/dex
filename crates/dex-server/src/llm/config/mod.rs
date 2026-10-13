@@ -410,7 +410,7 @@ pub fn apply_verify_optin(config: &mut LlmConfig) {
 /// recognized one (Cargo.toml, go.mod, package.json) selects the standard
 /// test command.
 pub fn detect_verify_command() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
+    let cwd = crate::tools::workspace_root().ok()?;
     if cwd.join("Cargo.toml").exists() {
         return Some("cargo test".into());
     }
@@ -818,7 +818,7 @@ impl LlmConfig {
         permission_override: Option<PermissionMode>,
         header_overrides: Vec<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        tokio::task::spawn_blocking(move || {
+        crate::workspace::spawn_blocking_in_workspace(move || {
             Self::from_env(
                 base_url_override,
                 model_override,

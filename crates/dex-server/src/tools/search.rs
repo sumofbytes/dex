@@ -1,10 +1,10 @@
 //! fff-powered search: `grep` (content) and `find` (paths) — aliases `ffgrep`/`fffind` kept for compat, backed by the
 //! fff-search crate (also the engine behind fff.nvim).
-//! One shared picker per process; fff spawns its own background scan and
+//! One shared picker per workspace root; fff spawns its own background scan and
 //! filesystem watcher, so results stay fresh without rescans.
 
-use std::env;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ::fff::grep::{has_regex_metacharacters, GrepMode, GrepSearchOptions};
@@ -21,13 +21,49 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds a single grep so a pathological query cannot stall the turn.
 const GREP_TIME_BUDGET_MS: u64 = 10_000;
 
-static FFF: OnceLock<Result<(SharedFilePicker, SharedFrecency), String>> = OnceLock::new();
+type Picker = Result<Arc<(SharedFilePicker, SharedFrecency)>, String>;
 
-fn fff() -> Result<&'static (SharedFilePicker, SharedFrecency), ToolError> {
-    FFF.get_or_init(|| {
+/// Roots kept indexed at once. Each owns a scanner and a filesystem watcher,
+/// so a long-lived daemon evicts the least recently used one past this.
+const MAX_PICKERS: usize = 8;
+
+type RootPicker = (PathBuf, Arc<OnceLock<Picker>>);
+
+/// A daemon serves sessions in different directories, so each root gets its
+/// own picker. Least recently used last.
+static FFF: OnceLock<Mutex<Vec<RootPicker>>> = OnceLock::new();
+
+fn fff() -> Result<Arc<(SharedFilePicker, SharedFrecency)>, ToolError> {
+    let base = super::workspace_root().map_err(|e| ToolError::Internal(e.to_string()))?;
+    let cell = {
+        let mut entries = FFF
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match entries.iter().position(|(root, _)| *root == base) {
+            Some(i) => {
+                let entry = entries.remove(i);
+                entries.insert(0, entry);
+            }
+            None => {
+                entries.insert(0, (base.clone(), Arc::new(OnceLock::new())));
+                if entries.len() > MAX_PICKERS {
+                    if let Some((_, Some(Ok(evicted)))) = entries
+                        .pop()
+                        .map(|(root, cell)| (root, cell.get().cloned()))
+                    {
+                        // In-flight searches keep their Arc; the watcher stops now.
+                        evicted.0.cancel();
+                        evicted.0.shutdown_watches();
+                    }
+                }
+            }
+        }
+        entries[0].1.clone()
+    };
+    cell.get_or_init(|| {
         let shared = SharedFilePicker::default();
         let frecency = SharedFrecency::default();
-        let base = env::current_dir().map_err(|e| e.to_string())?;
         FilePicker::new_with_shared_state(
             shared.clone(),
             frecency.clone(),
@@ -44,10 +80,10 @@ fn fff() -> Result<&'static (SharedFilePicker, SharedFrecency), ToolError> {
         if !shared.wait_for_scan(SCAN_TIMEOUT) {
             return Err("fff initial scan did not finish in 30s".to_string());
         }
-        Ok((shared, frecency))
+        Ok(Arc::new((shared, frecency)))
     })
-    .as_ref()
-    .map_err(|e| ToolError::Internal(e.clone()))
+    .clone()
+    .map_err(ToolError::Internal)
 }
 
 /// Deterministic index refresh for tests that create fixture files after the
@@ -59,7 +95,8 @@ fn fff() -> Result<&'static (SharedFilePicker, SharedFrecency), ToolError> {
 pub(crate) fn rescan() {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock();
-    if let Ok((picker, frecency)) = fff() {
+    if let Ok(handle) = fff() {
+        let (picker, frecency) = &*handle;
         for _ in 0..2 {
             let _ = picker.trigger_full_rescan_async(frecency);
             // wait_for_indexing_complete (not wait_for_scan): the walk finishing
@@ -84,7 +121,8 @@ fn query_arg(args: &Map<String, Value>) -> Result<String, ToolError> {
 fn with_picker<T>(
     f: impl FnOnce(&::fff::FilePicker) -> Result<T, ToolError>,
 ) -> Result<T, ToolError> {
-    let (picker, _) = fff()?;
+    let handle = fff()?;
+    let picker = &handle.0;
     let guard = picker
         .read()
         .map_err(|e| ToolError::Internal(format!("fff lock: {e}")))?;

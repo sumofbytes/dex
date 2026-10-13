@@ -511,7 +511,8 @@ pub(super) fn workspace_table(lua: &Lua, manifest: &Manifest) -> Table {
                             "extension '{ext_id}' reads workspace without the workspace.read capability"
                         )));
                     }
-                    let root = crate::tools::workspace_root().map_err(|e| {
+                    let root = crate::workspace::workspace_root()
+                        .or_else(|_| crate::workspace::process_cwd()).map_err(|e| {
                         LuaError::RuntimeError(format!("extension '{ext_id}': {e}"))
                     })?;
                     let full = resolve_workspace_path(&root, &path).map_err(|e| {
@@ -539,7 +540,8 @@ pub(super) fn workspace_table(lua: &Lua, manifest: &Manifest) -> Table {
                             "extension '{ext_id}' stats workspace without the workspace.read capability"
                         )));
                     }
-                    let Ok(root) = crate::tools::workspace_root() else {
+                    let Ok(root) = crate::workspace::workspace_root()
+                        .or_else(|_| crate::workspace::process_cwd()) else {
                         return Err(LuaError::RuntimeError(format!(
                             "extension '{ext_id}': no workspace"
                         )));

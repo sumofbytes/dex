@@ -206,6 +206,17 @@ pub(crate) struct Boot {
 
 /// Boot half of the remote REPL: connect, fan out the config/session/skills
 /// fetches, build the app, replay a reattach, and prime the terminal.
+/// The daemon runs a session in the requested directory when that exists on
+/// its host and in its own otherwise (`resp_cwd`; empty from older daemons).
+fn warn_cwd_fallback(requested: &str, resp_cwd: &str) {
+    if !resp_cwd.is_empty() && resp_cwd != requested {
+        crate::runtime::notice::warn_once(
+            "session-cwd-fallback",
+            &format!("daemon has no directory {requested}; session runs in {resp_cwd} on the daemon host"),
+        );
+    }
+}
+
 pub(crate) fn bootstrap(
     args: &Args,
     daemon_url: &str,
@@ -288,6 +299,7 @@ pub(crate) fn bootstrap(
         let resp = client
             .create_session(&local_cwd, Some(name))
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        warn_cwd_fallback(&local_cwd, &resp.cwd);
         let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
@@ -295,11 +307,12 @@ pub(crate) fn bootstrap(
     } else if daemon_is_local && !local_cwd.is_empty() {
         // Local default: the spawned daemon inherits our cwd, so mint the
         // name locally and overlap all three (same as the explicit-name path
-        // above); the server ignores the carried cwd anyway.
+        // above); the daemon runs the session in the cwd we send.
         let session_name = Session::default_session_name(&local_cwd);
         let resp = client
             .create_session(&local_cwd, Some(&session_name))
             .map_err(|e| std::io::Error::other(format!("failed to create session: {e}")))?;
+        warn_cwd_fallback(&local_cwd, &resp.cwd);
         let info = crate::runtime::http::block_on(info_handle)
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?
             .map_err(|e| std::io::Error::other(format!("failed to read daemon config: {e}")))?;
@@ -417,6 +430,8 @@ pub(crate) fn bootstrap(
     // Shared journal cursor: the turn worker publishes (fetch_max) the seq
     // its SSE stream has delivered; the idle poller resumes from it.
     let events_cursor = Arc::new(AtomicU64::new(0));
+    let git_session: super::pollers::GitSession =
+        Arc::new(std::sync::Mutex::new(session_id.clone()));
     let mut remote = RemoteApp {
         app,
         client: client.clone(),
@@ -433,11 +448,12 @@ pub(crate) fn bootstrap(
         live_children: live_children.clone(),
         busy_poll: busy_poll.clone(),
         events_cursor: events_cursor.clone(),
+        git_session: git_session.clone(),
     };
     // Background git poll off the UI thread (Phase 5): task polls every 2s,
     // pushes into the worker channel; UI loop only applies. Daemon 5s cache
     // stays; per-frame cost zero even when busy.
-    spawn_git_poller(client.clone(), worker_tx.clone());
+    spawn_git_poller(client.clone(), worker_tx.clone(), git_session);
     // Idle events poll (§15 V1b + §12 V1b): once the session may have child
     // agents, poll the journal so lifecycle lines, labeled approvals, and
     // wake turns surface without waiting for a user turn.
