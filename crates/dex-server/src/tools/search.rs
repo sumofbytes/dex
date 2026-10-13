@@ -1,10 +1,11 @@
 //! fff-powered search: `grep` (content) and `find` (paths) — aliases `ffgrep`/`fffind` kept for compat, backed by the
 //! fff-search crate (also the engine behind fff.nvim).
-//! One shared picker per process; fff spawns its own background scan and
+//! One shared picker per workspace root; fff spawns its own background scan and
 //! filesystem watcher, so results stay fresh without rescans.
 
-use std::env;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use ::fff::grep::{has_regex_metacharacters, GrepMode, GrepSearchOptions};
@@ -21,13 +22,27 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds a single grep so a pathological query cannot stall the turn.
 const GREP_TIME_BUDGET_MS: u64 = 10_000;
 
-static FFF: OnceLock<Result<(SharedFilePicker, SharedFrecency), String>> = OnceLock::new();
+type Picker = Result<(SharedFilePicker, SharedFrecency), String>;
+
+/// A daemon serves sessions in different directories, so each root gets its
+/// own picker. Entries live for the process, like the single picker did.
+static FFF: OnceLock<Mutex<HashMap<PathBuf, &'static OnceLock<Picker>>>> = OnceLock::new();
 
 fn fff() -> Result<&'static (SharedFilePicker, SharedFrecency), ToolError> {
-    FFF.get_or_init(|| {
+    let base = super::workspace_root().map_err(|e| ToolError::Internal(e.to_string()))?;
+    let cell = {
+        let mut map = FFF
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cell: &'static OnceLock<Picker> = map
+            .entry(base.clone())
+            .or_insert_with(|| Box::leak(Box::new(OnceLock::new())));
+        cell
+    };
+    cell.get_or_init(|| {
         let shared = SharedFilePicker::default();
         let frecency = SharedFrecency::default();
-        let base = env::current_dir().map_err(|e| e.to_string())?;
         FilePicker::new_with_shared_state(
             shared.clone(),
             frecency.clone(),

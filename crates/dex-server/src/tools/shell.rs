@@ -12,7 +12,7 @@ use crate::render::format::clamp_lines;
 use crate::runtime::cancel::{wait_cancelled, CancellationSource};
 
 use super::args::arg_str;
-use super::{ToolError, CONFIGURED_OUTPUT_LIMIT};
+use super::{workspace_root, ToolError, CONFIGURED_OUTPUT_LIMIT};
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -217,6 +217,7 @@ pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
         .arg("-c")
         .arg(command)
         .envs(tool_runner_env())
+        .current_dir(workspace_root().unwrap_or_else(|_| ".".into()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -237,6 +238,7 @@ pub(crate) fn shell_command(command: &str) -> tokio::process::Command {
         .arg("/C")
         .arg(command)
         .envs(tool_runner_env())
+        .current_dir(workspace_root().unwrap_or_else(|_| ".".into()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

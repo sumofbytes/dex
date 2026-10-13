@@ -12,8 +12,48 @@ use std::path::{Path, PathBuf};
 
 use super::WorkspaceError;
 
+tokio::task_local! {
+    static SESSION_ROOT: PathBuf;
+}
+
+/// The workspace tools resolve against: the session's directory inside
+/// [`with_workspace_root`], else the process cwd. A daemon serves many
+/// sessions from one process, so the cwd cannot be per-session.
 pub fn workspace_root() -> io::Result<PathBuf> {
-    env::current_dir()
+    match SESSION_ROOT.try_with(PathBuf::clone) {
+        Ok(root) => Ok(root),
+        Err(_) => env::current_dir(),
+    }
+}
+
+/// Run `fut` with `root` as its [`workspace_root`]. Tasks it spawns must use
+/// [`spawn_in_workspace`] to inherit the root.
+pub async fn with_workspace_root<F: std::future::Future>(root: PathBuf, fut: F) -> F::Output {
+    SESSION_ROOT.scope(root, fut).await
+}
+
+/// [`tokio::spawn`] that keeps the caller's [`workspace_root`].
+pub fn spawn_in_workspace<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match SESSION_ROOT.try_with(PathBuf::clone) {
+        Ok(root) => tokio::spawn(SESSION_ROOT.scope(root, fut)),
+        Err(_) => tokio::spawn(fut),
+    }
+}
+
+/// [`tokio::task::spawn_blocking`] that keeps the caller's [`workspace_root`].
+pub fn spawn_blocking_in_workspace<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match SESSION_ROOT.try_with(PathBuf::clone) {
+        Ok(root) => tokio::task::spawn_blocking(move || SESSION_ROOT.sync_scope(root, f)),
+        Err(_) => tokio::task::spawn_blocking(f),
+    }
 }
 
 /// Resolve a tool `path` argument: `~` expands to `$HOME`, relative paths
@@ -120,4 +160,43 @@ pub fn xdg_path(env_var: &str, home_sub: &str, rel: &str) -> Option<std::path::P
         return Some(std::path::PathBuf::from(dir).join(rel));
     }
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(home_sub).join(rel))
+}
+
+#[cfg(test)]
+mod session_root_tests {
+    use super::*;
+    use crate::runtime::console::CancellationToken;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("dex-root-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[tokio::test]
+    async fn scoped_root_drives_paths_bash_and_spawned_tasks() {
+        let (a, b) = (temp_dir("a"), temp_dir("b"));
+        let run = |root: PathBuf| async move {
+            with_workspace_root(root.clone(), async move {
+                assert_eq!(workspace_root().unwrap(), root);
+                assert_eq!(tool_path("f.txt").unwrap(), root.join("f.txt"));
+                let (out, _) = crate::tools::shell::run_bash("pwd", &CancellationToken::new())
+                    .await
+                    .unwrap();
+                assert_eq!(PathBuf::from(out.trim()).canonicalize().unwrap(), root);
+                let spawned = spawn_in_workspace(async { workspace_root().unwrap() })
+                    .await
+                    .unwrap();
+                assert_eq!(spawned, root);
+                let blocking = spawn_blocking_in_workspace(|| workspace_root().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(blocking, root);
+            })
+            .await
+        };
+        // Concurrent sessions each see their own directory.
+        tokio::join!(run(a.clone()), run(b.clone()));
+        assert_eq!(workspace_root().unwrap(), env::current_dir().unwrap());
+    }
 }

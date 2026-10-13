@@ -410,7 +410,7 @@ impl<X: CancellationSource + Clone + Send + Sync + 'static> AgentHost for DexTur
             return Err("cancelled by user".into());
         }
 
-        let turn_cwd = std::env::current_dir()
+        let turn_cwd = crate::tools::workspace_root()
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();

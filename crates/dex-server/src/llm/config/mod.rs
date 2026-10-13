@@ -410,7 +410,7 @@ pub fn apply_verify_optin(config: &mut LlmConfig) {
 /// recognized one (Cargo.toml, go.mod, package.json) selects the standard
 /// test command.
 pub fn detect_verify_command() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
+    let cwd = crate::tools::workspace_root().ok()?;
     if cwd.join("Cargo.toml").exists() {
         return Some("cargo test".into());
     }

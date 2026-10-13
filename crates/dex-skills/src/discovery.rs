@@ -173,9 +173,15 @@ pub async fn discover_skills_async(dirs: &[PathBuf]) -> Vec<Skill> {
 }
 
 pub fn skill_dirs() -> Vec<PathBuf> {
+    skill_dirs_in(env::current_dir().ok().as_deref())
+}
+
+/// [`skill_dirs`] with project skills taken from `project` rather than the
+/// process cwd, for a daemon whose sessions live in different directories.
+pub fn skill_dirs_in(project: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     // Project-level skills
-    if let Ok(cwd) = env::current_dir() {
+    if let Some(cwd) = project {
         dirs.push(cwd.join(".dex/skills"));
         dirs.push(cwd.join(".agents/skills"));
     }

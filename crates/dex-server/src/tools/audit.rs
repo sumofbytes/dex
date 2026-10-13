@@ -1,5 +1,4 @@
 use serde_json::{Map, Value};
-use std::env;
 use std::fs;
 use std::io::Write;
 
@@ -19,7 +18,7 @@ pub(crate) fn audit(name: &str, args: &Map<String, Value>, outcome: &str) {
     }
     let record = serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "cwd": env::current_dir().ok().map(|p| p.display().to_string()),
+        "cwd": crate::tools::workspace_root().ok().map(|p| p.display().to_string()),
         "tool": name,
         "args": args,
         "outcome": outcome,

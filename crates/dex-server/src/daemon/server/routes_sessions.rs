@@ -25,13 +25,17 @@ pub(crate) async fn create_session(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Tools run in the daemon's working directory (the server owns the
-    // workspace), so sessions are recorded against it. A co-located client's
-    // cwd matches anyway; a remote client's cwd is not meaningful on the
-    // server and would be misleading in session listings.
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| req.cwd.clone());
+    // Tools run in the session's directory, which the client names. It must
+    // be a directory on this host; a remote client's path usually isn't, and
+    // then the session falls back to the daemon's own workspace.
+    let requested = std::path::Path::new(&req.cwd);
+    let cwd = if requested.is_absolute() && requested.is_dir() {
+        req.cwd.clone()
+    } else {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| req.cwd.clone())
+    };
     let session = Session::new(cwd.clone(), req.name.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

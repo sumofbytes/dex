@@ -19,7 +19,7 @@ use crate::protocol::{ChatRequest, StreamEnvelope, StreamEvent};
 use crate::runtime::console::{CancellationToken, Console};
 use crate::runtime::unwind::CatchUnwind;
 use crate::session::{self, Session};
-use dex_skills::{discover_skills_async, skill_dirs};
+use dex_skills::{discover_skills_async, skill_dirs_in};
 
 use super::approvals::child_approval_bridge;
 use super::lookup::persisted_current;
@@ -87,10 +87,45 @@ pub(crate) fn spawn_accepted_forwarder(
     });
 }
 
+/// Run one agent turn with the session's directory as its workspace, so tools,
+/// prompt files and skills resolve there rather than in the daemon's cwd.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agent_turn(
+    state: Arc<DaemonState>,
+    session_id: String,
+    req: ChatRequest,
+    cancel: CancellationToken,
+    tx: mpsc::Sender<StreamEnvelope>,
+    idempotency_key: Option<String>,
+    request_hash: u64,
+    steering_rx: Option<mpsc::Receiver<QueueMsg>>,
+    followup_rx: Option<mpsc::Receiver<QueueMsg>>,
+) {
+    let root = lock_map(&state.sessions)
+        .get(&session_id)
+        .map(|entry| std::path::PathBuf::from(&entry.cwd))
+        .filter(|path| path.is_dir());
+    let turn = run_agent_turn_in_root(
+        state,
+        session_id,
+        req,
+        cancel,
+        tx,
+        idempotency_key,
+        request_hash,
+        steering_rx,
+        followup_rx,
+    );
+    match root {
+        Some(root) => crate::workspace::with_workspace_root(root, turn).await,
+        None => turn.await,
+    }
+}
+
 /// Run one agent turn and push numbered `StreamEnvelope`s into `tx`. Async:
 /// spawned via `tokio::spawn`, bridges are tasks with `send().await`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_agent_turn(
+async fn run_agent_turn_in_root(
     state: Arc<DaemonState>,
     session_id: String,
     req: ChatRequest,
@@ -546,7 +581,7 @@ pub(crate) async fn run_turn_inner(
     });
 
     // Skills are resolved on the daemon (its filesystem is the workspace).
-    let mut dirs = skill_dirs();
+    let mut dirs = skill_dirs_in(Some(std::path::Path::new(&entry.cwd)));
     dirs.extend(req.skill_dirs.iter().map(std::path::PathBuf::from));
     let skills = discover_skills_async(&dirs).await;
 

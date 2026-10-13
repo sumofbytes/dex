@@ -475,7 +475,7 @@ impl AgentManager {
         // per-line emissions (`ProgressReporter::emit_line`) then never
         // touch the manager lock (see `ProgressReporter::events`).
         let events = manager.lock().events.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::workspace::spawn_in_workspace(async move {
             // Cancel wins over a body that ignores its token, and the body
             // gets the definition's `timeout` to finish (plan §14): a run
             // outliving it is dropped and ended `TimedOut`. Either way the
