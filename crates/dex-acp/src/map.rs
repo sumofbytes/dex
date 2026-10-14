@@ -213,9 +213,62 @@ pub fn modes_state(current: &str) -> Value {
     })
 }
 
+/// ACP session config options (`configOptions`): a `mode` select backed by
+/// [`MODES`], and a `model` select when the daemon reported models. The
+/// current model is listed even when the daemon's list lacks it (a `--model`
+/// flag naming another provider).
+pub fn config_options(mode: &str, model: Option<&str>, models: &[String]) -> Value {
+    let mut options = vec![json!({
+        "id": "mode",
+        "name": "Mode",
+        "category": "mode",
+        "type": "select",
+        "currentValue": mode,
+        "options": MODES.iter().map(|(id, name, description)| json!({
+            "value": id, "name": name, "description": description,
+        })).collect::<Vec<_>>(),
+    })];
+    if let Some(current) = model {
+        let mut choices: Vec<&str> = models.iter().map(String::as_str).collect();
+        if !choices.contains(&current) {
+            choices.insert(0, current);
+        }
+        options.push(json!({
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current,
+            "options": choices.iter().map(|id| json!({"value": id, "name": id})).collect::<Vec<_>>(),
+        }));
+    }
+    Value::Array(options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_options_list_mode_and_model() {
+        let models = vec!["a".to_string(), "b".to_string()];
+        let options = config_options("plan", Some("b"), &models);
+        assert_eq!(options[0]["id"], "mode");
+        assert_eq!(options[0]["currentValue"], "plan");
+        assert_eq!(options[0]["options"].as_array().unwrap().len(), MODES.len());
+        assert_eq!(options[1]["category"], "model");
+        assert_eq!(options[1]["currentValue"], "b");
+        assert_eq!(options[1]["options"][0]["value"], "a");
+        // A current model outside the list is still selectable.
+        let options = config_options("auto", Some("x/y"), &models);
+        assert_eq!(options[1]["options"][0]["value"], "x/y");
+        assert_eq!(options[1]["options"].as_array().unwrap().len(), 3);
+        // No model, no model option.
+        assert_eq!(
+            config_options("auto", None, &[]).as_array().unwrap().len(),
+            1
+        );
+    }
 
     #[test]
     fn flattens_prompt_blocks() {

@@ -23,6 +23,8 @@ Zed (`settings.json`):
 | `session/prompt` | one chat turn; text, resource links and embedded text are inlined |
 | `session/cancel` | daemon cancel; prompt returns `stopReason: cancelled` |
 | `session/set_mode` (`auto`/`manual`/`plan`) | agent mode |
+| `configOptions` in `session/new` / `session/load` | `mode` select (same modes) and `model` select (the daemon's model list, current = `--model` or the daemon's model) |
+| `session/set_config_option` (`configId` `mode`/`model`) | changes the session's mode or model; answers with all options. A model applies to the session's next turns (sent as the per-request model); it is not remembered across `session/load` |
 | `agent_message_chunk` / `agent_thought_chunk` | assistant text / thinking |
 | `tool_call` / `tool_call_update` | tool call / result |
 | `plan` | plan updates |

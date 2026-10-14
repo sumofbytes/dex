@@ -21,6 +21,10 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 struct Session {
     mode: Mutex<String>,
+    /// Model this session's turns request; `None` leaves the daemon's choice.
+    model: Mutex<Option<String>>,
+    /// Models the `model` option offers; empty when the daemon reported none.
+    models: Vec<String>,
     cancelled: AtomicBool,
     cancel_signal: Notify,
     /// A prompt turn is in flight; overlapping prompts are rejected.
@@ -46,11 +50,33 @@ impl Ctx {
             .ok_or_else(|| (rpc::INVALID_PARAMS, format!("unknown session '{id}'")))
     }
 
+    /// Tell the client the session's options changed outside
+    /// `session/set_config_option` (a `session/set_mode`).
+    fn options_changed(&self, params: &Value, session: &Session) {
+        self.rpc.notify(
+            "session/update",
+            json!({
+                "sessionId": params["sessionId"],
+                "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": session.config_options(),
+                },
+            }),
+        );
+    }
+
     /// Register a fresh ACP session state for a daemon session id and seed
     /// its mode. Used by both `session/new` and `session/load`.
-    fn register(&self, id: String, mode: &str) -> Arc<Session> {
+    fn register(
+        &self,
+        id: String,
+        mode: &str,
+        models: (Option<String>, Vec<String>),
+    ) -> Arc<Session> {
         let session = Arc::new(Session {
             mode: Mutex::new(mode.to_string()),
+            model: Mutex::new(models.0),
+            models: models.1,
             cancelled: AtomicBool::new(false),
             cancel_signal: Notify::new(),
             busy: AtomicBool::new(false),
@@ -60,6 +86,34 @@ impl Ctx {
         }
         session
     }
+}
+
+impl Session {
+    /// The session's `configOptions` as they stand now.
+    fn config_options(&self) -> Value {
+        let mode = self.mode.lock().map(|m| m.clone()).unwrap_or_default();
+        let model = self.model.lock().ok().and_then(|m| m.clone());
+        map::config_options(&mode, model.as_deref(), &self.models)
+    }
+}
+
+/// Model seed and choices for a new session: the `--model` flag, else the
+/// daemon's model, over the daemon's model list. A daemon that can't be
+/// asked leaves just the flag, or no model option at all.
+async fn seeded_models(ctx: &Ctx) -> (Option<String>, Vec<String>) {
+    let info = ctx.client.get_config_async().await.ok();
+    let current = ctx
+        .options
+        .model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            info.as_ref()
+                .map(|i| i.model.clone())
+                .filter(|m| !m.is_empty())
+        });
+    let models = info.map(|i| i.available_models).unwrap_or_default();
+    (current, models)
 }
 
 /// Session mode seed: the flag-provided mode when it names a known ACP
@@ -181,7 +235,42 @@ async fn handle_request(ctx: &Arc<Ctx>, method: &str, params: Value) -> Result<V
             if let Ok(mut current) = session.mode.lock() {
                 *current = mode.to_string();
             }
+            ctx.options_changed(&params, &session);
             Ok(json!({}))
+        }
+        "session/set_config_option" => {
+            let (_, session) = ctx.session(&params)?;
+            let value = params["value"].as_str().unwrap_or_default();
+            match params["configId"].as_str().unwrap_or_default() {
+                "mode" => {
+                    if !map::MODES.iter().any(|(id, ..)| *id == value) {
+                        return Err((rpc::INVALID_PARAMS, format!("unknown mode '{value}'")));
+                    }
+                    if let Ok(mut current) = session.mode.lock() {
+                        *current = value.to_string();
+                    }
+                }
+                "model" => {
+                    let known = session.models.iter().any(|m| m == value)
+                        || session
+                            .model
+                            .lock()
+                            .is_ok_and(|m| m.as_deref() == Some(value));
+                    if value.is_empty() || !known {
+                        return Err((rpc::INVALID_PARAMS, format!("unknown model '{value}'")));
+                    }
+                    if let Ok(mut current) = session.model.lock() {
+                        *current = Some(value.to_string());
+                    }
+                }
+                other => {
+                    return Err((
+                        rpc::INVALID_PARAMS,
+                        format!("unknown config option '{other}'"),
+                    ))
+                }
+            }
+            Ok(json!({"configOptions": session.config_options()}))
         }
         "session/prompt" => prompt(ctx, &params).await,
         other => Err((rpc::METHOD_NOT_FOUND, format!("method not found: {other}"))),
@@ -202,8 +291,12 @@ async fn new_session(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> 
         .await
         .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
     let mode = seeded_mode(&ctx.options);
-    ctx.register(created.session_id.clone(), &mode);
-    Ok(json!({"sessionId": created.session_id, "modes": map::modes_state(&mode)}))
+    let session = ctx.register(created.session_id.clone(), &mode, seeded_models(ctx).await);
+    Ok(json!({
+        "sessionId": created.session_id,
+        "modes": map::modes_state(&mode),
+        "configOptions": session.config_options(),
+    }))
 }
 
 /// Sessions per `session/list` page.
@@ -291,9 +384,9 @@ async fn load_session(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError>
         .await
         .map_err(|e| (rpc::INTERNAL_ERROR, e.to_string()))?;
     let mode = seeded_mode(&ctx.options);
-    ctx.register(id.to_string(), &mode);
+    let session = ctx.register(id.to_string(), &mode, seeded_models(ctx).await);
     replay_updates(ctx, id).await;
-    Ok(json!({"modes": map::modes_state(&mode)}))
+    Ok(json!({"modes": map::modes_state(&mode), "configOptions": session.config_options()}))
 }
 
 /// Stream the journal under a loaded session as `session/update`
@@ -342,6 +435,9 @@ async fn prompt(ctx: &Arc<Ctx>, params: &Value) -> Result<Value, RpcError> {
 
     let mut options = ctx.options.clone();
     options.mode = session.mode.lock().ok().map(|m| m.clone());
+    if let Some(model) = session.model.lock().ok().and_then(|m| m.clone()) {
+        options.model = Some(model);
+    }
     let mut stream = ctx
         .client
         .chat_stream(&session_id, &text, options)
@@ -607,6 +703,45 @@ mod tests {
         assert_eq!(by_id(2)["error"]["code"], rpc::METHOD_NOT_FOUND);
         assert_eq!(by_id(3)["error"]["code"], rpc::INVALID_PARAMS);
         assert_eq!(by_id(4)["error"]["code"], rpc::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn config_options_expose_mode_and_model() {
+        let daemon = mock_daemon(&[
+            ("/api/sessions", 200, r#"{"session_id":"s-1","path":"/w"}"#),
+            (
+                "/api/config",
+                200,
+                r#"{"provider":"p","model":"m1","available_models":["m1","m2"],"context_window":1,"permission":"trusted","cwd":"/w","git_branch":null,"git_dirty":false}"#,
+            ),
+        ])
+        .await;
+        let out = roundtrip_with(
+            &daemon,
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/w"}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"session/set_config_option",
+                    "params":{"sessionId":"s-1","configId":"model","value":"m2"}}),
+                json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option",
+                    "params":{"sessionId":"s-1","configId":"model","value":"nope"}}),
+                json!({"jsonrpc":"2.0","id":4,"method":"session/set_config_option",
+                    "params":{"sessionId":"s-1","configId":"mode","value":"plan"}}),
+                json!({"jsonrpc":"2.0","id":5,"method":"session/set_config_option",
+                    "params":{"sessionId":"s-1","configId":"x","value":"y"}}),
+            ],
+        )
+        .await;
+        let by_id = |id: u64| out.iter().find(|m| m["id"] == id).unwrap();
+        let options = &by_id(1)["result"]["configOptions"];
+        assert_eq!(options[0]["id"], "mode");
+        assert_eq!(options[1]["currentValue"], "m1");
+        assert_eq!(options[1]["options"].as_array().unwrap().len(), 2);
+        assert_eq!(by_id(2)["result"]["configOptions"][1]["currentValue"], "m2");
+        assert_eq!(by_id(3)["error"]["code"], rpc::INVALID_PARAMS);
+        let options = &by_id(4)["result"]["configOptions"];
+        assert_eq!(options[0]["currentValue"], "plan");
+        assert_eq!(options[1]["currentValue"], "m2");
+        assert_eq!(by_id(5)["error"]["code"], rpc::INVALID_PARAMS);
     }
 
     #[tokio::test]
