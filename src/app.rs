@@ -171,21 +171,25 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
             let _ = session.set_name(name.clone());
         }
     }
-    let mut system = system_prompt_with_override(
+    let system = system_prompt_with_override(
         &skills,
         cli_system_prompt(args)
             .as_ref()
             .map(|(text, _)| text.as_str()),
     );
-    // One-shot plan mode: same directive the daemon appends for remote
-    // `mode: plan` turns, so headless runs behave identically.
-    if args.mode.is_some_and(crate::protocol::AgentMode::is_plan) {
-        system.push_str(crate::llm::prompt::plan_mode_directive());
-    }
     let mut messages = vec![ChatMessage::system(system)];
     // History already loaded on the session thread above (`!!` runs
     // excluded there); the turn below appends the new user message.
     messages.extend(history);
+    // One-shot plan mode: the same history note the daemon appends for
+    // remote `mode: plan` turns, so headless runs behave identically.
+    let plan = args.mode.is_some_and(crate::protocol::AgentMode::is_plan);
+    if let Some(note) = crate::llm::prompt::plan_mode_note(&messages, plan) {
+        if let Some(session) = session.as_mut() {
+            let _ = session.append_message(&note);
+        }
+        messages.push(note);
+    }
     let user = ChatMessage::user(prompt);
     if let Some(session) = session.as_mut() {
         let _ = session.turn_event("turn_start");
@@ -216,6 +220,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     // explicit `--header` flags already baked into `extra_headers` still win.
     if let Some(session) = session.as_ref() {
         crate::llm::config::apply_opencode_session_headers(&mut config, session.id());
+        config.prompt_cache_key = Some(session.id().to_string());
     }
     let mut state = ToolState::load();
     let console = crate::runtime::console::Console::none();

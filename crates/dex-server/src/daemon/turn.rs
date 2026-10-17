@@ -468,6 +468,7 @@ pub(crate) async fn run_turn_inner(
     // (`MissingSessionID`); auto-fill from the dex session id. Explicit
     // per-request headers below still win on collision.
     crate::llm::config::apply_opencode_session_headers(&mut config, session_id);
+    config.prompt_cache_key = Some(session_id.to_string());
     // Per-request custom headers from the client (`--header` flags) win
     // over the daemon's own configured headers for this turn only.
     // `insert_extra_header` drops empties + `authorization` and collapses
@@ -604,10 +605,18 @@ pub(crate) async fn run_turn_inner(
         &skills,
         req.system_prompt.as_deref(),
         Some(std::path::Path::new(&entry.cwd)),
-        agent_mode.is_some_and(crate::protocol::AgentMode::is_plan),
     )));
     // The history above is the exact message list the turn sends.
     messages.extend(history);
+    // Plan-mode transitions ride history as an appended note, never the
+    // system prompt, so a mode toggle keeps the cached prefix.
+    let plan = agent_mode.is_some_and(crate::protocol::AgentMode::is_plan);
+    if let Some(note) = crate::llm::prompt::plan_mode_note(&messages, plan) {
+        session
+            .append_message(&note)
+            .map_err(|e| format!("failed to persist plan-mode note: {e}"))?;
+        messages.push(note);
+    }
     // `@path` mentions expand here, not in the journaled `UserPrompt`, so the
     // transcript shows what the user typed while the model gets the contents.
     let mut mention_bytes = 0;

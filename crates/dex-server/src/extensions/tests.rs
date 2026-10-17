@@ -1047,6 +1047,7 @@ fn model_select_config(
         global_headers: Default::default(),
         connect_timeout_secs: 10,
         request_timeout_secs: 300,
+        prompt_cache_key: None,
         provider_entries: Default::default(),
         provider_headers: Default::default(),
         api_pinned: false,

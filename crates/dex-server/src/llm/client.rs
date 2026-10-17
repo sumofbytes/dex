@@ -99,6 +99,7 @@ pub(crate) fn http_call(
         hint_model,
         warm_ping: false,
         cache_write,
+        prompt_cache_key: config.prompt_cache_key.clone(),
         thinking_effort: config.thinking_effort.clone(),
         idle_timeout: crate::llm::transport::sse::stream_idle_timeout_for(
             &config.model,
@@ -148,9 +149,10 @@ impl WireProtocol for ChatCompletions {
             },
             reasoning_effort: &call.thinking_effort,
         };
+        let body = chat_completions_body(call, &req)?;
         run_streaming_call(
             call,
-            &req,
+            &body,
             sink,
             cancel,
             // Rate limits arrive as HTTP statuses, retried in `post_with_retry`.
@@ -159,6 +161,37 @@ impl WireProtocol for ChatCompletions {
         )
         .await
     }
+}
+
+/// Chat-completions body plus the prompt-cache extras the struct doesn't
+/// carry. `prompt_cache_key` goes only to OpenAI itself: strict
+/// OpenAI-compatible servers reject unknown fields. A Claude model behind a
+/// gateway gets explicit breakpoints (the gateway caches nothing without
+/// them); one-off calls (`cache_write: false`) skip both.
+fn chat_completions_body(
+    call: &HttpCall,
+    req: &ChatCompletionsRequest<'_>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let mut body = serde_json::to_value(req)?;
+    if !call.cache_write {
+        return Ok(body);
+    }
+    if call.model.to_ascii_lowercase().contains("claude") {
+        if let Some(messages) = body["messages"].as_array_mut() {
+            dex_ai::wire::mark_chat_cache_breakpoints(messages);
+        }
+    }
+    let openai = reqwest::Url::parse(&call.url)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.eq_ignore_ascii_case("api.openai.com"))
+        })
+        .unwrap_or(false);
+    if let (true, Some(key)) = (openai, &call.prompt_cache_key) {
+        body["prompt_cache_key"] = json!(key);
+    }
+    Ok(body)
 }
 
 /// `openai-responses`.
@@ -192,6 +225,9 @@ impl WireProtocol for Responses {
         }
         if let Some(effort) = &call.thinking_effort {
             body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        }
+        if let Some(key) = &call.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
         }
         run_streaming_call(
             call,
@@ -628,5 +664,67 @@ mod tests {
                 cached_tokens: None
             })
         );
+    }
+
+    fn completions_body_for(url: &str, model: &str, cache_write: bool) -> serde_json::Value {
+        let mut config = crate::llm::config::tests::test_cfg();
+        config.model = model.into();
+        config.prompt_cache_key = Some("sess-1".into());
+        let call = http_call(&config, url.into(), None, cache_write);
+        let messages = [
+            ChatMessage::system("sys"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("next"),
+        ];
+        let req = ChatCompletionsRequest {
+            model: &call.model,
+            messages: chat_completions_messages(&messages),
+            tools: Vec::new(),
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+            reasoning_effort: &None,
+        };
+        chat_completions_body(&call, &req).unwrap()
+    }
+
+    #[test]
+    fn completions_cache_key_goes_only_to_openai() {
+        let openai =
+            completions_body_for("https://api.openai.com/v1/chat/completions", "gpt-5", true);
+        assert_eq!(openai["prompt_cache_key"], "sess-1");
+        // Strict compatible servers reject unknown fields.
+        let other = completions_body_for("https://llm.example/v1/chat/completions", "m", true);
+        assert!(other.get("prompt_cache_key").is_none(), "{other}");
+        // Plain-string content stays untouched for non-Claude models.
+        assert_eq!(other["messages"][0]["content"], "sys");
+    }
+
+    #[test]
+    fn completions_mark_system_and_last_user_for_claude() {
+        let body = completions_body_for(
+            "https://openrouter.ai/api/v1/chat/completions",
+            "anthropic/claude-sonnet-5-5",
+            true,
+        );
+        let messages = body["messages"].as_array().unwrap();
+        for index in [0, 3] {
+            assert_eq!(
+                messages[index]["content"][0]["cache_control"]["type"], "ephemeral",
+                "{body}"
+            );
+        }
+        assert_eq!(messages[3]["content"][0]["text"], "next");
+        assert_eq!(messages[1]["content"], "hi");
+        assert_eq!(messages[2]["content"], "ok");
+        // One-off calls write no breakpoints.
+        let cold = completions_body_for(
+            "https://openrouter.ai/api/v1/chat/completions",
+            "anthropic/claude-sonnet-5-5",
+            false,
+        );
+        assert!(!cold.to_string().contains("cache_control"), "{cold}");
     }
 }

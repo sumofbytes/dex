@@ -54,6 +54,32 @@ pub fn chat_completions_messages(messages: &[ChatMessage]) -> Vec<WireMessage<'_
     messages.iter().map(ChatMessage::wire).collect()
 }
 
+/// Prompt-cache breakpoints for a chat-completions body bound for a Claude
+/// model behind an OpenAI-compatible gateway (OpenRouter and friends pass
+/// `cache_control` content parts through to Anthropic; without them a
+/// Claude model on this wire never caches). Marks the system message and
+/// the newest user message: the stable prefix and the conversation so far.
+/// String content becomes one text part carrying the marker; other shapes
+/// are left alone.
+pub fn mark_chat_cache_breakpoints(messages: &mut [Value]) {
+    let system = messages
+        .iter()
+        .position(|m| m.get("role").and_then(Value::as_str) == Some("system"));
+    let last_user = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+    for index in [system, last_user].into_iter().flatten() {
+        let message = &mut messages[index];
+        if let Some(text) = message.get("content").and_then(Value::as_str) {
+            message["content"] = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
+    }
+}
+
 pub fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
