@@ -31,7 +31,8 @@ pub fn messages_url(base_url: &str) -> String {
     }
 }
 
-/// `thinking_effort` knob → Anthropic `budget_tokens`. Anthropic has no
+/// `thinking_effort` knob → Anthropic `budget_tokens` (pre-4.6 models; see
+/// [`adaptive_thinking`]). The budget form has no
 /// effort names, so the OpenAI-style vocabulary maps onto budgets (the
 /// API floor is 1024). Unknown picks get the middle bucket.
 pub fn thinking_budget(effort: &str) -> u64 {
@@ -41,6 +42,54 @@ pub fn thinking_budget(effort: &str) -> u64 {
         "high" => 16_384,
         "xhigh" => 32_768,
         _ => 8192,
+    }
+}
+
+/// Whether `model` takes adaptive thinking (`thinking: {type: "adaptive"}`
+/// plus `output_config.effort`) instead of a fixed `budget_tokens`. Claude
+/// 4.6 and later deprecate `budget_tokens`, and the newest models reject it
+/// with a 400; Fable/Mythos are always adaptive. Older Claude models and
+/// non-Claude ids served over this wire keep the budget form. Matches
+/// gateway spellings too (`anthropic/claude-opus-4.6`,
+/// `us.anthropic.claude-sonnet-4-6-v1`, `claude-opus-4-5-20251101`).
+pub fn adaptive_thinking(model: &str) -> bool {
+    claude_version(model).is_some_and(|v| v >= (4, 6))
+}
+
+/// `(major, minor)` of a Claude model id, `None` when it isn't one with a
+/// recognizable family/version. Fable and Mythos count as current.
+fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let id = model.to_ascii_lowercase();
+    let id = id.rsplit('/').next().unwrap_or(&id);
+    let rest = &id[id.find("claude-")? + "claude-".len()..];
+    if rest.starts_with("fable") || rest.starts_with("mythos") {
+        return Some((u32::MAX, 0));
+    }
+    let rest = ["opus-", "sonnet-", "haiku-"]
+        .iter()
+        .find_map(|family| rest.strip_prefix(family))?;
+    let mut parts = rest.split(['-', '.', '@']);
+    let major: u32 = parts.next()?.parse().ok()?;
+    // A dated snapshot (`-20251101`) is not a minor version.
+    let minor = parts
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+        .filter(|m| *m < 100)
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// `thinking_effort` knob → `output_config.effort` for adaptive models.
+/// `minimal` has no API equivalent and lands on `low`; `xhigh` arrived with
+/// Claude 4.7, so 4.6 gets `high`. Unknown picks get `medium`.
+fn adaptive_effort(model: &str, effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "low" => "low",
+        "high" => "high",
+        "xhigh" if claude_version(model).is_some_and(|v| v < (4, 7)) => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        _ => "medium",
     }
 }
 
@@ -90,8 +139,17 @@ pub fn messages_body(
         }
         body["tools"] = json!(wire_tools);
     }
-    if let Some(budget) = budget {
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    match (thinking_effort, budget) {
+        (Some(effort), Some(_)) if adaptive_thinking(model) => {
+            // `max_tokens` keeps the budget-plus-headroom sizing: adaptive
+            // thinking spends from the same output allowance.
+            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+            body["output_config"] = json!({ "effort": adaptive_effort(model, effort) });
+        }
+        (_, Some(budget)) => {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
+        _ => {}
     }
     body
 }
@@ -285,7 +343,7 @@ pub fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::messages_body;
+    use super::{adaptive_thinking, messages_body};
     use crate::{ChatMessage, FunctionDef, ToolDefinition};
 
     fn one_tool() -> Vec<ToolDefinition> {
@@ -335,5 +393,83 @@ mod tests {
             false,
         );
         assert!(!cold.to_string().contains("cache_control"), "{cold}");
+    }
+
+    #[test]
+    fn adaptive_thinking_starts_at_claude_4_6() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "anthropic/claude-opus-4.6",
+            "us.anthropic.claude-sonnet-4-6-v1",
+        ] {
+            assert!(adaptive_thinking(model), "{model}");
+        }
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5",
+            "claude-opus-4-1",
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-latest",
+            "claude-haiku-mini",
+            "kimi-k2",
+        ] {
+            assert!(!adaptive_thinking(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn adaptive_models_send_effort_instead_of_budget_tokens() {
+        let body = messages_body(
+            "claude-opus-5-5",
+            None,
+            Some("xhigh"),
+            &[ChatMessage::user("hi")],
+            &[],
+            true,
+        );
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["max_tokens"], 36_864);
+
+        // Claude 4.6 has no `xhigh`; `minimal` has no API level at all.
+        let body = messages_body(
+            "claude-sonnet-4-6",
+            None,
+            Some("xhigh"),
+            &[ChatMessage::user("hi")],
+            &[],
+            true,
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+        let body = messages_body(
+            "claude-sonnet-4-6",
+            None,
+            Some("minimal"),
+            &[ChatMessage::user("hi")],
+            &[],
+            true,
+        );
+        assert_eq!(body["output_config"]["effort"], "low");
+
+        // Effort off: no thinking parameter either way.
+        let body = messages_body(
+            "claude-opus-5-5",
+            None,
+            None,
+            &[ChatMessage::user("hi")],
+            &[],
+            true,
+        );
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
     }
 }
