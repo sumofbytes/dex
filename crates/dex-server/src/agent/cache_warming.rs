@@ -10,9 +10,10 @@
 //! for the same session cancels the pending one (and the real next turn
 //! refreshes the cache anyway, so a skipped ping is always safe).
 //!
-//! Thinking: history that replays signed thinking blocks keeps the
-//! session's effort on the ping (the API rejects thinking blocks without
-//! the parameter) — see [`warm_effort_and_cap`].
+//! Thinking: a session with effort set keeps it on the ping — the
+//! `thinking` parameter is part of the messages-cache key, so a ping
+//! without it would warm an entry the next turn never reads — see
+//! [`warm_effort_and_cap`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,27 +34,25 @@ use crate::daemon::state::DaemonState;
 const WARM_AFTER: Duration = Duration::from_secs(270);
 /// Skip pings that cannot plausibly pay for themselves (pi's $0.05 shape).
 const MIN_SAVED_USD: f64 = 0.05;
-/// Output cap for the ping: the response is dropped, so keep it tiny. Also
-/// forces `thinking` off — a thinking budget cannot fit under the cap.
+/// Output cap for the ping when thinking is off: the response is dropped,
+/// so keep it tiny.
 pub(crate) const WARM_MAX_TOKENS: u64 = 64;
 
-/// The ping's `(thinking effort, output cap)` for `messages_body`. Plain
-/// history takes the tiny dead-reply cap with thinking off. History that
-/// replays signed thinking blocks must keep thinking on — the API rejects
-/// thinking blocks without the parameter — so those pings mirror the
-/// session's effort with a budget-plus-headroom cap (mirroring the real
-/// request's relationship); with effort off, mirror that too and take the
-/// catalog limit.
+/// The ping's `(thinking effort, output cap)` for `messages_body`. The
+/// `thinking` parameter is part of the messages-cache key — a ping that
+/// toggles it writes an entry the next real turn never reads — so a session
+/// with effort set always mirrors it, with a budget-plus-headroom cap
+/// (mirroring the real request's relationship). Effort off: plain history
+/// takes the tiny dead-reply cap; history that replays signed thinking
+/// blocks takes the catalog limit, mirroring the real request.
 pub(crate) fn warm_effort_and_cap<'a>(
     effort: Option<&'a str>,
     messages: &[ChatMessage],
 ) -> (Option<&'a str>, Option<u64>) {
-    if !dex_ai::anthropic::replays_thinking(messages) {
-        return (None, Some(WARM_MAX_TOKENS));
-    }
     match effort.map(dex_ai::anthropic::thinking_budget) {
         Some(budget) => (effort, Some(budget + dex_ai::anthropic::THINKING_HEADROOM)),
-        None => (None, None),
+        None if dex_ai::anthropic::replays_thinking(messages) => (None, None),
+        None => (None, Some(WARM_MAX_TOKENS)),
     }
 }
 
@@ -325,13 +324,21 @@ mod tests {
     fn _api_protocol_marker(_: ApiProtocol) {}
 
     #[test]
-    fn warming_keeps_thinking_only_when_history_replays_blocks() {
-        // Plain history: tiny dead-reply cap, thinking off regardless of
-        // the session's effort.
+    fn warming_mirrors_the_sessions_thinking_parameter() {
+        // Plain history, effort off: tiny dead-reply cap, thinking off.
         let plain = vec![ChatMessage::user("hi")];
         assert_eq!(
-            warm_effort_and_cap(Some("low"), &plain),
+            warm_effort_and_cap(None, &plain),
             (None, Some(WARM_MAX_TOKENS))
+        );
+        // Plain history, effort on: thinking stays on — dropping it would
+        // change the messages-cache key the real turn reads.
+        assert_eq!(
+            warm_effort_and_cap(Some("low"), &plain),
+            (
+                Some("low"),
+                Some(4096 + dex_ai::anthropic::THINKING_HEADROOM)
+            )
         );
         // Signed thinking blocks in the history: mirror the session's
         // effort with a budget-plus-headroom cap.
