@@ -83,6 +83,7 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
         // Display-only copy never talks to a provider (timeouts inert).
         connect_timeout_secs: 10,
         request_timeout_secs: 300,
+        prompt_cache_key: None,
     }
 }
 

@@ -451,6 +451,7 @@ mod handler_tests {
             api_pinned: false,
             connect_timeout_secs: 10,
             request_timeout_secs: 300,
+            prompt_cache_key: None,
         };
         apply_thinking_override(&mut config, None);
         assert_eq!(config.thinking_effort.as_deref(), Some("low"));

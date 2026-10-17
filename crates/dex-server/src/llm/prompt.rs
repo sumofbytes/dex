@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use crate::protocol::Skill;
+use crate::protocol::{ChatMessage, Skill};
 
 /// Format discovered skills as a system-prompt section. Sorted by name so
 /// the system prefix is byte-identical no matter what order the caller
@@ -161,21 +161,20 @@ pub(crate) fn system_prompt(skills: &[Skill]) -> String {
 /// `Some` replaces the built-in base; `None` falls back to the env/file
 /// layers via `system_prompt_origin`.
 pub fn system_prompt_with_override(skills: &[Skill], explicit: Option<&str>) -> String {
-    system_prompt_with_override_for(skills, explicit, None, false)
+    system_prompt_with_override_for(skills, explicit, None)
 }
 
 /// Same as [`system_prompt_with_override`] but rooted at `cwd` for the
 /// project-instructions lookup: daemon turns pass the session workspace so
 /// multi-session daemons don't serve the daemon cwd's file to every session.
-/// `plan_mode` appends the plan directive; `false` reproduces the historic
-/// bytes exactly, so the prompt-cache and byte-stable tests stay green.
+/// Nothing per-turn lands here (plan mode rides [`plan_mode_note`]), so the
+/// bytes stay stable across a session and the provider prompt cache holds.
 pub(crate) fn system_prompt_with_override_for(
     skills: &[Skill],
     explicit: Option<&str>,
     cwd: Option<&Path>,
-    plan_mode: bool,
 ) -> String {
-    system_prompt_parts_for(skills, explicit, cwd, plan_mode).join()
+    system_prompt_parts_for(skills, explicit, cwd).join()
 }
 
 /// The composed system prompt split by section, each section including its
@@ -188,7 +187,6 @@ pub(crate) struct SystemPromptParts {
     pub extensions: String,
     pub skills: String,
     pub tool_guidelines: String,
-    pub plan_mode: String,
 }
 
 impl SystemPromptParts {
@@ -198,7 +196,6 @@ impl SystemPromptParts {
         prompt.push_str(&self.extensions);
         prompt.push_str(&self.skills);
         prompt.push_str(&self.tool_guidelines);
-        prompt.push_str(&self.plan_mode);
         prompt
     }
 }
@@ -207,7 +204,6 @@ pub(crate) fn system_prompt_parts_for(
     skills: &[Skill],
     explicit: Option<&str>,
     cwd: Option<&Path>,
-    plan_mode: bool,
 ) -> SystemPromptParts {
     // Read once per render so the appendix bytes stay stable within a turn
     // (the flag lives in an atomic set at daemon startup).
@@ -260,31 +256,50 @@ pub(crate) fn system_prompt_parts_for(
     } else {
         format_tool_guidelines_for_prompt(&guidelines)
     };
-    let plan_mode = if plan_mode {
-        PLAN_MODE_DIRECTIVE.to_string()
-    } else {
-        String::new()
-    };
     SystemPromptParts {
         base,
         project_context,
         extensions,
         skills,
         tool_guidelines,
-        plan_mode,
     }
 }
 
-/// Appended to the system prompt when the client selected `plan` mode. The
-/// gate (read-only) blocks the mutations; this directive is what makes the
-/// model *plan* instead of merely failing. Prose, not a tool or a struct —
-/// CC, Codex and pi all ship plan as prose.
-pub fn plan_mode_directive() -> &'static str {
-    PLAN_MODE_DIRECTIVE
+/// The plan-mode transition note this turn needs, if any: the directive
+/// when plan mode starts, a release when it ends, `None` while the mode is
+/// unchanged. The gate (read-only) blocks the mutations; the directive is
+/// what makes the model *plan* instead of merely failing. It rides history
+/// as an appended user-role note rather than the system prompt or the tool
+/// list, so toggling modes never rewrites the cached prompt prefix (CC
+/// ships the same shape). State comes from the newest note in `history`,
+/// so it survives reattach; a note compacted away just re-announces.
+pub fn plan_mode_note(history: &[ChatMessage], plan: bool) -> Option<ChatMessage> {
+    let active = history
+        .iter()
+        .rev()
+        .find(|m| m.is_plan_mode_note())
+        .is_some_and(|m| m.content.as_deref() == Some(PLAN_MODE_DIRECTIVE));
+    match (active, plan) {
+        (false, true) => Some(ChatMessage::user_named(
+            PLAN_MODE_DIRECTIVE,
+            dex_ai::PLAN_MODE_NOTE_NAME,
+        )),
+        (true, false) => Some(ChatMessage::user_named(
+            PLAN_MODE_RELEASE,
+            dex_ai::PLAN_MODE_NOTE_NAME,
+        )),
+        _ => None,
+    }
 }
 
+const PLAN_MODE_RELEASE: &str = concat!(
+    "--- Plan mode ended ---\n",
+    "Plan mode is off: edit, write and bash are allowed again. Carry out the ",
+    "user's request.",
+);
+
 const PLAN_MODE_DIRECTIVE: &str = concat!(
-    "\n\n--- Plan mode ---\n",
+    "--- Plan mode ---\n",
     "You are in plan mode: research and present a plan; make no changes.\n",
     "- Explore first. Before proposing anything, perform at least one targeted ",
     "non-mutating pass (read, grep, find, ls) over the code the request touches.\n",
@@ -451,18 +466,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_appends_the_directive_and_false_is_byte_stable() {
-        // Absent `plan_mode` must reproduce the historic bytes exactly, so
-        // the prompt-cache and byte-stable doctor/prompt tests stay green.
-        let off = system_prompt_with_override_for(&[], Some("base"), None, false);
-        assert_eq!(off, system_prompt_with_override(&[], Some("base")));
-        assert!(!off.contains("--- Plan mode ---"), "{off}");
+    fn plan_mode_notes_only_mark_transitions() {
+        let user = ChatMessage::user("hi");
+        // Entering plan mode announces the directive once.
+        let on = plan_mode_note(std::slice::from_ref(&user), true).unwrap();
+        assert!(on.is_plan_mode_note());
+        assert!(on.content_str().contains("make no changes"));
+        assert!(plan_mode_note(&[user.clone(), on.clone()], true).is_none());
+        // Leaving it releases the gate; staying out says nothing.
+        let off = plan_mode_note(&[on.clone(), user.clone()], false).unwrap();
+        assert!(off.content_str().contains("Plan mode ended"));
+        assert!(plan_mode_note(&[on.clone(), off.clone()], false).is_none());
+        assert!(plan_mode_note(std::slice::from_ref(&user), false).is_none());
+        // Re-entering after a release announces again.
+        assert!(plan_mode_note(&[on, off], true).is_some());
+    }
 
-        // `true` appends exactly the plan section and nothing else changes.
-        let on = system_prompt_with_override_for(&[], Some("base"), None, true);
-        assert!(on.starts_with(&off), "plan text must be an appendix: {on}");
-        assert!(on.contains("--- Plan mode ---"), "{on}");
-        assert!(on.contains("make no changes"), "{on}");
-        assert_eq!(on, format!("{off}{PLAN_MODE_DIRECTIVE}"));
+    #[test]
+    fn system_prompt_carries_no_plan_directive() {
+        let prompt = system_prompt_with_override_for(&[], Some("base"), None);
+        assert_eq!(prompt, system_prompt_with_override(&[], Some("base")));
+        assert!(!prompt.contains("--- Plan mode ---"), "{prompt}");
     }
 }

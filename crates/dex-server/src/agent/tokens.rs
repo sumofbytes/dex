@@ -38,7 +38,7 @@ pub(crate) fn schema_budget_tokens() -> u64 {
 /// and the footer's early estimates agree. Empty contributors are omitted;
 /// order follows the prompt, schemas last.
 pub(crate) fn base_context_breakdown(cwd: &Path, skills: &[Skill]) -> Vec<BaseContextPart> {
-    let parts = crate::llm::prompt::system_prompt_parts_for(skills, None, Some(cwd), false);
+    let parts = crate::llm::prompt::system_prompt_parts_for(skills, None, Some(cwd));
     let mut out = Vec::new();
     // Prefix-carry rounding: each part's token count is floor((prefix+len)/4)
     // minus floor(prefix/4), so the parts telescope and always sum to the
@@ -80,8 +80,7 @@ mod base_tests {
             path: std::path::PathBuf::from("/tmp"),
         }];
         let breakdown = base_context_breakdown(&cwd, &skills);
-        let prompt =
-            crate::llm::prompt::system_prompt_with_override_for(&skills, None, Some(&cwd), false);
+        let prompt = crate::llm::prompt::system_prompt_with_override_for(&skills, None, Some(&cwd));
         assert_eq!(
             breakdown.iter().map(|p| p.tokens).sum::<u64>(),
             schema_budget_tokens() + prompt.len() as u64 / 4
