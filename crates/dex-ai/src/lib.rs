@@ -80,6 +80,11 @@ impl Role {
 /// here; `ChatMessage::is_context_excluded` is the only check.
 pub const BASH_EXCLUDED_NAME: &str = "bash-excluded";
 
+/// Name tag of the plan-mode transition notes: user-role messages the
+/// harness writes, not something the user typed (see
+/// [`ChatMessage::is_plan_mode_note`]).
+pub const PLAN_MODE_NOTE_NAME: &str = "plan-mode";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMessage {
     pub role: Role,
@@ -158,6 +163,13 @@ impl ChatMessage {
     /// must never see (see [`BASH_EXCLUDED_NAME`]).
     pub fn is_context_excluded(&self) -> bool {
         self.name.as_deref() == Some(BASH_EXCLUDED_NAME)
+    }
+
+    /// True for the harness's plan-mode transition notes: user-role, but
+    /// context rather than a prompt, so titles, "latest prompt" anchors and
+    /// the transcript skip them.
+    pub fn is_plan_mode_note(&self) -> bool {
+        self.name.as_deref() == Some(PLAN_MODE_NOTE_NAME)
     }
 }
 

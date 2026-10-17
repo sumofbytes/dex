@@ -610,7 +610,7 @@ pub(crate) async fn run_turn_inner(
     messages.extend(history);
     // Plan-mode transitions ride history as an appended note, never the
     // system prompt, so a mode toggle keeps the cached prefix.
-    let plan = agent_mode.is_some_and(crate::protocol::AgentMode::is_plan);
+    let plan = config.permission == crate::protocol::PermissionMode::ReadOnly;
     if let Some(note) = crate::llm::prompt::plan_mode_note(&messages, plan) {
         session
             .append_message(&note)

@@ -150,7 +150,9 @@ fn find_cut_point(
     // then re-answers an old goal with similar output.
     if let Some(last_user) = messages[start..end]
         .iter()
-        .rposition(|m| m.role == Role::User && m.name.as_deref() != Some("summary"))
+        .rposition(|m| {
+            m.role == Role::User && m.name.as_deref() != Some("summary") && !m.is_plan_mode_note()
+        })
         .map(|p| p + start)
     {
         if cut_index > last_user {

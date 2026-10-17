@@ -794,7 +794,7 @@ pub(crate) fn render_message_slice<'m>(
 ) {
     for msg in msgs {
         match msg.role {
-            Role::User if crate::llm::prompt::is_plan_mode_note(msg) => {}
+            Role::User if msg.is_plan_mode_note() => {}
             Role::User => {
                 if let Some(content) = &msg.content {
                     let typed = crate::protocol::strip_mention_block(content);

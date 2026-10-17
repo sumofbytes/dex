@@ -265,9 +265,6 @@ pub(crate) fn system_prompt_parts_for(
     }
 }
 
-/// Name tag of the plan-mode transition notes in history.
-const PLAN_MODE_NOTE: &str = "plan-mode";
-
 /// The plan-mode transition note this turn needs, if any: the directive
 /// when plan mode starts, a release when it ends, `None` while the mode is
 /// unchanged. The gate (read-only) blocks the mutations; the directive is
@@ -280,19 +277,19 @@ pub fn plan_mode_note(history: &[ChatMessage], plan: bool) -> Option<ChatMessage
     let active = history
         .iter()
         .rev()
-        .find(|m| m.name.as_deref() == Some(PLAN_MODE_NOTE))
+        .find(|m| m.is_plan_mode_note())
         .is_some_and(|m| m.content.as_deref() == Some(PLAN_MODE_DIRECTIVE));
     match (active, plan) {
-        (false, true) => Some(ChatMessage::user_named(PLAN_MODE_DIRECTIVE, PLAN_MODE_NOTE)),
-        (true, false) => Some(ChatMessage::user_named(PLAN_MODE_RELEASE, PLAN_MODE_NOTE)),
+        (false, true) => Some(ChatMessage::user_named(
+            PLAN_MODE_DIRECTIVE,
+            dex_ai::PLAN_MODE_NOTE_NAME,
+        )),
+        (true, false) => Some(ChatMessage::user_named(
+            PLAN_MODE_RELEASE,
+            dex_ai::PLAN_MODE_NOTE_NAME,
+        )),
         _ => None,
     }
-}
-
-/// Whether `message` is a plan-mode transition note (hidden from the
-/// transcript: it is harness context, not something the user typed).
-pub fn is_plan_mode_note(message: &ChatMessage) -> bool {
-    message.name.as_deref() == Some(PLAN_MODE_NOTE)
 }
 
 const PLAN_MODE_RELEASE: &str = concat!(
@@ -473,7 +470,7 @@ mod tests {
         let user = ChatMessage::user("hi");
         // Entering plan mode announces the directive once.
         let on = plan_mode_note(std::slice::from_ref(&user), true).unwrap();
-        assert!(is_plan_mode_note(&on));
+        assert!(on.is_plan_mode_note());
         assert!(on.content_str().contains("make no changes"));
         assert!(plan_mode_note(&[user.clone(), on.clone()], true).is_none());
         // Leaving it releases the gate; staying out says nothing.

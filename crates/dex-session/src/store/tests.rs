@@ -506,6 +506,18 @@ fn scan_listing_skips_summaries_and_cuts_long_titles() {
 }
 
 #[test]
+fn scan_listing_skips_plan_mode_notes() {
+    let path = unique_path("dex-scan-plan-note");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let note = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","name":"plan-mode","content":"--- Plan mode ---"}"#;
+    let user = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"plan the refactor"}"#;
+    fs::write(&path, format!("{header}\n{note}\n{user}\n")).unwrap();
+    let listing = Session::scan_listing(&path).unwrap();
+    assert_eq!(listing.first_prompt.as_deref(), Some("plan the refactor"));
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn scan_listing_folds_renames_from_journal_entries() {
     // Listings prefer the newest appended rename over the header name —
     // for journals written before the header patch it is the only place

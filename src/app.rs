@@ -183,7 +183,7 @@ fn run_one_shot(prompt: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     messages.extend(history);
     // One-shot plan mode: the same history note the daemon appends for
     // remote `mode: plan` turns, so headless runs behave identically.
-    let plan = args.mode.is_some_and(crate::protocol::AgentMode::is_plan);
+    let plan = config.permission == crate::protocol::PermissionMode::ReadOnly;
     if let Some(note) = crate::llm::prompt::plan_mode_note(&messages, plan) {
         if let Some(session) = session.as_mut() {
             let _ = session.append_message(&note);
