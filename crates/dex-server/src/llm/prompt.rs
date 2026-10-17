@@ -474,11 +474,11 @@ mod tests {
         // Entering plan mode announces the directive once.
         let on = plan_mode_note(std::slice::from_ref(&user), true).unwrap();
         assert!(is_plan_mode_note(&on));
-        assert!(on.content_str().contains("make no changes"), "{on:?}");
+        assert!(on.content_str().contains("make no changes"));
         assert!(plan_mode_note(&[user.clone(), on.clone()], true).is_none());
         // Leaving it releases the gate; staying out says nothing.
         let off = plan_mode_note(&[on.clone(), user.clone()], false).unwrap();
-        assert!(off.content_str().contains("Plan mode ended"), "{off:?}");
+        assert!(off.content_str().contains("Plan mode ended"));
         assert!(plan_mode_note(&[on.clone(), off.clone()], false).is_none());
         assert!(plan_mode_note(std::slice::from_ref(&user), false).is_none());
         // Re-entering after a release announces again.
