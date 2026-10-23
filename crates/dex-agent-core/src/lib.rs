@@ -22,11 +22,12 @@ pub use compaction::{
     attach_file_section, deterministic_summary, extract_file_ops_from_message, FileOps,
 };
 pub use components::{
-    AlwaysCompact, CompactionTrigger, ConflictDetector, CutConfig, DefaultOverflowDetector,
-    DefaultPruneScorer, DeterministicSummarizer, FnCatalog, FnConflictDetector, FnOverflowDetector,
-    FnPruneScorer, FnSummarizer, FnTrigger, Harness, HarnessLimits, NeverCompact, NeverConflict,
-    OverflowDetector, PairVerdict, PruneScorer, PruneThresholds, SerializeAll, StaticCatalog,
-    StaticSummarizer, Summarizer, ToolCatalog, OVERFLOW_PHRASES,
+    lane_deps, AlwaysCompact, CompactionTrigger, ConflictDetector, CutConfig,
+    DefaultOverflowDetector, DefaultPruneScorer, DeterministicSummarizer, FnCatalog,
+    FnConflictDetector, FnOverflowDetector, FnPruneScorer, FnSummarizer, FnTrigger, Harness,
+    HarnessLimits, NeverCompact, NeverConflict, OverflowDetector, PairVerdict, PruneScorer,
+    PruneThresholds, SerializeAll, StaticCatalog, StaticSummarizer, Summarizer, ToolCatalog,
+    BARRIER_LANE, OVERFLOW_PHRASES,
 };
 pub use lines::{ApprovalRequest, SinkLine};
 pub use modes::{AgentMode, PermissionMode};

@@ -443,6 +443,10 @@ impl Harness {
         self.conflict.conflicts(calls)
     }
 
+    pub fn conflict_lanes(&self, calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
+        self.conflict.lanes(calls)
+    }
+
     pub fn decide(
         &self,
         tool: &str,
@@ -525,6 +529,57 @@ where
 /// `then_run`) provide a finer detector.
 pub trait ConflictDetector: Send + Sync {
     fn conflicts(&self, calls: &[LlmToolCall]) -> bool;
+
+    /// Finer-grained schedule for a batch [`conflicts`](Self::conflicts)
+    /// flagged: one list of lane keys per call. Calls sharing a key run in
+    /// input order; a call carrying [`BARRIER_LANE`] waits for every earlier
+    /// call and holds back every later one; everything else fans out.
+    /// `None` (the default) means "no finer knowledge": serialize the whole
+    /// batch.
+    fn lanes(&self, _calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
+        None
+    }
+}
+
+/// Lane key for a call whose effects can't be seen from its arguments
+/// (`bash`, `then_run`): it orders against every other call in the batch.
+pub const BARRIER_LANE: &str = "\0barrier";
+
+/// Turn per-call lane keys into per-call predecessor indices (all `< i`, so
+/// the wait graph is acyclic). `None` chains every call behind the previous
+/// one — full serialization, the fail-closed fallback.
+pub fn lane_deps(len: usize, lanes: Option<&[Vec<String>]>) -> Vec<Vec<usize>> {
+    let Some(lanes) = lanes.filter(|l| l.len() == len) else {
+        return (0..len)
+            .map(|i| i.checked_sub(1).into_iter().collect())
+            .collect();
+    };
+    let mut last_by_key: std::collections::HashMap<&str, usize> = Default::default();
+    let mut last_barrier: Option<usize> = None;
+    // Calls since the last barrier: a barrier must wait for all of them.
+    let mut since_barrier: Vec<usize> = Vec::new();
+    let mut deps = Vec::with_capacity(len);
+    for (i, keys) in lanes.iter().enumerate() {
+        let mut d: Vec<usize> = last_barrier.into_iter().collect();
+        if keys.iter().any(|k| k == BARRIER_LANE) {
+            d.extend(&since_barrier);
+            last_barrier = Some(i);
+            since_barrier.clear();
+            last_by_key.clear();
+        } else {
+            for k in keys {
+                if let Some(&j) = last_by_key.get(k.as_str()).filter(|&&j| j != i) {
+                    d.push(j);
+                }
+                last_by_key.insert(k, i);
+            }
+            since_barrier.push(i);
+        }
+        d.sort_unstable();
+        d.dedup();
+        deps.push(d);
+    }
+    deps
 }
 
 /// Fail-closed default: serialize every multi-call batch.
@@ -805,5 +860,44 @@ mod tests {
                 keep_result: false,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    fn lanes(spec: &[&[&str]]) -> Vec<Vec<String>> {
+        spec.iter()
+            .map(|k| k.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn same_key_chains_and_others_fan_out() {
+        let l = lanes(&[&["a"], &["b"], &["a"], &[], &["a", "b"]]);
+        let d = lane_deps(5, Some(&l));
+        assert_eq!(d, vec![vec![], vec![], vec![0], vec![], vec![1, 2]]);
+    }
+
+    #[test]
+    fn barrier_orders_against_everything() {
+        let l = lanes(&[&["a"], &["b"], &[BARRIER_LANE], &["c"], &["a"]]);
+        let d = lane_deps(5, Some(&l));
+        assert_eq!(d, vec![vec![], vec![], vec![0, 1], vec![2], vec![2]]);
+    }
+
+    #[test]
+    fn repeated_key_within_one_call_is_not_a_self_dependency() {
+        let l = lanes(&[&["a", "a"], &["a"]]);
+        assert_eq!(lane_deps(2, Some(&l)), vec![vec![], vec![0]]);
+    }
+
+    #[test]
+    fn no_lanes_or_length_mismatch_serializes() {
+        let chain = vec![vec![], vec![0], vec![1]];
+        assert_eq!(lane_deps(3, None), chain);
+        let l = lanes(&[&["a"]]);
+        assert_eq!(lane_deps(3, Some(&l)), chain);
     }
 }
