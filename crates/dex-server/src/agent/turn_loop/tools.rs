@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::apply_queue_msg;
+use dex_agent_core::{lane_deps, BARRIER_LANE};
+
 use crate::agent::compaction::compact_history;
 use crate::agent::compaction::verbatim::summary_mode;
 use crate::agent::composable::{DexHarness, ToolExecutor};
@@ -47,34 +49,47 @@ pub(super) async fn note_sink(
     }
 }
 
+/// Per-call lane keys for the batch scheduler (see `ConflictDetector::lanes`):
+/// the normalized `path` for anything that carries one, [`BARRIER_LANE`] for
+/// `bash` and `write`/`edit` with `then_run` (a shell whose file effects we
+/// cannot see orders against every other call). `None` when any call's args
+/// are unparseable — fail closed to full-batch serialization.
+pub(crate) fn tool_call_lanes(calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
+    calls
+        .iter()
+        .map(|call| {
+            let value = serde_json::from_str::<Value>(&call.function.arguments).ok()?;
+            let name = call.function.name.as_str();
+            if name == "bash" || crate::tools::then_run::carries_then_run(name, &value) {
+                return Some(vec![BARRIER_LANE.to_string()]);
+            }
+            // Normalize before comparing: `./foo.rs` and `foo.rs` (or an
+            // absolute vs relative spelling of one file) must share a lane,
+            // or two edits run against one file concurrently and the second
+            // silently clobbers the first. Calls without a `path` can't be
+            // checked and never order against anything on their own.
+            Some(
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(|p| vec![crate::tools::normalize_conflict_path(p)])
+                    .unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Whether the batch needs any ordering at all: unparseable args, a shell
+/// call, or two calls on one normalized path.
 pub(crate) fn tool_calls_conflict(calls: &[LlmToolCall]) -> bool {
-    let mut paths = std::collections::HashSet::new();
-    calls.iter().any(|call| {
-        // Fail closed: unparseable args serialize the batch rather than
-        // risk a concurrent same-file race we couldn't check.
-        let Ok(value) = serde_json::from_str::<Value>(&call.function.arguments) else {
-            return true;
-        };
-        // `bash`, and any `write`/`edit` carrying `then_run`, spawn a shell
-        // command whose file effects we cannot see from `path` alone. Force
-        // the whole batch through the mutation lock rather than fan out
-        // several concurrent shells — a case the scheduler never had to
-        // consider while these calls were pure file writes.
-        let name = call.function.name.as_str();
-        if name == "bash" || crate::tools::then_run::carries_then_run(name, &value) {
-            return true;
-        }
-        // Calls without a `path` can't be checked — they never force
-        // serialization on their own.
-        let Some(path) = value.get("path").and_then(Value::as_str) else {
-            return false;
-        };
-        // Normalize before comparing: `./foo.rs` and `foo.rs` (or an
-        // absolute vs relative spelling of one file) must collide, or the
-        // fan-out runs two edits against one file concurrently and the
-        // second silently clobbers the first.
-        !paths.insert(crate::tools::normalize_conflict_path(path))
-    })
+    let Some(lanes) = tool_call_lanes(calls) else {
+        return true;
+    };
+    let mut seen = std::collections::HashSet::new();
+    lanes
+        .iter()
+        .flatten()
+        .any(|key| key == BARRIER_LANE || !seen.insert(key))
 }
 
 pub(crate) fn persist_pending(
@@ -307,10 +322,21 @@ pub(super) async fn note_tool_start(console: &Console, call: &LlmToolCall) {
     .await;
 }
 
-/// Execute one batch of tool calls: serialized under the mutation lock when
-/// the harness conflict detector fires, else fanned out on JoinSet tasks
-/// (bounded to the harness batch-concurrency permits, aborted promptly on
-/// cancel; input-ordered via indexed slots, panics surface as tool errors).
+fn rust_conflicts(harness: &DexHarness, calls: &[LlmToolCall]) -> (bool, Option<Vec<Vec<String>>>) {
+    if harness.conflicts(calls) {
+        (true, harness.conflict_lanes(calls))
+    } else {
+        (false, None)
+    }
+}
+
+/// Execute one batch of tool calls on JoinSet tasks (bounded to the harness
+/// batch-concurrency permits, aborted promptly on cancel; input-ordered via
+/// indexed slots, panics surface as tool errors). When the harness conflict
+/// detector fires, the batch holds the mutation lock and each call first
+/// waits only for the earlier calls it collides with (same normalized path;
+/// `bash`/`then_run` order against everything), so unrelated calls still
+/// fan out. A detector with no finer schedule serializes the whole batch.
 pub(super) async fn run_tool_batch<X>(
     calls: &[LlmToolCall],
     cancel: &X,
@@ -323,23 +349,79 @@ where
     X: CancellationSource + Clone + 'static,
 {
     // Runtime override: one `harness.conflict` round-trip per batch when a Lua
-    // extension subscribes, else the Rust detector (zero-cost default).
-    let conflicts = if crate::extensions::has_event_handlers("harness.conflict") {
-        crate::extensions::query_harness_conflict(
+    // extension subscribes, else the Rust detector (zero-cost default). A Lua
+    // verdict is a bare bool, so `true` serializes the whole batch; only the
+    // Rust detector supplies a finer schedule.
+    let (conflicts, lanes) = if crate::extensions::has_event_handlers("harness.conflict") {
+        match crate::extensions::query_harness_conflict(
             calls,
             cancel as &(dyn CancellationSource + Send + Sync),
         )
         .await
-        .unwrap_or_else(|| harness.conflicts(calls))
+        {
+            Some(c) => (c, None),
+            None => rust_conflicts(harness, calls),
+        }
     } else {
-        harness.conflicts(calls)
+        rust_conflicts(harness, calls)
     };
-    if conflicts {
-        let _guard = TOOL_MUTATION_LOCK.lock().await;
-        let mut out = Vec::new();
-        for call in calls {
+    let _guard = if conflicts {
+        Some(TOOL_MUTATION_LOCK.lock().await)
+    } else {
+        None
+    };
+    // One watch channel per call: its sender drops when the task ends (done,
+    // panicked, or aborted), which releases every dependent. Waiting happens
+    // before the permit is taken so blocked calls never starve their own
+    // predecessors of concurrency.
+    let deps = if conflicts {
+        lane_deps(calls.len(), lanes.as_deref())
+    } else {
+        vec![Vec::new(); calls.len()]
+    };
+    let mut done_tx = Vec::with_capacity(calls.len());
+    let mut done_rx = Vec::with_capacity(calls.len());
+    for _ in calls {
+        let (tx, rx) = tokio::sync::watch::channel(());
+        done_tx.push(Some(tx));
+        done_rx.push(rx);
+    }
+    // Bounded fan-out on a JoinSet: tasks still run concurrently (total
+    // ~max, not sum), each result carries its own index so the transcript
+    // stays in input order. A semaphore caps fd/thread pressure no matter
+    // how many calls the model packed into one batch; `select!` on
+    // `wait_cancelled` aborts the stragglers instead of waiting for the
+    // slowest tool after Ctrl+C. The bound comes from the harness so the
+    // fan-out is overwritable without forking the scheduler.
+    let batch_max = harness.config.batch_max_concurrent();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_max));
+    let executor = harness.executor.clone();
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, call) in calls.iter().enumerate() {
+        let call = call.clone();
+        let cancel = cancel.clone();
+        let policy = policy.clone();
+        // Owned per task: the future must be 'static, so it
+        // cannot hold the turn's borrowed filter — same shape
+        // as the per-task policy clone above.
+        let filter = filter.cloned();
+        // Each task announces its own start (paired later by call
+        // id), but only as semaphore permits free up: ~max blocks
+        // open at once, in permit order rather than input order.
+        let task_console = console.clone();
+        let sem = sem.clone();
+        let executor = executor.clone();
+        let wait_for: Vec<_> = deps[idx].iter().map(|&j| done_rx[j].clone()).collect();
+        let done = done_tx[idx].take();
+        set.spawn(crate::workspace::in_workspace(async move {
+            let _done = done;
+            for mut rx in wait_for {
+                // Err means the predecessor's sender dropped: it finished.
+                let _ = rx.changed().await;
+            }
             if cancel.is_cancelled() {
-                out.push((
+                return (
+                    idx,
                     call.function.name.clone(),
                     call.function.arguments.clone(),
                     ToolOutcome {
@@ -348,168 +430,125 @@ where
                         diff: None,
                     },
                     Duration::ZERO,
-                ));
-                continue;
+                );
             }
+            // The semaphore is never closed, but fail closed with
+            // the index intact rather than run unpermitted.
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return (
+                    idx,
+                    call.function.name.clone(),
+                    call.function.arguments.clone(),
+                    ToolOutcome {
+                        text: "Error: tool worker missing".into(),
+                        ok: false,
+                        diff: None,
+                    },
+                    Duration::ZERO,
+                );
+            };
             let started = Instant::now();
-            note_tool_start(console, call).await;
-            let (name, input, outcome) = execute_tool_call(
-                call,
-                cancel as &(dyn CancellationSource + Send + Sync),
-                policy,
-                filter,
-                &*harness.executor,
-            )
-            .await;
-            out.push((name, input, outcome, started.elapsed()));
-        }
-        out
-    } else {
-        // Bounded fan-out on a JoinSet: tasks still run concurrently (total
-        // ~max, not sum), each result carries its own index so the transcript
-        // stays in input order. A semaphore caps fd/thread pressure no matter
-        // how many calls the model packed into one batch; `select!` on
-        // `wait_cancelled` aborts the stragglers instead of waiting for the
-        // slowest tool after Ctrl+C. The bound comes from the harness so the
-        // fan-out is overwritable without forking the scheduler.
-        let batch_max = harness.config.batch_max_concurrent();
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_max));
-        let executor = harness.executor.clone();
-        let mut set = tokio::task::JoinSet::new();
-        for (idx, call) in calls.iter().enumerate() {
-            let call = call.clone();
-            let cancel = cancel.clone();
-            let policy = policy.clone();
-            // Owned per task: the future must be 'static, so it
-            // cannot hold the turn's borrowed filter — same shape
-            // as the per-task policy clone above.
-            let filter = filter.cloned();
-            // Each task announces its own start (paired later by call
-            // id), but only as semaphore permits free up: ~max blocks
-            // open at once, in permit order rather than input order.
-            let task_console = console.clone();
-            let sem = sem.clone();
-            let executor = executor.clone();
-            set.spawn(crate::workspace::in_workspace(async move {
-                // The semaphore is never closed, but fail closed with
-                // the index intact rather than run unpermitted.
-                let Ok(_permit) = sem.acquire_owned().await else {
-                    return (
-                        idx,
-                        call.function.name.clone(),
-                        call.function.arguments.clone(),
-                        ToolOutcome {
-                            text: "Error: tool worker missing".into(),
-                            ok: false,
-                            diff: None,
-                        },
-                        Duration::ZERO,
-                    );
-                };
-                let started = Instant::now();
-                note_tool_start(&task_console, &call).await;
-                // `CatchUnwind` keeps the index on the panic path: a
-                // panicking worker reports against its own call instead
-                // of landing on a positional guess (JoinSet's JoinError
-                // carries no task payload).
-                let work = async {
-                    let (name, input, outcome) =
-                        execute_tool_call(&call, &cancel, &policy, filter.as_ref(), &*executor)
-                            .await;
-                    (name, input, outcome, started.elapsed())
-                };
-                match CatchUnwind::new(Box::pin(work), "tool worker panicked").await {
-                    Ok((name, input, outcome, elapsed)) => (idx, name, input, outcome, elapsed),
-                    Err(text) => (
-                        idx,
-                        call.function.name.clone(),
-                        call.function.arguments.clone(),
-                        ToolOutcome {
-                            text: format!("Error: {text}"),
-                            ok: false,
-                            diff: None,
-                        },
-                        Duration::ZERO,
-                    ),
-                }
-            }));
-        }
-        let mut slots: Vec<Option<(String, String, ToolOutcome, Duration)>> =
-            Vec::with_capacity(calls.len());
-        slots.resize_with(calls.len(), || None);
-        let mut remaining = calls.len();
-        let cancel_ref = cancel as &(dyn CancellationSource + Send + Sync);
-        while remaining > 0 {
-            tokio::select! {
-                res = set.join_next() => {
-                    match res {
-                        Some(Ok((idx, name, input, outcome, elapsed))) => {
-                            slots[idx] = Some((name, input, outcome, elapsed));
-                            remaining -= 1;
-                        }
-                        Some(Err(_)) => {
-                            // Only panics outside the `CatchUnwind`
-                            // wrapper reach here (permit acquire, start
-                            // announce): attribute to the first empty
-                            // slot. Panics are rare, count stays exact.
-                            if let Some(hole) = slots.iter().position(|s| s.is_none()) {
-                                let call = &calls[hole];
-                                slots[hole] = Some((
-                                    call.function.name.clone(),
-                                    call.function.arguments.clone(),
-                                    ToolOutcome {
-                                        text: "Error: tool worker panicked".into(),
-                                        ok: false,
-                                        diff: None,
-                                    },
-                                    Duration::ZERO,
-                                ));
-                            }
-                            remaining -= 1;
-                        }
-                        None => break,
+            note_tool_start(&task_console, &call).await;
+            // `CatchUnwind` keeps the index on the panic path: a
+            // panicking worker reports against its own call instead
+            // of landing on a positional guess (JoinSet's JoinError
+            // carries no task payload).
+            let work = async {
+                let (name, input, outcome) =
+                    execute_tool_call(&call, &cancel, &policy, filter.as_ref(), &*executor).await;
+                (name, input, outcome, started.elapsed())
+            };
+            match CatchUnwind::new(Box::pin(work), "tool worker panicked").await {
+                Ok((name, input, outcome, elapsed)) => (idx, name, input, outcome, elapsed),
+                Err(text) => (
+                    idx,
+                    call.function.name.clone(),
+                    call.function.arguments.clone(),
+                    ToolOutcome {
+                        text: format!("Error: {text}"),
+                        ok: false,
+                        diff: None,
+                    },
+                    Duration::ZERO,
+                ),
+            }
+        }));
+    }
+    let mut slots: Vec<Option<(String, String, ToolOutcome, Duration)>> =
+        Vec::with_capacity(calls.len());
+    slots.resize_with(calls.len(), || None);
+    let mut remaining = calls.len();
+    let cancel_ref = cancel as &(dyn CancellationSource + Send + Sync);
+    while remaining > 0 {
+        tokio::select! {
+            res = set.join_next() => {
+                match res {
+                    Some(Ok((idx, name, input, outcome, elapsed))) => {
+                        slots[idx] = Some((name, input, outcome, elapsed));
+                        remaining -= 1;
                     }
-                }
-                _ = wait_cancelled(cancel_ref) => {
-                    set.abort_all();
-                    while set.join_next().await.is_some() {}
-                    for (i, slot) in slots.iter_mut().enumerate() {
-                        if slot.is_none() {
-                            let call = &calls[i];
-                            *slot = Some((
+                    Some(Err(_)) => {
+                        // Only panics outside the `CatchUnwind`
+                        // wrapper reach here (permit acquire, start
+                        // announce): attribute to the first empty
+                        // slot. Panics are rare, count stays exact.
+                        if let Some(hole) = slots.iter().position(|s| s.is_none()) {
+                            let call = &calls[hole];
+                            slots[hole] = Some((
                                 call.function.name.clone(),
                                 call.function.arguments.clone(),
                                 ToolOutcome {
-                                    text: "Error: cancelled by user".into(),
+                                    text: "Error: tool worker panicked".into(),
                                     ok: false,
                                     diff: None,
                                 },
                                 Duration::ZERO,
                             ));
                         }
+                        remaining -= 1;
                     }
-                    break;
+                    None => break,
                 }
             }
+            _ = wait_cancelled(cancel_ref) => {
+                set.abort_all();
+                while set.join_next().await.is_some() {}
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        let call = &calls[i];
+                        *slot = Some((
+                            call.function.name.clone(),
+                            call.function.arguments.clone(),
+                            ToolOutcome {
+                                text: "Error: cancelled by user".into(),
+                                ok: false,
+                                diff: None,
+                            },
+                            Duration::ZERO,
+                        ));
+                    }
+                }
+                break;
+            }
         }
-        slots
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| {
-                s.unwrap_or_else(|| {
-                    let call = &calls[i];
-                    (
-                        call.function.name.clone(),
-                        call.function.arguments.clone(),
-                        ToolOutcome {
-                            text: "Error: tool worker missing".into(),
-                            ok: false,
-                            diff: None,
-                        },
-                        Duration::ZERO,
-                    )
-                })
-            })
-            .collect()
     }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.unwrap_or_else(|| {
+                let call = &calls[i];
+                (
+                    call.function.name.clone(),
+                    call.function.arguments.clone(),
+                    ToolOutcome {
+                        text: "Error: tool worker missing".into(),
+                        ok: false,
+                        diff: None,
+                    },
+                    Duration::ZERO,
+                )
+            })
+        })
+        .collect()
 }

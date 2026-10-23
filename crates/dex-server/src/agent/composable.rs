@@ -193,6 +193,10 @@ impl ConflictDetector for PathConflictDetector {
     fn conflicts(&self, calls: &[LlmToolCall]) -> bool {
         super::turn_loop::tools::tool_calls_conflict(calls)
     }
+
+    fn lanes(&self, calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
+        super::turn_loop::tools::tool_call_lanes(calls)
+    }
 }
 
 /// Journal append / rewrite behind the `persisted_cursor` invariant.
@@ -682,6 +686,10 @@ impl DexHarness {
 
     pub fn conflicts(&self, calls: &[LlmToolCall]) -> bool {
         self.conflict.conflicts(calls)
+    }
+
+    pub fn conflict_lanes(&self, calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
+        self.conflict.lanes(calls)
     }
 
     pub fn recovery_attempts(&self) -> usize {

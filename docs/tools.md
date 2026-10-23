@@ -30,9 +30,10 @@ too).
 `*` daemon sessions only (sub-agents); the default native schema is 7 tools.
 Tool results are truncated before being
 sent back to the model, and a result cache (`dex-tool-cache.json`) is kept only
-when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; same
-`path`, any `bash`, or any call carrying `then_run` (which runs a shell command)
-serializes the batch.
+when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; calls on the same
+`path` run in input order (others still fan out), while any `bash` or call
+carrying `then_run` (a shell whose effects can't be seen) orders against every
+other call in the batch.
 
 `write`/`edit` take an optional `then_run` shell command that runs in the same
 call _after_ a successful change, so a build, formatter or test result arrives

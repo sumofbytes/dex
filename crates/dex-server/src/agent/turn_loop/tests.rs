@@ -1898,3 +1898,87 @@ end
         mgr.reset_for_tests().await;
     }
 }
+
+#[test]
+fn lanes_share_keys_only_on_same_path() {
+    let call = |name: &str, args: &str| crate::protocol::LlmToolCall {
+        id: name.into(),
+        call_type: "function".into(),
+        function: crate::protocol::FunctionCall {
+            name: name.into(),
+            arguments: args.into(),
+        },
+    };
+    let lanes = super::tools::tool_call_lanes(&[
+        call("edit", r#"{"path":"./a.rs"}"#),
+        call("edit", r#"{"path":"a.rs"}"#),
+        call("read", r#"{"path":"b.rs"}"#),
+        call("grep", r#"{"pattern":"x"}"#),
+        call("bash", r#"{"command":"ls"}"#),
+    ])
+    .expect("parseable");
+    assert_eq!(lanes[0], lanes[1], "spellings of one file share a lane");
+    assert_ne!(lanes[0], lanes[2]);
+    assert!(lanes[3].is_empty());
+    assert_eq!(lanes[4], vec![dex_agent_core::BARRIER_LANE.to_string()]);
+    // Unparseable args fail closed.
+    assert!(super::tools::tool_call_lanes(&[call("edit", "{not json")]).is_none());
+}
+
+#[tokio::test]
+async fn same_file_calls_run_in_order_while_others_fan_out() {
+    // `write` then `edit` on one file: the edit's oldText only exists once
+    // the write landed, so a concurrent run would fail it. The unrelated
+    // third file must not be held back or disturbed.
+    use crate::tools::Policy;
+    let dir = std::env::temp_dir().join(format!("dex-lanes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    let call = |id: &str, name: &str, args: serde_json::Value| crate::protocol::LlmToolCall {
+        id: id.into(),
+        call_type: "function".into(),
+        function: crate::protocol::FunctionCall {
+            name: name.into(),
+            arguments: args.to_string(),
+        },
+    };
+    let calls = vec![
+        call(
+            "1",
+            "write",
+            serde_json::json!({"path": a, "content": "alpha"}),
+        ),
+        call(
+            "2",
+            "edit",
+            serde_json::json!({"path": a, "edits": [{"oldText": "alpha", "newText": "beta"}]}),
+        ),
+        call(
+            "3",
+            "write",
+            serde_json::json!({"path": b, "content": "other"}),
+        ),
+    ];
+    assert!(tool_calls_conflict(&calls));
+    let (sink_tx, _sink_rx) = mpsc::channel(32);
+    let (approval_tx, _approval_rx) = mpsc::channel(16);
+    let console = crate::runtime::console::Console::daemon(sink_tx, approval_tx);
+    let results = run_tool_batch(
+        &calls,
+        &NeverCancel,
+        &Policy::trusted(),
+        None,
+        &console,
+        &crate::agent::composable::DexHarness::default(),
+    )
+    .await;
+    assert!(
+        results.iter().all(|r| r.2.ok),
+        "{:?}",
+        results.iter().map(|r| &r.2.text).collect::<Vec<_>>()
+    );
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "beta");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "other");
+    let _ = std::fs::remove_dir_all(&dir);
+}
