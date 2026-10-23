@@ -54,6 +54,37 @@ pub fn chat_completions_messages(messages: &[ChatMessage]) -> Vec<WireMessage<'_
     messages.iter().map(ChatMessage::wire).collect()
 }
 
+/// Prompt-cache breakpoints for a chat-completions body bound for a Claude
+/// model behind an OpenAI-compatible gateway (OpenRouter and friends pass
+/// `cache_control` content parts through to Anthropic; without them a
+/// Claude model on this wire never caches). Marks the system message (the
+/// stable prefix) and the newest message with text content (the
+/// conversation so far). The tail marker follows the conversation rather
+/// than the last user prompt so a long tool loop never outruns Anthropic's
+/// ~20-block lookback from the newest breakpoint. String content becomes
+/// one text part carrying the marker; empty or non-string content is left
+/// alone.
+pub fn mark_chat_cache_breakpoints(messages: &mut [Value]) {
+    let system = messages
+        .iter()
+        .position(|m| m.get("role").and_then(Value::as_str) == Some("system"));
+    let tail = messages.iter().rposition(|m| {
+        m.get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    });
+    for index in [system, tail].into_iter().flatten() {
+        let message = &mut messages[index];
+        if let Some(text) = message.get("content").and_then(Value::as_str) {
+            message["content"] = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
+    }
+}
+
 pub fn responses_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
@@ -168,4 +199,33 @@ pub fn response_call_index(calls: &[LlmToolCall], index: usize, item: &Value) ->
         .and_then(Value::as_str)
         .and_then(|id| calls.iter().position(|call| call.id == id))
         .unwrap_or(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_cache_tail_follows_the_conversation_not_the_last_user() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": null, "tool_calls": []}),
+            json!({"role": "tool", "tool_call_id": "t", "content": "result"}),
+            json!({"role": "assistant", "content": ""}),
+        ];
+        mark_chat_cache_breakpoints(&mut messages);
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        // Newest message with text: the tool result, not the user prompt.
+        assert_eq!(messages[3]["content"][0]["text"], "result");
+        assert_eq!(
+            messages[3]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(messages[1]["content"], "go");
+        assert_eq!(messages[4]["content"], "");
+    }
 }

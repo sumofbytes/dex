@@ -420,6 +420,7 @@ impl App {
                 api_pinned: false,
                 connect_timeout_secs: 10,
                 request_timeout_secs: 300,
+                prompt_cache_key: None,
             },
             messages: Vec::new(),
             tool_state: crate::ui::UsageState::default(),

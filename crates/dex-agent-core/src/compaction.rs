@@ -107,11 +107,9 @@ pub fn deterministic_summary(
         }
     }
     if goal.is_none() {
-        if let Some(first) = old
-            .iter()
-            .chain(turn_prefix.iter())
-            .find(|m| m.role == Role::User && m.name.as_deref() != Some("summary"))
-        {
+        if let Some(first) = old.iter().chain(turn_prefix.iter()).find(|m| {
+            m.role == Role::User && m.name.as_deref() != Some("summary") && !m.is_plan_mode_note()
+        }) {
             if let Some(c) = &first.content {
                 goal = Some(truncate_text(c, 600, 8));
             }

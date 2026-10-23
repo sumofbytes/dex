@@ -52,6 +52,8 @@ pub(crate) struct HttpCall {
     /// Write prompt-cache breakpoints on the Anthropic wire. `false` for
     /// one-off requests (compaction) whose prefix is never re-read.
     pub(crate) cache_write: bool,
+    /// OpenAI `prompt_cache_key` (the session id), see `LlmConfig`.
+    pub(crate) prompt_cache_key: Option<String>,
     /// Reasoning-effort knob, spelled per wire protocol in the request body.
     pub(crate) thinking_effort: Option<String>,
     /// Idle budget for the stream reader, computed once per call.

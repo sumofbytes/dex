@@ -474,6 +474,11 @@ pub struct LlmConfig {
     /// `reqwest::Client` here duplicated the shared pool per config.
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// OpenAI `prompt_cache_key`: the dex session id, so one session's
+    /// requests route to the same prompt-cache shard instead of competing
+    /// with every other session that shares dex's system prompt + tools.
+    /// Set per turn from the session id; `None` sends nothing.
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Base wire protocol + baked pin from the provider entry's `api:` pin and
@@ -776,6 +781,7 @@ impl LlmConfig {
             global_headers,
             connect_timeout_secs,
             request_timeout_secs,
+            prompt_cache_key: None,
             endpoints: resolved.endpoints,
             provider_entries,
             provider_headers: resolved.headers,
