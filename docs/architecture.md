@@ -82,7 +82,7 @@ model/tool state machine in `dex-agent-core::run_turn`. Dex implements the
 `AgentHost` callbacks for compaction, steering, session writes, tool execution,
 usage accounting, and transcript events. Tool calls may run in parallel
 (`write`/`edit` on distinct files); calls on the same path run in input order
-while the rest fan out, and `bash`/`then_run` order against the whole batch. The host compacts history to keep model requests within the
+while the rest fan out, and `bash`/`then_run` (and, in batches with a mutation, scans and non-file tools) order against the whole batch. The host compacts history to keep model requests within the
 configured context budget. Progress is reported through a dex `Console`
 (streamed lines + approval requests).
 

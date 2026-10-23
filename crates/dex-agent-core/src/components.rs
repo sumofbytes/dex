@@ -568,7 +568,7 @@ pub fn lane_deps(len: usize, lanes: Option<&[Vec<String>]>) -> Vec<Vec<usize>> {
             last_by_key.clear();
         } else {
             for k in keys {
-                if let Some(&j) = last_by_key.get(k.as_str()) {
+                if let Some(&j) = last_by_key.get(k.as_str()).filter(|&&j| j != i) {
                     d.push(j);
                 }
                 last_by_key.insert(k, i);
@@ -885,6 +885,12 @@ mod lane_tests {
         let l = lanes(&[&["a"], &["b"], &[BARRIER_LANE], &["c"], &["a"]]);
         let d = lane_deps(5, Some(&l));
         assert_eq!(d, vec![vec![], vec![], vec![0, 1], vec![2], vec![2]]);
+    }
+
+    #[test]
+    fn repeated_key_within_one_call_is_not_a_self_dependency() {
+        let l = lanes(&[&["a", "a"], &["a"]]);
+        assert_eq!(lane_deps(2, Some(&l)), vec![vec![], vec![0]]);
     }
 
     #[test]

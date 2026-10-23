@@ -1919,7 +1919,11 @@ fn lanes_share_keys_only_on_same_path() {
     .expect("parseable");
     assert_eq!(lanes[0], lanes[1], "spellings of one file share a lane");
     assert_ne!(lanes[0], lanes[2]);
-    assert!(lanes[3].is_empty());
+    assert_eq!(
+        lanes[3],
+        vec![dex_agent_core::BARRIER_LANE.to_string()],
+        "pathless scan orders against the batch once a mutator is present"
+    );
     assert_eq!(lanes[4], vec![dex_agent_core::BARRIER_LANE.to_string()]);
     // Unparseable args fail closed.
     assert!(super::tools::tool_call_lanes(&[call("edit", "{not json")]).is_none());
@@ -1981,4 +1985,37 @@ async fn same_file_calls_run_in_order_while_others_fan_out() {
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "beta");
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "other");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scans_and_unknown_tools_fan_out_without_a_mutator() {
+    let call = |name: &str, args: &str| crate::protocol::LlmToolCall {
+        id: name.into(),
+        call_type: "function".into(),
+        function: crate::protocol::FunctionCall {
+            name: name.into(),
+            arguments: args.into(),
+        },
+    };
+    let free = [
+        call("grep", r#"{"pattern":"x"}"#),
+        call("find", r#"{"pattern":"*.rs","path":"src"}"#),
+        call("read", r#"{"path":"a.rs"}"#),
+        call("delegate", r#"{"action":"list"}"#),
+    ];
+    assert!(!tool_calls_conflict(&free));
+    // Add a write: the scans and delegate now order against it, but a read
+    // of an unrelated file stays free.
+    let mut mixed = free.to_vec();
+    mixed.push(call("write", r#"{"path":"src/x.rs","content":""}"#));
+    let lanes = super::tools::tool_call_lanes(&mixed).unwrap();
+    let barrier = vec![dex_agent_core::BARRIER_LANE.to_string()];
+    assert_eq!(lanes[0], barrier);
+    assert_eq!(
+        lanes[1], barrier,
+        "dir scan must not race a write beneath it"
+    );
+    assert_ne!(lanes[2], barrier);
+    assert_eq!(lanes[3], barrier);
+    assert!(tool_calls_conflict(&mixed));
 }

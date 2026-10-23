@@ -33,7 +33,8 @@ sent back to the model, and a result cache (`dex-tool-cache.json`) is kept only
 when `DEX_TOOL_CACHE=1`. `write`/`edit` on distinct files run in parallel; calls on the same
 `path` run in input order (others still fan out), while any `bash` or call
 carrying `then_run` (a shell whose effects can't be seen) orders against every
-other call in the batch.
+other call in the batch. Once a batch contains a write, `edit` or shell call,
+scans (`grep`/`find`/`ls`) and other non-file tools order against everything too.
 
 `write`/`edit` take an optional `then_run` shell command that runs in the same
 call _after_ a successful change, so a build, formatter or test result arrives

@@ -50,33 +50,50 @@ pub(super) async fn note_sink(
 }
 
 /// Per-call lane keys for the batch scheduler (see `ConflictDetector::lanes`):
-/// the normalized `path` for anything that carries one, [`BARRIER_LANE`] for
+/// the normalized `path` for `read`/`write`/`edit`, [`BARRIER_LANE`] for
 /// `bash` and `write`/`edit` with `then_run` (a shell whose file effects we
-/// cannot see orders against every other call). `None` when any call's args
-/// are unparseable — fail closed to full-batch serialization.
+/// cannot see orders against every other call). Once the batch contains a
+/// mutator, every other call (`grep`/`find`/`ls` scans, `delegate`, `task`,
+/// MCP/extension tools) is a barrier too: their reach isn't a single file
+/// path, so they must see each earlier write landed and not race a later one.
+/// Mutator-free batches keep them free to fan out. `None` when any call's
+/// args are unparseable — fail closed to full-batch serialization.
 pub(crate) fn tool_call_lanes(calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
-    calls
+    let parsed = calls
         .iter()
-        .map(|call| {
-            let value = serde_json::from_str::<Value>(&call.function.arguments).ok()?;
-            let name = call.function.name.as_str();
-            if name == "bash" || crate::tools::then_run::carries_then_run(name, &value) {
-                return Some(vec![BARRIER_LANE.to_string()]);
-            }
-            // Normalize before comparing: `./foo.rs` and `foo.rs` (or an
-            // absolute vs relative spelling of one file) must share a lane,
-            // or two edits run against one file concurrently and the second
-            // silently clobbers the first. Calls without a `path` can't be
-            // checked and never order against anything on their own.
-            Some(
-                value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(|p| vec![crate::tools::normalize_conflict_path(p)])
-                    .unwrap_or_default(),
-            )
-        })
-        .collect()
+        .map(|call| serde_json::from_str::<Value>(&call.function.arguments).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let shell = |call: &LlmToolCall, value: &Value| {
+        let name = call.function.name.as_str();
+        name == "bash" || crate::tools::then_run::carries_then_run(name, value)
+    };
+    let has_mutator = calls.iter().zip(&parsed).any(|(call, value)| {
+        matches!(call.function.name.as_str(), "write" | "edit") || shell(call, value)
+    });
+    Some(
+        calls
+            .iter()
+            .zip(&parsed)
+            .map(|(call, value)| {
+                if shell(call, value) {
+                    return vec![BARRIER_LANE.to_string()];
+                }
+                match call.function.name.as_str() {
+                    // Normalize before comparing: `./foo.rs` and `foo.rs` (or
+                    // an absolute vs relative spelling of one file) must share
+                    // a lane, or two edits run against one file concurrently
+                    // and the second silently clobbers the first.
+                    "read" | "write" | "edit" => value
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(|p| vec![crate::tools::normalize_conflict_path(p)])
+                        .unwrap_or_default(),
+                    _ if has_mutator => vec![BARRIER_LANE.to_string()],
+                    _ => Vec::new(),
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Whether the batch needs any ordering at all: unparseable args, a shell
