@@ -1,8 +1,9 @@
 //! Tool steps: the call (`✓ read src/a.rs:1-40`) with its outcome (`41 lines`)
 //! on the row beneath. Output previews stay folded for successful
 //! calls (Ctrl+O unfolds them); failures and write/edit diffs always show.
-//! A run of ≥2 parallel calls that all finished successfully folds into ONE
-//! summary row instead (`merged_run_rows`); Ctrl+O unfolds it line-by-line.
+//! A run of ≥2 parallel calls folds into ONE summary row — even while calls
+//! are still running (`✓ 3 tools · 1 running · … · Ctrl+O`); Ctrl+O unfolds
+//! it line-by-line. Failures and write/edit diffs always show unfolded.
 
 use super::super::style::fg;
 use super::super::style::TRANSCRIPT_INDENT;
@@ -120,13 +121,14 @@ pub(crate) struct RunCall {
     pub(crate) ok: Option<bool>,
 }
 
-/// The ONE merged row for a run of parallel calls that all finished
-/// successfully: `✓ 3 tools · read src/a.rs · read src/b.rs · grep TODO ·
-/// Ctrl+O` — the count is the indicator, the `Ctrl+O` hint says the
-/// individual step rows are behind the fold. `None` when the run must
-/// render line-by-line: Ctrl+O expanded, any call still pending or failed
-/// (failures always show their output), or any write/edit (its diff
-/// always shows). Per-call outcomes/durations are visible only unfolded.
+/// The ONE merged row for a run of ≥2 parallel calls, running or finished:
+/// `✓ 3 tools · read src/a.rs · read src/b.rs · grep TODO · Ctrl+O` — the
+/// count is the indicator and `Ctrl+O` says the step rows are behind the
+/// fold; while calls are still in flight the glyph is `◌` and a `· N running`
+/// clause appears. `None` when the run must render line-by-line: Ctrl+O
+/// expanded, any call failed (failures always show their output), or any
+/// write/edit (its diff always shows). Per-call outcomes/durations are
+/// visible only unfolded.
 pub(crate) fn merged_run_rows(
     calls: &[RunCall],
     width: u16,
@@ -136,8 +138,14 @@ pub(crate) fn merged_run_rows(
         return None;
     }
     let mut parts = Vec::with_capacity(calls.len());
+    let mut running = 0usize;
     for call in calls {
-        if call.ok != Some(true) || matches!(call.name.as_str(), "write" | "edit") {
+        match call.ok {
+            Some(false) => return None,
+            None => running += 1,
+            Some(true) => {}
+        }
+        if matches!(call.name.as_str(), "write" | "edit") {
             return None;
         }
         parts.push(if call.arg.is_empty() {
@@ -146,11 +154,21 @@ pub(crate) fn merged_run_rows(
             format!("{} {}", call.name, call.arg)
         });
     }
+    let (glyph, style) = if running == 0 {
+        ("✓", fg(theme::success_fg()))
+    } else {
+        ("◌", fg(theme::muted_fg()))
+    };
+    let count = if running == 0 {
+        format!("{} tools", calls.len())
+    } else {
+        format!("{} tools · {running} running", calls.len())
+    };
     let mut spans = vec![
         Span::raw(" ".repeat(TRANSCRIPT_INDENT)),
-        Span::styled("✓", fg(theme::success_fg())),
+        Span::styled(glyph, style),
         Span::raw(" "),
-        Span::styled(format!("{} tools", calls.len()), fg(theme::secondary_fg())),
+        Span::styled(count, fg(theme::secondary_fg())),
     ];
     for part in parts {
         spans.push(Span::raw(" · "));

@@ -1650,7 +1650,7 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         // (those are the live composer's): `wrap_block` pads every row out
         // to the full width on the terminal background.
         let block = &app.transcript[1]; // 0 is hello, 1 is user
-        let rows = wrap_block(block, w, false, false, false);
+        let rows = wrap_block(block, w, false, false);
         let bg = Color::Reset;
         assert!(!rows.is_empty(), "user block must hold content at w {w}");
         for row in &rows {
@@ -2403,6 +2403,87 @@ fn display_lines(app: &super::super::App) -> Vec<String> {
         .collect()
 }
 
+// A run folds into ONE summary row as soon as a second call starts — even
+// while calls are still running (count + `N running` + Ctrl+O), and stays
+// folded through the pending→done transitions.
+#[test]
+fn parallel_run_folds_while_calls_are_running() {
+    use crate::protocol::SinkLine;
+    let mut app = test_app();
+    app.transcript.clear();
+    let input = |app: &mut App, id: &str, arg: &str| {
+        super::super::append_sink_line(
+            app,
+            SinkLine::ToolInput {
+                id: id.into(),
+                input: format!("read {arg}"),
+            },
+        );
+    };
+    let output = |app: &mut App, id: &str, summary: &str| {
+        super::super::append_sink_line(
+            app,
+            SinkLine::ToolOutput {
+                id: id.into(),
+                name: "read".into(),
+                summary: summary.into(),
+                success: true,
+                preview: vec![],
+                duration: 0.0,
+            },
+        );
+    };
+    input(&mut app, "1", "a.rs");
+    input(&mut app, "2", "b.rs");
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // Both pending: one folded row with the running indicator.
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("◌ 2 tools · 2 running · read a.rs · read b.rs · Ctrl+O")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("✓ read a.rs")),
+        "{lines:?}"
+    );
+
+    // First result lands while the second still runs; the offset accounting
+    // survives the pending→done rewrap.
+    output(&mut app, "1", "3 lines");
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("◌ 2 tools · 1 running · read a.rs · read b.rs · Ctrl+O")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+
+    // The last result settles the run into the ✓ row.
+    output(&mut app, "2", "5 lines");
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✓ 2 tools · read a.rs · read b.rs · Ctrl+O")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("running")), "{lines:?}");
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+}
+
 #[test]
 fn parallel_tool_run_folds_into_one_summary_row() {
     let mut app = test_app();
@@ -2709,7 +2790,7 @@ fn submitted_prompt_wraps_like_the_composer() {
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, text);
         let block = &app.transcript[1];
-        let echo = wrap_block(block, w, false, false, false);
+        let echo = wrap_block(block, w, false, false);
         assert_eq!(
             echo.len(),
             composer.len(),
@@ -2917,7 +2998,7 @@ fn echoed_prompt_narrows_only_the_first_logical_line() {
     let mut app = test_app();
     super::super::render_user_prompt(&mut app, text);
     let block = &app.transcript[1];
-    let rows = wrap_block(block, 40, false, false, false);
+    let rows = wrap_block(block, 40, false, false);
     let row_text = |r: &Line<'static>| {
         r.spans
             .iter()
@@ -2954,7 +3035,7 @@ fn echoed_prompt_wraps_at_the_composer_content_width() {
     let mut app = test_app();
     super::super::render_user_prompt(&mut app, text);
     let block = &app.transcript[1];
-    let rows = wrap_block(block, 20, false, false, false);
+    let rows = wrap_block(block, 20, false, false);
     assert_eq!(
         composer.len(),
         rows.len(),
@@ -3331,7 +3412,7 @@ fn settled_summary_reflects_how_the_turn_ended() {
             panic!("settled");
         };
         assert!(s.text.starts_with(text), "{}", s.text);
-        let rows = wrap_block(&app.transcript[0], 80, false, false, false);
+        let rows = wrap_block(&app.transcript[0], 80, false, false);
         assert_eq!(rows[0].spans.last().unwrap().style.fg, Some(color));
     }
 }
@@ -3347,13 +3428,9 @@ fn blink_of_thinking_renders_no_row_but_a_long_one_does() {
             started: Instant::now(),
             elapsed: Some(Duration::from_millis(ms)),
         };
-        assert_eq!(
-            wrap_block(&block, 80, false, false, false).len(),
-            rows,
-            "{ms}ms"
-        );
+        assert_eq!(wrap_block(&block, 80, false, false).len(), rows, "{ms}ms");
         // Ctrl+T always shows the text.
-        assert_eq!(wrap_block(&block, 80, true, false, false).len(), 1);
+        assert_eq!(wrap_block(&block, 80, true, false).len(), 1);
     }
 }
 
@@ -3414,7 +3491,7 @@ fn code_rows_carry_a_block_fill_that_pads_to_the_width() {
         crate::protocol::SinkLine::Assistant("```rust\nlet a = 1;\n```".into()),
     );
     super::super::flush_assistant(&mut app);
-    let rows = wrap_block(&app.transcript[0], 40, false, false, false);
+    let rows = wrap_block(&app.transcript[0], 40, false, false);
     let code = rows.iter().find(|r| row_text(r).contains("let a")).unwrap();
     assert_eq!(code.style.bg, Some(theme::code_bg()));
     assert_eq!(row_text(code).width(), 40, "fill pads to the full width");
@@ -3615,7 +3692,7 @@ fn lifecycle_and_error_rows_read_cleanly() {
         &mut app,
         crate::protocol::SinkLine::Error("provider returned 429".into()),
     );
-    let text = |i: usize| row_text(&wrap_block(&app.transcript[i], 80, false, false, false)[0]);
+    let text = |i: usize| row_text(&wrap_block(&app.transcript[i], 80, false, false)[0]);
     assert_eq!(text(0).trim(), "◈ explorer started · ab12");
     assert_eq!(text(1).trim(), "✗ provider returned 429");
 }

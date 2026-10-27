@@ -88,7 +88,6 @@ pub(crate) fn wrap_block(
     width: u16,
     show_thinking: bool,
     thinking_open: bool,
-    expand_tools: bool,
 ) -> Vec<Line<'static>> {
     match block {
         super::super::TranscriptBlock::User { lines, .. } => {
@@ -100,13 +99,11 @@ pub(crate) fn wrap_block(
             // prompts reflow identically.
             surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH)
         }
-        super::super::TranscriptBlock::Tool {
-            name,
-            input,
-            result,
-            preview,
-            ..
-        } => super::tool::tool_rows(name, input, result.as_ref(), preview, width, expand_tools),
+        super::super::TranscriptBlock::Tool { .. } => {
+            // Production routes every Tool block through `wrap_tool_run`:
+            // a run's shape depends on all its members, never one block.
+            unreachable!("Tool blocks rewrap as a run (wrap_tool_run)")
+        }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
                 thinking_display_lines(text, true, false, None, 0, width)
@@ -246,13 +243,7 @@ fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
             continue;
         }
         let block = &app.transcript[idx];
-        let rows = wrap_block(
-            block,
-            width,
-            app.show_thinking,
-            app.thinking_open,
-            app.expand_tools,
-        );
+        let rows = wrap_block(block, width, app.show_thinking, app.thinking_open);
         app.wrapped_cache[idx] = WrappedBlock {
             stamp: block.stamp(),
             rows,
@@ -265,12 +256,6 @@ fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
     }
 }
 
-/// Re-extend `display_cache` from the first dirty block: truncate to that
-/// block's start offset (gap separators + wrapped-row counts — length
-/// arithmetic, no clones), then re-extend from there. Unchanged leading blocks
-/// keep byte-identical rows, so the offsets line up; this runs only on content
-/// or width changes, never for scroll. Every gap between blocks stays
-/// blank terminal bg.
 /// Wrap the whole run of consecutive `Tool` blocks around dirty block `idx`,
 /// even the undirty members: the run's display shape (merged row vs
 /// line-by-line) depends on every member's result, so it must be recomputed
@@ -349,6 +334,12 @@ fn wrap_tool_run(app: &mut App, idx: usize, width: u16, mark: &mut impl FnMut(us
     }
 }
 
+/// Re-extend `display_cache` from the first dirty block: truncate to that
+/// block's start offset (gap separators + wrapped-row counts — length
+/// arithmetic, no clones), then re-extend from there. Unchanged leading blocks
+/// keep byte-identical rows, so the offsets line up; this runs only on content
+/// or width changes, never for scroll. Every gap between blocks stays
+/// blank terminal bg.
 pub(crate) fn rebuild_display_cache(app: &mut App, first_dirty: Option<usize>) {
     let Some(dirty) = first_dirty else {
         return;
