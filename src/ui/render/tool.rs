@@ -1,6 +1,8 @@
 //! Tool steps: the call (`✓ read src/a.rs:1-40`) with its outcome (`41 lines`)
 //! on the row beneath. Output previews stay folded for successful
 //! calls (Ctrl+O unfolds them); failures and write/edit diffs always show.
+//! A run of ≥2 parallel calls that all finished successfully folds into ONE
+//! summary row instead (`merged_run_rows`); Ctrl+O unfolds it line-by-line.
 
 use super::super::style::fg;
 use super::super::style::TRANSCRIPT_INDENT;
@@ -107,4 +109,56 @@ pub(crate) fn tool_rows(
         }
     }
     rows
+}
+
+/// One call of a parallel run, summarized for the merged row.
+pub(crate) struct RunCall {
+    pub(crate) name: String,
+    /// Short arg as emitted by `ToolInput` (`src/main.rs:1-20`).
+    pub(crate) arg: String,
+    /// `None` while the call runs; `Some(ok)` once finished.
+    pub(crate) ok: Option<bool>,
+}
+
+/// The ONE merged row for a run of parallel calls that all finished
+/// successfully: `✓ 3 tools · read src/a.rs · read src/b.rs · grep TODO ·
+/// Ctrl+O` — the count is the indicator, the `Ctrl+O` hint says the
+/// individual step rows are behind the fold. `None` when the run must
+/// render line-by-line: Ctrl+O expanded, any call still pending or failed
+/// (failures always show their output), or any write/edit (its diff
+/// always shows). Per-call outcomes/durations are visible only unfolded.
+pub(crate) fn merged_run_rows(
+    calls: &[RunCall],
+    width: u16,
+    expand: bool,
+) -> Option<Vec<Line<'static>>> {
+    if expand || calls.len() < 2 {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(calls.len());
+    for call in calls {
+        if call.ok != Some(true) || matches!(call.name.as_str(), "write" | "edit") {
+            return None;
+        }
+        parts.push(if call.arg.is_empty() {
+            call.name.clone()
+        } else {
+            format!("{} {}", call.name, call.arg)
+        });
+    }
+    let mut spans = vec![
+        Span::raw(" ".repeat(TRANSCRIPT_INDENT)),
+        Span::styled("✓", fg(theme::success_fg())),
+        Span::raw(" "),
+        Span::styled(format!("{} tools", calls.len()), fg(theme::secondary_fg())),
+    ];
+    for part in parts {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(part, fg(theme::muted_fg())));
+    }
+    spans.push(Span::styled(
+        " · Ctrl+O",
+        Style::default().fg(theme::muted_fg()),
+    ));
+    Some(wrap_line_display(&Line::from(spans), width, 0))
 }

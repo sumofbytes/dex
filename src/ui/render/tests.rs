@@ -2372,6 +2372,134 @@ fn done(ok: bool, summary: &str, duration: f64) -> crate::ui::ToolResult {
     }
 }
 
+fn tool_step(
+    name: &str,
+    arg: &str,
+    result: Option<crate::ui::ToolResult>,
+) -> super::super::TranscriptBlock {
+    super::super::TranscriptBlock::Tool {
+        stamp: 0,
+        name: name.into(),
+        input: render_tool_arg(name, arg),
+        started: Instant::now(),
+        result,
+        preview: Vec::new(),
+        tool_id: format!("call-{arg}"),
+        tool_arg: arg.into(),
+    }
+}
+
+fn display_lines(app: &super::super::App) -> Vec<String> {
+    app.display_cache
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn parallel_tool_run_folds_into_one_summary_row() {
+    let mut app = test_app();
+    app.transcript = vec![
+        tool_step("read", "src/a.rs", Some(done(true, "20 lines", 0.0))),
+        tool_step("read", "src/b.rs", Some(done(true, "5 lines", 0.0))),
+        tool_step("grep", "TODO", Some(done(true, "3 files", 0.0))),
+    ];
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    // One merged row with the count indicator and the unfold hint.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✓ 3 tools · read src/a.rs · read src/b.rs · grep TODO · Ctrl+O")),
+        "{lines:?}"
+    );
+    // Per-call outcomes stay folded with the run.
+    assert!(!lines.iter().any(|l| l.contains("20 lines")), "{lines:?}");
+    // The row/offset accounting still lines up: one display unit per run.
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+
+    // Appending a fourth call refolds the run (3 → 4 tools).
+    app.transcript
+        .push(tool_step("ls", "src", Some(done(true, "2 rows", 0.0))));
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    assert!(lines.iter().any(|l| l.contains("✓ 4 tools")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("3 tools")), "{lines:?}");
+
+    // Ctrl+O unfolds back to line-by-line.
+    app.expand_tools = true;
+    for block in &mut app.transcript {
+        block.bump();
+    }
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    assert!(
+        lines.iter().any(|l| l.contains("✓ read src/a.rs")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("tools ·")), "{lines:?}");
+}
+
+#[test]
+fn failed_or_write_edit_run_stays_line_by_line() {
+    let mut app = test_app();
+    // A failed member must keep its outcome row visible.
+    app.transcript = vec![
+        tool_step(
+            "bash",
+            "cargo test",
+            Some(done(false, "exit 101 · boom", 0.0)),
+        ),
+        tool_step("read", "src/a.rs", Some(done(true, "20 lines", 0.0))),
+    ];
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    assert!(
+        lines.iter().any(|l| l.contains("✗ bash cargo test")),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains("exit 101")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("tools ·")), "{lines:?}");
+
+    // A write/edit's diff always shows, so its run never folds.
+    app.transcript = vec![
+        tool_step("edit", "src/a.rs", Some(done(true, "applied", 0.0))),
+        tool_step("read", "src/b.rs", Some(done(true, "5 lines", 0.0))),
+    ];
+    let mut app2 = test_app();
+    app2.transcript = app.transcript;
+    let mut terminal2 = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal2
+        .draw(|frame| view(frame, &mut app2))
+        .expect("render should succeed");
+    let lines = display_lines(&app2);
+    assert!(
+        lines.iter().any(|l| l.contains("✓ edit src/a.rs")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("tools ·")), "{lines:?}");
+}
+
 #[test]
 fn tool_step_leads_with_status_then_name_and_puts_the_outcome_beneath() {
     let arg = render_tool_arg("read", "src/main.rs:1-20");
@@ -3144,15 +3272,13 @@ fn every_block_is_separated_by_one_blank_row() {
     terminal.draw(|f| view(f, &mut app)).unwrap();
     let rows: Vec<String> = app.display_cache.iter().map(row_text).collect();
     let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
-    // One blank row between every pair of blocks, steps included.
+    // One blank row between every pair of blocks; the two consecutive calls
+    // fold into ONE merged row (count indicator + Ctrl+O hint).
     assert_eq!(at("looking"), at("go") + 2, "{rows:?}");
-    assert_eq!(at("✓ read"), at("looking") + 2, "{rows:?}");
-    let steps: Vec<usize> = (0..rows.len())
-        .filter(|i| rows[*i].contains("✓ read"))
-        .collect();
-    // Each step is two rows (call + outcome), then the blank row.
-    assert_eq!(steps[1], steps[0] + 3, "{rows:?}");
-    assert_eq!(at("boom"), steps[1] + 3, "{rows:?}");
+    let folded = at("✓ 2 tools");
+    assert_eq!(folded, at("looking") + 2, "{rows:?}");
+    assert!(rows[folded].contains("read a.rs · read a.rs"), "{rows:?}");
+    assert_eq!(at("boom"), folded + 2, "{rows:?}");
     assert_eq!(at("note"), at("boom") + 2, "{rows:?}");
 }
 
