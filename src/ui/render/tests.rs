@@ -2539,6 +2539,45 @@ fn parallel_tool_run_folds_into_one_summary_row() {
 }
 
 #[test]
+fn prose_splits_runs_and_long_runs_cap_the_list() {
+    let mut app = test_app();
+    let ok = || Some(done(true, "1 line", 0.0));
+    let mut blocks = vec![
+        tool_step("read", "a.rs", ok()),
+        tool_step("read", "b.rs", ok()),
+    ];
+    blocks.push(super::super::TranscriptBlock::Assistant {
+        stamp: 0,
+        lines: vec![super::super::indent_transcript_line(Line::from("between"))],
+    });
+    for i in 0..8 {
+        blocks.push(tool_step("read", &format!("f{i}.rs"), ok()));
+    }
+    app.transcript = blocks;
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(200, 24)).unwrap();
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines.iter().any(|l| l.contains("✓ 2 tools · read a.rs")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✓ 8 tools") && l.contains("+2 more") && !l.contains("f7.rs")),
+        "{lines:?}"
+    );
+
+    // A resize rewraps the folded run without drifting the row accounting.
+    let mut narrow = ratatui::Terminal::new(TestBackend::new(40, 24)).unwrap();
+    narrow.draw(|f| view(f, &mut app)).unwrap();
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+}
+
+#[test]
 fn failed_or_write_edit_run_stays_line_by_line() {
     let mut app = test_app();
     // A failed member must keep its outcome row visible.

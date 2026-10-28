@@ -112,6 +112,9 @@ pub(crate) fn tool_rows(
     rows
 }
 
+/// Calls named on the merged row; the rest collapse into `+N more`.
+const RUN_LIST_CAP: usize = 6;
+
 /// One call of a parallel run, summarized for the merged row.
 pub(crate) struct RunCall {
     pub(crate) name: String,
@@ -170,9 +173,15 @@ pub(crate) fn merged_run_rows(
         Span::raw(" "),
         Span::styled(count, fg(theme::secondary_fg())),
     ];
-    for part in parts {
+    for part in parts.iter().take(RUN_LIST_CAP) {
         spans.push(Span::raw(" · "));
-        spans.push(Span::styled(part, fg(theme::muted_fg())));
+        spans.push(Span::styled(part.clone(), fg(theme::muted_fg())));
+    }
+    if parts.len() > RUN_LIST_CAP {
+        spans.push(Span::styled(
+            format!(" · +{} more", parts.len() - RUN_LIST_CAP),
+            fg(theme::muted_fg()),
+        ));
     }
     spans.push(Span::styled(
         " · Ctrl+O",

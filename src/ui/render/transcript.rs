@@ -102,7 +102,8 @@ pub(crate) fn wrap_block(
         super::super::TranscriptBlock::Tool { .. } => {
             // Production routes every Tool block through `wrap_tool_run`:
             // a run's shape depends on all its members, never one block.
-            unreachable!("Tool blocks rewrap as a run (wrap_tool_run)")
+            debug_assert!(false, "Tool blocks rewrap as a run (wrap_tool_run)");
+            Vec::new()
         }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
