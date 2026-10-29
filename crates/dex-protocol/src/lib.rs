@@ -259,7 +259,9 @@ impl ApprovalDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum StreamEvent {
-    /// Incremental assistant text.
+    /// Incremental assistant text: complete markdown lines joined with
+    /// `\n`, and the payload terminated by one trailing `\n` — clients
+    /// can append events verbatim and the markdown stays intact.
     #[serde(rename = "assistant_text")]
     AssistantText(String),
 

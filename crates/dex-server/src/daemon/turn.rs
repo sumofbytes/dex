@@ -87,7 +87,100 @@ pub(crate) fn spawn_accepted_forwarder(
     });
 }
 
+/// Drain every queued consecutive line of the same kind into `batch`, a
+/// different line kind held back in `*deferred` and handled next, in order.
+/// Coalescing matters because providers stream one sink line per token and
+/// each event costs a seq bump, a journal append, and an SSE write.
+/// Thinking deltas are raw token fragments and join verbatim; Assistant
+/// events are complete markdown lines (stream.rs trims the trailing
+/// newline) and join with `'\n'` so paragraph structure survives
+/// coalescing.
+fn coalesce_from(
+    batch: &mut SinkLine,
+    deferred: &mut Option<SinkLine>,
+    sink_rx: &mut mpsc::Receiver<SinkLine>,
+) {
+    loop {
+        let next = sink_rx.try_recv();
+        match (&mut *batch, next) {
+            (SinkLine::Thinking(buf), Ok(SinkLine::Thinking(text))) => {
+                buf.push_str(&text);
+            }
+            (SinkLine::Assistant(buf), Ok(SinkLine::Assistant(text))) => {
+                buf.push('\n');
+                buf.push_str(&text);
+            }
+            (_, Ok(other)) => {
+                *deferred = Some(other);
+                return;
+            }
+            (_, Err(_)) => return,
+        }
+    }
+}
+
+/// One sink-line batch → the wire event it rides. Assistant batches are
+/// newline-terminated (exactly one `\n`, never two) so clients that
+/// concatenate events (ACP, SSE consumers, `connect`) keep the markdown
+/// intact; the TUI trims the tail when it renders.
+fn batch_stream_event(batch: SinkLine) -> StreamEvent {
+    match batch {
+        SinkLine::Assistant(mut text) => {
+            text.push('\n');
+            StreamEvent::AssistantText(text)
+        }
+        SinkLine::Thinking(text) => StreamEvent::Thinking(text),
+        SinkLine::ToolInput { id, input } => {
+            let mut parts = input.splitn(2, ' ');
+            let name = parts.next().unwrap_or_default().to_string();
+            let args = parts.next().unwrap_or_default().to_string();
+            StreamEvent::ToolCall {
+                name,
+                args: serde_json::Value::String(args),
+                id,
+            }
+        }
+        SinkLine::ToolOutput {
+            id,
+            name,
+            summary,
+            success,
+            preview,
+            duration,
+        } => StreamEvent::ToolResult {
+            name,
+            summary,
+            success,
+            preview,
+            duration,
+            id,
+        },
+        SinkLine::System(text) => StreamEvent::System(text),
+        SinkLine::Error(text) => StreamEvent::Error(text),
+        SinkLine::Usage {
+            tokens,
+            cached,
+            cost,
+            output,
+            gen_ms,
+        } => StreamEvent::Usage {
+            tokens,
+            cached,
+            cost,
+            output,
+            gen_ms,
+        },
+        SinkLine::Plan(plan) => StreamEvent::Plan {
+            goal: plan.goal,
+            steps: plan.steps,
+            constraints: plan.constraints,
+            acceptance: plan.acceptance,
+        },
+    }
+}
+
 /// Run one agent turn with the session's directory as its workspace, so tools,
+
 /// prompt files and skills resolve there rather than in the daemon's cwd.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_turn(
@@ -700,87 +793,9 @@ pub(crate) async fn run_turn_inner(
                         },
                     },
                 };
-                // Coalesce per-token thinking deltas: providers stream one
-                // sink line per token, and each event costs a seq bump, a
-                // journal append, and an SSE write. Drain every already
-                // queued consecutive line of the same kind into one event
-                // (a different line kind is held back and handled next, in
-                // order). Thinking deltas are raw token fragments and join
-                // verbatim; Assistant events are complete markdown lines
-                // (stream.rs trims the trailing newline) and join with '\n'
-                // so paragraph structure survives coalescing.
                 let mut batch = sl;
-                loop {
-                    match (&mut batch, sink_rx.try_recv()) {
-                        (SinkLine::Thinking(buf), Ok(SinkLine::Thinking(text))) => {
-                            buf.push_str(&text);
-                        }
-                        (SinkLine::Assistant(buf), Ok(SinkLine::Assistant(text))) => {
-                            buf.push('\n');
-                            buf.push_str(&text);
-                        }
-                        (_, Ok(other)) => {
-                            deferred = Some(other);
-                            break;
-                        }
-                        (_, Err(_)) => break,
-                    }
-                }
-                let event = match batch {
-                    // Terminate the line so clients that concatenate events
-                    // (ACP, SSE consumers, `connect`) keep the markdown intact.
-                    SinkLine::Assistant(mut text) => {
-                        text.push('\n');
-                        StreamEvent::AssistantText(text)
-                    }
-                    SinkLine::Thinking(text) => StreamEvent::Thinking(text),
-                    SinkLine::ToolInput { id, input } => {
-                        let mut parts = input.splitn(2, ' ');
-                        let name = parts.next().unwrap_or_default().to_string();
-                        let args = parts.next().unwrap_or_default().to_string();
-                        StreamEvent::ToolCall {
-                            name,
-                            args: serde_json::Value::String(args),
-                            id,
-                        }
-                    }
-                    SinkLine::ToolOutput {
-                        id,
-                        name,
-                        summary,
-                        success,
-                        preview,
-                        duration,
-                    } => StreamEvent::ToolResult {
-                        name,
-                        summary,
-                        success,
-                        preview,
-                        duration,
-                        id,
-                    },
-                    SinkLine::System(text) => StreamEvent::System(text),
-                    SinkLine::Error(text) => StreamEvent::Error(text),
-                    SinkLine::Usage {
-                        tokens,
-                        cached,
-                        cost,
-                        output,
-                        gen_ms,
-                    } => StreamEvent::Usage {
-                        tokens,
-                        cached,
-                        cost,
-                        output,
-                        gen_ms,
-                    },
-                    SinkLine::Plan(plan) => StreamEvent::Plan {
-                        goal: plan.goal,
-                        steps: plan.steps,
-                        constraints: plan.constraints,
-                        acceptance: plan.acceptance,
-                    },
-                };
+                coalesce_from(&mut batch, &mut deferred, &mut sink_rx);
+                let event = batch_stream_event(batch);
                 let seq = state.next_seq(&sid);
                 journal_event(&state, &sid, seq, &event);
                 let _ = stream_tx.send(StreamEnvelope { seq, event }).await;
@@ -1011,4 +1026,49 @@ pub(crate) async fn collect_notice_text(
         text.push_str(&notice.text());
     }
     Ok(Some(text))
+}
+
+#[cfg(test)]
+mod sink_batch_tests {
+    use super::*;
+
+    /// Pin the wire contract: an `AssistantText` event ends with exactly
+    /// one `\n`, so clients that concatenate events (ACP, SSE consumers,
+    /// `connect`) render headings and paragraphs separated.
+    #[test]
+    fn single_assistant_batch_is_terminated_exactly_once() {
+        let StreamEvent::AssistantText(text) =
+            batch_stream_event(SinkLine::Assistant("## Heading".into()))
+        else {
+            panic!("wrong event kind");
+        };
+        assert_eq!(text, "## Heading\n");
+    }
+
+    /// Adjacent assistant lines join with a single `\n` (blank-line deltas
+    /// may add exactly one more), the different kind drains instead of
+    /// joining, and the batch still lands terminated.
+    #[tokio::test]
+    async fn coalesced_assistant_lines_join_and_stay_terminated() {
+        let (tx, mut rx) = mpsc::channel::<SinkLine>(4);
+        tx.send(SinkLine::Assistant("".into())).await.unwrap();
+        tx.send(SinkLine::Assistant("body".into())).await.unwrap();
+        tx.send(SinkLine::Thinking("tk".into())).await.unwrap();
+        drop(tx);
+        let mut batch = SinkLine::Assistant(":: Heading".into());
+        let mut deferred: Option<SinkLine> = None;
+        coalesce_from(&mut batch, &mut deferred, &mut rx);
+        assert!(
+            matches!(&batch, SinkLine::Assistant(t) if t == ":: Heading\n\nbody"),
+            "got: {batch:?}"
+        );
+        assert!(
+            matches!(&deferred, Some(SinkLine::Thinking(t)) if t == "tk"),
+            "got: {deferred:?}"
+        );
+        let StreamEvent::AssistantText(text) = batch_stream_event(batch) else {
+            panic!("wrong event kind");
+        };
+        assert_eq!(text, ":: Heading\n\nbody\n");
+    }
 }
