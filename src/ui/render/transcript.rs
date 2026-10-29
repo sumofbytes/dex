@@ -88,7 +88,6 @@ pub(crate) fn wrap_block(
     width: u16,
     show_thinking: bool,
     thinking_open: bool,
-    expand_tools: bool,
 ) -> Vec<Line<'static>> {
     match block {
         super::super::TranscriptBlock::User { lines, .. } => {
@@ -100,13 +99,12 @@ pub(crate) fn wrap_block(
             // prompts reflow identically.
             surface_rows(lines.clone(), width, INPUT_PROMPT_WIDTH)
         }
-        super::super::TranscriptBlock::Tool {
-            name,
-            input,
-            result,
-            preview,
-            ..
-        } => super::tool::tool_rows(name, input, result.as_ref(), preview, width, expand_tools),
+        super::super::TranscriptBlock::Tool { .. } => {
+            // Production routes every Tool block through `wrap_tool_run`:
+            // a run's shape depends on all its members, never one block.
+            debug_assert!(false, "Tool blocks rewrap as a run (wrap_tool_run)");
+            Vec::new()
+        }
         super::super::TranscriptBlock::Thinking { text, elapsed, .. } => {
             if show_thinking {
                 thinking_display_lines(text, true, false, None, 0, width)
@@ -197,13 +195,13 @@ fn sync_wrapped_cache(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
 /// last source line are final. A head-cut, reset, or rebuild resets stamps and
 /// takes the full wrap.
 fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
-    for (idx, block) in app.transcript.iter().enumerate() {
-        if app.wrapped_cache[idx].stamp == block.stamp() {
+    for idx in 0..app.transcript.len() {
+        if app.wrapped_cache[idx].stamp == app.transcript[idx].stamp() {
             continue;
         }
-        if let super::super::TranscriptBlock::Thinking { text, .. } = block {
+        if let super::super::TranscriptBlock::Thinking { text, .. } = &app.transcript[idx] {
             if app.show_thinking {
-                let stamp = block.stamp();
+                let stamp = app.transcript[idx].stamp();
                 let wb = &mut app.wrapped_cache[idx];
                 if wb.expanded {
                     let state = ThinkingWrap {
@@ -233,13 +231,20 @@ fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
                 continue;
             }
         }
-        let rows = wrap_block(
-            block,
-            width,
-            app.show_thinking,
-            app.thinking_open,
-            app.expand_tools,
-        );
+        if matches!(
+            app.transcript[idx],
+            super::super::TranscriptBlock::Tool { .. }
+        ) {
+            // A parallel batch of tool calls rewraps as ONE run: it folds
+            // into a single merged row on the run's first block (the other
+            // members wrap to zero rows, keeping the per-block row/offset
+            // arithmetic — gaps, `display_offset`, selection mapping —
+            // intact) or back to line-by-line whenever any member changes.
+            wrap_tool_run(app, idx, width, &mut *mark);
+            continue;
+        }
+        let block = &app.transcript[idx];
+        let rows = wrap_block(block, width, app.show_thinking, app.thinking_open);
         app.wrapped_cache[idx] = WrappedBlock {
             stamp: block.stamp(),
             rows,
@@ -249,6 +254,84 @@ fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
             expanded: false,
         };
         mark(idx);
+    }
+}
+
+/// Wrap the whole run of consecutive `Tool` blocks around dirty block `idx`,
+/// even the undirty members: the run's display shape (merged row vs
+/// line-by-line) depends on every member's result, so it must be recomputed
+/// together. Collapsed runs store the merged row on the first member and
+/// zero rows on the rest, so every display row still belongs to exactly one
+/// block's cache entry.
+fn wrap_tool_run(app: &mut App, idx: usize, width: u16, mark: &mut impl FnMut(usize)) {
+    let is_tool =
+        |b: &super::super::TranscriptBlock| matches!(b, super::super::TranscriptBlock::Tool { .. });
+    let mut start = idx;
+    while start > 0 && is_tool(&app.transcript[start - 1]) {
+        start -= 1;
+    }
+    let mut end = idx + 1;
+    while end < app.transcript.len() && is_tool(&app.transcript[end]) {
+        end += 1;
+    }
+    let calls: Vec<super::tool::RunCall> = app.transcript[start..end]
+        .iter()
+        .map(|b| match b {
+            super::super::TranscriptBlock::Tool {
+                name,
+                tool_arg,
+                result,
+                ..
+            } => super::tool::RunCall {
+                name: name.clone(),
+                arg: tool_arg.clone(),
+                ok: result.as_ref().map(|r| r.ok),
+            },
+            _ => unreachable!("run bounds come from the same Tool predicate"),
+        })
+        .collect();
+    let stamps: Vec<u64> = (start..end).map(|i| app.transcript[i].stamp()).collect();
+    let fresh = |stamp: u64, rows: Vec<Line<'static>>| WrappedBlock {
+        stamp,
+        rows,
+        src_len: 0,
+        open_len: 0,
+        open_rows: 0,
+        expanded: false,
+    };
+    match super::tool::merged_run_rows(&calls, width, app.expand_tools) {
+        Some(rows) => {
+            app.wrapped_cache[start] = fresh(stamps[0], rows);
+            for (i, &stamp) in (start + 1..end).zip(stamps[1..].iter()) {
+                app.wrapped_cache[i] = fresh(stamp, Vec::new());
+            }
+        }
+        None => {
+            for (off, i) in (start..end).enumerate() {
+                let super::super::TranscriptBlock::Tool {
+                    name,
+                    input,
+                    result,
+                    preview,
+                    ..
+                } = &app.transcript[i]
+                else {
+                    unreachable!("run bounds come from the same Tool predicate")
+                };
+                let rows = super::tool::tool_rows(
+                    name,
+                    input,
+                    result.as_ref(),
+                    preview,
+                    width,
+                    app.expand_tools,
+                );
+                app.wrapped_cache[i] = fresh(stamps[off], rows);
+            }
+        }
+    }
+    for i in start..end {
+        mark(i);
     }
 }
 

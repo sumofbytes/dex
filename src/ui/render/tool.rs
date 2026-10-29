@@ -1,6 +1,9 @@
 //! Tool steps: the call (`✓ read src/a.rs:1-40`) with its outcome (`41 lines`)
 //! on the row beneath. Output previews stay folded for successful
 //! calls (Ctrl+O unfolds them); failures and write/edit diffs always show.
+//! A run of ≥2 parallel calls folds into ONE summary row — even while calls
+//! are still running (`✓ 3 tools · 1 running · … · Ctrl+O`); Ctrl+O unfolds
+//! it line-by-line. Failures and write/edit diffs always show unfolded.
 
 use super::super::style::fg;
 use super::super::style::TRANSCRIPT_INDENT;
@@ -107,4 +110,82 @@ pub(crate) fn tool_rows(
         }
     }
     rows
+}
+
+/// Calls named on the merged row; the rest collapse into `+N more`.
+const RUN_LIST_CAP: usize = 6;
+
+/// One call of a parallel run, summarized for the merged row.
+pub(crate) struct RunCall {
+    pub(crate) name: String,
+    /// Short arg as emitted by `ToolInput` (`src/main.rs:1-20`).
+    pub(crate) arg: String,
+    /// `None` while the call runs; `Some(ok)` once finished.
+    pub(crate) ok: Option<bool>,
+}
+
+/// The ONE merged row for a run of ≥2 parallel calls, running or finished:
+/// `✓ 3 tools · read src/a.rs · read src/b.rs · grep TODO · Ctrl+O` — the
+/// count is the indicator and `Ctrl+O` says the step rows are behind the
+/// fold; while calls are still in flight the glyph is `◌` and a `· N running`
+/// clause appears. `None` when the run must render line-by-line: Ctrl+O
+/// expanded, any call failed (failures always show their output), or any
+/// write/edit (its diff always shows). Per-call outcomes/durations are
+/// visible only unfolded.
+pub(crate) fn merged_run_rows(
+    calls: &[RunCall],
+    width: u16,
+    expand: bool,
+) -> Option<Vec<Line<'static>>> {
+    if expand || calls.len() < 2 {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(calls.len());
+    let mut running = 0usize;
+    for call in calls {
+        match call.ok {
+            Some(false) => return None,
+            None => running += 1,
+            Some(true) => {}
+        }
+        if matches!(call.name.as_str(), "write" | "edit") {
+            return None;
+        }
+        parts.push(if call.arg.is_empty() {
+            call.name.clone()
+        } else {
+            format!("{} {}", call.name, call.arg)
+        });
+    }
+    let (glyph, style) = if running == 0 {
+        ("✓", fg(theme::success_fg()))
+    } else {
+        ("◌", fg(theme::muted_fg()))
+    };
+    let count = if running == 0 {
+        format!("{} tools", calls.len())
+    } else {
+        format!("{} tools · {running} running", calls.len())
+    };
+    let mut spans = vec![
+        Span::raw(" ".repeat(TRANSCRIPT_INDENT)),
+        Span::styled(glyph, style),
+        Span::raw(" "),
+        Span::styled(count, fg(theme::secondary_fg())),
+    ];
+    for part in parts.iter().take(RUN_LIST_CAP) {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(part.clone(), fg(theme::muted_fg())));
+    }
+    if parts.len() > RUN_LIST_CAP {
+        spans.push(Span::styled(
+            format!(" · +{} more", parts.len() - RUN_LIST_CAP),
+            fg(theme::muted_fg()),
+        ));
+    }
+    spans.push(Span::styled(
+        " · Ctrl+O",
+        Style::default().fg(theme::muted_fg()),
+    ));
+    Some(wrap_line_display(&Line::from(spans), width, 0))
 }

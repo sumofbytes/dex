@@ -1650,7 +1650,7 @@ fn user_prompt_wrapping_is_width_bounded_on_grid_margin() {
         // (those are the live composer's): `wrap_block` pads every row out
         // to the full width on the terminal background.
         let block = &app.transcript[1]; // 0 is hello, 1 is user
-        let rows = wrap_block(block, w, false, false, false);
+        let rows = wrap_block(block, w, false, false);
         let bg = Color::Reset;
         assert!(!rows.is_empty(), "user block must hold content at w {w}");
         for row in &rows {
@@ -2372,6 +2372,254 @@ fn done(ok: bool, summary: &str, duration: f64) -> crate::ui::ToolResult {
     }
 }
 
+fn tool_step(
+    name: &str,
+    arg: &str,
+    result: Option<crate::ui::ToolResult>,
+) -> super::super::TranscriptBlock {
+    super::super::TranscriptBlock::Tool {
+        stamp: 0,
+        name: name.into(),
+        input: render_tool_arg(name, arg),
+        started: Instant::now(),
+        result,
+        preview: Vec::new(),
+        tool_id: format!("call-{arg}"),
+        tool_arg: arg.into(),
+    }
+}
+
+fn display_lines(app: &super::super::App) -> Vec<String> {
+    app.display_cache
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+// A run folds into ONE summary row as soon as a second call starts — even
+// while calls are still running (count + `N running` + Ctrl+O), and stays
+// folded through the pending→done transitions.
+#[test]
+fn parallel_run_folds_while_calls_are_running() {
+    use crate::protocol::SinkLine;
+    let mut app = test_app();
+    app.transcript.clear();
+    let input = |app: &mut App, id: &str, arg: &str| {
+        super::super::append_sink_line(
+            app,
+            SinkLine::ToolInput {
+                id: id.into(),
+                input: format!("read {arg}"),
+            },
+        );
+    };
+    let output = |app: &mut App, id: &str, summary: &str| {
+        super::super::append_sink_line(
+            app,
+            SinkLine::ToolOutput {
+                id: id.into(),
+                name: "read".into(),
+                summary: summary.into(),
+                success: true,
+                preview: vec![],
+                duration: 0.0,
+            },
+        );
+    };
+    input(&mut app, "1", "a.rs");
+    input(&mut app, "2", "b.rs");
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // Both pending: one folded row with the running indicator.
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("◌ 2 tools · 2 running · read a.rs · read b.rs · Ctrl+O")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("✓ read a.rs")),
+        "{lines:?}"
+    );
+
+    // First result lands while the second still runs; the offset accounting
+    // survives the pending→done rewrap.
+    output(&mut app, "1", "3 lines");
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("◌ 2 tools · 1 running · read a.rs · read b.rs · Ctrl+O")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+
+    // The last result settles the run into the ✓ row.
+    output(&mut app, "2", "5 lines");
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✓ 2 tools · read a.rs · read b.rs · Ctrl+O")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("running")), "{lines:?}");
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+}
+
+#[test]
+fn parallel_tool_run_folds_into_one_summary_row() {
+    let mut app = test_app();
+    app.transcript = vec![
+        tool_step("read", "src/a.rs", Some(done(true, "20 lines", 0.0))),
+        tool_step("read", "src/b.rs", Some(done(true, "5 lines", 0.0))),
+        tool_step("grep", "TODO", Some(done(true, "3 files", 0.0))),
+    ];
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    // One merged row with the count indicator and the unfold hint.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✓ 3 tools · read src/a.rs · read src/b.rs · grep TODO · Ctrl+O")),
+        "{lines:?}"
+    );
+    // Per-call outcomes stay folded with the run.
+    assert!(!lines.iter().any(|l| l.contains("20 lines")), "{lines:?}");
+    // The row/offset accounting still lines up: one display unit per run.
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+
+    // Appending a fourth call refolds the run (3 → 4 tools).
+    app.transcript
+        .push(tool_step("ls", "src", Some(done(true, "2 rows", 0.0))));
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    assert!(lines.iter().any(|l| l.contains("✓ 4 tools")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("3 tools")), "{lines:?}");
+
+    // Ctrl+O unfolds back to line-by-line.
+    app.expand_tools = true;
+    for block in &mut app.transcript {
+        block.bump();
+    }
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    assert!(
+        lines.iter().any(|l| l.contains("✓ read src/a.rs")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("tools ·")), "{lines:?}");
+}
+
+#[test]
+fn prose_splits_runs_and_long_runs_cap_the_list() {
+    let mut app = test_app();
+    let ok = || Some(done(true, "1 line", 0.0));
+    let mut blocks = vec![
+        tool_step("read", "a.rs", ok()),
+        tool_step("read", "b.rs", ok()),
+    ];
+    blocks.push(super::super::TranscriptBlock::Assistant {
+        stamp: 0,
+        lines: vec![super::super::indent_transcript_line(Line::from("between"))],
+    });
+    for i in 0..8 {
+        blocks.push(tool_step("read", &format!("f{i}.rs"), ok()));
+    }
+    app.transcript = blocks;
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(200, 24)).unwrap();
+    terminal.draw(|f| view(f, &mut app)).unwrap();
+    let lines = display_lines(&app);
+    assert!(
+        lines.iter().any(|l| l.contains("✓ 2 tools · read a.rs")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✓ 8 tools") && l.contains("+2 more") && !l.contains("f7.rs")),
+        "{lines:?}"
+    );
+
+    // A resize rewraps the folded run without drifting the row accounting.
+    let mut narrow = ratatui::Terminal::new(TestBackend::new(40, 24)).unwrap();
+    narrow.draw(|f| view(f, &mut app)).unwrap();
+    assert_eq!(
+        display_offset(&app, app.transcript.len()),
+        app.display_cache.len()
+    );
+}
+
+#[test]
+fn failed_or_write_edit_run_stays_line_by_line() {
+    let mut app = test_app();
+    // A failed member must keep its outcome row visible.
+    app.transcript = vec![
+        tool_step(
+            "bash",
+            "cargo test",
+            Some(done(false, "exit 101 · boom", 0.0)),
+        ),
+        tool_step("read", "src/a.rs", Some(done(true, "20 lines", 0.0))),
+    ];
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| view(frame, &mut app))
+        .expect("render should succeed");
+    let lines = display_lines(&app);
+    assert!(
+        lines.iter().any(|l| l.contains("✗ bash cargo test")),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains("exit 101")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("tools ·")), "{lines:?}");
+
+    // A write/edit's diff always shows, so its run never folds.
+    app.transcript = vec![
+        tool_step("edit", "src/a.rs", Some(done(true, "applied", 0.0))),
+        tool_step("read", "src/b.rs", Some(done(true, "5 lines", 0.0))),
+    ];
+    let mut app2 = test_app();
+    app2.transcript = app.transcript;
+    let mut terminal2 = ratatui::Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal2
+        .draw(|frame| view(frame, &mut app2))
+        .expect("render should succeed");
+    let lines = display_lines(&app2);
+    assert!(
+        lines.iter().any(|l| l.contains("✓ edit src/a.rs")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("tools ·")), "{lines:?}");
+}
+
 #[test]
 fn tool_step_leads_with_status_then_name_and_puts_the_outcome_beneath() {
     let arg = render_tool_arg("read", "src/main.rs:1-20");
@@ -2581,7 +2829,7 @@ fn submitted_prompt_wraps_like_the_composer() {
         let mut app = test_app();
         super::super::render_user_prompt(&mut app, text);
         let block = &app.transcript[1];
-        let echo = wrap_block(block, w, false, false, false);
+        let echo = wrap_block(block, w, false, false);
         assert_eq!(
             echo.len(),
             composer.len(),
@@ -2789,7 +3037,7 @@ fn echoed_prompt_narrows_only_the_first_logical_line() {
     let mut app = test_app();
     super::super::render_user_prompt(&mut app, text);
     let block = &app.transcript[1];
-    let rows = wrap_block(block, 40, false, false, false);
+    let rows = wrap_block(block, 40, false, false);
     let row_text = |r: &Line<'static>| {
         r.spans
             .iter()
@@ -2826,7 +3074,7 @@ fn echoed_prompt_wraps_at_the_composer_content_width() {
     let mut app = test_app();
     super::super::render_user_prompt(&mut app, text);
     let block = &app.transcript[1];
-    let rows = wrap_block(block, 20, false, false, false);
+    let rows = wrap_block(block, 20, false, false);
     assert_eq!(
         composer.len(),
         rows.len(),
@@ -3144,15 +3392,13 @@ fn every_block_is_separated_by_one_blank_row() {
     terminal.draw(|f| view(f, &mut app)).unwrap();
     let rows: Vec<String> = app.display_cache.iter().map(row_text).collect();
     let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
-    // One blank row between every pair of blocks, steps included.
+    // One blank row between every pair of blocks; the two consecutive calls
+    // fold into ONE merged row (count indicator + Ctrl+O hint).
     assert_eq!(at("looking"), at("go") + 2, "{rows:?}");
-    assert_eq!(at("✓ read"), at("looking") + 2, "{rows:?}");
-    let steps: Vec<usize> = (0..rows.len())
-        .filter(|i| rows[*i].contains("✓ read"))
-        .collect();
-    // Each step is two rows (call + outcome), then the blank row.
-    assert_eq!(steps[1], steps[0] + 3, "{rows:?}");
-    assert_eq!(at("boom"), steps[1] + 3, "{rows:?}");
+    let folded = at("✓ 2 tools");
+    assert_eq!(folded, at("looking") + 2, "{rows:?}");
+    assert!(rows[folded].contains("read a.rs · read a.rs"), "{rows:?}");
+    assert_eq!(at("boom"), folded + 2, "{rows:?}");
     assert_eq!(at("note"), at("boom") + 2, "{rows:?}");
 }
 
@@ -3205,7 +3451,7 @@ fn settled_summary_reflects_how_the_turn_ended() {
             panic!("settled");
         };
         assert!(s.text.starts_with(text), "{}", s.text);
-        let rows = wrap_block(&app.transcript[0], 80, false, false, false);
+        let rows = wrap_block(&app.transcript[0], 80, false, false);
         assert_eq!(rows[0].spans.last().unwrap().style.fg, Some(color));
     }
 }
@@ -3221,13 +3467,9 @@ fn blink_of_thinking_renders_no_row_but_a_long_one_does() {
             started: Instant::now(),
             elapsed: Some(Duration::from_millis(ms)),
         };
-        assert_eq!(
-            wrap_block(&block, 80, false, false, false).len(),
-            rows,
-            "{ms}ms"
-        );
+        assert_eq!(wrap_block(&block, 80, false, false).len(), rows, "{ms}ms");
         // Ctrl+T always shows the text.
-        assert_eq!(wrap_block(&block, 80, true, false, false).len(), 1);
+        assert_eq!(wrap_block(&block, 80, true, false).len(), 1);
     }
 }
 
@@ -3288,7 +3530,7 @@ fn code_rows_carry_a_block_fill_that_pads_to_the_width() {
         crate::protocol::SinkLine::Assistant("```rust\nlet a = 1;\n```".into()),
     );
     super::super::flush_assistant(&mut app);
-    let rows = wrap_block(&app.transcript[0], 40, false, false, false);
+    let rows = wrap_block(&app.transcript[0], 40, false, false);
     let code = rows.iter().find(|r| row_text(r).contains("let a")).unwrap();
     assert_eq!(code.style.bg, Some(theme::code_bg()));
     assert_eq!(row_text(code).width(), 40, "fill pads to the full width");
@@ -3489,7 +3731,7 @@ fn lifecycle_and_error_rows_read_cleanly() {
         &mut app,
         crate::protocol::SinkLine::Error("provider returned 429".into()),
     );
-    let text = |i: usize| row_text(&wrap_block(&app.transcript[i], 80, false, false, false)[0]);
+    let text = |i: usize| row_text(&wrap_block(&app.transcript[i], 80, false, false)[0]);
     assert_eq!(text(0).trim(), "◈ explorer started · ab12");
     assert_eq!(text(1).trim(), "✗ provider returned 429");
 }
