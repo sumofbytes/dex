@@ -727,7 +727,12 @@ pub(crate) async fn run_turn_inner(
                     }
                 }
                 let event = match batch {
-                    SinkLine::Assistant(text) => StreamEvent::AssistantText(text),
+                    // Terminate the line so clients that concatenate events
+                    // (ACP, SSE consumers, `connect`) keep the markdown intact.
+                    SinkLine::Assistant(mut text) => {
+                        text.push('\n');
+                        StreamEvent::AssistantText(text)
+                    }
                     SinkLine::Thinking(text) => StreamEvent::Thinking(text),
                     SinkLine::ToolInput { id, input } => {
                         let mut parts = input.splitn(2, ' ');
