@@ -862,8 +862,11 @@ pub fn child_system_prompt(def: &AgentDefinition) -> String {
 /// turn's sink pump (`daemon/turn.rs`): providers emit one sink line per
 /// thinking token, and each event costs a seq bump, a journal append, and
 /// an SSE write. Thinking deltas join verbatim; Assistant events are
-/// complete markdown lines and join with `'\n'`. A non-coalescing event
-/// flushes the held tail first, so line order never changes.
+/// complete markdown lines and join with `'\n'`. Each `AssistantText` is
+/// newline-terminated exactly like the parent's (`batch_stream_event`,
+/// `daemon/turn.rs`), so a client concatenating events keeps markdown
+/// intact. A non-coalescing event flushes the held tail first, so line
+/// order never changes.
 fn forward_coalesced(
     event: StreamEvent,
     coalescing: bool,
@@ -872,9 +875,9 @@ fn forward_coalesced(
 ) {
     if !coalescing {
         if let Some(held) = pending.take() {
-            emit(held);
+            emit_terminated(held, emit);
         }
-        emit(event);
+        emit_terminated(event, emit);
         return;
     }
     match (pending, event) {
@@ -887,10 +890,24 @@ fn forward_coalesced(
         }
         (held, event) => {
             if let Some(held) = held.take() {
-                emit(held);
+                emit_terminated(held, emit);
             }
             *held = Some(event);
         }
+    }
+}
+
+/// Newline-terminate an `AssistantText` at emit time — the same wire shape
+/// the parent sink pump ships (`batch_stream_event`, `daemon/turn.rs`). The
+/// terminator must land here and not on the held buffer: terminating early
+/// would leave `\n\n` when another assistant line joins the hold later.
+fn emit_terminated(event: StreamEvent, emit: &mut dyn FnMut(StreamEvent)) {
+    match event {
+        StreamEvent::AssistantText(mut text) => {
+            text.push('\n');
+            emit(StreamEvent::AssistantText(text));
+        }
+        other => emit(other),
     }
 }
 
