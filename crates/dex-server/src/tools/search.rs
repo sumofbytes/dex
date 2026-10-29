@@ -466,7 +466,12 @@ fn fuzzy_variants(token: &str) -> Option<Regex> {
 
 /// Fuzzy retry after zero exact matches: up to 3 matches per file, files in
 /// path order — the shapes the old engine's fallback produced.
-fn fuzzy_retry(root: &Path, rels: &[String], terms: &[Term], head_limit: usize) -> Vec<FileHit> {
+fn fuzzy_retry(
+    root: &Path,
+    files: &[&ScannedPath],
+    terms: &[Term],
+    head_limit: usize,
+) -> Vec<FileHit> {
     let mut fuzzy_terms = Vec::new();
     for t in terms {
         match fuzzy_variants(&t.raw) {
@@ -478,13 +483,16 @@ fn fuzzy_retry(root: &Path, rels: &[String], terms: &[Term], head_limit: usize) 
         }
     }
     let mut out = Vec::new();
-    for rel in rels {
-        if let Some(mut hit) = grep_file(root, rel, &fuzzy_terms, 0) {
+    for chunk in files.chunks(GREP_CHUNK) {
+        for mut hit in grep_chunk(root, chunk, &fuzzy_terms, 0)
+            .into_iter()
+            .flatten()
+        {
             hit.hits.truncate(3);
             hit.saturated = false;
             out.push(hit);
             if out.len() >= head_limit {
-                break;
+                return out;
             }
         }
     }
@@ -600,8 +608,7 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
     if file_offset > 0 {
         return Ok("0 matches.".to_string());
     }
-    let rels: Vec<String> = files.iter().map(|sp| sp.rel.clone()).collect();
-    let fuzzy = fuzzy_retry(&root, &rels, &parsed.terms, head_limit);
+    let fuzzy = fuzzy_retry(&root, &files, &parsed.terms, head_limit);
     if fuzzy.is_empty() {
         return Ok("0 matches.".to_string());
     }
