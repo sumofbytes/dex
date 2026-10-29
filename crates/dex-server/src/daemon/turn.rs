@@ -180,7 +180,6 @@ fn batch_stream_event(batch: SinkLine) -> StreamEvent {
 }
 
 /// Run one agent turn with the session's directory as its workspace, so tools,
-
 /// prompt files and skills resolve there rather than in the daemon's cwd.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_turn(
