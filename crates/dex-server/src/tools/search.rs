@@ -34,7 +34,7 @@ const MAX_MATCHES_PER_FILE: usize = 10;
 const HAS_GLOB: fn(&str) -> bool = |t: &str| t.chars().any(|c| matches!(c, '*' | '?' | '['));
 
 fn query_arg(args: &Map<String, Value>) -> Result<String, ToolError> {
-    // `pattern` keeps dex's search-tool convention; `query` matches fff's.
+    // `pattern` keeps dex's search-tool convention; `query` is the alias.
     let query = arg_str(args, "pattern").or_else(|_| arg_str(args, "query"))?;
     if query.trim().is_empty() {
         return Err(ToolError::InvalidArgument(
@@ -177,14 +177,39 @@ impl Term {
 }
 
 /// Translate one glob token into an anchored path regex: `**/` walks any
-/// number of directories (including none), `*`/`?` stay within a segment.
+/// number of directories (including none), `*`/`?` stay within a segment,
+/// `[a-z]`/`[!a-z]` are character classes. A token without `/` matches at
+/// any depth (`*.rs` hits `src/a.rs`).
 fn glob_regex(tok: &str) -> Option<Regex> {
     let mut re = String::from("^");
+    if !tok.contains('/') {
+        re.push_str("(?:.*/)?");
+    }
     let mut chars = tok.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '[' => {
+                let rest: String = chars.clone().collect();
+                match rest.find(']').filter(|&i| i > 0) {
+                    Some(i) => {
+                        let class = &rest[..i];
+                        let (neg, class) = match class.strip_prefix('!') {
+                            Some(c) => ("^", c),
+                            None => ("", class),
+                        };
+                        re.push('[');
+                        re.push_str(neg);
+                        re.push_str(&class.replace('\\', "\\\\").replace('[', "\\["));
+                        re.push(']');
+                        for _ in 0..rest[..=i].chars().count() {
+                            chars.next();
+                        }
+                    }
+                    None => re.push_str("\\["),
+                }
+            }
             '*' => {
-                if chars.next() == Some('*') {
+                if chars.next_if(|&n| n == '*').is_some() {
                     if chars.next_if(|&n| n == '/').is_some() {
                         re.push_str("(?:.*/)?");
                     } else {
@@ -471,6 +496,7 @@ fn fuzzy_retry(
     files: &[&ScannedPath],
     terms: &[Term],
     head_limit: usize,
+    deadline: Instant,
 ) -> Vec<FileHit> {
     let mut fuzzy_terms = Vec::new();
     for t in terms {
@@ -484,6 +510,9 @@ fn fuzzy_retry(
     }
     let mut out = Vec::new();
     for chunk in files.chunks(GREP_CHUNK) {
+        if Instant::now() >= deadline {
+            break;
+        }
         for mut hit in grep_chunk(root, chunk, &fuzzy_terms, 0)
             .into_iter()
             .flatten()
@@ -541,10 +570,12 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
     let mut next_offset: Option<usize> = None;
     let mut shown: Vec<String> = Vec::new();
     let deadline = Instant::now() + GREP_TIME_BUDGET;
+    let mut timed_out = false;
 
     'scan: for chunk in files.chunks(GREP_CHUNK) {
         if Instant::now() >= deadline {
             next_offset = Some(matched_seen.max(file_offset));
+            timed_out = true;
             break;
         }
         for hit in grep_chunk(&root, chunk, &parsed.terms, context)
@@ -558,6 +589,7 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
             if shown_files >= head_limit || Instant::now() >= deadline {
                 // First unshown matched file = the resume index.
                 next_offset = Some(matched_seen - 1);
+                timed_out = shown_files < head_limit;
                 break 'scan;
             }
             shown_files += 1;
@@ -605,10 +637,16 @@ pub(crate) fn tool_ffgrep(args: &Map<String, Value>) -> Result<String, ToolError
     // honest empty page (the remaining files don't match); fuzzy retry
     // would resurface files from before the offset. Otherwise retry as
     // fuzzy before giving up.
+    if timed_out {
+        return Ok(format!(
+            "0 matches found before the {}s time budget ran out; narrow the query with a path scope.",
+            GREP_TIME_BUDGET.as_secs()
+        ));
+    }
     if file_offset > 0 {
         return Ok("0 matches.".to_string());
     }
-    let fuzzy = fuzzy_retry(&root, &files, &parsed.terms, head_limit);
+    let fuzzy = fuzzy_retry(&root, &files, &parsed.terms, head_limit, deadline);
     if fuzzy.is_empty() {
         return Ok("0 matches.".to_string());
     }
@@ -795,3 +833,44 @@ pub(crate) fn complete_paths(query: &str, limit: usize) -> Result<Vec<PathMatch>
 /// every grep/find walks fresh, so fixture files are visible immediately.
 #[cfg(test)]
 pub(crate) fn rescan() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn globs(tok: &str, path: &str) -> bool {
+        glob_regex(tok).unwrap().is_match(path)
+    }
+
+    #[test]
+    fn glob_single_star_keeps_following_char() {
+        assert!(globs("*.rs", "a.rs"));
+        assert!(globs("*.rs", "src/a.rs"));
+        assert!(!globs("*.rs", "foors"));
+        assert!(globs("src/*/mod.rs", "src/a/mod.rs"));
+        assert!(!globs("src/*/mod.rs", "src/foomod.rs"));
+    }
+
+    #[test]
+    fn glob_double_star_and_anchoring() {
+        assert!(globs("src/**/*.rs", "src/a.rs"));
+        assert!(globs("src/**/*.rs", "src/x/y/a.rs"));
+        assert!(!globs("src/*.rs", "lib/src/a.rs"));
+    }
+
+    #[test]
+    fn glob_character_classes() {
+        assert!(globs("file[0-9].txt", "file3.txt"));
+        assert!(!globs("file[!0-9].txt", "file3.txt"));
+        assert!(globs("src/[id]/page.tsx", "src/i/page.tsx"));
+        assert!(globs("a[b", "a[b"));
+    }
+
+    #[test]
+    fn fuzzy_variants_catch_transposition_and_deletion() {
+        let re = fuzzy_variants("config").unwrap();
+        assert!(re.is_match("let cofnig = 1"));
+        assert!(re.is_match("let confg = 1"));
+        assert!(fuzzy_variants("ab").is_none());
+    }
+}

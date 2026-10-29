@@ -1305,7 +1305,7 @@ async fn ffgrep_scope_and_exclude_narrow_the_search() {
     let pid = std::process::id();
     let root = std::env::current_dir()
         .unwrap()
-        .join(format!("dex-fff-scope-{pid}"));
+        .join(format!("dex-search-scope-{pid}"));
     fs::create_dir_all(&root).unwrap();
     let needle = format!("SCOPETOKEN_{pid}");
     fs::write(root.join("in.rs"), format!("{needle}\n")).unwrap();
@@ -1315,7 +1315,7 @@ async fn ffgrep_scope_and_exclude_narrow_the_search() {
     let mut args = Map::new();
     args.insert(
         "pattern".into(),
-        Value::String(format!("dex-fff-scope-{pid} {needle} !skip")),
+        Value::String(format!("dex-search-scope-{pid} {needle} !skip")),
     );
     let outcome = execute_outcome(
         "ffgrep",
