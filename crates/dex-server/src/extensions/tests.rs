@@ -39,6 +39,15 @@ impl ExtensionManager {
     }
 }
 
+/// Drops the process-wide config cache on drop, so a failed assert cannot
+/// leave a test's temp config cached for later tests.
+struct ConfigCacheReset;
+impl Drop for ConfigCacheReset {
+    fn drop(&mut self) {
+        crate::llm::config::invalidate_config_cache();
+    }
+}
+
 /// Restore env vars on drop: the tests below set XDG/DEX vars and must
 /// not leak them into other tests in the process (single-threaded runs
 /// especially — env is global and never restored otherwise).
@@ -663,10 +672,14 @@ fn config_paths_reach_discovery_as_user_scope() {
     let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // Declared before `_env`, so it drops after the env is restored.
+    let _cache = ConfigCacheReset;
     let _env = EnvRestore::take(&["XDG_CONFIG_HOME", "XDG_DATA_HOME", "DEX_EXTENSIONS_PATHS"]);
     let root = std::env::temp_dir().join(format!("dex-ext-cfgpaths-{}", std::process::id()));
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("XDG_DATA_HOME", root.join("data"));
+    // The config is cached process-wide: drop whatever an earlier test cached.
+    crate::llm::config::invalidate_config_cache();
     let cfg_dir = root.join("config/dex");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(

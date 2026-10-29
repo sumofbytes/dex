@@ -428,6 +428,9 @@ mod tests {
         let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // `ExtensionManager::reset_for_tests` clears the active profile; hold
+        // the manager lock so it cannot do that mid-test.
+        let _ext = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK.blocking_lock();
         set_active_profile(None);
         let prev_config = std::env::var_os("DEX_CONFIG");
         let profile_rows = |body: &str| {
@@ -468,6 +471,16 @@ mod tests {
         crate::llm::config::invalidate_config_cache();
     }
 
+    /// Clears the process-global active profile and config cache on drop, so
+    /// a failed assert cannot leak either into later tests.
+    struct ProfileTestReset;
+    impl Drop for ProfileTestReset {
+        fn drop(&mut self) {
+            set_active_profile(None);
+            crate::llm::config::invalidate_config_cache();
+        }
+    }
+
     /// `dex.activate_profile` stores the name; the next resolution validates
     /// it against the config's profiles and applies on match.
     #[test]
@@ -475,7 +488,13 @@ mod tests {
         let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_config = std::env::var_os("DEX_CONFIG");
+        // `ExtensionManager::reset_for_tests` clears the active profile; hold
+        // the manager lock so it cannot do that mid-test.
+        let _ext = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK.blocking_lock();
+        // Dropped after the env guard below: the profile and config cache
+        // are cleared even when an assert panics, once DEX_CONFIG is back.
+        let _reset = ProfileTestReset;
+        let _env = crate::test_env::EnvGuard(vec![("DEX_CONFIG", std::env::var_os("DEX_CONFIG"))]);
         let dir = test_config_file("harness_profiles:\n  lean:\n    trigger: never\n");
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
         crate::llm::config::invalidate_config_cache();
@@ -487,11 +506,6 @@ mod tests {
         set_active_profile(None);
         let (_, rows) = resolve_snapshot_with_origins();
         assert!(rows.iter().all(|r| r.profile.is_none()));
-        match prev_config {
-            Some(v) => std::env::set_var("DEX_CONFIG", v),
-            None => std::env::remove_var("DEX_CONFIG"),
-        }
-        crate::llm::config::invalidate_config_cache();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
