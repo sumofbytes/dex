@@ -715,7 +715,7 @@ fn diff_stat(diff: Option<&str>) -> Option<(usize, usize)> {
 }
 
 /// A grep content-mode row is a match when shaped `path:123:text`; context
-/// rows print `path:123-text`, and fff's fuzzy fallback prints `  12: code`
+/// rows print `path:123-text`, and the grep fuzzy fallback prints `  12: code`
 /// under a bare path header (matches too). Trailers start `[...`.
 fn grep_match_line(line: &str) -> bool {
     if line.starts_with("[...") {

@@ -92,7 +92,13 @@ axum = "0.8"
   tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "process", "time", "io-util", "signal"] }
 futures-core = "0.3"
 uuid = { version = "1", features = ["v4"] }
-fff = { package = "fff-search", version = "0.10.6", features = ["definitions"] }
+# grep/find: a fresh gitignore-respecting walk over the workspace per query
+# (`ignore`) plus the `regex` engine. No search index or filesystem watcher —
+# an index buys millisecond warm-cache searches but costs a heavyweight
+# dependency subtree (libgit2, LMDB, notify, SIMD crates) and its compile
+# time; agents are ramping between turns anyway.
+ignore = "0.4"
+regex = "1"
 # MCP OAuth login (PKCE S256 + base64url): tiny, audited, std-only otherwise.
 base64 = "0.23"
 sha2 = "0.11"

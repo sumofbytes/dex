@@ -18,14 +18,14 @@ schema):
 | `bash`             | Run a shell command via `sh -c` (`command`).                                                                                                                                                                                                                             |
 | `write`            | Write/overwrite a file (`path`, `content`, optional `then_run`).                                                                                                                                                                                                         |
 | `edit`             | Replace text (`path` + `edits[]` of `{oldText, newText}` entries, optional batch-wide `replaceAll`, `then_run`). A legacy single `oldText`/`newText` pair — and `edits` serialized as a JSON string — is accepted and repaired into the batch. Matching tolerates indentation, trailing whitespace, and quote/dash variants. |
-| `grep`             | Fast frecency-ranked content search (fff engine): regex or plain text, typo-tolerant fuzzy fallback, respects `.gitignore` (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
-| `find`             | Fuzzy frecency-ranked file-path search (fff engine, typo-tolerant) (`pattern`, `limit`).                                                                                                                                                                                 |
+| `grep`             | Fast content search: regex or plain text, respects `.gitignore`, supports path scopes/excludes (`'src/ TODO'`, `'TODO !tests/'`), typo-tolerant fuzzy fallback (`pattern`, `output_mode`, `file_offset`); truncated results end with a counted `[... more exist ...]` trailer naming the next `file_offset`. |
+| `find`             | Fuzzy file-path search (respects `.gitignore`, typo-tolerant) (`pattern`, `limit`).                                                                                                                                    |
 | `ls`               | List files and directories (`path`, default `.`).                                                                                                                                                                                                                        |
 | `delegate`*        | Sub-agents via `action`: `spawn` a background child (`explorer`/`reviewer`/`tester`; `resume_from` continues one, `model` overrides — else inherits; resume keeps prior pick), `wait` (bounded, ≤120 s) fetches its result, `stop` cancels it, `list` shows this session's children (live, finished, interrupted on-disk), `send` delivers a message to one — `steer` injects it into a running child's next model call, `follow_up` queues its next turn, and a finished child continues with its history intact (new generation, full budget). Daemon sessions only. |
 
 The model-facing schema registers `grep` and `find`; both are also dispatched
-under their fff-engine names, `ffgrep`/`fffind` (so `dex run ffgrep …` works
-too).
+under their compatibility alias names, `ffgrep`/`fffind` (so `dex run ffgrep …`
+works too).
 
 `*` daemon sessions only (sub-agents); the default native schema is 7 tools.
 Tool results are truncated before being

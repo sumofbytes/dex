@@ -1300,6 +1300,43 @@ async fn ffgrep_without_matches_is_success() {
 }
 
 #[tokio::test]
+async fn ffgrep_scope_and_exclude_narrow_the_search() {
+    // Tokens like `dir/` scope the search; `!name` (or a glob) excludes.
+    let pid = std::process::id();
+    let root = std::env::current_dir()
+        .unwrap()
+        .join(format!("dex-fff-scope-{pid}"));
+    fs::create_dir_all(&root).unwrap();
+    let needle = format!("SCOPETOKEN_{pid}");
+    fs::write(root.join("in.rs"), format!("{needle}\n")).unwrap();
+    fs::write(root.join("skip.rs"), format!("{needle}\n")).unwrap();
+    super::search::rescan();
+
+    let mut args = Map::new();
+    args.insert(
+        "pattern".into(),
+        Value::String(format!("dex-fff-scope-{pid} {needle} !skip")),
+    );
+    let outcome = execute_outcome(
+        "ffgrep",
+        &args,
+        &GlobalCancellation,
+        &Policy::trusted(),
+        None,
+    )
+    .await;
+    assert!(outcome.ok, "{}", outcome.text);
+    assert!(outcome.text.contains("in.rs"), "{}", outcome.text);
+    assert!(
+        !outcome.text.contains("skip.rs"),
+        "exclude must drop the file: {}",
+        outcome.text
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn fffind_finds_paths_fuzzily() {
     super::search::rescan();
     let mut args = Map::new();
