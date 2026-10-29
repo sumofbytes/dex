@@ -332,7 +332,7 @@ pub(crate) async fn list_skills() -> Json<serde_json::Value> {
 }
 
 /// `GET /api/files?q=<query>&limit=<n>`: fuzzy file + folder candidates for
-/// the composer's `@` popup, served from the same fff index as `find`/`grep`.
+/// the composer's `@` popup, from the same search as `find`/`grep`.
 /// `&session=<id>` searches that session's directory instead of the daemon's.
 pub(crate) async fn list_files(
     State(state): State<Arc<DaemonState>>,

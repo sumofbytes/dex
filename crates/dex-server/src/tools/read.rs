@@ -225,8 +225,8 @@ pub(crate) async fn expand_glob_in(root: &Path, glob: &str) -> Result<Vec<PathBu
     // `find` command through `run_bash`, so a `'` or space in the pattern
     // broke the command — and every call paid the sh spawn + drain tasks +
     // 120 s-timeout machinery for a sub-second directory walk. `find` itself
-    // stays on Unix (exact `-prune`/`-path` semantics; serving from the fff index
-    // would miss files never read, and a hand-rolled matcher would drift
+    // stays on Unix (exact `-prune`/`-path` semantics; serving from a search
+    // index would miss files never read, and a hand-rolled matcher would drift
     // from `find`); only the wrapping changes. Windows has no usable `find`
     // (System32 `find.exe` takes different flags), so it uses the native
     // walk below directly.

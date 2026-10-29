@@ -249,7 +249,8 @@ async fn dispatch_tool(
             .await
             .map_err(ToolError::Internal);
     }
-    // fff owns its threads + lock; run inside spawn_blocking (10s grep budget stays).
+    // grep/find walk synchronously (10 s in-tool budget); keep them off
+    // the async runtime with spawn_blocking.
     if matches!(name, "grep" | "ffgrep" | "find" | "fffind") {
         let name_owned = name.to_string();
         let args_owned = args.clone();
@@ -258,7 +259,7 @@ async fn dispatch_tool(
             _ => tool_fffind(&args_owned),
         })
         .await
-        .unwrap_or(Err(ToolError::Internal("fff worker panicked".into())));
+        .unwrap_or(Err(ToolError::Internal("search worker panicked".into())));
     }
     match name {
         "read" => tool_read(args).await,

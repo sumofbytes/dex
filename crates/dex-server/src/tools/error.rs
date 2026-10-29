@@ -22,8 +22,7 @@ pub enum ToolError {
         output: String,
         code: Option<i32>,
     },
-    /// An internal tool-engine failure (not a bad invocation, not a shell
-    /// exit): e.g. the fff index failed to initialize.
+    /// A search walk failed to run (workspace root missing).
     Internal(String),
     /// The permission policy refused the call before it ran: a read-only
     /// rejection, a user deny, an unanswered approval (approver gone), or
