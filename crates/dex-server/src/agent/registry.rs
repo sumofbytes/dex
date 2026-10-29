@@ -428,6 +428,9 @@ mod tests {
         let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // `ExtensionManager::reset_for_tests` clears the active profile; hold
+        // the manager lock so it cannot do that mid-test.
+        let _ext = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK.blocking_lock();
         set_active_profile(None);
         let prev_config = std::env::var_os("DEX_CONFIG");
         let profile_rows = |body: &str| {
@@ -475,6 +478,9 @@ mod tests {
         let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // `ExtensionManager::reset_for_tests` clears the active profile; hold
+        // the manager lock so it cannot do that mid-test.
+        let _ext = crate::extensions::tests::TEST_GLOBAL_MANAGER_LOCK.blocking_lock();
         let prev_config = std::env::var_os("DEX_CONFIG");
         let dir = test_config_file("harness_profiles:\n  lean:\n    trigger: never\n");
         std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));

@@ -667,6 +667,8 @@ fn config_paths_reach_discovery_as_user_scope() {
     let root = std::env::temp_dir().join(format!("dex-ext-cfgpaths-{}", std::process::id()));
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("XDG_DATA_HOME", root.join("data"));
+    // The config is cached process-wide: drop whatever an earlier test cached.
+    crate::llm::config::invalidate_config_cache();
     let cfg_dir = root.join("config/dex");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(
@@ -700,6 +702,7 @@ fn config_paths_reach_discovery_as_user_scope() {
     std::env::remove_var("DEX_EXTENSIONS_PATHS");
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all("/tmp/dex-ext-cfgpaths-extra").ok();
+    crate::llm::config::invalidate_config_cache();
 }
 
 #[test]
