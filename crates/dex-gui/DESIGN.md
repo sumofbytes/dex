@@ -144,3 +144,8 @@ Stroke icons on a 24px grid, stroke 1.6, round caps and joins, drawn as inline S
 - Separate with hairlines (#433b3b), not card backgrounds. Cards are only for code blocks and dialogs.
 - Tool output sits under a 2px left rule. Code gets a label and a surface. Bubbles are used only for the user's message.
 - The primary action is the accent button. Everything else is outline or ghost.
+
+## Thought
+
+- Live: spinner + "Thinking" (14px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 13px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (15px / 22px, faint). Click the row or Ctrl+T.
+- Transcript rhythm: 16 between blocks, 32 around a user message, 20 from tools to the reply, 8 from a thought row to its text, tool and thought rows 20 tall.

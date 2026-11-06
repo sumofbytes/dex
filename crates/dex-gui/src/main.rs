@@ -176,6 +176,8 @@ fn busy(s: &mut State) {
     s.items.push(Item::Thinking {
         text: "Checking how the client handles reconnects…".into(),
         open: true,
+        started: None,
+        secs: None,
     });
     s.queue.push(state::Queued {
         text: "also add a regression test".into(),
@@ -184,6 +186,38 @@ fn busy(s: &mut State) {
     s.queue.push(state::Queued {
         text: "then update the docs".into(),
         followup: true,
+    });
+}
+
+/// A finished thought, collapsed or open, then tools and the reply (`DEX_GUI_OPEN=1` opens it).
+fn thought_scene(s: &mut State) {
+    sample(s);
+    let open = std::env::var_os("DEX_GUI_OPEN").is_some();
+    s.items.clear();
+    s.items.push(Item::User(
+        "can you read me readme and tell me if we are good".into(),
+    ));
+    s.items.push(Item::Thinking {
+        text: "This isn't the dex repo at all. I'm in a different project, dex-gui, a spike GUI client. There's no README here.".into(),
+        open,
+        started: None,
+        secs: Some(4),
+    });
+    s.items.push(Item::Tool(ToolRun {
+        id: "1".into(),
+        name: "ls".into(),
+        args: ".".into(),
+        done: Some(ToolDone {
+            summary: "6 entries".into(),
+            ok: true,
+            preview: vec![],
+            secs: 0.1,
+        }),
+        open: false,
+    }));
+    s.items.push(Item::Assistant {
+        text: "Turns out I'm not in the dex repo. I'm in a separate spike project called dex-gui.\n\n- `Cargo.toml`: a standalone workspace\n- `src/`: main.rs, state.rs\n\nWhich would you like?".into(),
+        streaming: false,
     });
 }
 
@@ -326,6 +360,7 @@ fn main() {
             ("chat", sample),
             ("home", home_scene),
             ("busy", busy),
+            ("thought", thought_scene),
             ("many", many),
             ("long", long),
             ("real", real),

@@ -98,6 +98,9 @@ pub enum Item {
     Thinking {
         text: String,
         open: bool,
+        /// When the first chunk arrived; `secs` is set once something else follows it.
+        started: Option<std::time::Instant>,
+        secs: Option<u64>,
     },
     Tool(ToolRun),
     Notice(String),
@@ -427,7 +430,22 @@ impl State {
         }
     }
 
+    /// Stamps the trailing thought with how long it took, once something else follows it.
+    fn finish_thinking(&mut self) {
+        if let Some(Item::Thinking {
+            started: Some(t),
+            secs: secs @ None,
+            ..
+        }) = self.items.last_mut()
+        {
+            *secs = Some(t.elapsed().as_secs());
+        }
+    }
+
     pub fn apply_event(&mut self, ev: StreamEvent) {
+        if !matches!(ev, StreamEvent::Thinking(_)) {
+            self.finish_thinking();
+        }
         match ev {
             StreamEvent::UserPrompt { content } => self.items.push(Item::User(content)),
             StreamEvent::AssistantText(t) => {
@@ -448,6 +466,8 @@ impl State {
                     self.items.push(Item::Thinking {
                         text: t,
                         open: false,
+                        started: Some(std::time::Instant::now()),
+                        secs: None,
                     });
                 }
             }

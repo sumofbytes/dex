@@ -3,7 +3,7 @@
 use dex_client::protocol::ApprovalDecision;
 use rune::{Cx, El, ScrollSpec, TextStyle, col, el, row, spacer, text, text_input};
 use rune_kit::markdown::Markdown;
-use rune_kit::{Button, ButtonVariant, Collapsible, IconButton, IconButtonVariant, Kit, Spinner};
+use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons;
 
 use crate::state::{Cmd, Item, Page, State, VTab};
@@ -162,7 +162,7 @@ fn human(n: u64) -> String {
 
 fn transcript(s: &State, k: &Kit) -> El {
     // Text leads: items sit 14 points apart, and a turn's user message gets a little more room.
-    let mut list = col().w_full().max_w(COLUMN).gap(14.0).py(16.0).px(16.0);
+    let mut list = col().w_full().max_w(COLUMN).gap(16.0).py(16.0).px(16.0);
     if s.items.is_empty() {
         list = list.child(
             col()
@@ -191,8 +191,15 @@ fn transcript(s: &State, k: &Kit) -> El {
         }
         let live = s.busy && i + 1 == s.items.len();
         let mut el = item(i, &s.items[i], k, live).key(format!("item{i}"));
-        if i > 0 && matches!(s.items[i], Item::User(_)) {
-            el = col().w_full().gap(0.0).child(el.pt(8.0));
+        // Rhythm: 16 between blocks; +16 around a user message (32), +4 from tools to the reply (20).
+        if i > 0 && (matches!(s.items[i], Item::User(_)) || matches!(s.items[i - 1], Item::User(_)))
+        {
+            el = col().w_full().gap(0.0).child(el.pt(16.0));
+        } else if i > 0
+            && matches!(s.items[i], Item::Assistant { .. })
+            && matches!(s.items[i - 1], Item::Tool(_))
+        {
+            el = col().w_full().gap(0.0).child(el.pt(4.0));
         }
         list = list.child(el);
         i += 1;
@@ -220,7 +227,7 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
     let label = format!("Ran {n} command{}", if n == 1 { "" } else { "s" });
     let head = row()
         .key(format!("tools{start}"))
-        .h(22.0)
+        .h(20.0)
         .gap(6.0)
         .items_center()
         .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
@@ -246,6 +253,60 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
     group
 }
 
+/// A model thought. Live: spinner + "Thinking", open while it streams. Done: the same quiet row
+/// as a tool group (`› Thought · 4s`), collapsed; opening it only turns the chevron and shows
+/// the text below.
+fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: bool) -> El {
+    let head = row()
+        .key(format!("thought{i}"))
+        .h(20.0)
+        .gap(6.0)
+        .items_center();
+    let mut group = col().w_full().gap(8.0);
+    if live {
+        group = group.child(
+            head.child(Spinner::new().size(12.0).build(k)).child(
+                text("Thinking")
+                    .font(k.ty.body_medium)
+                    .color(k.c.text_muted),
+            ),
+        );
+    } else {
+        let chevron = if open {
+            &crate::icons::DOWN
+        } else {
+            &crate::icons::RIGHT
+        };
+        let label = match secs {
+            Some(n) if n >= 1 => format!("Thought · {n}s"),
+            _ => "Thought".to_string(),
+        };
+        group = group.child(
+            k.interactive(
+                head.child(rune::icon(chevron, 12.0).color(k.c.text_faint))
+                    .child(text(label).font(k.ty.small).color(k.c.text_faint)),
+            )
+            .on_press(move |s: &mut State| {
+                if let Some(Item::Thinking { open, .. }) = s.items.get_mut(i) {
+                    *open = !*open;
+                }
+            }),
+        );
+    }
+    if open || live {
+        group = group.child(
+            text(text_.to_string())
+                .font(rune::TextStyle {
+                    size: 15.0,
+                    ..k.ty.ui.lh(22.0)
+                })
+                .color(k.c.text_faint)
+                .wrap(),
+        );
+    }
+    group
+}
+
 fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
     match it {
         Item::User(t) => row().w_full().justify_end().child(
@@ -261,16 +322,12 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
             .streaming(*streaming)
             .build(k)
             .w_full(),
-        Item::Thinking { text: t, open } => {
-            Collapsible::new(if live { "Thinking" } else { "Thought" }, *open)
-                .child(text(t.clone()).font(k.ty.ui).color(k.c.text_muted))
-                .on_toggle(move |s: &mut State| {
-                    if let Some(Item::Thinking { open, .. }) = s.items.get_mut(i) {
-                        *open = !*open;
-                    }
-                })
-                .build(k)
-        }
+        Item::Thinking {
+            text: t,
+            open,
+            secs,
+            ..
+        } => thought(i, k, t, *open, *secs, live),
         Item::Tool(t) => {
             // A compact row, as in the transcript design: the tool's name, its arguments and the
             // duration. Its output follows dimmed under a `↳`: the first line when closed, all of it
