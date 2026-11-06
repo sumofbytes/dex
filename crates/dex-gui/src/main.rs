@@ -172,7 +172,63 @@ fn home_scene(s: &mut State) {
     s.page = state::Page::Home;
 }
 
+/// Where the detached GUI's output goes: `$XDG_CACHE_HOME/dex/gui.log` (default `~/.cache`).
+fn log_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("dex");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("gui.log"))
+}
+
+/// Like `code .`: relaunch ourselves in the background and return to the shell. Skipped with
+/// any argument (`-f`, `--snap`, … stay in the foreground), with `DEX_GUI_FOREGROUND`, and in
+/// the relaunched child itself.
+fn detach() {
+    use std::process::{Command, Stdio};
+    if std::env::args().len() > 1
+        || std::env::var_os("DEX_GUI_DETACHED").is_some()
+        || std::env::var_os("DEX_GUI_FOREGROUND").is_some()
+    {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let (out, err) = match log_path().and_then(|p| {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()?;
+        Some((f.try_clone().ok()?, f))
+    }) {
+        Some((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        None => (Stdio::null(), Stdio::null()),
+    };
+    let mut cmd = Command::new(exe);
+    cmd.env("DEX_GUI_DETACHED", "1")
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // own group: a closed terminal's SIGHUP/Ctrl-C do not reach it
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | NEW_PROCESS_GROUP
+    }
+    if cmd.spawn().is_ok() {
+        std::process::exit(0);
+    }
+}
+
 fn main() {
+    detach();
     rune::run(AppSpec::<State> {
         scenes: &[
             ("chat", sample),
