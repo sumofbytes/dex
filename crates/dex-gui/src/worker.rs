@@ -1,0 +1,199 @@
+//! Background thread: embedded (or remote) daemon plus a tokio loop that executes `Cmd`s and
+//! posts `Msg`s for the UI thread.
+
+use std::sync::Arc;
+
+use dex_client::protocol::StreamEvent;
+use dex_client::{ChatOptions, DaemonClient};
+use rune::Waker;
+use tokio::sync::mpsc;
+
+use crate::state::{Cmd, Inbox, Info, Msg};
+
+/// Run the dex daemon on a background thread of this process, on a pre-bound loopback port.
+fn start_embedded_daemon() -> std::io::Result<std::net::SocketAddr> {
+    dex_server::agent::delegate::set_daemon_linked(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio");
+        rt.block_on(async {
+            if let Err(e) = dex_server::daemon::run_daemon(listener).await {
+                eprintln!("daemon error: {e}");
+            }
+        });
+    });
+    Ok(addr)
+}
+
+pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio");
+        rt.block_on(async move {
+            let post = |m: Msg| {
+                inbox.0.lock().unwrap().push(m);
+                wake();
+            };
+            let url = match std::env::var("DEX_GUI_URL") {
+                Ok(url) => url,
+                Err(_) => match start_embedded_daemon() {
+                    Ok(addr) => format!("http://{addr}"),
+                    Err(e) => return post(Msg::Status(format!("embedded daemon failed: {e}"))),
+                },
+            };
+            let client = match DaemonClient::new(&url) {
+                Ok(c) => c,
+                Err(e) => return post(Msg::Status(format!("bad url: {e}"))),
+            };
+            if let Err(e) = client
+                .wait_until_ready_async(std::time::Duration::from_secs(15))
+                .await
+            {
+                return post(Msg::Status(format!("daemon not ready: {e}")));
+            }
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            match client.get_config_async().await {
+                Ok(c) => post(Msg::Ready(Info {
+                    provider: c.provider,
+                    model: c.model,
+                    models: c.available_models,
+                    permission: c.permission,
+                    cwd: if c.cwd.is_empty() { cwd.clone() } else { c.cwd },
+                    branch: c.git_branch,
+                })),
+                Err(e) => post(Msg::Status(format!("config: {e}"))),
+            }
+            refresh(&client, &post).await;
+
+            let mut session: Option<String> = None;
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    Cmd::NewSession => {
+                        session = None;
+                        post(Msg::Opened {
+                            id: String::new(),
+                            replay: Vec::new(),
+                        });
+                    }
+                    Cmd::Open(id) => match replay(&client, &id).await {
+                        Ok(events) => {
+                            session = Some(id.clone());
+                            post(Msg::Opened { id, replay: events });
+                        }
+                        Err(e) => post(Msg::Status(format!("open failed: {e}"))),
+                    },
+                    Cmd::Send {
+                        text,
+                        model,
+                        permission,
+                    } => {
+                        let id = match &session {
+                            Some(id) => id.clone(),
+                            None => match client.create_session_async(&cwd, None).await {
+                                Ok(r) => {
+                                    session = Some(r.session_id.clone());
+                                    post(Msg::Opened {
+                                        id: r.session_id.clone(),
+                                        replay: vec![StreamEvent::UserPrompt {
+                                            content: text.clone(),
+                                        }],
+                                    });
+                                    r.session_id
+                                }
+                                Err(e) => {
+                                    post(Msg::Event(StreamEvent::TurnFailed {
+                                        error: e.to_string(),
+                                    }));
+                                    continue;
+                                }
+                            },
+                        };
+                        let options = ChatOptions {
+                            model,
+                            permission,
+                            ..ChatOptions::default()
+                        };
+                        run_turn(&client, &id, &text, options, &mut rx, &post).await;
+                        refresh(&client, &post).await;
+                    }
+                    Cmd::Cancel | Cmd::Approve { .. } => {}
+                }
+            }
+        });
+    });
+}
+
+async fn refresh(client: &DaemonClient, post: &impl Fn(Msg)) {
+    if let Ok(list) = client.list_sessions_async().await {
+        post(Msg::Sessions(list));
+    }
+}
+
+async fn replay(client: &DaemonClient, id: &str) -> Result<Vec<StreamEvent>, String> {
+    client.reattach_async(id).await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let mut since = 0u64;
+    loop {
+        let page = client
+            .events_async(id, since)
+            .await
+            .map_err(|e| e.to_string())?;
+        let progressed = page.next_seq > since;
+        out.extend(page.events.into_iter().map(|e| e.event));
+        if !progressed {
+            break;
+        }
+        since = page.next_seq;
+        if out.len() > 50_000 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn run_turn(
+    client: &DaemonClient,
+    id: &str,
+    prompt: &str,
+    options: ChatOptions,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    post: &impl Fn(Msg),
+) {
+    let mut stream = match client.chat_stream(id, prompt, options).await {
+        Ok(s) => s,
+        Err(e) => {
+            return post(Msg::Event(StreamEvent::TurnFailed {
+                error: e.to_string(),
+            }));
+        }
+    };
+    loop {
+        tokio::select! {
+            item = stream.next_event() => match item {
+                Some(Ok(ev)) => {
+                    let done = matches!(ev, StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. });
+                    post(Msg::Event(ev));
+                    if done { return; }
+                }
+                Some(Err(e)) => return post(Msg::Event(StreamEvent::TurnFailed { error: e })),
+                None => return post(Msg::Event(StreamEvent::TurnComplete { response: String::new(), usage: None, cached: None })),
+            },
+            cmd = rx.recv() => match cmd {
+                Some(Cmd::Approve { request_id, decision }) => {
+                    let _ = client.approve_async(id, &request_id, decision).await;
+                }
+                Some(Cmd::Cancel) => { let _ = client.cancel_async(id).await; }
+                Some(_) => {}
+                None => return,
+            },
+        }
+    }
+}
