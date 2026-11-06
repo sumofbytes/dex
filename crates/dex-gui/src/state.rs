@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use dex_client::protocol::{ApprovalDecision, SessionInfo, StreamEvent};
-use rune::TextEdit;
+use rune::{TextEdit, Waker};
+use rune_kit::diff::{DiffState, parse};
 use tokio::sync::mpsc;
 
 /// UI -> worker commands.
@@ -44,6 +45,12 @@ pub enum Msg {
     },
     Event(StreamEvent),
     Status(String),
+    /// Project files (relative) and the working-tree patch from a background `git` scan.
+    Scanned {
+        cwd: String,
+        files: Vec<String>,
+        patch: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -103,6 +110,17 @@ pub struct Queued {
     pub followup: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum VTab {
+    Files,
+    Changes,
+}
+
+pub struct OpenFile {
+    pub path: String,
+    pub text: String,
+}
+
 #[derive(Default)]
 pub struct Inbox(pub Mutex<Vec<Msg>>);
 
@@ -130,6 +148,15 @@ pub struct State {
     pub collapsed: HashSet<String>,
     pub show_all: HashSet<String>,
     pub all_projects: bool,
+    /// Right-hand viewer pane (files, changes).
+    pub viewer: bool,
+    pub vtab: VTab,
+    pub files: Vec<String>,
+    pub file_filter: TextEdit,
+    pub open_file: Option<OpenFile>,
+    pub diff: DiffState,
+    pub scanned: Option<String>,
+    pub wake: Option<Waker>,
     pub inbox: Arc<Inbox>,
     pub cmds: Option<mpsc::UnboundedSender<Cmd>>,
 }
@@ -159,6 +186,14 @@ impl Default for State {
             collapsed: HashSet::new(),
             show_all: HashSet::new(),
             all_projects: false,
+            viewer: false,
+            vtab: VTab::Files,
+            files: Vec::new(),
+            file_filter: TextEdit::default(),
+            open_file: None,
+            diff: DiffState::new(Vec::new()),
+            scanned: None,
+            wake: None,
             inbox: Arc::default(),
             cmds: None,
         }
@@ -219,6 +254,13 @@ impl State {
                 self.sessions_loaded = true;
             }
             Msg::Status(s) => self.status = s,
+            Msg::Scanned { cwd, files, patch } => {
+                if cwd == self.cwd() {
+                    self.files = files;
+                    self.diff.set_files(parse(&patch));
+                    self.scanned = Some(cwd);
+                }
+            }
             Msg::Opened { id, replay } => {
                 self.reset_transcript();
                 self.queue.clear();
@@ -356,6 +398,43 @@ impl State {
         }
     }
 
+    /// Show the viewer on `tab` (or hide it when it already shows that tab) and rescan.
+    pub fn show_viewer(&mut self, tab: VTab) {
+        if self.viewer && self.vtab == tab {
+            self.viewer = false;
+            return;
+        }
+        self.viewer = true;
+        self.vtab = tab;
+        self.rescan();
+    }
+
+    /// List the project's files and its uncommitted changes on a background thread.
+    pub fn rescan(&self) {
+        let (cwd, inbox, wake) = (self.cwd(), self.inbox.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            inbox.0.lock().unwrap().push(scan(cwd));
+            if let Some(w) = wake {
+                w();
+            }
+        });
+    }
+
+    pub fn open_path(&mut self, rel: &str) {
+        let full = std::path::Path::new(&self.cwd()).join(rel);
+        let text = match std::fs::read(&full) {
+            Ok(b) if b.len() > 512 * 1024 => "File too large to preview.".into(),
+            Ok(b) => String::from_utf8(b).unwrap_or_else(|_| "Binary file.".into()),
+            Err(e) => format!("Cannot read: {e}"),
+        };
+        self.open_file = Some(OpenFile {
+            path: rel.to_string(),
+            text,
+        });
+        self.viewer = true;
+        self.vtab = VTab::Files;
+    }
+
     /// Toggle every tool call's details open (or all closed when they already are).
     pub fn toggle_tools(&mut self) {
         let open = self
@@ -481,4 +560,23 @@ fn args_line(args: &serde_json::Value) -> String {
         other => other.to_string(),
     };
     s.lines().next().unwrap_or("").chars().take(120).collect()
+}
+
+/// `git` listing of a project's files and its working-tree patch against HEAD.
+pub fn scan(cwd: String) -> Msg {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(args)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let files = git(&["ls-files", "--cached", "--others", "--exclude-standard"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let patch = git(&["diff", "HEAD", "--no-color"]);
+    Msg::Scanned { cwd, files, patch }
 }

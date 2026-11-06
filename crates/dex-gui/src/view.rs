@@ -9,7 +9,7 @@ use rune_kit::{
 };
 use rune_theme_opencode::icons;
 
-use crate::state::{Cmd, Item, Page, State, project_name, session_title};
+use crate::state::{Cmd, Item, Page, State, VTab, project_name, session_title};
 use dex_client::protocol::SessionInfo;
 
 const MODES: [&str; 3] = ["read-only", "ask", "trusted"];
@@ -31,10 +31,22 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
             .child(sidebar(s, k).w(SIDEBAR_W))
             .child(el().w(1.0).h_full().fill(k.c.border_base))
             .child(page.grow(1.0).min_w(0.0))
+            .children(viewer_col(s, k))
     } else {
         row().w_full().h_full().fill(k.c.page).child(page.grow(1.0))
     };
     rune_kit::root(body, layer)
+}
+
+/// The viewer pane with its divider, on thread pages only.
+fn viewer_col(s: &State, k: &Kit) -> Vec<El> {
+    if !(s.viewer && s.page == Page::Thread) {
+        return Vec::new();
+    }
+    vec![
+        el().w(1.0).h_full().fill(k.c.border_base),
+        crate::viewer::viewer(s, k),
+    ]
 }
 
 const PER_PROJECT: usize = 5;
@@ -355,6 +367,14 @@ fn header(s: &State, k: &Kit) -> El {
         .child(toggle)
         .child(title.grow(1.0).min_w(0.0))
         .child(stats)
+        .child(
+            IconButton::new(&icons::FOLDER)
+                .variant(IconButtonVariant::Ghost)
+                .label("Files (Ctrl+E)")
+                .on_press(|s: &mut State| s.show_viewer(VTab::Files))
+                .build(k)
+                .key("open-files"),
+        )
 }
 
 fn human(n: u64) -> String {

@@ -6,6 +6,7 @@ mod home;
 mod state;
 mod theme;
 mod view;
+mod viewer;
 mod worker;
 
 use rune::{AppSpec, KeyEvent, Tx, Waker};
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 fn setup(s: &mut State, wake: Waker) {
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
     s.cmds = Some(tx);
+    s.wake = Some(wake.clone());
     worker::spawn(s.inbox.clone(), wake, rx);
 }
 
@@ -26,6 +28,10 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
     } else if e.is_command('n') {
         s.page = state::Page::Thread;
         s.send_cmd(Cmd::NewSession);
+    } else if e.is_command('e') {
+        s.show_viewer(state::VTab::Files);
+    } else if e.is_command('g') {
+        s.show_viewer(state::VTab::Changes);
     } else if e.is_command('o') {
         s.toggle_tools();
     } else if e.is_command('t') {
@@ -167,6 +173,24 @@ fn busy(s: &mut State) {
     });
 }
 
+/// Viewer pane over this repository: file preview, or the changes tab.
+fn viewer_scene(s: &mut State, tab: state::VTab) {
+    sample(s);
+    s.project = Some(std::env::var("DEX_GUI_REPO").unwrap_or_else(|_| "/home/aks/Work/dex".into()));
+    s.apply(state::scan(s.cwd()));
+    s.viewer = true;
+    s.vtab = tab;
+}
+
+fn files_scene(s: &mut State) {
+    viewer_scene(s, state::VTab::Files);
+    s.open_path("crates/dex-gui/src/viewer.rs");
+}
+
+fn changes_scene(s: &mut State) {
+    viewer_scene(s, state::VTab::Changes);
+}
+
 fn home_scene(s: &mut State) {
     sample(s);
     s.page = state::Page::Home;
@@ -237,6 +261,8 @@ fn main() {
             ("many", many),
             ("long", long),
             ("real", real),
+            ("files", files_scene),
+            ("changes", changes_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
