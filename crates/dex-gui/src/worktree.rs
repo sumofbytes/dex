@@ -11,12 +11,17 @@ pub struct Worktree {
     pub branch: String,
 }
 
-fn root_dir() -> PathBuf {
+/// dex's data directory: `$XDG_DATA_HOME/dex` (default `~/.local/share/dex`).
+pub fn data_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir)
-        .join("dex/worktrees")
+        .join("dex")
+}
+
+fn root_dir() -> PathBuf {
+    data_dir().join("worktrees")
 }
 
 fn git(dir: &str, args: &[&str]) -> Result<String, String> {

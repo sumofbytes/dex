@@ -86,6 +86,7 @@ fn nav_row(
 
 fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project: bool) -> El {
     let id = sess.session_id.clone();
+    let hide_id = sess.session_id.clone();
     let open_cwd = sess.cwd.clone();
     let selected = s.page == Page::Thread && s.current.as_deref() == Some(sess.session_id.as_str());
     let mut r = SidebarRow::new(session_title(sess))
@@ -110,6 +111,8 @@ fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project:
     } else {
         r.detail(age)
     };
+    // Hover reveals an × that removes the thread from the sidebar.
+    r = r.on_close(move |s: &mut State, _| s.hide_thread(&hide_id));
     r.build(k).key(key)
 }
 
@@ -196,7 +199,7 @@ fn sidebar(s: &State, k: &Kit) -> El {
     for sess in s
         .sessions
         .iter()
-        .filter(|x| x.message_count > 0 && !x.cwd.is_empty())
+        .filter(|x| x.message_count > 0 && !x.cwd.is_empty() && s.is_visible(x))
     {
         let root = crate::worktree::project_root(&sess.cwd);
         match projects.iter_mut().find(|(c, _)| *c == root) {
@@ -241,10 +244,12 @@ fn sidebar(s: &State, k: &Kit) -> El {
         } else {
             k.glyph.triangle_down
         };
+        let hide_cwd = cwd.clone();
         let header = k
             .interactive(
                 row()
                     .key(format!("proj{pi}"))
+                    .hover_group()
                     .w_full()
                     .h(34.0)
                     .px(10.0)
@@ -260,6 +265,15 @@ fn sidebar(s: &State, k: &Kit) -> El {
                             .min_w(0.0),
                     )
                     .child(add)
+                    .child(
+                        IconButton::new(&icons::CLOSE)
+                            .variant(IconButtonVariant::GhostMuted)
+                            .label("Remove project from sidebar")
+                            .on_press(move |s: &mut State| s.hide_project(&hide_cwd))
+                            .build(k)
+                            .key(format!("hide{pi}"))
+                            .group_opacity(0.0, 1.0),
+                    )
                     .child(rune::icon(chevron, 12.0).color(color)),
             )
             .on_press(move |s: &mut State| {

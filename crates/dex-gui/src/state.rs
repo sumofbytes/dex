@@ -156,6 +156,9 @@ pub struct State {
     pub show_all: HashSet<String>,
     pub all_projects: bool,
     /// Right-hand viewer pane (files, changes).
+    /// Threads and projects removed from the sidebar. Only hidden: the sessions stay on disk.
+    pub hidden_threads: HashSet<String>,
+    pub hidden_projects: HashSet<String>,
     pub use_worktree: bool,
     pub confirm_discard: bool,
     pub viewer: bool,
@@ -199,6 +202,8 @@ impl Default for State {
             collapsed: HashSet::new(),
             show_all: HashSet::new(),
             all_projects: false,
+            hidden_threads: HashSet::new(),
+            hidden_projects: HashSet::new(),
             use_worktree: false,
             confirm_discard: false,
             viewer: false,
@@ -231,6 +236,60 @@ impl State {
         self.project
             .clone()
             .unwrap_or_else(|| self.info.cwd.clone())
+    }
+
+    /// Whether a thread is listed: not hidden itself, nor under a hidden project.
+    pub fn is_visible(&self, sess: &SessionInfo) -> bool {
+        !self.hidden_threads.contains(&sess.session_id)
+            && !self
+                .hidden_projects
+                .contains(&crate::worktree::project_root(&sess.cwd))
+    }
+
+    pub fn hide_thread(&mut self, id: &str) {
+        self.hidden_threads.insert(id.to_string());
+        self.save_hidden();
+    }
+
+    pub fn hide_project(&mut self, root: &str) {
+        self.hidden_projects.insert(root.to_string());
+        self.save_hidden();
+    }
+
+    /// Read the hidden set from the data directory, if it was saved before.
+    pub fn load_hidden(&mut self) {
+        let Some(text) = hidden_file().and_then(|p| std::fs::read_to_string(p).ok()) else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let set = |key: &str| -> HashSet<String> {
+            v.get(key)
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        self.hidden_threads = set("threads");
+        self.hidden_projects = set("projects");
+    }
+
+    fn save_hidden(&self) {
+        let Some(path) = hidden_file() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let v = serde_json::json!({
+            "threads": self.hidden_threads,
+            "projects": self.hidden_projects,
+        });
+        let _ = std::fs::write(path, v.to_string());
     }
 
     pub fn effective_model(&self) -> String {
@@ -641,6 +700,10 @@ impl State {
     }
 }
 
+fn hidden_file() -> Option<std::path::PathBuf> {
+    Some(crate::worktree::data_dir().join("gui-hidden.json"))
+}
+
 /// A project's display name: the last path component.
 pub fn project_name(cwd: &str) -> String {
     let t = cwd.trim_end_matches('/');
@@ -726,6 +789,25 @@ pub fn scan(cwd: String) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_threads_and_projects_are_not_visible() {
+        let sess = |id: &str, cwd: &str| -> SessionInfo {
+            serde_json::from_value(serde_json::json!({
+                "session_id": id, "path": "", "cwd": cwd, "updated_at": "2026-11-06T00:00:00Z",
+                "auto_named": false, "message_count": 1
+            }))
+            .unwrap()
+        };
+        let mut s = State::default();
+        let a = sess("a", "/x/one");
+        let b = sess("b", "/x/two");
+        assert!(s.is_visible(&a) && s.is_visible(&b));
+        s.hidden_threads.insert("a".into());
+        assert!(!s.is_visible(&a) && s.is_visible(&b));
+        s.hidden_projects.insert("/x/two".into());
+        assert!(!s.is_visible(&b));
+    }
 
     #[test]
     fn terminal_runs_a_command_and_streams_output() {

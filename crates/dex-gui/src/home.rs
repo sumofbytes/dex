@@ -72,6 +72,7 @@ pub fn home(s: &State, k: &Kit) -> El {
     let dated: Vec<(&dex_client::protocol::SessionInfo, Option<NaiveDate>)> = s
         .sessions
         .iter()
+        .filter(|x| s.is_visible(x))
         .map(|x| (x, local_date(&x.updated_at)))
         .collect();
     let today_threads: Vec<_> = dated
@@ -79,7 +80,12 @@ pub fn home(s: &State, k: &Kit) -> El {
         .filter(|(_, d)| *d == Some(today))
         .map(|(x, _)| *x)
         .collect();
-    let mut projects: Vec<&str> = s.sessions.iter().map(|x| x.cwd.as_str()).collect();
+    let mut projects: Vec<&str> = s
+        .sessions
+        .iter()
+        .filter(|x| s.is_visible(x))
+        .map(|x| x.cwd.as_str())
+        .collect();
     projects.sort_unstable();
     projects.dedup();
     let running = usize::from(s.busy);
@@ -196,7 +202,8 @@ pub fn home(s: &State, k: &Kit) -> El {
 
     let continue_cwd = s
         .sessions
-        .first()
+        .iter()
+        .find(|x| s.is_visible(x))
         .map(|x| (x.session_id.clone(), x.cwd.clone()));
     let mut start = row()
         .gap(10.0)

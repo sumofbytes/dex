@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 fn setup(s: &mut State, wake: Waker) {
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
     s.cmds = Some(tx);
+    s.load_hidden();
     s.wake = Some(wake.clone());
     worker::spawn(s.inbox.clone(), wake, rx);
 }
