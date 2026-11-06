@@ -169,6 +169,27 @@ fn long(s: &mut State) {
     }
 }
 
+/// The sidebar with NEEDS YOU rows and a thread running in the background.
+fn needs_scene(s: &mut State) {
+    sample(s);
+    s.current = Some("s0".into());
+    let n = |id: &str, kind, label: Option<&str>| state::Need {
+        id: id.into(),
+        kind,
+        label: label.map(Into::into),
+    };
+    s.needs = vec![
+        n(
+            "s1",
+            state::NeedKind::Waiting,
+            Some("Allow bash: cargo test?"),
+        ),
+        n("s2", state::NeedKind::Done, None),
+        n("s4", state::NeedKind::Failed, None),
+    ];
+    s.running.insert("s3".into());
+}
+
 /// Mid-turn: thinking, a steering message and a follow-up queued.
 fn busy(s: &mut State) {
     sample(s);
@@ -313,6 +334,12 @@ fn home_scene(s: &mut State) {
     s.page = state::Page::Home;
 }
 
+/// A sidebar thread renamed in place: the title is an editable field (double-click rename).
+fn rename_scene(s: &mut State) {
+    sample(s);
+    s.start_rename("s1");
+}
+
 /// Where the detached GUI's output goes: `$XDG_CACHE_HOME/dex/gui.log` (default `~/.cache`).
 fn log_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
@@ -374,7 +401,9 @@ fn main() {
         scenes: &[
             ("chat", sample),
             ("home", home_scene),
+            ("rename", rename_scene),
             ("busy", busy),
+            ("needs", needs_scene),
             ("thought", thought_scene),
             ("many", many),
             ("long", long),

@@ -12,6 +12,11 @@ use tokio::sync::mpsc;
 pub enum Cmd {
     NewSession,
     Open(String),
+    /// Rename a thread: Return ended an in-place sidebar edit.
+    Rename {
+        id: String,
+        name: String,
+    },
     Send {
         cwd: String,
         text: String,
@@ -46,6 +51,12 @@ pub enum Msg {
         replay: Vec<StreamEvent>,
     },
     Event(StreamEvent),
+    /// An event from a running turn, tagged with its thread (which may not be the open one).
+    Turn {
+        id: String,
+        ev: StreamEvent,
+    },
+    TurnStarted(String),
     Status(String),
     /// The directory the current thread works in changed (a worktree was made).
     Project(String),
@@ -155,7 +166,28 @@ pub struct OpenFile {
 #[derive(Default)]
 pub struct Inbox(pub Mutex<Vec<Msg>>);
 
+/// Why a thread is listed under NEEDS YOU.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NeedKind {
+    /// An approval or a question is waiting.
+    Waiting,
+    /// A background turn finished while the thread was not open.
+    Done,
+    Failed,
+}
+
+pub struct Need {
+    pub id: String,
+    pub kind: NeedKind,
+    /// The prompt for a waiting thread; done and failed rows show the thread title.
+    pub label: Option<String>,
+}
+
 pub struct State {
+    /// Threads with a turn running (open or not).
+    pub running: HashSet<String>,
+    /// Threads waiting on the user, newest first.
+    pub needs: Vec<Need>,
     pub sessions: Vec<SessionInfo>,
     pub sessions_loaded: bool,
     pub current: Option<String>,
@@ -174,6 +206,10 @@ pub struct State {
     pub queue: Vec<Queued>,
     pub search: TextEdit,
     pub searching: bool,
+    /// The thread being renamed (its sidebar row's title is an editable field).
+    pub renaming: Option<String>,
+    /// The rename field's text and caret.
+    pub rename: TextEdit,
     /// Project (working directory) new threads start in; follows the opened thread.
     pub project: Option<String>,
     pub collapsed: HashSet<String>,
@@ -210,6 +246,8 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         State {
+            running: HashSet::new(),
+            needs: Vec::new(),
             sessions: Vec::new(),
             sessions_loaded: false,
             current: None,
@@ -228,6 +266,8 @@ impl Default for State {
             queue: Vec::new(),
             search: TextEdit::default(),
             searching: false,
+            renaming: None,
+            rename: TextEdit::default(),
             project: None,
             collapsed: HashSet::new(),
             open_work: HashSet::new(),
@@ -344,6 +384,37 @@ impl State {
         let _ = std::fs::write(path, v.to_string());
     }
 
+    /// Double-click on a thread row: its title becomes an editable field.
+    pub fn start_rename(&mut self, id: &str) {
+        let title = self
+            .sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .map(session_title)
+            .unwrap_or_default();
+        self.rename = TextEdit::new(title);
+        self.rename.anchor = 0; // caret at the end: the whole title is selected
+        self.rename.focused = true;
+        self.renaming = Some(id.to_string());
+    }
+
+    /// Return ended the edit: send the name to the daemon (an empty name keeps the old one).
+    pub fn commit_rename(&mut self) {
+        self.rename.focused = false;
+        if let Some(id) = self.renaming.take() {
+            let name = self.rename.text.trim().to_string();
+            if !name.is_empty() {
+                self.send_cmd(Cmd::Rename { id, name });
+            }
+        }
+    }
+
+    /// Escape put the row back: keep the old title.
+    pub fn cancel_rename(&mut self) {
+        self.rename.focused = false;
+        self.renaming = None;
+    }
+
     pub fn effective_model(&self) -> String {
         self.model
             .clone()
@@ -409,6 +480,19 @@ impl State {
                 }
             }
             Msg::Opened { id, replay } => {
+                // Leaving a thread that still has an unanswered approval keeps it in NEEDS YOU.
+                let old = self.current.clone().filter(|o| !o.is_empty() && *o != id);
+                let unanswered = self
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, Item::Approval { decided: None, .. }));
+                if let Some(old) = old
+                    && unanswered
+                    && self.running.contains(&old)
+                {
+                    self.need(old, NeedKind::Waiting, Some("Waiting for approval".into()));
+                }
+                self.needs.retain(|n| n.id != id);
                 self.reset_transcript();
                 self.queue.clear();
                 self.page = Page::Thread;
@@ -417,8 +501,52 @@ impl State {
                     self.apply_event(ev);
                 }
                 self.finish_stream();
+                self.busy = self
+                    .running
+                    .contains(&self.current.clone().unwrap_or_default());
             }
             Msg::Event(ev) => self.apply_event(ev),
+            Msg::TurnStarted(id) => {
+                self.needs.retain(|n| n.id != id);
+                self.running.insert(id);
+            }
+            Msg::Turn { id, ev } => self.apply_turn(id, ev),
+        }
+    }
+
+    /// Adds (or replaces) a NEEDS YOU row, newest first.
+    fn need(&mut self, id: String, kind: NeedKind, label: Option<String>) {
+        self.needs.retain(|n| n.id != id);
+        self.needs.insert(0, Need { id, kind, label });
+    }
+
+    /// An event from a running turn: the open thread folds it into the transcript, any other
+    /// thread only updates its sidebar state.
+    fn apply_turn(&mut self, id: String, ev: StreamEvent) {
+        if self.current.as_deref() == Some(id.as_str()) {
+            self.apply_event(ev);
+            if !self.busy {
+                self.running.remove(&id);
+            }
+            return;
+        }
+        match ev {
+            StreamEvent::ApprovalRequired { name, .. } => {
+                self.need(id, NeedKind::Waiting, Some(format!("Allow {name}?")));
+            }
+            StreamEvent::QuestionRequired { questions, .. } => {
+                let q = questions.first().map(|q| q.question.clone());
+                self.need(id, NeedKind::Waiting, q);
+            }
+            StreamEvent::TurnComplete { .. } => {
+                self.running.remove(&id);
+                self.need(id, NeedKind::Done, None);
+            }
+            StreamEvent::TurnFailed { .. } => {
+                self.running.remove(&id);
+                self.need(id, NeedKind::Failed, None);
+            }
+            _ => {}
         }
     }
 
@@ -935,6 +1063,41 @@ pub fn scan(cwd: String) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_turns_land_in_needs_you() {
+        let mut s = State {
+            current: Some("a".into()),
+            ..State::default()
+        };
+        s.running.insert("b".into());
+        s.apply(Msg::Turn {
+            id: "b".into(),
+            ev: StreamEvent::ApprovalRequired {
+                request_id: "r".into(),
+                name: "bash".into(),
+                input: String::new(),
+                agent: None,
+            },
+        });
+        assert!(s.needs[0].kind == NeedKind::Waiting && s.running.contains("b"));
+        s.apply(Msg::Turn {
+            id: "b".into(),
+            ev: StreamEvent::TurnComplete {
+                response: String::new(),
+                usage: None,
+                cached: None,
+            },
+        });
+        assert!(s.needs.len() == 1 && s.needs[0].kind == NeedKind::Done);
+        assert!(!s.running.contains("b"));
+        // Opening the thread clears its row.
+        s.apply(Msg::Opened {
+            id: "b".into(),
+            replay: Vec::new(),
+        });
+        assert!(s.needs.is_empty());
+    }
 
     #[test]
     fn tool_calls_group_into_runs() {

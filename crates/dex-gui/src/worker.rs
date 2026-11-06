@@ -10,6 +10,16 @@ use tokio::sync::mpsc;
 
 use crate::state::{Cmd, Inbox, Info, Msg};
 
+/// A clonable handle for posting messages from the per-turn tasks.
+#[derive(Clone)]
+struct Poster(Arc<dyn Fn(Msg) + Send + Sync>);
+
+impl Poster {
+    fn post(&self, m: Msg) {
+        (self.0)(m)
+    }
+}
+
 /// Threads older than this are not listed in the sidebar.
 const RECENT_DAYS: i64 = 2;
 
@@ -39,10 +49,11 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
             .build()
             .expect("tokio");
         rt.block_on(async move {
-            let post = |m: Msg| {
+            let poster = Poster(Arc::new(move |m: Msg| {
                 inbox.0.lock().unwrap().push(m);
                 wake();
-            };
+            }));
+            let post = |m: Msg| poster.post(m);
             let url = match std::env::var("DEX_GUI_URL") {
                 Ok(url) => url,
                 Err(_) => match start_embedded_daemon() {
@@ -77,17 +88,10 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
             refresh(&client, &post).await;
 
             let mut session: Option<String> = None;
-            // A New/Open that arrives mid-turn detaches from that turn (it keeps running in the
-            // daemon) and is handled here.
-            let mut pending: Option<Cmd> = None;
-            loop {
-                let cmd = match pending.take() {
-                    Some(c) => c,
-                    None => match rx.recv().await {
-                        Some(c) => c,
-                        None => break,
-                    },
-                };
+            // Control channels of the turns that are running, by session id.
+            let mut turns: std::collections::HashMap<String, mpsc::UnboundedSender<Cmd>> =
+                std::collections::HashMap::new();
+            while let Some(cmd) = rx.recv().await {
                 match cmd {
                     Cmd::NewSession => {
                         session = None;
@@ -103,6 +107,15 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                         }
                         Err(e) => post(Msg::Status(format!("open failed: {e}"))),
                     },
+                    Cmd::Rename { id, name } => {
+                        // A rename during a streamed turn is refused (409); the retry is
+                        // the next drag into the field.
+                        if let Err(e) = client.rename_session_async(&id, &name).await {
+                            post(Msg::Status(format!("rename failed: {e}")));
+                        }
+                        // The sidebar and the thread header show the stored names.
+                        refresh(&client, &post).await;
+                    }
                     Cmd::Send {
                         cwd,
                         text,
@@ -150,14 +163,28 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                             permission,
                             ..ChatOptions::default()
                         };
-                        pending = run_turn(&client, &id, &text, options, &mut rx, &post).await;
-                        refresh(&client, &post).await;
+                        // The turn runs on its own task, so New/Open (and other threads) stay
+                        // usable while it streams.
+                        let (tx, mut trx) = mpsc::unbounded_channel();
+                        turns.insert(id.clone(), tx);
+                        post(Msg::TurnStarted(id.clone()));
+                        let (client, poster) = (client.clone(), poster.clone());
+                        tokio::spawn(async move {
+                            let p = |m: Msg| poster.post(m);
+                            run_turn(&client, &id, &text, options, &mut trx, &p).await;
+                            refresh(&client, &p).await;
+                        });
                     }
-                    Cmd::Cancel
+                    cmd @ (Cmd::Cancel
                     | Cmd::Approve { .. }
                     | Cmd::Steer(_)
                     | Cmd::Followup(_)
-                    | Cmd::Recall { .. } => {}
+                    | Cmd::Recall { .. }) => {
+                        // Controls go to the open thread's turn.
+                        if let Some(t) = session.as_ref().and_then(|id| turns.get(id)) {
+                            let _ = t.send(cmd);
+                        }
+                    }
                 }
             }
         });
@@ -211,14 +238,16 @@ async fn run_turn(
     options: ChatOptions,
     rx: &mut mpsc::UnboundedReceiver<Cmd>,
     post: &impl Fn(Msg),
-) -> Option<Cmd> {
+) {
     let mut stream = match client.chat_stream(id, prompt, options).await {
         Ok(s) => s,
         Err(e) => {
-            post(Msg::Event(StreamEvent::TurnFailed {
-                error: e.to_string(),
-            }));
-            return None;
+            return post(Msg::Turn {
+                id: id.to_string(),
+                ev: StreamEvent::TurnFailed {
+                    error: e.to_string(),
+                },
+            });
         }
     };
     // Follow-ups chain more turns on this same stream, so a TurnComplete only ends it when none
@@ -236,11 +265,11 @@ async fn run_turn(
                         StreamEvent::TurnFailed { .. } => true,
                         _ => false,
                     };
-                    post(Msg::Event(ev));
-                    if done { return None; }
+                    post(Msg::Turn { id: id.to_string(), ev });
+                    if done { return; }
                 }
-                Some(Err(e)) => { post(Msg::Event(StreamEvent::TurnFailed { error: e })); return None; }
-                None => { post(Msg::Event(StreamEvent::TurnComplete { response: String::new(), usage: None, cached: None })); return None; }
+                Some(Err(e)) => return post(Msg::Turn { id: id.to_string(), ev: StreamEvent::TurnFailed { error: e } }),
+                None => return post(Msg::Turn { id: id.to_string(), ev: StreamEvent::TurnComplete { response: String::new(), usage: None, cached: None } }),
             },
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Approve { request_id, decision }) => {
@@ -254,14 +283,18 @@ async fn run_turn(
                         followups -= 1;
                     }
                 }
-                Some(Cmd::Recall { text, followup }) => {
-                    if client.recall_async(id, &text, followup).await.is_ok() && followup {
-                        followups = followups.saturating_sub(1);
-                    }
-                }
-                Some(c @ (Cmd::NewSession | Cmd::Open(_))) => return Some(c),
+                  Some(Cmd::Recall { text, followup }) => {
+                      if client.recall_async(id, &text, followup).await.is_ok() && followup {
+                          followups = followups.saturating_sub(1);
+                      }
+                  }
+                  Some(Cmd::Rename { id: sid, name }) => {
+                      if client.rename_session_async(&sid, &name).await.is_ok() {
+                          refresh(client, post).await;
+                      }
+                  }
                 Some(_) => {}
-                None => return None,
+                None => return,
             },
         }
     }

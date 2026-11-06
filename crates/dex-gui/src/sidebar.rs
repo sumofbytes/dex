@@ -1,16 +1,16 @@
 //! Sidebar, on one grid (see DESIGN.md): a 16 lead column (nav icon, project dot or spinner, a
 //! running thread's spinner), a text column (labels, project names, titles) and a trailing edge
-//! (time column, then a 20 slot for + and ×). Every row is built from the same chrome, so
+//! (a 20 slot for + and ×, then the time column). Every row is built from the same chrome, so
 //! their positions cannot drift. All sizes come from `tok`.
 
 use dex_client::protocol::SessionInfo;
-use rune::{El, row, spacer, text, text_input};
+use rune::{El, Key, row, spacer, text, text_input};
 use rune_kit::shell::Sidebar;
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons as kit_icons;
 
 use crate::icons;
-use crate::state::{Cmd, Item, Page, State, project_name, session_title};
+use crate::state::{Cmd, Item, NeedKind, Page, State, project_name, session_title};
 use crate::style::{caps, dot, space, typo};
 
 /// Layout tokens, in points.
@@ -28,8 +28,6 @@ pub mod tok {
     pub const LEAD_GAP: f32 = 8.0;
     /// The trailing slot: + on a project, × on hover.
     pub const SLOT: f32 = 20.0;
-    /// A thread's time: fixed, right-aligned, one gap left of the slot (right edge at 230).
-    pub const TIME_W: f32 = 24.0;
     pub const DOT: f32 = 6.0;
     pub const SPINNER: f32 = 8.0;
     pub const PER_PROJECT: usize = 5;
@@ -123,22 +121,49 @@ fn nav_row(
 }
 
 /// A thread row: running spinner (or attention dot) in the lead column, title in the text
-/// column, time left of the slot, × (hide) in the slot on hover. In search results the time
-/// column is replaced by `project · time`.
+/// column, × (hide) in the slot on hover, time right-aligned at the row's trailing edge (the
+/// same edge the `+` on a project header sits on). In search results the time is
+/// `project · age`.
 fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project: bool) -> El {
+    thread_row_as(s, k, sess, key, with_project, None, None)
+}
+
+/// A thread row, optionally with its own title (a NEEDS YOU prompt) and lead mark.
+fn thread_row_as(
+    s: &State,
+    k: &Kit,
+    sess: &SessionInfo,
+    key: String,
+    with_project: bool,
+    title: Option<String>,
+    status: Option<NeedKind>,
+) -> El {
     let id = sess.session_id.clone();
     let hide_id = sess.session_id.clone();
     let open_cwd = sess.cwd.clone();
     let selected = s.page == Page::Thread && s.current.as_deref() == Some(sess.session_id.as_str());
-    let waiting = s
-        .items
-        .iter()
-        .any(|i| matches!(i, Item::Approval { decided: None, .. }));
-    // The running thread keeps its indicator even when another thread (or Home) is in view.
-    let running = s.current.as_deref() == Some(sess.session_id.as_str());
-    let mark = if running && waiting {
+    let is_open = s.current.as_deref() == Some(sess.session_id.as_str());
+    let waiting = if is_open {
+        s.items
+            .iter()
+            .any(|i| matches!(i, Item::Approval { decided: None, .. }))
+    } else {
+        s.needs
+            .iter()
+            .any(|n| n.id == sess.session_id && n.kind == NeedKind::Waiting)
+    };
+    // A running thread keeps its spinner even when it is in the background.
+    let running = s.running.contains(&sess.session_id) || (is_open && s.busy);
+    let mark = if let Some(kind) = status {
+        let color = match kind {
+            NeedKind::Waiting => crate::theme::waiting(),
+            NeedKind::Done => crate::theme::done(),
+            NeedKind::Failed => k.c.danger.fg,
+        };
+        lead(dot(color, tok::DOT))
+    } else if waiting {
         lead(dot(crate::theme::waiting(), tok::DOT))
-    } else if running && s.busy {
+    } else if running {
         lead(spinner(k))
     } else {
         lead_gap()
@@ -146,18 +171,22 @@ fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project:
     let age = ago(&sess.updated_at);
     let time = if with_project {
         text(format!("{} · {age}", project_name(&sess.cwd)))
-            .font(typo::time(k))
-            .color(k.c.text_faint)
     } else {
-        // Fixed width, text on its right edge, so `2h` and `1d` line up.
+        // Right-aligned in the trailing slot, flush with the `+` a project header ends with.
         row()
-            .w(tok::TIME_W)
+            .w(tok::SLOT)
             .child(spacer().grow(1.0))
             .child(text(age).font(typo::time(k)).color(k.c.text_faint))
     };
-    thread_chrome(k, key, selected, mark, sess, id, open_cwd, hide_id, time)
+    // A renaming row shows a text field instead of its title, bound to the state's edit.
+    let edit = (s.renaming.as_deref() == Some(sess.session_id.as_str())).then(|| s.rename.clone());
+    thread_chrome(
+        k, key, selected, mark, sess, title, id, open_cwd, hide_id, edit, time,
+    )
 }
 
+/// A thread row's chrome. `edit` (`Some` while this row is being renamed) swaps the title text
+/// for an editable field: Return commits, Escape cancels, a press elsewhere ends it.
 #[allow(clippy::too_many_arguments)]
 fn thread_chrome(
     k: &Kit,
@@ -165,9 +194,11 @@ fn thread_chrome(
     selected: bool,
     mark: El,
     sess: &SessionInfo,
+    title: Option<String>,
     id: String,
     open_cwd: String,
     hide_id: String,
+    edit: Option<rune::TextEdit>,
     time: El,
 ) -> El {
     let ink = if selected {
@@ -176,17 +207,36 @@ fn thread_chrome(
         k.c.text_muted
     };
     let font = if selected { k.ty.ui_medium } else { k.ty.ui };
+    let rename_id = id.clone();
+    let title = match edit {
+        Some(edit) => text_input(&edit, font)
+            .single_line()
+            .key(format!("{key}-rename"))
+            .grow(1.0)
+            .shrink()
+            .min_w(0.0)
+            .color(k.c.text_base)
+            .caret(k.c.text_base, k.c.border_focus.alpha(0.35))
+            .on_edit(|s: &mut State| &mut s.rename)
+            .on_submit(|s: &mut State, _| s.commit_rename())
+            .on_input_key(|s: &mut State, ev, _| {
+                if ev.key == Key::Escape {
+                    s.cancel_rename();
+                    true
+                } else {
+                    false
+                }
+            }),
+        None => text(title.unwrap_or_else(|| session_title(sess)))
+            .font(font)
+            .color(ink)
+            .truncate()
+            .grow(1.0)
+            .min_w(0.0),
+    };
     shell(k, key.clone(), selected)
         .child(mark)
-        .child(
-            text(session_title(sess))
-                .font(font)
-                .color(ink)
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
-        )
-        .child(time)
+        .child(title)
         .child(boxed(
             tok::SLOT,
             IconButton::new(&kit_icons::CLOSE)
@@ -198,10 +248,21 @@ fn thread_chrome(
                 .key(format!("{key}-hide"))
                 .group_opacity(0.0, 1.0),
         ))
+        .child(time)
         .on_press(move |s: &mut State| {
+            // A press during a rename ends the edit (Return would too); don't jump threads.
+            if s.renaming.is_some() {
+                s.commit_rename();
+                return;
+            }
             s.project = Some(open_cwd.clone());
             s.page = Page::Thread;
             s.send_cmd(Cmd::Open(id.clone()));
+        })
+        .on_double_press(move |s: &mut State| {
+            if s.renaming.is_none() {
+                s.start_rename(&rename_id);
+            }
         })
 }
 
@@ -373,6 +434,41 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
         return sb.build(k).key("sidebar-root");
     }
 
+    // Threads waiting on the user (approval, question) or finished/failed in the background.
+    let needs: Vec<_> = s
+        .needs
+        .iter()
+        .filter_map(|n| {
+            s.sessions
+                .iter()
+                .find(|x| x.session_id == n.id)
+                .map(|x| (n, x))
+        })
+        .collect();
+    if !needs.is_empty() {
+        sb = sb.child(
+            row()
+                .key("needs-label")
+                .w_full()
+                .px(tok::PAD)
+                .pt(14.0)
+                .pb(space::XS)
+                .child(caps(k, "NEEDS YOU")),
+        );
+        for (i, (n, sess)) in needs.into_iter().enumerate() {
+            let title = n.label.clone();
+            sb = sb.child(thread_row_as(
+                s,
+                k,
+                sess,
+                format!("need{i}"),
+                false,
+                title,
+                Some(n.kind),
+            ));
+        }
+    }
+
     sb = sb.child(
         row()
             .key("projects-label")
@@ -399,10 +495,10 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
                 key: format!("proj{pi}"),
                 color: crate::theme::project_color(&name),
                 name,
-                running: s.busy
-                    && threads
-                        .iter()
-                        .any(|t| s.current.as_deref() == Some(t.session_id.as_str())),
+                running: threads.iter().any(|t| {
+                    s.running.contains(&t.session_id)
+                        || (s.busy && s.current.as_deref() == Some(t.session_id.as_str()))
+                }),
                 cwd: cwd.clone(),
             },
         ));

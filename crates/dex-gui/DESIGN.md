@@ -79,6 +79,7 @@ One grid (`src/sidebar.rs::tok`, board "dex / Sidebar v3 · grid"). Width 280, m
 - Trailing: a 24 time column, right edge x 230 (one 8 gap left of the slot); a 20 slot centred x 248 holding + on a project header and × on a hovered thread; the "Ctrl N" hint right-aligned to x 258.
 - Brand "dex" at x 22, 14px weight 600. Nav labels 12px weight 500; selected row fill #433b3b, radius 8. Thread titles 12px, selected weight 500. Project names 10px caps. Times and hint mono 12.
 - The whole project header toggles collapse (no chevron); × (hide) shows on hover only. The 8px lead holds the dot, or a spinner while a thread in the project runs. Titles truncate with an ellipsis.
+- A double-click on a thread row edits its title in place: the title becomes a single-line field with the text selected, Return sends the rename to the daemon (`POST /api/sessions/{id}/name`), Escape or a press elsewhere keeps the old title.
 
 ## Composer options
 
@@ -150,3 +151,11 @@ Every run of thoughts and tool calls between two messages folds into one block (
 - Done, expanded: chevron down; the rows nest 14 in, in order. A thought is a `› Thought · 4s` row that opens by itself to 12px / 18 faint text (indented 14); tool rows are unchanged (`bash: cmd`, time, dimmed `↳` output).
 - Live: spinner + "Working · 9s" (12px medium, muted), always open; folds when the reply starts.
 - Ctrl+O opens or closes every block and tool row; Ctrl+T every thought. Rhythm: 16 between blocks, 32 around a user message, 20 from the block to the reply.
+
+## Needs you
+
+Penpot board "dex / Sidebar v4 · needs you". A NEEDS YOU caps label and rows sit above PROJECTS, on the same grid as thread rows: status dot in the lead column, title in the text column, time at the right.
+
+- Amber dot: an approval or a question is waiting on you (the row shows the prompt). Green: a background turn finished while the thread was not open. Red: it failed.
+- A row leaves the list when you open the thread. The thread stays under its project as well.
+- A thread whose turn runs in the background keeps its spinner under its project (and on the project header), however many threads run at once. Starting a new thread or opening another one does not stop a running turn.
