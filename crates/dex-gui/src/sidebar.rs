@@ -2,13 +2,14 @@
 //! more" link) and the assembly. Every size and gap comes from `tok`, so rows stay aligned.
 
 use dex_client::protocol::SessionInfo;
-use rune::{El, el, row, spacer, text, text_input};
+use rune::{El, row, spacer, text, text_input};
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
 use rune_theme_opencode::icons as kit_icons;
 
 use crate::icons;
 use crate::state::{Cmd, Item, Page, State, project_name, session_title};
+use crate::style::{caps, dot, typo};
 
 /// Layout tokens, in points. One row height, one inset, one gap: rows never drift apart.
 pub mod tok {
@@ -104,7 +105,7 @@ fn time_col(k: &Kit, age: String) -> El {
         .key("time")
         .w(tok::TIME_W)
         .child(spacer().grow(1.0))
-        .child(text(age).font(k.ty.small).color(k.c.text_faint))
+        .child(text(age).font(typo::time(k)).color(k.c.text_faint))
 }
 
 /// What a project header needs: pressing anywhere on it toggles `collapsed`.
@@ -124,11 +125,6 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
     } else {
         &icons::DOWN
     };
-    let label = rune::TextStyle {
-        size: 11.0,
-        tracking: 0.9,
-        ..k.ty.ui_medium
-    };
     k.interactive(
         row()
             .key(p.key.clone())
@@ -140,15 +136,10 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
             .items_center()
             .radius(k.radius.md)
             .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
-            .child(
-                el().w(tok::DOT)
-                    .h(tok::DOT)
-                    .radius(tok::DOT / 2.0)
-                    .fill(p.color),
-            )
+            .child(dot(p.color, tok::DOT))
             .child(
                 text(p.name.to_uppercase())
-                    .font(label)
+                    .font(typo::caps(k))
                     .color(k.c.text_faint)
                     .truncate()
                     .grow(1.0)
@@ -291,7 +282,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
             .px(tok::INSET)
             .pt(14.0)
             .pb(4.0)
-            .child(crate::home::caps(k, "PROJECTS")),
+            .child(caps(k, "PROJECTS")),
     );
 
     let projects = projects(s);
@@ -359,7 +350,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
     if !s.sessions_loaded {
         sb = sb.child(
             text("Loading threads…")
-                .font(k.ty.small)
+                .font(typo::caption(k))
                 .color(k.c.text_faint)
                 .px(12.0)
                 .key("loading"),

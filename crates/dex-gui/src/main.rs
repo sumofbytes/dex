@@ -7,6 +7,7 @@ mod home;
 mod icons;
 mod sidebar;
 mod state;
+mod style;
 mod theme;
 mod theme_picker;
 mod view;

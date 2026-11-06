@@ -8,6 +8,7 @@ use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
 
 use crate::state::{State, TermBlock, TermStatus, VTab};
+use crate::style::typo;
 use crate::theme;
 
 /// Output lines shown per command block; older ones are hidden.
@@ -277,7 +278,7 @@ fn terminal(s: &State, k: &Kit) -> El {
                     .items_center()
                     .radius(k.radius.md)
                     .border(1.0, k.c.border_base)
-                    .child(text("Clear").font(k.ty.small).color(k.c.text_muted)),
+                    .child(text("Clear").font(typo::caption(k)).color(k.c.text_muted)),
             )
             .on_press(|s: &mut State| s.clear_term())
         } else {
@@ -300,7 +301,7 @@ fn terminal(s: &State, k: &Kit) -> El {
                 )
                 .child(
                     text("One-shot commands only. Editors and pagers won't work here.")
-                        .font(k.ty.small)
+                        .font(typo::caption(k))
                         .color(k.c.text_faint)
                         .wrap(),
                 ),
@@ -338,7 +339,7 @@ fn terminal(s: &State, k: &Kit) -> El {
                 .grow(1.0)
                 .min_w(0.0),
         )
-        .child(text("Enter").font(k.ty.small).color(k.c.text_faint));
+        .child(text("Enter").font(typo::caption(k)).color(k.c.text_faint));
 
     col()
         .w_full()
@@ -356,7 +357,7 @@ fn terminal(s: &State, k: &Kit) -> El {
         .child(
             col().w_full().px(16.0).gap(8.0).pb(8.0).child(input).child(
                 text("One-shot commands · no interactive programs")
-                    .font(k.ty.small)
+                    .font(typo::caption(k))
                     .color(k.c.text_faint),
             ),
         )
@@ -369,10 +370,10 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
         TermStatus::Running { started } => row()
             .gap(6.0)
             .items_center()
-            .child(el().size(6.0, 6.0).radius(3.0).fill(theme::waiting()))
+            .child(crate::style::dot(theme::waiting(), 6.0))
             .child(
                 text(format!("running · {:.0}s", started.elapsed().as_secs_f64()))
-                    .font(k.ty.small)
+                    .font(typo::caption(k))
                     .color(theme::waiting()),
             ),
         TermStatus::Done { code: 0, secs } => row()
@@ -420,7 +421,7 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
         if shown > 0 {
             out = out.child(
                 text(format!("{shown} earlier lines hidden"))
-                    .font(k.ty.small)
+                    .font(typo::caption(k))
                     .color(k.c.text_faint),
             );
         }

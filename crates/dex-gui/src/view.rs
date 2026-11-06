@@ -1,12 +1,13 @@
 //! Views: sidebar, transcript, composer, footer. Pure functions of `State`.
 
 use dex_client::protocol::ApprovalDecision;
-use rune::{Cx, El, ScrollSpec, TextStyle, col, el, row, spacer, text, text_input};
+use rune::{Cx, El, ScrollSpec, col, el, row, spacer, text, text_input};
 use rune_kit::markdown::{Markdown, MarkdownStyle};
 use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons;
 
 use crate::state::{Cmd, Item, Page, State, VTab};
+use crate::style::typo;
 
 const COLUMN: f32 = 760.0;
 
@@ -231,7 +232,7 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
         .gap(6.0)
         .items_center()
         .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
-        .child(text(label).font(k.ty.small).color(k.c.text_faint));
+        .child(text(label).font(typo::meta(k)).color(k.c.text_faint));
     let mut group =
         col()
             .w_full()
@@ -256,19 +257,9 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
 /// The reply's type, per the transcript design: 16px on a 24px line, lists with a 22px marker
 /// column and 6px between items.
 fn reply_style(k: &Kit) -> MarkdownStyle {
-    let body = rune::TextStyle {
-        size: 16.0,
-        line_height: 24.0,
-        ..k.ty.body
-    };
-    let heading = |size: f32| rune::TextStyle {
-        size,
-        weight: 600.0,
-        line_height: 26.0,
-        ..body
-    };
+    let heading = |size: f32| typo::heading(k, size);
     MarkdownStyle::from_kit(k)
-        .body_font(body)
+        .body_font(typo::reply(k))
         .heading_font(1, heading(20.0))
         .heading_font(2, heading(17.0))
         .heading_font(3, heading(16.0))
@@ -306,7 +297,7 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: 
         group = group.child(
             k.interactive(
                 head.child(rune::icon(chevron, 12.0).color(k.c.text_faint))
-                    .child(text(label).font(k.ty.small).color(k.c.text_faint)),
+                    .child(text(label).font(typo::meta(k)).color(k.c.text_faint)),
             )
             .on_press(move |s: &mut State| {
                 if let Some(Item::Thinking { open, .. }) = s.items.get_mut(i) {
@@ -318,10 +309,7 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: 
     if open || live {
         group = group.child(
             text(text_.to_string())
-                .font(rune::TextStyle {
-                    size: 15.0,
-                    ..k.ty.ui.lh(22.0)
-                })
+                .font(typo::thought(k))
                 .color(k.c.text_faint)
                 .wrap(),
         );
@@ -429,7 +417,7 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
             }
             c
         }
-        Item::Notice(t) => text(t.clone()).font(k.ty.small).color(k.c.text_faint),
+        Item::Notice(t) => text(t.clone()).font(typo::meta(k)).color(k.c.text_faint),
         Item::Error(t) => col()
             .w_full()
             .px(12.0)
@@ -464,7 +452,7 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                         ApprovalDecision::AllowOnce => "Allowed once",
                         ApprovalDecision::AllowSession => "Allowed for session",
                     })
-                    .font(k.ty.small)
+                    .font(typo::meta(k))
                     .color(k.c.text_faint),
                 ),
                 None => {
@@ -575,7 +563,7 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
                 .items_center()
                 .radius(k.radius.lg)
                 .border(1.0, k.c.border_muted)
-                .child(text(label).font(k.ty.small).color(k.c.text_faint))
+                .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
                 .child(
                     text(q.text.clone())
                         .font(k.ty.ui)
@@ -606,10 +594,7 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
 /// The line under the composer: the project path and branch on the left, the agent's status
 /// on the right. It sits in the same centred column as the composer, so their edges line up.
 fn footer(s: &State, k: &Kit) -> El {
-    let meta = TextStyle {
-        size: 12.0,
-        ..k.ty.mono
-    };
+    let meta = typo::footer(k);
     let mut left = row().grow(1.0).min_w(0.0).gap(6.0).items_center().child(
         text(s.cwd())
             .font(meta)
@@ -619,7 +604,7 @@ fn footer(s: &State, k: &Kit) -> El {
     );
     if let Some(b) = &s.info.branch {
         left = left
-            .child(text("·").font(k.ty.small).color(k.c.border_strong))
+            .child(text("·").font(typo::caption(k)).color(k.c.border_strong))
             .child(rune::icon(&crate::icons::BRANCH, 12.0).color(k.c.text_faint))
             .child(text(b.clone()).font(meta).color(k.c.text_faint).truncate());
     }
@@ -632,13 +617,10 @@ fn footer(s: &State, k: &Kit) -> El {
     let status = row()
         .gap(6.0)
         .items_center()
-        .child(el().size(6.0, 6.0).radius(3.0).fill(dot))
+        .child(crate::style::dot(dot, 6.0))
         .child(
             text(format!("{} · {}", s.info.provider, s.status))
-                .font(TextStyle {
-                    size: 12.0,
-                    ..k.ty.small
-                })
+                .font(typo::caption(k))
                 .color(k.c.text_faint),
         );
     row().w_full().justify_center().child(

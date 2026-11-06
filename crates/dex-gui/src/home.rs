@@ -2,12 +2,13 @@
 //! touched in the last two days, a column of counts, and the start actions.
 
 use chrono::{Local, NaiveDate, Timelike};
-use rune::{El, ScrollSpec, TextStyle, col, el, row, text};
+use rune::{El, ScrollSpec, col, el, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
 
 use crate::icons;
 use crate::sidebar::ago;
 use crate::state::{Cmd, Page, State, project_name, session_title};
+use crate::style::{caps, rule, typo};
 use crate::theme;
 
 fn local_date(updated_at: &str) -> Option<NaiveDate> {
@@ -16,38 +17,15 @@ fn local_date(updated_at: &str) -> Option<NaiveDate> {
         .map(|t| t.with_timezone(&Local).date_naive())
 }
 
-/// A small uppercase section label, as in the design.
-pub fn caps(k: &Kit, label: &str) -> El {
-    text(label.to_string())
-        .font(TextStyle {
-            size: 11.0,
-            tracking: 0.9,
-            ..k.ty.ui_medium
-        })
-        .color(k.c.text_faint)
-}
-
-/// A 1px hairline, drawn as an element: `El` has no per-side borders.
-fn rule(k: &Kit) -> El {
-    el().w_full().h(1.0).fill(k.c.border_muted)
-}
-
 fn stat(k: &Kit, n: usize, label: &str, color: rune::Color) -> El {
     col()
         .w_full()
         .gap(6.0)
         .py(18.0)
-        .child(
-            text(n.to_string())
-                .font(TextStyle {
-                    size: 40.0,
-                    ..k.ty.body_medium
-                })
-                .color(color),
-        )
+        .child(text(n.to_string()).font(typo::stat(k)).color(color))
         .child(
             text(label.to_string())
-                .font(k.ty.small)
+                .font(typo::caption(k))
                 .color(k.c.text_faint),
         )
         .child(rule(k).mt(18.0))
@@ -150,10 +128,10 @@ pub fn home(s: &State, k: &Kit) -> El {
             )
             .child(
                 text(project_name(&sess.cwd).to_uppercase())
-                    .font(k.ty.small)
+                    .font(typo::caps(k))
                     .color(k.c.text_faint),
             )
-            .child(text(when).font(k.ty.small).color(k.c.text_faint));
+            .child(text(when).font(typo::time(k)).color(k.c.text_faint));
         recent = recent.child(k.interactive(line).on_press(move |s: &mut State| {
             s.project = Some(cwd.clone());
             s.page = Page::Thread;
@@ -198,7 +176,7 @@ pub fn home(s: &State, k: &Kit) -> El {
             s.send_cmd(Cmd::Open(id.clone()));
         }));
     }
-    actions = actions.child(text("Ctrl N").font(k.ty.small).color(k.c.text_faint));
+    actions = actions.child(text("Ctrl N").font(typo::time(k)).color(k.c.text_faint));
 
     let content = col()
         .w_full()
@@ -211,14 +189,7 @@ pub fn home(s: &State, k: &Kit) -> El {
         ))
         .child(
             text(greeting.to_string())
-                .font(
-                    TextStyle {
-                        size: 56.0,
-                        tracking: -1.5,
-                        ..k.ty.body_medium
-                    }
-                    .lh(68.0),
-                )
+                .font(typo::greeting(k))
                 .color(k.c.text_base)
                 .pt(14.0),
         )

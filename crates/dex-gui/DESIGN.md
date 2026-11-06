@@ -47,7 +47,8 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Title: 18px, weight 600 (transcript headings).
 - Header title: 15px, weight 500.
 - Body: 14px / 22px line height; secondary 14px / 20px.
-- Small: 13px. Caption: 12px, weight 500, 0.02em (project labels, uppercase in the sidebar).
+- Small (quiet transcript rows): 13px / 20. Caption: 12px / 18 (hints, descriptions, status). Caps labels: 11px, weight 500, tracked 0.9 (project and section labels). Time and shortcut hints: mono 11.
+- In code these are named roles in `src/style.rs::typo` (reply, heading, thought, meta, caption, caps, time, footer, greeting, stat). Rune's own `small` is 11px, so views never use `k.ty.small`; shared pieces `caps`, `rule`, `dot` live there too.
 - Mono: 12px / 18px (tool output, diffs), 13px (inline code).
 
 ## Radius and spacing

@@ -2,7 +2,8 @@
 //! mode list with a one-line description per mode, and a searchable model list grouped by
 //! provider. Both open upward from their chip.
 
-use rune::{El, ScrollSpec, TextStyle, col, el, row, text, text_input};
+use crate::style::{caps, typo};
+use rune::{El, ScrollSpec, col, el, row, text, text_input};
 use rune_kit::{Kit, Placement, Popover};
 
 use crate::icons;
@@ -17,16 +18,6 @@ pub const MODES: [(&str, &str, &str); 3] = [
 
 /// Models shown before the list asks the user to filter.
 const MAX_MODELS: usize = 12;
-
-fn caps(k: &Kit, label: &str) -> El {
-    text(label.to_string())
-        .font(TextStyle {
-            size: 11.0,
-            tracking: 0.9,
-            ..k.ty.ui_medium
-        })
-        .color(k.c.text_faint)
-}
 
 /// A chip in the composer: an optional icon, a label, faint detail, and a chevron.
 fn chip(k: &Kit, icon: Option<&'static rune::Icon>, label: &str, detail: &str, key: &str) -> El {
@@ -48,7 +39,7 @@ fn chip(k: &Kit, icon: Option<&'static rune::Icon>, label: &str, detail: &str, k
     if !detail.is_empty() {
         r = r.child(
             text(detail.to_string())
-                .font(k.ty.small)
+                .font(typo::caption(k))
                 .color(k.c.text_faint),
         );
     }
@@ -60,17 +51,14 @@ fn menu_row(k: &Kit, key: String, name: &str, desc: &str, detail: &str, on: bool
     let mut label = col().grow(1.0).min_w(0.0).gap(2.0);
     label = label.child(
         text(name.to_string())
-            .font(TextStyle {
-                size: 13.0,
-                ..k.ty.ui_medium
-            })
+            .font(k.ty.ui_medium)
             .color(k.c.text_base)
             .truncate(),
     );
     if !desc.is_empty() {
         label = label.child(
             text(desc.to_string())
-                .font(k.ty.small)
+                .font(typo::caption(k))
                 .color(k.c.text_faint),
         );
     }
@@ -92,7 +80,7 @@ fn menu_row(k: &Kit, key: String, name: &str, desc: &str, detail: &str, on: bool
     if !detail.is_empty() {
         r = r.child(
             text(detail.to_string())
-                .font(k.ty.small)
+                .font(typo::caption(k))
                 .color(k.c.text_faint),
         );
     }
@@ -206,7 +194,7 @@ pub fn model(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     if matched.is_empty() {
         list = list.child(
             text("No model matches")
-                .font(k.ty.small)
+                .font(typo::caption(k))
                 .color(k.c.text_faint)
                 .px(10.0)
                 .py(6.0),
@@ -217,7 +205,7 @@ pub fn model(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
                 "{} more · keep typing to filter",
                 matched.len() - MAX_MODELS
             ))
-            .font(k.ty.small)
+            .font(typo::caption(k))
             .color(k.c.text_faint)
             .px(10.0)
             .py(6.0),
