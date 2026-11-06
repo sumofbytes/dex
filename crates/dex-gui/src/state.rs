@@ -45,6 +45,8 @@ pub enum Cmd {
 pub enum Msg {
     Ready(Info),
     Sessions(Vec<SessionInfo>),
+    /// A session just created: it lists before the next refresh catches it.
+    Upsert(SessionInfo),
     /// A session was opened (or created): replayed history follows as `Event`s.
     Opened {
         id: String,
@@ -451,9 +453,24 @@ impl State {
             }
             Msg::Sessions(list) => {
                 let mut list = list;
+                // A thread that is running or open must not vanish because the daemon's listing
+                // does not include it yet (nothing journaled).
+                for old in &self.sessions {
+                    let id = &old.session_id;
+                    let live = self.running.contains(id) || self.current.as_deref() == Some(id);
+                    if live && !list.iter().any(|x| x.session_id == *id) {
+                        list.push(old.clone());
+                    }
+                }
                 list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 self.sessions = list;
                 self.sessions_loaded = true;
+            }
+            Msg::Upsert(sess) => {
+                self.sessions.retain(|x| x.session_id != sess.session_id);
+                self.sessions.insert(0, sess);
+                self.sessions
+                    .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
             }
             Msg::Status(s) => self.status = s,
             Msg::Project(p) => self.project = Some(p),
@@ -508,6 +525,10 @@ impl State {
             Msg::Event(ev) => self.apply_event(ev),
             Msg::TurnStarted(id) => {
                 self.needs.retain(|n| n.id != id);
+                // For a brand-new thread `Opened` came first and saw nothing running yet.
+                if self.current.as_deref() == Some(id.as_str()) {
+                    self.busy = true;
+                }
                 self.running.insert(id);
             }
             Msg::Turn { id, ev } => self.apply_turn(id, ev),
@@ -1065,6 +1086,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_thread_is_busy_after_its_turn_starts() {
+        let mut s = State::default();
+        s.apply(Msg::Opened {
+            id: "n".into(),
+            replay: Vec::new(),
+        });
+        assert!(!s.busy);
+        s.apply(Msg::TurnStarted("n".into()));
+        assert!(s.busy && s.running.contains("n"));
+        s.apply(Msg::Turn {
+            id: "n".into(),
+            ev: StreamEvent::TurnComplete {
+                response: String::new(),
+                usage: None,
+                cached: None,
+            },
+        });
+        assert!(!s.busy && !s.running.contains("n"));
+    }
+
+    #[test]
+    fn refresh_keeps_running_threads() {
+        let mut s = State::default();
+        let sess: SessionInfo = serde_json::from_value(serde_json::json!({
+            "session_id": "new", "path": "", "cwd": "/w", "created_at": "", "updated_at": "",
+            "auto_named": false, "message_count": 0
+        }))
+        .unwrap();
+        s.apply(Msg::Upsert(sess));
+        s.running.insert("new".into());
+        s.apply(Msg::Sessions(Vec::new()));
+        assert_eq!(s.sessions.len(), 1);
+        s.running.clear();
+        s.apply(Msg::Sessions(Vec::new()));
+        assert!(s.sessions.is_empty());
+    }
+
+    #[test]
     fn background_turns_land_in_needs_you() {
         let mut s = State {
             current: Some("a".into()),
@@ -1128,6 +1187,25 @@ mod tests {
         ];
         assert_eq!(work_run_starts(&items), vec![1, 5]);
         assert_eq!(work_summary(&items[1..4]), (1, 2, 2.0));
+    }
+
+    #[test]
+    fn a_new_thread_lists_before_the_next_refresh() {
+        let sess = |id: &str, updated: &str| -> SessionInfo {
+            serde_json::from_value(serde_json::json!({
+                "session_id": id, "path": "", "cwd": "/x" , "updated_at": updated,
+                "message_count": 1, "auto_named": false
+            }))
+            .unwrap()
+        };
+        let mut s = State::default();
+        s.apply(Msg::Sessions(vec![sess("old", "2026-11-05T00:00:00Z")]));
+        s.apply(Msg::Upsert(sess("new", "2026-11-07T00:00:00Z")));
+        assert_eq!(s.sessions[0].session_id, "new");
+        assert!(s.sessions.iter().any(|x| x.session_id == "old"));
+        // A full listing replaces the placeholder with real values.
+        s.apply(Msg::Sessions(vec![sess("old", "2026-11-05T00:00:00Z")]));
+        assert!(!s.sessions.iter().any(|x| x.session_id == "new"));
     }
 
     #[test]

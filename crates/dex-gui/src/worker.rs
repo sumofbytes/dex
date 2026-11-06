@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use dex_client::protocol::StreamEvent;
+use dex_client::protocol::{SessionInfo, StreamEvent};
 use dex_client::{ChatOptions, DaemonClient};
 use rune::Waker;
 use tokio::sync::mpsc;
@@ -141,6 +141,22 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                                 match client.create_session_async(&cwd, None).await {
                                     Ok(r) => {
                                         session = Some(r.session_id.clone());
+                                        // The listing is only refreshed after turns; a new thread
+                                        // must show up in its project right away.
+                                        let now = chrono::Utc::now().to_rfc3339();
+                                        post(Msg::Upsert(SessionInfo {
+                                            session_id: r.session_id.clone(),
+                                            path: r.path.clone(),
+                                            name: None,
+                                            cwd: if r.cwd.is_empty() { cwd.clone() } else { r.cwd },
+                                            created_at: now.clone(),
+                                            message_count: 1,
+                                            updated_at: now,
+                                            auto_named: false,
+                                            first_prompt: Some(text.clone()),
+                                            child_agents: 0,
+                                            interrupted_children: 0,
+                                        }));
                                         post(Msg::Opened {
                                             id: r.session_id.clone(),
                                             replay: vec![StreamEvent::UserPrompt {
