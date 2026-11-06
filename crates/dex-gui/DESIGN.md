@@ -56,7 +56,7 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Sidebar: 280px wide, padding 14px 8px, rows 8px 10px. Thread rows under a project indent 14px.
 - Spacing scale (`src/style.rs::space`): XXS 2, XS 4, SM 6, MD 8, LG 10, XL 12, XXL 16. Gaps and paddings use these names; layout one-offs (14, 18, 20, 48 …) stay literal.
 - Header: 48px tall, padding 0 16px.
-- Transcript column: 680px max, gap 14px, centred.
+- Transcript column: 760px max inside a 16px gutter, gap 16px, centred. The transcript, composer card and footer share this column, so their left and right edges are one line (user bubble right edge = card right edge; reply text left = card left).
 - Home: padding 40px 48px, gap 28px. Stat cards: four equal columns, gap 12px.
 - Viewer: 460px wide. Tabs row 48px, padding 0 12px.
 

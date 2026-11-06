@@ -163,12 +163,7 @@ fn human(n: u64) -> String {
 
 fn transcript(s: &State, k: &Kit) -> El {
     // Text leads: items sit 14 points apart, and a turn's user message gets a little more room.
-    let mut list = col()
-        .w_full()
-        .max_w(COLUMN)
-        .gap(space::XXL)
-        .py(space::XXL)
-        .px(space::XXL);
+    let mut list = col().w_full().max_w(COLUMN).gap(space::XXL).py(space::XXL);
     if s.items.is_empty() {
         list = list.child(
             col()
@@ -218,7 +213,13 @@ fn transcript(s: &State, k: &Kit) -> El {
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: true })
-        .child(row().w_full().justify_center().child(list.grow(1.0)))
+        .child(
+            row()
+                .w_full()
+                .justify_center()
+                .px(space::XXL)
+                .child(list.grow(1.0)),
+        )
 }
 
 /// A run of tool calls (`start..end`): a quiet summary line that opens to the rows.
@@ -597,7 +598,8 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 /// The line under the composer: the project path and branch on the left, the agent's status
-/// on the right. It sits in the same centred column as the composer, so their edges line up.
+/// on the right. Transcript, composer card and this line share one column (`COLUMN` inside a
+/// 16 gutter), so their left and right edges line up.
 fn footer(s: &State, k: &Kit) -> El {
     let meta = typo::footer(k);
     let mut left = row()
@@ -633,12 +635,11 @@ fn footer(s: &State, k: &Kit) -> El {
                 .font(typo::caption(k))
                 .color(k.c.text_faint),
         );
-    row().w_full().justify_center().child(
+    row().w_full().justify_center().px(space::XXL).child(
         row()
             .w_full()
             .max_w(COLUMN)
             .h(36.0)
-            .px(space::XXL)
             .pb(space::MD)
             .gap(space::MD)
             .items_center()
