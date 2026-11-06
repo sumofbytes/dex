@@ -8,7 +8,7 @@ use rune_kit::{IconButton, IconButtonVariant, Kit};
 use crate::icons;
 use crate::sidebar::ago;
 use crate::state::{Cmd, Page, State, project_name, session_title};
-use crate::style::{caps, rule, typo};
+use crate::style::{caps, rule, space, typo};
 use crate::theme;
 
 fn local_date(updated_at: &str) -> Option<NaiveDate> {
@@ -20,7 +20,7 @@ fn local_date(updated_at: &str) -> Option<NaiveDate> {
 fn stat(k: &Kit, n: usize, label: &str, color: rune::Color) -> El {
     col()
         .w_full()
-        .gap(6.0)
+        .gap(space::SM)
         .py(18.0)
         .child(text(n.to_string()).font(typo::stat(k)).color(color))
         .child(
@@ -39,9 +39,9 @@ fn action(k: &Kit, label: &str, primary: bool, key: &str, f: impl Fn(&mut State)
     };
     let mut b = row()
         .key(key.to_string())
-        .px(16.0)
-        .py(10.0)
-        .gap(8.0)
+        .px(space::XXL)
+        .py(space::LG)
+        .gap(space::MD)
         .items_center()
         .radius(k.radius.md)
         .fill(fill);
@@ -110,7 +110,7 @@ pub fn home(s: &State, k: &Kit) -> El {
             .w_full()
             .min_w(0.0)
             .h(56.0)
-            .gap(12.0)
+            .gap(space::XL)
             .items_center()
             .child(
                 el().size(6.0, 6.0)
@@ -140,26 +140,29 @@ pub fn home(s: &State, k: &Kit) -> El {
         recent = recent.child(rule(k));
     }
 
-    let week = col().w(200.0).child(caps(k, "THIS WEEK").pb(12.0)).child(
-        col()
-            .w_full()
-            .child(rule(k))
-            .child(stat(
-                k,
-                dated.len(),
-                "threads active in two days",
-                k.c.text_base,
-            ))
-            .child(stat(k, projects.len(), "projects", k.c.text_base))
-            .child(stat(k, running, "running now", theme::waiting())),
-    );
+    let week = col()
+        .w(200.0)
+        .child(caps(k, "THIS WEEK").pb(space::XL))
+        .child(
+            col()
+                .w_full()
+                .child(rule(k))
+                .child(stat(
+                    k,
+                    dated.len(),
+                    "threads active in two days",
+                    k.c.text_base,
+                ))
+                .child(stat(k, projects.len(), "projects", k.c.text_base))
+                .child(stat(k, running, "running now", theme::waiting())),
+        );
 
     let continue_cwd = s
         .sessions
         .iter()
         .find(|x| s.is_visible(x))
         .map(|x| (x.session_id.clone(), x.cwd.clone()));
-    let mut actions = row().w_full().gap(10.0).items_center().child(action(
+    let mut actions = row().w_full().gap(space::LG).items_center().child(action(
         k,
         "New thread",
         true,
@@ -193,7 +196,12 @@ pub fn home(s: &State, k: &Kit) -> El {
                 .color(k.c.text_base)
                 .pt(14.0),
         )
-        .child(text(subtitle).font(k.ty.body).color(k.c.text_muted).pt(8.0))
+        .child(
+            text(subtitle)
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .pt(space::MD),
+        )
         .child(
             row()
                 .w_full()
@@ -204,7 +212,7 @@ pub fn home(s: &State, k: &Kit) -> El {
                     col()
                         .grow(1.0)
                         .min_w(0.0)
-                        .child(caps(k, "RECENT").pb(12.0))
+                        .child(caps(k, "RECENT").pb(space::XL))
                         .child(recent),
                 )
                 .child(week),
@@ -215,7 +223,14 @@ pub fn home(s: &State, k: &Kit) -> El {
     col()
         .w_full()
         .h_full()
-        .child(row().w_full().h(48.0).px(12.0).items_center().child(toggle))
+        .child(
+            row()
+                .w_full()
+                .h(48.0)
+                .px(space::XL)
+                .items_center()
+                .child(toggle),
+        )
         .child(
             col()
                 .w_full()

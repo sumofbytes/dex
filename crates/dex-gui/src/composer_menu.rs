@@ -2,7 +2,7 @@
 //! mode list with a one-line description per mode, and a searchable model list grouped by
 //! provider. Both open upward from their chip.
 
-use crate::style::{caps, typo};
+use crate::style::{caps, space, typo};
 use rune::{El, ScrollSpec, col, el, row, text, text_input};
 use rune_kit::{Kit, Placement, Popover};
 
@@ -24,8 +24,8 @@ fn chip(k: &Kit, icon: Option<&'static rune::Icon>, label: &str, detail: &str, k
     let mut r = row()
         .key(key.to_string())
         .h(28.0)
-        .px(8.0)
-        .gap(6.0)
+        .px(space::MD)
+        .gap(space::SM)
         .items_center()
         .radius(k.radius.md);
     if let Some(ic) = icon {
@@ -48,7 +48,7 @@ fn chip(k: &Kit, icon: Option<&'static rune::Icon>, label: &str, detail: &str, k
 
 /// One row of a menu: a name with an optional description, and a check on the current one.
 fn menu_row(k: &Kit, key: String, name: &str, desc: &str, detail: &str, on: bool) -> El {
-    let mut label = col().grow(1.0).min_w(0.0).gap(2.0);
+    let mut label = col().grow(1.0).min_w(0.0).gap(space::XXS);
     label = label.child(
         text(name.to_string())
             .font(k.ty.ui_medium)
@@ -66,9 +66,9 @@ fn menu_row(k: &Kit, key: String, name: &str, desc: &str, detail: &str, on: bool
         .key(key)
         .w_full()
         .min_h(34.0)
-        .px(10.0)
-        .py(6.0)
-        .gap(10.0)
+        .px(space::LG)
+        .py(space::SM)
+        .gap(space::LG)
         .items_center()
         .radius(k.radius.md)
         .fill(if on {
@@ -109,7 +109,7 @@ pub fn mode(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
                 Some("mode")
             };
         });
-    let mut list = col().w_full().gap(2.0);
+    let mut list = col().w_full().gap(space::XXS);
     for (value, label, desc) in MODES {
         let pick = value.to_string();
         let item = k
@@ -129,8 +129,8 @@ pub fn mode(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     let body = col()
         .w(240.0)
-        .gap(4.0)
-        .child(caps(k, "MODE").px(10.0).pt(6.0).pb(4.0))
+        .gap(space::XS)
+        .child(caps(k, "MODE").px(space::LG).pt(space::SM).pb(space::XS))
         .child(list);
     Popover::new("mode-menu")
         .trigger(trigger)
@@ -176,10 +176,10 @@ pub fn model(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .single_line()
         .on_edit(|s: &mut State| &mut s.model_query)
         .w_full()
-        .px(10.0)
-        .py(6.0);
+        .px(space::LG)
+        .py(space::SM);
 
-    let mut list = col().w_full().gap(2.0);
+    let mut list = col().w_full().gap(space::XXS);
     for m in matched.iter().take(MAX_MODELS) {
         let pick = (*m).clone();
         let on = **m == current;
@@ -196,8 +196,8 @@ pub fn model(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             text("No model matches")
                 .font(typo::caption(k))
                 .color(k.c.text_faint)
-                .px(10.0)
-                .py(6.0),
+                .px(space::LG)
+                .py(space::SM),
         );
     } else if matched.len() > MAX_MODELS {
         list = list.child(
@@ -207,16 +207,21 @@ pub fn model(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             ))
             .font(typo::caption(k))
             .color(k.c.text_faint)
-            .px(10.0)
-            .py(6.0),
+            .px(space::LG)
+            .py(space::SM),
         );
     }
 
     let body = col()
         .w(280.0)
-        .gap(4.0)
+        .gap(space::XS)
         .child(search)
-        .child(caps(k, &provider.to_uppercase()).px(10.0).pt(6.0).pb(2.0))
+        .child(
+            caps(k, &provider.to_uppercase())
+                .px(space::LG)
+                .pt(space::SM)
+                .pb(space::XXS),
+        )
         .child(
             col()
                 .w_full()

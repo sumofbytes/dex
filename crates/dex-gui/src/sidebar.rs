@@ -9,7 +9,7 @@ use rune_theme_opencode::icons as kit_icons;
 
 use crate::icons;
 use crate::state::{Cmd, Item, Page, State, project_name, session_title};
-use crate::style::{caps, dot, typo};
+use crate::style::{caps, dot, space, typo};
 
 /// Layout tokens, in points. One row height, one inset, one gap: rows never drift apart.
 pub mod tok {
@@ -17,9 +17,9 @@ pub mod tok {
     /// Every row: nav, project header, thread.
     pub const ROW_H: f32 = 32.0;
     /// Space between the sidebar edge and a row's content.
-    pub const INSET: f32 = 10.0;
+    pub const INSET: f32 = super::space::LG;
     /// Gap between items inside a row.
-    pub const GAP: f32 = 6.0;
+    pub const GAP: f32 = super::space::SM;
     /// Fixed, right-aligned column for a thread's time, just left of the slot.
     pub const TIME_W: f32 = 24.0;
     /// Project dot diameter.
@@ -257,7 +257,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
                 .on_edit(|s: &mut State| &mut s.search)
                 .w_full()
                 .px(tok::INSET)
-                .py(6.0),
+                .py(space::SM),
         );
     }
 
@@ -281,7 +281,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
             .w_full()
             .px(tok::INSET)
             .pt(14.0)
-            .pb(4.0)
+            .pb(space::XS)
             .child(caps(k, "PROJECTS")),
     );
 
@@ -352,7 +352,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
             text("Loading threads…")
                 .font(typo::caption(k))
                 .color(k.c.text_faint)
-                .px(12.0)
+                .px(space::XL)
                 .key("loading"),
         );
     }

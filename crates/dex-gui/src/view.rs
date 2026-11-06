@@ -7,7 +7,7 @@ use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Spinne
 use rune_theme_opencode::icons;
 
 use crate::state::{Cmd, Item, Page, State, VTab};
-use crate::style::typo;
+use crate::style::{space, typo};
 
 const COLUMN: f32 = 760.0;
 
@@ -69,7 +69,7 @@ fn header(s: &State, k: &Kit) -> El {
         .color(k.c.text_base)
         .truncate();
     let wt = crate::worktree::info(&s.cwd());
-    let mut stats = row().gap(8.0).items_center();
+    let mut stats = row().gap(space::MD).items_center();
     if let Some(w) = &wt {
         stats = stats
             .child(text(w.branch.clone()).font(k.ty.mono).color(k.c.text_muted))
@@ -119,8 +119,8 @@ fn header(s: &State, k: &Kit) -> El {
     row()
         .w_full()
         .h(48.0)
-        .px(12.0)
-        .gap(8.0)
+        .px(space::XL)
+        .gap(space::MD)
         .items_center()
         .child(toggle)
         .child(title.grow(1.0).min_w(0.0))
@@ -163,14 +163,19 @@ fn human(n: u64) -> String {
 
 fn transcript(s: &State, k: &Kit) -> El {
     // Text leads: items sit 14 points apart, and a turn's user message gets a little more room.
-    let mut list = col().w_full().max_w(COLUMN).gap(16.0).py(16.0).px(16.0);
+    let mut list = col()
+        .w_full()
+        .max_w(COLUMN)
+        .gap(space::XXL)
+        .py(space::XXL)
+        .px(space::XXL);
     if s.items.is_empty() {
         list = list.child(
             col()
                 .w_full()
                 .py(120.0)
                 .items_center()
-                .gap(6.0)
+                .gap(space::SM)
                 .child(
                     text("What should we work on?")
                         .font(k.ty.body_medium)
@@ -195,12 +200,12 @@ fn transcript(s: &State, k: &Kit) -> El {
         // Rhythm: 16 between blocks; +16 around a user message (32), +4 from tools to the reply (20).
         if i > 0 && (matches!(s.items[i], Item::User(_)) || matches!(s.items[i - 1], Item::User(_)))
         {
-            el = col().w_full().gap(0.0).child(el.pt(16.0));
+            el = col().w_full().gap(0.0).child(el.pt(space::XXL));
         } else if i > 0
             && matches!(s.items[i], Item::Assistant { .. })
             && matches!(s.items[i - 1], Item::Tool(_))
         {
-            el = col().w_full().gap(0.0).child(el.pt(4.0));
+            el = col().w_full().gap(0.0).child(el.pt(space::XS));
         }
         list = list.child(el);
         i += 1;
@@ -229,19 +234,18 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
     let head = row()
         .key(format!("tools{start}"))
         .h(20.0)
-        .gap(6.0)
+        .gap(space::SM)
         .items_center()
         .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
         .child(text(label).font(typo::meta(k)).color(k.c.text_faint));
-    let mut group =
-        col()
-            .w_full()
-            .gap(4.0)
-            .child(k.interactive(head).on_press(move |s: &mut State| {
-                if !s.open_tools.remove(&start) {
-                    s.open_tools.insert(start);
-                }
-            }));
+    let mut group = col()
+        .w_full()
+        .gap(space::XS)
+        .child(k.interactive(head).on_press(move |s: &mut State| {
+            if !s.open_tools.remove(&start) {
+                s.open_tools.insert(start);
+            }
+        }));
     if open {
         for i in start..end {
             group = group.child(
@@ -273,9 +277,9 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: 
     let head = row()
         .key(format!("thought{i}"))
         .h(20.0)
-        .gap(6.0)
+        .gap(space::SM)
         .items_center();
-    let mut group = col().w_full().gap(8.0);
+    let mut group = col().w_full().gap(space::MD);
     if live {
         group = group.child(
             head.child(Spinner::new().size(12.0).build(k)).child(
@@ -322,8 +326,8 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
         Item::User(t) => row().w_full().justify_end().child(
             col()
                 .max_w(560.0)
-                .px(16.0)
-                .py(12.0)
+                .px(space::XXL)
+                .py(space::XL)
                 .radius(k.radius.xl)
                 .fill(k.c.layer_02)
                 .child(text(t.clone()).font(k.ty.body).color(k.c.text_base).wrap()),
@@ -360,7 +364,7 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                 .key(format!("tool{i}"))
                 .w_full()
                 .h(24.0)
-                .gap(6.0)
+                .gap(space::SM)
                 .items_center()
                 .child(label)
                 .child(
@@ -376,13 +380,14 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                 } else {
                     k.c.text_faint
                 }));
-            let mut c = col().w_full().gap(2.0).child(k.interactive(head).on_press(
-                move |s: &mut State| {
+            let mut c = col()
+                .w_full()
+                .gap(space::XXS)
+                .child(k.interactive(head).on_press(move |s: &mut State| {
                     if let Some(Item::Tool(t)) = s.items.get_mut(i) {
                         t.open = !t.open;
                     }
-                },
-            ));
+                }));
             if let Some(d) = &t.done {
                 let ink = if failed {
                     k.c.danger.fg
@@ -401,8 +406,8 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                     c = c.child(
                         row()
                             .w_full()
-                            .gap(8.0)
-                            .pl(4.0)
+                            .gap(space::MD)
+                            .pl(space::XS)
                             .child(text(arrow).font(k.ty.mono).color(k.c.text_faint))
                             .child(
                                 text(l.clone())
@@ -420,8 +425,8 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
         Item::Notice(t) => text(t.clone()).font(typo::meta(k)).color(k.c.text_faint),
         Item::Error(t) => col()
             .w_full()
-            .px(12.0)
-            .py(8.0)
+            .px(space::XL)
+            .py(space::MD)
             .radius(k.radius.md)
             .fill(k.c.danger.bg)
             .child(text(t.clone()).font(k.ty.ui).color(k.c.danger.fg)),
@@ -438,8 +443,8 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
             let mut c = col()
                 .w_full()
                 .px(14.0)
-                .py(12.0)
-                .gap(8.0)
+                .py(space::XL)
+                .gap(space::MD)
                 .radius(k.radius.lg)
                 .fill(k.c.layer_02)
                 .border(1.0, k.c.border_base)
@@ -474,7 +479,7 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                     };
                     c.child(
                         row()
-                            .gap(8.0)
+                            .gap(space::MD)
                             .child(btn(
                                 "Allow once",
                                 ButtonVariant::Contrast,
@@ -536,30 +541,30 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .w_full()
         .max_w(COLUMN)
         .padding(12.0)
-        .gap(8.0)
+        .gap(space::MD)
         .radius(k.radius.xl)
         .fill(k.c.layer_02)
         .border(1.0, k.c.border_base)
         .child(input)
         .child(
             row()
-                .gap(8.0)
+                .gap(space::MD)
                 .items_center()
                 .child(mode)
                 .child(model)
                 .child(spacer())
                 .child(action),
         );
-    let mut stack = col().w_full().max_w(COLUMN).gap(6.0);
+    let mut stack = col().w_full().max_w(COLUMN).gap(space::SM);
     for (i, q) in s.queue.iter().enumerate() {
         let label = if q.followup { "Queued" } else { "Steering" };
         stack = stack.child(
             row()
                 .key(format!("queued{i}"))
                 .w_full()
-                .px(12.0)
-                .py(4.0)
-                .gap(8.0)
+                .px(space::XL)
+                .py(space::XS)
+                .gap(space::MD)
                 .items_center()
                 .radius(k.radius.lg)
                 .border(1.0, k.c.border_muted)
@@ -586,8 +591,8 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     row()
         .w_full()
         .justify_center()
-        .px(16.0)
-        .pb(8.0)
+        .px(space::XXL)
+        .pb(space::MD)
         .child(stack.grow(1.0))
 }
 
@@ -595,13 +600,18 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
 /// on the right. It sits in the same centred column as the composer, so their edges line up.
 fn footer(s: &State, k: &Kit) -> El {
     let meta = typo::footer(k);
-    let mut left = row().grow(1.0).min_w(0.0).gap(6.0).items_center().child(
-        text(s.cwd())
-            .font(meta)
-            .color(k.c.text_faint)
-            .truncate()
-            .shrink(),
-    );
+    let mut left = row()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(space::SM)
+        .items_center()
+        .child(
+            text(s.cwd())
+                .font(meta)
+                .color(k.c.text_faint)
+                .truncate()
+                .shrink(),
+        );
     if let Some(b) = &s.info.branch {
         left = left
             .child(text("·").font(typo::caption(k)).color(k.c.border_strong))
@@ -615,7 +625,7 @@ fn footer(s: &State, k: &Kit) -> El {
         crate::theme::waiting()
     };
     let status = row()
-        .gap(6.0)
+        .gap(space::SM)
         .items_center()
         .child(crate::style::dot(dot, 6.0))
         .child(
@@ -628,9 +638,9 @@ fn footer(s: &State, k: &Kit) -> El {
             .w_full()
             .max_w(COLUMN)
             .h(36.0)
-            .px(16.0)
-            .pb(8.0)
-            .gap(8.0)
+            .px(space::XXL)
+            .pb(space::MD)
+            .gap(space::MD)
             .items_center()
             .child(left)
             .child(status),

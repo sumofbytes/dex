@@ -8,7 +8,7 @@ use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
 
 use crate::state::{State, TermBlock, TermStatus, VTab};
-use crate::style::typo;
+use crate::style::{space, typo};
 use crate::theme;
 
 /// Output lines shown per command block; older ones are hidden.
@@ -46,8 +46,8 @@ pub fn viewer(s: &State, k: &Kit) -> El {
         let seg = row()
             .key(key.to_string())
             .h(28.0)
-            .px(10.0)
-            .gap(6.0)
+            .px(space::LG)
+            .gap(space::SM)
             .items_center()
             .radius(k.radius.md)
             .fill(if on {
@@ -65,7 +65,7 @@ pub fn viewer(s: &State, k: &Kit) -> El {
     let changes = s.diff.files().len();
     let segments = row()
         .padding(2.0)
-        .gap(2.0)
+        .gap(space::XXS)
         .radius(k.radius.lg)
         .border(1.0, k.c.border_base)
         .child(tab(
@@ -93,8 +93,8 @@ pub fn viewer(s: &State, k: &Kit) -> El {
     let bar = row()
         .w_full()
         .h(48.0)
-        .px(12.0)
-        .gap(6.0)
+        .px(space::XL)
+        .gap(space::SM)
         .items_center()
         .child(segments)
         .child(col().grow(1.0))
@@ -150,7 +150,12 @@ fn files(s: &State, k: &Kit) -> El {
                 .key(format!("f:{p}")),
         );
     }
-    let mut c = col().w_full().grow(1.0).min_h(0.0).gap(8.0).px(12.0);
+    let mut c = col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(space::MD)
+        .px(space::XL);
     c = c.child(
         text_input(&s.file_filter, k.ty.ui.lh(20.0))
             .key("file-filter")
@@ -160,8 +165,8 @@ fn files(s: &State, k: &Kit) -> El {
             .single_line()
             .on_edit(|s: &mut State| &mut s.file_filter)
             .w_full()
-            .px(10.0)
-            .py(6.0),
+            .px(space::LG)
+            .py(space::SM),
     );
     if s.files.is_empty() {
         return c.child(empty(k, "No files (not a git project?)"));
@@ -188,8 +193,8 @@ fn files(s: &State, k: &Kit) -> El {
 fn preview(f: &crate::state::OpenFile, k: &Kit) -> El {
     let head = row()
         .w_full()
-        .px(12.0)
-        .gap(6.0)
+        .px(space::XL)
+        .gap(space::SM)
         .items_center()
         .child(
             IconButton::new(&crate::icons::LEFT)
@@ -234,7 +239,7 @@ fn preview(f: &crate::state::OpenFile, k: &Kit) -> El {
             .child(
                 row()
                     .w_full()
-                    .gap(10.0)
+                    .gap(space::LG)
                     .padding(12.0)
                     .child(gutter)
                     .child(code),
@@ -249,7 +254,7 @@ fn breadcrumb(path: &str, k: &Kit) -> El {
         None => (String::new(), path.to_string()),
     };
     row()
-        .gap(6.0)
+        .gap(space::SM)
         .items_center()
         .child(text(dir).font(k.ty.ui).color(k.c.text_faint).truncate())
         .child(
@@ -265,8 +270,8 @@ fn terminal(s: &State, k: &Kit) -> El {
     let header = row()
         .w_full()
         .h(40.0)
-        .px(12.0)
-        .gap(8.0)
+        .px(space::XL)
+        .gap(space::MD)
         .items_center()
         .child(breadcrumb(&dir, k).grow(1.0).min_w(0.0))
         .child(if !s.term.is_empty() && !s.term_running {
@@ -274,7 +279,7 @@ fn terminal(s: &State, k: &Kit) -> El {
                 row()
                     .key("term-clear")
                     .h(26.0)
-                    .px(10.0)
+                    .px(space::LG)
                     .items_center()
                     .radius(k.radius.md)
                     .border(1.0, k.c.border_base)
@@ -293,7 +298,7 @@ fn terminal(s: &State, k: &Kit) -> El {
                 .w_full()
                 .py(48.0)
                 .items_center()
-                .gap(6.0)
+                .gap(space::SM)
                 .child(
                     text("Run a command in this project")
                         .font(k.ty.body_medium)
@@ -313,9 +318,9 @@ fn terminal(s: &State, k: &Kit) -> El {
 
     let input = row()
         .w_full()
-        .px(12.0)
-        .py(8.0)
-        .gap(8.0)
+        .px(space::XL)
+        .py(space::MD)
+        .gap(space::MD)
         .items_center()
         .radius(k.radius.lg)
         .border(1.0, k.c.border_base)
@@ -355,11 +360,17 @@ fn terminal(s: &State, k: &Kit) -> El {
                 .child(blocks),
         )
         .child(
-            col().w_full().px(16.0).gap(8.0).pb(8.0).child(input).child(
-                text("One-shot commands · no interactive programs")
-                    .font(typo::caption(k))
-                    .color(k.c.text_faint),
-            ),
+            col()
+                .w_full()
+                .px(space::XXL)
+                .gap(space::MD)
+                .pb(space::MD)
+                .child(input)
+                .child(
+                    text("One-shot commands · no interactive programs")
+                        .font(typo::caption(k))
+                        .color(k.c.text_faint),
+                ),
         )
 }
 
@@ -368,7 +379,7 @@ fn terminal(s: &State, k: &Kit) -> El {
 fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
     let status = match &b.status {
         TermStatus::Running { started } => row()
-            .gap(6.0)
+            .gap(space::SM)
             .items_center()
             .child(crate::style::dot(theme::waiting(), 6.0))
             .child(
@@ -377,7 +388,7 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
                     .color(theme::waiting()),
             ),
         TermStatus::Done { code: 0, secs } => row()
-            .gap(4.0)
+            .gap(space::XS)
             .items_center()
             .child(rune::icon(&crate::icons::CHECK, 12.0).color(theme::done()))
             .child(
@@ -386,7 +397,7 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
                     .color(k.c.text_faint),
             ),
         TermStatus::Done { code, secs } => row()
-            .gap(4.0)
+            .gap(space::XS)
             .items_center()
             .child(rune::icon(&crate::icons::X, 12.0).color(k.c.danger.fg))
             .child(
@@ -397,7 +408,7 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
     };
     let head = row()
         .w_full()
-        .gap(8.0)
+        .gap(space::MD)
         .items_center()
         .child(text("$").font(k.ty.mono).color(theme::accent()))
         .child(
@@ -412,12 +423,12 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
     let mut block = col()
         .key(format!("term{i}"))
         .w_full()
-        .gap(8.0)
-        .py(12.0)
+        .gap(space::MD)
+        .py(space::XL)
         .child(head);
     if !b.lines.is_empty() {
         let shown = b.lines.len().saturating_sub(OUTPUT_LINES);
-        let mut out = col().gap(2.0).grow(1.0).min_w(0.0);
+        let mut out = col().gap(space::XXS).grow(1.0).min_w(0.0);
         if shown > 0 {
             out = out.child(
                 text(format!("{shown} earlier lines hidden"))
@@ -438,7 +449,7 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
         block = block.child(
             row()
                 .w_full()
-                .gap(12.0)
+                .gap(space::XL)
                 .child(el().w(2.0).fill(k.c.border_muted))
                 .child(out),
         );

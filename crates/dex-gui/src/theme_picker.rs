@@ -4,6 +4,7 @@ use rune::{El, ScrollSpec, col, el, row, text, text_input};
 use rune_kit::{Dialog, Kit};
 
 use crate::state::State;
+use crate::style::space;
 
 /// Three squares: the scheme's background, text and accent.
 fn swatch(bg: rune::Color, fg: rune::Color, accent: rune::Color) -> El {
@@ -28,7 +29,7 @@ pub fn picker(s: &State, k: &Kit, layer: &mut Vec<El>) {
         .into_iter()
         .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
         .collect();
-    let mut list = col().w_full().gap(2.0);
+    let mut list = col().w_full().gap(space::XXS);
     for name in matches.iter().take(MAX_ROWS) {
         let pick = name.to_string();
         let on = *name == current;
@@ -37,8 +38,8 @@ pub fn picker(s: &State, k: &Kit, layer: &mut Vec<El>) {
             .key(format!("theme:{name}"))
             .w_full()
             .h(36.0)
-            .px(10.0)
-            .gap(12.0)
+            .px(space::LG)
+            .gap(space::XL)
             .items_center()
             .radius(k.radius.md)
             .fill(if on {
@@ -83,7 +84,7 @@ pub fn picker(s: &State, k: &Kit, layer: &mut Vec<El>) {
     }
     let body = col()
         .w_full()
-        .gap(8.0)
+        .gap(space::MD)
         .child(
             text_input(&s.theme_query, k.ty.ui.lh(20.0))
                 .key("theme-search")
@@ -93,8 +94,8 @@ pub fn picker(s: &State, k: &Kit, layer: &mut Vec<El>) {
                 .single_line()
                 .on_edit(|s: &mut State| &mut s.theme_query)
                 .w_full()
-                .px(10.0)
-                .py(6.0),
+                .px(space::LG)
+                .py(space::SM),
         )
         .child(
             col()
