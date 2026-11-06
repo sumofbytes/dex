@@ -82,6 +82,15 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Gap of 12px between project groups.
 - Home nav row is selected on the Home page; a thread row is selected on the Thread page.
 
+## Composer options (proposed, not yet replicated)
+
+Artboard **dex / Composer options** (Paper node 16W-0). Replaces the flat mode and model selects.
+
+- Mode menu: a titled list (MODE) of Read-only, Ask and Trusted, each with a one-line description. The current mode has a fill and a check mark. Menu width 240px.
+- Model menu: 280px. A search field, then models grouped by provider (OPENCODE), current model with a check, and a "12 more · type to filter" row when the list is long.
+- Chips in the composer: mode with a sliders icon, model with the provider in faint text. Both open their menus upward from the composer.
+- Menus share a surface (#2c2626), 1px border (#4a4141), radius 12, 6px padding; rows radius 8.
+
 ## Footer under the composer
 
 - It sits in the same centred column as the composer (680px in Paper, 760px max in the app), so the two edges line up.
