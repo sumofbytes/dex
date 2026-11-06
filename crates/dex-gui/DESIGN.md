@@ -82,6 +82,13 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Gap of 12px between project groups.
 - Home nav row is selected on the Home page; a thread row is selected on the Thread page.
 
+## Footer under the composer
+
+- It sits in the same centred column as the composer (680px in Paper, 760px max in the app), so the two edges line up.
+- Height 36px with 8px bottom padding, so it doesn't touch the window edge.
+- Left: the project path in IBM Plex Mono 12px, a "·" separator, the branch icon and the branch name in mono 12px. Faint colour.
+- Right: a 6px status dot (green when ready, amber when busy) and "provider · status" in Inter 12px, faint.
+
 ## Replication status
 
 Replicated in `src/` (v2): the sidebar, Home, the thread header, tool rows, composer and footer, the viewer tabs and numbered file preview, and the theme picker rows. Icons are in `src/icons.rs`.

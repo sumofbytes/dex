@@ -1,7 +1,7 @@
 //! Views: sidebar, transcript, composer, footer. Pure functions of `State`.
 
 use dex_client::protocol::ApprovalDecision;
-use rune::{Cx, El, ScrollSpec, col, el, row, spacer, text, text_input};
+use rune::{Cx, El, ScrollSpec, TextStyle, col, el, row, spacer, text, text_input};
 use rune_kit::markdown::Markdown;
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
 use rune_kit::{
@@ -813,20 +813,27 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(stack.grow(1.0))
 }
 
+/// The line under the composer: the project path and branch on the left, the agent's status
+/// on the right. It sits in the same centred column as the composer, so their edges line up.
 fn footer(s: &State, k: &Kit) -> El {
-    let mut left = row().grow(1.0).min_w(0.0).gap(8.0).items_center().child(
+    let meta = TextStyle {
+        size: 12.0,
+        ..k.ty.mono
+    };
+    let mut left = row().grow(1.0).min_w(0.0).gap(6.0).items_center().child(
         text(s.cwd())
-            .font(k.ty.small)
+            .font(meta.clone())
             .color(k.c.text_faint)
             .truncate()
             .shrink(),
     );
     if let Some(b) = &s.info.branch {
         left = left
+            .child(text("·").font(k.ty.small).color(k.c.border_strong))
             .child(rune::icon(&crate::icons::BRANCH, 12.0).color(k.c.text_faint))
             .child(
                 text(b.clone())
-                    .font(k.ty.small)
+                    .font(meta.clone())
                     .color(k.c.text_faint)
                     .truncate(),
             );
@@ -837,17 +844,28 @@ fn footer(s: &State, k: &Kit) -> El {
     } else {
         crate::theme::waiting()
     };
-    row()
-        .w_full()
-        .h(28.0)
-        .px(16.0)
-        .gap(8.0)
+    let status = row()
+        .gap(6.0)
         .items_center()
-        .child(left)
         .child(el().size(6.0, 6.0).radius(3.0).fill(dot))
         .child(
             text(format!("{} · {}", s.info.provider, s.status))
-                .font(k.ty.small)
+                .font(TextStyle {
+                    size: 12.0,
+                    ..k.ty.small
+                })
                 .color(k.c.text_faint),
-        )
+        );
+    row().w_full().justify_center().child(
+        row()
+            .w_full()
+            .max_w(COLUMN)
+            .h(36.0)
+            .px(16.0)
+            .pb(8.0)
+            .gap(8.0)
+            .items_center()
+            .child(left)
+            .child(status),
+    )
 }
