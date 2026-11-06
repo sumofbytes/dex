@@ -128,7 +128,11 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                         run_turn(&client, &id, &text, options, &mut rx, &post).await;
                         refresh(&client, &post).await;
                     }
-                    Cmd::Cancel | Cmd::Approve { .. } => {}
+                    Cmd::Cancel
+                    | Cmd::Approve { .. }
+                    | Cmd::Steer(_)
+                    | Cmd::Followup(_)
+                    | Cmd::Recall { .. } => {}
                 }
             }
         });
@@ -191,11 +195,21 @@ async fn run_turn(
             }));
         }
     };
+    // Follow-ups chain more turns on this same stream, so a TurnComplete only ends it when none
+    // are waiting.
+    let mut followups = 0usize;
     loop {
         tokio::select! {
             item = stream.next_event() => match item {
                 Some(Ok(ev)) => {
-                    let done = matches!(ev, StreamEvent::TurnComplete { .. } | StreamEvent::TurnFailed { .. });
+                    if matches!(ev, StreamEvent::FollowupAccepted { .. }) {
+                        followups = followups.saturating_sub(1);
+                    }
+                    let done = match &ev {
+                        StreamEvent::TurnComplete { .. } => followups == 0,
+                        StreamEvent::TurnFailed { .. } => true,
+                        _ => false,
+                    };
                     post(Msg::Event(ev));
                     if done { return; }
                 }
@@ -207,6 +221,18 @@ async fn run_turn(
                     let _ = client.approve_async(id, &request_id, decision).await;
                 }
                 Some(Cmd::Cancel) => { let _ = client.cancel_async(id).await; }
+                Some(Cmd::Steer(text)) => { let _ = client.steer_async(id, &text).await; }
+                Some(Cmd::Followup(text)) => {
+                    followups += 1;
+                    if client.followup_async(id, &text).await.is_err() {
+                        followups -= 1;
+                    }
+                }
+                Some(Cmd::Recall { text, followup }) => {
+                    if client.recall_async(id, &text, followup).await.is_ok() && followup {
+                        followups = followups.saturating_sub(1);
+                    }
+                }
                 Some(_) => {}
                 None => return,
             },

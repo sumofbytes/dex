@@ -2,11 +2,13 @@
 //! and talks to it over HTTP+SSE via `dex-client`; `DEX_GUI_URL` attaches to an existing one.
 //! Headless render: `dex-gui --snap out.png --scene chat`.
 
+mod home;
 mod state;
+mod theme;
 mod view;
 mod worker;
 
-use rune::{AppSpec, Tx, Waker};
+use rune::{AppSpec, KeyEvent, Tx, Waker};
 use state::{Cmd, Info, Item, Msg, State, ToolDone, ToolRun};
 use tokio::sync::mpsc;
 
@@ -14,6 +16,24 @@ fn setup(s: &mut State, wake: Waker) {
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
     s.cmds = Some(tx);
     worker::spawn(s.inbox.clone(), wake, rx);
+}
+
+/// Shortcuts, written with Ctrl (Cmd on macOS) as in Po: B sidebar, N new thread, O every tool
+/// call's details, T all thinking.
+fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
+    if e.is_command('b') {
+        s.sidebar = !s.sidebar;
+    } else if e.is_command('n') {
+        s.page = state::Page::Thread;
+        s.send_cmd(Cmd::NewSession);
+    } else if e.is_command('o') {
+        s.toggle_tools();
+    } else if e.is_command('t') {
+        s.toggle_thinking();
+    } else {
+        return false;
+    }
+    true
 }
 
 fn poll(s: &mut State, _: f64, _: &mut Tx) -> bool {
@@ -26,6 +46,7 @@ fn poll(s: &mut State, _: f64, _: &mut Tx) -> bool {
 }
 
 fn sample(s: &mut State) {
+    s.page = state::Page::Thread;
     s.status = "ready".into();
     s.info = Info {
         provider: "opencode".into(),
@@ -104,6 +125,7 @@ fn many(s: &mut State) {
 /// Debug scene: sessions from the JSON file named by DEX_GUI_SESSIONS (a saved `/api/sessions`).
 fn real(s: &mut State) {
     sample(s);
+    s.page = state::Page::Home;
     s.sessions.clear();
     if let Ok(path) = std::env::var("DEX_GUI_SESSIONS")
         && let Ok(text) = std::fs::read_to_string(path)
@@ -126,16 +148,43 @@ fn long(s: &mut State) {
     }
 }
 
+/// Mid-turn: thinking, a steering message and a follow-up queued.
+fn busy(s: &mut State) {
+    sample(s);
+    s.busy = true;
+    s.status = "working…".into();
+    s.items.push(Item::Thinking {
+        text: "Checking how the client handles reconnects…".into(),
+        open: true,
+    });
+    s.queue.push(state::Queued {
+        text: "also add a regression test".into(),
+        followup: false,
+    });
+    s.queue.push(state::Queued {
+        text: "then update the docs".into(),
+        followup: true,
+    });
+}
+
+fn home_scene(s: &mut State) {
+    sample(s);
+    s.page = state::Page::Home;
+}
+
 fn main() {
     rune::run(AppSpec::<State> {
         scenes: &[
             ("chat", sample),
+            ("home", home_scene),
+            ("busy", busy),
             ("many", many),
             ("long", long),
             ("real", real),
         ],
         setup: Some(setup),
         poll: Some(poll),
+        on_key: Some(on_key),
         fonts: rune_theme_opencode::FONTS,
         families: rune_theme_opencode::FAMILIES,
         ..AppSpec::new("dex", (1100.0, 760.0), State::default, view::view)

@@ -18,6 +18,15 @@ pub enum Cmd {
         permission: Option<String>,
     },
     Cancel,
+    /// Mid-turn steering: the agent reads it before its next model call.
+    Steer(String),
+    /// A message that runs as a chained turn after the current one.
+    Followup(String),
+    /// Take a queued message back (the daemon drops it if it has not injected it yet).
+    Recall {
+        text: String,
+        followup: bool,
+    },
     Approve {
         request_id: String,
         decision: ApprovalDecision,
@@ -83,6 +92,17 @@ pub enum Item {
     },
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Page {
+    Home,
+    Thread,
+}
+
+pub struct Queued {
+    pub text: String,
+    pub followup: bool,
+}
+
 #[derive(Default)]
 pub struct Inbox(pub Mutex<Vec<Msg>>);
 
@@ -101,6 +121,10 @@ pub struct State {
     pub tokens: u64,
     pub cost: f64,
     pub sidebar: bool,
+    pub page: Page,
+    pub queue: Vec<Queued>,
+    pub search: TextEdit,
+    pub searching: bool,
     /// Project (working directory) new threads start in; follows the opened thread.
     pub project: Option<String>,
     pub collapsed: HashSet<String>,
@@ -127,6 +151,10 @@ impl Default for State {
             tokens: 0,
             cost: 0.0,
             sidebar: true,
+            page: Page::Home,
+            queue: Vec::new(),
+            search: TextEdit::default(),
+            searching: false,
             project: None,
             collapsed: HashSet::new(),
             show_all: HashSet::new(),
@@ -193,6 +221,8 @@ impl State {
             Msg::Status(s) => self.status = s,
             Msg::Opened { id, replay } => {
                 self.reset_transcript();
+                self.queue.clear();
+                self.page = Page::Thread;
                 self.current = Some(id);
                 for ev in replay {
                     self.apply_event(ev);
@@ -292,6 +322,18 @@ impl State {
                     decided: None,
                 });
             }
+            StreamEvent::SteeringAccepted { content }
+            | StreamEvent::FollowupAccepted { content } => {
+                let t = content.trim();
+                if let Some(i) = self
+                    .queue
+                    .iter()
+                    .position(|q| q.text == content || q.text.trim() == t)
+                {
+                    self.queue.remove(i);
+                }
+                self.items.push(Item::User(content));
+            }
             StreamEvent::System(s) => self.items.push(Item::Notice(s)),
             StreamEvent::Error(e) => self.items.push(Item::Error(e)),
             StreamEvent::Usage { tokens, cost, .. } => {
@@ -300,7 +342,8 @@ impl State {
             }
             StreamEvent::TurnComplete { .. } => {
                 self.finish_stream();
-                self.busy = false;
+                // A queued follow-up chains another turn on the same stream.
+                self.busy = self.queue.iter().any(|q| q.followup);
                 self.status = "ready".into();
             }
             StreamEvent::TurnFailed { error } => {
@@ -313,11 +356,77 @@ impl State {
         }
     }
 
-    pub fn submit(&mut self) {
+    /// Toggle every tool call's details open (or all closed when they already are).
+    pub fn toggle_tools(&mut self) {
+        let open = self
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Tool(t) if !t.open));
+        for it in &mut self.items {
+            if let Item::Tool(t) = it {
+                t.open = open;
+            }
+        }
+    }
+
+    pub fn toggle_thinking(&mut self) {
+        let open = self
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Thinking { open: false, .. }));
+        for it in &mut self.items {
+            if let Item::Thinking { open: o, .. } = it {
+                *o = open;
+            }
+        }
+    }
+
+    /// Alt+Enter: queue the message to run after the current turn.
+    pub fn queue_followup(&mut self) {
         let text = self.edit.text.trim().to_string();
-        if text.is_empty() || self.busy {
+        if text.is_empty() {
             return;
         }
+        if !self.busy {
+            return self.submit();
+        }
+        self.edit.replace_text("");
+        self.queue.push(Queued {
+            text: text.clone(),
+            followup: true,
+        });
+        self.send_cmd(Cmd::Followup(text));
+    }
+
+    /// Take queued message `i` back into the input to edit it.
+    pub fn recall(&mut self, i: usize) {
+        if i >= self.queue.len() {
+            return;
+        }
+        let q = self.queue.remove(i);
+        self.send_cmd(Cmd::Recall {
+            text: q.text.clone(),
+            followup: q.followup,
+        });
+        self.edit.replace_text(q.text);
+    }
+
+    pub fn submit(&mut self) {
+        let text = self.edit.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if self.busy {
+            // Enter mid-turn steers: the agent reads it before its next model call.
+            self.edit.replace_text("");
+            self.queue.push(Queued {
+                text: text.clone(),
+                followup: false,
+            });
+            self.send_cmd(Cmd::Steer(text));
+            return;
+        }
+        self.page = Page::Thread;
         self.edit.replace_text("");
         self.items.push(Item::User(text.clone()));
         self.busy = true;
