@@ -258,12 +258,21 @@ fn sidebar(s: &State, k: &Kit) -> El {
                     .items_center()
                     .radius(k.radius.md)
                     .child(
-                        text(name)
-                            .font(k.ty.ui_medium)
-                            .color(color)
-                            .truncate()
+                        // A project is a small caps label with its colour dot, not a row.
+                        row()
+                            .gap(6.0)
+                            .items_center()
                             .grow(1.0)
-                            .min_w(0.0),
+                            .min_w(0.0)
+                            .child(el().w(6.0).h(6.0).radius(3.0).fill(color))
+                            .child(
+                                text(name.to_uppercase())
+                                    .font(k.ty.ui_medium)
+                                    .color(k.c.text_muted)
+                                    .truncate()
+                                    .grow(1.0)
+                                    .min_w(0.0),
+                            ),
                     )
                     .child(add)
                     .child(
@@ -292,7 +301,14 @@ fn sidebar(s: &State, k: &Kit) -> El {
             threads.len().min(PER_PROJECT)
         };
         for (ti, sess) in threads.iter().take(shown).enumerate() {
-            sb = sb.child(thread_row(s, k, sess, format!("t{pi}-{ti}"), false));
+            // Threads sit indented under their project label.
+            sb = sb.child(row().w_full().pl(14.0).child(thread_row(
+                s,
+                k,
+                sess,
+                format!("t{pi}-{ti}"),
+                false,
+            )));
         }
         if threads.len() > PER_PROJECT {
             let more_cwd = cwd.clone();
