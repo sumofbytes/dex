@@ -101,9 +101,11 @@ fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project:
         .items
         .iter()
         .any(|i| matches!(i, Item::Approval { decided: None, .. }));
-    if selected && waiting {
+    // The running thread keeps its spinner even when another thread (or Home) is in view.
+    let running = s.current.as_deref() == Some(sess.session_id.as_str());
+    if running && waiting {
         r = r.status(RowStatus::Attention);
-    } else if selected && s.busy {
+    } else if running && s.busy {
         r = r.status(RowStatus::Busy);
     }
     let age = ago(&sess.updated_at);

@@ -1,4 +1,4 @@
-//! The landing page: a greeting, counts, the threads touched today, the week, and a start card.
+//! The landing page: a greeting, counts, the threads touched today, and a start card.
 
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use rune::{El, ScrollSpec, col, el, row, text};
@@ -158,48 +158,6 @@ pub fn home(s: &State, k: &Kit) -> El {
         }));
     }
 
-    // The week, Monday first, with a dot under days that had threads.
-    let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
-    let mut week = row().w_full().justify_between();
-    for i in 0..7 {
-        let d = monday + chrono::Duration::days(i);
-        let is_today = d == today;
-        let had = dated.iter().any(|(_, x)| *x == Some(d));
-        let cell = col()
-            .key(format!("day{i}"))
-            .px(8.0)
-            .py(8.0)
-            .gap(4.0)
-            .items_center()
-            .radius(k.radius.lg)
-            .fill(if is_today {
-                theme::accent().alpha(0.22)
-            } else {
-                rune::Color::TRANSPARENT
-            })
-            .child(
-                text(d.format("%a").to_string())
-                    .font(k.ty.small)
-                    .color(k.c.text_muted),
-            )
-            .child(
-                text(d.day().to_string())
-                    .font(k.ty.ui_medium)
-                    .color(k.c.text_base),
-            )
-            .child(el().size(5.0, 5.0).radius(3.0).fill(if had {
-                theme::accent()
-            } else {
-                rune::Color::TRANSPARENT
-            }));
-        week = week.child(cell);
-    }
-    let week_card = card(k)
-        .grow(1.0)
-        .min_w(340.0)
-        .child(text("This week").font(k.ty.ui_medium).color(k.c.text_base))
-        .child(week);
-
     let continue_cwd = s
         .sessions
         .iter()
@@ -255,8 +213,7 @@ pub fn home(s: &State, k: &Kit) -> El {
                 .gap(12.0)
                 .items_start()
                 .flex_wrap()
-                .child(today_card)
-                .child(week_card),
+                .child(today_card),
         )
         .child(start_card);
 
