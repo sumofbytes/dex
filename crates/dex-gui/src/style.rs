@@ -10,28 +10,24 @@ pub mod typo {
     use rune::TextStyle;
     use rune_kit::Kit;
 
-    /// Assistant reply: 16 / 24.
+    /// Assistant reply, user message and thought text: 14 / 22.
     pub fn reply(k: &Kit) -> TextStyle {
-        TextStyle {
-            size: 16.0,
-            line_height: 24.0,
-            ..k.ty.body
-        }
+        k.ty.body
     }
-    /// Reply headings (level 1..=3): 20 / 17 / 16, semibold, 26 line.
+    /// Reply headings (level 1..=3): 18 / 16 / 14, semibold, 24 line.
     pub fn heading(k: &Kit, size: f32) -> TextStyle {
         TextStyle {
             size,
             weight: 600.0,
-            line_height: 26.0,
+            line_height: 24.0,
             ..reply(k)
         }
     }
-    /// A model thought's text: 16 / 24, the reply's size; its faint colour sets it apart.
+    /// A model thought's text: the reply's size; its faint colour sets it apart.
     pub fn thought(k: &Kit) -> TextStyle {
         reply(k)
     }
-    /// Quiet transcript rows (tool group, thought, notices, queued labels): 14 / 20.
+    /// Quiet transcript rows (tool group, thought, notices, queued labels): 12 / 18.
     pub fn meta(k: &Kit) -> TextStyle {
         k.ty.ui
     }
@@ -42,11 +38,12 @@ pub mod typo {
             ..k.ty.ui.lh(18.0)
         }
     }
-    /// Uppercase section and project labels: 12, weight 500, tracked.
+    /// Uppercase section and project labels: 10, weight 600, tracked.
     pub fn caps(k: &Kit) -> TextStyle {
         TextStyle {
-            size: 12.0,
-            tracking: 0.8,
+            size: 10.0,
+            tracking: 1.0,
+            weight: 600.0,
             ..k.ty.ui_medium
         }
     }

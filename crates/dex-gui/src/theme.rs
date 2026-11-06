@@ -96,17 +96,17 @@ fn build(name: &str) -> Option<Active> {
 
 /// Kits are built once per switch and kept for the life of the process (a handful at most).
 /// Rune's scale uses 11, 13 and odd line heights; the app's is whole and even: 12 (small,
-/// captions, mono), 14 (UI and body), with even line heights. Rune's own components follow.
+/// captions, mono, UI rows), 14 (body and reading text), with even line heights. Rune's own components follow.
 fn even_type(k: &mut Kit) {
     use rune::TextStyle;
-    let ui = TextStyle::new(14.0, 400.0).lh(20.0);
+    let ui = TextStyle::new(12.0, 400.0).lh(18.0);
     let body = TextStyle::new(14.0, 400.0).lh(22.0);
     k.ty.ui = ui;
     k.ty.ui_medium = TextStyle {
         weight: 500.0,
         ..ui
     };
-    k.ty.ui_compact = ui.lh(18.0);
+    k.ty.ui_compact = ui.lh(16.0);
     k.ty.small = TextStyle::new(12.0, 400.0).lh(16.0);
     k.ty.small_medium = TextStyle::new(12.0, 500.0).lh(16.0);
     k.ty.body = body;
