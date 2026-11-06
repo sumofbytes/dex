@@ -77,7 +77,17 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
             refresh(&client, &post).await;
 
             let mut session: Option<String> = None;
-            while let Some(cmd) = rx.recv().await {
+            // A New/Open that arrives mid-turn detaches from that turn (it keeps running in the
+            // daemon) and is handled here.
+            let mut pending: Option<Cmd> = None;
+            loop {
+                let cmd = match pending.take() {
+                    Some(c) => c,
+                    None => match rx.recv().await {
+                        Some(c) => c,
+                        None => break,
+                    },
+                };
                 match cmd {
                     Cmd::NewSession => {
                         session = None;
@@ -140,7 +150,7 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                             permission,
                             ..ChatOptions::default()
                         };
-                        run_turn(&client, &id, &text, options, &mut rx, &post).await;
+                        pending = run_turn(&client, &id, &text, options, &mut rx, &post).await;
                         refresh(&client, &post).await;
                     }
                     Cmd::Cancel
@@ -201,13 +211,14 @@ async fn run_turn(
     options: ChatOptions,
     rx: &mut mpsc::UnboundedReceiver<Cmd>,
     post: &impl Fn(Msg),
-) {
+) -> Option<Cmd> {
     let mut stream = match client.chat_stream(id, prompt, options).await {
         Ok(s) => s,
         Err(e) => {
-            return post(Msg::Event(StreamEvent::TurnFailed {
+            post(Msg::Event(StreamEvent::TurnFailed {
                 error: e.to_string(),
             }));
+            return None;
         }
     };
     // Follow-ups chain more turns on this same stream, so a TurnComplete only ends it when none
@@ -226,10 +237,10 @@ async fn run_turn(
                         _ => false,
                     };
                     post(Msg::Event(ev));
-                    if done { return; }
+                    if done { return None; }
                 }
-                Some(Err(e)) => return post(Msg::Event(StreamEvent::TurnFailed { error: e })),
-                None => return post(Msg::Event(StreamEvent::TurnComplete { response: String::new(), usage: None, cached: None })),
+                Some(Err(e)) => { post(Msg::Event(StreamEvent::TurnFailed { error: e })); return None; }
+                None => { post(Msg::Event(StreamEvent::TurnComplete { response: String::new(), usage: None, cached: None })); return None; }
             },
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Approve { request_id, decision }) => {
@@ -248,8 +259,9 @@ async fn run_turn(
                         followups = followups.saturating_sub(1);
                     }
                 }
+                Some(c @ (Cmd::NewSession | Cmd::Open(_))) => return Some(c),
                 Some(_) => {}
-                None => return,
+                None => return None,
             },
         }
     }
