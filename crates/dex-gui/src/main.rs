@@ -5,6 +5,7 @@
 mod composer_menu;
 mod home;
 mod icons;
+mod sidebar;
 mod state;
 mod theme;
 mod theme_picker;
@@ -91,7 +92,7 @@ fn sample(s: &mut State) {
     for (i, (t, cwd)) in samples.iter().enumerate() {
         if let Ok(si) = serde_json::from_value(serde_json::json!({
             "session_id": format!("s{i}"), "path": "", "name": t, "cwd": cwd,
-            "updated_at": format!("2026-11-0{}", 9 - i), "auto_named": false, "message_count": 4
+            "updated_at": (chrono::Utc::now() - chrono::Duration::hours([2, 9, 26, 3, 50][i])).to_rfc3339(), "auto_named": false, "message_count": 4
         })) {
             s.sessions.push(si);
         }

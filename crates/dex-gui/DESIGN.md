@@ -75,9 +75,10 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Brand: "dex", Inter 15px, weight 600.
 - Nav rows (Home, New thread, Search): 32px tall, icon 16px in muted, label Inter 13px weight 500, selected row bg #433b3b. Shortcut hints in IBM Plex Mono 11px, faint (for example "Ctrl N").
 - Section label "PROJECTS": Inter 11px, weight 600, uppercase, letter-spacing 0.06em, placeholder colour, 28px tall, 20px space above.
-- Project header: 32px tall, 6px colour dot, name Inter 11px weight 600 uppercase, muted, chevron right.
+- Project header: 32px tall, `[chevron] [dot] NAME … [×] [+]`. The whole row toggles collapse; the chevron (left) points right when collapsed, down when open. The + (new thread) is always visible on the right; the × (hide) shows on hover only. 6px colour dot, name Inter 11px weight 600 uppercase, muted.
 - Thread rows: 32px tall, left padding 24px so the title lines up with the project name, Inter 13px. Selected: weight 500, text colour, bg #433b3b, radius 8px. Unselected: weight 400, text-3.
-- Age: IBM Plex Mono 11px, faint, right-aligned in a 24px column. Titles truncate with an ellipsis.
+- Age: faint, right-aligned in a fixed 24px column left of the shared 20px right slot (thread status / hover ×, project +), so + and the slot line up. Titles truncate with an ellipsis.
+- Code: layout tokens (row height, inset, gap, dot, indent, time column) live in `src/sidebar.rs::tok`.
 - "Show N more": Inter 12px, faint, 28px tall, same left padding as thread rows.
 - Gap of 12px between project groups.
 - Home nav row is selected on the Home page; a thread row is selected on the Thread page.

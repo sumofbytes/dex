@@ -6,9 +6,9 @@ use rune::{El, ScrollSpec, TextStyle, col, el, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
 
 use crate::icons;
+use crate::sidebar::ago;
 use crate::state::{Cmd, Page, State, project_name, session_title};
 use crate::theme;
-use crate::view::ago;
 
 fn local_date(updated_at: &str) -> Option<NaiveDate> {
     chrono::DateTime::parse_from_rfc3339(updated_at)
