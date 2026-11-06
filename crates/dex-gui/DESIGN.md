@@ -13,7 +13,7 @@ The GUI replicates these artboards. Change the design in Paper first, then updat
 | dex / Viewer v2 · Changes | 460×760 | LX-0 | file list with status, diff with two gutters |
 | dex / Theme picker v2 | 440×400 | OC-0 | dialog with swatches and check mark |
 
-The v1 artboards (1-0, 1X-0, 5Y-0, 52-0, 7J-0) are kept, renamed "(v1)", for comparison.
+The v1 artboards were removed from the Paper file.
 
 ## Colour tokens (dark, dex default)
 
