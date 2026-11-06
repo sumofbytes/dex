@@ -191,16 +191,17 @@ fn sidebar(s: &State, k: &Kit) -> El {
 
     // Projects: the active one first, then by most recent thread. The daemon lists every
     // directory's threads; empty ones are skipped.
-    let current = s.cwd();
+    let current = crate::worktree::project_root(&s.cwd());
     let mut projects: Vec<(String, Vec<&SessionInfo>)> = Vec::new();
     for sess in s
         .sessions
         .iter()
         .filter(|x| x.message_count > 0 && !x.cwd.is_empty())
     {
-        match projects.iter_mut().find(|(c, _)| *c == sess.cwd) {
+        let root = crate::worktree::project_root(&sess.cwd);
+        match projects.iter_mut().find(|(c, _)| *c == root) {
             Some((_, v)) => v.push(sess),
-            None => projects.push((sess.cwd.clone(), vec![sess])),
+            None => projects.push((root, vec![sess])),
         }
     }
     if let Some(i) = projects.iter().position(|(c, _)| *c == current) {
@@ -347,7 +348,44 @@ fn header(s: &State, k: &Kit) -> El {
         .font(k.ty.ui_medium)
         .color(k.c.text_base)
         .truncate();
+    let wt = crate::worktree::info(&s.cwd());
     let mut stats = row().gap(8.0).items_center();
+    if let Some(w) = &wt {
+        stats = stats
+            .child(text(w.branch.clone()).font(k.ty.mono).color(k.c.text_muted))
+            .child(
+                Button::new("Merge")
+                    .variant(ButtonVariant::Submit)
+                    .on_press(|s: &mut State| s.finish_worktree(true))
+                    .build(k)
+                    .key("wt-merge"),
+            )
+            .child(if s.confirm_discard {
+                Button::new("Discard work?")
+                    .variant(ButtonVariant::Danger)
+                    .on_press(|s: &mut State| s.finish_worktree(false))
+                    .build(k)
+                    .key("wt-discard-yes")
+            } else {
+                Button::new("Discard")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(|s: &mut State| s.confirm_discard = true)
+                    .build(k)
+                    .key("wt-discard")
+            });
+    } else if s.current.is_none() {
+        stats = stats.child(
+            Button::new("Worktree")
+                .variant(if s.use_worktree {
+                    ButtonVariant::Neutral
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .on_press(|s: &mut State| s.use_worktree = !s.use_worktree)
+                .build(k)
+                .key("wt-toggle"),
+        );
+    }
     if s.busy {
         stats = stats.child(Spinner::new().build(k));
     }

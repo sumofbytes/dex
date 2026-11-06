@@ -17,6 +17,8 @@ pub enum Cmd {
         text: String,
         model: Option<String>,
         permission: Option<String>,
+        /// First message of a new thread: work in a fresh git worktree.
+        worktree: bool,
     },
     Cancel,
     /// Mid-turn steering: the agent reads it before its next model call.
@@ -45,6 +47,8 @@ pub enum Msg {
     },
     Event(StreamEvent),
     Status(String),
+    /// The directory the current thread works in changed (a worktree was made).
+    Project(String),
     /// Project files (relative) and the working-tree patch from a background `git` scan.
     /// Output of the terminal's running command (`None`: it exited).
     Term(Option<String>),
@@ -152,6 +156,8 @@ pub struct State {
     pub show_all: HashSet<String>,
     pub all_projects: bool,
     /// Right-hand viewer pane (files, changes).
+    pub use_worktree: bool,
+    pub confirm_discard: bool,
     pub viewer: bool,
     pub vtab: VTab,
     pub files: Vec<String>,
@@ -193,6 +199,8 @@ impl Default for State {
             collapsed: HashSet::new(),
             show_all: HashSet::new(),
             all_projects: false,
+            use_worktree: false,
+            confirm_discard: false,
             viewer: false,
             vtab: VTab::Files,
             files: Vec::new(),
@@ -265,6 +273,7 @@ impl State {
                 self.sessions_loaded = true;
             }
             Msg::Status(s) => self.status = s,
+            Msg::Project(p) => self.project = Some(p),
             Msg::Term(Some(chunk)) => {
                 for l in chunk.split('\n') {
                     self.term.push(strip_ansi(l.trim_end_matches('\r')));
@@ -508,6 +517,30 @@ impl State {
         });
     }
 
+    /// Merge (or discard) the current thread's worktree and return to the main project.
+    pub fn finish_worktree(&mut self, merge: bool) {
+        self.confirm_discard = false;
+        let Some(w) = crate::worktree::info(&self.cwd()) else {
+            return;
+        };
+        let r = if merge {
+            crate::worktree::merge(&w)
+        } else {
+            crate::worktree::discard(&w)
+        };
+        match r {
+            Ok(m) => {
+                self.project = Some(w.repo);
+                self.current = None;
+                self.items.clear();
+                self.send_cmd(Cmd::NewSession);
+                self.items.push(Item::Notice(m));
+                self.rescan();
+            }
+            Err(e) => self.items.push(Item::Error(e)),
+        }
+    }
+
     pub fn open_path(&mut self, rel: &str) {
         let full = std::path::Path::new(&self.cwd()).join(rel);
         let text = match std::fs::read(&full) {
@@ -603,6 +636,7 @@ impl State {
             text,
             model: self.model.clone(),
             permission: self.permission.clone(),
+            worktree: self.use_worktree && self.current.is_none(),
         });
     }
 }

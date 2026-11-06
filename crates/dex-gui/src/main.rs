@@ -8,6 +8,7 @@ mod theme;
 mod view;
 mod viewer;
 mod worker;
+mod worktree;
 
 use rune::{AppSpec, KeyEvent, Tx, Waker};
 use state::{Cmd, Info, Item, Msg, State, ToolDone, ToolRun};
@@ -198,6 +199,11 @@ fn term_scene(s: &mut State) {
     ];
 }
 
+fn wt_scene(s: &mut State) {
+    sample(s);
+    s.project = std::env::var("DEX_GUI_WT").ok();
+}
+
 fn changes_scene(s: &mut State) {
     viewer_scene(s, state::VTab::Changes);
 }
@@ -275,6 +281,7 @@ fn main() {
             ("files", files_scene),
             ("changes", changes_scene),
             ("term", term_scene),
+            ("wt", wt_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),

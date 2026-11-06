@@ -98,27 +98,42 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                         text,
                         model,
                         permission,
+                        worktree,
                     } => {
                         let id = match &session {
                             Some(id) => id.clone(),
-                            None => match client.create_session_async(&cwd, None).await {
-                                Ok(r) => {
-                                    session = Some(r.session_id.clone());
-                                    post(Msg::Opened {
-                                        id: r.session_id.clone(),
-                                        replay: vec![StreamEvent::UserPrompt {
-                                            content: text.clone(),
-                                        }],
-                                    });
-                                    r.session_id
+                            None => {
+                                let mut cwd = cwd;
+                                if worktree {
+                                    match crate::worktree::create(&cwd) {
+                                        Ok(p) => {
+                                            post(Msg::Project(p.clone()));
+                                            cwd = p;
+                                        }
+                                        Err(e) => post(Msg::Event(StreamEvent::System(format!(
+                                            "worktree not created: {e}"
+                                        )))),
+                                    }
                                 }
-                                Err(e) => {
-                                    post(Msg::Event(StreamEvent::TurnFailed {
-                                        error: e.to_string(),
-                                    }));
-                                    continue;
+                                match client.create_session_async(&cwd, None).await {
+                                    Ok(r) => {
+                                        session = Some(r.session_id.clone());
+                                        post(Msg::Opened {
+                                            id: r.session_id.clone(),
+                                            replay: vec![StreamEvent::UserPrompt {
+                                                content: text.clone(),
+                                            }],
+                                        });
+                                        r.session_id
+                                    }
+                                    Err(e) => {
+                                        post(Msg::Event(StreamEvent::TurnFailed {
+                                            error: e.to_string(),
+                                        }));
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                         };
                         let options = ChatOptions {
                             model,
