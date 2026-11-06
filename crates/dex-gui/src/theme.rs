@@ -153,6 +153,11 @@ pub fn project_color(name: &str) -> Color {
 }
 
 /// Status colours for thread marks.
+/// The tool name label in the transcript, a cool blue beside the warm palette.
+pub fn tool_label() -> Color {
+    c("#8fb4ff")
+}
+
 pub fn waiting() -> Color {
     c("#f2c87a")
 }

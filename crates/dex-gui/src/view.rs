@@ -546,58 +546,80 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                 .build(k)
         }
         Item::Tool(t) => {
-            // A row: status icon, name, arguments and duration. Opening it shows the output
-            // under a 2px rule, as in the Paper design.
-            let (mark, mark_color) = match &t.done {
-                None => (None, k.c.text_faint),
-                Some(d) if d.ok => (Some(&crate::icons::CHECK), crate::theme::done()),
-                Some(_) => (Some(&crate::icons::X), k.c.danger.fg),
-            };
+            // A compact row, as in the transcript design: the tool's name, its arguments and the
+            // duration. Its output follows dimmed under a `↳`: the first line when closed, all of it
+            // when opened.
+            let failed = matches!(&t.done, Some(d) if !d.ok);
             let secs = match &t.done {
                 Some(d) => format!("{:.1}s", d.secs),
                 None => String::new(),
             };
-            let status = match mark {
-                Some(ic) => rune::icon(ic, 14.0).color(mark_color),
-                None => text("…").font(k.ty.mono).color(mark_color),
-            };
+            let label = row()
+                .gap(0.0)
+                .child(
+                    text(t.name.clone())
+                        .font(k.ty.mono)
+                        .color(crate::theme::tool_label()),
+                )
+                .child(text(":").font(k.ty.mono).color(crate::theme::tool_label()));
             let head = row()
                 .key(format!("tool{i}"))
                 .w_full()
-                .h(28.0)
-                .gap(8.0)
+                .h(24.0)
+                .gap(6.0)
                 .items_center()
-                .child(status)
-                .child(text(t.name.clone()).font(k.ty.mono).color(k.c.text_base))
+                .child(label)
                 .child(
                     text(t.args.clone())
                         .font(k.ty.mono)
-                        .color(k.c.text_faint)
+                        .color(k.c.text_muted)
                         .truncate()
                         .grow(1.0)
                         .min_w(0.0),
                 )
-                .child(text(secs).font(k.ty.mono).color(k.c.text_faint));
-            let mut c = col().w_full().gap(4.0).child(k.interactive(head).on_press(
+                .child(text(secs).font(k.ty.mono).color(if failed {
+                    k.c.danger.fg
+                } else {
+                    k.c.text_faint
+                }));
+            let mut c = col().w_full().gap(2.0).child(k.interactive(head).on_press(
                 move |s: &mut State| {
                     if let Some(Item::Tool(t)) = s.items.get_mut(i) {
                         t.open = !t.open;
                     }
                 },
             ));
-            if let (true, Some(d)) = (t.open, &t.done) {
-                let mut body = col().gap(2.0).py(4.0);
-                body = body.child(text(d.summary.clone()).font(k.ty.ui).color(k.c.text_muted));
-                for l in &d.preview {
-                    body = body.child(text(l.clone()).font(k.ty.mono).color(k.c.text_muted));
+            if let Some(d) = &t.done {
+                let ink = if failed {
+                    k.c.danger.fg
+                } else {
+                    k.c.text_faint
+                };
+                let lines: Vec<&String> = if t.open {
+                    std::iter::once(&d.summary)
+                        .chain(d.preview.iter())
+                        .collect()
+                } else {
+                    d.preview.iter().take(1).collect()
+                };
+                for (n, l) in lines.into_iter().enumerate() {
+                    let arrow = if n == 0 { "↳" } else { " " };
+                    c = c.child(
+                        row()
+                            .w_full()
+                            .gap(8.0)
+                            .pl(4.0)
+                            .child(text(arrow).font(k.ty.mono).color(k.c.text_faint))
+                            .child(
+                                text(l.clone())
+                                    .font(k.ty.mono)
+                                    .color(ink)
+                                    .truncate()
+                                    .grow(1.0)
+                                    .min_w(0.0),
+                            ),
+                    );
                 }
-                c = c.child(
-                    row()
-                        .w_full()
-                        .pl(7.0)
-                        .child(el().w(2.0).fill(k.c.border_muted))
-                        .child(col().pl(13.0).grow(1.0).min_w(0.0).child(body)),
-                );
             }
             c
         }
