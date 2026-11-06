@@ -98,6 +98,13 @@ Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode a
 - Left: the project path in IBM Plex Mono 12px, a "·" separator, the branch icon and the branch name in mono 12px. Faint colour.
 - Right: a 6px status dot (green when ready, amber when busy) and "provider · status" in Inter 12px, faint.
 
+## Terminal and transcript (built without a Paper design)
+
+The terminal and transcript changes below were made in code at your request, because the Paper file was rate-limited. They are not in Paper yet, so the Paper file doesn't match them.
+
+- Terminal: each command is a block: `$ command` with its status on the right (running dot and seconds, a check with seconds, or `exit N` in the danger colour), then its output under a 2px rule. A "Clear" button appears once there is history. The prompt is a bordered row with a `›` and an Enter hint. The last 300 lines of each command are shown.
+- Transcript: 22 points between items, 24 points at the top and bottom, and 10 extra points before each user message. The user bubble has 16×12 padding and an extra-large radius.
+
 ## Replication status
 
 Replicated in `src/` (v2): the sidebar, Home, the thread header, tool rows, composer and footer, the viewer tabs and numbered file preview, and the theme picker rows. Icons are in `src/icons.rs`.

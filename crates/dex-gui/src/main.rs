@@ -203,9 +203,20 @@ fn files_scene(s: &mut State) {
 fn term_scene(s: &mut State) {
     viewer_scene(s, state::VTab::Terminal);
     s.term = vec![
-        "$ git log --oneline -3".into(),
-        "694fe3c feat(gui): viewer pane".into(),
-        "219ed67 feat(gui): detach".into(),
+        state::TermBlock {
+            cmd: "git log --oneline -3".into(),
+            lines: vec![
+                "9cdca96 feat(gui): replicate the Paper design v2".into(),
+                "cb34053 fix(gui): align the footer with the composer".into(),
+                "03ba94e docs(gui): proposed composer option menus".into(),
+            ],
+            status: state::TermStatus::Done { code: 0, secs: 0.1 },
+        },
+        state::TermBlock {
+            cmd: "cargo test viewer".into(),
+            lines: vec!["error[E0433]: cannot find `theme` in this scope".into()],
+            status: state::TermStatus::Done { code: 1, secs: 2.4 },
+        },
     ];
 }
 

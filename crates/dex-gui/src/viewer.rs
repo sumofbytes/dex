@@ -1,13 +1,17 @@
 //! Right-hand viewer pane: the project's files with a syntax-coloured preview, and its
 //! uncommitted changes as a diff.
 
-use rune::{El, ScrollSpec, col, row, text, text_input};
+use rune::{El, ScrollSpec, col, el, row, text, text_input};
 use rune_kit::diff::DiffView;
 use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
 
-use crate::state::{State, VTab};
+use crate::state::{State, TermBlock, TermStatus, VTab};
+use crate::theme;
+
+/// Output lines shown per command block; older ones are hidden.
+const OUTPUT_LINES: usize = 300;
 
 pub const WIDTH: f32 = 460.0;
 const MAX_ROWS: usize = 200;
@@ -257,54 +261,177 @@ fn breadcrumb(path: &str, k: &Kit) -> El {
 
 fn terminal(s: &State, k: &Kit) -> El {
     let dir = s.term_cwd.clone().unwrap_or_else(|| s.cwd());
-    let out = if s.term.is_empty() {
-        "Run a command. One-shot shell commands only (no interactive programs).".to_string()
-    } else {
-        s.term.join("\n")
-    };
-    let input = text_input(&s.term_input, k.ty.mono.lh(20.0))
-        .key("term-input")
-        .placeholder(
-            if s.term_running {
-                "running…"
-            } else {
-                "command"
-            },
-            k.c.text_faint,
-        )
-        .caret(k.c.text_base, k.c.border_focus.alpha(0.35))
-        .color(k.c.text_base)
-        .single_line()
-        .on_edit(|s: &mut State| &mut s.term_input)
-        .on_submit(|s: &mut State, _| s.run_term())
+    let header = row()
         .w_full()
-        .px(10.0)
-        .py(8.0);
+        .h(40.0)
+        .px(12.0)
+        .gap(8.0)
+        .items_center()
+        .child(breadcrumb(&dir, k).grow(1.0).min_w(0.0))
+        .child(if !s.term.is_empty() && !s.term_running {
+            k.interactive(
+                row()
+                    .key("term-clear")
+                    .h(24.0)
+                    .px(8.0)
+                    .items_center()
+                    .radius(k.radius.md)
+                    .child(text("Clear").font(k.ty.small).color(k.c.text_muted)),
+            )
+            .on_press(|s: &mut State| s.clear_term())
+        } else {
+            el().size(0.0, 0.0)
+        });
+
+    // Each command is a block: the command line with its status, then its output under a rule.
+    let mut blocks = col().w_full().padding(16.0).gap(0.0);
+    if s.term.is_empty() {
+        blocks = blocks.child(
+            col()
+                .w_full()
+                .py(48.0)
+                .items_center()
+                .gap(6.0)
+                .child(
+                    text("Run a command in this project")
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_base),
+                )
+                .child(
+                    text("One-shot commands only. Editors and pagers won't work here.")
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .wrap(),
+                ),
+        );
+    }
+    for (i, b) in s.term.iter().enumerate() {
+        blocks = blocks.child(term_block(i, b, k));
+    }
+
+    let input = row()
+        .w_full()
+        .px(12.0)
+        .py(8.0)
+        .gap(8.0)
+        .items_center()
+        .radius(k.radius.lg)
+        .border(1.0, k.c.border_base)
+        .child(text("›").font(k.ty.mono).color(theme::accent()))
+        .child(
+            text_input(&s.term_input, k.ty.mono.lh(20.0))
+                .key("term-input")
+                .placeholder(
+                    if s.term_running {
+                        "Running…"
+                    } else {
+                        "Run a command…"
+                    },
+                    k.c.text_faint,
+                )
+                .caret(k.c.text_base, k.c.border_focus.alpha(0.35))
+                .color(k.c.text_base)
+                .single_line()
+                .on_edit(|s: &mut State| &mut s.term_input)
+                .on_submit(|s: &mut State, _| s.run_term())
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(text("Enter").font(k.ty.small).color(k.c.text_faint));
+
     col()
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+        .child(header)
         .child(
             col()
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
                 .scroll(ScrollSpec { stick_bottom: true })
-                .child(
-                    col()
-                        .w_full()
-                        .padding(12.0)
-                        .child(text(out).font(k.ty.mono).color(k.c.text_base).wrap()),
-                ),
+                .child(blocks),
         )
+        .child(col().w_full().px(16.0).pb(8.0).child(input))
+}
+
+/// One command block: `$ command` with its status on the right, then its output, the last
+/// `OUTPUT_LINES` lines, under a rule.
+fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
+    let status = match &b.status {
+        TermStatus::Running { started } => row()
+            .gap(6.0)
+            .items_center()
+            .child(el().size(6.0, 6.0).radius(3.0).fill(theme::waiting()))
+            .child(
+                text(format!("running · {:.0}s", started.elapsed().as_secs_f64()))
+                    .font(k.ty.small)
+                    .color(theme::waiting()),
+            ),
+        TermStatus::Done { code: 0, secs } => row()
+            .gap(4.0)
+            .items_center()
+            .child(rune::icon(&crate::icons::CHECK, 12.0).color(theme::done()))
+            .child(
+                text(format!("{secs:.1}s"))
+                    .font(k.ty.mono)
+                    .color(k.c.text_faint),
+            ),
+        TermStatus::Done { code, secs } => row()
+            .gap(4.0)
+            .items_center()
+            .child(rune::icon(&crate::icons::X, 12.0).color(k.c.danger.fg))
+            .child(
+                text(format!("exit {code} · {secs:.1}s"))
+                    .font(k.ty.mono)
+                    .color(k.c.danger.fg),
+            ),
+    };
+    let head = row()
+        .w_full()
+        .gap(8.0)
+        .items_center()
+        .child(text("$").font(k.ty.mono).color(theme::accent()))
         .child(
-            text(dir)
-                .font(k.ty.ui)
-                .color(k.c.text_muted)
+            text(b.cmd.clone())
+                .font(k.ty.mono)
+                .color(k.c.text_base)
                 .truncate()
-                .px(12.0),
+                .grow(1.0)
+                .min_w(0.0),
         )
-        .child(input)
+        .child(status);
+    let mut block = col()
+        .key(format!("term{i}"))
+        .w_full()
+        .gap(8.0)
+        .py(12.0)
+        .child(head);
+    if !b.lines.is_empty() {
+        let shown = b.lines.len().saturating_sub(OUTPUT_LINES);
+        let mut out = col().gap(2.0).grow(1.0).min_w(0.0);
+        if shown > 0 {
+            out = out.child(
+                text(format!("{shown} earlier lines hidden"))
+                    .font(k.ty.small)
+                    .color(k.c.text_faint),
+            );
+        }
+        for l in &b.lines[shown..] {
+            out = out.child(text(l.clone()).font(k.ty.mono).color(k.c.text_muted).wrap());
+        }
+        block = block.child(
+            row()
+                .w_full()
+                .gap(12.0)
+                .child(el().w(2.0).fill(k.c.border_muted))
+                .child(out),
+        );
+    }
+    col()
+        .w_full()
+        .child(block)
+        .child(el().w_full().h(1.0).fill(k.c.border_muted))
 }
 
 fn changes_view(s: &State, k: &Kit) -> El {

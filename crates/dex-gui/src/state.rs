@@ -50,8 +50,13 @@ pub enum Msg {
     /// The directory the current thread works in changed (a worktree was made).
     Project(String),
     /// Project files (relative) and the working-tree patch from a background `git` scan.
-    /// Output of the terminal's running command (`None`: it exited).
-    Term(Option<String>),
+    /// One line of the terminal's running command's output.
+    TermLine(String),
+    /// The terminal's command ended with this exit code after `secs`.
+    TermDone {
+        code: i32,
+        secs: f64,
+    },
     Scanned {
         cwd: String,
         files: Vec<String>,
@@ -116,6 +121,22 @@ pub struct Queued {
     pub followup: bool,
 }
 
+/// How many command blocks the terminal keeps, and lines kept per block.
+pub const TERM_BLOCKS: usize = 100;
+pub const TERM_LINES: usize = 2000;
+
+/// One command the terminal ran: the command, its output lines, and how it ended.
+pub struct TermBlock {
+    pub cmd: String,
+    pub lines: Vec<String>,
+    pub status: TermStatus,
+}
+
+pub enum TermStatus {
+    Running { started: std::time::Instant },
+    Done { code: i32, secs: f64 },
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum VTab {
     Files,
@@ -172,7 +193,7 @@ pub struct State {
     pub open_file: Option<OpenFile>,
     pub diff: DiffState,
     pub scanned: Option<String>,
-    pub term: Vec<String>,
+    pub term: Vec<TermBlock>,
     pub term_input: TextEdit,
     pub term_cwd: Option<String>,
     pub term_running: bool,
@@ -358,16 +379,21 @@ impl State {
             }
             Msg::Status(s) => self.status = s,
             Msg::Project(p) => self.project = Some(p),
-            Msg::Term(Some(chunk)) => {
-                for l in chunk.split('\n') {
-                    self.term.push(strip_ansi(l.trim_end_matches('\r')));
-                }
-                let n = self.term.len();
-                if n > 5000 {
-                    self.term.drain(..n - 5000);
+            Msg::TermLine(line) => {
+                if let Some(b) = self.term.last_mut() {
+                    b.lines.push(strip_ansi(line.trim_end_matches('\r')));
+                    let n = b.lines.len();
+                    if n > TERM_LINES {
+                        b.lines.drain(..n - TERM_LINES);
+                    }
                 }
             }
-            Msg::Term(None) => self.term_running = false,
+            Msg::TermDone { code, secs } => {
+                if let Some(b) = self.term.last_mut() {
+                    b.status = TermStatus::Done { code, secs };
+                }
+                self.term_running = false;
+            }
             Msg::Scanned { cwd, files, patch } => {
                 if cwd == self.cwd() {
                     self.files = files;
@@ -534,8 +560,8 @@ impl State {
         });
     }
 
-    /// Run the terminal input as a shell command in the project directory, streaming its output.
-    /// Not a PTY: interactive programs (editors, pagers) do not work.
+    /// Run the terminal input as a shell command in the project directory, streaming its output
+    /// into a new block. Not a PTY: interactive programs (editors, pagers) do not work.
     pub fn run_term(&mut self) {
         let cmd = self.term_input.text.trim().to_string();
         if cmd.is_empty() || self.term_running {
@@ -543,7 +569,9 @@ impl State {
         }
         self.term_input.replace_text("");
         let dir = self.term_cwd.clone().unwrap_or_else(|| self.cwd());
-        self.term.push(format!("$ {cmd}"));
+        if self.term.len() >= TERM_BLOCKS {
+            self.term.remove(0);
+        }
         if let Some(arg) = cmd.strip_prefix("cd ").or((cmd == "cd").then_some("~")) {
             let arg = arg.trim();
             let home = std::env::var("HOME").unwrap_or_default();
@@ -551,17 +579,33 @@ impl State {
                 Some(rest) => format!("{home}{rest}"),
                 None => arg.to_string(),
             };
-            match std::path::Path::new(&dir).join(target).canonicalize() {
-                Ok(p) if p.is_dir() => self.term_cwd = Some(p.display().to_string()),
-                _ => self.term.push(format!("cd: {arg}: no such directory")),
-            }
+            let (lines, code) = match std::path::Path::new(&dir).join(target).canonicalize() {
+                Ok(p) if p.is_dir() => {
+                    self.term_cwd = Some(p.display().to_string());
+                    (Vec::new(), 0)
+                }
+                _ => (vec![format!("cd: {arg}: no such directory")], 1),
+            };
+            self.term.push(TermBlock {
+                cmd,
+                lines,
+                status: TermStatus::Done { code, secs: 0.0 },
+            });
             return;
         }
+        self.term.push(TermBlock {
+            cmd: cmd.clone(),
+            lines: Vec::new(),
+            status: TermStatus::Running {
+                started: std::time::Instant::now(),
+            },
+        });
         self.term_running = true;
         let (inbox, wake) = (self.inbox.clone(), self.wake.clone());
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
             use std::process::{Command, Stdio};
+            let started = std::time::Instant::now();
             let post = |m: Msg| {
                 inbox.0.lock().unwrap().push(m);
                 if let Some(w) = &wake {
@@ -590,15 +634,31 @@ impl State {
                 Ok(mut ch) => {
                     if let Some(out) = ch.stdout.take() {
                         for l in BufReader::new(out).lines().map_while(Result::ok) {
-                            post(Msg::Term(Some(l)));
+                            post(Msg::TermLine(l));
                         }
                     }
-                    let _ = ch.wait();
+                    let code = ch.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                    post(Msg::TermDone {
+                        code,
+                        secs: started.elapsed().as_secs_f64(),
+                    });
                 }
-                Err(e) => post(Msg::Term(Some(format!("failed to run: {e}")))),
+                Err(e) => {
+                    post(Msg::TermLine(format!("failed to run: {e}")));
+                    post(Msg::TermDone {
+                        code: -1,
+                        secs: 0.0,
+                    });
+                }
             }
-            post(Msg::Term(None));
         });
+    }
+
+    /// Forget the terminal's history, unless a command is still running.
+    pub fn clear_term(&mut self) {
+        if !self.term_running {
+            self.term.clear();
+        }
     }
 
     /// Merge (or discard) the current thread's worktree and return to the main project.
@@ -854,6 +914,8 @@ mod tests {
             }
         }
         assert!(!s.term_running);
-        assert_eq!(s.term, ["$ echo hi; echo err >&2", "hi", "err"]);
+        assert_eq!(s.term.len(), 1);
+        assert_eq!(s.term[0].lines, ["hi", "err"]);
+        assert!(matches!(s.term[0].status, TermStatus::Done { code: 0, .. }));
     }
 }

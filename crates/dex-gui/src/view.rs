@@ -484,7 +484,8 @@ fn human(n: u64) -> String {
 }
 
 fn transcript(s: &State, k: &Kit) -> El {
-    let mut list = col().w_full().max_w(COLUMN).gap(14.0).py(16.0).px(16.0);
+    // Items breathe: 22 points between them, and a turn's user message starts a new group.
+    let mut list = col().w_full().max_w(COLUMN).gap(22.0).py(24.0).px(20.0);
     if s.items.is_empty() {
         list = list.child(
             col()
@@ -502,7 +503,11 @@ fn transcript(s: &State, k: &Kit) -> El {
     }
     for (i, it) in s.items.iter().enumerate() {
         let live = s.busy && i + 1 == s.items.len();
-        list = list.child(item(i, it, k, live).key(format!("item{i}")));
+        let mut el = item(i, it, k, live).key(format!("item{i}"));
+        if i > 0 && matches!(it, Item::User(_)) {
+            el = col().w_full().gap(0.0).child(el.pt(10.0));
+        }
+        list = list.child(el);
     }
     // The viewport must be a column: a row would stretch its child to the viewport's height,
     // so the content would never overflow and nothing could scroll.
@@ -520,11 +525,11 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
         Item::User(t) => row().w_full().justify_end().child(
             col()
                 .max_w(560.0)
-                .px(14.0)
-                .py(10.0)
-                .radius(k.radius.lg)
+                .px(16.0)
+                .py(12.0)
+                .radius(k.radius.xl)
                 .fill(k.c.layer_02)
-                .child(text(t.clone()).font(k.ty.body).color(k.c.text_base)),
+                .child(text(t.clone()).font(k.ty.body).color(k.c.text_base).wrap()),
         ),
         Item::Assistant { text: t, streaming } => Markdown::new(t.clone())
             .streaming(*streaming)
