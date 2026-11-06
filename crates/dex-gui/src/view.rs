@@ -265,7 +265,7 @@ fn reply_style(k: &Kit) -> MarkdownStyle {
     MarkdownStyle::from_kit(k)
         .body_font(typo::reply(k))
         .heading_font(1, heading(20.0))
-        .heading_font(2, heading(17.0))
+        .heading_font(2, heading(18.0))
         .heading_font(3, heading(16.0))
         .list(22.0, 6.0)
 }

@@ -45,11 +45,10 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - UI: Inter. Code and numbers: IBM Plex Mono.
 - Display: 44px, weight 300, −0.02em (Home greeting).
 - Title: 18px, weight 600 (transcript headings).
-- Header title: 15px, weight 500.
-- Body: 14px / 22px line height; secondary 14px / 20px.
-- Small (quiet transcript rows): 13px / 20. Caption: 12px / 18 (hints, descriptions, status). Caps labels: 11px, weight 500, tracked 0.9 (project and section labels). Time and shortcut hints: mono 11.
-- In code these are named roles in `src/style.rs::typo` (reply, heading, thought, meta, caption, caps, time, footer, greeting, stat). Rune's own `small` is 11px, so views never use `k.ty.small`; shared pieces `caps`, `rule`, `dot` live there too.
-- Mono: 12px / 18px (tool output, diffs), 13px (inline code).
+- Header title: 14px, weight 500.
+- Whole, even sizes only. UI and body: 14px / 20 (UI) or 22 (body). Quiet transcript rows and thought text: 14. Caption: 12px / 18 (hints, descriptions, status). Caps labels: 12px, weight 500, tracked 0.8 (project and section labels). Time and shortcut hints: mono 12 / 16. Reply: 16 / 24; reply headings 20 / 18 / 16.
+- In code these are named roles in `src/style.rs::typo`, and `theme.rs::even_type` sets Rune's own scale (ui 14/20, small 12/16, body 14/22) so its components follow. Never use odd sizes or fractional line heights.
+- Mono: 12px / 18px (tool output, diffs, inline code).
 
 ## Radius and spacing
 
@@ -74,11 +73,11 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 ## Sidebar
 
 - Width 280px, padding 0 12px, surface #2c2626. The brand row is 48px tall, the same as the header, so their text lines up.
-- Brand: "dex", Inter 15px, weight 600.
-- Nav rows (Home, New thread, Search): 32px tall, icon 16px in muted, label Inter 13px weight 500, selected row bg #433b3b. Shortcut hints in IBM Plex Mono 11px, faint (for example "Ctrl N").
-- Section label "PROJECTS": Inter 11px, weight 600, uppercase, letter-spacing 0.06em, placeholder colour, 28px tall, 20px space above.
-- Project header: 32px tall, `[chevron] [dot] NAME … [×] [+]`. The whole row toggles collapse; the chevron (left) points right when collapsed, down when open. The + (new thread) is always visible on the right; the × (hide) shows on hover only. 6px colour dot, name Inter 11px weight 600 uppercase, muted.
-- Thread rows: 32px tall, left padding 24px so the title lines up with the project name, Inter 13px. Selected: weight 500, text colour, bg #433b3b, radius 8px. Unselected: weight 400, text-3.
+- Brand: "dex", Inter 14px, weight 600.
+- Nav rows (Home, New thread, Search): 32px tall, icon 16px in muted, label Inter 14px weight 500, selected row bg #433b3b. Shortcut hints in IBM Plex Mono 12px, faint (for example "Ctrl N").
+- Section label "PROJECTS": Inter 12px, weight 600, uppercase, letter-spacing 0.06em, placeholder colour, 28px tall, 20px space above.
+- Project header: 32px tall, `[chevron] [dot] NAME … [×] [+]`. The whole row toggles collapse; the chevron (left) points right when collapsed, down when open. The + (new thread) is always visible on the right; the × (hide) shows on hover only. 6px colour dot, name Inter 12px weight 600 uppercase, muted.
+- Thread rows: 32px tall, left padding 24px so the title lines up with the project name, Inter 14px. Selected: weight 500, text colour, bg #433b3b, radius 8px. Unselected: weight 400, text-3.
 - Age: faint, right-aligned in a fixed 24px column left of the shared 20px right slot (thread status / hover ×, project +), so + and the slot line up. Titles truncate with an ellipsis.
 - Code: layout tokens (row height, inset, gap, dot, indent, time column) live in `src/sidebar.rs::tok`.
 - "Show N more": Inter 12px, faint, 28px tall, same left padding as thread rows.
@@ -142,12 +141,12 @@ Stroke icons on a 24px grid, stroke 1.6, round caps and joins, drawn as inline S
 ## Hierarchy rules (v2)
 
 - One strong focal point per screen: the greeting on Home, the title in the thread header, the code on the viewer.
-- Use scale contrast: 56px display against 11px caps labels. Use light weight (300) for display and medium (500) for labels.
+- Use scale contrast: 56px display against 12px caps labels. Use light weight (300) for display and medium (500) for labels.
 - Separate with hairlines (#433b3b), not card backgrounds. Cards are only for code blocks and dialogs.
 - Tool output sits under a 2px left rule. Code gets a label and a surface. Bubbles are used only for the user's message.
 - The primary action is the accent button. Everything else is outline or ghost.
 
 ## Thought
 
-- Live: spinner + "Thinking" (14px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 13px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (15px / 22px, faint). Click the row or Ctrl+T.
+- Live: spinner + "Thinking" (14px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 14px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (14px / 22px, faint). Click the row or Ctrl+T.
 - Transcript rhythm: 16 between blocks, 32 around a user message, 20 from tools to the reply, 8 from a thought row to its text, tool and thought rows 20 tall.

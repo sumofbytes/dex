@@ -27,14 +27,11 @@ pub mod typo {
             ..reply(k)
         }
     }
-    /// A model thought's text: 15 / 22.
+    /// A model thought's text: 14 / 22.
     pub fn thought(k: &Kit) -> TextStyle {
-        TextStyle {
-            size: 15.0,
-            ..k.ty.ui.lh(22.0)
-        }
+        k.ty.body
     }
-    /// Quiet transcript rows (tool group, thought, notices, queued labels): 13 / 20.
+    /// Quiet transcript rows (tool group, thought, notices, queued labels): 14 / 20.
     pub fn meta(k: &Kit) -> TextStyle {
         k.ty.ui
     }
@@ -45,21 +42,17 @@ pub mod typo {
             ..k.ty.ui.lh(18.0)
         }
     }
-    /// Uppercase section and project labels: 11, weight 500, tracked.
+    /// Uppercase section and project labels: 12, weight 500, tracked.
     pub fn caps(k: &Kit) -> TextStyle {
         TextStyle {
-            size: 11.0,
-            tracking: 0.9,
+            size: 12.0,
+            tracking: 0.8,
             ..k.ty.ui_medium
         }
     }
-    /// Times and shortcut hints: mono 11.
+    /// Times and shortcut hints: mono 12 / 16.
     pub fn time(k: &Kit) -> TextStyle {
-        TextStyle {
-            size: 11.0,
-            ..k.ty.mono
-        }
-        .lh(14.0)
+        k.ty.mono.lh(16.0)
     }
     /// The footer line under the composer: mono 12.
     pub fn footer(k: &Kit) -> TextStyle {

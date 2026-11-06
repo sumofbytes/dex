@@ -95,8 +95,38 @@ fn build(name: &str) -> Option<Active> {
 }
 
 /// Kits are built once per switch and kept for the life of the process (a handful at most).
+/// Rune's scale uses 11, 13 and odd line heights; the app's is whole and even: 12 (small,
+/// captions, mono), 14 (UI and body), with even line heights. Rune's own components follow.
+fn even_type(k: &mut Kit) {
+    use rune::TextStyle;
+    let ui = TextStyle::new(14.0, 400.0).lh(20.0);
+    let body = TextStyle::new(14.0, 400.0).lh(22.0);
+    k.ty.ui = ui;
+    k.ty.ui_medium = TextStyle {
+        weight: 500.0,
+        ..ui
+    };
+    k.ty.ui_compact = ui.lh(18.0);
+    k.ty.small = TextStyle::new(12.0, 400.0).lh(16.0);
+    k.ty.small_medium = TextStyle::new(12.0, 500.0).lh(16.0);
+    k.ty.body = body;
+    k.ty.body_medium = TextStyle {
+        weight: 500.0,
+        ..body
+    };
+    k.ty.text_small = ui;
+    k.ty.text_small_medium = TextStyle {
+        weight: 500.0,
+        ..ui
+    };
+    k.ty.text_xsmall = TextStyle::new(12.0, 400.0).lh(18.0);
+    k.ty.text_xsmall_medium = TextStyle::new(12.0, 500.0).lh(18.0);
+}
+
 fn leak(bg: Color, fg: Color, accent: Color) -> &'static Kit {
-    Box::leak(Box::new(Kit::from_palette(PaletteSeed { bg, fg, accent })))
+    let mut kit = Kit::from_palette(PaletteSeed { bg, fg, accent });
+    even_type(&mut kit);
+    Box::leak(Box::new(kit))
 }
 
 /// Every scheme's name: dex first, then Po's bundle in its order.
