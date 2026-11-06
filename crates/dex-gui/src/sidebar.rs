@@ -4,7 +4,7 @@
 //! their positions cannot drift. All sizes come from `tok`.
 
 use dex_client::protocol::SessionInfo;
-use rune::{El, Key, row, spacer, text, text_input};
+use rune::{El, Key, el, row, spacer, text, text_input};
 use rune_kit::shell::Sidebar;
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons as kit_icons;
@@ -28,6 +28,11 @@ pub mod tok {
     pub const LEAD_GAP: f32 = 8.0;
     /// The trailing slot: + on a project, × on hover.
     pub const SLOT: f32 = 20.0;
+    /// Thread rows nest under their project: the fill starts at MARGIN + 22 = 34, the mark's
+    /// centre sits at 46 and the title at 58 (8 pad + 8 mark + 8 gap).
+    pub const THREAD_INDENT: f32 = 22.0;
+    pub const THREAD_PAD: f32 = 8.0;
+    pub const THREAD_LEAD: f32 = 8.0;
     pub const DOT: f32 = 6.0;
     pub const SPINNER: f32 = 8.0;
     pub const PER_PROJECT: usize = 5;
@@ -50,21 +55,93 @@ pub fn ago(updated_at: &str) -> String {
     }
 }
 
-/// The chrome every row shares: 32 tall, 10 padding, lead column then text column, hover and
-/// (when selected) the pressed fill.
-fn shell(k: &Kit, key: String, selected: bool) -> El {
-    let r = k.interactive(
-        row()
+/// The chrome every row shares: an outer hit area the full width (the hover group for the ×) and
+/// a body that carries the hover and selected fill, content and trailing edges inside it. Nav and
+/// project rows fill 12 to 268; thread rows start the fill at their indent (`THREAD_INDENT`),
+/// like their text.
+struct Shell {
+    outer: El,
+    body: El,
+    indent: f32,
+    edges: Vec<El>,
+}
+
+impl Shell {
+    /// Leading content: marks, labels, titles.
+    fn child(mut self, c: El) -> Self {
+        self.body = self.body.child(c);
+        self
+    }
+
+    /// A trailing-edge child (slot buttons, time), pushed to the right end of the fill.
+    fn edge(mut self, c: El) -> Self {
+        self.edges.push(c);
+        self
+    }
+
+    fn on_press(mut self, f: impl Fn(&mut State) + 'static) -> Self {
+        self.body = self.body.on_press(f);
+        self
+    }
+
+    fn on_double_press(mut self, f: impl Fn(&mut State) + 'static) -> Self {
+        self.body = self.body.on_double_press(f);
+        self
+    }
+
+    fn build(self) -> El {
+        let Shell {
+            outer,
+            mut body,
+            indent,
+            edges,
+        } = self;
+        if !edges.is_empty() {
+            // Leftover space goes to a spacer so the edges keep their right-hand position; its
+            // weight is tiny so a growing title (which truncates) takes nearly all of it.
+            body = body.child(spacer().grow(0.001)).children(edges);
+        }
+        let out = if indent > 0.0 {
+            outer.child(el().w(indent).h(tok::ROW_H))
+        } else {
+            outer
+        };
+        out.child(body.grow(1.0).min_w(0.0))
+    }
+}
+
+fn shell(k: &Kit, key: String, selected: bool) -> Shell {
+    row_shell(k, key, selected, 0.0, tok::PAD)
+}
+
+/// A thread row's chrome: indented under its project.
+fn thread_shell(k: &Kit, key: String, selected: bool) -> Shell {
+    row_shell(k, key, selected, tok::THREAD_INDENT, tok::THREAD_PAD)
+}
+
+fn row_shell(k: &Kit, key: String, selected: bool, indent: f32, pad_left: f32) -> Shell {
+    // 32 tall, 8 radius; shrink lets a long title truncate instead of overflowing.
+    let mut body = row()
+        .h(tok::ROW_H)
+        .pl(pad_left)
+        .pr(tok::PAD)
+        .gap(tok::LEAD_GAP)
+        .items_center()
+        .radius(k.radius.md);
+    if selected {
+        body = body.fill(k.c.pressed);
+    }
+    Shell {
+        outer: row()
             .key(key)
             .hover_group()
             .w_full()
             .h(tok::ROW_H)
-            .px(tok::PAD)
-            .gap(tok::LEAD_GAP)
-            .items_center()
-            .radius(k.radius.md),
-    );
-    if selected { r.fill(k.c.pressed) } else { r }
+            .items_center(),
+        body: k.interactive(body),
+        indent,
+        edges: Vec::new(),
+    }
 }
 
 /// A fixed `size` x `size` box centring its content.
@@ -72,13 +149,17 @@ fn boxed(size: f32, child: El) -> El {
     row().size(size, size).center().child(child)
 }
 
-fn lead(child: El) -> El {
-    boxed(tok::LEAD, child)
+/// A thread row's mark column (8 wide: dot or spinner).
+fn thread_lead(child: El) -> El {
+    boxed(tok::THREAD_LEAD, child)
 }
 
-/// An empty lead column, so text lines up when a row has no icon.
-fn lead_gap() -> El {
-    row().size(tok::LEAD, tok::LEAD)
+fn thread_lead_gap() -> El {
+    row().size(tok::THREAD_LEAD, tok::THREAD_LEAD)
+}
+
+fn lead(child: El) -> El {
+    boxed(tok::LEAD, child)
 }
 
 fn spinner(k: &Kit) -> El {
@@ -111,13 +192,13 @@ fn nav_row(
                 .min_w(0.0),
         );
     if let Some(h) = hint {
-        r = r.child(
+        r = r.edge(
             text(h.to_string())
                 .font(typo::time(k))
                 .color(k.c.text_faint),
         );
     }
-    r.on_press(move |s: &mut State| f(s))
+    r.on_press(move |s: &mut State| f(s)).build()
 }
 
 /// A thread row: running spinner (or attention dot) in the lead column, title in the text
@@ -160,13 +241,13 @@ fn thread_row_as(
             NeedKind::Done => crate::theme::done(),
             NeedKind::Failed => k.c.danger.fg,
         };
-        lead(dot(color, tok::DOT))
+        thread_lead(dot(color, tok::DOT))
     } else if waiting {
-        lead(dot(crate::theme::waiting(), tok::DOT))
+        thread_lead(dot(crate::theme::waiting(), tok::DOT))
     } else if running {
-        lead(spinner(k))
+        thread_lead(spinner(k))
     } else {
-        lead_gap()
+        thread_lead_gap()
     };
     let age = ago(&sess.updated_at);
     let time = if with_project {
@@ -234,10 +315,10 @@ fn thread_chrome(
             .grow(1.0)
             .min_w(0.0),
     };
-    shell(k, key.clone(), selected)
+    thread_shell(k, key.clone(), selected)
         .child(mark)
         .child(title)
-        .child(boxed(
+        .edge(boxed(
             tok::SLOT,
             IconButton::new(&kit_icons::CLOSE)
                 .control_size(ControlSize::Small)
@@ -248,7 +329,7 @@ fn thread_chrome(
                 .key(format!("{key}-hide"))
                 .group_opacity(0.0, 1.0),
         ))
-        .child(time)
+        .edge(time)
         .on_press(move |s: &mut State| {
             // A press during a rename ends the edit (Return would too); don't jump threads.
             if s.renaming.is_some() {
@@ -264,6 +345,7 @@ fn thread_chrome(
                 s.start_rename(&rename_id);
             }
         })
+        .build()
 }
 
 /// What a project header needs: pressing anywhere on it toggles collapse.
@@ -294,7 +376,7 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
                 .grow(1.0)
                 .min_w(0.0),
         )
-        .child(boxed(
+        .edge(boxed(
             tok::SLOT,
             IconButton::new(&kit_icons::CLOSE)
                 .control_size(ControlSize::Small)
@@ -305,7 +387,7 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
                 .key(format!("{}-hide", p.key))
                 .group_opacity(0.0, 1.0),
         ))
-        .child(boxed(
+        .edge(boxed(
             tok::SLOT,
             IconButton::new(&kit_icons::PLUS)
                 .control_size(ControlSize::Small)
@@ -324,14 +406,16 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
                 s.collapsed.insert(toggle.clone());
             }
         })
+        .build()
 }
 
 /// A quiet row under a list ("Show 2 more"), its text in the text column.
 fn more_link(k: &Kit, key: String, label: String, f: impl Fn(&mut State) + 'static) -> El {
-    shell(k, key, false)
-        .child(lead_gap())
+    thread_shell(k, key, false)
+        .child(thread_lead_gap())
         .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
         .on_press(move |s: &mut State| f(s))
+        .build()
 }
 
 fn projects(s: &State) -> Vec<(String, Vec<&SessionInfo>)> {
