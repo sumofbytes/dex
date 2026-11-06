@@ -72,17 +72,13 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 
 ## Sidebar
 
-- Width 280px, padding 0 12px, surface #2c2626. The brand row is 48px tall, the same as the header, so their text lines up.
-- Brand: "dex", Inter 14px, weight 600.
-- Nav rows (Home, New thread, Search): 32px tall, icon 16px in muted, label Inter 14px weight 500, selected row bg #433b3b. Shortcut hints in IBM Plex Mono 12px, faint (for example "Ctrl N").
-- Section label "PROJECTS": Inter 12px, weight 600, uppercase, letter-spacing 0.06em, placeholder colour, 28px tall, 20px space above.
-- Project header: 32px tall, `[dot|spinner] NAME … [×] [+]`. No chevron: the whole row toggles collapse. The 8px lead slot holds the 6px colour dot, or a spinner while a thread in the project is running; names align with thread titles. The + (new thread) is always visible on the right; the × (hide) shows on hover only. Name Inter 10px weight 600 uppercase, muted.
-- Thread rows: 32px tall, left padding 24px so the title lines up with the project name, Inter 14px. Selected: weight 500, text colour, bg #433b3b, radius 8px. Unselected: weight 400, text-3.
-- Age: faint, right-aligned in a fixed 24px column left of the shared 20px right slot (thread status / hover ×, project +), so + and the slot line up. Titles truncate with an ellipsis.
-- Code: layout tokens (row height, inset, gap, dot, indent, time column) live in `src/sidebar.rs::tok`.
-- "Show N more": Inter 12px, faint, 28px tall, same left padding as thread rows.
-- Gap of 12px between project groups.
-- Home nav row is selected on the Home page; a thread row is selected on the Thread page.
+One grid (`src/sidebar.rs::tok`, board "dex / Sidebar v3 · grid"). Width 280, margin 12, row padding 10, so content spans x 22..258. Every row is 32 tall and built from the same chrome.
+
+- Lead column x 22..38 (centre 30): nav icon (16), project colour dot (6) or spinner (8), a running thread's spinner (8) or attention dot.
+- Text column starts x 46 (lead 16 + gap 8): nav label, project name, thread title, "Show more". Hierarchy is by type (small bold caps for projects, regular text for threads), not indent.
+- Trailing: a 24 time column, right edge x 230 (one 8 gap left of the slot); a 20 slot centred x 248 holding + on a project header and × on a hovered thread; the "Ctrl N" hint right-aligned to x 258.
+- Brand "dex" at x 22, 14px weight 600. Nav labels 12px weight 500; selected row fill #433b3b, radius 8. Thread titles 12px, selected weight 500. Project names 10px caps. Times and hint mono 12.
+- The whole project header toggles collapse (no chevron); × (hide) shows on hover only. The 8px lead holds the dot, or a spinner while a thread in the project runs. Titles truncate with an ellipsis.
 
 ## Composer options
 

@@ -1,33 +1,37 @@
-//! Sidebar: layout tokens, small reusable pieces (nav row, project header, thread row, "show
-//! more" link) and the assembly. Every size and gap comes from `tok`, so rows stay aligned.
+//! Sidebar, on one grid (see DESIGN.md): a 16 lead column (nav icon, project dot or spinner, a
+//! running thread's spinner), a text column (labels, project names, titles) and a trailing edge
+//! (time column, then a 20 slot for + and ×). Every row is built from the same chrome, so
+//! their positions cannot drift. All sizes come from `tok`.
 
 use dex_client::protocol::SessionInfo;
 use rune::{El, row, spacer, text, text_input};
-use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
+use rune_kit::shell::Sidebar;
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons as kit_icons;
 
 use crate::icons;
 use crate::state::{Cmd, Item, Page, State, project_name, session_title};
 use crate::style::{caps, dot, space, typo};
 
-/// Layout tokens, in points. One row height, one inset, one gap: rows never drift apart.
+/// Layout tokens, in points.
 pub mod tok {
     pub const WIDTH: f32 = 280.0;
+    /// Space between the sidebar edge and a row.
+    pub const MARGIN: f32 = 12.0;
+    /// Space between a row's edge and its content: content starts at MARGIN + PAD = 22.
+    pub const PAD: f32 = 10.0;
     /// Every row: nav, project header, thread.
     pub const ROW_H: f32 = 32.0;
-    /// Space between the sidebar edge and a row's content.
-    pub const INSET: f32 = super::space::LG;
-    /// Gap between items inside a row.
-    pub const GAP: f32 = super::space::SM;
-    /// Fixed, right-aligned column for a thread's time, just left of the slot.
+    /// The lead column: nav icon, project dot / spinner, thread spinner (centred in it).
+    pub const LEAD: f32 = 16.0;
+    /// Between the lead column and the text column (text starts at 22 + 16 + 8 = 46).
+    pub const LEAD_GAP: f32 = 8.0;
+    /// The trailing slot: + on a project, × on hover.
+    pub const SLOT: f32 = 20.0;
+    /// A thread's time: fixed, right-aligned, one gap left of the slot (right edge at 230).
     pub const TIME_W: f32 = 24.0;
-    /// The slot before a project's name: holds the dot, or a spinner while it runs.
-    pub const LEAD: f32 = 8.0;
-    /// Project dot diameter.
     pub const DOT: f32 = 6.0;
-    /// Threads sit under their project's chevron + dot.
-    pub const INDENT: f32 = 14.0;
+    pub const SPINNER: f32 = 8.0;
     pub const PER_PROJECT: usize = 5;
     pub const PROJECTS: usize = 12;
 }
@@ -48,69 +52,160 @@ pub fn ago(updated_at: &str) -> String {
     }
 }
 
-/// A navigation row: icon + label.
+/// The chrome every row shares: 32 tall, 10 padding, lead column then text column, hover and
+/// (when selected) the pressed fill.
+fn shell(k: &Kit, key: String, selected: bool) -> El {
+    let r = k.interactive(
+        row()
+            .key(key)
+            .hover_group()
+            .w_full()
+            .h(tok::ROW_H)
+            .px(tok::PAD)
+            .gap(tok::LEAD_GAP)
+            .items_center()
+            .radius(k.radius.md),
+    );
+    if selected { r.fill(k.c.pressed) } else { r }
+}
+
+/// A fixed `size` x `size` box centring its content.
+fn boxed(size: f32, child: El) -> El {
+    row().size(size, size).center().child(child)
+}
+
+fn lead(child: El) -> El {
+    boxed(tok::LEAD, child)
+}
+
+/// An empty lead column, so text lines up when a row has no icon.
+fn lead_gap() -> El {
+    row().size(tok::LEAD, tok::LEAD)
+}
+
+fn spinner(k: &Kit) -> El {
+    Spinner::new().size(tok::SPINNER).build(k)
+}
+
+/// A navigation row: icon in the lead column, label in the text column, optional hint.
 fn nav_row(
     k: &Kit,
     label: &str,
     icon: &'static rune::Icon,
+    hint: Option<&str>,
     selected: bool,
     key: &str,
     f: impl Fn(&mut State) + 'static,
 ) -> El {
-    SidebarRow::new(label)
-        .icon(icon)
-        .selected(selected)
-        .height(tok::ROW_H)
-        .on_select(move |s: &mut State, _| f(s))
-        .build(k)
-        .key(key.to_string())
+    let (ink, glyph) = if selected {
+        (k.c.text_base, k.c.icon_base)
+    } else {
+        (k.c.text_muted, k.c.icon_muted)
+    };
+    let mut r = shell(k, key.to_string(), selected)
+        .child(lead(rune::icon(icon, 16.0).color(glyph)))
+        .child(
+            text(label.to_string())
+                .font(k.ty.ui_medium)
+                .color(ink)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        );
+    if let Some(h) = hint {
+        r = r.child(
+            text(h.to_string())
+                .font(typo::time(k))
+                .color(k.c.text_faint),
+        );
+    }
+    r.on_press(move |s: &mut State| f(s))
 }
 
-/// A thread row: title, status, and a right-aligned time (or `project · time` in search).
+/// A thread row: running spinner (or attention dot) in the lead column, title in the text
+/// column, time left of the slot, × (hide) in the slot on hover. In search results the time
+/// column is replaced by `project · time`.
 fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project: bool) -> El {
     let id = sess.session_id.clone();
     let hide_id = sess.session_id.clone();
     let open_cwd = sess.cwd.clone();
     let selected = s.page == Page::Thread && s.current.as_deref() == Some(sess.session_id.as_str());
-    let mut r = SidebarRow::new(session_title(sess))
-        .selected(selected)
-        .on_select(move |s: &mut State, _| {
-            s.project = Some(open_cwd.clone());
-            s.page = Page::Thread;
-            s.send_cmd(Cmd::Open(id.clone()));
-        });
     let waiting = s
         .items
         .iter()
         .any(|i| matches!(i, Item::Approval { decided: None, .. }));
-    // The running thread keeps its spinner even when another thread (or Home) is in view.
+    // The running thread keeps its indicator even when another thread (or Home) is in view.
     let running = s.current.as_deref() == Some(sess.session_id.as_str());
-    if running && waiting {
-        r = r.status(RowStatus::Attention);
+    let mark = if running && waiting {
+        lead(dot(crate::theme::waiting(), tok::DOT))
     } else if running && s.busy {
-        r = r.status(RowStatus::Busy);
-    }
-    let age = ago(&sess.updated_at);
-    r = if with_project {
-        r.detail(format!("{} · {age}", project_name(&sess.cwd)))
+        lead(spinner(k))
     } else {
-        r.trailing(time_col(k, age))
+        lead_gap()
     };
-    // Hover reveals an × that removes the thread from the sidebar.
-    r = r.on_close(move |s: &mut State, _| s.hide_thread(&hide_id));
-    r.height(tok::ROW_H).build(k).key(key)
+    let age = ago(&sess.updated_at);
+    let time = if with_project {
+        text(format!("{} · {age}", project_name(&sess.cwd)))
+            .font(typo::time(k))
+            .color(k.c.text_faint)
+    } else {
+        // Fixed width, text on its right edge, so `2h` and `1d` line up.
+        row()
+            .w(tok::TIME_W)
+            .child(spacer().grow(1.0))
+            .child(text(age).font(typo::time(k)).color(k.c.text_faint))
+    };
+    thread_chrome(k, key, selected, mark, sess, id, open_cwd, hide_id, time)
 }
 
-/// A thread's time: a fixed-width column, text pushed to its right edge, so `2h` and `1d` align.
-fn time_col(k: &Kit, age: String) -> El {
-    row()
-        .key("time")
-        .w(tok::TIME_W)
-        .child(spacer().grow(1.0))
-        .child(text(age).font(typo::time(k)).color(k.c.text_faint))
+#[allow(clippy::too_many_arguments)]
+fn thread_chrome(
+    k: &Kit,
+    key: String,
+    selected: bool,
+    mark: El,
+    sess: &SessionInfo,
+    id: String,
+    open_cwd: String,
+    hide_id: String,
+    time: El,
+) -> El {
+    let ink = if selected {
+        k.c.text_base
+    } else {
+        k.c.text_muted
+    };
+    let font = if selected { k.ty.ui_medium } else { k.ty.ui };
+    shell(k, key.clone(), selected)
+        .child(mark)
+        .child(
+            text(session_title(sess))
+                .font(font)
+                .color(ink)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(time)
+        .child(boxed(
+            tok::SLOT,
+            IconButton::new(&kit_icons::CLOSE)
+                .control_size(ControlSize::Small)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Hide thread from sidebar")
+                .on_press(move |s: &mut State| s.hide_thread(&hide_id))
+                .build(k)
+                .key(format!("{key}-hide"))
+                .group_opacity(0.0, 1.0),
+        ))
+        .on_press(move |s: &mut State| {
+            s.project = Some(open_cwd.clone());
+            s.page = Page::Thread;
+            s.send_cmd(Cmd::Open(id.clone()));
+        })
 }
 
-/// What a project header needs: pressing anywhere on it toggles `collapsed`.
+/// What a project header needs: pressing anywhere on it toggles collapse.
 struct ProjectHeader {
     key: String,
     name: String,
@@ -123,82 +218,61 @@ struct ProjectHeader {
 /// `[dot|spinner] NAME ........ [×] [+]`: no chevron, the whole row toggles; × shows on hover.
 fn project_header(k: &Kit, p: ProjectHeader) -> El {
     let (toggle, add, hide) = (p.cwd.clone(), p.cwd.clone(), p.cwd.clone());
-    // One fixed slot, so the name never shifts between the dot and the spinner.
-    let lead = row()
-        .size(tok::LEAD, tok::LEAD)
-        .center()
-        .child(if p.running {
-            Spinner::new().size(tok::LEAD).build(k)
-        } else {
-            dot(p.color, tok::DOT)
-        });
-    k.interactive(
-        row()
-            .key(p.key.clone())
-            .hover_group()
-            .w_full()
-            .h(tok::ROW_H)
-            .px(tok::INSET)
-            .gap(tok::GAP)
-            .items_center()
-            .radius(k.radius.md)
-            .child(
-                row()
-                    .gap(space::XS)
-                    .items_center()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .child(lead)
-                    .child(
-                        text(p.name.to_uppercase())
-                            .font(typo::caps(k))
-                            .color(k.c.text_faint)
-                            .truncate()
-                            .grow(1.0)
-                            .min_w(0.0),
-                    ),
-            )
-            .child(
-                IconButton::new(&kit_icons::CLOSE)
-                    .control_size(ControlSize::Small)
-                    .variant(IconButtonVariant::GhostMuted)
-                    .label("Remove project from sidebar")
-                    .on_press(move |s: &mut State| s.hide_project(&hide))
-                    .build(k)
-                    .key(format!("{}-hide", p.key))
-                    .group_opacity(0.0, 1.0),
-            )
-            .child(
-                IconButton::new(&kit_icons::PLUS)
-                    .control_size(ControlSize::Small)
-                    .variant(IconButtonVariant::Ghost)
-                    .label("New thread in project")
-                    .on_press(move |s: &mut State| {
-                        s.project = Some(add.clone());
-                        s.page = Page::Thread;
-                        s.send_cmd(Cmd::NewSession);
-                    })
-                    .build(k)
-                    .key(format!("{}-add", p.key)),
-            ),
-    )
-    .on_press(move |s: &mut State| {
-        if !s.collapsed.remove(&toggle) {
-            s.collapsed.insert(toggle.clone());
-        }
-    })
+    let mark = if p.running {
+        spinner(k)
+    } else {
+        dot(p.color, tok::DOT)
+    };
+    shell(k, p.key.clone(), false)
+        .child(lead(mark))
+        .child(
+            text(p.name.to_uppercase())
+                .font(typo::caps(k))
+                .color(k.c.text_faint)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(boxed(
+            tok::SLOT,
+            IconButton::new(&kit_icons::CLOSE)
+                .control_size(ControlSize::Small)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Remove project from sidebar")
+                .on_press(move |s: &mut State| s.hide_project(&hide))
+                .build(k)
+                .key(format!("{}-hide", p.key))
+                .group_opacity(0.0, 1.0),
+        ))
+        .child(boxed(
+            tok::SLOT,
+            IconButton::new(&kit_icons::PLUS)
+                .control_size(ControlSize::Small)
+                .variant(IconButtonVariant::Ghost)
+                .label("New thread in project")
+                .on_press(move |s: &mut State| {
+                    s.project = Some(add.clone());
+                    s.page = Page::Thread;
+                    s.send_cmd(Cmd::NewSession);
+                })
+                .build(k)
+                .key(format!("{}-add", p.key)),
+        ))
+        .on_press(move |s: &mut State| {
+            if !s.collapsed.remove(&toggle) {
+                s.collapsed.insert(toggle.clone());
+            }
+        })
 }
 
-/// A quiet text button under a list ("Show 2 more").
+/// A quiet row under a list ("Show 2 more"), its text in the text column.
 fn more_link(k: &Kit, key: String, label: String, f: impl Fn(&mut State) + 'static) -> El {
-    Button::new(label)
-        .variant(ButtonVariant::Ghost)
-        .on_press(f)
-        .build(k)
-        .key(key)
+    shell(k, key, false)
+        .child(lead_gap())
+        .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
+        .on_press(move |s: &mut State| f(s))
 }
 
-/// Threads grouped by project root: the active project first, then by most recent thread.
 fn projects(s: &State) -> Vec<(String, Vec<&SessionInfo>)> {
     let current = crate::worktree::project_root(&s.cwd());
     let mut out: Vec<(String, Vec<&SessionInfo>)> = Vec::new();
@@ -226,30 +300,41 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
     let brand = text("dex")
         .font(k.ty.body_medium)
         .color(k.c.text_base)
-        .px(tok::INSET)
+        .px(tok::PAD)
         .key("brand");
     let mut sb = Sidebar::new()
         .label("Navigation")
+        .inset(tok::MARGIN)
         .header_padding(12.0, 8.0)
         .header(brand)
         .header(nav_row(
             k,
             "Home",
             &icons::HOME,
+            None,
             s.page == Page::Home,
             "nav-home",
             |s| {
                 s.page = Page::Home;
             },
         ))
-        .header(nav_row(k, "New", &icons::PLUS, false, "nav-new", |s| {
-            s.page = Page::Thread;
-            s.send_cmd(Cmd::NewSession);
-        }))
+        .header(nav_row(
+            k,
+            "New thread",
+            &icons::PLUS,
+            Some("Ctrl N"),
+            false,
+            "nav-new",
+            |s| {
+                s.page = Page::Thread;
+                s.send_cmd(Cmd::NewSession);
+            },
+        ))
         .header(nav_row(
             k,
             "Search",
             &icons::SEARCH,
+            None,
             s.searching,
             "nav-search",
             |s| {
@@ -269,7 +354,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
                 .single_line()
                 .on_edit(|s: &mut State| &mut s.search)
                 .w_full()
-                .px(tok::INSET)
+                .px(tok::PAD)
                 .py(space::SM),
         );
     }
@@ -292,7 +377,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
         row()
             .key("projects-label")
             .w_full()
-            .px(tok::INSET)
+            .px(tok::PAD)
             .pt(14.0)
             .pb(space::XS)
             .child(caps(k, "PROJECTS")),
@@ -331,13 +416,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
             threads.len().min(tok::PER_PROJECT)
         };
         for (ti, sess) in threads.iter().take(shown).enumerate() {
-            sb = sb.child(row().w_full().pl(tok::INDENT).child(thread_row(
-                s,
-                k,
-                sess,
-                format!("t{pi}-{ti}"),
-                false,
-            )));
+            sb = sb.child(thread_row(s, k, sess, format!("t{pi}-{ti}"), false));
         }
         if threads.len() > tok::PER_PROJECT {
             let more_cwd = cwd.clone();
