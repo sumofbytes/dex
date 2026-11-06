@@ -12,6 +12,9 @@ use crate::style::{space, typo};
 const COLUMN: f32 = 760.0;
 /// Left indent of what opens under a quiet row: tool calls and a thought's text share it.
 const NESTED: f32 = 14.0;
+/// The content line: text, bubbles and the footer sit this far inside the composer card's edge,
+/// where the input's own text starts, so everything shares a left and a right edge.
+const CONTENT: f32 = 12.0;
 
 pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
     let k = crate::theme::kit();
@@ -165,7 +168,12 @@ fn human(n: u64) -> String {
 
 fn transcript(s: &State, k: &Kit) -> El {
     // Text leads: items sit 14 points apart, and a turn's user message gets a little more room.
-    let mut list = col().w_full().max_w(COLUMN).gap(space::XXL).py(space::XXL);
+    let mut list = col()
+        .w_full()
+        .max_w(COLUMN)
+        .gap(space::XXL)
+        .py(space::XXL)
+        .px(CONTENT);
     if s.items.is_empty() {
         list = list.child(
             col()
@@ -522,6 +530,8 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             false
         })
         .w_full()
+        .px(space::MD)
+        .py(space::MD)
         .min_h(44.0)
         .max_h(220.0);
 
@@ -546,16 +556,20 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let card = col()
         .w_full()
         .max_w(COLUMN)
-        .padding(12.0)
-        .gap(space::MD)
+        .padding(space::XS)
+        .gap(space::XXS)
         .radius(k.radius.xl)
         .fill(k.c.layer_02)
         .border(1.0, k.c.border_base)
         .child(input)
         .child(
+            // Chips carry their own 8 padding and the button sits 8 in, so chip text, the send
+            // button and the input text all land on the content line (card edge + 12).
             row()
                 .gap(space::MD)
                 .items_center()
+                .pr(space::MD)
+                .pb(space::MD)
                 .child(mode)
                 .child(model)
                 .child(spacer())
@@ -603,8 +617,7 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 /// The line under the composer: the project path and branch on the left, the agent's status
-/// on the right. Transcript, composer card and this line share one column (`COLUMN` inside a
-/// 16 gutter), so their left and right edges line up.
+/// on the right. Transcript, composer text and this line share one content line (`CONTENT` inside the card).
 fn footer(s: &State, k: &Kit) -> El {
     let meta = typo::footer(k);
     let mut left = row()
@@ -645,6 +658,7 @@ fn footer(s: &State, k: &Kit) -> El {
             .w_full()
             .max_w(COLUMN)
             .h(36.0)
+            .px(CONTENT)
             .pb(space::MD)
             .gap(space::MD)
             .items_center()
