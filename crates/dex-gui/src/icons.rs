@@ -74,3 +74,9 @@ pub static SLIDERS: Icon = Icon {
     view: 24.0,
     body: r#"<path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" cx="16" cy="7" r="2"/><circle fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" cx="8" cy="17" r="2"/>"#,
 };
+
+pub static DOWN: Icon = Icon {
+    name: "down",
+    view: 24.0,
+    body: r#"<path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};

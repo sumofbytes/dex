@@ -2,6 +2,7 @@
 //! and talks to it over HTTP+SSE via `dex-client`; `DEX_GUI_URL` attaches to an existing one.
 //! Headless render: `dex-gui --snap out.png --scene chat`.
 
+mod composer_menu;
 mod home;
 mod icons;
 mod state;
@@ -227,6 +228,21 @@ fn themepick_scene(s: &mut State) {
     s.theme_open = true;
 }
 
+/// Composer options: the model menu open over a list of models.
+fn menus_scene(s: &mut State) {
+    sample(s);
+    s.info.models = (0..14).map(|i| format!("model-{i}")).collect();
+    s.info.models.insert(0, "glm-5.3-flash".into());
+    s.model = Some("glm-5.3-flash".into());
+    s.open_select = Some("model");
+}
+
+/// Composer options: the mode menu open.
+fn modemenu_scene(s: &mut State) {
+    sample(s);
+    s.open_select = Some("mode");
+}
+
 fn changes_scene(s: &mut State) {
     viewer_scene(s, state::VTab::Changes);
 }
@@ -306,6 +322,8 @@ fn main() {
             ("term", term_scene),
             ("wt", wt_scene),
             ("themepick", themepick_scene),
+            ("menus", menus_scene),
+            ("modemenu", modemenu_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),

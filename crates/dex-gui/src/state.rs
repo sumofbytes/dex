@@ -160,6 +160,8 @@ pub struct State {
     pub hidden_threads: HashSet<String>,
     pub hidden_projects: HashSet<String>,
     pub theme_open: bool,
+    /// The model menu's search text.
+    pub model_query: TextEdit,
     pub theme_query: TextEdit,
     pub use_worktree: bool,
     pub confirm_discard: bool,
@@ -207,6 +209,7 @@ impl Default for State {
             hidden_threads: HashSet::new(),
             hidden_projects: HashSet::new(),
             theme_open: false,
+            model_query: TextEdit::default(),
             theme_query: TextEdit::default(),
             use_worktree: false,
             confirm_discard: false,

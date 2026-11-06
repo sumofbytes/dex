@@ -4,15 +4,12 @@ use dex_client::protocol::ApprovalDecision;
 use rune::{Cx, El, ScrollSpec, TextStyle, col, el, row, spacer, text, text_input};
 use rune_kit::markdown::Markdown;
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
-use rune_kit::{
-    Button, ButtonVariant, Collapsible, IconButton, IconButtonVariant, Kit, Select, Spinner,
-};
+use rune_kit::{Button, ButtonVariant, Collapsible, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons;
 
 use crate::state::{Cmd, Item, Page, State, VTab, project_name, session_title};
 use dex_client::protocol::SessionInfo;
 
-const MODES: [&str; 3] = ["read-only", "ask", "trusted"];
 const COLUMN: f32 = 760.0;
 const SIDEBAR_W: f32 = 280.0;
 
@@ -696,48 +693,8 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .min_h(44.0)
         .max_h(220.0);
 
-    let mode_cur = s.effective_permission();
-    let mode = Select::new("mode", &MODES)
-        .current(Some(&mode_cur))
-        .width(120.0)
-        .open(s.open_select == Some("mode"))
-        .on_toggle(|s: &mut State| {
-            s.open_select = if s.open_select == Some("mode") {
-                None
-            } else {
-                Some("mode")
-            }
-        })
-        .on_close(|s: &mut State| s.open_select = None)
-        .on_choose(|s: &mut State, v: &str, _| {
-            s.permission = Some(v.to_string());
-            s.open_select = None;
-        })
-        .build(k, layer);
-
-    let models = if s.info.models.is_empty() {
-        vec![s.effective_model()]
-    } else {
-        s.info.models.clone()
-    };
-    let model_cur = s.effective_model();
-    let model = Select::new("model", &models)
-        .current(Some(&model_cur))
-        .width(260.0)
-        .open(s.open_select == Some("model"))
-        .on_toggle(|s: &mut State| {
-            s.open_select = if s.open_select == Some("model") {
-                None
-            } else {
-                Some("model")
-            }
-        })
-        .on_close(|s: &mut State| s.open_select = None)
-        .on_choose(|s: &mut State, v: &str, _| {
-            s.model = Some(v.to_string());
-            s.open_select = None;
-        })
-        .build(k, layer);
+    let mode = crate::composer_menu::mode(s, k, layer);
+    let model = crate::composer_menu::model(s, k, layer);
 
     let action = if s.busy {
         IconButton::new(&icons::STOP)
@@ -822,7 +779,7 @@ fn footer(s: &State, k: &Kit) -> El {
     };
     let mut left = row().grow(1.0).min_w(0.0).gap(6.0).items_center().child(
         text(s.cwd())
-            .font(meta.clone())
+            .font(meta)
             .color(k.c.text_faint)
             .truncate()
             .shrink(),
@@ -831,12 +788,7 @@ fn footer(s: &State, k: &Kit) -> El {
         left = left
             .child(text("·").font(k.ty.small).color(k.c.border_strong))
             .child(rune::icon(&crate::icons::BRANCH, 12.0).color(k.c.text_faint))
-            .child(
-                text(b.clone())
-                    .font(meta.clone())
-                    .color(k.c.text_faint)
-                    .truncate(),
-            );
+            .child(text(b.clone()).font(meta).color(k.c.text_faint).truncate());
     }
     let ready = s.status == "ready";
     let dot = if ready {

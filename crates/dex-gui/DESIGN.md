@@ -82,7 +82,7 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Gap of 12px between project groups.
 - Home nav row is selected on the Home page; a thread row is selected on the Thread page.
 
-## Composer options (proposed, not yet replicated)
+## Composer options
 
 Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode and model selects.
 
@@ -101,6 +101,8 @@ Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode a
 ## Replication status
 
 Replicated in `src/` (v2): the sidebar, Home, the thread header, tool rows, composer and footer, the viewer tabs and numbered file preview, and the theme picker rows. Icons are in `src/icons.rs`.
+
+Composer options (`src/composer_menu.rs`) replicate the mode and model menus.
 
 Differences that remain:
 - The code blocks come from rune-kit's Markdown, so they don't have the "RUST" label from the design.
