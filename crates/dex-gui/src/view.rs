@@ -2,7 +2,7 @@
 
 use dex_client::protocol::ApprovalDecision;
 use rune::{Cx, El, ScrollSpec, TextStyle, col, el, row, spacer, text, text_input};
-use rune_kit::markdown::Markdown;
+use rune_kit::markdown::{Markdown, MarkdownStyle};
 use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons;
 
@@ -253,6 +253,28 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
     group
 }
 
+/// The reply's type, per the transcript design: 16px on a 24px line, lists with a 22px marker
+/// column and 6px between items.
+fn reply_style(k: &Kit) -> MarkdownStyle {
+    let body = rune::TextStyle {
+        size: 16.0,
+        line_height: 24.0,
+        ..k.ty.body
+    };
+    let heading = |size: f32| rune::TextStyle {
+        size,
+        weight: 600.0,
+        line_height: 26.0,
+        ..body
+    };
+    MarkdownStyle::from_kit(k)
+        .body_font(body)
+        .heading_font(1, heading(20.0))
+        .heading_font(2, heading(17.0))
+        .heading_font(3, heading(16.0))
+        .list(22.0, 6.0)
+}
+
 /// A model thought. Live: spinner + "Thinking", open while it streams. Done: the same quiet row
 /// as a tool group (`› Thought · 4s`), collapsed; opening it only turns the chevron and shows
 /// the text below.
@@ -319,6 +341,7 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                 .child(text(t.clone()).font(k.ty.body).color(k.c.text_base).wrap()),
         ),
         Item::Assistant { text: t, streaming } => Markdown::new(t.clone())
+            .style(reply_style(k))
             .streaming(*streaming)
             .build(k)
             .w_full(),
