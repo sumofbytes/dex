@@ -1,5 +1,6 @@
 //! App state and the pure transitions that fold daemon events into the transcript.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use dex_client::protocol::{ApprovalDecision, SessionInfo, StreamEvent};
@@ -11,6 +12,7 @@ pub enum Cmd {
     NewSession,
     Open(String),
     Send {
+        cwd: String,
         text: String,
         model: Option<String>,
         permission: Option<String>,
@@ -86,6 +88,7 @@ pub struct Inbox(pub Mutex<Vec<Msg>>);
 
 pub struct State {
     pub sessions: Vec<SessionInfo>,
+    pub sessions_loaded: bool,
     pub current: Option<String>,
     pub items: Vec<Item>,
     pub edit: TextEdit,
@@ -98,6 +101,11 @@ pub struct State {
     pub tokens: u64,
     pub cost: f64,
     pub sidebar: bool,
+    /// Project (working directory) new threads start in; follows the opened thread.
+    pub project: Option<String>,
+    pub collapsed: HashSet<String>,
+    pub show_all: HashSet<String>,
+    pub all_projects: bool,
     pub inbox: Arc<Inbox>,
     pub cmds: Option<mpsc::UnboundedSender<Cmd>>,
 }
@@ -106,6 +114,7 @@ impl Default for State {
     fn default() -> Self {
         State {
             sessions: Vec::new(),
+            sessions_loaded: false,
             current: None,
             items: Vec::new(),
             edit: TextEdit::default(),
@@ -118,6 +127,10 @@ impl Default for State {
             tokens: 0,
             cost: 0.0,
             sidebar: true,
+            project: None,
+            collapsed: HashSet::new(),
+            show_all: HashSet::new(),
+            all_projects: false,
             inbox: Arc::default(),
             cmds: None,
         }
@@ -129,6 +142,13 @@ impl State {
         if let Some(tx) = &self.cmds {
             let _ = tx.send(c);
         }
+    }
+
+    /// Directory new threads run in and the footer shows.
+    pub fn cwd(&self) -> String {
+        self.project
+            .clone()
+            .unwrap_or_else(|| self.info.cwd.clone())
     }
 
     pub fn effective_model(&self) -> String {
@@ -168,6 +188,7 @@ impl State {
                 let mut list = list;
                 list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 self.sessions = list;
+                self.sessions_loaded = true;
             }
             Msg::Status(s) => self.status = s,
             Msg::Opened { id, replay } => {
@@ -302,11 +323,22 @@ impl State {
         self.busy = true;
         self.status = "working…".into();
         self.send_cmd(Cmd::Send {
+            cwd: self.cwd(),
             text,
             model: self.model.clone(),
             permission: self.permission.clone(),
         });
     }
+}
+
+/// A project's display name: the last path component.
+pub fn project_name(cwd: &str) -> String {
+    let t = cwd.trim_end_matches('/');
+    t.rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("/")
+        .to_string()
 }
 
 pub fn session_title(s: &SessionInfo) -> String {

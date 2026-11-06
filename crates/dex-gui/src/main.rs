@@ -35,21 +35,29 @@ fn sample(s: &mut State) {
         cwd: "~/Work/dex".into(),
         branch: Some("develop".into()),
     };
-    for (i, t) in [
-        "Fix flaky reconnect in the event stream",
-        "Sidebar shows stale session titles",
-        "Migrate config loader",
-        "Add keyboard shortcuts",
-    ]
-    .iter()
-    .enumerate()
-    {
+    let samples = [
+        (
+            "Fix flaky reconnect in the event stream",
+            "/home/aks/Work/dex",
+        ),
+        ("Sidebar shows stale session titles", "/home/aks/Work/dex"),
+        ("Migrate config loader", "/home/aks/Work/dex"),
+        ("Explain the tile cache eviction", "/home/aks/Work/lumen"),
+        (
+            "Retry uploads after a dropped connection",
+            "/home/aks/Work/lumen",
+        ),
+    ];
+    for (i, (t, cwd)) in samples.iter().enumerate() {
         if let Ok(si) = serde_json::from_value(serde_json::json!({
-            "session_id": format!("s{i}"), "path": "", "name": t, "cwd": "/", "updated_at": format!("2026-11-0{}", 9 - i), "auto_named": false
+            "session_id": format!("s{i}"), "path": "", "name": t, "cwd": cwd,
+            "updated_at": format!("2026-11-0{}", 9 - i), "auto_named": false, "message_count": 4
         })) {
             s.sessions.push(si);
         }
     }
+    s.sessions_loaded = true;
+    s.project = Some("/home/aks/Work/dex".into());
     s.current = Some("s0".into());
     s.tokens = 64_600;
     s.cost = 1.84;
@@ -74,9 +82,41 @@ fn sample(s: &mut State) {
     });
 }
 
+/// Stress scene: a large session history like a long-lived daemon's.
+fn many(s: &mut State) {
+    sample(s);
+    s.sessions.clear();
+    for i in 0..4700 {
+        let cwd = [
+            "/home/aks/Work/dex",
+            "/home/aks/Work/po",
+            "/home/aks/Work/exsa",
+        ][i % 3];
+        if let Ok(si) = serde_json::from_value(serde_json::json!({
+            "session_id": format!("m{i}"), "path": "", "name": format!("thread {i}"), "cwd": cwd,
+            "updated_at": format!("2026-11-{:02}", i % 28), "auto_named": false, "message_count": 3
+        })) {
+            s.sessions.push(si);
+        }
+    }
+}
+
+/// Debug scene: sessions from the JSON file named by DEX_GUI_SESSIONS (a saved `/api/sessions`).
+fn real(s: &mut State) {
+    sample(s);
+    s.sessions.clear();
+    if let Ok(path) = std::env::var("DEX_GUI_SESSIONS")
+        && let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        let rows = v.get("sessions").cloned().unwrap_or(v);
+        s.sessions = serde_json::from_value(rows).unwrap_or_default();
+    }
+}
+
 fn main() {
     rune::run(AppSpec::<State> {
-        scenes: &[("chat", sample)],
+        scenes: &[("chat", sample), ("many", many), ("real", real)],
         setup: Some(setup),
         poll: Some(poll),
         fonts: rune_theme_opencode::FONTS,

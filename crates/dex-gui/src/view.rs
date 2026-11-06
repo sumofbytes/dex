@@ -3,13 +3,14 @@
 use dex_client::protocol::ApprovalDecision;
 use rune::{Cx, El, ScrollSpec, col, row, spacer, text, text_input};
 use rune_kit::markdown::Markdown;
-use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
+use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SidebarSection};
 use rune_kit::{
     Button, ButtonVariant, Collapsible, IconButton, IconButtonVariant, Kit, Select, Spinner,
 };
 use rune_theme_opencode::icons;
 
-use crate::state::{Cmd, Item, State, session_title};
+use crate::state::{Cmd, Item, State, project_name, session_title};
+use dex_client::protocol::SessionInfo;
 
 const MODES: [&str; 3] = ["read-only", "ask", "trusted"];
 const COLUMN: f32 = 760.0;
@@ -32,34 +33,139 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     rune_kit::root(body, layer)
 }
 
+const PER_PROJECT: usize = 8;
+const PROJECTS: usize = 12;
+
 fn sidebar(s: &State, k: &Kit) -> El {
-    let new = Button::new("New session")
+    let new = Button::new("New thread")
         .variant(ButtonVariant::Ghost)
         .icon(&icons::EDIT)
         .on_press(|s: &mut State| {
             s.send_cmd(Cmd::NewSession);
         })
         .build(k)
-        .key("new-session");
+        .key("new-thread");
     let mut sb = Sidebar::new()
-        .label("Sessions")
+        .label("Projects")
         .header_padding(14.0, 10.0)
         .header(new);
-    // This project's sessions that have content; the daemon lists every directory's.
-    let here = s
+
+    // Projects: the active one first, then by most recent thread. The daemon lists every
+    // directory's threads; empty ones are skipped.
+    let current = s.cwd();
+    let mut projects: Vec<(String, Vec<&SessionInfo>)> = Vec::new();
+    for sess in s
         .sessions
         .iter()
-        .filter(|x| x.message_count > 0 && (s.info.cwd.is_empty() || x.cwd == s.info.cwd));
-    for (i, sess) in here.enumerate() {
-        let id = sess.session_id.clone();
-        let selected = s.current.as_deref() == Some(sess.session_id.as_str());
-        let mut r = SidebarRow::new(session_title(sess))
-            .selected(selected)
-            .on_select(move |s: &mut State, _| s.send_cmd(Cmd::Open(id.clone())));
-        if selected && s.busy {
-            r = r.status(RowStatus::Busy);
+        .filter(|x| x.message_count > 0 && !x.cwd.is_empty())
+    {
+        match projects.iter_mut().find(|(c, _)| *c == sess.cwd) {
+            Some((_, v)) => v.push(sess),
+            None => projects.push((sess.cwd.clone(), vec![sess])),
         }
-        sb = sb.child(r.build(k).key(format!("sess{i}")));
+    }
+    if !projects.iter().any(|(c, _)| *c == current) && !current.is_empty() {
+        projects.insert(0, (current.clone(), Vec::new()));
+    } else if let Some(i) = projects.iter().position(|(c, _)| *c == current) {
+        let p = projects.remove(i);
+        projects.insert(0, p);
+    }
+
+    let hidden = projects.len().saturating_sub(PROJECTS);
+    let take = if s.all_projects {
+        projects.len()
+    } else {
+        projects.len().min(PROJECTS)
+    };
+    for (pi, (cwd, threads)) in projects.iter().take(take).enumerate() {
+        let collapsed = s.collapsed.contains(cwd);
+        let all = s.show_all.contains(cwd);
+        let add = {
+            let cwd = cwd.clone();
+            IconButton::new(&icons::PLUS)
+                .variant(IconButtonVariant::Ghost)
+                .label("New thread in project")
+                .on_press(move |s: &mut State| {
+                    s.project = Some(cwd.clone());
+                    s.send_cmd(Cmd::NewSession);
+                })
+                .build(k)
+                .key("add")
+        };
+        let toggle_cwd = cwd.clone();
+        let mut sec = SidebarSection::new(project_name(cwd))
+            .key(format!("proj{pi}"))
+            .collapsed(collapsed)
+            .count(threads.len())
+            .action(add)
+            .on_toggle(move |s: &mut State, _| {
+                if !s.collapsed.remove(&toggle_cwd) {
+                    s.collapsed.insert(toggle_cwd.clone());
+                }
+            });
+        let shown = if all {
+            threads.len()
+        } else {
+            threads.len().min(PER_PROJECT)
+        };
+        for (ti, sess) in threads.iter().take(shown).enumerate() {
+            let id = sess.session_id.clone();
+            let open_cwd = sess.cwd.clone();
+            let selected = s.current.as_deref() == Some(sess.session_id.as_str());
+            let mut r = SidebarRow::new(session_title(sess))
+                .selected(selected)
+                .on_select(move |s: &mut State, _| {
+                    s.project = Some(open_cwd.clone());
+                    s.send_cmd(Cmd::Open(id.clone()));
+                });
+            if selected && s.busy {
+                r = r.status(RowStatus::Busy);
+            }
+            sec = sec.row(r.build(k).key(format!("t{pi}-{ti}")));
+        }
+        if threads.len() > PER_PROJECT {
+            let more_cwd = cwd.clone();
+            let label = if all {
+                "Show less".to_string()
+            } else {
+                format!("Show {} more", threads.len() - PER_PROJECT)
+            };
+            sec = sec.row(
+                Button::new(label)
+                    .variant(ButtonVariant::Ghost)
+                    .on_press(move |s: &mut State| {
+                        if !s.show_all.remove(&more_cwd) {
+                            s.show_all.insert(more_cwd.clone());
+                        }
+                    })
+                    .build(k)
+                    .key(format!("more{pi}")),
+            );
+        }
+        sb = sb.section(sec);
+    }
+    if hidden > 0 {
+        let label = if s.all_projects {
+            "Show fewer projects".to_string()
+        } else {
+            format!("Show {hidden} more projects")
+        };
+        sb = sb.child(
+            Button::new(label)
+                .variant(ButtonVariant::Ghost)
+                .on_press(|s: &mut State| s.all_projects = !s.all_projects)
+                .build(k)
+                .key("more-projects"),
+        );
+    }
+    if !s.sessions_loaded {
+        sb = sb.child(
+            text("Loading threads…")
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .px(12.0)
+                .key("loading"),
+        );
     }
     sb.build(k).key("sidebar-root")
 }
@@ -135,7 +241,7 @@ fn transcript(s: &State, k: &Kit) -> El {
                         .font(k.ty.body_medium)
                         .color(k.c.text_base),
                 )
-                .child(text(s.info.cwd.clone()).font(k.ty.ui).color(k.c.text_muted)),
+                .child(text(s.cwd()).font(k.ty.ui).color(k.c.text_muted)),
         );
     }
     for (i, it) in s.items.iter().enumerate() {
@@ -385,7 +491,7 @@ fn footer(s: &State, k: &Kit) -> El {
         .px(14.0)
         .items_center()
         .child(
-            text(format!("{}{branch}", s.info.cwd))
+            text(format!("{}{branch}", s.cwd()))
                 .font(k.ty.small)
                 .color(k.c.text_faint)
                 .truncate()

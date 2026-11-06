@@ -91,6 +91,7 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                         Err(e) => post(Msg::Status(format!("open failed: {e}"))),
                     },
                     Cmd::Send {
+                        cwd,
                         text,
                         model,
                         permission,
@@ -132,7 +133,16 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
 }
 
 async fn refresh(client: &DaemonClient, post: &impl Fn(Msg)) {
-    if let Ok(list) = client.list_sessions_async().await {
+    if let Ok(mut list) = client.list_sessions_async().await {
+        // Test runs and scratch work leave thousands of throwaway-directory sessions; they
+        // would each become a sidebar project.
+        let tmp = std::env::temp_dir();
+        list.retain(|x| {
+            x.message_count > 0
+                && !x.cwd.is_empty()
+                && !std::path::Path::new(&x.cwd).starts_with(&tmp)
+                && !x.cwd.starts_with("/tmp/")
+        });
         post(Msg::Sessions(list));
     }
 }
