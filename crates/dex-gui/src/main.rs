@@ -114,9 +114,26 @@ fn real(s: &mut State) {
     }
 }
 
+/// A transcript taller than the window, to check scrolling.
+fn long(s: &mut State) {
+    sample(s);
+    for i in 0..30 {
+        s.items.push(Item::User(format!("follow-up question {i}")));
+        s.items.push(Item::Assistant {
+            text: format!("Answer {i}: the quick brown fox jumps over the lazy dog, twice, to make the line wrap across the column."),
+            streaming: false,
+        });
+    }
+}
+
 fn main() {
     rune::run(AppSpec::<State> {
-        scenes: &[("chat", sample), ("many", many), ("real", real)],
+        scenes: &[
+            ("chat", sample),
+            ("many", many),
+            ("long", long),
+            ("real", real),
+        ],
         setup: Some(setup),
         poll: Some(poll),
         fonts: rune_theme_opencode::FONTS,

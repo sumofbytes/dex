@@ -247,13 +247,15 @@ fn transcript(s: &State, k: &Kit) -> El {
     for (i, it) in s.items.iter().enumerate() {
         list = list.child(item(i, it, k).key(format!("item{i}")));
     }
-    let centered = row().w_full().justify_center().child(list.grow(1.0));
-    centered
+    // The viewport must be a column: a row would stretch its child to the viewport's height,
+    // so the content would never overflow and nothing could scroll.
+    col()
         .key("transcript")
-        .scroll(ScrollSpec { stick_bottom: true })
+        .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .w_full()
+        .scroll(ScrollSpec { stick_bottom: true })
+        .child(row().w_full().justify_center().child(list.grow(1.0)))
 }
 
 fn item(i: usize, it: &Item, k: &Kit) -> El {
