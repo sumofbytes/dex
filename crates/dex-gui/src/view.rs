@@ -35,6 +35,7 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
     } else {
         row().w_full().h_full().fill(k.c.page).child(page.grow(1.0))
     };
+    crate::theme_picker::picker(s, k, &mut layer);
     rune_kit::root(body, layer)
 }
 
@@ -419,6 +420,14 @@ fn header(s: &State, k: &Kit) -> El {
         .child(toggle)
         .child(title.grow(1.0).min_w(0.0))
         .child(stats)
+        .child(
+            IconButton::new(&icons::SETTINGS_GEAR)
+                .variant(IconButtonVariant::Ghost)
+                .label("Theme (Ctrl+,)")
+                .on_press(|s: &mut State| s.theme_open = true)
+                .build(k)
+                .key("open-theme"),
+        )
         .child(
             IconButton::new(&icons::CONSOLE)
                 .variant(IconButtonVariant::Ghost)

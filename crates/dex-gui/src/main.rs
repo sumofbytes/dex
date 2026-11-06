@@ -5,6 +5,7 @@
 mod home;
 mod state;
 mod theme;
+mod theme_picker;
 mod view;
 mod viewer;
 mod worker;
@@ -18,6 +19,7 @@ fn setup(s: &mut State, wake: Waker) {
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
     s.cmds = Some(tx);
     s.load_hidden();
+    s.load_theme();
     s.wake = Some(wake.clone());
     worker::spawn(s.inbox.clone(), wake, rx);
 }
@@ -39,6 +41,8 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
     {
         s.page = state::Page::Thread;
         s.show_viewer(state::VTab::Terminal);
+    } else if e.is_command(',') {
+        s.theme_open = true;
     } else if e.is_command('o') {
         s.toggle_tools();
     } else if e.is_command('t') {
@@ -208,6 +212,20 @@ fn wt_scene(s: &mut State) {
     s.project = std::env::var("DEX_GUI_WT").ok();
 }
 
+/// Applies without saving, so renders never change the user's own scheme.
+fn apply_theme_only(name: &str) {
+    theme::set(name);
+}
+
+/// Theme picker open; `DEX_GUI_THEME` picks the scheme behind it.
+fn themepick_scene(s: &mut State) {
+    sample(s);
+    if let Ok(name) = std::env::var("DEX_GUI_THEME") {
+        apply_theme_only(&name);
+    }
+    s.theme_open = true;
+}
+
 fn changes_scene(s: &mut State) {
     viewer_scene(s, state::VTab::Changes);
 }
@@ -286,6 +304,7 @@ fn main() {
             ("changes", changes_scene),
             ("term", term_scene),
             ("wt", wt_scene),
+            ("themepick", themepick_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),

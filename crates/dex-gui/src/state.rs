@@ -159,6 +159,8 @@ pub struct State {
     /// Threads and projects removed from the sidebar. Only hidden: the sessions stay on disk.
     pub hidden_threads: HashSet<String>,
     pub hidden_projects: HashSet<String>,
+    pub theme_open: bool,
+    pub theme_query: TextEdit,
     pub use_worktree: bool,
     pub confirm_discard: bool,
     pub viewer: bool,
@@ -204,6 +206,8 @@ impl Default for State {
             all_projects: false,
             hidden_threads: HashSet::new(),
             hidden_projects: HashSet::new(),
+            theme_open: false,
+            theme_query: TextEdit::default(),
             use_worktree: false,
             confirm_discard: false,
             viewer: false,
@@ -254,6 +258,24 @@ impl State {
     pub fn hide_project(&mut self, root: &str) {
         self.hidden_projects.insert(root.to_string());
         self.save_hidden();
+    }
+
+    /// Switch colour scheme and remember it in the data directory.
+    pub fn set_theme(&mut self, name: &str) {
+        if crate::theme::set(name)
+            && let Some(dir) = crate::worktree::data_dir().to_str()
+        {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(std::path::Path::new(dir).join("gui-theme"), name);
+        }
+    }
+
+    /// Apply the scheme saved last time, if any.
+    pub fn load_theme(&self) {
+        let path = crate::worktree::data_dir().join("gui-theme");
+        if let Ok(name) = std::fs::read_to_string(path) {
+            crate::theme::set(name.trim());
+        }
     }
 
     /// Read the hidden set from the data directory, if it was saved before.
