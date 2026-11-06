@@ -67,8 +67,19 @@ The app derives the rest of the palette from three seeds (background, text, acce
 
 **Theme picker.** A dialog with a title, a close button, a search box and a list of schemes. The selected scheme has the selected background.
 
-## Known gaps to fix when replicating
+## Sidebar
 
-- Home: the sidebar should highlight "Home" in the nav, not a thread. The Paper artboard doesn't show that yet.
-- Thread: the selected thread title truncates with an ellipsis. The Paper artboard uses a shorter title to avoid wrapping.
-- Thread: the Paper artboard shows no viewer pane; that is the separate Viewer artboards.
+- Width 280px, padding 0 12px, surface #2c2626. The brand row is 48px tall, the same as the header, so their text lines up.
+- Brand: "dex", Inter 15px, weight 600.
+- Nav rows (Home, New thread, Search): 32px tall, icon 16px in muted, label Inter 13px weight 500, selected row bg #433b3b. Shortcut hints in IBM Plex Mono 11px, faint (for example "Ctrl N").
+- Section label "PROJECTS": Inter 11px, weight 600, uppercase, letter-spacing 0.06em, placeholder colour, 28px tall, 20px space above.
+- Project header: 32px tall, 6px colour dot, name Inter 11px weight 600 uppercase, muted, chevron right.
+- Thread rows: 32px tall, left padding 24px so the title lines up with the project name, Inter 13px. Selected: weight 500, text colour, bg #433b3b, radius 8px. Unselected: weight 400, text-3.
+- Age: IBM Plex Mono 11px, faint, right-aligned in a 24px column. Titles truncate with an ellipsis.
+- "Show N more": Inter 12px, faint, 28px tall, same left padding as thread rows.
+- Gap of 12px between project groups.
+- Home nav row is selected on the Home page; a thread row is selected on the Thread page.
+
+## Known gaps
+
+- The sidebar in the Viewer and Theme artboards is not drawn; they are shown without it.
