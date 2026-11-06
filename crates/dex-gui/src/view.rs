@@ -484,8 +484,8 @@ fn human(n: u64) -> String {
 }
 
 fn transcript(s: &State, k: &Kit) -> El {
-    // Items breathe: 22 points between them, and a turn's user message starts a new group.
-    let mut list = col().w_full().max_w(COLUMN).gap(22.0).py(24.0).px(20.0);
+    // Text leads: items sit 14 points apart, and a turn's user message gets a little more room.
+    let mut list = col().w_full().max_w(COLUMN).gap(14.0).py(16.0).px(16.0);
     if s.items.is_empty() {
         list = list.child(
             col()
@@ -501,13 +501,24 @@ fn transcript(s: &State, k: &Kit) -> El {
                 .child(text(s.cwd()).font(k.ty.ui).color(k.c.text_muted)),
         );
     }
-    for (i, it) in s.items.iter().enumerate() {
+    let mut i = 0;
+    while i < s.items.len() {
+        if matches!(s.items[i], Item::Tool(_)) {
+            // A run of tool calls folds into one summary line; the rows show when it is opened.
+            let start = i;
+            while i < s.items.len() && matches!(s.items[i], Item::Tool(_)) {
+                i += 1;
+            }
+            list = list.child(tool_group(s, k, start, i));
+            continue;
+        }
         let live = s.busy && i + 1 == s.items.len();
-        let mut el = item(i, it, k, live).key(format!("item{i}"));
-        if i > 0 && matches!(it, Item::User(_)) {
-            el = col().w_full().gap(0.0).child(el.pt(10.0));
+        let mut el = item(i, &s.items[i], k, live).key(format!("item{i}"));
+        if i > 0 && matches!(s.items[i], Item::User(_)) {
+            el = col().w_full().gap(0.0).child(el.pt(8.0));
         }
         list = list.child(el);
+        i += 1;
     }
     // The viewport must be a column: a row would stretch its child to the viewport's height,
     // so the content would never overflow and nothing could scroll.
@@ -518,6 +529,44 @@ fn transcript(s: &State, k: &Kit) -> El {
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: true })
         .child(row().w_full().justify_center().child(list.grow(1.0)))
+}
+
+/// A run of tool calls (`start..end`): a quiet summary line that opens to the rows.
+fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
+    let n = end - start;
+    let open = s.open_tools.contains(&start);
+    let chevron = if open {
+        &crate::icons::DOWN
+    } else {
+        &crate::icons::RIGHT
+    };
+    let label = format!("Ran {n} command{}", if n == 1 { "" } else { "s" });
+    let head = row()
+        .key(format!("tools{start}"))
+        .h(22.0)
+        .gap(6.0)
+        .items_center()
+        .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
+        .child(text(label).font(k.ty.small).color(k.c.text_faint));
+    let mut group =
+        col()
+            .w_full()
+            .gap(4.0)
+            .child(k.interactive(head).on_press(move |s: &mut State| {
+                if !s.open_tools.remove(&start) {
+                    s.open_tools.insert(start);
+                }
+            }));
+    if open {
+        for i in start..end {
+            group = group.child(
+                item(i, &s.items[i], k, false)
+                    .key(format!("item{i}"))
+                    .pl(14.0),
+            );
+        }
+    }
+    group
 }
 
 fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {

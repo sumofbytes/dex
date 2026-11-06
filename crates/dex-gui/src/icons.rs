@@ -80,3 +80,9 @@ pub static DOWN: Icon = Icon {
     view: 24.0,
     body: r#"<path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
+
+pub static RIGHT: Icon = Icon {
+    name: "right",
+    view: 24.0,
+    body: r#"<path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};

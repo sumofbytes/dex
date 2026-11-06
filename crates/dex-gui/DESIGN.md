@@ -98,6 +98,14 @@ Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode a
 - Left: the project path in IBM Plex Mono 12px, a "·" separator, the branch icon and the branch name in mono 12px. Faint colour.
 - Right: a 6px status dot (green when ready, amber when busy) and "provider · status" in Inter 12px, faint.
 
+## Transcript (text first, v5)
+
+Designed in Penpot as **dex / Transcript v5 · text first** (760×640), replicated in `src/view.rs`:
+
+- A run of tool calls in a turn folds into one summary line, "Ran N commands", with a chevron. Opening it shows the compact tool rows (`bash: command`, output dimmed under `↳`). Ctrl+O opens or closes all groups.
+- Items sit 14 points apart; a user message gets 8 points more above it.
+- Known gap: assistant text uses the Markdown component's own size, not the 16px in Penpot, and it has no orange dot on the first line.
+
 ## Terminal and transcript
 
 The terminal was designed in Penpot as **dex / Terminal v3** (460×760) and replicated in `src/viewer.rs`. The Penpot file is "Helpful canyon" in Arpit's Team's Penpot instance (local, self-hosted). Its board id is `11917636-b751-8001-8008-e7b0ec2a1141`.

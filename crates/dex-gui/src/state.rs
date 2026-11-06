@@ -174,6 +174,8 @@ pub struct State {
     /// Project (working directory) new threads start in; follows the opened thread.
     pub project: Option<String>,
     pub collapsed: HashSet<String>,
+    /// Tool-call groups opened in the transcript, by the index of their first item.
+    pub open_tools: HashSet<usize>,
     pub show_all: HashSet<String>,
     pub all_projects: bool,
     /// Right-hand viewer pane (files, changes).
@@ -225,6 +227,7 @@ impl Default for State {
             searching: false,
             project: None,
             collapsed: HashSet::new(),
+            open_tools: HashSet::new(),
             show_all: HashSet::new(),
             all_projects: false,
             hidden_threads: HashSet::new(),
@@ -360,6 +363,7 @@ impl State {
 
     fn reset_transcript(&mut self) {
         self.items.clear();
+        self.open_tools.clear();
         self.tokens = 0;
         self.cost = 0.0;
         self.busy = false;
@@ -711,6 +715,11 @@ impl State {
                 t.open = open;
             }
         }
+        // Open or close every tool-call group along with the rows.
+        self.open_tools.clear();
+        if open {
+            self.open_tools.extend(tool_group_starts(&self.items));
+        }
     }
 
     pub fn toggle_thinking(&mut self) {
@@ -787,6 +796,15 @@ impl State {
 
 fn hidden_file() -> Option<std::path::PathBuf> {
     Some(crate::worktree::data_dir().join("gui-hidden.json"))
+}
+
+/// The index of the first item of each run of consecutive tool calls.
+pub fn tool_group_starts(items: &[Item]) -> Vec<usize> {
+    (0..items.len())
+        .filter(|&i| {
+            matches!(items[i], Item::Tool(_)) && (i == 0 || !matches!(items[i - 1], Item::Tool(_)))
+        })
+        .collect()
 }
 
 /// A project's display name: the last path component.
@@ -874,6 +892,30 @@ pub fn scan(cwd: String) -> Msg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_calls_group_into_runs() {
+        let tool = || {
+            Item::Tool(ToolRun {
+                id: String::new(),
+                name: "bash".into(),
+                args: String::new(),
+                done: None,
+                open: false,
+            })
+        };
+        let items = vec![
+            Item::User("a".into()),
+            tool(),
+            tool(),
+            Item::Assistant {
+                text: "b".into(),
+                streaming: false,
+            },
+            tool(),
+        ];
+        assert_eq!(tool_group_starts(&items), vec![1, 4]);
+    }
 
     #[test]
     fn hidden_threads_and_projects_are_not_visible() {
