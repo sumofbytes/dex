@@ -7,11 +7,13 @@ The GUI replicates these artboards. Change the design in Paper first, then updat
 
 | Artboard | Size | Paper node | Notes |
 | --- | --- | --- | --- |
-| dex / Thread | 1100×760 | 1-0 | sidebar, header, transcript, composer, footer |
-| dex / Home | 1100×760 | 1X-0 | greeting, stat cards, Today, Start |
-| dex / Viewer · Files | 460×760 | 5Y-0 | tabs, path, code preview |
-| dex / Viewer · Changes | 460×760 | 52-0 | tabs, file header, diff hunks |
-| dex / Theme picker | 420×fit | 7J-0 | dialog with search and scheme list |
+| dex / Home v2 | 1100×760 | DH-0 | large greeting, Recent list, This week numbers, actions |
+| dex / Thread v2 | 1100×760 | G5-0 | header, transcript hierarchy, composer, footer |
+| dex / Viewer v2 · Files | 460×760 | JE-0 | segmented tabs, breadcrumb, numbered code |
+| dex / Viewer v2 · Changes | 460×760 | LX-0 | file list with status, diff with two gutters |
+| dex / Theme picker v2 | 440×400 | OC-0 | dialog with swatches and check mark |
+
+The v1 artboards (1-0, 1X-0, 5Y-0, 52-0, 7J-0) are kept, renamed "(v1)", for comparison.
 
 ## Colour tokens (dark, dex default)
 
@@ -36,7 +38,7 @@ The GUI replicates these artboards. Change the design in Paper first, then updat
 | diff add bg | #2b3a2e | added lines |
 | diff del bg | #3d2a2a | removed lines |
 
-The app derives the rest of the palette from three seeds (background, text, accent) with `rune-kit`. The Paper file uses the same seeds, so the values above are the seeds' outputs and should match.
+Paper variables are not set through the MCP (a CSS variable on a parent does not reach its children), so the values are literal hex in the artboards. Set these as Paper variables in the Paper UI if you want them linked. The app derives the rest of the palette from three seeds (background, text, accent) with `rune-kit`. The Paper file uses the same seeds, so the values above are the seeds' outputs and should match.
 
 ## Type
 
@@ -83,3 +85,15 @@ The app derives the rest of the palette from three seeds (background, text, acce
 ## Known gaps
 
 - The sidebar in the Viewer and Theme artboards is not drawn; they are shown without it.
+
+## Icons
+
+Stroke icons on a 24px grid, stroke 1.6, round caps and joins, drawn as inline SVG in Paper. Sizes: 12px (chevrons, meta), 14px (tool and tab icons), 16px (nav and header). Set: home, plus, search, chevrons, x, folder, terminal, file, branch, compare, sliders, up (send), check, theme, panel, clock. Source paths are in `ui.py` in the design scratchpad.
+
+## Hierarchy rules (v2)
+
+- One strong focal point per screen: the greeting on Home, the title in the thread header, the code on the viewer.
+- Use scale contrast: 56px display against 11px caps labels. Use light weight (300) for display and medium (500) for labels.
+- Separate with hairlines (#433b3b), not card backgrounds. Cards are only for code blocks and dialogs.
+- Tool output sits under a 2px left rule. Code gets a label and a surface. Bubbles are used only for the user's message.
+- The primary action is the accent button. Everything else is outline or ghost.
