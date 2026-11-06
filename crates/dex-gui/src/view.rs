@@ -462,7 +462,11 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
             }
             c
         }
-        Item::Notice(t) => text(t.clone()).font(typo::meta(k)).color(k.c.text_faint),
+        Item::Notice(t) => text(t.clone())
+            .font(typo::meta(k))
+            .color(k.c.text_faint)
+            .w_full()
+            .wrap(),
         Item::Error(t) => col()
             .w_full()
             .px(space::XL)
