@@ -4,7 +4,7 @@
 use dex_client::protocol::SessionInfo;
 use rune::{El, row, spacer, text, text_input};
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons as kit_icons;
 
 use crate::icons;
@@ -22,6 +22,8 @@ pub mod tok {
     pub const GAP: f32 = super::space::SM;
     /// Fixed, right-aligned column for a thread's time, just left of the slot.
     pub const TIME_W: f32 = 24.0;
+    /// The slot before a project's name: holds the dot, or a spinner while it runs.
+    pub const LEAD: f32 = 8.0;
     /// Project dot diameter.
     pub const DOT: f32 = 6.0;
     /// Threads sit under their project's chevron + dot.
@@ -113,18 +115,23 @@ struct ProjectHeader {
     key: String,
     name: String,
     color: rune::Color,
-    collapsed: bool,
+    /// A thread in this project is running: its dot becomes a spinner.
+    running: bool,
     cwd: String,
 }
 
-/// `[chevron] [dot] NAME ........ [×] [+]`: the whole row toggles; × shows on hover only.
+/// `[dot|spinner] NAME ........ [×] [+]`: no chevron, the whole row toggles; × shows on hover.
 fn project_header(k: &Kit, p: ProjectHeader) -> El {
     let (toggle, add, hide) = (p.cwd.clone(), p.cwd.clone(), p.cwd.clone());
-    let chevron = if p.collapsed {
-        &icons::RIGHT
-    } else {
-        &icons::DOWN
-    };
+    // One fixed slot, so the name never shifts between the dot and the spinner.
+    let lead = row()
+        .size(tok::LEAD, tok::LEAD)
+        .center()
+        .child(if p.running {
+            Spinner::new().size(tok::LEAD).build(k)
+        } else {
+            dot(p.color, tok::DOT)
+        });
     k.interactive(
         row()
             .key(p.key.clone())
@@ -135,15 +142,21 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
             .gap(tok::GAP)
             .items_center()
             .radius(k.radius.md)
-            .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
-            .child(dot(p.color, tok::DOT))
             .child(
-                text(p.name.to_uppercase())
-                    .font(typo::caps(k))
-                    .color(k.c.text_faint)
-                    .truncate()
+                row()
+                    .gap(space::XS)
+                    .items_center()
                     .grow(1.0)
-                    .min_w(0.0),
+                    .min_w(0.0)
+                    .child(lead)
+                    .child(
+                        text(p.name.to_uppercase())
+                            .font(typo::caps(k))
+                            .color(k.c.text_faint)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    ),
             )
             .child(
                 IconButton::new(&kit_icons::CLOSE)
@@ -301,7 +314,10 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
                 key: format!("proj{pi}"),
                 color: crate::theme::project_color(&name),
                 name,
-                collapsed,
+                running: s.busy
+                    && threads
+                        .iter()
+                        .any(|t| s.current.as_deref() == Some(t.session_id.as_str())),
                 cwd: cwd.clone(),
             },
         ));

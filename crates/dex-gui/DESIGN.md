@@ -76,7 +76,7 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Brand: "dex", Inter 14px, weight 600.
 - Nav rows (Home, New thread, Search): 32px tall, icon 16px in muted, label Inter 14px weight 500, selected row bg #433b3b. Shortcut hints in IBM Plex Mono 12px, faint (for example "Ctrl N").
 - Section label "PROJECTS": Inter 12px, weight 600, uppercase, letter-spacing 0.06em, placeholder colour, 28px tall, 20px space above.
-- Project header: 32px tall, `[chevron] [dot] NAME … [×] [+]`. The whole row toggles collapse; the chevron (left) points right when collapsed, down when open. The + (new thread) is always visible on the right; the × (hide) shows on hover only. 6px colour dot, name Inter 12px weight 600 uppercase, muted.
+- Project header: 32px tall, `[dot|spinner] NAME … [×] [+]`. No chevron: the whole row toggles collapse. The 8px lead slot holds the 6px colour dot, or a spinner while a thread in the project is running; names align with thread titles. The + (new thread) is always visible on the right; the × (hide) shows on hover only. Name Inter 10px weight 600 uppercase, muted.
 - Thread rows: 32px tall, left padding 24px so the title lines up with the project name, Inter 14px. Selected: weight 500, text colour, bg #433b3b, radius 8px. Unselected: weight 400, text-3.
 - Age: faint, right-aligned in a fixed 24px column left of the shared 20px right slot (thread status / hover ×, project +), so + and the slot line up. Titles truncate with an ellipsis.
 - Code: layout tokens (row height, inset, gap, dot, indent, time column) live in `src/sidebar.rs::tok`.
