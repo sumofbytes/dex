@@ -84,10 +84,10 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 
 ## Composer options (proposed, not yet replicated)
 
-Artboard **dex / Composer options** (Paper node 16W-0). Replaces the flat mode and model selects.
+Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode and model selects.
 
 - Mode menu: a titled list (MODE) of Read-only, Ask and Trusted, each with a one-line description. The current mode has a fill and a check mark. Menu width 240px.
-- Model menu: 280px. A search field, then models grouped by provider (OPENCODE), current model with a check, and a "12 more · type to filter" row when the list is long.
+- Model menu: 280px. A search field, then models grouped by provider (OPENCODE). Each row shows the model name in mono, the provider in faint text, and a check on the current model. A "12 more · type to filter" row appears when the list is long.
 - Chips in the composer: mode with a sliders icon, model with the provider in faint text. Both open their menus upward from the composer.
 - Menus share a surface (#2c2626), 1px border (#4a4141), radius 12, 6px padding; rows radius 8.
 
