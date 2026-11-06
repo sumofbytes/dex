@@ -695,8 +695,10 @@ mod tests {
 
     #[test]
     fn terminal_runs_a_command_and_streams_output() {
-        let mut s = State::default();
-        s.project = Some(std::env::temp_dir().display().to_string());
+        let mut s = State {
+            project: Some(std::env::temp_dir().display().to_string()),
+            ..State::default()
+        };
         s.term_input.replace_text("echo hi; echo err >&2");
         s.run_term();
         assert!(s.term_running);
