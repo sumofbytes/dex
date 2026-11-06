@@ -148,5 +148,5 @@ Stroke icons on a 24px grid, stroke 1.6, round caps and joins, drawn as inline S
 
 ## Thought
 
-- Live: spinner + "Thinking" (12px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 12px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (14px / 22px, faint). Click the row or Ctrl+T.
+- Live: spinner + "Thinking" (12px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 12px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (12px / 18px, faint, indented 14 like tool rows). Click the row or Ctrl+T.
 - Transcript rhythm: 16 between blocks, 32 around a user message, 20 from tools to the reply, 8 from a thought row to its text, tool and thought rows 20 tall.

@@ -10,7 +10,7 @@ pub mod typo {
     use rune::TextStyle;
     use rune_kit::Kit;
 
-    /// Assistant reply, user message and thought text: 14 / 22.
+    /// Assistant reply and user message: 14 / 22.
     pub fn reply(k: &Kit) -> TextStyle {
         k.ty.body
     }
@@ -22,10 +22,6 @@ pub mod typo {
             line_height: 24.0,
             ..reply(k)
         }
-    }
-    /// A model thought's text: the reply's size; its faint colour sets it apart.
-    pub fn thought(k: &Kit) -> TextStyle {
-        reply(k)
     }
     /// Quiet transcript rows (tool group, thought, notices, queued labels): 12 / 18.
     pub fn meta(k: &Kit) -> TextStyle {

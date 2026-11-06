@@ -10,6 +10,8 @@ use crate::state::{Cmd, Item, Page, State, VTab};
 use crate::style::{space, typo};
 
 const COLUMN: f32 = 760.0;
+/// Left indent of what opens under a quiet row: tool calls and a thought's text share it.
+const NESTED: f32 = 14.0;
 
 pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
     let k = crate::theme::kit();
@@ -252,7 +254,7 @@ fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
             group = group.child(
                 item(i, &s.items[i], k, false)
                     .key(format!("item{i}"))
-                    .pl(14.0),
+                    .pl(NESTED),
             );
         }
     }
@@ -280,14 +282,11 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: 
         .h(20.0)
         .gap(space::SM)
         .items_center();
-    let mut group = col().w_full().gap(space::MD);
+    let mut group = col().w_full().gap(space::XS);
     if live {
         group = group.child(
-            head.child(Spinner::new().size(12.0).build(k)).child(
-                text("Thinking")
-                    .font(k.ty.body_medium)
-                    .color(k.c.text_muted),
-            ),
+            head.child(Spinner::new().size(12.0).build(k))
+                .child(text("Thinking").font(k.ty.ui_medium).color(k.c.text_muted)),
         );
     } else {
         let chevron = if open {
@@ -314,9 +313,10 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: 
     if open || live {
         group = group.child(
             text(text_.to_string())
-                .font(typo::thought(k))
+                .font(typo::meta(k))
                 .color(k.c.text_faint)
-                .wrap(),
+                .wrap()
+                .pl(NESTED),
         );
     }
     group
