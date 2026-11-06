@@ -406,6 +406,14 @@ fn header(s: &State, k: &Kit) -> El {
         .child(title.grow(1.0).min_w(0.0))
         .child(stats)
         .child(
+            IconButton::new(&icons::CONSOLE)
+                .variant(IconButtonVariant::Ghost)
+                .label("Terminal (Ctrl+`)")
+                .on_press(|s: &mut State| s.show_viewer(VTab::Terminal))
+                .build(k)
+                .key("open-term"),
+        )
+        .child(
             IconButton::new(&icons::FOLDER)
                 .variant(IconButtonVariant::Ghost)
                 .label("Files (Ctrl+E)")

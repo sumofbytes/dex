@@ -33,7 +33,10 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
         s.show_viewer(state::VTab::Files);
     } else if e.is_command('g') {
         s.show_viewer(state::VTab::Changes);
-    } else if e.is_command('`') {
+    } else if e.is_command('j')
+        || matches!(&e.key, rune::Key::Text(t) if t == "`" && (e.mods.cmd || e.mods.ctrl))
+    {
+        s.page = state::Page::Thread;
         s.show_viewer(state::VTab::Terminal);
     } else if e.is_command('o') {
         s.toggle_tools();
