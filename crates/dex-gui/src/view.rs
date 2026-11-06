@@ -191,24 +191,23 @@ fn transcript(s: &State, k: &Kit) -> El {
     }
     let mut i = 0;
     while i < s.items.len() {
-        if matches!(s.items[i], Item::Tool(_)) {
-            // A run of tool calls folds into one summary line; the rows show when it is opened.
+        if crate::state::is_work(&s.items[i]) {
+            // A run of thoughts and tool calls folds into one "Worked" block.
             let start = i;
-            while i < s.items.len() && matches!(s.items[i], Item::Tool(_)) {
+            while i < s.items.len() && crate::state::is_work(&s.items[i]) {
                 i += 1;
             }
-            list = list.child(tool_group(s, k, start, i));
+            list = list.child(work_block(s, k, start, i));
             continue;
         }
-        let live = s.busy && i + 1 == s.items.len();
-        let mut el = item(i, &s.items[i], k, live).key(format!("item{i}"));
+        let mut el = item(i, &s.items[i], k).key(format!("item{i}"));
         // Rhythm: 16 between blocks; +16 around a user message (32), +4 from tools to the reply (20).
         if i > 0 && (matches!(s.items[i], Item::User(_)) || matches!(s.items[i - 1], Item::User(_)))
         {
             el = col().w_full().gap(0.0).child(el.pt(space::XXL));
         } else if i > 0
             && matches!(s.items[i], Item::Assistant { .. })
-            && matches!(s.items[i - 1], Item::Tool(_))
+            && crate::state::is_work(&s.items[i - 1])
         {
             el = col().w_full().gap(0.0).child(el.pt(space::XS));
         }
@@ -233,37 +232,74 @@ fn transcript(s: &State, k: &Kit) -> El {
 }
 
 /// A run of tool calls (`start..end`): a quiet summary line that opens to the rows.
-fn tool_group(s: &State, k: &Kit, start: usize, end: usize) -> El {
-    let n = end - start;
-    let open = s.open_tools.contains(&start);
-    let chevron = if open {
-        &crate::icons::DOWN
-    } else {
-        &crate::icons::RIGHT
-    };
-    let label = format!("Ran {n} command{}", if n == 1 { "" } else { "s" });
+/// A run of thoughts and tool calls (`start..end`) as one block. Done: a quiet row, `› Worked
+/// for 14s  2 thoughts · 5 commands`, collapsed; opened it nests the rows in order, each thought
+/// still folding on its own. Live (the run is still being worked): a spinner and "Working", open.
+fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
+    let live = s.busy && end == s.items.len();
+    let open = live || s.open_work.contains(&start);
+    let (thoughts, commands, secs) = crate::state::work_summary(&s.items[start..end]);
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let detail = [
+        (thoughts > 0).then(|| plural(thoughts, "thought", "thoughts")),
+        (commands > 0).then(|| plural(commands, "command", "commands")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
     let head = row()
-        .key(format!("tools{start}"))
+        .key(format!("work{start}"))
         .h(20.0)
         .gap(space::SM)
-        .items_center()
-        .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
-        .child(text(label).font(typo::meta(k)).color(k.c.text_faint));
-    let mut group = col()
-        .w_full()
-        .gap(space::XS)
-        .child(k.interactive(head).on_press(move |s: &mut State| {
-            if !s.open_tools.remove(&start) {
-                s.open_tools.insert(start);
+        .items_center();
+    let head = if live {
+        // The first thought's start gives a running time; without one the label stands alone.
+        let label = match s.items[start..end].iter().find_map(|i| match i {
+            Item::Thinking {
+                started: Some(t), ..
+            } => Some(t.elapsed().as_secs()),
+            _ => None,
+        }) {
+            Some(n) if n >= 1 => format!("Working · {n}s"),
+            _ => "Working".to_string(),
+        };
+        head.child(Spinner::new().size(12.0).build(k))
+            .child(text(label).font(k.ty.ui_medium).color(k.c.text_muted))
+    } else {
+        let chevron = if open {
+            &crate::icons::DOWN
+        } else {
+            &crate::icons::RIGHT
+        };
+        let label = if secs.round() >= 1.0 {
+            format!("Worked for {}s", secs.round() as u64)
+        } else {
+            "Worked".to_string()
+        };
+        head.child(rune::icon(chevron, 12.0).color(k.c.text_faint))
+            .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
+            .child(
+                text(detail)
+                    .font(typo::meta(k))
+                    .color(k.c.text_faint.alpha(0.75)),
+            )
+    };
+    let head = if live {
+        head
+    } else {
+        k.interactive(head).on_press(move |s: &mut State| {
+            if !s.open_work.remove(&start) {
+                s.open_work.insert(start);
             }
-        }));
+        })
+    };
+    let mut group = col().w_full().gap(space::XS).child(head);
     if open {
         for i in start..end {
-            group = group.child(
-                item(i, &s.items[i], k, false)
-                    .key(format!("item{i}"))
-                    .pl(NESTED),
-            );
+            // Thoughts inside a block are plain rows: the block's header carries the spinner.
+            group = group.child(item(i, &s.items[i], k).key(format!("item{i}")).pl(NESTED));
         }
     }
     group
@@ -281,44 +317,34 @@ fn reply_style(k: &Kit) -> MarkdownStyle {
         .list(22.0, 6.0)
 }
 
-/// A model thought. Live: spinner + "Thinking", open while it streams. Done: the same quiet row
-/// as a tool group (`› Thought · 4s`), collapsed; opening it only turns the chevron and shows
-/// the text below.
-fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: bool) -> El {
+/// A model thought inside a work block: `› Thought · 4s`, the same quiet row as everything
+/// else; opening turns the chevron and shows the text below, indented like tool rows.
+fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>) -> El {
+    let chevron = if open {
+        &crate::icons::DOWN
+    } else {
+        &crate::icons::RIGHT
+    };
+    let label = match secs {
+        Some(n) if n >= 1 => format!("Thought · {n}s"),
+        _ => "Thought".to_string(),
+    };
     let head = row()
         .key(format!("thought{i}"))
         .h(20.0)
         .gap(space::SM)
-        .items_center();
-    let mut group = col().w_full().gap(space::XS);
-    if live {
-        group = group.child(
-            head.child(Spinner::new().size(12.0).build(k))
-                .child(text("Thinking").font(k.ty.ui_medium).color(k.c.text_muted)),
-        );
-    } else {
-        let chevron = if open {
-            &crate::icons::DOWN
-        } else {
-            &crate::icons::RIGHT
-        };
-        let label = match secs {
-            Some(n) if n >= 1 => format!("Thought · {n}s"),
-            _ => "Thought".to_string(),
-        };
-        group = group.child(
-            k.interactive(
-                head.child(rune::icon(chevron, 12.0).color(k.c.text_faint))
-                    .child(text(label).font(typo::meta(k)).color(k.c.text_faint)),
-            )
-            .on_press(move |s: &mut State| {
-                if let Some(Item::Thinking { open, .. }) = s.items.get_mut(i) {
-                    *open = !*open;
-                }
-            }),
-        );
-    }
-    if open || live {
+        .items_center()
+        .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
+        .child(text(label).font(typo::meta(k)).color(k.c.text_faint));
+    let mut group = col()
+        .w_full()
+        .gap(space::XS)
+        .child(k.interactive(head).on_press(move |s: &mut State| {
+            if let Some(Item::Thinking { open, .. }) = s.items.get_mut(i) {
+                *open = !*open;
+            }
+        }));
+    if open {
         group = group.child(
             text(text_.to_string())
                 .font(typo::meta(k))
@@ -330,7 +356,7 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>, live: 
     group
 }
 
-fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
+fn item(i: usize, it: &Item, k: &Kit) -> El {
     match it {
         Item::User(t) => row().w_full().justify_end().child(
             col()
@@ -356,7 +382,7 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
             open,
             secs,
             ..
-        } => thought(i, k, t, *open, *secs, live),
+        } => thought(i, k, t, *open, *secs),
         Item::Tool(t) => {
             // A compact row, as in the transcript design: the tool's name, its arguments and the
             // duration. Its output follows dimmed under a `↳`: the first line when closed, all of it

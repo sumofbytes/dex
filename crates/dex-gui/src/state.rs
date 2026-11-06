@@ -178,7 +178,7 @@ pub struct State {
     pub project: Option<String>,
     pub collapsed: HashSet<String>,
     /// Tool-call groups opened in the transcript, by the index of their first item.
-    pub open_tools: HashSet<usize>,
+    pub open_work: HashSet<usize>,
     pub show_all: HashSet<String>,
     pub all_projects: bool,
     /// Right-hand viewer pane (files, changes).
@@ -230,7 +230,7 @@ impl Default for State {
             searching: false,
             project: None,
             collapsed: HashSet::new(),
-            open_tools: HashSet::new(),
+            open_work: HashSet::new(),
             show_all: HashSet::new(),
             all_projects: false,
             hidden_threads: HashSet::new(),
@@ -366,7 +366,7 @@ impl State {
 
     fn reset_transcript(&mut self) {
         self.items.clear();
-        self.open_tools.clear();
+        self.open_work.clear();
         self.tokens = 0;
         self.cost = 0.0;
         self.busy = false;
@@ -735,10 +735,10 @@ impl State {
                 t.open = open;
             }
         }
-        // Open or close every tool-call group along with the rows.
-        self.open_tools.clear();
+        // Open or close every work block along with the rows.
+        self.open_work.clear();
         if open {
-            self.open_tools.extend(tool_group_starts(&self.items));
+            self.open_work.extend(work_run_starts(&self.items));
         }
     }
 
@@ -819,12 +819,35 @@ fn hidden_file() -> Option<std::path::PathBuf> {
 }
 
 /// The index of the first item of each run of consecutive tool calls.
-pub fn tool_group_starts(items: &[Item]) -> Vec<usize> {
+pub fn work_run_starts(items: &[Item]) -> Vec<usize> {
     (0..items.len())
-        .filter(|&i| {
-            matches!(items[i], Item::Tool(_)) && (i == 0 || !matches!(items[i - 1], Item::Tool(_)))
-        })
+        .filter(|&i| is_work(&items[i]) && (i == 0 || !is_work(&items[i - 1])))
         .collect()
+}
+
+/// A thought or a tool call: what folds into a "Worked" block.
+pub fn is_work(it: &Item) -> bool {
+    matches!(it, Item::Thinking { .. } | Item::Tool(_))
+}
+
+/// What a run of work items did: `(thoughts, commands, seconds)`. Seconds add the finished
+/// thoughts' and tool calls' own durations.
+pub fn work_summary(items: &[Item]) -> (usize, usize, f64) {
+    let (mut thoughts, mut commands, mut secs) = (0, 0, 0.0);
+    for it in items {
+        match it {
+            Item::Thinking { secs: t, .. } => {
+                thoughts += 1;
+                secs += t.unwrap_or(0) as f64;
+            }
+            Item::Tool(t) => {
+                commands += 1;
+                secs += t.done.as_ref().map_or(0.0, |d| d.secs);
+            }
+            _ => {}
+        }
+    }
+    (thoughts, commands, secs)
 }
 
 /// A project's display name: the last path component.
@@ -926,6 +949,12 @@ mod tests {
         };
         let items = vec![
             Item::User("a".into()),
+            Item::Thinking {
+                text: "t".into(),
+                open: false,
+                started: None,
+                secs: Some(2),
+            },
             tool(),
             tool(),
             Item::Assistant {
@@ -934,7 +963,8 @@ mod tests {
             },
             tool(),
         ];
-        assert_eq!(tool_group_starts(&items), vec![1, 4]);
+        assert_eq!(work_run_starts(&items), vec![1, 5]);
+        assert_eq!(work_summary(&items[1..4]), (1, 2, 2.0));
     }
 
     #[test]
