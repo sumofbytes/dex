@@ -10,6 +10,9 @@ use tokio::sync::mpsc;
 
 use crate::state::{Cmd, Inbox, Info, Msg};
 
+/// Threads older than this are not listed in the sidebar.
+const RECENT_DAYS: i64 = 2;
+
 /// Run the dex daemon on a background thread of this process, on a pre-bound loopback port.
 fn start_embedded_daemon() -> std::io::Result<std::net::SocketAddr> {
     dex_server::agent::delegate::set_daemon_linked(true);
@@ -136,9 +139,12 @@ async fn refresh(client: &DaemonClient, post: &impl Fn(Msg)) {
     if let Ok(mut list) = client.list_sessions_async().await {
         // Test runs and scratch work leave thousands of throwaway-directory sessions; they
         // would each become a sidebar project.
+        // Only threads touched in the last two days are listed.
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(RECENT_DAYS);
         let tmp = std::env::temp_dir();
         list.retain(|x| {
-            x.message_count > 0
+            chrono::DateTime::parse_from_rfc3339(&x.updated_at).is_ok_and(|t| t >= cutoff)
+                && x.message_count > 0
                 && !x.cwd.is_empty()
                 && !std::path::Path::new(&x.cwd).starts_with(&tmp)
                 && !x.cwd.starts_with("/tmp/")

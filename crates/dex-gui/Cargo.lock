@@ -908,6 +908,7 @@ dependencies = [
 name = "dex-gui"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "dex-client",
  "dex-server",
  "rune",
