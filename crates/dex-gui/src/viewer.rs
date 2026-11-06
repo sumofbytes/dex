@@ -272,10 +272,11 @@ fn terminal(s: &State, k: &Kit) -> El {
             k.interactive(
                 row()
                     .key("term-clear")
-                    .h(24.0)
-                    .px(8.0)
+                    .h(26.0)
+                    .px(10.0)
                     .items_center()
                     .radius(k.radius.md)
+                    .border(1.0, k.c.border_base)
                     .child(text("Clear").font(k.ty.small).color(k.c.text_muted)),
             )
             .on_press(|s: &mut State| s.clear_term())
@@ -352,7 +353,13 @@ fn terminal(s: &State, k: &Kit) -> El {
                 .scroll(ScrollSpec { stick_bottom: true })
                 .child(blocks),
         )
-        .child(col().w_full().px(16.0).pb(8.0).child(input))
+        .child(
+            col().w_full().px(16.0).gap(8.0).pb(8.0).child(input).child(
+                text("One-shot commands · no interactive programs")
+                    .font(k.ty.small)
+                    .color(k.c.text_faint),
+            ),
+        )
 }
 
 /// One command block: `$ command` with its status on the right, then its output, the last
@@ -417,8 +424,15 @@ fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
                     .color(k.c.text_faint),
             );
         }
+        // In a failed command, error lines take the danger colour, as in the Penpot design.
+        let failed = matches!(b.status, TermStatus::Done { code, .. } if code != 0);
         for l in &b.lines[shown..] {
-            out = out.child(text(l.clone()).font(k.ty.mono).color(k.c.text_muted).wrap());
+            let ink = if failed && l.contains("error") {
+                k.c.danger.fg
+            } else {
+                k.c.text_muted
+            };
+            out = out.child(text(l.clone()).font(k.ty.mono).color(ink).wrap());
         }
         block = block.child(
             row()
