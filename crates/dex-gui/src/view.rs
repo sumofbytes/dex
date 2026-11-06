@@ -33,7 +33,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     rune_kit::root(body, layer)
 }
 
-const PER_PROJECT: usize = 8;
+const PER_PROJECT: usize = 5;
 const PROJECTS: usize = 12;
 
 fn sidebar(s: &State, k: &Kit) -> El {
