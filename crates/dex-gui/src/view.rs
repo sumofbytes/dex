@@ -331,7 +331,12 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                 .py(space::XL)
                 .radius(k.radius.xl)
                 .fill(k.c.layer_02)
-                .child(text(t.clone()).font(k.ty.body).color(k.c.text_base).wrap()),
+                .child(
+                    text(t.clone())
+                        .font(typo::reply(k))
+                        .color(k.c.text_base)
+                        .wrap(),
+                ),
         ),
         Item::Assistant { text: t, streaming } => Markdown::new(t.clone())
             .style(reply_style(k))

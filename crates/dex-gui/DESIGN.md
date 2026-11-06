@@ -46,7 +46,7 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Display: 44px, weight 300, −0.02em (Home greeting).
 - Title: 18px, weight 600 (transcript headings).
 - Header title: 14px, weight 500.
-- Whole, even sizes only. UI and body: 14px / 20 (UI) or 22 (body). Quiet transcript rows and thought text: 14. Caption: 12px / 18 (hints, descriptions, status). Caps labels: 12px, weight 500, tracked 0.8 (project and section labels). Time and shortcut hints: mono 12 / 16. Reply: 16 / 24; reply headings 20 / 18 / 16.
+- Whole, even sizes only. UI and body: 14px / 20 (UI) or 22 (body). Quiet transcript rows (labels): 14. User message and thought text: 16 / 24, same as the reply. Caption: 12px / 18 (hints, descriptions, status). Caps labels: 12px, weight 500, tracked 0.8 (project and section labels). Time and shortcut hints: mono 12 / 16. Reply: 16 / 24; reply headings 20 / 18 / 16.
 - In code these are named roles in `src/style.rs::typo`, and `theme.rs::even_type` sets Rune's own scale (ui 14/20, small 12/16, body 14/22) so its components follow. Never use odd sizes or fractional line heights.
 - Mono: 12px / 18px (tool output, diffs, inline code).
 
@@ -148,5 +148,5 @@ Stroke icons on a 24px grid, stroke 1.6, round caps and joins, drawn as inline S
 
 ## Thought
 
-- Live: spinner + "Thinking" (14px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 14px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (14px / 22px, faint). Click the row or Ctrl+T.
+- Live: spinner + "Thinking" (14px medium, muted), open while the text streams. Done: `› Thought · 4s`, the same 14px faint row as "Ran N commands" (duration only when 1s or more), collapsed by default; opening turns the chevron down and shows the text below (16px / 24px, faint). Click the row or Ctrl+T.
 - Transcript rhythm: 16 between blocks, 32 around a user message, 20 from tools to the reply, 8 from a thought row to its text, tool and thought rows 20 tall.

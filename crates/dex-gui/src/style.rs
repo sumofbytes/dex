@@ -27,9 +27,9 @@ pub mod typo {
             ..reply(k)
         }
     }
-    /// A model thought's text: 14 / 22.
+    /// A model thought's text: 16 / 24, the reply's size; its faint colour sets it apart.
     pub fn thought(k: &Kit) -> TextStyle {
-        k.ty.body
+        reply(k)
     }
     /// Quiet transcript rows (tool group, thought, notices, queued labels): 14 / 20.
     pub fn meta(k: &Kit) -> TextStyle {
