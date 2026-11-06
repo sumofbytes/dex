@@ -214,6 +214,15 @@ fn transcript(s: &State, k: &Kit) -> El {
         list = list.child(el);
         i += 1;
     }
+    // A reply streaming (or a turn that has not produced anything yet) has no work block to
+    // carry the live row.
+    if s.busy {
+        match s.items.last() {
+            Some(Item::Assistant { .. }) => list = list.child(live_row(k, "Replying")),
+            Some(Item::User(_)) => list = list.child(live_row(k, "Working")),
+            _ => {}
+        }
+    }
     // The viewport must be a column: a row would stretch its child to the viewport's height,
     // so the content would never overflow and nothing could scroll.
     col()
@@ -229,6 +238,37 @@ fn transcript(s: &State, k: &Kit) -> El {
                 .px(space::XXL)
                 .child(list.grow(1.0)),
         )
+}
+
+/// The live row while a turn runs: spinner, label, and a ghost Stop button (with its Esc hint) at
+/// the right end of the content line. Gone once the turn ends.
+fn live_row(k: &Kit, label: &str) -> El {
+    let stop = k
+        .interactive(
+            row()
+                .h(24.0)
+                .px(space::LG)
+                .gap(space::MD)
+                .items_center()
+                .radius(k.radius.md)
+                .child(text("Stop").font(k.ty.ui_medium).color(k.c.text_muted))
+                .child(text("Esc").font(typo::time(k)).color(k.c.text_faint)),
+        )
+        .on_press(|s: &mut State| s.send_cmd(Cmd::Cancel))
+        .key("stop");
+    row()
+        .w_full()
+        .h(24.0)
+        .gap(space::SM)
+        .items_center()
+        .child(Spinner::new().size(12.0).build(k))
+        .child(
+            text(label.to_string())
+                .font(k.ty.ui_medium)
+                .color(k.c.text_muted),
+        )
+        .child(spacer().grow(1.0))
+        .child(stop)
 }
 
 /// A run of tool calls (`start..end`): a quiet summary line that opens to the rows.
@@ -265,8 +305,7 @@ fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
             Some(n) if n >= 1 => format!("Working · {n}s"),
             _ => "Working".to_string(),
         };
-        head.child(Spinner::new().size(12.0).build(k))
-            .child(text(label).font(k.ty.ui_medium).color(k.c.text_muted))
+        live_row(k, &label).key(format!("work{start}"))
     } else {
         let chevron = if open {
             &crate::icons::DOWN
