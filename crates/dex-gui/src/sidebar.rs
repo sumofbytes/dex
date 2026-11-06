@@ -241,7 +241,7 @@ fn thread_row_as(
             NeedKind::Done => crate::theme::done(),
             NeedKind::Failed => k.c.danger.fg,
         };
-        thread_lead(dot(color, tok::DOT))
+        lead(dot(color, tok::DOT))
     } else if waiting {
         thread_lead(dot(crate::theme::waiting(), tok::DOT))
     } else if running {
@@ -261,8 +261,10 @@ fn thread_row_as(
     };
     // A renaming row shows a text field instead of its title, bound to the state's edit.
     let edit = (s.renaming.as_deref() == Some(sess.session_id.as_str())).then(|| s.rename.clone());
+    // NEEDS YOU rows are not nested under a project: plain full-width rows.
+    let nested = status.is_none();
     thread_chrome(
-        k, key, selected, mark, sess, title, id, open_cwd, hide_id, edit, time,
+        k, key, selected, nested, mark, sess, title, id, open_cwd, hide_id, edit, time,
     )
 }
 
@@ -273,6 +275,7 @@ fn thread_chrome(
     k: &Kit,
     key: String,
     selected: bool,
+    nested: bool,
     mark: El,
     sess: &SessionInfo,
     title: Option<String>,
@@ -315,37 +318,41 @@ fn thread_chrome(
             .grow(1.0)
             .min_w(0.0),
     };
-    thread_shell(k, key.clone(), selected)
-        .child(mark)
-        .child(title)
-        .edge(boxed(
-            tok::SLOT,
-            IconButton::new(&kit_icons::CLOSE)
-                .control_size(ControlSize::Small)
-                .variant(IconButtonVariant::GhostMuted)
-                .label("Hide thread from sidebar")
-                .on_press(move |s: &mut State| s.hide_thread(&hide_id))
-                .build(k)
-                .key(format!("{key}-hide"))
-                .group_opacity(0.0, 1.0),
-        ))
-        .edge(time)
-        .on_press(move |s: &mut State| {
-            // A press during a rename ends the edit (Return would too); don't jump threads.
-            if s.renaming.is_some() {
-                s.commit_rename();
-                return;
-            }
-            s.project = Some(open_cwd.clone());
-            s.page = Page::Thread;
-            s.send_cmd(Cmd::Open(id.clone()));
-        })
-        .on_double_press(move |s: &mut State| {
-            if s.renaming.is_none() {
-                s.start_rename(&rename_id);
-            }
-        })
-        .build()
+    if nested {
+        thread_shell(k, key.clone(), selected)
+    } else {
+        shell(k, key.clone(), selected)
+    }
+    .child(mark)
+    .child(title)
+    .edge(boxed(
+        tok::SLOT,
+        IconButton::new(&kit_icons::CLOSE)
+            .control_size(ControlSize::Small)
+            .variant(IconButtonVariant::GhostMuted)
+            .label("Hide thread from sidebar")
+            .on_press(move |s: &mut State| s.hide_thread(&hide_id))
+            .build(k)
+            .key(format!("{key}-hide"))
+            .group_opacity(0.0, 1.0),
+    ))
+    .edge(time)
+    .on_press(move |s: &mut State| {
+        // A press during a rename ends the edit (Return would too); don't jump threads.
+        if s.renaming.is_some() {
+            s.commit_rename();
+            return;
+        }
+        s.project = Some(open_cwd.clone());
+        s.page = Page::Thread;
+        s.send_cmd(Cmd::Open(id.clone()));
+    })
+    .on_double_press(move |s: &mut State| {
+        if s.renaming.is_none() {
+            s.start_rename(&rename_id);
+        }
+    })
+    .build()
 }
 
 /// What a project header needs: pressing anywhere on it toggles collapse.
