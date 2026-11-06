@@ -1,10 +1,11 @@
-//! The landing page: a greeting, counts, the threads touched today, and a start card.
+//! The landing page, as drawn in Paper (`DESIGN.md`, dex / Home v2): a greeting, the threads
+//! touched in the last two days, a column of counts, and the start actions.
 
-use chrono::{Datelike, Local, NaiveDate, Timelike};
-use rune::{El, ScrollSpec, col, el, row, text};
+use chrono::{Local, NaiveDate, Timelike};
+use rune::{El, ScrollSpec, TextStyle, col, el, row, text};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
-use rune_theme_opencode::icons;
 
+use crate::icons;
 use crate::state::{Cmd, Page, State, project_name, session_title};
 use crate::theme;
 use crate::view::ago;
@@ -15,54 +16,68 @@ fn local_date(updated_at: &str) -> Option<NaiveDate> {
         .map(|t| t.with_timezone(&Local).date_naive())
 }
 
-fn card(k: &Kit) -> El {
-    col()
-        .padding(18.0)
-        .gap(10.0)
-        .radius(k.radius.xl)
-        .border(1.0, k.c.border_base)
+/// A small uppercase section label, as in the design.
+pub fn caps(k: &Kit, label: &str) -> El {
+    text(label.to_string())
+        .font(TextStyle {
+            size: 11.0,
+            tracking: 0.9,
+            ..k.ty.ui_medium
+        })
+        .color(k.c.text_faint)
+}
+
+/// A 1px hairline, drawn as an element: `El` has no per-side borders.
+fn rule(k: &Kit) -> El {
+    el().w_full().h(1.0).fill(k.c.border_muted)
 }
 
 fn stat(k: &Kit, n: usize, label: &str, color: rune::Color) -> El {
     col()
-        .grow(1.0)
-        .min_w(130.0)
-        .padding(16.0)
-        .gap(2.0)
-        .radius(k.radius.xl)
-        .border(1.0, k.c.border_base)
+        .w_full()
+        .gap(6.0)
+        .py(18.0)
         .child(
             text(n.to_string())
-                .font(k.ty.body_medium.lh(32.0))
+                .font(TextStyle {
+                    size: 40.0,
+                    ..k.ty.body_medium
+                })
                 .color(color),
         )
-        .child(text(label.to_string()).font(k.ty.ui).color(k.c.text_muted))
+        .child(
+            text(label.to_string())
+                .font(k.ty.small)
+                .color(k.c.text_faint),
+        )
+        .child(rule(k).mt(18.0))
 }
 
-fn pill(k: &Kit, label: &str, primary: bool, key: &str, f: impl Fn(&mut State) + 'static) -> El {
+fn action(k: &Kit, label: &str, primary: bool, key: &str, f: impl Fn(&mut State) + 'static) -> El {
     let (fill, ink) = if primary {
         (theme::accent(), theme::on_accent())
     } else {
         (rune::Color::TRANSPARENT, k.c.text_base)
     };
-    let b = row()
+    let mut b = row()
         .key(key.to_string())
-        .px(18.0)
-        .py(9.0)
-        .radius(999.0)
-        .fill(fill)
-        .child(text(label.to_string()).font(k.ty.ui_medium).color(ink));
-    let b = if primary {
-        b
+        .px(16.0)
+        .py(10.0)
+        .gap(8.0)
+        .items_center()
+        .radius(k.radius.md)
+        .fill(fill);
+    if primary {
+        b = b.child(rune::icon(&icons::PLUS, 16.0).color(ink));
     } else {
-        b.border(1.0, k.c.border_strong)
-    };
+        b = b.border(1.0, k.c.border_strong);
+    }
+    b = b.child(text(label.to_string()).font(k.ty.ui_medium).color(ink));
     k.interactive(b).on_press(f)
 }
 
 pub fn home(s: &State, k: &Kit) -> El {
     let now = Local::now();
-    let today = now.date_naive();
     let greeting = match now.hour() {
         5..=11 => "Good morning",
         12..=17 => "Good afternoon",
@@ -75,11 +90,6 @@ pub fn home(s: &State, k: &Kit) -> El {
         .filter(|x| s.is_visible(x))
         .map(|x| (x, local_date(&x.updated_at)))
         .collect();
-    let today_threads: Vec<_> = dated
-        .iter()
-        .filter(|(_, d)| *d == Some(today))
-        .map(|(x, _)| *x)
-        .collect();
     let mut projects: Vec<&str> = s
         .sessions
         .iter()
@@ -90,52 +100,48 @@ pub fn home(s: &State, k: &Kit) -> El {
     projects.dedup();
     let running = usize::from(s.busy);
 
-    let toggle = IconButton::new(&icons::SIDEBAR)
+    let toggle = IconButton::new(&icons::PANEL)
         .variant(IconButtonVariant::Ghost)
         .label("Toggle sidebar")
         .on_press(|s: &mut State| s.sidebar = !s.sidebar)
         .build(k)
         .key("home-toggle");
 
-    let stats = row()
-        .w_full()
-        .gap(12.0)
-        .flex_wrap()
-        .child(stat(k, today_threads.len(), "Today", k.c.text_base))
-        .child(stat(k, dated.len(), "Last 2 days", k.c.text_muted))
-        .child(stat(k, running, "In progress", theme::waiting()))
-        .child(stat(k, projects.len(), "Projects", theme::done()));
+    let subtitle = match dated.len() {
+        0 => "Nothing moved in the last two days.".to_string(),
+        1 => "One thread moved in the last two days. Pick up where you left off.".to_string(),
+        n => format!("{n} threads moved in the last two days. Pick up where you left off."),
+    };
 
-    let mut today_card = card(k)
-        .grow(1.0)
-        .min_w(320.0)
-        .child(text("Today").font(k.ty.ui_medium).color(k.c.text_base));
-    if today_threads.is_empty() {
-        today_card = today_card.child(
-            text(
-                "Nothing yet today. Pick up an older thread from the sidebar, or start a new one.",
-            )
-            .font(k.ty.ui)
-            .color(k.c.text_muted)
-            .wrap(),
+    // Recent: threads touched in the last two days, newest first.
+    let mut recent = col().w_full().child(rule(k));
+    if dated.is_empty() {
+        recent = recent.child(
+            text("Start a thread to see it here.")
+                .font(k.ty.body)
+                .color(k.c.text_muted)
+                .py(20.0),
         );
     }
-    for (i, sess) in today_threads.iter().take(5).enumerate() {
+    for (i, (sess, _)) in dated.iter().take(6).enumerate() {
         let id = sess.session_id.clone();
         let cwd = sess.cwd.clone();
+        let when = ago(&sess.updated_at);
         let line = row()
-            .key(format!("today{i}"))
+            .key(format!("recent{i}"))
             .w_full()
             .min_w(0.0)
-            .min_w(0.0)
-            .px(8.0)
-            .py(6.0)
-            .gap(8.0)
-            .radius(k.radius.md)
+            .h(56.0)
+            .gap(12.0)
             .items_center()
             .child(
+                el().size(6.0, 6.0)
+                    .radius(3.0)
+                    .fill(theme::project_color(&project_name(&sess.cwd))),
+            )
+            .child(
                 text(session_title(sess))
-                    .font(k.ty.ui)
+                    .font(k.ty.body_medium)
                     .color(k.c.text_base)
                     .truncate()
                     .grow(1.0)
@@ -143,79 +149,97 @@ pub fn home(s: &State, k: &Kit) -> El {
                     .min_w(0.0),
             )
             .child(
-                text(format!(
-                    "{} · {}",
-                    project_name(&sess.cwd),
-                    ago(&sess.updated_at)
-                ))
-                .font(k.ty.small)
-                .color(k.c.text_faint),
-            );
-        today_card = today_card.child(k.interactive(line).on_press(move |s: &mut State| {
+                text(project_name(&sess.cwd).to_uppercase())
+                    .font(k.ty.small)
+                    .color(k.c.text_faint),
+            )
+            .child(text(when).font(k.ty.small).color(k.c.text_faint));
+        recent = recent.child(k.interactive(line).on_press(move |s: &mut State| {
             s.project = Some(cwd.clone());
             s.page = Page::Thread;
             s.send_cmd(Cmd::Open(id.clone()));
         }));
+        recent = recent.child(rule(k));
     }
+
+    let week = col().w(200.0).child(caps(k, "THIS WEEK").pb(12.0)).child(
+        col()
+            .w_full()
+            .child(rule(k))
+            .child(stat(
+                k,
+                dated.len(),
+                "threads active in two days",
+                k.c.text_base,
+            ))
+            .child(stat(k, projects.len(), "projects", k.c.text_base))
+            .child(stat(k, running, "running now", theme::waiting())),
+    );
 
     let continue_cwd = s
         .sessions
         .iter()
         .find(|x| s.is_visible(x))
         .map(|x| (x.session_id.clone(), x.cwd.clone()));
-    let mut start = row()
-        .gap(10.0)
-        .child(pill(k, "New thread", true, "start-new", |s| {
+    let mut actions = row().w_full().gap(10.0).items_center().child(action(
+        k,
+        "New thread",
+        true,
+        "start-new",
+        |s| {
             s.page = Page::Thread;
             s.send_cmd(Cmd::NewSession);
-        }));
+        },
+    ));
     if let Some((id, cwd)) = continue_cwd {
-        start = start.child(pill(k, "Continue last", false, "start-last", move |s| {
+        actions = actions.child(action(k, "Continue last", false, "start-last", move |s| {
             s.project = Some(cwd.clone());
             s.page = Page::Thread;
             s.send_cmd(Cmd::Open(id.clone()));
         }));
     }
-    let start_card = card(k)
-        .child(text("Start").font(k.ty.ui_medium).color(k.c.text_base))
-        .child(start);
+    actions = actions.child(text("Ctrl N").font(k.ty.small).color(k.c.text_faint));
 
     let content = col()
         .w_full()
-        .max_w(860.0)
-        .padding(28.0)
-        .gap(14.0)
-        .child(
-            text(now.format("%A, %B %-d").to_string())
-                .font(k.ty.ui)
-                .color(k.c.text_muted),
-        )
+        .max_w(820.0)
+        .padding(56.0)
+        .gap(0.0)
+        .child(caps(
+            k,
+            &now.format("%A, %B %-d").to_string().to_uppercase(),
+        ))
         .child(
             text(greeting.to_string())
                 .font(
-                    rune::TextStyle {
-                        size: 40.0,
+                    TextStyle {
+                        size: 56.0,
+                        tracking: -1.5,
                         ..k.ty.body_medium
                     }
-                    .lh(46.0),
+                    .lh(68.0),
                 )
-                .color(k.c.text_base),
+                .color(k.c.text_base)
+                .pt(14.0),
         )
-        .child(
-            text("A clear view of what matters today.")
-                .font(k.ty.body)
-                .color(k.c.text_muted),
-        )
-        .child(stats)
+        .child(text(subtitle).font(k.ty.body).color(k.c.text_muted).pt(8.0))
         .child(
             row()
                 .w_full()
-                .gap(12.0)
+                .gap(64.0)
                 .items_start()
-                .flex_wrap()
-                .child(today_card),
+                .pt(56.0)
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(caps(k, "RECENT").pb(12.0))
+                        .child(recent),
+                )
+                .child(week),
         )
-        .child(start_card);
+        .child(el().grow(1.0))
+        .child(actions.pt(40.0));
 
     col()
         .w_full()

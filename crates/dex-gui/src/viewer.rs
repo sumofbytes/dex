@@ -5,8 +5,7 @@ use rune::{El, ScrollSpec, col, row, text, text_input};
 use rune_kit::diff::DiffView;
 use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::syntax::{self, SyntaxTheme};
-use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit};
-use rune_theme_opencode::icons;
+use rune_kit::{IconButton, IconButtonVariant, Kit};
 
 use crate::state::{State, VTab};
 
@@ -35,41 +34,67 @@ fn lang(path: &str) -> Option<&'static str> {
 }
 
 pub fn viewer(s: &State, k: &Kit) -> El {
-    let tab = |label: &str, t: VTab, key: &str| {
-        Button::new(label)
-            .variant(if s.vtab == t {
-                ButtonVariant::Neutral
-            } else {
-                ButtonVariant::Ghost
-            })
-            .on_press(move |s: &mut State| {
-                s.vtab = t;
-                s.rescan();
-            })
-            .build(k)
+    // A segmented control: the active tab sits on a raised fill, as in the Paper design.
+    let tab = |label: String, icon: &'static rune::Icon, t: VTab, key: &str| {
+        let on = s.vtab == t;
+        let ink = if on { k.c.text_base } else { k.c.text_muted };
+        let seg = row()
             .key(key.to_string())
+            .h(28.0)
+            .px(10.0)
+            .gap(6.0)
+            .items_center()
+            .radius(k.radius.md)
+            .fill(if on {
+                k.c.surface_raised
+            } else {
+                rune::Color::TRANSPARENT
+            })
+            .child(rune::icon(icon, 14.0).color(ink))
+            .child(text(label).font(k.ty.ui_medium).color(ink));
+        k.interactive(seg).on_press(move |s: &mut State| {
+            s.vtab = t;
+            s.rescan();
+        })
     };
     let changes = s.diff.files().len();
+    let segments = row()
+        .padding(2.0)
+        .gap(2.0)
+        .radius(k.radius.lg)
+        .border(1.0, k.c.border_base)
+        .child(tab(
+            "Files".into(),
+            &crate::icons::FILE,
+            VTab::Files,
+            "vt-files",
+        ))
+        .child(tab(
+            if changes > 0 {
+                format!("Changes {changes}")
+            } else {
+                "Changes".into()
+            },
+            &crate::icons::COMPARE,
+            VTab::Changes,
+            "vt-changes",
+        ))
+        .child(tab(
+            "Terminal".into(),
+            &crate::icons::TERMINAL,
+            VTab::Terminal,
+            "vt-term",
+        ));
     let bar = row()
         .w_full()
         .h(48.0)
         .px(12.0)
         .gap(6.0)
         .items_center()
-        .child(tab("Files", VTab::Files, "vt-files"))
-        .child(tab(
-            &if changes > 0 {
-                format!("Changes {changes}")
-            } else {
-                "Changes".into()
-            },
-            VTab::Changes,
-            "vt-changes",
-        ))
-        .child(tab("Terminal", VTab::Terminal, "vt-term"))
+        .child(segments)
         .child(col().grow(1.0))
         .child(
-            IconButton::new(&icons::CLOSE)
+            IconButton::new(&crate::icons::X)
                 .variant(IconButtonVariant::Ghost)
                 .label("Close viewer")
                 .on_press(|s: &mut State| s.viewer = false)
@@ -162,21 +187,14 @@ fn preview(f: &crate::state::OpenFile, k: &Kit) -> El {
         .gap(6.0)
         .items_center()
         .child(
-            IconButton::new(&icons::CLOSE)
+            IconButton::new(&crate::icons::LEFT)
                 .variant(IconButtonVariant::Ghost)
                 .label("Back to files")
                 .on_press(|s: &mut State| s.open_file = None)
                 .build(k)
                 .key("back"),
         )
-        .child(
-            text(f.path.clone())
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base)
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
-        );
+        .child(breadcrumb(&f.path, k).grow(1.0).min_w(0.0));
     // Only the head of a long file is drawn.
     let mut body = String::new();
     for (i, l) in f.text.lines().take(MAX_LINES).enumerate() {
@@ -187,7 +205,19 @@ fn preview(f: &crate::state::OpenFile, k: &Kit) -> El {
     }
     let found = syntax::highlight(lang(&f.path), &body);
     let spans = SyntaxTheme::from_kit(k).spans(&found, 0);
-    let code = rune::rich(body, spans).font(k.ty.mono).color(k.c.text_base);
+    // A line-number gutter beside the code; both use one line height so rows line up.
+    let line_count = body.lines().count().max(1);
+    let numbers = (1..=line_count)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let gutter = text(numbers)
+        .font(k.ty.mono.lh(20.0))
+        .color(k.c.text_faint)
+        .w(40.0);
+    let code = rune::rich(body, spans)
+        .font(k.ty.mono.lh(20.0))
+        .color(k.c.text_base);
     col().w_full().grow(1.0).min_h(0.0).child(head).child(
         col()
             .w_full()
@@ -196,8 +226,33 @@ fn preview(f: &crate::state::OpenFile, k: &Kit) -> El {
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
-            .child(col().w_full().padding(12.0).child(code)),
+            .child(
+                row()
+                    .w_full()
+                    .gap(10.0)
+                    .padding(12.0)
+                    .child(gutter)
+                    .child(code),
+            ),
     )
+}
+
+/// `dir / file` as the design draws it: the directory muted, the file name strong.
+fn breadcrumb(path: &str, k: &Kit) -> El {
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((d, n)) => (format!("{d} /"), n.to_string()),
+        None => (String::new(), path.to_string()),
+    };
+    row()
+        .gap(6.0)
+        .items_center()
+        .child(text(dir).font(k.ty.ui).color(k.c.text_faint).truncate())
+        .child(
+            text(name)
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base)
+                .shrink(),
+        )
 }
 
 fn terminal(s: &State, k: &Kit) -> El {

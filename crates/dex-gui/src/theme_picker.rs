@@ -1,10 +1,19 @@
 //! Theme picker: a searchable list of every colour scheme, opened from the header or Ctrl+,.
 
-use rune::{El, ScrollSpec, col, text, text_input};
-use rune_kit::shell::SidebarRow;
+use rune::{El, ScrollSpec, col, el, row, text, text_input};
 use rune_kit::{Dialog, Kit};
 
 use crate::state::State;
+
+/// Three squares: the scheme's background, text and accent.
+fn swatch(bg: rune::Color, fg: rune::Color, accent: rune::Color) -> El {
+    row()
+        .gap(0.0)
+        .radius(4.0)
+        .child(el().size(10.0, 14.0).fill(bg))
+        .child(el().size(10.0, 14.0).fill(fg))
+        .child(el().size(10.0, 14.0).fill(accent))
+}
 
 /// Rows drawn at once; refine the search for the rest.
 const MAX_ROWS: usize = 80;
@@ -22,16 +31,39 @@ pub fn picker(s: &State, k: &Kit, layer: &mut Vec<El>) {
     let mut list = col().w_full().gap(2.0);
     for name in matches.iter().take(MAX_ROWS) {
         let pick = name.to_string();
-        list = list.child(
-            SidebarRow::new(*name)
-                .selected(*name == current)
-                .on_select(move |s: &mut State, _| {
-                    s.set_theme(&pick);
-                    s.theme_open = false;
-                })
-                .build(k)
-                .key(format!("theme:{name}")),
-        );
+        let on = *name == current;
+        let (bg, fg, accent) = crate::theme::swatch(name);
+        let line = row()
+            .key(format!("theme:{name}"))
+            .w_full()
+            .h(36.0)
+            .px(10.0)
+            .gap(12.0)
+            .items_center()
+            .radius(k.radius.md)
+            .fill(if on {
+                k.c.surface_raised
+            } else {
+                rune::Color::TRANSPARENT
+            })
+            .child(swatch(bg, fg, accent))
+            .child(
+                text(name.to_string())
+                    .font(k.ty.ui)
+                    .color(if on { k.c.text_base } else { k.c.text_weak })
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            )
+            .child(if on {
+                rune::icon(&crate::icons::CHECK, 14.0).color(k.c.text_base)
+            } else {
+                el().size(14.0, 14.0)
+            });
+        list = list.child(k.interactive(line).on_press(move |s: &mut State| {
+            s.set_theme(&pick);
+            s.theme_open = false;
+        }));
     }
     if matches.is_empty() {
         list = list.child(

@@ -82,6 +82,17 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 - Gap of 12px between project groups.
 - Home nav row is selected on the Home page; a thread row is selected on the Thread page.
 
+## Replication status
+
+Replicated in `src/` (v2): the sidebar, Home, the thread header, tool rows, composer and footer, the viewer tabs and numbered file preview, and the theme picker rows. Icons are in `src/icons.rs`.
+
+Differences that remain:
+- The code blocks come from rune-kit's Markdown, so they don't have the "RUST" label from the design.
+- The greeting uses medium weight. The design uses light (300); rune's type scale has no light weight yet.
+- The viewer's code scrolls vertically only, so long lines run past the pane edge.
+- The Changes view uses rune-kit's diff component, so its file list and hunk headers differ from the Paper design.
+- Colours come from the theme picker (the three seeds), so the default is the design's dex palette, but other schemes change them.
+
 ## Known gaps
 
 - The sidebar in the Viewer and Theme artboards is not drawn; they are shown without it.

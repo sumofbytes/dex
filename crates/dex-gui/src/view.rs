@@ -80,6 +80,7 @@ fn nav_row(
     SidebarRow::new(label)
         .icon(icon)
         .selected(selected)
+        .height(32.0)
         .on_select(move |s: &mut State, _| f(s))
         .build(k)
         .key(key.to_string())
@@ -116,7 +117,7 @@ fn thread_row(s: &State, k: &Kit, sess: &SessionInfo, key: String, with_project:
     };
     // Hover reveals an × that removes the thread from the sidebar.
     r = r.on_close(move |s: &mut State, _| s.hide_thread(&hide_id));
-    r.build(k).key(key)
+    r.height(32.0).build(k).key(key)
 }
 
 fn sidebar(s: &State, k: &Kit) -> El {
@@ -132,21 +133,28 @@ fn sidebar(s: &State, k: &Kit) -> El {
         .header(nav_row(
             k,
             "Home",
-            &icons::GRID_PLUS,
+            &crate::icons::HOME,
             s.page == Page::Home,
             "nav-home",
             |s| {
                 s.page = Page::Home;
             },
         ))
-        .header(nav_row(k, "New", &icons::PLUS, false, "nav-new", |s| {
-            s.page = Page::Thread;
-            s.send_cmd(Cmd::NewSession);
-        }))
+        .header(nav_row(
+            k,
+            "New",
+            &crate::icons::PLUS,
+            false,
+            "nav-new",
+            |s| {
+                s.page = Page::Thread;
+                s.send_cmd(Cmd::NewSession);
+            },
+        ))
         .header(nav_row(
             k,
             "Search",
-            &icons::MAGNIFYING_GLASS,
+            &crate::icons::SEARCH,
             s.searching,
             "nav-search",
             |s| {
@@ -192,7 +200,7 @@ fn sidebar(s: &State, k: &Kit) -> El {
             .px(10.0)
             .pt(14.0)
             .pb(4.0)
-            .child(text("Projects").font(k.ty.ui).color(k.c.text_muted)),
+            .child(crate::home::caps(k, "PROJECTS")),
     );
 
     // Projects: the active one first, then by most recent thread. The daemon lists every
@@ -269,8 +277,12 @@ fn sidebar(s: &State, k: &Kit) -> El {
                             .child(el().w(6.0).h(6.0).radius(3.0).fill(color))
                             .child(
                                 text(name.to_uppercase())
-                                    .font(k.ty.ui_medium)
-                                    .color(k.c.text_muted)
+                                    .font(rune::TextStyle {
+                                        size: 11.0,
+                                        tracking: 0.9,
+                                        ..k.ty.ui_medium
+                                    })
+                                    .color(k.c.text_faint)
                                     .truncate()
                                     .grow(1.0)
                                     .min_w(0.0),
@@ -371,7 +383,7 @@ fn main_pane(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 fn header(s: &State, k: &Kit) -> El {
-    let toggle = IconButton::new(&icons::SIDEBAR)
+    let toggle = IconButton::new(&crate::icons::PANEL)
         .variant(IconButtonVariant::Ghost)
         .label("Toggle sidebar")
         .on_press(|s: &mut State| s.sidebar = !s.sidebar)
@@ -439,7 +451,7 @@ fn header(s: &State, k: &Kit) -> El {
         .child(title.grow(1.0).min_w(0.0))
         .child(stats)
         .child(
-            IconButton::new(&icons::SETTINGS_GEAR)
+            IconButton::new(&crate::icons::SLIDERS)
                 .variant(IconButtonVariant::Ghost)
                 .label("Theme (Ctrl+,)")
                 .on_press(|s: &mut State| s.theme_open = true)
@@ -447,7 +459,7 @@ fn header(s: &State, k: &Kit) -> El {
                 .key("open-theme"),
         )
         .child(
-            IconButton::new(&icons::CONSOLE)
+            IconButton::new(&crate::icons::TERMINAL)
                 .variant(IconButtonVariant::Ghost)
                 .label("Terminal (Ctrl+`)")
                 .on_press(|s: &mut State| s.show_viewer(VTab::Terminal))
@@ -455,7 +467,7 @@ fn header(s: &State, k: &Kit) -> El {
                 .key("open-term"),
         )
         .child(
-            IconButton::new(&icons::FOLDER)
+            IconButton::new(&crate::icons::FOLDER)
                 .variant(IconButtonVariant::Ghost)
                 .label("Files (Ctrl+E)")
                 .on_press(|s: &mut State| s.show_viewer(VTab::Files))
@@ -532,30 +544,60 @@ fn item(i: usize, it: &Item, k: &Kit, live: bool) -> El {
                 .build(k)
         }
         Item::Tool(t) => {
-            let mark = match &t.done {
-                None => "…",
-                Some(d) if d.ok => "✓",
-                Some(_) => "✗",
+            // A row: status icon, name, arguments and duration. Opening it shows the output
+            // under a 2px rule, as in the Paper design.
+            let (mark, mark_color) = match &t.done {
+                None => (None, k.c.text_faint),
+                Some(d) if d.ok => (Some(&crate::icons::CHECK), crate::theme::done()),
+                Some(_) => (Some(&crate::icons::X), k.c.danger.fg),
             };
             let secs = match &t.done {
-                Some(d) if d.secs >= 1.0 => format!("  {:.1}s", d.secs),
-                _ => String::new(),
+                Some(d) => format!("{:.1}s", d.secs),
+                None => String::new(),
             };
-            let title = format!("{mark} {}  {}{secs}", t.name, t.args);
-            let mut c = Collapsible::new(title, t.open).on_toggle(move |s: &mut State| {
-                if let Some(Item::Tool(t)) = s.items.get_mut(i) {
-                    t.open = !t.open;
-                }
-            });
-            if let Some(d) = &t.done {
-                let mut body = col().gap(2.0).px(8.0).py(4.0);
+            let status = match mark {
+                Some(ic) => rune::icon(ic, 14.0).color(mark_color),
+                None => text("…").font(k.ty.mono).color(mark_color),
+            };
+            let head = row()
+                .key(format!("tool{i}"))
+                .w_full()
+                .h(28.0)
+                .gap(8.0)
+                .items_center()
+                .child(status)
+                .child(text(t.name.clone()).font(k.ty.mono).color(k.c.text_base))
+                .child(
+                    text(t.args.clone())
+                        .font(k.ty.mono)
+                        .color(k.c.text_faint)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(text(secs).font(k.ty.mono).color(k.c.text_faint));
+            let mut c = col().w_full().gap(4.0).child(k.interactive(head).on_press(
+                move |s: &mut State| {
+                    if let Some(Item::Tool(t)) = s.items.get_mut(i) {
+                        t.open = !t.open;
+                    }
+                },
+            ));
+            if let (true, Some(d)) = (t.open, &t.done) {
+                let mut body = col().gap(2.0).py(4.0);
                 body = body.child(text(d.summary.clone()).font(k.ty.ui).color(k.c.text_muted));
                 for l in &d.preview {
-                    body = body.child(text(l.clone()).font(k.ty.mono).color(k.c.text_base));
+                    body = body.child(text(l.clone()).font(k.ty.mono).color(k.c.text_muted));
                 }
-                c = c.child(body);
+                c = c.child(
+                    row()
+                        .w_full()
+                        .pl(7.0)
+                        .child(el().w(2.0).fill(k.c.border_muted))
+                        .child(col().pl(13.0).grow(1.0).min_w(0.0).child(body)),
+                );
             }
-            c.build(k)
+            c
         }
         Item::Notice(t) => text(t.clone()).font(k.ty.small).color(k.c.text_faint),
         Item::Error(t) => col()
@@ -704,8 +746,8 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .on_press(|s: &mut State| s.send_cmd(Cmd::Cancel))
             .build(k)
     } else {
-        IconButton::new(&icons::ARROW_UP)
-            .variant(IconButtonVariant::Contrast)
+        IconButton::new(&crate::icons::UP)
+            .variant(IconButtonVariant::Submit)
             .label("Send")
             .on_press(|s: &mut State| s.submit())
             .build(k)
@@ -772,25 +814,37 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 fn footer(s: &State, k: &Kit) -> El {
-    let branch = s
-        .info
-        .branch
-        .clone()
-        .map(|b| format!("  ⎇ {b}"))
-        .unwrap_or_default();
+    let mut left = row().grow(1.0).min_w(0.0).gap(8.0).items_center().child(
+        text(s.cwd())
+            .font(k.ty.small)
+            .color(k.c.text_faint)
+            .truncate()
+            .shrink(),
+    );
+    if let Some(b) = &s.info.branch {
+        left = left
+            .child(rune::icon(&crate::icons::BRANCH, 12.0).color(k.c.text_faint))
+            .child(
+                text(b.clone())
+                    .font(k.ty.small)
+                    .color(k.c.text_faint)
+                    .truncate(),
+            );
+    }
+    let ready = s.status == "ready";
+    let dot = if ready {
+        crate::theme::done()
+    } else {
+        crate::theme::waiting()
+    };
     row()
         .w_full()
         .h(28.0)
-        .px(14.0)
+        .px(16.0)
+        .gap(8.0)
         .items_center()
-        .child(
-            text(format!("{}{branch}", s.cwd()))
-                .font(k.ty.small)
-                .color(k.c.text_faint)
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
-        )
+        .child(left)
+        .child(el().size(6.0, 6.0).radius(3.0).fill(dot))
         .child(
             text(format!("{} · {}", s.info.provider, s.status))
                 .font(k.ty.small)

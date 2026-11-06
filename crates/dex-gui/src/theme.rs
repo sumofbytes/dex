@@ -39,8 +39,16 @@ fn build_dex() -> Active {
     }
 }
 
+/// A scheme's three seeds (background, text, accent) for a swatch in the picker.
+pub fn swatch(name: &str) -> (Color, Color, Color) {
+    if name == DEFAULT {
+        return (c("#342d2d"), c("#f4eeee"), c("#f38d70"));
+    }
+    seeds(name).unwrap_or((c("#342d2d"), c("#f4eeee"), c("#f38d70")))
+}
+
 /// A scheme's seeds from its section of the bundle. `accent` is its blue, as Po's primary.
-fn build(name: &str) -> Option<Active> {
+fn seeds(name: &str) -> Option<(Color, Color, Color)> {
     let body = BUNDLE.split("@@ ").skip(1).find_map(|sec| {
         let (title, body) = sec.split_once('\n')?;
         title.trim().eq_ignore_ascii_case(name).then_some(body)
@@ -65,7 +73,12 @@ fn build(name: &str) -> Option<Active> {
         }
     }
     let (bg, fg) = (bg?, fg?);
-    let accent = blue.unwrap_or(fg);
+    Some((bg, fg, blue.unwrap_or(fg)))
+}
+
+/// A scheme's seeds from its section of the bundle, ready to build a kit.
+fn build(name: &str) -> Option<Active> {
+    let (bg, fg, accent) = seeds(name)?;
     // Ink on the accent: whichever of background and text contrasts more with it.
     let on_accent = if (bg.luminance() - accent.luminance()).abs()
         >= (fg.luminance() - accent.luminance()).abs()

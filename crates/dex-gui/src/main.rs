@@ -3,6 +3,7 @@
 //! Headless render: `dex-gui --snap out.png --scene chat`.
 
 mod home;
+mod icons;
 mod state;
 mod theme;
 mod theme_picker;
