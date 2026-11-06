@@ -29,7 +29,7 @@ fn setup(s: &mut State, wake: Waker) {
 }
 
 /// Shortcuts, written with Ctrl (Cmd on macOS) as in Po: B sidebar, N new thread, O every tool
-/// call's details, T all thinking.
+/// call's details, T all thinking, Esc stops the running turn.
 fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
     if e.is_command('b') {
         s.sidebar = !s.sidebar;
@@ -51,6 +51,10 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
         s.toggle_tools();
     } else if e.is_command('t') {
         s.toggle_thinking();
+    } else if matches!(e.key, rune::Key::Escape) && s.busy && s.renaming.is_none() && !s.theme_open
+    {
+        // Esc stops the running turn (the composer's Stop button does the same).
+        s.send_cmd(Cmd::Cancel);
     } else {
         return false;
     }
