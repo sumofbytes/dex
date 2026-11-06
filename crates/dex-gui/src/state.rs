@@ -46,6 +46,8 @@ pub enum Msg {
     Event(StreamEvent),
     Status(String),
     /// Project files (relative) and the working-tree patch from a background `git` scan.
+    /// Output of the terminal's running command (`None`: it exited).
+    Term(Option<String>),
     Scanned {
         cwd: String,
         files: Vec<String>,
@@ -114,6 +116,7 @@ pub struct Queued {
 pub enum VTab {
     Files,
     Changes,
+    Terminal,
 }
 
 pub struct OpenFile {
@@ -156,6 +159,10 @@ pub struct State {
     pub open_file: Option<OpenFile>,
     pub diff: DiffState,
     pub scanned: Option<String>,
+    pub term: Vec<String>,
+    pub term_input: TextEdit,
+    pub term_cwd: Option<String>,
+    pub term_running: bool,
     pub wake: Option<Waker>,
     pub inbox: Arc<Inbox>,
     pub cmds: Option<mpsc::UnboundedSender<Cmd>>,
@@ -193,6 +200,10 @@ impl Default for State {
             open_file: None,
             diff: DiffState::new(Vec::new()),
             scanned: None,
+            term: Vec::new(),
+            term_input: TextEdit::default(),
+            term_cwd: None,
+            term_running: false,
             wake: None,
             inbox: Arc::default(),
             cmds: None,
@@ -254,6 +265,16 @@ impl State {
                 self.sessions_loaded = true;
             }
             Msg::Status(s) => self.status = s,
+            Msg::Term(Some(chunk)) => {
+                for l in chunk.split('\n') {
+                    self.term.push(strip_ansi(l.trim_end_matches('\r')));
+                }
+                let n = self.term.len();
+                if n > 5000 {
+                    self.term.drain(..n - 5000);
+                }
+            }
+            Msg::Term(None) => self.term_running = false,
             Msg::Scanned { cwd, files, patch } => {
                 if cwd == self.cwd() {
                     self.files = files;
@@ -420,6 +441,73 @@ impl State {
         });
     }
 
+    /// Run the terminal input as a shell command in the project directory, streaming its output.
+    /// Not a PTY: interactive programs (editors, pagers) do not work.
+    pub fn run_term(&mut self) {
+        let cmd = self.term_input.text.trim().to_string();
+        if cmd.is_empty() || self.term_running {
+            return;
+        }
+        self.term_input.replace_text("");
+        let dir = self.term_cwd.clone().unwrap_or_else(|| self.cwd());
+        self.term.push(format!("$ {cmd}"));
+        if let Some(arg) = cmd.strip_prefix("cd ").or((cmd == "cd").then_some("~")) {
+            let arg = arg.trim();
+            let home = std::env::var("HOME").unwrap_or_default();
+            let target = match arg.strip_prefix('~') {
+                Some(rest) => format!("{home}{rest}"),
+                None => arg.to_string(),
+            };
+            match std::path::Path::new(&dir).join(target).canonicalize() {
+                Ok(p) if p.is_dir() => self.term_cwd = Some(p.display().to_string()),
+                _ => self.term.push(format!("cd: {arg}: no such directory")),
+            }
+            return;
+        }
+        self.term_running = true;
+        let (inbox, wake) = (self.inbox.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            use std::process::{Command, Stdio};
+            let post = |m: Msg| {
+                inbox.0.lock().unwrap().push(m);
+                if let Some(w) = &wake {
+                    w();
+                }
+            };
+            #[cfg(unix)]
+            let mut c = {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(format!("exec 2>&1; {cmd}"));
+                c
+            };
+            #[cfg(windows)]
+            let mut c = {
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(format!("{cmd} 2>&1"));
+                c
+            };
+            let child = c
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+            match child {
+                Ok(mut ch) => {
+                    if let Some(out) = ch.stdout.take() {
+                        for l in BufReader::new(out).lines().map_while(Result::ok) {
+                            post(Msg::Term(Some(l)));
+                        }
+                    }
+                    let _ = ch.wait();
+                }
+                Err(e) => post(Msg::Term(Some(format!("failed to run: {e}")))),
+            }
+            post(Msg::Term(None));
+        });
+    }
+
     pub fn open_path(&mut self, rel: &str) {
         let full = std::path::Path::new(&self.cwd()).join(rel);
         let text = match std::fs::read(&full) {
@@ -562,6 +650,26 @@ fn args_line(args: &serde_json::Value) -> String {
     s.lines().next().unwrap_or("").chars().take(120).collect()
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            if it.peek() == Some(&'[') {
+                it.next();
+                for n in it.by_ref() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// `git` listing of a project's files and its working-tree patch against HEAD.
 pub fn scan(cwd: String) -> Msg {
     let git = |args: &[&str]| {
@@ -579,4 +687,30 @@ pub fn scan(cwd: String) -> Msg {
         .collect();
     let patch = git(&["diff", "HEAD", "--no-color"]);
     Msg::Scanned { cwd, files, patch }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_runs_a_command_and_streams_output() {
+        let mut s = State::default();
+        s.project = Some(std::env::temp_dir().display().to_string());
+        s.term_input.replace_text("echo hi; echo err >&2");
+        s.run_term();
+        assert!(s.term_running);
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let msgs: Vec<Msg> = std::mem::take(&mut *s.inbox.0.lock().unwrap());
+            for m in msgs {
+                s.apply(m);
+            }
+            if !s.term_running {
+                break;
+            }
+        }
+        assert!(!s.term_running);
+        assert_eq!(s.term, ["$ echo hi; echo err >&2", "hi", "err"]);
+    }
 }

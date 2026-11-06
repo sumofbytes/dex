@@ -66,6 +66,7 @@ pub fn viewer(s: &State, k: &Kit) -> El {
             VTab::Changes,
             "vt-changes",
         ))
+        .child(tab("Terminal", VTab::Terminal, "vt-term"))
         .child(col().grow(1.0))
         .child(
             IconButton::new(&icons::CLOSE)
@@ -78,6 +79,7 @@ pub fn viewer(s: &State, k: &Kit) -> El {
     let body = match s.vtab {
         VTab::Files => files(s, k),
         VTab::Changes => changes_view(s, k),
+        VTab::Terminal => terminal(s, k),
     };
     col()
         .key("viewer")
@@ -196,6 +198,58 @@ fn preview(f: &crate::state::OpenFile, k: &Kit) -> El {
             })
             .child(col().w_full().padding(12.0).child(code)),
     )
+}
+
+fn terminal(s: &State, k: &Kit) -> El {
+    let dir = s.term_cwd.clone().unwrap_or_else(|| s.cwd());
+    let out = if s.term.is_empty() {
+        "Run a command. One-shot shell commands only (no interactive programs).".to_string()
+    } else {
+        s.term.join("\n")
+    };
+    let input = text_input(&s.term_input, k.ty.mono.lh(20.0))
+        .key("term-input")
+        .placeholder(
+            if s.term_running {
+                "running…"
+            } else {
+                "command"
+            },
+            k.c.text_faint,
+        )
+        .caret(k.c.text_base, k.c.border_focus.alpha(0.35))
+        .color(k.c.text_base)
+        .single_line()
+        .on_edit(|s: &mut State| &mut s.term_input)
+        .on_submit(|s: &mut State, _| s.run_term())
+        .w_full()
+        .px(10.0)
+        .py(8.0);
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(
+            col()
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec { stick_bottom: true })
+                .child(
+                    col()
+                        .w_full()
+                        .padding(12.0)
+                        .child(text(out).font(k.ty.mono).color(k.c.text_base).wrap()),
+                ),
+        )
+        .child(
+            text(dir)
+                .font(k.ty.ui)
+                .color(k.c.text_muted)
+                .truncate()
+                .px(12.0),
+        )
+        .child(input)
 }
 
 fn changes_view(s: &State, k: &Kit) -> El {

@@ -32,6 +32,8 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
         s.show_viewer(state::VTab::Files);
     } else if e.is_command('g') {
         s.show_viewer(state::VTab::Changes);
+    } else if e.is_command('`') {
+        s.show_viewer(state::VTab::Terminal);
     } else if e.is_command('o') {
         s.toggle_tools();
     } else if e.is_command('t') {
@@ -187,6 +189,15 @@ fn files_scene(s: &mut State) {
     s.open_path("crates/dex-gui/src/viewer.rs");
 }
 
+fn term_scene(s: &mut State) {
+    viewer_scene(s, state::VTab::Terminal);
+    s.term = vec![
+        "$ git log --oneline -3".into(),
+        "694fe3c feat(gui): viewer pane".into(),
+        "219ed67 feat(gui): detach".into(),
+    ];
+}
+
 fn changes_scene(s: &mut State) {
     viewer_scene(s, state::VTab::Changes);
 }
@@ -263,6 +274,7 @@ fn main() {
             ("real", real),
             ("files", files_scene),
             ("changes", changes_scene),
+            ("term", term_scene),
         ],
         setup: Some(setup),
         poll: Some(poll),
