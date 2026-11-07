@@ -10,7 +10,7 @@ keywords = ["cli", "agent", "llm", "tui", "coding-assistant"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
-members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session", "crates/dex-acp"]
+members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session", "crates/dex-acp", "crates/dex-gui"]
 default-members = [".", "crates/dex-runtime", "crates/dex-server", "crates/dex-protocol", "crates/dex-ai", "crates/dex-agent-core", "crates/dex-coding-agent", "crates/dex-client", "crates/dex-skills", "crates/dex-session", "crates/dex-acp"]
 resolver = "2"
 
@@ -28,6 +28,10 @@ tui = [
     "dep:crossterm",
     "dep:ratatui-markdown",
 ]
+# `gui` links the Rune GUI (crates/dex-gui) into the binary: bare `dex` opens it, and `dex tui`
+# opens the TUI instead. Off by default: Rune pulls a large GPU/windowing tree, so release
+# builds opt in.
+gui = ["dep:dex-gui"]
 network-tests = []
 
 [dependencies]
@@ -36,6 +40,7 @@ dex-runtime = { version = "0.1.0", path = "crates/dex-runtime" }
 dex-client = { version = "0.1.0", path = "crates/dex-client" }
 dex-acp = { version = "0.1.0", path = "crates/dex-acp" }
 dex-skills = { version = "0.1.0", path = "crates/dex-skills" }
+dex-gui = { path = "crates/dex-gui", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"

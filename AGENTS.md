@@ -11,7 +11,7 @@ cargo test --all-targets       # must pass
 cargo clippy --all-targets -- -D warnings  # must pass
 ```
 
-Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `docs/configuration.md` and `dex doctor`.
+Requires Rust edition 2021 (Cargo 1.88+ because `crates/dex-gui` is edition 2024). Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `docs/configuration.md` and `dex doctor`.
 
 ## Structure
 
@@ -25,6 +25,7 @@ Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX
 - `crates/dex-skills/` — SKILL.md discovery + frontmatter parsing; `Skill` is re-exported via the server's `protocol` module.
 - `crates/dex-session/` — append-only JSONL session store (header, journals, state, loaders); `crates/dex-server/src/session.rs` re-exports it and adds plan persistence + the undo ledger (`changes.rs`).
 - `crates/dex-server/` — the server side with a public API: `daemon/` (axum + SSE), `agent/` (`turn_loop.rs` lifecycle wrapper + `turn_loop/host.rs` dex `AgentHost` adapter, `state.rs`, app compaction backend, `delegate/`), `llm/` (provider clients/adapters, `config/` with provider/model/endpoint resolution, `/model` write-back, `dex doctor`; `prompt.rs` system prompt), `tools/` (unconfined, paths via `workspace::tool_path`; `search.rs` backs `grep`/`find`, `shell.rs` exposes `$DEX_BIN`), `mcp/` (stdio/HTTP/SSE, OAuth, `mcp_servers:` config), `extensions/` (Lua engine), `render/` (headless format/theme; TUI bits behind its `tui` feature), `telemetry/`, `auth/`, `workspace/`. The `dex` binary re-exports these via compat shims (`crate::agent`, `crate::llm`, … still resolve).
+- `crates/dex-gui/` — Rune GUI (library + spike bin). A workspace member but not a default member; the root `dex` links it only behind the `gui` feature (`cargo build --release --features gui`): bare `dex` then opens the GUI, `dex tui` opens the TUI, and all subcommands/args stay on the CLI/TUI side. Rune is pre-release (pinned git rev) and adds ~3k lockfile lines; `cargo update -p smallvec` was needed to unify it.
 - `src/main.rs` — entry, mode resolution, daemon bootstrap
 - `src/cli.rs` — arg parsing / `Mode` (`Default`/`Serve`/`Connect`/`OneShot`/`Tool`/`RunTool`/`Doctor`/`Update`/`Mcp`/`Extensions`/`Usage`/`Help`/`Version`)
 - `src/app/` + `src/client/` — thin-client glue: in-process/daemon bootstrap (`app.rs`), connect/one-shot, `DaemonClient` configuration; the TUI path only talks HTTP+SSE

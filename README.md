@@ -64,9 +64,10 @@ reused to build your own agent.
 
 ## Install
 
-Every `v*` tag builds binaries for `x86_64`/`aarch64` Linux (static musl — runs
-on any distro, no libssl or glibc constraints), `x86_64`/`aarch64` macOS, and
-`x86_64` Windows, and attaches them to the GitHub release.
+Every `v*` tag builds binaries for `x86_64`/`aarch64` Linux (glibc 2.35+),
+`x86_64`/`aarch64` macOS, and `x86_64` Windows, and attaches them to the GitHub
+release. Each is a single binary: bare `dex` opens the GUI, `dex tui` the
+terminal UI (also the fallback on Linux without a display).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install.sh | sh
@@ -77,6 +78,13 @@ curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install
   `DEX_INSTALL_DIR=/usr/local/bin curl -fsSL .../install.sh | sh`
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/sumofbytes/dex/releases).
+
+Requirements: the terminal UI (`dex tui`) needs nothing beyond glibc 2.35+ on
+Linux (musl distros such as Alpine: build from source). The GUI needs a
+graphical session and, on Linux, a Vulkan driver plus Wayland or X11 libraries
+(`libvulkan`, `libwayland-client` or `libX11`/`libxcb`, `libxkbcommon`), which
+desktop distros already ship. If the GUI cannot start, `dex` falls back to the
+TUI. `git` is used for the GUI's worktree and Changes views.
 
 First run needs one thing: a model — the
 [Getting started guide](docs/getting-started.md) walks through it. Copy a

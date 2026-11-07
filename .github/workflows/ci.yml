@@ -27,6 +27,36 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The GUI (`gui` feature, crates/dex-gui) ships in every release binary but is not a default
+  # member, so the main job never compiles it. Check it on all release platforms.
+  gui-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gui-check
+      - name: Install GUI link dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libxkbcommon-dev
+      # Windows compiles only: clippy -D warnings there trips on pre-existing Windows-only
+      # dead code in dex-server (tools/read.rs), which nothing lints today.
+      - run: cargo check -p dex -p dex-gui --features gui --all-targets
+        if: runner.os == 'Windows'
+      - run: cargo clippy -p dex -p dex-gui --features gui --all-targets -- -D warnings
+        if: runner.os != 'Windows'
+      - run: cargo test -p dex-gui -p dex --features gui --lib --bins --tests
+        if: runner.os == 'Linux'
+
   # Portability gate: catches unix-only APIs before they reach a release tag
   # (v0.1.0 failed exactly this way). windows-latest has MSVC preinstalled —
   # same platform release.yml builds on, no cross-compilation needed.
