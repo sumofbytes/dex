@@ -274,7 +274,7 @@ fn terminal(s: &State, k: &Kit) -> El {
         .gap(space::MD)
         .items_center()
         .child(breadcrumb(&dir, k).grow(1.0).min_w(0.0))
-        .child(if !s.term.is_empty() && !s.term_running {
+        .child(if !s.term.is_empty() && !s.term_running() {
             k.interactive(
                 row()
                     .key("term-clear")
@@ -329,7 +329,7 @@ fn terminal(s: &State, k: &Kit) -> El {
             text_input(&s.term_input, k.ty.mono.lh(20.0))
                 .key("term-input")
                 .placeholder(
-                    if s.term_running {
+                    if s.term_running() {
                         "Running…"
                     } else {
                         "Run a command…"

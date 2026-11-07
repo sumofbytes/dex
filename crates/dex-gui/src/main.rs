@@ -52,7 +52,10 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
         s.toggle_tools();
     } else if e.is_command('t') {
         s.toggle_thinking();
-    } else if matches!(e.key, rune::Key::Escape) && s.busy && s.renaming.is_none() && !s.theme_open
+    } else if matches!(e.key, rune::Key::Escape)
+        && s.busy()
+        && s.renaming.is_none()
+        && !s.theme_open
     {
         // Esc stops the running turn (the composer's Stop button does the same).
         s.send_cmd(Cmd::Cancel);
@@ -206,7 +209,7 @@ fn needs_scene(s: &mut State) {
 /// Mid-turn: thinking, a steering message and a follow-up queued.
 fn busy(s: &mut State) {
     sample(s);
-    s.busy = true;
+    s.sending = true;
     s.status = "working…".into();
     s.items.push(Item::Thinking {
         text: "Checking how the client handles reconnects…".into(),

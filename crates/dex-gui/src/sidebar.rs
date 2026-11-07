@@ -218,7 +218,7 @@ fn thread_row_as(
             .any(|n| n.id == sess.session_id && n.kind == NeedKind::Waiting)
     };
     // A running thread keeps its spinner even when it is in the background.
-    let running = s.running.contains(&sess.session_id) || (is_open && s.busy);
+    let running = s.running.contains(&sess.session_id) || (is_open && s.busy());
     let mark = if let Some(kind) = status {
         let color = match kind {
             NeedKind::Waiting => crate::theme::waiting(),

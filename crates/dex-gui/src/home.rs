@@ -76,7 +76,7 @@ pub fn home(s: &State, k: &Kit) -> El {
         .collect();
     projects.sort_unstable();
     projects.dedup();
-    let running = usize::from(s.busy);
+    let running = usize::from(s.busy());
 
     let toggle = IconButton::new(&icons::PANEL)
         .variant(IconButtonVariant::Ghost)

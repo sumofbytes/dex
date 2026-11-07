@@ -160,7 +160,7 @@ fn header(s: &State, k: &Kit) -> El {
                 .key("wt-toggle"),
         );
     }
-    if s.busy {
+    if s.busy() {
         stats = stats.child(Spinner::new().build(k));
     }
     if s.tokens > 0 {
@@ -265,7 +265,7 @@ fn transcript(s: &State, k: &Kit) -> El {
     }
     // A reply streaming (or a turn that has not produced anything yet) has no work block to
     // carry the live row.
-    if s.busy {
+    if s.busy() {
         match s.items.last() {
             Some(Item::Assistant { .. }) => list = list.child(live_row(k, "Replying")),
             Some(Item::User(_)) => list = list.child(live_row(k, "Working")),
@@ -331,7 +331,7 @@ fn live_row(k: &Kit, label: &str) -> El {
 /// still folding on its own, and the row carries a header-like fill so the start of the block
 /// stays findable while its content flows under it.
 fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
-    let live = s.busy && end == s.items.len();
+    let live = s.busy() && end == s.items.len();
     // Collapsed only, in both states; opening survives the turn's end (the same `start`).
     let open = s.open_work.contains(&start);
     let (thoughts, commands, secs) = crate::state::work_summary(&s.items[start..end]);
@@ -694,7 +694,7 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let mode = crate::composer_menu::mode(s, k, layer);
     let model = crate::composer_menu::model(s, k, layer);
 
-    let action = if s.busy {
+    let action = if s.busy() {
         IconButton::new(&icons::STOP)
             .variant(IconButtonVariant::Ghost)
             .label("Stop")

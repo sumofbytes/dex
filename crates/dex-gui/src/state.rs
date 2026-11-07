@@ -195,9 +195,21 @@ pub struct Need {
     pub label: Option<String>,
 }
 
+/// Where the open thread is in its turn: `Idle` -> `Sending` (prompt submitted, daemon has not
+/// confirmed) -> `Working` (the thread is in `State::running`) -> `Idle`. `Working` is not stored
+/// here: it is membership in `running`, so the two can never disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Turn {
+    Idle,
+    Sending,
+    Working,
+}
+
 pub struct State {
     /// Threads with a turn running (open or not).
     pub running: HashSet<String>,
+    /// The open thread submitted a prompt and waits for `TurnStarted` (the `Sending` phase).
+    pub sending: bool,
     /// Threads waiting on the user, newest first.
     pub needs: Vec<Need>,
     pub sessions: Vec<SessionInfo>,
@@ -207,7 +219,6 @@ pub struct State {
     pub edit: TextEdit,
     /// The composer text as of the last poll: a change asks for one more frame (see `poll`).
     pub edit_seen: String,
-    pub busy: bool,
     pub status: String,
     pub info: Info,
     pub model: Option<String>,
@@ -260,7 +271,6 @@ pub struct State {
     /// started (the text Ctrl+R then searches for).
     pub term_hist: Option<(usize, String)>,
     pub term_cwd: Option<String>,
-    pub term_running: bool,
     pub wake: Option<Waker>,
     pub inbox: Arc<Inbox>,
     pub cmds: Option<mpsc::UnboundedSender<Cmd>>,
@@ -277,7 +287,7 @@ impl Default for State {
             items: Vec::new(),
             edit: TextEdit::default(),
             edit_seen: String::new(),
-            busy: false,
+            sending: false,
             status: "starting…".into(),
             info: Info::default(),
             model: None,
@@ -318,7 +328,6 @@ impl Default for State {
             term_history: Vec::new(),
             term_hist: None,
             term_cwd: None,
-            term_running: false,
             wake: None,
             inbox: Arc::default(),
             cmds: None,
@@ -334,6 +343,34 @@ impl State {
     }
 
     /// Directory new threads run in and the footer shows.
+    /// The open thread's turn phase.
+    pub fn turn(&self) -> Turn {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|c| self.running.contains(c))
+        {
+            Turn::Working
+        } else if self.sending {
+            Turn::Sending
+        } else {
+            Turn::Idle
+        }
+    }
+
+    /// A turn is in flight on the open thread (sending or working).
+    pub fn busy(&self) -> bool {
+        self.turn() != Turn::Idle
+    }
+
+    /// A terminal command is running: the last block has not ended.
+    pub fn term_running(&self) -> bool {
+        matches!(
+            self.term.last().map(|b| &b.status),
+            Some(TermStatus::Running { .. })
+        )
+    }
+
     pub fn cwd(&self) -> String {
         self.project
             .clone()
@@ -468,7 +505,7 @@ impl State {
         self.open_work.clear();
         self.tokens = 0;
         self.cost = 0.0;
-        self.busy = false;
+        self.sending = false;
     }
 
     pub fn apply(&mut self, msg: Msg) {
@@ -513,7 +550,6 @@ impl State {
                 if let Some(b) = self.term.last_mut() {
                     b.status = TermStatus::Done { code, secs };
                 }
-                self.term_running = false;
             }
             Msg::Scanned { cwd, files, patch } => {
                 if cwd == self.cwd() {
@@ -544,16 +580,13 @@ impl State {
                     self.apply_event(ev);
                 }
                 self.finish_stream();
-                self.busy = self
-                    .running
-                    .contains(&self.current.clone().unwrap_or_default());
             }
             Msg::Event(ev) => self.apply_event(ev),
             Msg::TurnStarted(id) => {
                 self.needs.retain(|n| n.id != id);
                 // For a brand-new thread `Opened` came first and saw nothing running yet.
                 if self.current.as_deref() == Some(id.as_str()) {
-                    self.busy = true;
+                    self.sending = false;
                 }
                 self.running.insert(id);
             }
@@ -571,8 +604,14 @@ impl State {
     /// thread only updates its sidebar state.
     fn apply_turn(&mut self, id: String, ev: StreamEvent) {
         if self.current.as_deref() == Some(id.as_str()) {
+            // The turn ends here unless a queued follow-up chains another one on the same stream.
+            let ends = match &ev {
+                StreamEvent::TurnComplete { .. } => !self.queue.iter().any(|q| q.followup),
+                StreamEvent::TurnFailed { .. } => true,
+                _ => false,
+            };
             self.apply_event(ev);
-            if !self.busy {
+            if ends {
                 self.running.remove(&id);
             }
             return;
@@ -723,13 +762,12 @@ impl State {
             }
             StreamEvent::TurnComplete { .. } => {
                 self.finish_stream();
-                // A queued follow-up chains another turn on the same stream.
-                self.busy = self.queue.iter().any(|q| q.followup);
+                self.sending = false;
                 self.status = "ready".into();
             }
             StreamEvent::TurnFailed { error } => {
                 self.finish_stream();
-                self.busy = false;
+                self.sending = false;
                 self.status = "ready".into();
                 self.items.push(Item::Error(error));
             }
@@ -866,7 +904,7 @@ impl State {
     /// into a new block. Not a PTY: interactive programs (editors, pagers) do not work.
     pub fn run_term(&mut self) {
         let cmd = self.term_input.text.trim().to_string();
-        if cmd.is_empty() || self.term_running {
+        if cmd.is_empty() || self.term_running() {
             return;
         }
         self.term_hist = None;
@@ -904,7 +942,6 @@ impl State {
                 started: std::time::Instant::now(),
             },
         });
-        self.term_running = true;
         let (inbox, wake) = (self.inbox.clone(), self.wake.clone());
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
@@ -960,7 +997,7 @@ impl State {
 
     /// Forget the terminal's history, unless a command is still running.
     pub fn clear_term(&mut self) {
-        if !self.term_running {
+        if !self.term_running() {
             self.term.clear();
         }
     }
@@ -1040,7 +1077,7 @@ impl State {
         if text.is_empty() {
             return;
         }
-        if !self.busy {
+        if !self.busy() {
             return self.submit();
         }
         self.edit.replace_text("");
@@ -1069,7 +1106,7 @@ impl State {
         if text.is_empty() {
             return;
         }
-        if self.busy {
+        if self.busy() {
             // Enter mid-turn steers: the agent reads it before its next model call.
             self.edit.replace_text("");
             self.queue.push(Queued {
@@ -1082,7 +1119,7 @@ impl State {
         self.page = Page::Thread;
         self.edit.replace_text("");
         self.items.push(Item::User(text.clone()));
-        self.busy = true;
+        self.sending = true;
         self.status = "working…".into();
         self.send_cmd(Cmd::Send {
             cwd: self.cwd(),
@@ -1231,9 +1268,9 @@ mod tests {
             id: "n".into(),
             replay: Vec::new(),
         });
-        assert!(!s.busy);
+        assert!(!s.busy());
         s.apply(Msg::TurnStarted("n".into()));
-        assert!(s.busy && s.running.contains("n"));
+        assert!(s.busy() && s.running.contains("n"));
         s.apply(Msg::Turn {
             id: "n".into(),
             ev: StreamEvent::TurnComplete {
@@ -1242,7 +1279,7 @@ mod tests {
                 cached: None,
             },
         });
-        assert!(!s.busy && !s.running.contains("n"));
+        assert!(!s.busy() && !s.running.contains("n"));
     }
 
     #[test]
@@ -1419,18 +1456,18 @@ mod tests {
         };
         s.term_input.replace_text("echo hi; echo err >&2");
         s.run_term();
-        assert!(s.term_running);
+        assert!(s.term_running());
         for _ in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(50));
             let msgs: Vec<Msg> = std::mem::take(&mut *s.inbox.0.lock().unwrap());
             for m in msgs {
                 s.apply(m);
             }
-            if !s.term_running {
+            if !s.term_running() {
                 break;
             }
         }
-        assert!(!s.term_running);
+        assert!(!s.term_running());
         assert_eq!(s.term.len(), 1);
         assert_eq!(s.term[0].lines, ["hi", "err"]);
         assert!(matches!(s.term[0].status, TermStatus::Done { code: 0, .. }));
