@@ -455,8 +455,10 @@ async fn sweep_drops_dead_clients() {
     mgr.insert_client("dead", fake_client(vec![], false, true))
         .await;
     mgr.sweep_once().await;
-    assert!(!mgr.clients.read().await.contains_key("dead"));
-    assert!(mgr.down.read().await.contains_key("dead"));
+    assert!(matches!(
+        mgr.conns.read().await.get("dead"),
+        Some(super::manager::Conn::Down(_))
+    ));
 }
 
 #[tokio::test]
