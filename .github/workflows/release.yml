@@ -44,22 +44,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Static Linux builds: no libssl/glibc constraints, run on any distro.
+          # Linux is glibc, not static musl: the GUI loads Vulkan/Wayland/X11
+          # at runtime, which a static binary cannot do. 22.04 keeps the glibc
+          # floor at 2.35.
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            cross: true
-          - os: ubuntu-22.04
-            target: aarch64-unknown-linux-musl
-            cross: true
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-            cross: false
           - os: macos-latest
             target: x86_64-apple-darwin
-            cross: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            cross: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -73,35 +70,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install zig (Linux musl cross-linker)
-        if: matrix.cross
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
-      - name: Install cargo-zigbuild (Linux)
-        if: matrix.cross
-        run: cargo install cargo-zigbuild --locked
-      - name: Install qemu-user-static (Linux)
-        if: matrix.cross
-        run: sudo apt-get -y -q install qemu-user-static
       - name: Build
         shell: bash
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        # `gui`: bare `dex` opens the GUI, `dex tui` the TUI — one binary.
+        run: cargo build --release --target ${{ matrix.target }} --features gui
       - name: Smoke test
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/dex"
           [ -f "$bin.exe" ] && bin="$bin.exe"
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            qemu-aarch64-static "$bin" --version
-          else
-            "$bin" --version
-          fi
+          "$bin" --version
       - name: Package
         shell: bash
         run: |

@@ -237,9 +237,9 @@ fn crates_toml_tracks_dex(text: &str) -> bool {
 /// Release target triple for this build, matching `release.yml`'s matrix.
 fn release_target() -> Result<&'static str, String> {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Ok("x86_64-unknown-linux-musl")
+        Ok("x86_64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        Ok("aarch64-unknown-linux-musl")
+        Ok("aarch64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Ok("aarch64-apple-darwin")
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
@@ -351,10 +351,10 @@ mod tests {
 
     #[test]
     fn checksum_parsing_matches_sha256sum_format() {
-        let sums = "abc123  dex-v0.4.2-x86_64-unknown-linux-musl.tar.gz\n\
+        let sums = "abc123  dex-v0.4.2-x86_64-unknown-linux-gnu.tar.gz\n\
                     def456  dex-v0.4.2-aarch64-apple-darwin.tar.gz\n";
         assert_eq!(
-            checksum_for(sums, "dex-v0.4.2-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            checksum_for(sums, "dex-v0.4.2-x86_64-unknown-linux-gnu.tar.gz").as_deref(),
             Some("abc123")
         );
         assert_eq!(checksum_for(sums, "missing.tar.gz"), None);

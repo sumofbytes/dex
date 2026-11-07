@@ -369,6 +369,7 @@ fn print_help() {
         run <tool> k=v...         one-shot tool (read, ls, bash, write, edit, grep, find)\n  \
           doctor                    show resolved provider/model config + origins\n  \
           usage <id|path>           plot token usage per model call from a session's event journal\n  \
+          tui                       open the terminal UI (bare `dex` opens the GUI when built with it)\n  \
           runtime [graph]           print the resolved runtime-slot graph (harness.slots)\n  \
           mcp [status|login|logout]   MCP OAuth for HTTP servers (status|login <server>|logout <server>)\n  \
         update [--models|--all]   update dex itself; --models refreshes the model catalog\n  \
@@ -734,7 +735,21 @@ fn run_auth(action: &str, provider: Option<&str>) {
     }
 }
 
+/// Bare `dex` opens the GUI when built with `gui`; any argument (`dex tui`, subcommands, flags)
+/// or a Linux session without a display keeps the TUI and the CLI.
+#[cfg(feature = "gui")]
+fn gui_default(argv: &[std::ffi::OsString]) -> bool {
+    let headless = cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none();
+    argv.len() == 1 && !headless
+}
+
 pub fn run() {
+    #[cfg(feature = "gui")]
+    if gui_default(&std::env::args_os().collect::<Vec<_>>()) {
+        return dex_gui::run();
+    }
     crate::runtime::logging::init();
     #[cfg(feature = "tui")]
     crate::ui::mark_launch_start();
@@ -902,6 +917,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gui_is_default_only_for_bare_dex() {
+        let argv = |a: &[&str]| a.iter().map(Into::into).collect::<Vec<_>>();
+        std::env::set_var("DISPLAY", ":0");
+        assert!(gui_default(&argv(&["dex"])));
+        assert!(!gui_default(&argv(&["dex", "tui"])));
+        assert!(!gui_default(&argv(&["dex", "serve"])));
+    }
 
     #[test]
     fn schema_surface_matches_docs() {

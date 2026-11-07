@@ -2,13 +2,12 @@
 name = "dex-gui"
 version = "0.0.0"
 edition = "2024"
-description = "Spike: native GUI client for the dex daemon, built on Rune"
+description = "Native GUI client for the dex daemon, built on Rune"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Standalone workspace: Rune is pre-release and pulls a large GPU/windowing
-# tree, so it stays out of dex's workspace, lockfile and CI.
-[workspace]
+# Rune is pre-release and pulls a large GPU/windowing tree: this crate is a workspace member
+# but not a default member, and the root `dex` package links it only behind its `gui` feature.
 
 [dependencies]
 dex-client = { path = "../dex-client" }

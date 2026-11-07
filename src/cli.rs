@@ -293,6 +293,8 @@ pub fn resolve_mode(args: &Args) -> Mode {
                 session: args.rest[1].clone(),
             }
         }
+        // Explicit TUI, so a GUI-default build (`gui` feature) can still open it.
+        Some("tui") if args.rest.len() == 1 => Mode::Default,
         Some("runtime") => {
             // Strict like `usage`: extra args are an error, not a prompt.
             if args.rest.len() > 2 {
@@ -577,6 +579,16 @@ mod tests {
             Mode::Auth { action, .. } => assert_eq!(action, "__invalid__"),
             other => panic!("expected invalid Auth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tui_subcommand_is_the_default_mode() {
+        assert_eq!(resolve_mode(&args_with_rest(&["tui"])), Mode::Default);
+        // With extra words it stays a one-shot prompt.
+        assert!(matches!(
+            resolve_mode(&args_with_rest(&["tui", "fix", "it"])),
+            Mode::OneShot { .. }
+        ));
     }
 
     #[test]

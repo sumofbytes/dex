@@ -43,7 +43,7 @@ aarch64 | arm64) arch="aarch64" ;;
 esac
 
 case "$os" in
-linux) TARGET="${arch}-unknown-linux-musl" ;;
+linux) TARGET="${arch}-unknown-linux-gnu" ;;
 darwin) TARGET="${arch}-apple-darwin" ;;
 esac
 

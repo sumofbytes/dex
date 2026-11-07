@@ -64,9 +64,10 @@ reused to build your own agent.
 
 ## Install
 
-Every `v*` tag builds binaries for `x86_64`/`aarch64` Linux (static musl — runs
-on any distro, no libssl or glibc constraints), `x86_64`/`aarch64` macOS, and
-`x86_64` Windows, and attaches them to the GitHub release.
+Every `v*` tag builds binaries for `x86_64`/`aarch64` Linux (glibc 2.35+),
+`x86_64`/`aarch64` macOS, and `x86_64` Windows, and attaches them to the GitHub
+release. Each is a single binary: bare `dex` opens the GUI, `dex tui` the
+terminal UI (also the fallback on Linux without a display).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install.sh | sh
