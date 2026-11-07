@@ -240,7 +240,10 @@ fn thinking_stream_coalesces_and_closes_on_assistant_text() {
     for chunk in ["Let me ", "think."] {
         append_sink_line(&mut app, crate::protocol::SinkLine::Thinking(chunk.into()));
     }
-    assert!(app.thinking_open, "streaming deltas keep the block open");
+    assert!(
+        app.tail.is_thinking(),
+        "streaming deltas keep the block open"
+    );
     // The thinking bumps reset the shared throttle clock; reopen the
     // window so the assistant delta renders immediately.
     app.stream_last_flush = Instant::now() - STREAM_FLUSH_INTERVAL - Duration::from_millis(1);
@@ -249,7 +252,7 @@ fn thinking_stream_coalesces_and_closes_on_assistant_text() {
         crate::protocol::SinkLine::Assistant("done".into()),
     );
     assert!(
-        !app.thinking_open,
+        !app.tail.is_thinking(),
         "assistant text closes the thinking block"
     );
     assert_eq!(app.transcript.len(), 2);
@@ -261,7 +264,7 @@ fn thinking_stream_coalesces_and_closes_on_assistant_text() {
         &app.transcript[1],
         TranscriptBlock::Assistant { .. }
     ));
-    assert!(app.assistant_open);
+    assert!(app.tail.is_assistant());
 }
 
 #[test]
@@ -272,7 +275,7 @@ fn thinking_only_deltas_stay_in_one_block() {
     }
     assert_eq!(app.transcript.len(), 1);
     assert!(matches!(&app.transcript[0], TranscriptBlock::Thinking { text, .. } if text == "abc"));
-    assert!(app.thinking_open);
+    assert!(app.tail.is_thinking());
 }
 
 #[test]
@@ -294,7 +297,7 @@ fn assistant_lines_buffer_until_the_throttle_window() {
         crate::protocol::SinkLine::Assistant("world".into()),
     );
     assert!(app.assistant_pending.is_empty());
-    assert!(app.assistant_open);
+    assert!(app.tail.is_assistant());
     // Two complete markdown lines inside one window keep their line
     // break (the daemon coalescer joins with '\n' as well).
     let TranscriptBlock::Assistant { lines, .. } = &app.transcript[0] else {
@@ -353,7 +356,7 @@ fn heading_keeps_top_air_across_flush_windows() {
         &mut app,
         crate::protocol::SinkLine::Assistant("intro text".into()),
     );
-    assert!(app.assistant_open);
+    assert!(app.tail.is_assistant());
     app.stream_last_flush = due();
     append_sink_line(
         &mut app,
@@ -410,9 +413,9 @@ fn thinking_closes_on_user_prompt() {
     // Steering-style interleave: a user prompt lands mid-turn.
     let mut app = test_app();
     append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("h".into()));
-    assert!(app.thinking_open);
+    assert!(app.tail.is_thinking());
     render_user_prompt(&mut app, "steer");
-    assert!(!app.thinking_open);
+    assert!(!app.tail.is_thinking());
 }
 
 #[test]
@@ -436,7 +439,7 @@ fn thinking_close_records_elapsed_duration() {
 #[test]
 fn activity_block_trails_the_tail_then_settles() {
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     start_activity(&mut app);
     assert!(matches!(
         app.transcript.last(),
@@ -526,7 +529,7 @@ fn selection_above_retrailed_activity_survives_streaming() {
     // spinner re-trails to the tail.
     for (sel_row, survives) in [(1, true), (6, false), (7, false)] {
         let mut app = test_app();
-        app.busy = true;
+        app.turn.start();
         app.transcript = vec![
             TranscriptBlock::Assistant {
                 stamp: 0,
@@ -595,7 +598,7 @@ fn selection_above_retrailed_activity_survives_streaming() {
 #[test]
 fn thinking_coalesces_behind_activity_and_closes_with_elapsed() {
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     start_activity(&mut app);
     append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("a".into()));
     append_sink_line(&mut app, crate::protocol::SinkLine::Thinking("b".into()));
@@ -629,7 +632,7 @@ fn thinking_coalesces_behind_activity_and_closes_with_elapsed() {
 #[test]
 fn tool_output_completes_open_tool_behind_activity() {
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     start_activity(&mut app);
     append_sink_line(
         &mut app,
@@ -830,7 +833,7 @@ fn chunked_replay_matches_one_shot_rebuild() {
 #[test]
 fn assistant_coalesces_behind_activity() {
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     start_activity(&mut app);
     app.stream_last_flush = Instant::now() - std::time::Duration::from_secs(1);
     append_sink_line(&mut app, crate::protocol::SinkLine::Assistant("one".into()));
@@ -1078,7 +1081,7 @@ fn reset_session_state_clears_per_session_state() {
 
     assert!(app.messages.len() <= 1);
     assert!(app.transcript.is_empty());
-    assert!(!app.assistant_open);
+    assert!(!app.tail.is_assistant());
     assert!(app.autoscroll);
     assert_eq!(app.scroll, 0);
     assert_eq!(app.tool_state.total_usage, 0);
@@ -1097,7 +1100,7 @@ fn reset_session_state_clears_per_session_state() {
 #[test]
 fn slash_new_refuses_while_busy() {
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     crate::ui::slash::handle_slash(&mut app, "/new");
     assert!(
             app.transcript
@@ -1270,7 +1273,7 @@ fn a_mid_turn_steer_does_not_reset_the_tool_count() {
         );
     };
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     tool(&mut app); // a previous turn's tool
     start_activity(&mut app);
     tool(&mut app);

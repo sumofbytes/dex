@@ -30,7 +30,7 @@ impl ComposerView {
         f.render_widget(Clear, band);
         // Bare text on the terminal background between the two hairline rules
         // (see `input_block`); the busy state dims the text.
-        let input_style = if app.busy || !app.pending_approvals.is_empty() {
+        let input_style = if app.turn.is_active() || !app.pending_approvals.is_empty() {
             fg(theme::muted_fg())
         } else {
             fg(theme::surface_fg())

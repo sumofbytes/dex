@@ -46,7 +46,7 @@ pub(crate) fn push_info_line(app: &mut App, line: Line<'static>) {
 pub(crate) fn push_info_lines(app: &mut App, lines: Vec<Line<'static>>) {
     flush_assistant(app);
     close_thinking(app);
-    app.assistant_open = false;
+    app.tail.close_assistant();
     app.transcript.push(TranscriptBlock::Info {
         stamp: 0,
         lines: lines.into_iter().map(indent_transcript_line).collect(),
@@ -79,7 +79,7 @@ pub(crate) const BANNER: &str = concat!("DEX (v", env!("CARGO_PKG_VERSION"), ")"
 pub(crate) fn push_banner(app: &mut App, extra: Vec<Line<'static>>) {
     flush_assistant(app);
     close_thinking(app);
-    app.assistant_open = false;
+    app.tail.close_assistant();
     // Subtle by design: the theme-aware muted foreground instead of a bright
     // accent, so the banner reads as quiet chrome on light/dark terminals.
     let style = fg(theme::muted_fg());
@@ -154,7 +154,7 @@ pub(crate) fn flush_assistant(app: &mut App) {
             .map(indent_transcript_line)
             .collect();
     app.assistant_pending.clear();
-    if app.assistant_open {
+    if app.tail.is_assistant() {
         if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
             lines.extend(new_lines);
             *stamp = stamp.wrapping_add(1);
@@ -165,7 +165,7 @@ pub(crate) fn flush_assistant(app: &mut App) {
         stamp: 0,
         lines: new_lines,
     });
-    app.assistant_open = true;
+    app.tail.open_assistant();
     // New block landed after the trailing spinner; re-trail it so the
     // "● Working" indicator stays last during a turn. No-op when idle.
     move_activity_to_tail(app);
@@ -219,7 +219,7 @@ fn trim_thinking_head(app: &mut App) {
 /// inter-block gutter stays canonical (blank runs collapse to one air row).
 fn append_assistant(app: &mut App, s: String) {
     if s.trim().is_empty() {
-        if app.assistant_open {
+        if app.tail.is_assistant() {
             flush_assistant(app);
             if let Some(TranscriptBlock::Assistant { lines, stamp }) = content_tail_mut(app) {
                 if !lines.last().is_some_and(line_is_air) {
@@ -231,7 +231,7 @@ fn append_assistant(app: &mut App, s: String) {
         }
         return;
     }
-    if !app.assistant_open && app.assistant_pending.is_empty() {
+    if !app.tail.is_assistant() && app.assistant_pending.is_empty() {
         app.assistant_gap.reset();
     }
     let chunk = app.assistant_gap.normalize(&s);
@@ -262,7 +262,7 @@ fn append_thinking(app: &mut App, s: String) {
     if s.is_empty() {
         return;
     }
-    app.assistant_open = false;
+    app.tail.close_assistant();
     // (Gate read before the mutable borrow; clock reset after it.)
     let due = stream_flush_due(app);
     let mut over_cap = false;
@@ -286,16 +286,15 @@ fn append_thinking(app: &mut App, s: String) {
     if due {
         note_stream_flush(app);
     }
-    if !app.thinking_open {
+    if !app.tail.start_thinking() {
         // Spinner hides while thinking streams; re-wrap it away.
         bump_open_activity(app);
     }
-    app.thinking_open = true;
 }
 
 /// `SinkLine::ToolInput`: start a tool step (pending until its output lands).
 fn append_tool_input(app: &mut App, id: String, input: String) {
-    app.assistant_open = false;
+    app.tail.close_assistant();
     let mut it = input.splitn(2, ' ');
     let name = it.next().unwrap_or("").to_string();
     let arg = it.next().unwrap_or("").to_string();
@@ -400,7 +399,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
             })
             .collect()
     };
-    app.assistant_open = false;
+    app.tail.close_assistant();
     // Complete the tool block started by ToolInput if it is still open.
     if let Some(i) = open_idx {
         if let Some(TranscriptBlock::Tool {
@@ -444,7 +443,7 @@ fn append_tool_output(app: &mut App, sl: SinkLine) -> bool {
 /// the id dim, so a delegation stands out from plain notes without raw
 /// bracket syntax.
 fn append_system(app: &mut App, s: String) {
-    app.assistant_open = false;
+    app.tail.close_assistant();
     let line = match agent_lifecycle(&s) {
         Some((glyph, rest)) => {
             let (who, tail) = rest.split_once("] ").unwrap_or((rest, ""));
@@ -471,7 +470,7 @@ fn append_system(app: &mut App, s: String) {
 }
 
 fn append_error(app: &mut App, s: String) {
-    app.assistant_open = false;
+    app.tail.close_assistant();
     app.transcript.push(TranscriptBlock::Error {
         stamp: 0,
         line: indent_transcript_line(Line::from(vec![
@@ -527,8 +526,7 @@ pub(crate) fn append_sink_line(app: &mut App, sl: SinkLine) {
 /// stamp bump forces a re-wrap so an expanded (Ctrl+T) block shows any text
 /// that arrived since the last throttled bump.
 pub(crate) fn close_thinking(app: &mut App) {
-    if app.thinking_open {
-        app.thinking_open = false;
+    if app.tail.end_thinking() {
         // Working reappears once thinking settles; re-wrap the spinner.
         bump_open_activity(app);
         // Stamp bump forces a re-wrap so the settled row shows the elapsed
@@ -593,7 +591,7 @@ fn drop_shifted_selection(app: &mut App, pos: usize) {
 /// every busy-time append; no-op without a running turn (settled blocks
 /// from finished turns stay where they settled).
 pub(crate) fn move_activity_to_tail(app: &mut App) {
-    if !app.busy {
+    if !app.turn.is_active() {
         return;
     }
     if matches!(
@@ -726,7 +724,7 @@ pub(crate) fn scroll_transcript(app: &mut App, delta: i32) {
 pub(crate) fn render_user_prompt(app: &mut App, line: &str) {
     flush_assistant(app);
     close_thinking(app);
-    app.assistant_open = false;
+    app.tail.close_assistant();
     // No background is stored here: `wrap_block` pads every row to the
     // full width and frames the box with the composer's top/bottom
     // hairlines at wrap time; spacing is the inter-block gap.
@@ -758,8 +756,7 @@ pub(crate) fn rebuild_transcript(app: &mut App) {
     app.selection = None;
     app.assistant_pending.clear();
     app.assistant_gap.reset();
-    app.assistant_open = false;
-    app.thinking_open = false;
+    app.tail.reset();
     // The message vec moves out instead of cloning: none of the render
     // paths below touch `app.messages` (streaming lands in transcript
     // blocks), so the restore at the end is exact (§1).

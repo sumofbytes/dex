@@ -78,7 +78,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
                     }
                     Ok(WorkerMessage::Stream(event)) => {
                         streamed = true;
-                        if remote.app.cancel_requested {
+                        if remote.app.turn.is_cancelling() {
                             match &event {
                                 StreamEvent::TurnComplete { .. }
                                 | StreamEvent::TurnFailed { .. } => {
@@ -105,9 +105,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
                         excluded,
                     }) => {
                         streamed = true;
-                        remote.shell_running = false;
-                        remote.shell_cancel_requested = false;
-                        remote.app.cancel_presses = 0;
+                        remote.shell.finish();
                         finish_shell_command(
                             &mut remote,
                             &command,
@@ -123,7 +121,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
 
             // A `!` shell run animates like a turn even with no agent turn in
             // flight (otherwise a long shell looks frozen).
-            let busy = remote.app.busy || remote.shell_running;
+            let busy = remote.app.turn.is_active() || remote.shell.is_active();
             // The idle poller pauses while anything streams (the turn's own
             // SSE carries those rows) and resumes at the published cursor.
             remote.busy_poll.store(busy, Ordering::SeqCst);

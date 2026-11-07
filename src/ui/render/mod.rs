@@ -345,7 +345,7 @@ pub(crate) fn view(f: &mut ratatui::Frame, app: &mut App) {
     let (input_lines, input_cursor) = render_input(
         &app.input,
         input_content_width(area.width),
-        app.busy || !app.pending_approvals.is_empty(),
+        app.turn.is_active() || !app.pending_approvals.is_empty(),
     );
     let input_rows = input_lines.len() as u16;
     let layout =

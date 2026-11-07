@@ -84,7 +84,11 @@ pub(crate) fn slash_suggestions(app: &App) -> Vec<(String, String)> {
     // composer holds a line recalled by the history walk (history_index is
     // Some), Up/Down must keep walking history instead of getting trapped
     // over a recalled "/clear" — see popup_open().
-    if app.busy || app.history_index.is_some() || !input.starts_with('/') || input.contains('\n') {
+    if app.turn.is_active()
+        || app.history_index.is_some()
+        || !input.starts_with('/')
+        || input.contains('\n')
+    {
         return Vec::new();
     }
     let key = SlashKey {

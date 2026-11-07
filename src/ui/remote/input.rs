@@ -510,8 +510,7 @@ pub(crate) fn rebuild_remote_from_messages(
     remote.app.selection = None;
     remote.app.assistant_pending.clear();
     remote.app.assistant_gap.reset();
-    remote.app.assistant_open = false;
-    remote.app.thinking_open = false;
+    remote.app.tail.reset();
     let mut opened = std::collections::HashSet::new();
     if msgs.len() > 1 {
         // Skip the leading system message (never rendered).
@@ -594,7 +593,7 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     let app = &mut remote.app;
     let tone = if failed {
         TurnTone::Failed
-    } else if app.cancel_requested {
+    } else if app.turn.is_cancelling() {
         TurnTone::Cancelled
     } else {
         TurnTone::Done
@@ -604,7 +603,7 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
     flush_assistant(app);
     // If the turn was cancelled, restore queued steering/follow-ups to the
     // composer so the user can retry (mirrors old local `event.rs` logic).
-    if app.cancel_requested {
+    if app.turn.is_cancelling() {
         let mut restored = Vec::new();
         restored.append(&mut app.pending_steering);
         restored.append(&mut app.pending_followups);
@@ -620,9 +619,7 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
         deny_all_approvals(app);
         resolve_all_questions(app);
     }
-    app.busy = false;
-    app.cancel_requested = false;
-    app.cancel_presses = 0;
+    app.turn.finish();
     // A turn can end right after thinking (cancel, failure before any text);
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);

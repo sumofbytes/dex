@@ -262,7 +262,7 @@ fn multiline_pending_steer_renders_each_source_line() {
     // chars, so feeding the whole text to one badge row used to flatten
     // it into a single raw line.
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     app.pending_steering
         .push("first steer line\nsecond steer line".into());
     app.pending_followups.push("follow one\ntwo".into());
@@ -314,7 +314,7 @@ fn long_multiline_queue_is_capped_per_item() {
     // `…` row, keeping the strip (and the layout that sizes from it)
     // within one terminal's height.
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     let paste = (1..=20)
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
@@ -358,7 +358,7 @@ fn full_queue_height_stays_bounded() {
     // plus the tail) must still fit a standard terminal with the
     // composer and footer intact.
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     let ten = (1..=10)
         .map(|i| format!("row {i}"))
         .collect::<Vec<_>>()
@@ -387,7 +387,7 @@ fn degenerate_layout_keeps_composer_and_footer() {
     // When the queue can't fit (short terminal), the strip yields
     // first — a vanished composer leaves the agent uncontrollable.
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     let ten = (1..=10)
         .map(|i| format!("row {i}"))
         .collect::<Vec<_>>()
@@ -567,7 +567,7 @@ fn closed_thinking_settles_to_thought_for_duration() {
 #[test]
 fn activity_block_animates_then_settles_to_worked_for() {
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     app.tick = 2; // animated frame for this tick is "● Working .."
     app.transcript = vec![super::super::TranscriptBlock::Activity {
         stamp: 0,
@@ -612,7 +612,7 @@ fn activity_block_animates_then_settles_to_worked_for() {
         "{painted:?}"
     );
 
-    app.busy = false;
+    app.turn.finish();
     app.transcript[0] = super::super::TranscriptBlock::Activity {
         stamp: 1,
         started: Instant::now(),
@@ -664,7 +664,7 @@ fn settled_thinking_stays_frozen_while_a_new_block_streams() {
             elapsed: None,
         },
     ];
-    app.thinking_open = true;
+    app.tail = crate::ui::tail::Tail::Thinking;
     app.tick = 2; // animated frame for this tick is "◌ Thinking .."
     let backend = TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -1521,7 +1521,7 @@ fn composer_shows_cursor_while_busy() {
     let backend = TestBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
     let mut app = test_app();
-    app.busy = true;
+    app.turn.start();
     app.input = InputField::from_text("steer left");
     terminal.draw(|f| view(f, &mut app)).expect("frame");
     let input_rows = render_input(&app.input, input_content_width(area.width), false)
@@ -3406,7 +3406,7 @@ fn every_block_is_separated_by_one_blank_row() {
 fn working_row_names_the_running_call_and_the_interrupt_key() {
     let mut app = test_app();
     app.transcript.clear();
-    app.busy = true;
+    app.turn.start();
     super::super::start_activity(&mut app);
     super::super::append_sink_line(
         &mut app,
@@ -3441,7 +3441,7 @@ fn settled_summary_reflects_how_the_turn_ended() {
     ] {
         let mut app = test_app();
         app.transcript.clear();
-        app.busy = true;
+        app.turn.start();
         super::super::start_activity(&mut app);
         super::super::settle_activity(&mut app, tone);
         let super::super::TranscriptBlock::Activity {

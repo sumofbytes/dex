@@ -22,10 +22,12 @@ pub(crate) mod input;
 pub(crate) mod mention;
 pub(crate) mod metrics;
 pub(crate) mod osc7501;
+pub(crate) mod phase;
 pub(crate) mod remote;
 pub(crate) mod render;
 pub(crate) mod slash;
 pub(crate) mod status;
+pub(crate) mod tail;
 pub(crate) mod wrapping;
 
 pub(crate) use self::input::InputField;

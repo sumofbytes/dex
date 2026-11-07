@@ -71,13 +71,12 @@ pub(crate) struct RemoteApp {
     pub(crate) ceiling: PermissionMode,
     pub(crate) worker_tx: mpsc::Sender<WorkerMessage>,
     pub(crate) worker_rx: mpsc::Receiver<WorkerMessage>,
-    /// A `!`/`!!` shell run is in flight on the worker (one bash at a
+    /// Run phase of the `!`/`!!` shell on the worker (one bash at a
     /// time — a second is refused until this one finishes). Independent of
-    /// `app.busy`: a shell may overlap an agent turn.
-    pub(crate) shell_running: bool,
-    /// A cancel for the in-flight shell was already requested (second
-    /// Ctrl+C force-quits instead of re-sending, mirroring the turn path).
-    pub(crate) shell_cancel_requested: bool,
+    /// `app.turn.is_active()`: a shell may overlap an agent turn.
+    /// Cancelling means a cancel was already sent (second Ctrl+C
+    /// force-quits instead of re-sending, mirroring the turn path).
+    pub(crate) shell: crate::ui::phase::Phase,
     /// Shared with the active worker so approvals arriving after a cancel
     /// request are denied instead of parking the turn on the overlay.
     pub(crate) cancel_flag: Arc<AtomicBool>,

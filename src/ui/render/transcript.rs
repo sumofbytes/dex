@@ -244,7 +244,7 @@ fn wrap_dirty_blocks(app: &mut App, width: u16, mark: &mut impl FnMut(usize)) {
             continue;
         }
         let block = &app.transcript[idx];
-        let rows = wrap_block(block, width, app.show_thinking, app.thinking_open);
+        let rows = wrap_block(block, width, app.show_thinking, app.tail.is_thinking());
         app.wrapped_cache[idx] = WrappedBlock {
             stamp: block.stamp(),
             rows,
@@ -430,7 +430,7 @@ impl TranscriptView {
         // instead of walking the cache.
         let mut thinking_row: Option<usize> = None;
         let mut activity_row: Option<usize> = None;
-        if (app.thinking_open && !app.show_thinking) || app.busy {
+        if (app.tail.is_thinking() && !app.show_thinking) || app.turn.is_active() {
             if let Some(tail) = app.transcript.len().checked_sub(1) {
                 let tail_open = matches!(
                     &app.transcript[tail],
@@ -446,7 +446,7 @@ impl TranscriptView {
                     // the last display row.
                     activity_row = Some(app.display_cache.len() - 1);
                 }
-                if app.thinking_open && !app.show_thinking {
+                if app.tail.is_thinking() && !app.show_thinking {
                     if let Some(idx) = tail.checked_sub(usize::from(tail_open)) {
                         if matches!(
                             &app.transcript[idx],
