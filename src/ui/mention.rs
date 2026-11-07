@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn popup_stays_available_while_a_turn_runs() {
         let mut app = App::test_app();
-        app.busy = true;
+        app.turn.start();
         answered(&mut app, "also check @ma", "ma", &[("main.rs", false)]);
         assert_eq!(suggestions(&app).len(), 1);
         assert!(complete(&mut app));

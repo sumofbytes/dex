@@ -81,7 +81,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             if !state.client_seen_fresh(&session_id, wake_presence_window()) {
                 return;
             }
-            if lock_map(&state.active_turns).contains(&session_id) {
+            if state.turn_active(&session_id) {
                 // A user turn is live: it drains at its boundary. Re-check
                 // after it ends so a notice landing mid-turn still wakes.
                 tokio::time::sleep(wake_retry_delay()).await;
@@ -94,15 +94,15 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
             let Some(wake_cancel) = state.claim_wake(&session_id) else {
                 return; // one wake at a time per session
             };
-            // Re-check idle after claiming (the claim raced a user turn).
-            if lock_map(&state.active_turns).contains(&session_id) {
+            // Take the turn slot after claiming the wake (the claim raced a
+            // user turn if this fails). The wake holds the slot, so the
+            // append-only log stays serialized; the user chat POST steals
+            // instead of 409ing.
+            if !state.claim_turn(&session_id) {
                 state.cancel_wake(&session_id);
                 continue;
             }
-            // The wake holds the session's turn slot, so the append-only log
-            // stays serialized; the user chat POST steals instead of 409ing.
-            lock_map(&state.active_turns).insert(session_id.clone());
-            lock_map(&state.cancel_tokens).insert(session_id.clone(), wake_cancel.clone());
+            state.set_turn_cancel(&session_id, wake_cancel.clone());
             // Same model the session's last turn used (stored per session);
             // permission resolves from the daemon's own ceiling. Served
             // from the registry entry (stashed at turn start); the file

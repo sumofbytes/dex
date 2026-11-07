@@ -405,7 +405,7 @@ pub(crate) async fn session_name(
         return Err(StatusCode::CONFLICT);
     }
     let renamed = rename_session(&state, &session_id, name).await;
-    lock_map(&state.active_turns).remove(&session_id);
+    state.release_turn(&session_id);
     renamed?;
     Ok(Json(json!({ "status": "ok" })))
 }

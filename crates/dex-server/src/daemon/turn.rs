@@ -227,7 +227,7 @@ async fn run_agent_turn_in_root(
     steering_rx: Option<mpsc::Receiver<QueueMsg>>,
     followup_rx: Option<mpsc::Receiver<QueueMsg>>,
 ) {
-    // Use a guard so active_turns/cancel_tokens/pending approvals/steering
+    // Use a guard so the turn slot/pending approvals/steering
     // are cleaned even when run_turn_inner panics inside the spawned task
     // (`CatchUnwind` below still delivers `TurnFailed` in that case).
     struct TurnGuard {
@@ -254,21 +254,10 @@ async fn run_agent_turn_in_root(
             // Tear down only the entries THIS turn registered: an idle wake
             // stolen by a user chat POST must not remove the user turn's
             // fresh registration (identity-checked via the cancel token).
-            let owned = {
-                let mut tokens = lock_map(&self.state.cancel_tokens);
-                let owned = tokens
-                    .get(&self.session_id)
-                    .is_some_and(|token| token.same_token(&self.cancel));
-                if owned {
-                    tokens.remove(&self.session_id);
-                }
-                owned
-            };
-            if owned {
-                lock_map(&self.state.active_turns).remove(&self.session_id);
-                for map in [&self.state.steering_txs, &self.state.followup_txs] {
-                    lock_map(map).remove(&self.session_id);
-                }
+            if self
+                .state
+                .release_owned_turn(&self.session_id, &self.cancel)
+            {
                 self.state
                     .unregister_stream(&self.session_id, &self.stream_tx);
             }
@@ -290,7 +279,7 @@ async fn run_agent_turn_in_root(
     // (direct `run_agent_turn` calls, e.g. tests) create them here.
     let (steering_rx, followup_rx) = match (steering_rx, followup_rx) {
         (Some(sr), Some(fr)) => (sr, fr),
-        _ => create_queue_pair(&state, &session_id),
+        _ => create_queue_pair(&state, &session_id, &cancel),
     };
     let (steering_accepted_tx, steering_accepted_rx) = mpsc::channel::<String>(16);
     let (followup_accepted_tx, followup_accepted_rx) = mpsc::channel::<String>(16);

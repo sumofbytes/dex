@@ -25,8 +25,7 @@ pub(crate) fn reset_session_state(app: &mut App) {
     app.turn_start = 0;
     app.pending_steering.clear();
     app.pending_followups.clear();
-    app.cancel_requested = false;
-    app.cancel_presses = 0;
+    app.turn.clear_cancel();
     for approval in app.pending_approvals.drain(..) {
         let _ = approval
             .response
@@ -52,8 +51,7 @@ pub(crate) fn reset_session_state(app: &mut App) {
     app.selection = None;
     app.assistant_pending.clear();
     app.assistant_gap.reset();
-    app.assistant_open = false;
-    app.thinking_open = false;
+    app.tail.reset();
     app.autoscroll = true;
     app.scroll = 0;
 }
@@ -232,7 +230,7 @@ pub(crate) fn usage_rows(app: &App) -> Vec<String> {
 }
 
 fn cmd_clear(app: &mut App) {
-    if app.busy {
+    if app.turn.is_active() {
         push_info(app, "cannot clear while a turn is running.".to_string());
         return;
     }
@@ -245,7 +243,7 @@ fn cmd_clear(app: &mut App) {
 }
 
 fn cmd_new(app: &mut App) {
-    if app.busy {
+    if app.turn.is_active() {
         push_info(
             app,
             "cannot start a new session while a turn is running.".to_string(),

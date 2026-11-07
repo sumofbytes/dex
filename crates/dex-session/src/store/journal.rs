@@ -135,6 +135,7 @@ impl Session {
     /// the same pass (see `Listing.session_name`).
     pub fn scan_listing(path: &Path) -> io::Result<Listing> {
         let mut first_prompt: Option<String> = None;
+        let mut summary_body: Option<String> = None;
         let mut session_name: Option<String> = None;
         let mut reader = BufReader::new(File::open(path)?);
         let mut count = 0usize;
@@ -189,6 +190,18 @@ impl Session {
                                 {
                                     first_prompt = msg.content.as_deref().and_then(prompt_title);
                                 }
+                                // Mid-turn compaction replaces the head of the
+                                // transcript — the original prompt with it — by a
+                                // `summary` checkpoint. That checkpoint's first
+                                // real line is the task, so threads that were
+                                // still untilted from their prompt keep a title
+                                // through a compaction strength refresh.
+                                if summary_body.is_none()
+                                    && msg.role == Role::User
+                                    && msg.name.as_deref() == Some("summary")
+                                {
+                                    summary_body = msg.content.clone();
+                                }
                             }
                             _ => {}
                         }
@@ -226,7 +239,12 @@ impl Session {
         Ok(Listing {
             message_count: count,
             turn_state: state.to_string(),
-            first_prompt,
+            first_prompt: first_prompt.or_else(|| {
+                summary_body
+                    .as_deref()
+                    .and_then(summary_goal)
+                    .and_then(prompt_title)
+            }),
             session_name,
         })
     }
@@ -246,6 +264,15 @@ pub struct Listing {
     /// header name, so a rename survives restarts and picks even before
     /// any header rewrite ever ran.
     pub session_name: Option<String>,
+}
+
+/// The first non-empty, non-heading, non-quoted line of a structured
+/// checkpoint summary (deterministic and LLM shape both open with the
+/// `## Goal` section before the task paraphrase).
+fn summary_goal(content: &str) -> Option<&str> {
+    content.lines().map(str::trim).find(|line| {
+        !line.is_empty() && !line.starts_with('#') && !line.starts_with('>') && *line != "---"
+    })
 }
 
 /// The first non-empty line of a prompt, cut to `TITLE_CHARS`.

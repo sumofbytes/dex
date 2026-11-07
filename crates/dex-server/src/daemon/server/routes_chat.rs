@@ -76,7 +76,7 @@ pub(crate) async fn chat(
     }
     // Pre-create per-turn channels so `POST /steer` / `POST /followup`
     // have a target as soon as the turn is registered (avoids a race where
-    // the client sends steering in the gap between `active_turns` insert and
+    // the client sends steering in the gap between the turn-slot claim and
     // the `spawn_blocking` thread creating its channels).
     let mut steering_rx_opt: Option<mpsc::Receiver<QueueMsg>> = None;
     let mut followup_rx_opt: Option<mpsc::Receiver<QueueMsg>> = None;
@@ -93,12 +93,12 @@ pub(crate) async fn chat(
         // and the stream reader poll it; it never leaks across sessions or
         // later turns.
         let cancel = CancellationToken::new();
-        lock_map(&state.cancel_tokens).insert(session_id.clone(), cancel.clone());
-        cancel_for_turn = Some(cancel);
+        state.set_turn_cancel(&session_id, cancel.clone());
         // Steering / follow-up queues for this turn (mirrors old local
         // `event.rs` channels). Insert now so the HTTP handlers can push
         // immediately.
-        let (steering_rx, followup_rx) = create_queue_pair(&state, &session_id);
+        let (steering_rx, followup_rx) = create_queue_pair(&state, &session_id, &cancel);
+        cancel_for_turn = Some(cancel);
         steering_rx_opt = Some(steering_rx);
         followup_rx_opt = Some(followup_rx);
     }
@@ -180,12 +180,9 @@ impl Stream for ReceiverStream {
 pub(crate) fn create_queue_pair(
     state: &DaemonState,
     session_id: &str,
+    cancel: &CancellationToken,
 ) -> (mpsc::Receiver<QueueMsg>, mpsc::Receiver<QueueMsg>) {
-    let (steering_tx, steering_rx) = mpsc::channel::<QueueMsg>(16);
-    let (followup_tx, followup_rx) = mpsc::channel::<QueueMsg>(16);
-    lock_map(&state.steering_txs).insert(session_id.to_string(), steering_tx);
-    lock_map(&state.followup_txs).insert(session_id.to_string(), followup_tx);
-    (steering_rx, followup_rx)
+    state.attach_queues(session_id, cancel)
 }
 
 pub(crate) async fn approve(
@@ -284,7 +281,7 @@ pub(crate) async fn cancel(
     // loop poll this token between steps. A missing entry means no turn is
     // running for the session, so there is nothing to cancel. Cloned under
     // the lock, cancelled outside it — never hold the mutex across the call.
-    if let Some(token) = lock_map(&state.cancel_tokens).get(&session_id).cloned() {
+    if let Some(token) = state.turn_cancel_token(&session_id) {
         token.cancel();
     }
     // Same for an in-flight `!` shell run (Esc cancels it).
@@ -318,12 +315,7 @@ fn queue_tx(
     session_id: &str,
     followup: bool,
 ) -> Option<mpsc::Sender<QueueMsg>> {
-    let map = if followup {
-        lock_map(&state.followup_txs)
-    } else {
-        lock_map(&state.steering_txs)
-    };
-    map.get(session_id).cloned()
+    state.turn_queue(session_id, followup)
 }
 
 pub(crate) async fn steer(
@@ -394,12 +386,7 @@ pub(crate) async fn recall(
 /// Take the session's active-turn slot; `false` when a live turn holds it.
 /// The registry guard dies inside this fn — it never spans an await.
 pub(crate) fn try_claim_slot(state: &Arc<DaemonState>, session_id: &str) -> bool {
-    let mut active = lock_map(&state.active_turns);
-    if active.contains(session_id) {
-        return false;
-    }
-    active.insert(session_id.to_string());
-    true
+    state.claim_turn(session_id)
 }
 
 // Chat wins over an idle wake (§10b V1b): cancel the wake, then take the

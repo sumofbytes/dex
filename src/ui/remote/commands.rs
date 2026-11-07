@@ -108,7 +108,7 @@ pub(crate) fn handle_remote_slash(remote: &mut RemoteApp, line: &str) -> bool {
 /// `/clear` and `/new` both start a fresh daemon session (the daemon owns the
 /// conversation); `new_session` only picks the wording.
 fn remote_reset(remote: &mut RemoteApp, new_session: bool) {
-    if remote.app.busy {
+    if remote.app.turn.is_active() {
         let what = if new_session {
             "start a new session"
         } else {
@@ -131,6 +131,7 @@ fn remote_reset(remote: &mut RemoteApp, new_session: bool) {
         Ok(session) => {
             remote.set_session(session.session_id);
             reset_session_state(&mut remote.app);
+            remote.shell.reset_presses();
             remote.options.plan = None;
             let mut fresh = Session::in_memory(cwd);
             fresh.set_name(name).ok();
@@ -506,7 +507,7 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
         }
         return;
     };
-    if remote.app.busy {
+    if remote.app.turn.is_active() {
         push_info(
             &mut remote.app,
             "cannot resume a session while a turn is running.".to_string(),
@@ -607,6 +608,7 @@ fn remote_resume(remote: &mut RemoteApp, selector: Option<&str>) {
             // pending steering/approvals) so the old conversation
             // doesn't leak into the resumed one.
             reset_session_state(&mut remote.app);
+            remote.shell.reset_presses();
             remote.options.plan = None;
             // Restore the journaled agent mode from the last `turn_start`
             // (same as reattach): a session parked in `plan` resumes in

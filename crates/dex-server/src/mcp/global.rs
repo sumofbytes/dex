@@ -156,13 +156,7 @@ pub fn cached_statuses() -> Option<Vec<ServerStatus>> {
 /// contended — callers must treat that as "unavailable", never as an empty
 /// server list (which would wrongly imply no MCP is configured).
 fn try_snapshot(mgr: &McpManager) -> Option<Vec<ServerStatus>> {
-    let clients = spin_read(&mgr.clients)?;
+    let conns = spin_read(&mgr.conns)?;
     let tools = spin_read(&mgr.cached_tools)?;
-    let down = spin_read(&mgr.down)?;
-    Some(McpManager::status_list(
-        &mgr.configs,
-        &clients,
-        &tools,
-        &down,
-    ))
+    Some(McpManager::status_list(&mgr.configs, &conns, &tools))
 }

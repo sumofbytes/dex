@@ -241,10 +241,9 @@ pub(crate) struct App {
     pub(crate) followup_rx: Option<mpsc::Receiver<String>>,
     pub(crate) pending_steering: Vec<String>,
     pub(crate) pending_followups: Vec<String>,
-    pub(crate) cancel_requested: bool,
-    /// Busy Ctrl+C presses since the current cancel started; the third press
-    /// force-quits (stuck daemon). Reset wherever `cancel_requested` resets.
-    pub(crate) cancel_presses: u8,
+    /// The agent turn's run phase (idle / running / cancelling). The third
+    /// Ctrl+C while cancelling force-quits (stuck daemon).
+    pub(crate) turn: super::phase::Phase,
     pub(crate) approval_rx: Option<mpsc::Receiver<crate::protocol::ApprovalRequest>>,
     /// Waiting approval prompts, oldest first (V1b): child agents can park
     /// several at once and they outlive the parent turn, so the old
@@ -284,7 +283,6 @@ pub(crate) struct App {
     /// Set by the renderer when the activity strip had something to show
     /// but no room, so the footer carries a compact running count instead.
     pub(crate) activity_shed: bool,
-    pub(crate) busy: bool,
     pub(crate) autoscroll: bool,
     pub(crate) scroll: u16,
     pub(crate) tick: u16,
@@ -305,11 +303,12 @@ pub(crate) struct App {
     /// in a remote TUI goes to the daemon API, not the client's manager).
     /// `None` for local/loopback turns, which own their manager.
     pub(crate) daemon_url: Option<String>,
-    /// Whether the tail `Assistant` block is still open for streaming
-    /// coalescence. Tracked so an initial transcript block (e.g. in tests)
-    /// does not merge with the first streamed assistant turn; gaps remain
-    /// canonical between blocks.
-    pub(crate) assistant_open: bool,
+    /// What the tail block is streaming: an open `Assistant` block (so an
+    /// initial transcript block, e.g. in tests, does not merge with the first
+    /// streamed assistant turn), an open `Thinking` block (drives the
+    /// collapsed indicator's dots until any non-thinking line or the turn end
+    /// closes it), or nothing.
+    pub(crate) tail: super::tail::Tail,
     /// Whether streamed thinking blocks render in full (Ctrl+T) or as a
     /// one-line preview.
     pub(crate) show_thinking: bool,
@@ -327,10 +326,6 @@ pub(crate) struct App {
     /// settled summary counts this turn's tools (steers add `User` blocks
     /// mid-turn, so the last prompt is no boundary).
     pub(crate) turn_tools_base: usize,
-    /// Whether the tail `Thinking` block is still streaming deltas. Drives
-    /// the collapsed indicator's dot animation; it closes (settles) as soon
-    /// as any non-thinking line arrives or the turn ends.
-    pub(crate) thinking_open: bool,
     pub(crate) plan: crate::protocol::Plan,
     /// Assistant deltas buffered between throttle windows. `markdown_lines`
     /// (term-md + tree-sitter) runs on the buffer at most once per
@@ -434,8 +429,7 @@ impl App {
             followup_rx: None,
             pending_steering: Vec::new(),
             pending_followups: Vec::new(),
-            cancel_requested: false,
-            cancel_presses: 0,
+            turn: super::phase::Phase::Idle,
             approval_rx: None,
             pending_approvals: Vec::new(),
             pending_questions: Vec::new(),
@@ -449,7 +443,6 @@ impl App {
             recent_done: Vec::new(),
             done_tally: 0,
             activity_shed: false,
-            busy: false,
             autoscroll: true,
             scroll: 0,
             tick: 0,
@@ -462,13 +455,12 @@ impl App {
             mention: Default::default(),
             connection: None,
             daemon_url: None,
-            assistant_open: false,
+            tail: super::tail::Tail::Idle,
             show_thinking: false,
             expand_tools: false,
             base_context: Vec::new(),
             turn_out_base: 0,
             turn_tools_base: 0,
-            thinking_open: false,
             plan: crate::protocol::Plan::default(),
             assistant_pending: String::new(),
             assistant_gap: crate::render::theme::markdown::GapState::new(),

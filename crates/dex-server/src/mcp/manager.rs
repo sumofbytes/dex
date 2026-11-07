@@ -31,10 +31,24 @@ struct ServerDefs {
     reader: Option<ToolDefinition>,
 }
 
+/// One server's connection state. A server is absent from the map until a
+/// connect is attempted; from then on it is exactly `Up` or `Down`, never
+/// both, so the two can't drift apart as two parallel maps could.
+///
+/// ```text
+/// (absent) --connect ok--> Up --probe/ping fails--> Down(reason)
+///     |                     ^                          |
+///     +--connect fails--> Down <--connect ok-----------+   reconnect: -> (absent) -> connect
+/// ```
+#[derive(Clone)]
+pub(super) enum Conn {
+    Up(Arc<McpClient>),
+    Down(String),
+}
+
 pub struct McpManager {
     pub(super) configs: BTreeMap<String, McpServerConfig>,
-    pub(super) clients: RwLock<HashMap<String, Arc<McpClient>>>,
-    pub(super) down: RwLock<HashMap<String, String>>,
+    pub(super) conns: RwLock<HashMap<String, Conn>>,
     /// Schema cache behind `Arc`: readers clone the `Arc`, never the defs
     /// (each `parameters: Value` re-serializes expensively — see
     /// `cached_schema_tokens`).
@@ -51,8 +65,7 @@ impl McpManager {
     pub fn new(configs: BTreeMap<String, McpServerConfig>) -> Self {
         Self {
             configs,
-            clients: RwLock::new(HashMap::new()),
-            down: RwLock::new(HashMap::new()),
+            conns: RwLock::new(HashMap::new()),
             cached_tools: RwLock::new(Arc::new([])),
             cached_names: RwLock::new(HashMap::new()),
             cached_truncated: RwLock::new(0),
@@ -67,10 +80,45 @@ impl McpManager {
     /// Insert a pre-built client (tests / daemon bootstrap).
     #[cfg(test)]
     pub async fn insert_client(&self, server: &str, client: McpClient) {
-        self.clients
+        self.conns
             .write()
             .await
-            .insert(server.to_string(), Arc::new(client));
+            .insert(server.to_string(), Conn::Up(Arc::new(client)));
+    }
+
+    /// The live client for `name`, if it is `Up`.
+    pub(super) async fn client(&self, name: &str) -> Option<Arc<McpClient>> {
+        match self.conns.read().await.get(name) {
+            Some(Conn::Up(c)) => Some(Arc::clone(c)),
+            _ => None,
+        }
+    }
+
+    /// Snapshot of every `Up` client.
+    async fn up_clients(&self) -> HashMap<String, Arc<McpClient>> {
+        self.conns
+            .read()
+            .await
+            .iter()
+            .filter_map(|(n, c)| match c {
+                Conn::Up(c) => Some((n.clone(), Arc::clone(c))),
+                Conn::Down(_) => None,
+            })
+            .collect()
+    }
+
+    pub(super) async fn down_reason(&self, name: &str) -> String {
+        match self.conns.read().await.get(name) {
+            Some(Conn::Down(reason)) => reason.clone(),
+            _ => "not connected".to_string(),
+        }
+    }
+
+    async fn mark_down(&self, name: &str, reason: String) {
+        self.conns
+            .write()
+            .await
+            .insert(name.to_string(), Conn::Down(reason));
     }
 
     /// Connect all servers concurrently; one failure never fails the batch.
@@ -88,7 +136,7 @@ impl McpManager {
     }
 
     async fn connect_one(&self, name: &str, cfg: &McpServerConfig) {
-        if self.clients.read().await.contains_key(name) {
+        if self.client(name).await.is_some() {
             return;
         }
         let transport: Result<Box<dyn McpTransport>, String> = if cfg.is_http() {
@@ -106,25 +154,20 @@ impl McpManager {
                 // not mid-turn.
                 match client.list_tools(None).await {
                     Ok(_) => {
-                        self.clients.write().await.insert(name.to_string(), client);
-                        self.down.write().await.remove(name);
-                    }
-                    Err(e) => {
-                        self.down
+                        self.conns
                             .write()
                             .await
-                            .insert(name.to_string(), redact_secrets(&e));
+                            .insert(name.to_string(), Conn::Up(client));
                     }
+                    Err(e) => self.mark_down(name, redact_secrets(&e)).await,
                 }
             }
-            Err(e) => {
-                self.down.write().await.insert(name.to_string(), e);
-            }
+            Err(e) => self.mark_down(name, e).await,
         }
     }
 
     pub(super) async fn rebuild_cache(&self) {
-        let clients = self.clients.read().await.clone();
+        let clients = self.up_clients().await;
         // Fan out the per-server RPCs: `fetch_server_defs` holds no locks,
         // so one slow server never stalls the rest (previously serial, 2
         // RPCs each with 30s timeouts).
@@ -237,7 +280,7 @@ impl McpManager {
     /// slice under a held write lock.
     async fn connect_and_cache(&self, name: &str, cfg: &McpServerConfig) {
         self.connect_one(name, cfg).await;
-        let Some(client) = self.clients.read().await.get(name).cloned() else {
+        let Some(client) = self.client(name).await else {
             return;
         };
         let defs = Self::fetch_server_defs(name, cfg, &client).await;
@@ -272,23 +315,16 @@ impl McpManager {
             .get(server)
             .cloned()
             .ok_or_else(|| format!("unknown mcp server '{server}'"))?;
-        self.clients.write().await.remove(server);
-        self.down.write().await.remove(server);
+        self.conns.write().await.remove(server);
         self.connect_and_cache(server, &cfg).await;
-        if self.clients.read().await.contains_key(server) {
+        if self.client(server).await.is_some() {
             let tools = self.cached_tools.read().await;
             Ok(tools
                 .iter()
                 .filter(|d| def_belongs_to(&d.function.name, server))
                 .count())
         } else {
-            Err(self
-                .down
-                .read()
-                .await
-                .get(server)
-                .cloned()
-                .unwrap_or_else(|| "not connected".to_string()))
+            Err(self.down_reason(server).await)
         }
     }
 
@@ -296,8 +332,7 @@ impl McpManager {
     /// before the next turn. Runs every 60s on the global manager; never
     /// fails the batch.
     pub async fn sweep_once(&self) {
-        let clients: Vec<(String, Arc<McpClient>)> =
-            self.clients.read().await.clone().into_iter().collect();
+        let clients: Vec<(String, Arc<McpClient>)> = self.up_clients().await.into_iter().collect();
         let mut set = tokio::task::JoinSet::new();
         for (name, client) in clients {
             set.spawn(async move {
@@ -315,13 +350,11 @@ impl McpManager {
             return;
         }
         {
-            let mut clients = self.clients.write().await;
-            let mut down = self.down.write().await;
+            let mut conns = self.conns.write().await;
             for name in &dead {
-                clients.remove(name);
-                down.insert(
+                conns.insert(
                     name.clone(),
-                    "liveness probe failed; will reconnect on next use".to_string(),
+                    Conn::Down("liveness probe failed; will reconnect on next use".to_string()),
                 );
             }
         }
@@ -334,17 +367,15 @@ impl McpManager {
     }
 
     pub async fn statuses(&self) -> Vec<ServerStatus> {
-        let clients = self.clients.read().await;
+        let conns = self.conns.read().await;
         let tools = self.cached_tools.read().await;
-        let down = self.down.read().await;
-        Self::status_list(&self.configs, &clients, &tools, &down)
+        Self::status_list(&self.configs, &conns, &tools)
     }
 
     pub(super) fn status_list(
         configs: &BTreeMap<String, McpServerConfig>,
-        clients: &HashMap<String, Arc<McpClient>>,
+        conns: &HashMap<String, Conn>,
         tools: &[ToolDefinition],
-        down: &HashMap<String, String>,
     ) -> Vec<ServerStatus> {
         let mut out: Vec<ServerStatus> = configs
             .keys()
@@ -353,7 +384,7 @@ impl McpManager {
                     .iter()
                     .filter(|d| def_belongs_to(&d.function.name, name))
                     .count();
-                let state = if clients.contains_key(name) {
+                let state = if matches!(conns.get(name), Some(Conn::Up(_))) {
                     "up"
                 } else {
                     "down"
@@ -362,7 +393,10 @@ impl McpManager {
                     name: name.clone(),
                     state: state.to_string(),
                     tools: count,
-                    error: down.get(name).cloned(),
+                    error: match conns.get(name) {
+                        Some(Conn::Down(reason)) => Some(reason.clone()),
+                        _ => None,
+                    },
                 }
             })
             .collect();
@@ -394,7 +428,7 @@ impl McpManager {
         // Lazy connect: the background refresh may not have run (or the
         // server was added after boot). Connect on demand so the first call
         // works instead of reporting a phantom `down`.
-        if !self.clients.read().await.contains_key(&server) {
+        if self.client(&server).await.is_none() {
             if let Some(cfg) = self.configs.get(&server).cloned() {
                 self.connect_and_cache(&server, &cfg).await;
             }
@@ -412,20 +446,14 @@ impl McpManager {
             }
             None => (server, tool),
         };
-        let clients = self.clients.read().await.get(&server).cloned();
+        let clients = self.client(&server).await;
         // Clone the client out of the map and drop the guard before any
         // `.await`: holding the read guard across the tool RPC (up to the
         // 30s timeout) would stall every map writer — reconnect, sweeper
         // drops, lazy-connect inserts — on a hung server. Read-shared
         // otherwise, so concurrent calls never block each other here.
         let Some(client) = clients else {
-            let reason = self
-                .down
-                .read()
-                .await
-                .get(&server)
-                .cloned()
-                .unwrap_or_else(|| "not connected".to_string());
+            let reason = self.down_reason(&server).await;
             return Err(format!("mcp server '{server}' is down: {reason}"));
         };
         if tool == "\0resource" {

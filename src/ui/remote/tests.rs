@@ -225,8 +225,7 @@ fn test_remote() -> RemoteApp {
         worker_rx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
         last_click: None,
-        shell_running: false,
-        shell_cancel_requested: false,
+        shell: crate::ui::phase::Phase::Idle,
         live_children: Arc::new(AtomicBool::new(false)),
         busy_poll: Arc::new(AtomicBool::new(false)),
         events_cursor: Arc::new(AtomicU64::new(0)),
@@ -293,9 +292,9 @@ fn alt_v_cycles_the_voice_without_touching_the_draft() {
 #[test]
 fn busy_ctrl_c_needs_three_presses_to_force_quit() {
     let mut remote = test_remote();
-    remote.app.busy = true;
+    remote.app.turn.start();
     handle_key(&mut remote, ctrl_c());
-    assert!(remote.app.cancel_requested, "first press cancels");
+    assert!(remote.app.turn.is_cancelling(), "first press cancels");
     assert!(!remote.app.quit);
     handle_key(&mut remote, ctrl_c());
     assert!(
@@ -325,7 +324,7 @@ fn recall_candidate_prefers_newest_steer_then_followup() {
 #[test]
 fn recall_queued_failure_keeps_queue_and_draft() {
     let mut remote = test_remote();
-    remote.app.busy = true;
+    remote.app.turn.start();
     remote.app.pending_steering.push("queued msg".into());
     remote.app.input = crate::ui::input::InputField::from_text("draft text");
     // The fixture's client points at a dead port: the POST fails, so the
@@ -339,17 +338,17 @@ fn recall_queued_failure_keeps_queue_and_draft() {
 #[test]
 fn esc_repress_while_cancelling_stays_put() {
     let mut remote = test_remote();
-    remote.app.busy = true;
-    remote.app.cancel_requested = true;
+    remote.app.turn.start();
+    remote.app.turn.cancel();
     handle_key(&mut remote, esc_key());
     assert!(!remote.app.quit);
-    assert!(remote.app.cancel_requested);
+    assert!(remote.app.turn.is_cancelling());
 }
 
 #[test]
 fn at_popup_takes_esc_and_enter_while_busy() {
     let open = |remote: &mut RemoteApp| {
-        remote.app.busy = true;
+        remote.app.turn.start();
         remote.app.input = crate::ui::input::InputField::from_text("see @ma");
         assert!(crate::ui::mention::query_to_request(&mut remote.app).is_some());
         let files = vec![crate::protocol::FileMatch {
@@ -367,7 +366,7 @@ fn at_popup_takes_esc_and_enter_while_busy() {
     open(&mut remote);
     handle_key(&mut remote, esc_key());
     assert!(
-        !remote.app.cancel_requested,
+        !remote.app.turn.is_cancelling(),
         "first Esc only closes the popup"
     );
     assert!(!crate::ui::mention::is_open(&remote.app));
@@ -392,7 +391,7 @@ fn ctrl_d_quits_only_on_empty_idle_composer() {
     assert_eq!(remote.app.input.text(), "draft");
 
     let mut remote = test_remote();
-    remote.app.busy = true;
+    remote.app.turn.start();
     handle_key(&mut remote, ctrl_d());
     assert!(!remote.app.quit, "busy Ctrl+D must not quit the turn");
 }
@@ -912,13 +911,13 @@ fn finish_turn_drains_parked_approvals_and_questions() {
             None,
         ));
     let mut qrx = park_question(&mut remote, vec![one_question()]);
-    remote.app.busy = true;
+    remote.app.turn.start();
 
     super::input::finish_turn(&mut remote, None);
 
     assert!(remote.app.pending_approvals.is_empty(), "approval drained");
     assert!(remote.app.pending_questions.is_empty(), "questions drained");
-    assert!(!remote.app.busy);
+    assert!(!remote.app.turn.is_active());
     assert_eq!(
         arx.try_recv().ok(),
         Some(crate::protocol::ApprovalDecision::Deny),
@@ -1498,4 +1497,38 @@ fn child_log_count_is_capped_and_view_closes_on_dropped_log() {
     assert_eq!(remote.app.child_logs.len(), crate::ui::CHILD_LOG_MAX_LOGS);
     assert_eq!(remote.app.child_logs[0].id, "a1", "oldest dropped");
     assert!(remote.app.child_view.is_none(), "view closed");
+}
+
+#[test]
+fn finishing_the_turn_restarts_the_shells_force_quit_count() {
+    // The Ctrl+C press count is shared across a turn and a `!` shell: ending
+    // (or starting) one job restarts the other's count without ending its
+    // cancel, as the old single `cancel_presses` counter did.
+    let mut remote = test_remote();
+    remote.app.turn.start();
+    remote.shell.start();
+    remote.shell.cancel();
+    remote.shell.bump();
+    remote.shell.bump();
+    assert_eq!(remote.shell.presses(), 2);
+    super::input::finish_turn(&mut remote, None);
+    assert!(remote.shell.is_cancelling(), "shell cancel still pending");
+    assert_eq!(remote.shell.presses(), 0);
+}
+
+#[test]
+fn overlapping_cancel_needs_three_fresh_presses_after_the_other_job_ends() {
+    let mut remote = test_remote();
+    remote.app.turn.start();
+    remote.shell.start();
+    handle_key(&mut remote, ctrl_c());
+    handle_key(&mut remote, ctrl_c());
+    assert!(!remote.app.quit);
+    // The turn ends; the shell's count restarts rather than carrying over.
+    super::input::finish_turn(&mut remote, None);
+    handle_key(&mut remote, ctrl_c());
+    handle_key(&mut remote, ctrl_c());
+    assert!(!remote.app.quit, "two presses after a reset must not quit");
+    handle_key(&mut remote, ctrl_c());
+    assert!(remote.app.quit, "third press force-quits");
 }

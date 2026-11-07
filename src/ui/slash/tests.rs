@@ -85,13 +85,13 @@ fn suggestions_only_for_bare_slash_prefixes() {
         "no popup across a newline"
     );
 
-    app.busy = true;
+    app.turn.start();
     type_input(&mut app, "/cle");
     assert!(
         slash_suggestions(&app).is_empty(),
         "no popup while a turn runs"
     );
-    app.busy = false;
+    app.turn.finish();
 
     type_input(&mut app, "/cle");
     let got = slash_suggestions(&app);
@@ -296,8 +296,9 @@ fn reset_session_state_clears_conversation_scope_only() {
     app.messages.push(ChatMessage::user("m2"));
     app.pending_steering.push("s".into());
     app.pending_followups.push("f".into());
-    app.cancel_requested = true;
-    app.cancel_presses = 1;
+    app.turn.start();
+    app.turn.cancel();
+    app.turn.bump();
     app.tool_state.total_usage = 99;
     app.tool_state.total_cost = 1.5;
     app.tool_state.verify_dirty = true;
@@ -324,7 +325,7 @@ fn reset_session_state_clears_conversation_scope_only() {
     assert_eq!(app.messages.len(), 1);
     assert!(app.messages[0].content_str().contains("sys"));
     assert!(app.pending_steering.is_empty() && app.pending_followups.is_empty());
-    assert!(!app.cancel_requested && app.cancel_presses == 0);
+    assert!(!app.turn.is_cancelling() && app.turn.presses() == 0);
     assert_eq!(app.tool_state.total_usage, 0);
     assert_eq!(app.tool_state.total_cost, 0.0);
     assert!(!app.tool_state.verify_dirty);
@@ -445,12 +446,12 @@ fn handle_slash_clear_refuses_while_busy_and_clears_when_idle() {
     let mut app = new_app();
     app.messages.push(ChatMessage::system("sys"));
     app.messages.push(ChatMessage::user("keep-me-out"));
-    app.busy = true;
+    app.turn.start();
     assert!(!handle_slash(&mut app, "/clear"));
     assert!(has_info(&app, "cannot clear while a turn is running"));
     assert_eq!(app.messages.len(), 2, "busy /clear changes nothing");
 
-    app.busy = false;
+    app.turn.finish();
     assert!(!handle_slash(&mut app, "/clear"));
     assert!(has_info(&app, "history cleared"));
     assert_eq!(app.messages.len(), 1, "the system prompt survives");

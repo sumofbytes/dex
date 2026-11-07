@@ -455,8 +455,10 @@ async fn sweep_drops_dead_clients() {
     mgr.insert_client("dead", fake_client(vec![], false, true))
         .await;
     mgr.sweep_once().await;
-    assert!(!mgr.clients.read().await.contains_key("dead"));
-    assert!(mgr.down.read().await.contains_key("dead"));
+    assert!(matches!(
+        mgr.conns.read().await.get("dead"),
+        Some(super::manager::Conn::Down(_))
+    ));
 }
 
 #[tokio::test]
@@ -493,4 +495,56 @@ fn mcp_status_line_names_up_and_down_servers() {
     .expect("non-empty statuses produce a line");
     assert!(line.contains("gh (3 tools)"), "{line}");
     assert!(line.contains("db (down)"), "{line}");
+}
+
+#[tokio::test]
+async fn conn_states_report_up_down_and_never_connected() {
+    use super::manager::Conn;
+    let mut configs = BTreeMap::new();
+    for name in ["a", "b", "c"] {
+        configs.insert(name.to_string(), McpServerConfig::default());
+    }
+    let mgr = McpManager::new(configs);
+    mgr.insert_client("a", fake_client(vec![], false, false))
+        .await;
+    mgr.conns
+        .write()
+        .await
+        .insert("b".to_string(), Conn::Down("boom".to_string()));
+    let st = mgr.statuses().await;
+    let by = |n: &str| st.iter().find(|s| s.name == n).unwrap();
+    assert_eq!(
+        (by("a").state.as_str(), by("a").error.as_deref()),
+        ("up", None)
+    );
+    assert_eq!(
+        (by("b").state.as_str(), by("b").error.as_deref()),
+        ("down", Some("boom"))
+    );
+    // Never attempted: down, but with no recorded reason.
+    assert_eq!(
+        (by("c").state.as_str(), by("c").error.as_deref()),
+        ("down", None)
+    );
+    assert_eq!(mgr.down_reason("b").await, "boom");
+    assert_eq!(mgr.down_reason("c").await, "not connected");
+}
+
+#[tokio::test]
+async fn a_reconnected_client_replaces_a_down_entry() {
+    use super::manager::Conn;
+    let mgr = McpManager::new(BTreeMap::new());
+    mgr.conns
+        .write()
+        .await
+        .insert("s".to_string(), Conn::Down("old".to_string()));
+    mgr.insert_client("s", fake_client(vec![], false, false))
+        .await;
+    assert!(matches!(mgr.conns.read().await.get("s"), Some(Conn::Up(_))));
+    assert!(mgr.client("s").await.is_some());
+    // And a dead one goes back down on the next sweep.
+    mgr.insert_client("s", fake_client(vec![], false, true))
+        .await;
+    mgr.sweep_once().await;
+    assert!(mgr.client("s").await.is_none());
 }

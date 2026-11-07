@@ -16,14 +16,39 @@ use std::io::{self, Write};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Whether the printer is inside a code fence. The fence's language and
+/// buffered body exist only in `Code`, so they can never be stale or
+/// non-empty outside a fence.
+///
+/// ```text
+/// Prose --"```lang"--> Code { lang, body } --"```"--> Prose
+///                          ^  body line  |
+///                          '-------------'
+/// ```
+pub(crate) enum Fence {
+    Prose,
+    Code { lang: String, body: String },
+}
+
+/// What one line did to the [`Fence`]; the caller emits the matching output.
+enum Fed {
+    /// Prose outside any fence.
+    Prose,
+    /// An opening fence line; the fence is now `Code`.
+    Opened,
+    /// A body line, buffered into the open fence.
+    Body,
+    /// A closing fence line; the fence is `Prose` again and the finished
+    /// block is handed back.
+    Closed { lang: String, body: String },
+}
+
 /// Incremental markdown printer: prose is flushed as soon as a full line
 /// arrives; code fences are buffered until closed so they can be highlighted
 /// as one block. If a fence is still open when the stream ends, it is
 /// flushed as-is.
 pub(crate) struct StreamPrinter {
-    pub(crate) in_code: bool,
-    pub(crate) code_lang: String,
-    pub(crate) code_body: String,
+    pub(crate) fence: Fence,
     pub(crate) sink: Option<mpsc::Sender<ModelEvent>>,
     /// Headless (no-sink) gap state so plain-terminal output follows the same
     /// blanks-around-blocks rule as the TUI (MD022/MD031/MD032/MD058).
@@ -37,9 +62,7 @@ pub(crate) struct StreamPrinter {
 impl StreamPrinter {
     pub fn new(sink: Option<mpsc::Sender<ModelEvent>>) -> Self {
         Self {
-            in_code: false,
-            code_lang: String::new(),
-            code_body: String::new(),
+            fence: Fence::Prose,
             sink,
             headless_prev: String::new(),
             headless_air: false,
@@ -116,85 +139,92 @@ impl StreamPrinter {
         }
     }
 
-    pub(crate) fn feed_line_inner(&mut self, line: &str) {
+    /// The single fence transition shared by the sync and async paths.
+    fn advance(&mut self, line: &str) -> Fed {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            if self.in_code {
+        let is_fence = trimmed.starts_with("```");
+        match (&mut self.fence, is_fence) {
+            (Fence::Prose, true) => {
+                self.headless_on_fence_open();
+                self.fence = Fence::Code {
+                    lang: trimmed.trim_start_matches('`').trim().to_string(),
+                    body: String::new(),
+                };
+                Fed::Opened
+            }
+            (Fence::Prose, false) => Fed::Prose,
+            (Fence::Code { body, .. }, false) => {
+                body.push_str(line);
+                body.push('\n');
+                Fed::Body
+            }
+            (Fence::Code { .. }, true) => {
+                let Fence::Code { lang, body } = std::mem::replace(&mut self.fence, Fence::Prose)
+                else {
+                    unreachable!("matched Code above");
+                };
+                Fed::Closed { lang, body }
+            }
+        }
+    }
+
+    pub(crate) fn feed_line_inner(&mut self, line: &str) {
+        match self.advance(line) {
+            Fed::Closed { lang, body } => {
                 if let Some(sink) = &self.sink {
-                    let _ = sink.try_send(ModelEvent::Assistant(format!(
-                        "```{}:\n{}\n```",
-                        self.code_lang, self.code_body
-                    )));
+                    let _ =
+                        sink.try_send(ModelEvent::Assistant(format!("```{lang}:\n{body}\n```")));
                 } else {
-                    print_code_block(&self.code_lang, &self.code_body);
+                    print_code_block(&lang, &body);
                     self.headless_on_fence_close();
                 }
-                self.code_body.clear();
-                self.code_lang.clear();
-                self.in_code = false;
-            } else {
-                self.headless_on_fence_open();
-                self.in_code = true;
-                self.code_lang = trimmed.trim_start_matches('`').trim().to_string();
             }
-        } else if self.in_code {
-            self.code_body.push_str(line);
-            self.code_body.push('\n');
-        } else {
-            if let Some(sink) = &self.sink {
-                let _ = sink.try_send(ModelEvent::Assistant(line.to_string()));
-            } else {
-                self.headless_on_prose(line);
+            Fed::Prose => {
+                if let Some(sink) = &self.sink {
+                    let _ = sink.try_send(ModelEvent::Assistant(line.to_string()));
+                } else {
+                    self.headless_on_prose(line);
+                }
             }
+            Fed::Opened | Fed::Body => {}
         }
     }
 
     async fn feed_line_inner_async(&mut self, line: &str) {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            if self.in_code {
+        match self.advance(line) {
+            Fed::Closed { lang, body } => {
                 if let Some(sink) = &self.sink {
                     let _ = sink
-                        .send(ModelEvent::Assistant(format!(
-                            "```{}:\n{}\n```",
-                            self.code_lang, self.code_body
-                        )))
+                        .send(ModelEvent::Assistant(format!("```{lang}:\n{body}\n```")))
                         .await;
                 } else {
-                    print_code_block(&self.code_lang, &self.code_body);
+                    print_code_block(&lang, &body);
                     self.headless_on_fence_close();
                 }
-                self.code_body.clear();
-                self.code_lang.clear();
-                self.in_code = false;
-            } else {
-                self.headless_on_fence_open();
-                self.in_code = true;
-                self.code_lang = trimmed.trim_start_matches('`').trim().to_string();
             }
-        } else if self.in_code {
-            self.code_body.push_str(line);
-            self.code_body.push('\n');
-        } else if let Some(sink) = &self.sink {
-            let _ = sink.send(ModelEvent::Assistant(line.to_string())).await;
-        } else {
-            self.headless_on_prose(line);
+            Fed::Prose => {
+                if let Some(sink) = &self.sink {
+                    let _ = sink.send(ModelEvent::Assistant(line.to_string())).await;
+                } else {
+                    self.headless_on_prose(line);
+                }
+            }
+            Fed::Opened | Fed::Body => {}
         }
     }
 
     pub(crate) async fn finish_async(self) {
-        if self.in_code && !self.code_body.is_empty() {
+        // A fence still open when the stream ends is flushed as-is.
+        if let Fence::Code { lang, body } = &self.fence {
+            if body.is_empty() {
+                return;
+            }
             if let Some(sink) = &self.sink {
                 let _ = sink
-                    .send(ModelEvent::Assistant(format!(
-                        "```{}:\n{}\n```",
-                        self.code_lang, self.code_body
-                    )))
+                    .send(ModelEvent::Assistant(format!("```{lang}:\n{body}\n```")))
                     .await;
             } else {
-                with_console(self.sink.is_some(), || {
-                    print_code_block(&self.code_lang, &self.code_body)
-                });
+                with_console(self.sink.is_some(), || print_code_block(lang, body));
             }
         }
     }

@@ -3,6 +3,7 @@ use super::super::bump_thinking_stamps;
 use super::super::bump_tool_stamps;
 use super::super::deny_all_approvals;
 use super::super::mention;
+use super::super::phase::FORCE_QUIT_PRESSES;
 use super::super::push_info;
 use super::super::render_user_prompt;
 use super::super::resolve_approval;
@@ -82,10 +83,9 @@ pub(crate) fn handle_paste(app: &mut App, s: &str) {
 }
 
 pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
-    // Copied before the `app` borrow: a `!` shell run is independent of
-    // `busy` but cancels the same way (Esc cancels it).
-    let shell_running = remote.shell_running;
-    let shell_cancel_requested = remote.shell_cancel_requested;
+    // Copied before the `app` borrow: a `!` shell run is independent of the
+    // turn phase but cancels the same way (Esc cancels it).
+    let shell_running = remote.shell.is_active();
 
     // `ask_user` wizard takes top precedence: a question is a direct ask
     // to the user, and the worker is blocked on it.
@@ -120,11 +120,11 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
 
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_ctrl_c(remote, shell_running, shell_cancel_requested);
+            handle_ctrl_c(remote);
         }
         KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !app.busy
+                && !app.turn.is_active()
                 && !shell_running
                 && app.input.text().trim().is_empty() =>
         {
@@ -133,7 +133,7 @@ pub(crate) fn handle_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent
             app.quit = true;
         }
         // An open `@` popup takes Esc first (closes it); a second Esc cancels.
-        KeyCode::Esc if (app.busy || shell_running) && !mention::is_open(app) => {
+        KeyCode::Esc if (app.turn.is_active() || shell_running) && !mention::is_open(app) => {
             request_cancel(remote);
         }
         KeyCode::Char('t') if key.modifiers == KeyModifiers::CONTROL => {
@@ -670,15 +670,15 @@ fn handle_approval_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) 
 
 /// Ctrl+C: cancel a running turn/shell (with the force-quit guard), clear a
 /// drafted prompt, or arm the double-press quit when idle.
-fn handle_ctrl_c(remote: &mut RemoteApp, shell_running: bool, shell_cancel_requested: bool) {
+fn handle_ctrl_c(remote: &mut RemoteApp) {
     let app = &mut remote.app;
-    if app.busy || shell_running {
-        if app.cancel_requested || shell_cancel_requested {
+    if app.turn.is_active() || remote.shell.is_active() {
+        if app.turn.is_cancelling() || remote.shell.is_cancelling() {
             // Cancel already in flight: stay idempotent. Only the third press
             // force-quits (stuck daemon/shell) — a slow turn must never die to
             // an impatient double-tap.
-            app.cancel_presses = app.cancel_presses.saturating_add(1);
-            if app.cancel_presses >= 3 {
+            let presses = app.turn.bump().max(remote.shell.bump());
+            if presses >= FORCE_QUIT_PRESSES {
                 app.quit = true;
             } else {
                 push_info(
@@ -688,7 +688,8 @@ fn handle_ctrl_c(remote: &mut RemoteApp, shell_running: bool, shell_cancel_reque
             }
         } else {
             request_cancel(remote);
-            remote.app.cancel_presses = 1;
+            remote.app.turn.bump();
+            remote.shell.bump();
         }
     } else if !app.input.text().is_empty() {
         // First press with a drafted prompt just clears the composer;
@@ -782,7 +783,7 @@ fn handle_popup_key(remote: &mut RemoteApp, key: crossterm::event::KeyEvent) {
 /// Up: scroll while busy/Shift, walk history at a single-line composer, else
 /// move the composer cursor.
 fn handle_up_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
+    if app.turn.is_active() || key.modifiers.contains(KeyModifiers::SHIFT) {
         scroll_transcript(app, -1);
     } else if app.input.lines.len() <= 1
         || (app.history_index.is_some() && composer_at_end(app))
@@ -797,7 +798,7 @@ fn handle_up_key(app: &mut App, key: crossterm::event::KeyEvent) {
 /// Down: scroll while busy/Shift, walk history at the last line, else move the
 /// composer cursor.
 fn handle_down_key(app: &mut App, key: crossterm::event::KeyEvent) {
-    if app.busy || key.modifiers.contains(KeyModifiers::SHIFT) {
+    if app.turn.is_active() || key.modifiers.contains(KeyModifiers::SHIFT) {
         scroll_transcript(app, 1);
     } else if app.input.lines.len() <= 1 || app.input.row + 1 >= app.input.lines.len() {
         app.history_down();
@@ -824,28 +825,21 @@ fn handle_composer_key(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 fn request_cancel(remote: &mut RemoteApp) {
-    let turn_running = remote.app.busy;
-    if !turn_running && !remote.shell_running {
-        return;
-    }
     // A cancel is already unwinding everything running (double Esc / overlay
-    // re-press): don't re-POST or spam the transcript.
-    let turn_done = !turn_running || remote.app.cancel_requested;
-    let shell_done = !remote.shell_running || remote.shell_cancel_requested;
-    if turn_done && shell_done {
+    // re-press): `cancel` only transitions from `Running`, so nothing to do
+    // (and no re-POST or transcript spam) when neither phase moved.
+    let turn_cancelled = remote.app.turn.cancel();
+    let shell_cancelled = remote.shell.cancel();
+    if !turn_cancelled && !shell_cancelled {
         return;
     }
-    if turn_running && !remote.app.cancel_requested {
-        remote.app.cancel_requested = true;
+    if turn_cancelled {
         remote.cancel_flag.store(true, Ordering::SeqCst);
         // Deny every queued approval so the blocked agent threads unwind
         // (child agents may have parked several). Same for parked
         // `ask_user` batches.
         deny_all_approvals(&mut remote.app);
         resolve_all_questions(&mut remote.app);
-    }
-    if remote.shell_running && !remote.shell_cancel_requested {
-        remote.shell_cancel_requested = true;
     }
     // One Esc cancels whatever is running: the daemon signals the turn
     // token and the shell token alike (a turn and a shell overlap only
@@ -863,9 +857,8 @@ fn request_cancel(remote: &mut RemoteApp) {
 /// the model context.
 fn run_shell_command(remote: &mut RemoteApp, line: String, command: String, excluded: bool) {
     render_user_prompt(&mut remote.app, &line);
-    remote.shell_running = true;
-    remote.shell_cancel_requested = false;
-    remote.app.cancel_presses = 0;
+    remote.shell.start();
+    remote.app.turn.reset_presses();
     let client = remote.client.clone();
     let sid = remote.session_id.clone();
     let tx = remote.worker_tx.clone();
@@ -1019,7 +1012,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     if let Some((command, excluded)) = crate::tools::parse_shell_escape(&line) {
         remote.app.history_push(line.clone());
         remote.app.input.reset();
-        if remote.shell_running {
+        if remote.shell.is_active() {
             push_info(
                 &mut remote.app,
                 "A bash command is already running. Press Esc to cancel it first.".to_string(),
@@ -1033,7 +1026,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     // the daemon instead of starting a new turn. The daemon's `steering_rx` /
     // `followup_rx` (consumed inside `process_turn` and the outer follow-up
     // loop) mirrors the old in-memory `event.rs::submit(is_followup)` path.
-    if remote.app.busy {
+    if remote.app.turn.is_active() {
         if is_followup {
             remote.app.pending_followups.push(line.clone());
         } else {
@@ -1099,9 +1092,8 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
     render_user_prompt(&mut remote.app, &line);
 
     let app = &mut remote.app;
-    app.busy = true;
-    app.cancel_requested = false;
-    app.cancel_presses = 0;
+    app.turn.start();
+    remote.shell.reset_presses();
     // Live "● Working" indicator inside the transcript; settled to the
     // "Worked for …" summary by `finish_turn`.
     start_activity(app);
