@@ -43,7 +43,12 @@ aarch64 | arm64) arch="aarch64" ;;
 esac
 
 case "$os" in
-linux) TARGET="${arch}-unknown-linux-gnu" ;;
+linux)
+    # Release binaries are glibc (the GUI needs dlopen); a static/musl distro cannot run them.
+    if (ldd --version 2>&1 || true) | grep -qi musl; then
+        err "musl-based Linux (e.g. Alpine) is not supported by the release binaries. Build from source: cargo install --git https://github.com/$REPO"
+    fi
+    TARGET="${arch}-unknown-linux-gnu" ;;
 darwin) TARGET="${arch}-apple-darwin" ;;
 esac
 

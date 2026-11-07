@@ -366,19 +366,24 @@ fn log_path() -> Option<std::path::PathBuf> {
     Some(dir.join("gui.log"))
 }
 
+/// How long the launcher watches the relaunched GUI for an early crash (no GPU/Vulkan driver,
+/// no window system) before handing the shell back.
+const START_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+
 /// Like `code .`: relaunch ourselves in the background and return to the shell. Skipped with
 /// any argument (`-f`, `--snap`, … stay in the foreground), with `DEX_GUI_FOREGROUND`, and in
-/// the relaunched child itself.
-fn detach() {
+/// the relaunched child itself. Returns `false` when the child died within [`START_GRACE`] of a
+/// failed start, so the caller can fall back instead of leaving the user with nothing.
+fn detach() -> bool {
     use std::process::{Command, Stdio};
     if std::env::args().len() > 1
         || std::env::var_os("DEX_GUI_DETACHED").is_some()
         || std::env::var_os("DEX_GUI_FOREGROUND").is_some()
     {
-        return;
+        return true;
     }
     let Ok(exe) = std::env::current_exe() else {
-        return;
+        return true;
     };
     let (out, err) = match log_path().and_then(|p| {
         let f = std::fs::OpenOptions::new()
@@ -406,13 +411,31 @@ fn detach() {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | NEW_PROCESS_GROUP
     }
-    if cmd.spawn().is_ok() {
-        std::process::exit(0);
+    let Ok(mut child) = cmd.spawn() else {
+        return true; // could not relaunch: run in this process instead
+    };
+    let deadline = std::time::Instant::now() + START_GRACE;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                eprintln!(
+                    "dex: the GUI failed to start ({status}); details in {}",
+                    log_path().map_or_else(|| "its log".into(), |p| p.display().to_string())
+                );
+                return false;
+            }
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
     }
+    std::process::exit(0);
 }
 
-pub fn run() {
-    detach();
+/// Runs the GUI. `false` means it could not start and the caller should fall back (to the TUI).
+pub fn run() -> bool {
+    if !detach() {
+        return false;
+    }
     rune::run(AppSpec::<State> {
         scenes: &[
             ("chat", sample),
@@ -439,4 +462,5 @@ pub fn run() {
         families: rune_theme_opencode::FAMILIES,
         ..AppSpec::new("dex", (1100.0, 760.0), State::default, view::view)
     });
+    true
 }

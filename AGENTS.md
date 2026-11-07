@@ -11,7 +11,7 @@ cargo test --all-targets       # must pass
 cargo clippy --all-targets -- -D warnings  # must pass
 ```
 
-Requires Rust edition 2021. Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `docs/configuration.md` and `dex doctor`.
+Requires Rust edition 2021 (Cargo 1.88+ because `crates/dex-gui` is edition 2024). Config: `$XDG_CONFIG_HOME/dex/config.yaml` (or `$DEX_CONFIG`) as defaults; CLI flags > env (`DEX_*`) > file > built-in default — see `docs/configuration.md` and `dex doctor`.
 
 ## Structure
 

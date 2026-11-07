@@ -236,9 +236,17 @@ fn crates_toml_tracks_dex(text: &str) -> bool {
 
 /// Release target triple for this build, matching `release.yml`'s matrix.
 fn release_target() -> Result<&'static str, String> {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    if cfg!(all(
+        target_os = "linux",
+        target_env = "gnu",
+        target_arch = "x86_64"
+    )) {
         Ok("x86_64-unknown-linux-gnu")
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    } else if cfg!(all(
+        target_os = "linux",
+        target_env = "gnu",
+        target_arch = "aarch64"
+    )) {
         Ok("aarch64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Ok("aarch64-apple-darwin")

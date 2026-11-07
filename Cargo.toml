@@ -28,9 +28,9 @@ tui = [
     "dep:crossterm",
     "dep:ratatui-markdown",
 ]
-# `gui` links the Rune GUI (crates/dex-gui) into the binary: bare `dex` opens it, and running
-# the binary as `dexc` (symlink/copy) opens the TUI instead. Off by default: Rune pulls a large
-# GPU/windowing tree, so release builds opt in.
+# `gui` links the Rune GUI (crates/dex-gui) into the binary: bare `dex` opens it, and `dex tui`
+# opens the TUI instead. Off by default: Rune pulls a large GPU/windowing tree, so release
+# builds opt in.
 gui = ["dep:dex-gui"]
 network-tests = []
 

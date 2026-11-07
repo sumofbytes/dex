@@ -1,3 +1,5 @@
 fn main() {
-    dex_gui::run();
+    if !dex_gui::run() {
+        std::process::exit(1);
+    }
 }

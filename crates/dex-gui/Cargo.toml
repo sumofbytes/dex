@@ -2,6 +2,7 @@
 name = "dex-gui"
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Native GUI client for the dex daemon, built on Rune"
 license = "MIT OR Apache-2.0"
 publish = false

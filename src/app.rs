@@ -736,7 +736,8 @@ fn run_auth(action: &str, provider: Option<&str>) {
 }
 
 /// Bare `dex` opens the GUI when built with `gui`; any argument (`dex tui`, subcommands, flags)
-/// or a Linux session without a display keeps the TUI and the CLI.
+/// or a Linux session without a display keeps the TUI and the CLI. A GUI that fails to start
+/// falls through to the TUI.
 #[cfg(feature = "gui")]
 fn gui_default(argv: &[std::ffi::OsString]) -> bool {
     let headless = cfg!(target_os = "linux")
@@ -747,8 +748,8 @@ fn gui_default(argv: &[std::ffi::OsString]) -> bool {
 
 pub fn run() {
     #[cfg(feature = "gui")]
-    if gui_default(&std::env::args_os().collect::<Vec<_>>()) {
-        return dex_gui::run();
+    if gui_default(&std::env::args_os().collect::<Vec<_>>()) && dex_gui::run() {
+        return;
     }
     crate::runtime::logging::init();
     #[cfg(feature = "tui")]
