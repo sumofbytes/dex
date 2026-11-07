@@ -224,4 +224,35 @@ mod tests {
         state.release_turn("s");
         assert!(!state.turn_active("s"));
     }
+
+    #[test]
+    fn swapping_the_token_on_a_streaming_slot_keeps_its_queues() {
+        let state = DaemonState::new();
+        let first = CancellationToken::new();
+        state.set_turn_cancel("s", first.clone());
+        let (_s, _f) = state.attach_queues("s", &first);
+        let second = CancellationToken::new();
+        state.set_turn_cancel("s", second.clone());
+        assert!(state.turn_queue("s", false).is_some(), "queues survive");
+        assert!(
+            !state.release_owned_turn("s", &first),
+            "old token no longer owns"
+        );
+        assert!(state.release_owned_turn("s", &second));
+    }
+
+    #[test]
+    fn release_leaves_neither_token_nor_queues_behind() {
+        let state = DaemonState::new();
+        let cancel = CancellationToken::new();
+        assert!(state.claim_turn("s"));
+        state.set_turn_cancel("s", cancel.clone());
+        let (_s, _f) = state.attach_queues("s", &cancel);
+        state.release_turn("s");
+        assert!(!state.turn_active("s"));
+        assert!(state.turn_cancel_token("s").is_none());
+        assert!(state.turn_queue("s", false).is_none());
+        assert!(state.turn_queue("s", true).is_none());
+        assert!(state.claim_turn("s"), "slot is claimable again");
+    }
 }

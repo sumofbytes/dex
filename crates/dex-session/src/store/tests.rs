@@ -1141,3 +1141,22 @@ fn parent_listing_and_loader_ignore_child_sessions() {
         .all(|m| m.content.as_deref() != Some("child-only content")));
     let _ = std::fs::remove_dir_all(parent_path.parent().unwrap());
 }
+
+#[test]
+fn compaction_title_skips_quotes_rules_and_headings_before_the_task() {
+    let path = unique_path("dex-scan-compaction-shapes");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let summary = format!(
+        r#"{{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","name":"summary","content":"{}"}}"#,
+        "## Goal\\n> quoted context\\n---\\n\\nShip the retry fix\\n\\n## Progress"
+    );
+    fs::write(&path, format!("{header}\n{summary}\n")).unwrap();
+    assert_eq!(
+        Session::scan_listing(&path)
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("Ship the retry fix")
+    );
+    let _ = fs::remove_file(&path);
+}

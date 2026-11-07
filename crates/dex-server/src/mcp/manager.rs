@@ -87,7 +87,7 @@ impl McpManager {
     }
 
     /// The live client for `name`, if it is `Up`.
-    async fn client(&self, name: &str) -> Option<Arc<McpClient>> {
+    pub(super) async fn client(&self, name: &str) -> Option<Arc<McpClient>> {
         match self.conns.read().await.get(name) {
             Some(Conn::Up(c)) => Some(Arc::clone(c)),
             _ => None,
@@ -107,7 +107,7 @@ impl McpManager {
             .collect()
     }
 
-    async fn down_reason(&self, name: &str) -> String {
+    pub(super) async fn down_reason(&self, name: &str) -> String {
         match self.conns.read().await.get(name) {
             Some(Conn::Down(reason)) => reason.clone(),
             _ => "not connected".to_string(),

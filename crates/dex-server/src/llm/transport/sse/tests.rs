@@ -953,3 +953,70 @@ async fn stalled_stream_fails_after_idle_deadline() {
         "watchdog must name the stall: {err}"
     );
 }
+
+async fn drain_assistant(rx: &mut mpsc::Receiver<ModelEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(ModelEvent::Assistant(s)) = rx.try_recv() {
+        out.push(s);
+    }
+    out
+}
+
+#[tokio::test]
+async fn fence_closes_back_to_prose_and_reopens() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut printer = StreamPrinter::new(Some(tx));
+    for line in [
+        "```rust",
+        "fn a() {}",
+        "```",
+        "between",
+        "```py",
+        "x = 1",
+        "```",
+    ] {
+        printer.feed_line_async(line).await;
+    }
+    printer.finish_async().await;
+    assert_eq!(
+        drain_assistant(&mut rx).await,
+        [
+            "```rust:\nfn a() {}\n\n```",
+            "between",
+            "```py:\nx = 1\n\n```"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn open_fence_is_flushed_at_stream_end_only_when_it_has_a_body() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut printer = StreamPrinter::new(Some(tx));
+    printer.feed_line_async("```sh").await;
+    printer.feed_line_async("ls").await;
+    printer.finish_async().await;
+    assert_eq!(drain_assistant(&mut rx).await, ["```sh:\nls\n\n```"]);
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut printer = StreamPrinter::new(Some(tx));
+    printer.feed_line_async("```sh").await;
+    printer.finish_async().await;
+    assert!(
+        drain_assistant(&mut rx).await.is_empty(),
+        "empty body: nothing to flush"
+    );
+}
+
+#[test]
+fn sync_and_async_paths_share_the_fence_transition() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut printer = StreamPrinter::new(Some(tx));
+    for line in ["```c", "int x;", "```", "tail"] {
+        printer.feed_line_inner(line);
+    }
+    let mut got = Vec::new();
+    while let Ok(ModelEvent::Assistant(s)) = rx.try_recv() {
+        got.push(s);
+    }
+    assert_eq!(got, ["```c:\nint x;\n\n```", "tail"]);
+}
