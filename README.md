@@ -79,6 +79,13 @@ curl -fsSL https://raw.githubusercontent.com/sumofbytes/dex/HEAD/scripts/install
 - Windows: grab `dex-v*-*-x86_64-pc-windows-msvc.zip` from the
   [releases page](https://github.com/sumofbytes/dex/releases).
 
+Requirements: the terminal UI (`dex tui`) needs nothing beyond glibc 2.35+ on
+Linux (musl distros such as Alpine: build from source). The GUI needs a
+graphical session and, on Linux, a Vulkan driver plus Wayland or X11 libraries
+(`libvulkan`, `libwayland-client` or `libX11`/`libxcb`, `libxkbcommon`), which
+desktop distros already ship. If the GUI cannot start, `dex` falls back to the
+TUI. `git` is used for the GUI's worktree and Changes views.
+
 First run needs one thing: a model — the
 [Getting started guide](docs/getting-started.md) walks through it. Copy a
 sample from `examples/config.yaml`, set `model: <provider>/<model>` in the
